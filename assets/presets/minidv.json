@@ -1,0 +1,33 @@
+{
+  "looks_preset": 1,
+  "name": "MiniDV",
+  "tags": ["digital", "video", "dv", "era"],
+  "group": {
+    "id": 100,
+    "name": "MiniDV",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "starve",
+        "value": 0.2,
+        "targets": [
+          {"effect": 3, "param": 0, "lo": 0.0, "hi": -0.11, "curve": "exp"}
+        ]
+      },
+      {
+        "name": "fringe",
+        "value": 0.2,
+        "targets": [
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.05, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "colorscience", "id": 1, "params": [9, 0.0, 0.1, 0.0]},
+    {"type": "rgb_split", "id": 2, "params": [1.5, 0.0], "wet": 0.6},
+    {"type": "bitrate_starve", "id": 3, "params": [26, 15]},
+    {"type": "grain", "id": 4, "params": [0.12, 1.0, 0.9]}
+  ]
+}

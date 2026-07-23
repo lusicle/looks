@@ -1,0 +1,140 @@
+// EffectInstance (spec §5) — shared by the document's stack and by mask
+// mini-chains (spec §8), so it lives in its own header below document.h.
+
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+namespace looks::doc {
+
+enum class EffectType : uint32_t {
+    RgbSplit = 0,
+    Vignette,
+    Pixelate,
+    Grain,
+    Jitter,
+    Quantize,
+    Glow,
+    FlowSmear,
+    MotionExtract,
+    Datamosh,          // Codec-Box family (spec §6.3): one box,
+    GenerationLoss,    // four named effects
+    JpegBlocking,
+    BitrateStarve,
+    Echo,              // stateful: previous own output (one-frame delay)
+    Feedback,
+    Glyph,             // per-cell luma -> tile from a glyph atlas
+    ColorScience,      // film-stock matrices/curves (spec §6.4)
+    Kaleido,           // wave 2 (spec §6.2/§6.3/§6.7): warp + optics + signal
+    Polar,
+    Turbulence,        // liquify: curl-noise warp
+    Displace,          // displacement by own luma
+    LensDistort,
+    Fringe,            // lens CA / digicam purple fringe
+    Interlace,
+    SliceShuffle,      // horizontal band displacement
+    PixelStretch,      // freeze a row/col and smear past it
+    Composite,         // dot crawl / rainbow shimmer / chroma delay
+    Snow,              // analog snow + ghosting
+    SyncFail,          // vertical roll + horizontal tear
+    Timestamp,         // 7-seg camcorder date/timecode burn
+    Oversharpen,       // unsharp-mask halos
+    NrMush,            // watercolor over-smoothing
+    Blur,              // directional / radial / zoom
+    DustScratches,     // procedural dust flecks + wobbling scratch lines
+    LightLeak,         // warm edge-anchored leak blobs
+    Anamorphic,        // horizontal streak flare + squeeze
+    DirectFlash,       // on-camera flash look
+    EdgeDetect,        // Sobel stylized lines
+    Kuwahara,          // painterly variance-min filter
+    CelShade,          // luma banding + dark edges
+    RuttEtra,          // luma-displaced scanlines
+    SlitScan,          // rows/cols sampled from a past-frames ring buffer
+    CamcorderHud,      // REC dot, battery, counter, safe-frame brackets
+    GateMask,          // Super 8 / 16mm / 35mm / scope gate + aspect
+    CueMark,           // projector reel-change dots
+    ScreenTexture,     // projection screen weave + hotspot
+    Voronoi,           // cellular shatter
+    ReactionDiffusion, // Gray-Scott sim seeded by the frame (stateful)
+    ErrorDiffusion,    // CPU serpentine FS/Atkinson dither (spec §6.2)
+    Flicker,           // exposure / projector flicker
+    FrameHold,         // frame-rate sim: hold at N fps + shutter blend
+    Stutter,           // beat-repeat: loop the last N frames when armed
+    Contour,           // topo iso-lines from luma
+    FlowParticles,     // dissolve + advect along the flow field (stateful)
+    Ball,              // spherize: frame wrapped onto a sphere
+    SoftUpscale,       // soft low-res upscale (spec §6.5)
+    ZoomCrunch,        // digital-zoom crunch: crop-zoom + resample
+    PixelSort,         // threshold-gated luma sort streaks
+    WaveWarp,          // sine / ripple displacement
+    CrtSim,            // CRT tube: grille, scanlines, curvature
+    Halftone,          // angled dot screens (mono / cmyk) — real print sim
+    StarFilter,        // cross-screen diffraction spikes on highlights
+    Streak,            // directional smear / directional glow (threshold)
+    SplitTone,         // shadow hue vs highlight hue
+    CornerSoft,        // radial corner blur + astigmatism (lens character)
+    HeadSwitch,        // VHS head-switching noise band at frame bottom
+    VhsOsd,            // tape-deck overlay: PLAY / REC / counter
+    CamAuto,           // AF hunt + AE pump + AWB drift, one bad camera
+    Mosquito,          // flickering DCT ringing hugging hard edges
+    BitPlane,          // XOR/AND/OR bit patterns on quantized channels
+    BlockShuffle,      // macroblock copy/stamp/swap glitch (GPU-side)
+    BufferGlitch,      // stuck columns / accumulating row shear
+    CrossHatch,        // multi-angle stroke shading by luma band
+    SpliceBump,        // splice: flash + frame jump + dirt (route a trigger)
+    FilmSlip,          // projector loses the loop: rolled frame + frame bar
+    Emulsion,          // vinegar-syndrome warp, mottle, mold blooms
+    TimeDisplace,      // per-pixel playback delay from luma/mask (ring)
+    FlowPaint,         // anisotropic Kuwahara along the flow field
+    Count,
+};
+
+// True for effects that read their own previous output (engine keeps a
+// persistent per-instance target; the one-frame-delay rule, spec §4).
+inline bool is_stateful_feedback(EffectType type) {
+    return type == EffectType::Echo || type == EffectType::Feedback;
+}
+
+// True for the Codec-Box effects (CPU roundtrip through the mosh codec).
+inline bool is_codec_box(EffectType type) {
+    return type == EffectType::Datamosh ||
+           type == EffectType::GenerationLoss ||
+           type == EffectType::JpegBlocking ||
+           type == EffectType::BitrateStarve;
+}
+
+// Blend modes, shared by per-effect composition and layer compositing
+// (spec §5). All operate in the linear working space.
+enum class BlendMode : uint32_t {
+    Normal = 0,
+    Add,
+    Multiply,
+    Screen,
+    Difference,
+    Count,
+};
+
+// Type + ordered params + wet/dry + opacity/blend + bypass + seed (spec §5).
+// Param metadata (ranges, labels, defaults) lives in effects.h; params here
+// parallel that table.
+//
+// Composition (canonical, wet is INTERIOR to the blend, opacity outside):
+//   final = mix(input, blend(input, mix(input, fx(input), wet)), opacity)
+struct EffectInstance {
+    EffectType type = EffectType::RgbSplit;
+    uint64_t id = 0;               // stable identity (UI state, mod routes)
+    std::vector<float> params;     // one per ParamDesc, same order
+    float wet = 1.0f;
+    float opacity = 1.0f;
+    BlendMode blend = BlendMode::Normal;
+    bool bypass = false;
+    // Solo (spec §5): when any effect in a stack is soloed, only soloed
+    // effects run (bypass still wins for the soloed effect itself).
+    bool solo = false;
+    uint64_t seed = 0;
+    uint64_t mask_id = 0;          // 0 = unmasked; else a Document mask
+    uint64_t group_id = 0;         // 0 = ungrouped; else a Layer group
+};
+
+}  // namespace looks::doc

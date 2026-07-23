@@ -1,0 +1,33 @@
+{
+  "looks_preset": 1,
+  "name": "2003 point-and-shoot",
+  "tags": ["digital", "y2k", "digicam", "era"],
+  "group": {
+    "id": 100,
+    "name": "2003 point-and-shoot",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "crush",
+        "value": 0.3,
+        "targets": [
+          {"effect": 4, "param": 0, "lo": 0.0, "hi": -0.18, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "smear",
+        "value": 0.25,
+        "targets": [
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.3, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "colorscience", "id": 1, "params": [9, 0.2, 0.25, 0.0]},
+    {"type": "glow", "id": 2, "params": [0.6, 10, 0.75, 2]},
+    {"type": "grain", "id": 3, "params": [0.18, 1.0, 0.8]},
+    {"type": "jpeg_blocking", "id": 4, "params": [24]}
+  ]
+}

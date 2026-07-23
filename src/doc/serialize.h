@@ -1,0 +1,36 @@
+// Project serialization (spec §10): the whole Document to/from a single
+// JSON file. Presets reuse the effect/group encoders so a saved group is
+// the same on-disk shape as a group inside a project.
+//
+// Loading is tolerant by construction: missing keys fall back to defaults
+// (json::Value typed reads never throw), unknown effect types are skipped,
+// and id counters are re-derived from the highest id seen so a hand-edited
+// file can never mint duplicate ids.
+
+#pragma once
+
+#include <filesystem>
+#include <optional>
+#include <string>
+
+#include "doc/document.h"
+#include "util/json.h"
+
+namespace looks::doc {
+
+inline constexpr int kProjectVersion = 1;
+
+json::Value doc_to_json(const Document& doc);
+Document doc_from_json(const json::Value& v);
+
+// Shared with preset files (a preset is a group + its member effects).
+json::Value effect_to_json(const EffectInstance& fx);
+std::optional<EffectInstance> effect_from_json(const json::Value& v);
+json::Value group_to_json(const Group& g);
+Group group_from_json(const json::Value& v);
+
+bool save_document(const std::filesystem::path& path, const Document& doc);
+std::optional<Document> load_document(const std::filesystem::path& path,
+                                      std::string* error = nullptr);
+
+}  // namespace looks::doc

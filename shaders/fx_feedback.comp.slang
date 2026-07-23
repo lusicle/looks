@@ -1,0 +1,70 @@
+// Feedback node (spec §6.1 category 1, §4): reads the previous frame's own
+// output (one-frame-delay rule — the only legal "cycle" in the graph),
+// transformed per pass: zoom/rotate around center + fade. The classic video
+// feedback tunnel.
+//
+// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+
+#include "fx_common.slang"
+
+[[vk::push_constant]]
+cbuffer Push
+{
+    uint width;
+    uint height;
+    float wet;
+    float opacity;
+    uint seed;
+    uint frame;
+    float fps;
+    float amount;      // feedback blend strength
+    float zoom;        // scale per pass (1 = none)
+    float rotate;      // radians per pass
+    float fade;        // brightness decay per pass
+    float hue_shift;   // degrees per pass (spec §6.1 color-shift)
+};
+
+[[vk::binding(0, 0)]] Sampler2D input;
+[[vk::binding(1, 0)]] Sampler2D prev_out;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= width || tid.y >= height)
+        return;
+    const float2 size = float2(width, height);
+    const float2 uv = (float2(tid.xy) + 0.5) / size;
+    const float4 base = input.SampleLevel(uv, 0);
+
+    // Inverse transform: where did this pixel come from last frame?
+    const float aspect = size.x / size.y;
+    float2 p = uv - 0.5;
+    p.x *= aspect;
+    const float inv_zoom = 1.0 / max(zoom, 0.05);
+    const float c = cos(-rotate);
+    const float s = sin(-rotate);
+    p = float2(p.x * c - p.y * s, p.x * s + p.y * c) * inv_zoom;
+    p.x /= aspect;
+    const float2 prev_uv = p + 0.5;
+
+    float3 fb = float3(0.0, 0.0, 0.0);
+    if (all(prev_uv >= 0.0) && all(prev_uv <= 1.0))
+        fb = prev_out.SampleLevel(prev_uv, 0).rgb * (1.0 - saturate(fade));
+
+    // Per-pass color-shift (spec §6.1): rotate the fed-back frame's hue
+    // around the luma axis — trails cycle through the spectrum.
+    if (abs(hue_shift) > 0.01) {
+        const float ha = hue_shift * 0.01745329252;
+        const float hc = cos(ha), hs = sin(ha);
+        const float3 k = float3(0.57735, 0.57735, 0.57735);
+        fb = fb * hc + cross(k, fb) * hs + k * dot(k, fb) * (1.0 - hc);
+        fb = max(fb, 0.0);
+    }
+
+    const float3 mixed = max(base.rgb, fb * saturate(amount));
+    const float4 result = float4(mixed, base.a);
+    const float4 wetted = lerp(base, result, saturate(wet));
+    output[tid.xy] = lerp(base, wetted, saturate(opacity));
+}
