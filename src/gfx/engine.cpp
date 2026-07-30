@@ -111,6 +111,30 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_emulsion.comp.spv", 1},
     {"fx_time_displace.comp.spv", 3},   // input + history slice + map
     {"fx_flow_paint.comp.spv", 2},      // input + flow field
+    {"fx_fm_synth.comp.spv", 1},
+    {"fx_colorizer.comp.spv", 1},
+    {"fx_solarize.comp.spv", 1},
+    {"fx_invert.comp.spv", 1},
+    {"fx_twirl.comp.spv", 1},
+    {"fx_tile.comp.spv", 1},
+    {"fx_emboss.comp.spv", 1},
+    {"fx_lens_flare.comp.spv", 1},
+    {"fx_velocity_scan.comp.spv", 3},   // input + canvas + front field
+    {"fx_lidar.comp.spv", 2},           // input + own previous output
+    {"fx_anaglyph.comp.spv", 1},
+    {"fx_photocopy.comp.spv", 1},
+    {"fx_risograph.comp.spv", 1},
+    {"fx_wet_plate.comp.spv", 1},
+    {"fx_reeded_glass.comp.spv", 1},
+    {"fx_watercolor.comp.spv", 1},
+    {"fx_wire_terrain.comp.spv", 1},
+    {"fx_ridgeline.comp.spv", 1},
+    {"fx_slow_scan.comp.spv", 2},       // input + own previous output
+    {"fx_vector_trace.comp.spv", 2},
+    {"fx_scope.comp.spv", 2},
+    {"fx_security_mux.comp.spv", 2},    // input + one history slice per pass
+    {"fx_audio_scope.comp.spv", 2},     // input + waveform strip
+    {"fx_modulate.comp.spv", 2},        // input + FM phase integral
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -267,13 +291,16 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         desc.spv_name = kFxShaders[i].spv_name;
         desc.sampled_inputs = kFxShaders[i].sampled_inputs;
         desc.storage_outputs = 1;
-        // Slit-scan and time-displace append one extra push word (the
-        // history-pass index); glyph appends four (atlas grid cols/rows +
-        // tile px + color flag, spec §12 custom glyph sets).
+        // Slit-scan, time-displace and security-mux append one extra push
+        // word (the history-pass index), velocity-scan one (front-state
+        // width); glyph appends four (atlas grid cols/rows + tile px +
+        // color flag, spec §12 custom glyph sets).
         const auto type_i = static_cast<doc::EffectType>(i);
         const uint32_t extra =
             (type_i == doc::EffectType::SlitScan ||
-             type_i == doc::EffectType::TimeDisplace)
+             type_i == doc::EffectType::TimeDisplace ||
+             type_i == doc::EffectType::SecurityMux ||
+             type_i == doc::EffectType::VelocityScan)
                 ? 1u
                 : (type_i == doc::EffectType::Glyph ? 4u : 0u);
         desc.push_bytes = static_cast<uint32_t>(
@@ -289,6 +316,28 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     flow_desc.push_bytes = 3 * sizeof(uint32_t);
     flow_ = ComputePipeline::create(device_, shader_dir, flow_desc);
     if (!flow_) return false;
+
+    // Velocity-scan front stepper (dwell-time rendering): advances the
+    // per-line sweep fronts against the current frame's luma.
+    ComputePipelineDesc vsf_desc;
+    vsf_desc.spv_name = "vs_front.comp.spv";
+    vsf_desc.sampled_inputs = 2;   // front state + video frame
+    vsf_desc.storage_outputs = 1;
+    vsf_desc.push_bytes = 12 * sizeof(uint32_t);
+    vs_front_ = ComputePipeline::create(device_, shader_dir, vsf_desc);
+    if (!vs_front_) return false;
+    if (!flow_) return false;
+
+    // Modulation phase integrator: one thread per lane, marching across
+    // the frame accumulating the FM phase (numthreads(8,1,1) — dispatch
+    // as (lanes, 1)).
+    ComputePipelineDesc mi_desc;
+    mi_desc.spv_name = "mod_integrate.comp.spv";
+    mi_desc.sampled_inputs = 1;
+    mi_desc.storage_outputs = 1;
+    mi_desc.push_bytes = 7 * sizeof(uint32_t);
+    mod_integrate_ = ComputePipeline::create(device_, shader_dir, mi_desc);
+    if (!mod_integrate_) return false;
 
     ComputePipelineDesc rd_desc;
     rd_desc.spv_name = "rd_step.comp.spv";
@@ -320,7 +369,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     gen_desc.spv_name = "gen.comp.spv";
     gen_desc.sampled_inputs = 0;
     gen_desc.storage_outputs = 1;
-    gen_desc.push_bytes = 13 * sizeof(uint32_t);
+    gen_desc.push_bytes = 14 * sizeof(uint32_t);
     generator_ = ComputePipeline::create(device_, shader_dir, gen_desc);
 
     ComputePipelineDesc blend_desc;
@@ -426,6 +475,49 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         if (!glyph_atlas_[3] ||
             !upload_gray_oneshot(*glyph_atlas_[3], braille.data(), kAtlasW,
+                                 kAtlasH))
+            return false;
+    }
+
+    // Procedural teletext atlas (spec §6.6/§12): 2x3 block-mosaic sextant
+    // cells — filled rectangles, not dots — lit-block count rising with
+    // the tile index, hash-shuffled per tile like the braille ramp.
+    {
+        constexpr uint32_t kAtlasW = 128, kAtlasH = 48;
+        std::vector<uint8_t> ttx(kAtlasW * kAtlasH, 0);
+        for (uint32_t tile = 0; tile < 96; ++tile) {
+            const uint32_t tx = (tile % 16) * 8;
+            const uint32_t ty = (tile / 16) * 8;
+            const uint32_t lit = (tile * 6 + 47) / 95;   // 0..6 blocks
+            uint32_t hash = tile * 2246822519u + 0x9E3779B9u;
+            uint8_t order[6] = {0, 1, 2, 3, 4, 5};
+            for (int i = 5; i > 0; --i) {
+                hash ^= hash << 13;
+                hash ^= hash >> 17;
+                hash ^= hash << 5;
+                const int j = static_cast<int>(hash % (i + 1));
+                const uint8_t tmpv = order[i];
+                order[i] = order[j];
+                order[j] = tmpv;
+            }
+            // Sextant grid inside the 8x8 tile: cols [0,4)/[4,8),
+            // rows [0,3)/[3,6)/[6,8) — full-bleed mosaic blocks.
+            for (uint32_t b = 0; b < lit && b < 6; ++b) {
+                const uint32_t slot = order[b];
+                const uint32_t bx = (slot & 1u) * 4;
+                const uint32_t row = slot >> 1;
+                const uint32_t by = row * 3;
+                const uint32_t bh = row == 2 ? 2 : 3;
+                for (uint32_t y = 0; y < bh; ++y)
+                    for (uint32_t x = 0; x < 4; ++x)
+                        ttx[(ty + by + y) * kAtlasW + tx + bx + x] = 255;
+            }
+        }
+        glyph_atlas_[4] = GpuImage::create(
+            device_, VK_FORMAT_R8_UNORM, kAtlasW, kAtlasH,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        if (!glyph_atlas_[4] ||
+            !upload_gray_oneshot(*glyph_atlas_[4], ttx.data(), kAtlasW,
                                  kAtlasH))
             return false;
     }
@@ -689,6 +781,12 @@ bool Engine::set_glyph_atlas_rgba(const uint8_t* rgba, uint32_t width,
     return upload_rgba_oneshot(*glyph_atlas_[slot], rgba, width, height);
 }
 
+void Engine::set_scope_audio(std::vector<int16_t> mono,
+                             uint32_t sample_rate) {
+    scope_audio_ = std::move(mono);
+    scope_rate_ = scope_audio_.empty() ? 0 : sample_rate;
+}
+
 namespace {
 
 uint16_t float_to_half(float f) {
@@ -724,7 +822,8 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
                                  const doc::EffectInstance& fx, EdSlot& slot) {
     const size_t n = static_cast<size_t>(width) * height;
     const float levels = std::clamp(fx.params[0], 2.0f, 16.0f);
-    const bool atkinson = fx.params[1] >= 0.5f;
+    const int kernel =
+        static_cast<int>(std::clamp(fx.params[1], 0.0f, 5.0f) + 0.5f);
     const bool serp = fx.params[2] >= 0.5f;
     const float carry_amt = std::clamp(fx.params[3], 0.0f, 1.0f);
     const float steps = levels - 1.0f;
@@ -772,9 +871,37 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
     static constexpr Tap kAtk[6] = {{1, 0, 1.0f / 8.0f}, {2, 0, 1.0f / 8.0f},
                                     {-1, 1, 1.0f / 8.0f}, {0, 1, 1.0f / 8.0f},
                                     {1, 1, 1.0f / 8.0f}, {0, 2, 1.0f / 8.0f}};
-    const Tap* taps = atkinson ? kAtk : kFs;
-    const int ntaps = atkinson ? 6 : 4;
-    const int margin = atkinson ? 2 : 1;
+    // The classic wide kernels (spec §6.2 family, DitherBoy-league).
+    static constexpr Tap kJarvis[12] = {
+        {1, 0, 7.0f / 48.0f},  {2, 0, 5.0f / 48.0f},  {-2, 1, 3.0f / 48.0f},
+        {-1, 1, 5.0f / 48.0f}, {0, 1, 7.0f / 48.0f},  {1, 1, 5.0f / 48.0f},
+        {2, 1, 3.0f / 48.0f},  {-2, 2, 1.0f / 48.0f}, {-1, 2, 3.0f / 48.0f},
+        {0, 2, 5.0f / 48.0f},  {1, 2, 3.0f / 48.0f},  {2, 2, 1.0f / 48.0f}};
+    static constexpr Tap kStucki[12] = {
+        {1, 0, 8.0f / 42.0f},  {2, 0, 4.0f / 42.0f},  {-2, 1, 2.0f / 42.0f},
+        {-1, 1, 4.0f / 42.0f}, {0, 1, 8.0f / 42.0f},  {1, 1, 4.0f / 42.0f},
+        {2, 1, 2.0f / 42.0f},  {-2, 2, 1.0f / 42.0f}, {-1, 2, 2.0f / 42.0f},
+        {0, 2, 4.0f / 42.0f},  {1, 2, 2.0f / 42.0f},  {2, 2, 1.0f / 42.0f}};
+    static constexpr Tap kBurkes[7] = {
+        {1, 0, 8.0f / 32.0f},  {2, 0, 4.0f / 32.0f}, {-2, 1, 2.0f / 32.0f},
+        {-1, 1, 4.0f / 32.0f}, {0, 1, 8.0f / 32.0f}, {1, 1, 4.0f / 32.0f},
+        {2, 1, 2.0f / 32.0f}};
+    static constexpr Tap kSierra[10] = {
+        {1, 0, 5.0f / 32.0f},  {2, 0, 3.0f / 32.0f}, {-2, 1, 2.0f / 32.0f},
+        {-1, 1, 4.0f / 32.0f}, {0, 1, 5.0f / 32.0f}, {1, 1, 4.0f / 32.0f},
+        {2, 1, 3.0f / 32.0f},  {-1, 2, 2.0f / 32.0f}, {0, 2, 3.0f / 32.0f},
+        {1, 2, 2.0f / 32.0f}};
+    const Tap* taps = kFs;
+    int ntaps = 4;
+    int margin = 1;
+    switch (kernel) {
+        case 1: taps = kAtk; ntaps = 6; margin = 2; break;
+        case 2: taps = kJarvis; ntaps = 12; margin = 2; break;
+        case 3: taps = kStucki; ntaps = 12; margin = 2; break;
+        case 4: taps = kBurkes; ntaps = 7; margin = 2; break;
+        case 5: taps = kSierra; ntaps = 10; margin = 2; break;
+        default: break;
+    }
 
     const int iw = static_cast<int>(width);
     const int ih = static_cast<int>(height);
@@ -783,7 +910,7 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
         const int dir = reverse ? -1 : 1;
         // Flat index deltas for this row direction (interior fast path —
         // no per-tap bounds checks on ~99% of pixels).
-        ptrdiff_t delta[6];
+        ptrdiff_t delta[12];
         for (int t = 0; t < ntaps; ++t)
             delta[t] = (static_cast<ptrdiff_t>(taps[t].dy) * iw +
                         taps[t].dx * dir) * 3;
@@ -1161,6 +1288,68 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // Seek gap / first frame: neutral prev = current (zero difference).
     GpuImage* prev_plane = prev_frame_valid_ ? prev_y_.get() : plane_y_.get();
 
+    // Audio Scope strips: one 1-D min/max waveform texture per active
+    // instance, sliced from the mono PCM copy for the trailing window
+    // ending at this timeline frame (deterministic on frame index).
+    {
+        auto upload_strip = [&](const doc::EffectInstance& fx) -> bool {
+            if (fx.type != doc::EffectType::AudioScope || fx.bypass)
+                return true;
+            std::unique_ptr<GpuImage>& tex = audio_strip_[fx.id];
+            if (!tex) {
+                tex = GpuImage::create(
+                    device_, VK_FORMAT_R32G32_SFLOAT, kAudioStripBins, 1,
+                    VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                if (!tex) return false;
+            }
+            float bins[kAudioStripBins * 2] = {};
+            const float window =
+                fx.params.empty()
+                    ? 0.5f
+                    : std::clamp(fx.params[0], 0.05f, 2.0f);
+            if (scope_rate_ > 0 && !scope_audio_.empty() && fps > 0.0) {
+                const double t1 = timeline_frame / fps;
+                const double t0 = t1 - window;
+                const int64_t total =
+                    static_cast<int64_t>(scope_audio_.size());
+                for (uint32_t i = 0; i < kAudioStripBins; ++i) {
+                    const double b0 =
+                        t0 + window * i / double(kAudioStripBins);
+                    const double b1 =
+                        t0 + window * (i + 1) / double(kAudioStripBins);
+                    int64_t s0 = static_cast<int64_t>(b0 * scope_rate_);
+                    int64_t s1 = static_cast<int64_t>(b1 * scope_rate_);
+                    if (s1 <= s0) s1 = s0 + 1;
+                    float mn = 0.0f, mx = 0.0f;
+                    bool any = false;
+                    for (int64_t s = s0; s < s1; ++s) {
+                        if (s < 0 || s >= total) continue;
+                        const float v =
+                            scope_audio_[static_cast<size_t>(s)] /
+                            32768.0f;
+                        mn = any ? std::min(mn, v) : v;
+                        mx = any ? std::max(mx, v) : v;
+                        any = true;
+                    }
+                    bins[i * 2] = mn;
+                    bins[i * 2 + 1] = mx;
+                }
+            }
+            if (!staging.upload_image(rec, bins, sizeof(bins),
+                                      kAudioStripBins, *tex))
+                return false;
+            tex->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            return true;
+        };
+        for (const doc::Layer& layer : doc.layers)
+            for (const doc::EffectInstance& fx : layer.stack)
+                if (!upload_strip(fx)) return nullptr;
+        for (const doc::Mask& mask : doc.masks)
+            for (const doc::EffectInstance& fx : mask.chain)
+                if (!upload_strip(fx)) return nullptr;
+    }
+
     std::vector<GpuImage*> results(graph.nodes.size(), nullptr);
     std::vector<int> remaining_uses(graph.nodes.size(), 0);
     for (const GraphNode& node : graph.nodes)
@@ -1234,7 +1423,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::Generator: {
-                uint32_t push[13] = {};
+                uint32_t push[14] = {};
                 push[0] = w;
                 push[1] = h;
                 if (node.layer_index >= 0) {
@@ -1250,6 +1439,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     }
                     push[11] = as_bits(layer.gen_scale);
                     push[12] = as_bits(layer.gen_angle);
+                    push[13] = layer.osc_shape;
                 } else {
                     // Mask generator source (spec §8): white-on-black with
                     // the mask's own scale/angle.
@@ -1599,10 +1789,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::Glyph) {
                     // set: 0 halftone, 1 ascii, 2 custom (spec §12 user-
-                    // droppable tilesets), 3 braille; missing slots fall
-                    // back down.
+                    // droppable tilesets), 3 braille, 4 teletext; missing
+                    // slots fall back down.
                     int which = std::clamp(
-                        static_cast<int>(fx.params[1] + 0.5f), 0, 3);
+                        static_cast<int>(fx.params[1] + 0.5f), 0, 4);
+                    if (which == 4 && !glyph_atlas_[4]) which = 1;
                     if (which == 3 && !glyph_atlas_[3]) which = 1;
                     if (which == 2 && !glyph_atlas_[2]) which = 1;
                     if (which == 1 && !glyph_atlas_[1]) which = 0;
@@ -2032,6 +2223,126 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::VelocityScan) {
+                    // Velocity-modulated scanning (dwell-time rendering):
+                    // sweep fronts advance at luma-braked speed (ping-pong
+                    // state, stepped once per timeline frame); the render
+                    // splats the beams over the phosphor canvas — the
+                    // effect's own previous output via the feedback slot.
+                    VsSlot& vs = vs_state_[fx.id];
+                    const uint32_t state_w = std::max(w, h);
+                    if (vs.state[0] && vs.state[0]->width() != state_w) {
+                        vs.state[0].reset();
+                        vs.state[1].reset();
+                        vs.last_frame = 0xFFFFFFFFu;
+                    }
+                    if (!vs.state[0]) {
+                        // Full-float state: positions live in PIXELS (up
+                        // to frame extent), and half floats step by a
+                        // whole pixel past 1024 — slow luma-braked fronts
+                        // would freeze, then pop a pixel at a time.
+                        for (int s = 0; s < 2; ++s) {
+                            vs.state[s] = GpuImage::create(
+                                device_, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                state_w, kVsSlots,
+                                VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_STORAGE_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                            if (!vs.state[s]) return nullptr;
+                            vs.state[s]->transition(
+                                rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                            VkClearColorValue zero{};
+                            VkImageSubresourceRange range{
+                                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                            vkCmdClearColorImage(
+                                rec, vs.state[s]->image(),
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero,
+                                1, &range);
+                        }
+                        vs.cur = 0;
+                    }
+                    if (vs.last_frame != timeline_frame) {
+                        GpuImage* src = vs.state[vs.cur].get();
+                        GpuImage* nxt = vs.state[1 - vs.cur].get();
+                        src->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        nxt->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                        uint32_t vp[12] = {};
+                        vp[0] = state_w;
+                        vp[1] = kVsSlots;
+                        vp[2] = static_cast<uint32_t>(seed64);
+                        vp[3] = timeline_frame;
+                        vp[4] = as_bits(static_cast<float>(fps));
+                        vp[5] = as_bits(fx.params[1]);   // sweep speed
+                        vp[6] = as_bits(fx.params[2]);   // stickiness
+                        vp[7] = as_bits(fx.params[4]);   // spawn rate
+                        vp[8] = as_bits(fx.params[6]);   // wiggle
+                        vp[9] = static_cast<uint32_t>(fx.params[0] + 0.5f);
+                        vp[10] = w;
+                        vp[11] = h;
+                        const GpuImage* vin[2] = {src, input_image(0)};
+                        GpuImage* vout = nxt;
+                        vs_front_->dispatch(rec, arena_, frame_index, vin, 2,
+                                            &vout, 1, vp, sizeof(vp),
+                                            state_w, kVsSlots,
+                                            linear_sampler_);
+                        vs.cur = 1 - vs.cur;
+                        vs.last_frame = timeline_frame;
+                    }
+                    GpuImage* front = vs.state[vs.cur].get();
+                    front->transition(
+                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+                    FeedbackSlot& slot = feedback_state_[fx.id];
+                    if (!slot.prev || slot.prev->width() != w ||
+                        slot.prev->height() != h) {
+                        slot.prev = GpuImage::create(
+                            device_, VK_FORMAT_R16G16B16A16_SFLOAT, w, h,
+                            VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                        slot.last_frame = 0xFFFFFFFFu;
+                        if (!slot.prev) return nullptr;
+                        slot.prev->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkClearColorValue black{};
+                        VkImageSubresourceRange range{
+                            VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                        vkCmdClearColorImage(
+                            rec, slot.prev->image(),
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
+                            &range);
+                    }
+                    slot.prev->transition(
+                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    push[kFxPreludeWords + param_count] = state_w;
+                    const GpuImage* sampled[3] = {input_image(0),
+                                                  slot.prev.get(), front};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 3, &dst, 1, push,
+                        push_bytes +
+                            static_cast<uint32_t>(sizeof(uint32_t)),
+                        w, h, linear_sampler_);
+                    if (slot.last_frame != timeline_frame) {
+                        dst->transition(rec,
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                        slot.prev->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkImageCopy vc{};
+                        vc.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                             1};
+                        vc.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                             1};
+                        vc.extent = {w, h, 1};
+                        vkCmdCopyImage(rec, dst->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       slot.prev->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &vc);
+                        slot.prev->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        dst->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                        slot.last_frame = timeline_frame;
+                    }
                 } else if (fx.type == doc::EffectType::FlowParticles) {
                     // Feedback-style persistent field advected by flow:
                     // inputs = {frame, own previous output, flow}.
@@ -2083,6 +2394,131 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         dst->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                         slot.last_frame = timeline_frame;
                     }
+                } else if (fx.type == doc::EffectType::SecurityMux) {
+                    // Same ring mechanism as SlitScan at full depth: one
+                    // masked dispatch per age band; each tile's seeded
+                    // delay picks exactly one band, so the passes tile
+                    // the output exactly once.
+                    SlitSlot& slot = slit_state_[fx.id];
+                    if (slot.ring[0] &&
+                        (slot.ring[0]->width() != w ||
+                         slot.ring[0]->height() != h)) {
+                        for (auto& img : slot.ring) img.reset();
+                        slot.head = slot.count = 0;
+                        slot.last_frame = 0xFFFFFFFFu;
+                    }
+                    GpuImage* in_img =
+                        const_cast<GpuImage*>(input_image(0));
+                    auto history = [&](uint32_t age) -> const GpuImage* {
+                        if (age == 0 || age > slot.count) return in_img;
+                        const uint32_t idx =
+                            (slot.head + kSlitRing - age) % kSlitRing;
+                        return slot.ring[idx] ? slot.ring[idx].get() : in_img;
+                    };
+                    uint32_t* extra = &push[kFxPreludeWords + param_count];
+                    const uint32_t mux_bytes =
+                        push_bytes + static_cast<uint32_t>(sizeof(uint32_t));
+                    for (uint32_t k = 0; k < kSlitRing; ++k) {
+                        *extra = k;
+                        const GpuImage* sampled[2] = {in_img, history(k)};
+                        fx_[static_cast<size_t>(fx.type)]->dispatch(
+                            rec, arena_, frame_index, sampled, 2, &dst, 1,
+                            push, mux_bytes, w, h, linear_sampler_);
+                    }
+                    if (slot.last_frame != timeline_frame) {
+                        std::unique_ptr<GpuImage>& target =
+                            slot.ring[slot.head];
+                        if (!target) {
+                            target = GpuImage::create(
+                                device_, VK_FORMAT_R16G16B16A16_SFLOAT, w, h,
+                                VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                            if (!target) return nullptr;
+                        }
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                        target->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkImageCopy mc{};
+                        mc.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                             0, 1};
+                        mc.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                             0, 1};
+                        mc.extent = {w, h, 1};
+                        vkCmdCopyImage(rec, in_img->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       target->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &mc);
+                        target->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        slot.head = (slot.head + 1) % kSlitRing;
+                        slot.count = std::min(slot.count + 1, kSlitRing);
+                        slot.last_frame = timeline_frame;
+                    }
+                } else if (fx.type == doc::EffectType::Modulate) {
+                    // FM raster: run the phase integrator over this
+                    // node's input, then render iso-phase traces from
+                    // the integral (GenerateMe fm.pde model).
+                    if (mod_integral_ &&
+                        (mod_integral_->width() != w ||
+                         mod_integral_->height() != h))
+                        mod_integral_.reset();
+                    if (!mod_integral_) {
+                        mod_integral_ = GpuImage::create(
+                            device_, VK_FORMAT_R32G32B32A32_SFLOAT, w, h,
+                            VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_STORAGE_BIT);
+                        if (!mod_integral_) return nullptr;
+                    }
+                    mod_integral_->transition(rec,
+                                              VK_IMAGE_LAYOUT_GENERAL);
+                    uint32_t fm_mode =
+                        fx.params.size() > 4 &&
+                                fx.params[4] >= 0.5f
+                            ? 1u
+                            : 0u;
+                    // Bit 1: reversed march — the integration always
+                    // follows the travel direction (speed sign).
+                    if (fx.params.size() > 3 && fx.params[3] < 0.0f)
+                        fm_mode |= 2u;
+                    const uint32_t lanes = (fm_mode & 1u) ? h : w;
+                    uint32_t mp[7] = {};
+                    mp[0] = w;
+                    mp[1] = h;
+                    mp[2] = as_bits(fx.params[0]);   // omega
+                    mp[3] = as_bits(fx.params[1]);   // distortion
+                    mp[4] = as_bits(fx.params[2]);   // lowpass
+                    mp[5] = fm_mode;
+                    mp[6] = as_bits(fx.params.size() > 9
+                                        ? fx.params[9]
+                                        : 0.35f);    // response curve
+                    const GpuImage* mi_in[1] = {input_image(0)};
+                    GpuImage* mi_out = mod_integral_.get();
+                    mod_integrate_->dispatch(rec, arena_, frame_index,
+                                             mi_in, 1, &mi_out, 1, mp,
+                                             sizeof(mp), lanes, 1,
+                                             linear_sampler_);
+                    mod_integral_->transition(
+                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    const GpuImage* sampled[2] = {input_image(0),
+                                                  mod_integral_.get()};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1,
+                        push, push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::AudioScope) {
+                    // The waveform strip was uploaded before graph eval.
+                    auto it = audio_strip_.find(fx.id);
+                    const GpuImage* strip =
+                        it != audio_strip_.end() && it->second
+                            ? it->second.get()
+                            : input_image(0);
+                    const GpuImage* sampled[2] = {input_image(0), strip};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
+                        push_bytes, w, h, linear_sampler_);
                 } else if (doc::is_stateful_feedback(fx.type)) {
                     FeedbackSlot& slot = feedback_state_[fx.id];
                     if (!slot.prev || slot.prev->width() != w ||

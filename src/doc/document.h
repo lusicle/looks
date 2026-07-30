@@ -23,6 +23,7 @@ enum class LayerSourceKind : uint32_t {
     Gradient,
     Noise,
     TestPattern,   // 75% color bars + grayscale ramp (spec §5)
+    Oscillator,    // video-synth periodic source: bars / rings / plasma
     Adjustment,
     Count,
 };
@@ -69,6 +70,8 @@ struct Layer {
     float color_b[3] = {0.1f, 0.1f, 0.1f};
     float gen_scale = 6.0f;
     float gen_angle = 0.0f;
+    // Oscillator waveform: 0 sine bars, 1 concentric rings, 2 plasma.
+    uint32_t osc_shape = 0;
     BlendMode blend = BlendMode::Normal;
     float opacity = 1.0f;
     bool visible = true;

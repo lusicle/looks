@@ -87,6 +87,32 @@ add_slang_shaders(looks_shaders
         fx_emulsion.comp.slang
         fx_time_displace.comp.slang
         fx_flow_paint.comp.slang
+        fx_fm_synth.comp.slang
+        fx_colorizer.comp.slang
+        fx_solarize.comp.slang
+        fx_invert.comp.slang
+        fx_twirl.comp.slang
+        fx_tile.comp.slang
+        fx_emboss.comp.slang
+        fx_lens_flare.comp.slang
+        vs_front.comp.slang
+        fx_velocity_scan.comp.slang
+        fx_lidar.comp.slang
+        fx_anaglyph.comp.slang
+        fx_photocopy.comp.slang
+        fx_risograph.comp.slang
+        fx_wet_plate.comp.slang
+        fx_reeded_glass.comp.slang
+        fx_watercolor.comp.slang
+        fx_wire_terrain.comp.slang
+        fx_ridgeline.comp.slang
+        fx_slow_scan.comp.slang
+        fx_vector_trace.comp.slang
+        fx_scope.comp.slang
+        fx_security_mux.comp.slang
+        fx_audio_scope.comp.slang
+        fx_modulate.comp.slang
+        mod_integrate.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang

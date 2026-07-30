@@ -5,7 +5,8 @@
 //
 // Presets: 0 neutral, 1 kodachrome, 2 portra, 3 vision3, 4 ektachrome,
 // 5 fuji, 6 bleach bypass, 7 cross-process, 8 technicolor 2-strip,
-// 9 ccd video, 10 wb fail warm, 11 wb fail cool.
+// 9 ccd video, 10 wb fail warm, 11 wb fail cool, 12 technicolor 3-strip,
+// 13 expired stock, 14 aerochrome IR, 15 b&w infrared, 16 instant film.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
 
@@ -31,7 +32,7 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-static const uint kPresets = 14;
+static const uint kPresets = 17;
 
 // Rows are output R/G/B as weights over input RGB.
 static const float3x3 kMatrix[kPresets] = {
@@ -64,6 +65,14 @@ static const float3x3 kMatrix[kPresets] = {
     float3x3(1.35, -0.20, -0.15, -0.15, 1.25, -0.10, -0.15, -0.20, 1.35),
     // expired stock: green-cyan fog, magenta-shifted mids, weak blues
     float3x3(0.92, 0.10, -0.02, 0.06, 1.04, 0.04, 0.02, 0.14, 0.78),
+    // aerochrome IR false color: chlorophyll (green) lands in red —
+    // foliage burns magenta-red, skies stay cyan-blue
+    float3x3(0.10, 1.20, -0.10, 0.80, 0.10, 0.05, 0.10, -0.10, 0.90),
+    // b&w infrared: identical rows = mono; green-heavy, blue-negative
+    // weights glow the foliage and blacken the skies
+    float3x3(0.40, 0.90, -0.30, 0.40, 0.90, -0.30, 0.40, 0.90, -0.30),
+    // instant film: cool green-cyan shadows, starved blue, creamy flat
+    float3x3(1.02, 0.04, -0.02, 0.02, 1.04, 0.00, -0.04, 0.06, 0.88),
 };
 
 // {extra_contrast, saturation, warmth_of_fade}
@@ -82,6 +91,9 @@ static const float3 kTone[kPresets] = {
     float3(0.05, 0.95, 0.0),   // wb cool
     float3(0.35, 1.45, 0.0),   // technicolor 3-strip
     float3(-0.10, 0.80, 0.6),  // expired: flat, desaturated, warm fog
+    float3(0.20, 1.35, 0.0),   // aerochrome: punchy false color
+    float3(0.15, 0.00, 0.0),   // b&w infrared
+    float3(-0.05, 0.90, 0.35), // instant: flat, slightly warm fade
 };
 
 [shader("compute")]
@@ -114,10 +126,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     enc = saturate((enc - 0.42) * (1.0 + contrast) + 0.42);
     const float l = fx_luma(enc);
     enc = saturate(lerp(float3(l, l, l), enc, kTone[p].y));
-    // Fade: lifted blacks, optionally warmed. The expired preset carries
-    // a baked-in base fog on top of the knob (spec §6.4 casts/fog).
+    // Fade: lifted blacks, optionally warmed. The expired and instant
+    // presets carry a baked-in base fog on top of the knob (spec §6.4).
     const float lift =
-        saturate(fade + (p == 13u ? 0.45 : 0.0)) * 0.14;
+        saturate(fade + (p == 13u ? 0.45 : (p == 16u ? 0.22 : 0.0))) *
+        0.14;
     const float3 fade_tint =
         float3(1.0 + kTone[p].z * 0.4, 1.0, 1.0 - kTone[p].z * 0.2);
     enc = enc * (1.0 - lift) + lift * fade_tint * 0.6;

@@ -1,0 +1,31 @@
+{
+  "looks_preset": 1,
+  "name": "unknown pleasures",
+  "tags": ["scan", "joyplot", "mono"],
+  "group": {
+    "id": 100,
+    "name": "unknown pleasures",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "peaks",
+        "value": 0.5,
+        "targets": [
+          {"effect": 1, "param": 1, "lo": 0.0, "hi": 1.0, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "rows",
+        "value": 0.4,
+        "targets": [
+          {"effect": 1, "param": 0, "lo": 0.0, "hi": 0.7, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "ridgeline", "id": 1, "params": [36, 0.55, 1.2, 0.35, 1.0, 0.0]},
+    {"type": "glow", "id": 2, "params": [0.8, 14, 0.3, 0, 0]}
+  ]
+}

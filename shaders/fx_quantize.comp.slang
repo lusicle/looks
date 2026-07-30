@@ -168,6 +168,24 @@ void main(uint3 tid : SV_DispatchThreadID)
         // RD stipple: the sim's B concentration (dots ~0.35, field 0).
         pattern = saturate(rd_state.SampleLevel(uv, 0).g * 2.5);
     }
+    else if (dm == 10) {
+        // Spiral screen: an archimedean spiral threshold wound from the
+        // pattern origin (ordered-shape family, spec §6.2).
+        const float2 d = pf - float2(float(width), float(height)) * 0.5;
+        pattern =
+            frac(length(d) * 0.125 - atan2(d.y, d.x) * 0.15915494);
+    }
+    else if (dm == 11) {
+        // Radial rings: concentric ordered threshold.
+        const float2 d = pf - float2(float(width), float(height)) * 0.5;
+        pattern = frac(length(d) * 0.125);
+    }
+    else if (dm == 12) {
+        // Diamond cluster: |dx|+|dy| ramp inside 8px cells — cluster-dot
+        // ordered dithering with a diamond growth shape.
+        const float2 f = frac(pf * 0.125) - 0.5;
+        pattern = saturate((abs(f.x) + abs(f.y)) * 1.4);
+    }
     float threshold = (pattern - 0.5) * saturate(dither_amt);
     if (dm == 0 || dm == 8) threshold = 0.0;
 

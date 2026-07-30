@@ -1,0 +1,33 @@
+{
+  "looks_preset": 1,
+  "name": "polaroid 600",
+  "tags": ["photo", "instant", "frame"],
+  "group": {
+    "id": 100,
+    "name": "polaroid 600",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "fade",
+        "value": 0.3,
+        "targets": [
+          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.8, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "leak",
+        "value": 0.25,
+        "targets": [
+          {"effect": 3, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "exp"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "colorscience", "id": 1, "params": [16, 0.0, 0.05, 0.25, 0.3]},
+    {"type": "grain", "id": 2, "params": [0.15, 1.6, 0.25, 0]},
+    {"type": "light_leak", "id": 3, "params": [0.35, 0.15, 0.1, 0], "wet": 0.5},
+    {"type": "gate_mask", "id": 4, "params": [4, 0.3, 0.08]}
+  ]
+}

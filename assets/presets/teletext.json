@@ -1,0 +1,33 @@
+{
+  "looks_preset": 1,
+  "name": "teletext",
+  "tags": ["broadcast", "mosaic", "retro"],
+  "group": {
+    "id": 100,
+    "name": "teletext",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "cell",
+        "value": 0.33,
+        "targets": [
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "tube",
+        "value": 0.4,
+        "targets": [
+          {"effect": 3, "param": 1, "lo": 0.0, "hi": 0.8, "curve": "linear"},
+          {"effect": 3, "param": 2, "lo": 0.0, "hi": 0.6, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "quantize", "id": 1, "params": [4, 5, 1, 0.6, 6]},
+    {"type": "glyph", "id": 2, "params": [12, 4, 1, 0]},
+    {"type": "crt_sim", "id": 3, "params": [0.3, 0.3, 0.25, 3, 0], "wet": 0.8}
+  ]
+}

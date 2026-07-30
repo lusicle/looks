@@ -9,18 +9,20 @@
     "bypass": false,
     "macros": [
       {
-        "name": "corrupt",
-        "value": 0.3,
-        "targets": [
-          {"effect": 4, "param": 4, "lo": 0.0, "hi": 0.5, "curve": "exp"},
-          {"effect": 4, "param": 3, "lo": 0.0, "hi": 0.3, "curve": "linear"}
-        ]
-      },
-      {
         "name": "tracking",
         "value": 0.25,
         "targets": [
-          {"effect": 1, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "scurve"}
+          {"effect": 1, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "scurve"},
+          {"effect": 4, "param": 2, "lo": 0.0, "hi": 0.4, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "corrupt",
+        "value": 0.3,
+        "targets": [
+          {"effect": 5, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "exp"},
+          {"effect": 6, "param": 1, "lo": 0.0, "hi": 0.6, "curve": "exp"},
+          {"effect": 6, "param": 0, "lo": 0.0, "hi": 0.3, "curve": "exp"}
         ]
       }
     ]
@@ -28,8 +30,10 @@
   "effects": [
     {"type": "jitter", "id": 1, "params": [7.0, 3.5, 2]},
     {"type": "colorscience", "id": 2, "params": [3, 0.0, 0.0, 0.3]},
-    {"type": "rgb_split", "id": 3, "params": [3.0, 0.0], "wet": 0.8},
-    {"type": "datamosh", "id": 4, "params": [40, 0, 1.0, 4.0, 0.15, 0]},
-    {"type": "echo", "id": 5, "params": [0.55, 0], "wet": 0.7}
+    {"type": "composite_artifacts", "id": 3, "params": [0.6, 0.5, 6.0]},
+    {"type": "head_switch", "id": 4, "params": [18, 14, 0.6, 2]},
+    {"type": "analog_snow", "id": 5, "params": [0.3, 24, 0.35]},
+    {"type": "sync_fail", "id": 6, "params": [0.0, 0.15, 0.15]},
+    {"type": "echo", "id": 7, "params": [0.5, 0], "wet": 0.4}
   ]
 }

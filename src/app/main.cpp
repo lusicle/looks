@@ -377,6 +377,11 @@ struct RenderWorker {
         float glyph_tile = 8.0f;
         bool glyph_is_color = false;
         bool glyph_pending = false;
+        // Audio Scope hand-off: mono PCM copy for the engine's waveform
+        // strip (empty = silent clip).
+        std::vector<int16_t> scope_data;
+        uint32_t scope_rate = 0;
+        bool scope_pending = false;
     };
 
     struct View {
@@ -485,6 +490,17 @@ struct RenderWorker {
             job_.glyph_rows = rows;
             job_.glyph_is_color = is_color;
             job_.glyph_pending = true;
+            ++job_serial_;
+        }
+        cv_.notify_all();
+    }
+
+    void post_scope_audio(std::vector<int16_t> mono, uint32_t rate) {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            job_.scope_data = std::move(mono);
+            job_.scope_rate = rate;
+            job_.scope_pending = true;
             ++job_serial_;
         }
         cv_.notify_all();
@@ -634,6 +650,15 @@ void RenderWorker::run() {
                 else
                     engine->set_glyph_atlas(bytes.data(), gw, gh, gt, gc, gr,
                                             /*slot=*/2);
+                lock.lock();
+                doc_changed = true;
+            }
+            if (job_.scope_pending) {
+                job_.scope_pending = false;
+                std::vector<int16_t> mono = std::move(job_.scope_data);
+                const uint32_t rate = job_.scope_rate;
+                lock.unlock();
+                engine->set_scope_audio(std::move(mono), rate);
                 lock.lock();
                 doc_changed = true;
             }
@@ -842,6 +867,43 @@ void RenderWorker::run() {
     }
 }
 
+// Audio Scope source (spec §7 family): mono copy of the PCM sidecar,
+// block-averaged down to ~16 kHz for the engine's per-frame waveform
+// strip. Deterministic — preview and export run the same reduction.
+std::vector<int16_t> load_scope_audio(const std::filesystem::path& pcm_path,
+                                      uint32_t* out_rate) {
+    *out_rate = 0;
+    if (pcm_path.empty()) return {};
+    media::PcmReader pcm;
+    std::string error;
+    if (!pcm.open(pcm_path, &error)) return {};
+    const uint32_t ch = pcm.channels();
+    const uint32_t sr = pcm.sample_rate();
+    if (!ch || !sr || !pcm.frame_count()) return {};
+    const uint32_t decim = std::max(1u, sr / 16000u);
+    std::vector<int16_t> mono;
+    mono.reserve(static_cast<size_t>(pcm.frame_count() / decim) + 1);
+    // Chunk size a multiple of decim so blocks never straddle chunks.
+    const size_t chunk = static_cast<size_t>(65536 - (65536 % decim));
+    std::vector<int16_t> buf(chunk * ch);
+    uint64_t pos = 0;
+    while (pos < pcm.frame_count()) {
+        const size_t got = pcm.read(pos, buf.data(), chunk);
+        if (!got) break;
+        for (size_t b = 0; b + decim <= got; b += decim) {
+            int32_t acc = 0;
+            for (size_t f = 0; f < decim; ++f)
+                for (uint32_t c = 0; c < ch; ++c)
+                    acc += buf[(b + f) * ch + c];
+            mono.push_back(static_cast<int16_t>(
+                acc / static_cast<int32_t>(decim * ch)));
+        }
+        pos += got;
+    }
+    *out_rate = sr / decim;
+    return mono;
+}
+
 // Offline export worker: private MezReader + Engine + readback on a copied
 // document — the preview loop keeps running; queue submits are serialized
 // by the device mutex.
@@ -876,6 +938,12 @@ std::unique_ptr<ExportJob> start_export(gfx::Device& device,
             raw->result.error = "export renderer init failed";
             raw->done = true;
             return;
+        }
+        // Audio Scope parity with preview (spec §11): same PCM reduction.
+        {
+            uint32_t scope_rate = 0;
+            auto scope_mono = load_scope_audio(pcm_path, &scope_rate);
+            engine->set_scope_audio(std::move(scope_mono), scope_rate);
         }
         codec::DecodedFrame decoded;
         MaskSourceReaders mask_readers;
@@ -982,7 +1050,7 @@ struct MaskUiState {
 struct LayerUiState {
     ui::ButtonState select_button, visible_check, remove_button;
     ui::ButtonState up_button, down_button;
-    ui::DropdownState blend_dd, mask_dd;
+    ui::DropdownState blend_dd, mask_dd, osc_dd;
     ui::SliderState sliders[9];
     // Transform + trim (spec §5), folded by default.
     bool xf_open = false;
@@ -1012,6 +1080,10 @@ struct AppState {
     std::unique_ptr<ImportJob> import;
     std::unique_ptr<ExportJob> export_job;
     std::filesystem::path mez_path, pcm_path;   // current clip bundle
+    // Audio Scope: which PCM the render engine currently holds (the main
+    // loop polls pcm_path and re-posts on change; empty = silent).
+    std::filesystem::path scope_pcm_loaded;
+    bool scope_pcm_init = false;
     mod::AnalysisCurves analysis;               // merged view (see sidechain)
     bool has_analysis = false;
     // Bumped whenever `analysis` is replaced — the render worker copies
@@ -1150,7 +1222,7 @@ struct AppState {
     ui::ButtonState speed_route_button, speed_key_button;
     ui::ButtonState ab_button, bypass_all_button;
     ui::SliderState wipe_slider;
-    ui::ButtonState add_layer_buttons[5];
+    ui::ButtonState add_layer_buttons[6];
     std::unordered_map<uint64_t, EffectUiState> fx_ui;
     std::unordered_map<uint64_t, RouteUiState> route_ui;
     std::unordered_map<uint64_t, MaskUiState> mask_ui;
@@ -1713,6 +1785,7 @@ struct FrameUi {
         bool* visible_staged;
         int* blend_selected;    // dropdown pick; -1 = untouched
         int* mask_selected;     // [none, masks...]; -1 = untouched
+        int* osc_shape_selected = nullptr;   // oscillator waveform pick
         bool* remove;
         bool* up = nullptr;     // swap toward index 0 (bottom of composite)
         bool* down = nullptr;
@@ -1721,8 +1794,8 @@ struct FrameUi {
         bool* flip_v = nullptr;
     };
     std::vector<LayerRow> layer_rows;
-    // solid, gradient, noise, test pattern, adjustment
-    bool* add_layer_clicked[5] = {};
+    // solid, gradient, noise, test pattern, oscillator, adjustment
+    bool* add_layer_clicked[6] = {};
 
     // Group + preset staging.
     struct GroupStage {
@@ -2968,7 +3041,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      "%.2f");
         if (layer.source == doc::LayerSourceKind::Solid ||
             layer.source == doc::LayerSourceKind::Gradient ||
-            layer.source == doc::LayerSourceKind::Noise) {
+            layer.source == doc::LayerSourceKind::Noise ||
+            layer.source == doc::LayerSourceKind::Oscillator) {
             layer_slider(LF::ColorAR, "color a r", 0.0f, 1.0f,
                          layer.color_a[0], "%.2f");
             layer_slider(LF::ColorAG, "color a g", 0.0f, 1.0f,
@@ -2977,7 +3051,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                          layer.color_a[2], "%.2f");
         }
         if (layer.source == doc::LayerSourceKind::Gradient ||
-            layer.source == doc::LayerSourceKind::Noise) {
+            layer.source == doc::LayerSourceKind::Noise ||
+            layer.source == doc::LayerSourceKind::Oscillator) {
             layer_slider(LF::ColorBR, "color b r", 0.0f, 1.0f,
                          layer.color_b[0], "%.2f");
             layer_slider(LF::ColorBG, "color b g", 0.0f, 1.0f,
@@ -2985,12 +3060,29 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             layer_slider(LF::ColorBB, "color b b", 0.0f, 1.0f,
                          layer.color_b[2], "%.2f");
         }
-        if (layer.source == doc::LayerSourceKind::Gradient)
+        if (layer.source == doc::LayerSourceKind::Gradient ||
+            layer.source == doc::LayerSourceKind::Oscillator)
             layer_slider(LF::Angle, "angle", -3.1416f, 3.1416f,
                          layer.gen_angle, "%.2f");
         if (layer.source == doc::LayerSourceKind::Noise)
             layer_slider(LF::Scale, "scale", 2.0f, 128.0f, layer.gen_scale,
                          "%.0f px");
+        if (layer.source == doc::LayerSourceKind::Oscillator) {
+            layer_slider(LF::Scale, "frequency", 0.5f, 32.0f,
+                         layer.gen_scale, "%.1f cyc");
+            // Waveform dropdown (spec §5 generators): the oscillator is a
+            // patchable periodic source, shape picks its geometry.
+            static const char* kOscShapes[] = {"sine bars", "rings",
+                                               "plasma", "lissajous"};
+            lrow.osc_shape_selected = arena.alloc<int>();
+            *lrow.osc_shape_selected = -1;
+            layer_rows_ui.push_back(value_row(
+                arena, "wave",
+                Dropdown(arena, kOscShapes, 4,
+                         static_cast<int>(layer.osc_shape), &ls.osc_dd,
+                         lrow.osc_shape_selected, SizeSpec::fill(),
+                         "oscillator waveform")));
+        }
 
         // Transform + trim (spec §5: crop/flip/scale/rotate + the clip
         // segment live on the layer). Folded per layer; the header marks
@@ -3071,14 +3163,15 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         out.layer_rows.push_back(lrow);
     }
     if (app.document.layers.size() < doc::kMaxLayers) {
-        // Paired rows: five full labels never fit one 300 px row.
-        static const char* kAddLayer[] = {"+ solid", "+ gradient", "+ noise",
-                                          "+ pattern", "+ adjust"};
-        for (int t = 0; t < 5; ++t)
+        // Paired rows: six full labels never fit one 300 px row.
+        static const char* kAddLayer[] = {"+ solid",   "+ gradient",
+                                          "+ noise",   "+ pattern",
+                                          "+ osc",     "+ adjust"};
+        for (int t = 0; t < 6; ++t)
             out.add_layer_clicked[t] = arena.alloc<bool>();
         ButtonOpts half;
         half.width = SizeSpec::fill();
-        for (int r = 0; r < 2; ++r) {
+        for (int r = 0; r < 3; ++r) {
             LayoutNode* pair = HStack(
                 arena, {4.0f},
                 {Button(arena, kAddLayer[r * 2],
@@ -3089,8 +3182,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         out.add_layer_clicked[r * 2 + 1], half)});
             rows.push_back(pair);
         }
-        rows.push_back(Button(arena, kAddLayer[4], &app.add_layer_buttons[4],
-                              out.add_layer_clicked[4], half));
     }
     if (!app.sec_open[0]) rows.resize(sec_begin);
     rows.push_back(Separator(arena));
@@ -4525,6 +4616,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
 
+        // Audio Scope: keep the engine's mono PCM copy in sync with the
+        // current clip — every open path funnels through app.pcm_path, so
+        // one poll covers them all (empty path = silent, flat line).
+        if (!app.scope_pcm_init || app.scope_pcm_loaded != app.pcm_path) {
+            app.scope_pcm_init = true;
+            app.scope_pcm_loaded = app.pcm_path;
+            uint32_t scope_rate = 0;
+            auto scope_mono = load_scope_audio(app.pcm_path, &scope_rate);
+            render_worker.post_scope_audio(std::move(scope_mono),
+                                           scope_rate);
+        }
+
         // Finished export → report, then start the next queued job.
         if (app.export_job && app.export_job->done.load()) {
             auto job = std::move(app.export_job);
@@ -5407,6 +5510,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     static_cast<doc::BlendMode>(*lrow.blend_selected);
                 app.undo.execute(app.document,
                                  doc::set_layer_props_command(edited));
+            } else if (lrow.osc_shape_selected &&
+                       *lrow.osc_shape_selected >= 0 &&
+                       static_cast<uint32_t>(*lrow.osc_shape_selected) !=
+                           layer->osc_shape) {
+                doc::Layer edited = *layer;
+                edited.osc_shape =
+                    static_cast<uint32_t>(*lrow.osc_shape_selected);
+                app.undo.execute(app.document,
+                                 doc::set_layer_props_command(edited));
             } else if (lrow.mask_selected && *lrow.mask_selected >= 0) {
                 const int sel = *lrow.mask_selected;   // 0 = none
                 const uint64_t next =
@@ -5506,11 +5618,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
         {
-            static const doc::LayerSourceKind kAddKinds[5] = {
+            static const doc::LayerSourceKind kAddKinds[6] = {
                 doc::LayerSourceKind::Solid, doc::LayerSourceKind::Gradient,
                 doc::LayerSourceKind::Noise, doc::LayerSourceKind::TestPattern,
+                doc::LayerSourceKind::Oscillator,
                 doc::LayerSourceKind::Adjustment};
-            for (int t = 0; t < 5; ++t) {
+            for (int t = 0; t < 6; ++t) {
                 if (frame_ui.add_layer_clicked[t] &&
                     *frame_ui.add_layer_clicked[t] &&
                     app.document.layers.size() < doc::kMaxLayers) {

@@ -106,6 +106,12 @@ public:
                               uint32_t cols = 16, uint32_t rows = 6,
                               int slot = 2);
 
+    // Audio Scope: mono soundtrack copy (block-decimated, ~16 kHz) the
+    // engine slices into a per-frame min/max waveform strip. Call from the
+    // thread that renders (worker / export thread) — no internal locking.
+    // Empty vector = no audio (the scope draws a flat line).
+    void set_scope_audio(std::vector<int16_t> mono, uint32_t sample_rate);
+
     // Preview proxy (spec §10): 1 = full, 2 = half, 4 = quarter. The source
     // planes stay full-res; the working targets shrink (kernels sample by
     // uv, so everything scales). Export uses its own Engine at 1.
@@ -186,15 +192,16 @@ private:
     bool upload_rgba_oneshot(GpuImage& dst, const uint8_t* rgba,
                              uint32_t width, uint32_t height);
     // 0 halftone, 1 ascii, 2 custom (spec §12 droppable glyph sets),
-    // 3 braille (procedural 2x4 dot cells). A color-flagged slot holds
-    // RGBA tiles (emoji sets): coverage from alpha, hue from the tile.
-    std::unique_ptr<GpuImage> glyph_atlas_[4];
-    bool glyph_atlas_color_[4] = {};
+    // 3 braille (procedural 2x4 dot cells), 4 teletext (procedural 2x3
+    // block-mosaic sextants). A color-flagged slot holds RGBA tiles
+    // (emoji sets): coverage from alpha, hue from the tile.
+    std::unique_ptr<GpuImage> glyph_atlas_[5];
+    bool glyph_atlas_color_[5] = {};
     struct GlyphMeta {
         uint32_t cols = 16, rows = 6;
         float tile = 8.0f;
     };
-    GlyphMeta glyph_meta_[4];
+    GlyphMeta glyph_meta_[5];
 
     // Dust/damage plate (spec §12 dust textures): assets/textures/dust.png
     // when present, else a procedural grunge fallback — always non-null.
@@ -257,6 +264,34 @@ private:
     };
     std::unordered_map<uint64_t, RdSlot> rd_state_;
     std::unique_ptr<ComputePipeline> rd_step_;
+
+    // Velocity scan (dwell-time rendering): per-instance ping-pong front
+    // field — one row of sweep-front positions per concurrent line, one
+    // column per along-axis texel. The phosphor canvas rides the shared
+    // feedback machinery (own previous output).
+    static constexpr uint32_t kVsSlots = 24;
+    struct VsSlot {
+        std::unique_ptr<GpuImage> state[2];
+        int cur = 0;
+        uint32_t last_frame = 0xFFFFFFFFu;
+    };
+    std::unordered_map<uint64_t, VsSlot> vs_state_;
+    std::unique_ptr<ComputePipeline> vs_front_;
+
+    // Modulation (FM raster): per-frame phase-integral scratch — each
+    // lane accumulates omega + distortion * signal across the frame
+    // (RGBA32F: R/G/B channel phases + luma phase). Recomputed by
+    // mod_integrate_ before every Modulate dispatch, so one shared
+    // scratch serves any number of instances (graph eval is sequential).
+    std::unique_ptr<GpuImage> mod_integral_;
+    std::unique_ptr<ComputePipeline> mod_integrate_;
+
+    // Audio Scope (spec §7 sidechain family): per-instance 1-D min/max
+    // waveform strip re-uploaded each render from the mono PCM copy.
+    static constexpr uint32_t kAudioStripBins = 1024;
+    std::unordered_map<uint64_t, std::unique_ptr<GpuImage>> audio_strip_;
+    std::vector<int16_t> scope_audio_;
+    uint32_t scope_rate_ = 0;
 
     // CPU error diffusion (spec §6.2): cached output halves + the residual
     // error plane carried into the next frame (temporal carry).

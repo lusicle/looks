@@ -19,15 +19,19 @@
         "name": "smear",
         "value": 0.25,
         "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.3, "curve": "linear"}
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.3, "curve": "linear"},
+          {"effect": 2, "param": 4, "lo": 0.0, "hi": 0.4, "curve": "exp"}
         ]
       }
     ]
   },
   "effects": [
-    {"type": "colorscience", "id": 1, "params": [9, 0.2, 0.25, 0.0]},
-    {"type": "glow", "id": 2, "params": [0.6, 10, 0.75, 2]},
-    {"type": "grain", "id": 3, "params": [0.18, 1.0, 0.8]},
+    {"type": "colorscience", "id": 1, "params": [9, 0.2, 0.25, 0.0, -0.15]},
+    {"type": "glow", "id": 2, "params": [0.6, 10, 0.75, 2, 0.25]},
+    {"type": "fringe", "id": 5, "params": [4.0, 1.0, 0.6]},
+    {"type": "oversharpen", "id": 6, "params": [1.6, 1.5]},
+    {"type": "grain", "id": 3, "params": [0.18, 1.0, 0.8, 1]},
+    {"type": "timestamp", "id": 7, "params": [0, 3, 3]},
     {"type": "jpeg_blocking", "id": 4, "params": [24]}
   ]
 }

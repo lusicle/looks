@@ -17,8 +17,9 @@ using json::Value;
 
 const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
-const char* const kSourceKindNames[] = {"clip", "solid", "gradient", "noise",
-                                        "test", "adjustment"};
+const char* const kSourceKindNames[] = {"clip",       "solid", "gradient",
+                                        "noise",      "test",  "oscillator",
+                                        "adjustment"};
 const char* const kModSourceNames[] = {
     "lfo",         "drift",       "audio_low",    "audio_mid",
     "audio_high",  "audio_onset", "video_motion", "video_brightness",
@@ -328,6 +329,8 @@ Value layer_to_json(const Layer& l) {
     v.set("color_b", f3_to_json(l.color_b));
     v.set("gen_scale", static_cast<double>(l.gen_scale));
     v.set("gen_angle", static_cast<double>(l.gen_angle));
+    if (l.osc_shape)
+        v.set("osc_shape", static_cast<int64_t>(l.osc_shape));
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
@@ -367,6 +370,7 @@ Layer layer_from_json(const Value& v) {
     f3_from_json(v.get("color_b"), l.color_b);
     l.gen_scale = num(v, "gen_scale", 6.0f);
     l.gen_angle = num(v, "gen_angle", 0.0f);
+    l.osc_shape = static_cast<uint32_t>(v.get("osc_shape").as_int(0));
     l.blend = static_cast<BlendMode>(
         enum_index(kBlendNames, v.get("blend").as_string()));
     l.opacity = num(v, "opacity", 1.0f);

@@ -1,0 +1,34 @@
+{
+  "looks_preset": 1,
+  "name": "cctv wall",
+  "tags": ["video", "surveillance", "multicam"],
+  "group": {
+    "id": 100,
+    "name": "cctv wall",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "grime",
+        "value": 0.3,
+        "targets": [
+          {"effect": 3, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "exp"},
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "delay",
+        "value": 1.0,
+        "targets": [
+          {"effect": 1, "param": 2, "lo": 0.0, "hi": 1.0, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "security_mux", "id": 1, "params": [3, 3, 0.0, 0.75, 0.9]},
+    {"type": "interlace", "id": 2, "params": [2.0, 0.25, 0], "wet": 0.7},
+    {"type": "analog_snow", "id": 3, "params": [0.1, 12, 0.12], "wet": 0.8},
+    {"type": "timestamp", "id": 4, "params": [0, 2, 3]}
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "looks_preset": 1,
+  "name": "scanimate",
+  "tags": ["synth", "scan", "phosphor"],
+  "group": {
+    "id": 100,
+    "name": "scanimate",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "deflect",
+        "value": 0.4,
+        "targets": [
+          {"effect": 1, "param": 1, "lo": 0.0, "hi": 0.8, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "phosphor",
+        "value": 0.35,
+        "targets": [
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.6, "curve": "linear"},
+          {"effect": 3, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "rutt_etra", "id": 1, "params": [5, 28, 1.5, 0, 0.25, 0.2, 12]},
+    {"type": "glow", "id": 2, "params": [1.2, 24, 0.25, 0, 0]},
+    {"type": "feedback", "id": 3, "params": [0.35, 1.01, 0.005, 0.1, 0], "wet": 0.5}
+  ]
+}

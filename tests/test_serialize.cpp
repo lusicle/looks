@@ -370,12 +370,13 @@ TEST(morph_interpolates_snapshots) {
 }
 
 TEST(era_presets_ship_valid) {
-    // The five spec §14 era presets in assets/presets must load, carry
-    // effects, and have every macro target resolve to a member effect.
+    // The shipped presets in assets/presets (the five spec §14 era looks
+    // plus the wave-2 style set) must load, carry effects, and have every
+    // macro target resolve to a member effect.
     const std::filesystem::path dir =
         std::filesystem::path(LOOKS_REPO_ROOT) / "assets" / "presets";
     std::vector<doc::Preset> presets = doc::scan_presets(dir);
-    CHECK_EQ(presets.size(), size_t{5});
+    CHECK_EQ(presets.size(), size_t{15});
     for (const doc::Preset& p : presets) {
         CHECK(!p.effects.empty());
         CHECK(!p.tags.empty());

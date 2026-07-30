@@ -135,16 +135,23 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     Layer layer;
     layer.id = doc.next_effect_id++;
     layer.source = kind;
-    static const char* kNames[] = {"clip", "solid", "gradient", "noise",
-                                   "pattern", "adjust"};
+    static const char* kNames[] = {"clip",    "solid", "gradient", "noise",
+                                   "pattern", "osc",   "adjust"};
     layer.name = std::string(kNames[static_cast<size_t>(kind)]) + " " +
                  std::to_string(layer.id);
     // Generators default to half opacity so adding one doesn't blank the
     // composite.
     if (kind == LayerSourceKind::Solid || kind == LayerSourceKind::Gradient ||
         kind == LayerSourceKind::Noise ||
-        kind == LayerSourceKind::TestPattern)
+        kind == LayerSourceKind::TestPattern ||
+        kind == LayerSourceKind::Oscillator)
         layer.opacity = 0.5f;
+    if (kind == LayerSourceKind::Oscillator) {
+        // Oscillator frequency reads in cycles, not px — a usable default.
+        layer.gen_scale = 8.0f;
+        layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
+        layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
+    }
     return layer;
 }
 

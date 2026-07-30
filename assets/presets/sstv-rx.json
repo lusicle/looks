@@ -1,0 +1,34 @@
+{
+  "looks_preset": 1,
+  "name": "sstv rx",
+  "tags": ["radio", "scan", "lofi"],
+  "group": {
+    "id": 100,
+    "name": "sstv rx",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "signal",
+        "value": 0.35,
+        "targets": [
+          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.8, "curve": "linear"},
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.6, "curve": "exp"}
+        ]
+      },
+      {
+        "name": "speed",
+        "value": 0.3,
+        "targets": [
+          {"effect": 1, "param": 0, "lo": 0.0, "hi": -0.25, "curve": "linear"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "colorscience", "id": 3, "params": [9, 0.0, 0.1, 0.1]},
+    {"type": "slow_scan", "id": 1, "params": [6, 0, 0.65, 0.45, 0.25]},
+    {"type": "analog_snow", "id": 2, "params": [0.15, 16, 0.15], "wet": 0.8},
+    {"type": "crt_sim", "id": 4, "params": [0.2, 0.35, 0.25, 3, 0], "wet": 0.6}
+  ]
+}

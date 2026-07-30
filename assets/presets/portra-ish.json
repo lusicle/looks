@@ -25,9 +25,10 @@
     ]
   },
   "effects": [
-    {"type": "colorscience", "id": 1, "params": [2, 0.0, 0.05, 0.1]},
-    {"type": "glow", "id": 2, "params": [0.5, 22, 0.6, 0]},
-    {"type": "grain", "id": 3, "params": [0.22, 1.8, 0.4]},
+    {"type": "colorscience", "id": 1, "params": [2, 0.0, 0.05, 0.1, 0.35]},
+    {"type": "glow", "id": 2, "params": [0.5, 22, 0.6, 0, 0]},
+    {"type": "grain", "id": 3, "params": [0.22, 1.8, 0.4, 0]},
+    {"type": "corner_soft", "id": 5, "params": [0.3, 0.5, 0.25]},
     {"type": "vignette", "id": 4, "params": [0.35, 0.65, 0.5]}
   ]
 }

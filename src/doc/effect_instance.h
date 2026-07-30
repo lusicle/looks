@@ -87,13 +87,40 @@ enum class EffectType : uint32_t {
     Emulsion,          // vinegar-syndrome warp, mottle, mold blooms
     TimeDisplace,      // per-pixel playback delay from luma/mask (ring)
     FlowPaint,         // anisotropic Kuwahara along the flow field
+    FmSynth,           // video-synth: luma-FM'd scanline carrier / ring mod
+    Colorizer,         // gradient map: luma -> 3-stop color ramp
+    Solarize,          // Sabattier partial inversion / luma wavefold
+    Invert,            // negative (plain / film orange-mask / luma-only)
+    Twirl,             // swirl warp: rotation falling off from center
+    Tile,              // grid repeat with mirror alternation
+    Emboss,            // directional relief convolution
+    LensFlare,         // aperture ghost train + halo from clipped lights
+    VelocityScan,      // dwell-time rendering: luma brakes sweeping lines
+    Lidar,             // point-scan sampling persisting on phosphor
+    Anaglyph,          // red/cyan stereo double image (luma depth proxy)
+    Photocopy,         // contrast collapse + toner speckle, N generations
+    Risograph,         // tone-separated ink layers, misregistered
+    WetPlate,          // collodion tintype: ortho response + chemistry
+    ReededGlass,       // fluted-glass refraction (bathroom window)
+    Watercolor,        // washes, edge pooling, pigment granulation
+    WireTerrain,       // perspective luma-heightfield wireframe
+    Ridgeline,         // stacked occluded luma waveforms (joyplot)
+    SlowScan,          // SSTV: beam crawls, replacing the held image
+    VectorTrace,       // beam strokes crawling image contours (phosphor)
+    ScopeMonitor,      // waveform / parade / vectorscope as aesthetic
+    SecurityMux,       // camera-wall grid, per-tile time offsets (ring)
+    AudioScope,        // the soundtrack's waveform traced over the frame
+    Modulate,          // luma-PM'd fine raster weave (FM engraving)
     Count,
 };
 
 // True for effects that read their own previous output (engine keeps a
 // persistent per-instance target; the one-frame-delay rule, spec §4).
 inline bool is_stateful_feedback(EffectType type) {
-    return type == EffectType::Echo || type == EffectType::Feedback;
+    return type == EffectType::Echo || type == EffectType::Feedback ||
+           type == EffectType::Lidar || type == EffectType::SlowScan ||
+           type == EffectType::VectorTrace ||
+           type == EffectType::ScopeMonitor;
 }
 
 // True for the Codec-Box effects (CPU roundtrip through the mosh codec).

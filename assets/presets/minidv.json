@@ -12,7 +12,8 @@
         "name": "starve",
         "value": 0.2,
         "targets": [
-          {"effect": 3, "param": 0, "lo": 0.0, "hi": -0.11, "curve": "exp"}
+          {"effect": 3, "param": 0, "lo": 0.0, "hi": -0.11, "curve": "exp"},
+          {"effect": 6, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"}
         ]
       },
       {
@@ -21,13 +22,22 @@
         "targets": [
           {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.05, "curve": "linear"}
         ]
+      },
+      {
+        "name": "comb",
+        "value": 0.25,
+        "targets": [
+          {"effect": 5, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"}
+        ]
       }
     ]
   },
   "effects": [
     {"type": "colorscience", "id": 1, "params": [9, 0.0, 0.1, 0.0]},
     {"type": "rgb_split", "id": 2, "params": [1.5, 0.0], "wet": 0.6},
+    {"type": "interlace", "id": 5, "params": [3.0, 0.2, 0]},
+    {"type": "mosquito", "id": 6, "params": [0.4, 3, 15]},
     {"type": "bitrate_starve", "id": 3, "params": [26, 15]},
-    {"type": "grain", "id": 4, "params": [0.12, 1.0, 0.9]}
+    {"type": "grain", "id": 4, "params": [0.12, 1.0, 0.9, 1]}
   ]
 }

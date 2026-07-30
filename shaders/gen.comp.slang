@@ -10,14 +10,16 @@ cbuffer Push
 {
     uint width;
     uint height;
-    uint kind;         // 1 solid, 2 gradient, 3 noise, 4 test pattern
-                       // (LayerSourceKind)
+    uint kind;         // 1 solid, 2 gradient, 3 noise, 4 test pattern,
+                       // 5 oscillator (LayerSourceKind)
     uint seed;
     uint frame;
     float ar, ag, ab;  // color A (sRGB)
     float br, bg, bb;  // color B (sRGB)
-    float scale;       // noise cell size in px
-    float angle;       // gradient angle, radians
+    float scale;       // noise cell size / oscillator frequency
+    float angle;       // gradient / oscillator orientation, radians
+    uint shape;        // oscillator: 0 sine bars, 1 rings, 2 plasma,
+                       // 3 lissajous XY trace
 };
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> output;
@@ -82,6 +84,71 @@ void main(uint3 tid : SV_DispatchThreadID)
                             : (seg < 4 ? 0.04 : (seg < 6 ? 0.5 : 1.0));
             rgb = fx_srgb_eotf(float3(v, v, v));
         }
+    }
+    else if (kind == 5)
+    {
+        // Oscillator (video-synth source): a periodic pattern to feed
+        // Displace / FM / ring-mod chains. `scale` = cycles across the
+        // frame, `angle` orients it; phase creeps on the frame clock so
+        // patched displacement breathes. Deterministic (frame-clocked).
+        const float t = float(frame) * 0.02;
+        const float freq = max(scale, 0.5) * 6.2831853;
+        float v;
+        if (shape == 1u)
+        {
+            // Concentric rings from center.
+            const float2 d = (uv - 0.5) *
+                             float2(float(width) / float(height), 1.0);
+            v = 0.5 + 0.5 * sin(length(d) * freq - t * 2.0);
+        }
+        else if (shape == 2u)
+        {
+            // Plasma: three drifting sine fields interfering.
+            const float2 d = uv * freq * 0.5;
+            const float p = sin(d.x + t) + sin(d.y - t * 0.7) +
+                            sin((d.x + d.y) * 0.6 + t * 1.3) +
+                            sin(length(uv - 0.5) * freq - t);
+            v = 0.5 + 0.25 * p * 0.5;
+        }
+        else if (shape == 3u)
+        {
+            // Lissajous XY trace (scope art): distance field to the
+            // curve sin(a*s), sin(b*s) with b = a + 1, phase creeping on
+            // the frame clock. `scale` picks the ratio, `angle` the
+            // phase offset.
+            const float2 asp =
+                float2(float(width) / float(height), 1.0);
+            const float2 p = (uv - 0.5) * asp;
+            const float fa = clamp(floor(scale * 0.5 + 0.5), 1.0, 6.0);
+            const float fb = fa + 1.0;
+            // Distance to the polyline through 128 curve samples (point
+            // distance alone leaves gaps between samples).
+            float md = 1e9;
+            float2 prev = 0.42 * float2(sin(t * 0.7 + angle),
+                                        sin(t * 0.3));
+            for (uint i = 1; i <= 128; ++i)
+            {
+                const float s = float(i) / 128.0 * 6.2831853;
+                const float2 q = 0.42 *
+                    float2(sin(fa * s + t * 0.7 + angle),
+                           sin(fb * s + t * 0.3));
+                const float2 ab = q - prev;
+                const float hseg = saturate(dot(p - prev, ab) /
+                                            max(dot(ab, ab), 1e-8));
+                md = min(md, length(p - (prev + ab * hseg)));
+                prev = q;
+            }
+            v = exp(-pow(md / 0.004, 2.0)) +
+                0.18 * exp(-pow(md / 0.02, 2.0));
+            v = saturate(v);
+        }
+        else
+        {
+            // Sine bars along `angle`.
+            const float2 dir = float2(cos(angle), sin(angle));
+            v = 0.5 + 0.5 * sin(dot(uv - 0.5, dir) * freq + t);
+        }
+        rgb = lerp(color_b, color_a, saturate(v));
     }
     else
     {

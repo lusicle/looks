@@ -1,0 +1,34 @@
+{
+  "looks_preset": 1,
+  "name": "tintype",
+  "tags": ["photo", "antique", "wetplate"],
+  "group": {
+    "id": 100,
+    "name": "tintype",
+    "folded": true,
+    "bypass": false,
+    "macros": [
+      {
+        "name": "chemistry",
+        "value": 0.4,
+        "targets": [
+          {"effect": 1, "param": 2, "lo": 0.0, "hi": 0.8, "curve": "linear"},
+          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.5, "curve": "linear"}
+        ]
+      },
+      {
+        "name": "age",
+        "value": 0.35,
+        "targets": [
+          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.8, "curve": "linear"},
+          {"effect": 2, "param": 1, "lo": 0.0, "hi": 0.6, "curve": "exp"}
+        ]
+      }
+    ]
+  },
+  "effects": [
+    {"type": "corner_soft", "id": 3, "params": [0.5, 0.35, 0.4]},
+    {"type": "dust_scratches", "id": 2, "params": [0.3, 0.2, 1.2, 0.2, 0.2, 0]},
+    {"type": "wet_plate", "id": 1, "params": [0.85, 0.3, 0.4, 0.25, 0.6]}
+  ]
+}

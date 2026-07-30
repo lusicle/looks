@@ -15,6 +15,7 @@ add_executable(looks_tests
     test_image.cpp
     test_serialize.cpp
     test_cache.cpp
+    test_refdump.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/render_cache.cpp)
 target_include_directories(looks_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
