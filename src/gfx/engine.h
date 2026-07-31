@@ -15,6 +15,7 @@
 #include "gfx/compute.h"
 #include "gfx/render_cache.h"
 #include "gfx/texture.h"
+#include "ui/truetype.h"   // runtime TTF loader for the Text effect
 
 namespace looks::gfx {
 
@@ -76,6 +77,9 @@ public:
     // the converted linear-RGB source frame (kept alive alongside the
     // final target, SHADER_READ_ONLY) — or nullptr when unavailable (cache
     // hit). Callers comparing A/B should pass cache_ctx 0.
+    // preview_node (v5.4): publish the named node's output instead of
+    // the composite (selection-follows preview). Callers hashing the
+    // render-cache context must include it; export passes 0.
     GpuImage* render(VkCommandBuffer cmd, uint32_t frame_index,
                      const SourcePlanes& source, const doc::Document& doc,
                      uint32_t timeline_frame, double fps,
@@ -85,7 +89,8 @@ public:
                      uint64_t cache_ctx = 0,
                      GpuImage** out_source = nullptr,
                      const LayerSourceFrame* layer_sources = nullptr,
-                     size_t layer_source_count = 0);
+                     size_t layer_source_count = 0,
+                     uint64_t preview_node = 0);
 
     RenderCache& cache() { return cache_; }
 
@@ -119,6 +124,17 @@ public:
         preview_divisor_ = d < 1 ? 1 : (d > 4 ? 4 : d);
     }
     uint32_t preview_divisor() const { return preview_divisor_; }
+
+    // Node-canvas thumbnails (docs/flow_canvas.md): a fixed 8x8 grid of
+    // 160x90 cells, RGBA8 sRGB-encoded, tapped after each layer-chain
+    // effect plus the final composite (cell key 0). The cell map reflects
+    // the last EVALUATED graph — stale-but-valid across render-cache hits.
+    static constexpr uint32_t kThumbCellW = 160, kThumbCellH = 90;
+    static constexpr uint32_t kThumbGridCols = 8, kThumbGridRows = 8;
+    GpuImage* thumb_atlas() { return thumb_atlas_.get(); }
+    const std::unordered_map<uint64_t, uint32_t>& thumb_cells() const {
+        return thumb_cells_;
+    }
 
 private:
     explicit Engine(Device& device)
@@ -207,6 +223,27 @@ private:
     // when present, else a procedural grunge fallback — always non-null.
     std::unique_ptr<GpuImage> dust_tex_;
 
+    // Text overlay (docs/flow_canvas.md v5.5b): runtime TTFs from
+    // assets/fonts/*.ttf, sorted by filename — the `font` param indexes
+    // the list, no bake step. Per-instance string SDFs (truetype.h) are
+    // cached per SIZE BUCKET, so a keyframed/modulated size walks a
+    // bounded raster set (the kernel scales between buckets — SDFs
+    // magnify cleanly) instead of re-rasterizing every frame. A text or
+    // font change drops the whole slot.
+    std::vector<ui::TtfFont> fx_fonts_;
+    static constexpr float kTextBuckets[6] = {12.0f, 24.0f, 48.0f,
+                                              96.0f, 192.0f, 400.0f};
+    struct TextRaster {
+        std::unique_ptr<GpuImage> tex;
+        uint32_t w = 0, h = 0;
+        float spread = 0.0f;
+    };
+    struct TextSlot {
+        uint64_t hash = 0;   // (text, font) content hash
+        TextRaster buckets[6];
+    };
+    std::unordered_map<uint64_t, TextSlot> text_state_;
+
     // Blue-noise / STBN dither LUT (build-time asset; procedural fallback).
     std::unique_ptr<GpuImage> noise_lut_;
 
@@ -285,6 +322,15 @@ private:
     // scratch serves any number of instances (graph eval is sequential).
     std::unique_ptr<GpuImage> mod_integral_;
     std::unique_ptr<ComputePipeline> mod_integrate_;
+
+    // Node-canvas thumbnail atlas (see public accessors). Allocated once,
+    // fixed size — no per-frame Vulkan object churn.
+    std::unique_ptr<GpuImage> thumb_atlas_;
+    std::unique_ptr<ComputePipeline> thumb_tap_;
+    std::unordered_map<uint64_t, uint32_t> thumb_cells_;
+    uint32_t thumb_next_cell_ = 0;
+    void record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
+                          GpuImage* src, uint64_t key);
 
     // Audio Scope (spec §7 sidechain family): per-instance 1-D min/max
     // waveform strip re-uploaded each render from the mono PCM copy.

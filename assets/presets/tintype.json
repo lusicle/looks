@@ -1,34 +1,88 @@
 {
   "looks_preset": 1,
   "name": "tintype",
-  "tags": ["photo", "antique", "wetplate"],
+  "tags": [
+    "photo",
+    "antique",
+    "wetplate"
+  ],
   "group": {
     "id": 100,
     "name": "tintype",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "chemistry",
-        "value": 0.4,
-        "targets": [
-          {"effect": 1, "param": 2, "lo": 0.0, "hi": 0.8, "curve": "linear"},
-          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.5, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 2
       },
       {
-        "name": "age",
-        "value": 0.35,
-        "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.8, "curve": "linear"},
-          {"effect": 2, "param": 1, "lo": 0.0, "hi": 0.6, "curve": "exp"}
-        ]
+        "effect": 1,
+        "param": 3
+      },
+      {
+        "effect": 2,
+        "param": 0
+      },
+      {
+        "effect": 2,
+        "param": 1
       }
     ]
   },
   "effects": [
-    {"type": "corner_soft", "id": 3, "params": [0.5, 0.35, 0.4]},
-    {"type": "dust_scratches", "id": 2, "params": [0.3, 0.2, 1.2, 0.2, 0.2, 0]},
-    {"type": "wet_plate", "id": 1, "params": [0.85, 0.3, 0.4, 0.25, 0.6]}
+    {
+      "type": "corner_soft",
+      "id": 3,
+      "params": [
+        0.5,
+        0.34999999403953552,
+        0.40000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "dust_scratches",
+      "id": 2,
+      "params": [
+        0.58000004291534424,
+        0.273499995470047,
+        1.2000000476837158,
+        0.20000000298023224,
+        0.20000000298023224,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "wet_plate",
+      "id": 1,
+      "params": [
+        0.85000002384185791,
+        0.30000001192092896,
+        0.72000002861022949,
+        0.44999998807907104,
+        0.60000002384185791
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

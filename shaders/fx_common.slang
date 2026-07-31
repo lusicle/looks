@@ -61,6 +61,95 @@ float3 fx_srgb_eotf(float3 encoded)
     return lerp(hi, lo, step(encoded, 0.04045));
 }
 
+// ---- Ordered-dither pattern helpers (spec §6.2): shared by the
+// Quantizer's dither leg and the standalone Dither node. The packed LUT
+// is 512x192 R8: rows 0..63 hold the STBN 64x64x8 atlas (slice s at
+// x = s*64), rows 64..191 the 128x128 blue noise (tools/bluenoise).
+
+static const float kFxBayer2[4] = {0.0, 2.0, 3.0, 1.0};
+static const float kFxBayer4[16] = {
+    0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
+    3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0};
+
+float fx_bayer8(uint2 p)
+{
+    // 8x8 from the recursive construction over the 4x4.
+    const uint2 q = p & 7;
+    const float base = kFxBayer4[(q.y & 3) * 4 + (q.x & 3)];
+    const float quad = float(((q.y >> 2) & 1) * 2 + ((q.x >> 2) & 1));
+    return (base * 4.0 + kFxBayer2[uint(quad)]) / 64.0;
+}
+
+float fx_lut_texel(Sampler2D lut, uint x, uint y)
+{
+    const float2 uv = (float2(float(x), float(y)) + 0.5) /
+                      float2(512.0, 192.0);
+    return lut.SampleLevel(uv, 0).r;
+}
+
+float fx_blue_noise(Sampler2D lut, uint2 p)
+{
+    return fx_lut_texel(lut, p.x & 127u, 64u + (p.y & 127u));
+}
+
+float fx_stbn(Sampler2D lut, uint2 p, uint slice)
+{
+    return fx_lut_texel(lut, (slice & 7u) * 64u + (p.x & 63u), p.y & 63u);
+}
+
+float3 fx_nearest_of4(float3 c, float3 p0, float3 p1, float3 p2, float3 p3)
+{
+    float3 best = p0;
+    float best_d = dot(c - p0, c - p0);
+    float d = dot(c - p1, c - p1);
+    if (d < best_d) { best_d = d; best = p1; }
+    d = dot(c - p2, c - p2);
+    if (d < best_d) { best_d = d; best = p2; }
+    d = dot(c - p3, c - p3);
+    if (d < best_d) { best_d = d; best = p3; }
+    return best;
+}
+
+// NES: a representative 12-entry cut of the 2C02 palette.
+float3 fx_nes_nearest(float3 c)
+{
+    const float3 nes[12] = {
+        float3(0.0, 0.0, 0.0),       float3(0.33, 0.33, 0.33),
+        float3(0.74, 0.74, 0.74),    float3(1.0, 1.0, 1.0),
+        float3(0.0, 0.47, 0.97),     float3(0.15, 0.15, 0.65),
+        float3(0.9, 0.2, 0.16),      float3(0.65, 0.06, 0.0),
+        float3(0.0, 0.66, 0.14),     float3(0.98, 0.7, 0.0),
+        float3(0.96, 0.46, 0.7),     float3(0.35, 0.2, 0.7),
+    };
+    float3 best = nes[0];
+    float best_d = 1.0e9;
+    for (int i = 0; i < 12; ++i) {
+        const float d = dot(c - nes[i], c - nes[i]);
+        if (d < best_d) { best_d = d; best = nes[i]; }
+    }
+    return best;
+}
+
+// Linear-light level pick (v5.6a): choose between the two encoded
+// levels bracketing `lin` with probability from the LINEAR interpolant,
+// so the displayed (linear) average of a dithered field reproduces the
+// input. Dithering in code values alone preserves the encoded mean, and
+// the display's convex EOTF then lifts every dithered region (Jensen) —
+// a 5% linear sky encodes near 0.25 and renders 25% white. t01 is the
+// ordered threshold in [0, 1]; returns the level index.
+float3 fx_dither_levels(float3 lin, float n, float t01)
+{
+    lin = saturate(lin);
+    const float3 enc = fx_srgb_oetf(lin);
+    const float3 lo = clamp(floor(enc * (n - 1.0)), 0.0, n - 2.0);
+    const float3 lin_lo = fx_srgb_eotf(lo / (n - 1.0));
+    const float3 lin_hi = fx_srgb_eotf((lo + 1.0) / (n - 1.0));
+    const float3 p =
+        (lin - lin_lo) / max(lin_hi - lin_lo, 1.0e-6);
+    // Strict compare: p = 0 (a pixel ON a level) must never pick up.
+    return lo + step(t01 + 1.0e-6, p);
+}
+
 // Smooth value noise over one dimension (deterministic wander).
 float fx_value_noise1(uint seed, float t)
 {

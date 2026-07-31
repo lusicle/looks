@@ -42,6 +42,7 @@ UiRenderer::~UiRenderer() {
     VkDevice dev = device_.device();
     device_.wait_idle();
     for (auto& tex : textures_) {
+        if (tex->external) continue;   // view/image owned by the engine
         if (tex->view) vkDestroyImageView(dev, tex->view, nullptr);
         if (tex->image) vmaDestroyImage(device_.allocator(), tex->image, tex->allocation);
     }
@@ -537,6 +538,40 @@ const UiTexture* UiRenderer::register_image(const uint8_t* rgba,
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write.pImageInfo = &image_binding;
     vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+
+    textures_.push_back(std::move(tex));
+    return textures_.back().get();
+}
+
+const UiTexture* UiRenderer::register_external(VkImageView view,
+                                               uint32_t width,
+                                               uint32_t height) {
+    if (!view || width == 0 || height == 0) return nullptr;
+    auto tex = std::make_unique<UiTexture>();
+    tex->view = view;
+    tex->width = width;
+    tex->height = height;
+    tex->rgba_image = true;
+    tex->external = true;
+
+    VkDescriptorSetAllocateInfo set_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    set_info.descriptorPool = descriptor_pool_;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &texture_set_layout_;
+    gfx::vk_check(
+        vkAllocateDescriptorSets(device_.device(), &set_info, &tex->set),
+        "vkAllocateDescriptorSets(external image)");
+    VkDescriptorImageInfo image_binding{
+        linear_sampler_, tex->view,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = tex->set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_binding;
+    vkUpdateDescriptorSets(device_.device(), 1, &write, 0, nullptr);
 
     textures_.push_back(std::move(tex));
     return textures_.back().get();

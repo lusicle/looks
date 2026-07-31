@@ -1,34 +1,101 @@
 {
   "looks_preset": 1,
   "name": "sstv rx",
-  "tags": ["radio", "scan", "lofi"],
+  "tags": [
+    "radio",
+    "scan",
+    "lofi"
+  ],
   "group": {
     "id": 100,
     "name": "sstv rx",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "signal",
-        "value": 0.35,
-        "targets": [
-          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.8, "curve": "linear"},
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.6, "curve": "exp"}
-        ]
+        "effect": 1,
+        "param": 3
       },
       {
-        "name": "speed",
-        "value": 0.3,
-        "targets": [
-          {"effect": 1, "param": 0, "lo": 0.0, "hi": -0.25, "curve": "linear"}
-        ]
+        "effect": 2,
+        "param": 0
+      },
+      {
+        "effect": 1,
+        "param": 0
       }
     ]
   },
   "effects": [
-    {"type": "colorscience", "id": 3, "params": [9, 0.0, 0.1, 0.1]},
-    {"type": "slow_scan", "id": 1, "params": [6, 0, 0.65, 0.45, 0.25]},
-    {"type": "analog_snow", "id": 2, "params": [0.15, 16, 0.15], "wet": 0.8},
-    {"type": "crt_sim", "id": 4, "params": [0.2, 0.35, 0.25, 3, 0], "wet": 0.6}
+    {
+      "type": "colorscience",
+      "id": 3,
+      "params": [
+        9,
+        0,
+        0.10000000149011612,
+        0.10000000149011612,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "slow_scan",
+      "id": 1,
+      "params": [
+        4.5374999046325684,
+        0,
+        0.64999997615814209,
+        0.73000001907348633,
+        0.25
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "analog_snow",
+      "id": 2,
+      "params": [
+        0.22350001335144043,
+        16,
+        0.15000000596046448
+      ],
+      "wet": 0.80000001192092896,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "crt_sim",
+      "id": 4,
+      "params": [
+        0.20000000298023224,
+        0.34999999403953552,
+        0.25,
+        3,
+        0
+      ],
+      "wet": 0.60000002384185791,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

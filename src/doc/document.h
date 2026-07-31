@@ -15,8 +15,7 @@
 
 namespace looks::doc {
 
-// Layer source (spec §5): the clip, a generator, or an adjustment layer
-// whose stack applies to the composite below it.
+// Layer source (spec §5): the clip or a generator.
 enum class LayerSourceKind : uint32_t {
     Clip = 0,
     Solid,
@@ -24,40 +23,47 @@ enum class LayerSourceKind : uint32_t {
     Noise,
     TestPattern,   // 75% color bars + grayscale ramp (spec §5)
     Oscillator,    // video-synth periodic source: bars / rings / plasma
+    // LEGACY, load-compat only (docs/flow_canvas.md v4): the flat graph
+    // made "adjustment" meaningless — a clip tap merged back through a
+    // Blend IS an adjustment. Not creatable anywhere; behaves as Clip.
     Adjustment,
+    // The SHAPE NODE (docs/flow_canvas.md v5.2): a centered SDF matte
+    // (circle/box/diamond via osc_shape) drawn white-on-black — an
+    // ordinary image source meant to run through effects and feed mask
+    // anchors. gen_scale = size, gen_angle = feather.
+    Shape,
     Count,
 };
 
-// Groups (spec §5): a Group collapses a sub-stack and exposes macro knobs;
+// Groups (spec §5, v5.3): a Group collapses a sub-stack into one card;
 // a saved group IS an "era preset". Membership is a tag on the effect
-// (EffectInstance::group_id) — groups don't change render order, only UI
-// folding, shared bypass, and macro routing.
-//
-// A macro knob drives N targets: as the knob sweeps 0→1, each target param
-// gets base + lerp(lo, hi, curve(value)) · param_span added on top — the
-// same normalized-span semantics as a ModRoute amount, so lo=0 makes the
-// knob neutral at rest. Targets live inside the group (not the global mod
-// matrix) so a preset file is fully self-contained.
-struct MacroTarget {
-    uint64_t effect_id = 0;
-    int param_index = 0;       // negatives = wet/opacity built-ins
-    float lo = 0.0f;
-    float hi = 0.5f;
-    ResponseCurve curve = ResponseCurve::Linear;
-};
-
-struct MacroKnob {
-    std::string name;
-    float value = 0.0f;        // 0..1
-    std::vector<MacroTarget> targets;
-};
-
+// (EffectInstance::group_id) — groups don't change render order, only
+// the card view, shared bypass, and the exposed face.
 struct Group {
     uint64_t id = 0;
     std::string name;
     bool folded = false;
     bool bypass = false;
-    std::vector<MacroKnob> macros;
+    // The group FACE (texed expose): member params surfaced on the
+    // collapsed card as DIRECT aliases — same value, same command path,
+    // no hidden offsets. Motion comes from value nodes wired inside.
+    std::vector<ParamKey> exposed;
+    // Boundary BINDINGS (v5.3): which member receives the card's In and
+    // which feeds its Out. Persistent INTERMEDIARIES — the scoped view's
+    // In/Out nodes wire to these regardless of whether anything is
+    // connected outside; external link edits route through them and
+    // never rewrite the internal picture. 0 = first/last member.
+    uint64_t face_in = 0;
+    uint64_t face_out = 0;
+    // Node-canvas position of the FOLDED group's card (docs/flow_canvas.md
+    // v4 subgraphs); (0,0) = unplaced.
+    float node_x = 0.0f;
+    float node_y = 0.0f;
+    // Scoped-view positions of the In/Out boundary nodes (v5.4: they
+    // hold their own place — member drags never tow them). (0,0) =
+    // unplaced (derived from the member extent once, then materialized).
+    float in_x = 0.0f, in_y = 0.0f;
+    float out_x = 0.0f, out_y = 0.0f;
 };
 
 struct Layer {
@@ -93,6 +99,10 @@ struct Layer {
     // frame past the segment (never blanks a looping preview).
     uint32_t trim_in = 0;
     uint32_t trim_out = 0;
+    // Node-canvas position of the layer's SOURCE node (docs/
+    // flow_canvas.md); (0,0) = unplaced.
+    float node_x = 0.0f;
+    float node_y = 0.0f;
     std::vector<EffectInstance> stack;
     std::vector<Group> groups;
 };
@@ -108,7 +118,10 @@ inline bool layer_has_trim(const Layer& l) {
            (l.trim_in > 0 || l.trim_out > 0);
 }
 
-inline constexpr size_t kMaxLayers = 3;   // spec §5: start with 3 max
+// TRUE GRAPH (docs/flow_canvas.md v3): layers are storage bags + source
+// nodes, not a composite hierarchy — branches merge through Blend nodes.
+// The old 3-layer cap is gone; this bounds runaway documents only.
+inline constexpr size_t kMaxLayers = 16;
 inline constexpr float kMaxSpeed = 4.0f;  // time-remap speed range 0..4
 
 struct Document {
@@ -186,6 +199,61 @@ struct Document {
     // Masks (spec §8): first-class named objects referenced by effects.
     std::vector<Mask> masks;
     uint64_t next_mask_id = 1;
+
+    // Node-canvas position of the Output node (docs/flow_canvas.md);
+    // (0,0) = unplaced.
+    float out_node_x = 0.0f;
+    float out_node_y = 0.0f;
+
+    // TRUE GRAPH (docs/flow_canvas.md v3): first-class links between node
+    // outputs and named input ports. Node ids: effect / layer / mask ids
+    // (one counter space per kind, disambiguated by the consumer); 0 as
+    // `to` = the Output node. to_port 0 = In, 1 = Mask, 2+ = per-effect
+    // aux inputs (Warp/Displace/B...). While `links` is empty the loader
+    // and engine synthesize links from the legacy per-layer stack order —
+    // every old project and preset opens unchanged.
+    struct NodeLink {
+        uint64_t from = 0;
+        uint64_t to = 0;
+        uint32_t to_port = 0;
+    };
+    std::vector<NodeLink> links;
+
+    // Canvas frames (docs/flow_canvas.md v3): titled visual grouping
+    // boxes, texed-style. Pure annotation — nothing reads them but the
+    // canvas. Ids come from next_effect_id.
+    struct Frame {
+        uint64_t id = 0;
+        float x = 0.0f, y = 0.0f;
+        float w = 480.0f, h = 360.0f;
+        std::string title;
+        // Colour tag (texed frame colour): 0 = none, 1..8 = palette hue.
+        uint32_t color = 0;
+    };
+    std::vector<Frame> frames;
 };
+
+// The legacy-chain topology as links: source → effects in stack order →
+// Output per layer. Mask wiring is NOT in the table — fx.mask_id /
+// layer.mask_id stay the single source of truth (the canvas draws those
+// wires from the fields, the compiler reads them directly).
+inline std::vector<Document::NodeLink> synthesize_links(const Document& d) {
+    std::vector<Document::NodeLink> links;
+    for (const Layer& layer : d.layers) {
+        uint64_t prev = layer.id;
+        for (const EffectInstance& fx : layer.stack) {
+            links.push_back({prev, fx.id, 0});
+            prev = fx.id;
+        }
+        links.push_back({prev, 0, 0});
+    }
+    return links;
+}
+
+// Materializes the synthesized links onto a legacy document (first link
+// edit, canvas display). Idempotent when links already exist.
+inline void ensure_links(Document& d) {
+    if (d.links.empty()) d.links = synthesize_links(d);
+}
 
 }  // namespace looks::doc

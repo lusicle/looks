@@ -148,10 +148,14 @@ TEST(graph_mask_overlay_output) {
     doc::Document d = make_doc();
     doc::Mask mask = make_mask(d, doc::MaskType::Shape);
     d.masks.push_back(mask);
-    // Not referenced by any effect — overlay still builds and shows it.
+    // Not referenced by any effect — the overlay still builds and shows
+    // it, as the VIEWPORT TAP (v5.4): the output stays the composite.
     RenderGraph g = gfx::compile_graph(d, mask.id);
     CHECK(g.valid);
-    CHECK(g.nodes[static_cast<size_t>(g.output)].kind ==
+    CHECK(g.preview >= 0);
+    CHECK(g.nodes[static_cast<size_t>(g.preview)].kind ==
+          GraphNode::Kind::MaskShape);
+    CHECK(g.nodes[static_cast<size_t>(g.output)].kind !=
           GraphNode::Kind::MaskShape);
 }
 

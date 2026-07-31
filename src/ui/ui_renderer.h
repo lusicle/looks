@@ -35,6 +35,9 @@ struct UiTexture {
     bool msdf = false;
     // Plain RGBA image (thumbnail strips): sampled and tinted as-is.
     bool rgba_image = false;
+    // Wraps an externally-owned view (engine thumbnail atlas): the
+    // renderer allocated only the descriptor set, never the image/view.
+    bool external = false;
     float unit_range[2] = {0.0f, 0.0f};   // px_range / atlas size
 };
 
@@ -59,6 +62,12 @@ public:
     // is no unregister (textures die with the renderer).
     const UiTexture* register_image(const uint8_t* rgba, uint32_t width,
                                     uint32_t height);
+
+    // Wraps an externally-owned SHADER_READ_ONLY view (the engine's node
+    // thumbnail atlas) so Canvas2D can draw it: allocates a descriptor set
+    // only. The caller keeps the view alive for the renderer's lifetime.
+    const UiTexture* register_external(VkImageView view, uint32_t width,
+                                       uint32_t height);
 
     // Records the canvas into `cmd` (must be inside a rendering pass whose
     // color attachment matches color_format). frame_index selects the

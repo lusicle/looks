@@ -11,7 +11,7 @@ cbuffer Push
     uint width;
     uint height;
     uint kind;         // 1 solid, 2 gradient, 3 noise, 4 test pattern,
-                       // 5 oscillator (LayerSourceKind)
+                       // 5 oscillator, 7 shape (LayerSourceKind)
     uint seed;
     uint frame;
     float ar, ag, ab;  // color A (sRGB)
@@ -149,6 +149,27 @@ void main(uint3 tid : SV_DispatchThreadID)
             v = 0.5 + 0.5 * sin(dot(uv - 0.5, dir) * freq + t);
         }
         rgb = lerp(color_b, color_a, saturate(v));
+    }
+    else if (kind == 7)
+    {
+        // Shape node (docs/flow_canvas.md v5.2): a centered SDF matte —
+        // circle / box / diamond via `shape` — drawn color_a on color_b
+        // (white-on-black by default). `scale` sizes it, `angle` is the
+        // feather width; position/aspect/rotation come from the layer
+        // transform, richer edges from the effect chain it feeds.
+        const float2 p = (uv - 0.5) *
+                         float2(float(width) / float(height), 1.0);
+        const float r = clamp(scale * 0.05, 0.02, 1.5);
+        float d;
+        if (shape == 1u)
+            d = max(abs(p.x), abs(p.y)) - r;          // box
+        else if (shape == 2u)
+            d = (abs(p.x) + abs(p.y)) * 0.7071 - r;   // diamond
+        else
+            d = length(p) - r;                        // circle
+        const float feather = max(abs(angle) * 0.25, 0.002);
+        const float v = saturate(0.5 - d / feather);
+        rgb = lerp(color_b, color_a, v * v * (3.0 - 2.0 * v));
     }
     else
     {

@@ -14,7 +14,9 @@ bool param_randomizable(const ParamDesc& desc) {
         if (std::strstr(desc.id, f)) return false;
     // Exact-match selectors (substring would catch "gop" via "op"):
     // discrete identity knobs on the newer effects.
-    static const char* const kFrozenExact[] = {"op", "channels", "counter"};
+    static const char* const kFrozenExact[] = {
+        "op",     "channels", "counter", "pattern", "flip",
+        "r_from", "g_from",   "b_from",  "font"};
     for (const char* f : kFrozenExact)
         if (std::strcmp(desc.id, f) == 0) return false;
     return true;

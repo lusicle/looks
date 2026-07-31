@@ -53,6 +53,8 @@ enum class ModSourceType : uint32_t {
     Envelope,          // attack-decay burst fired by triggers (see below)
     VideoCut,          // scene-cut trigger curve
     Beat,              // deterministic pulse train from the BPM estimate
+    VideoSample,       // color/luma at a point of the current source frame
+    VideoRegion,       // mean color/luma over a rect of the source frame
     Count,
 };
 
@@ -72,6 +74,13 @@ struct ModSource {
     float attack = 0.02f;     // seconds to peak
     float decay = 0.4f;       // exponential decay constant, seconds
     uint32_t trigger = 0;     // 0 onset, 1 scene cut, 2 beat, 3 keypress
+    // Video sampling (docs/flow_canvas.md v4): point / centered region on
+    // the CURRENT decoded source frame, uv 0..1. VideoSample ignores the
+    // extent (it averages a small fixed box so 8-bit code-value steps
+    // don't pop). channel: 0 luma, 1 R, 2 G, 3 B.
+    float px = 0.5f, py = 0.5f;
+    float pw = 0.25f, ph = 0.25f;
+    uint32_t channel = 0;
 };
 
 struct ModRoute {
@@ -80,6 +89,9 @@ struct ModRoute {
     ParamKey target;
     float amount = 0.0f;      // in normalized param range (-1..1 of span)
     ResponseCurve curve = ResponseCurve::Linear;
+    // Node-canvas position (docs/flow_canvas.md); (0,0) = unplaced.
+    float node_x = 0.0f;
+    float node_y = 0.0f;
 };
 
 // Cubic bezier key. Handles are (dframe, dvalue) offsets from the key —
@@ -100,6 +112,9 @@ struct KeyframeLane {
     // evaluation wraps through the key span instead of holding the last
     // value — draw a cycle once, it repeats forever.
     bool loop = false;
+    // Muted lanes keep their keys but stop driving the param (the
+    // timeline's disable toggle).
+    bool muted = false;
 };
 
 // Full parameter snapshot (spec §7): stack param values keyed by effect id.

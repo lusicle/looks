@@ -22,6 +22,10 @@ std::unique_ptr<Command> set_param_command(size_t layer_index,
                                            int param_index, float new_value);
 std::unique_ptr<Command> set_bypass_command(size_t layer_index,
                                             size_t effect_index, bool bypass);
+// The Text effect's string (v5.5) — the one non-float param.
+std::unique_ptr<Command> set_effect_text_command(size_t layer_index,
+                                                 size_t effect_index,
+                                                 std::string text);
 // Solo (spec §5): any soloed effect mutes the rest of its stack.
 std::unique_ptr<Command> set_solo_command(size_t layer_index,
                                           size_t effect_index, bool solo);
@@ -35,5 +39,41 @@ std::unique_ptr<Command> remove_effect_command(size_t layer_index,
 std::unique_ptr<Command> move_effect_command(size_t layer_index,
                                              size_t from_index,
                                              size_t to_index);
+
+// Node-canvas placement (docs/flow_canvas.md): one command moves any node
+// kind, addressed by document id. Consecutive moves of the same node
+// coalesce so a whole drag is one undo step. Positions are pure UI state
+// on the document — the renderer never reads them.
+enum class NodeRef : uint32_t {
+    Effect, Layer, Mask, Route, Output, Frame, Group,
+    GroupIn, GroupOut,   // a group's boundary nodes (id = the group)
+};
+std::unique_ptr<Command> set_node_pos_command(NodeRef kind, uint64_t id,
+                                              float x, float y);
+
+// TRUE GRAPH link edits (docs/flow_canvas.md v3). Both materialize the
+// synthesized legacy links on first edit, so the table becomes the single
+// topology truth from then on. connect replaces any existing link at
+// (to, port) — except the Output node (to 0), which accepts any number of
+// composite inputs. Callers validate with link_would_cycle FIRST; the
+// commands themselves apply unconditionally.
+std::unique_ptr<Command> connect_command(Document::NodeLink link);
+std::unique_ptr<Command> disconnect_command(Document::NodeLink link);
+
+// True when adding from→to would close a cycle: to already reaches from
+// through the (effective) link table. The texed reachability guard.
+bool link_would_cycle(const Document& doc, uint64_t from, uint64_t to);
+
+// Canvas frames (docs/flow_canvas.md v3): titled grouping boxes.
+std::unique_ptr<Command> add_frame_command(Document::Frame frame);
+std::unique_ptr<Command> remove_frame_command(uint64_t frame_id);
+// Resize coalesces per frame id (corner drag = one undo step).
+std::unique_ptr<Command> set_frame_bounds_command(uint64_t frame_id, float w,
+                                                  float h);
+std::unique_ptr<Command> set_frame_title_command(uint64_t frame_id,
+                                                 std::string title);
+// Colour tag cycle (0 = none, 1..8 = palette hue).
+std::unique_ptr<Command> set_frame_color_command(uint64_t frame_id,
+                                                 uint32_t color);
 
 }  // namespace looks::doc

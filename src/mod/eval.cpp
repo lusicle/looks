@@ -104,6 +104,65 @@ float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
     return 0.0f;
 }
 
+// Video sampling (docs/flow_canvas.md v4). Averages the channel over a
+// decimated tap grid: the point variant uses a small fixed box and the
+// region variant caps its grid, so cost stays bounded and single 8-bit
+// code-value steps get band-averaged instead of popping when a large
+// amount scales them (the CLAUDE.md luma rule).
+float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
+    if (!video || !video->y || video->width <= 0 || video->height <= 0)
+        return 0.0f;
+    const float w = static_cast<float>(video->width);
+    const float h = static_cast<float>(video->height);
+    float half_w, half_h;
+    if (s.type == doc::ModSourceType::VideoSample) {
+        half_w = half_h = 3.0f;   // pixels: 7x7 box around the point
+    } else {
+        half_w = std::max(s.pw, 0.01f) * w * 0.5f;
+        half_h = std::max(s.ph, 0.01f) * h * 0.5f;
+    }
+    const float cx = std::clamp(s.px, 0.0f, 1.0f) * (w - 1.0f);
+    const float cy = std::clamp(s.py, 0.0f, 1.0f) * (h - 1.0f);
+    const int x0 = std::clamp(static_cast<int>(cx - half_w), 0,
+                              video->width - 1);
+    const int x1 = std::clamp(static_cast<int>(cx + half_w), 0,
+                              video->width - 1);
+    const int y0 = std::clamp(static_cast<int>(cy - half_h), 0,
+                              video->height - 1);
+    const int y1 = std::clamp(static_cast<int>(cy + half_h), 0,
+                              video->height - 1);
+    const int nx = std::min(x1 - x0 + 1, 48);
+    const int ny = std::min(y1 - y0 + 1, 48);
+    const bool luma = s.channel == 0 || !video->u || !video->v;
+    float sum = 0.0f;
+    for (int j = 0; j < ny; ++j) {
+        const int py = y0 + ((y1 - y0) * j) / std::max(ny - 1, 1);
+        const uint8_t* yrow = video->y + py * video->y_stride;
+        for (int i = 0; i < nx; ++i) {
+            const int px = x0 + ((x1 - x0) * i) / std::max(nx - 1, 1);
+            const float Y = static_cast<float>(yrow[px]);
+            if (luma) {
+                sum += Y;
+                continue;
+            }
+            // I420 chroma at half resolution; BT.601 — close enough for a
+            // control value, and identical preview vs export.
+            const float U = static_cast<float>(
+                video->u[(py >> 1) * video->u_stride + (px >> 1)]) - 128.0f;
+            const float V = static_cast<float>(
+                video->v[(py >> 1) * video->v_stride + (px >> 1)]) - 128.0f;
+            switch (s.channel) {
+                case 1: sum += Y + 1.402f * V; break;
+                case 2: sum += Y - 0.344f * U - 0.714f * V; break;
+                default: sum += Y + 1.772f * U; break;
+            }
+        }
+    }
+    const float mean = sum / (static_cast<float>(nx) *
+                              static_cast<float>(ny) * 255.0f);
+    return std::clamp(mean, 0.0f, 1.0f);
+}
+
 float eval_drift(const doc::ModSource& s, double t) {
     // Value noise: smooth interpolation across a seeded lattice.
     const double pt = static_cast<double>(s.rate_hz) * t +
@@ -162,7 +221,8 @@ float eval_bezier(const doc::Keyframe& k0, const doc::Keyframe& k1,
 
 float eval_source(const doc::ModSource& source, double t_seconds,
                   uint32_t frame_index, const AnalysisCurves* analysis,
-                  double fps, double audio_offset_seconds, double key_time) {
+                  double fps, double audio_offset_seconds, double key_time,
+                  const SourceFrameView* video) {
     // Audio nudge (spec §7): audio-derived sources read a shifted clock so
     // a positive offset delays audio-driven wiggles against video.
     const double ta = t_seconds - audio_offset_seconds;
@@ -204,6 +264,9 @@ float eval_source(const doc::ModSource& source, double t_seconds,
         case doc::ModSourceType::VideoBrightness:
             return analysis ? analysis->sample(analysis->brightness, frame_index)
                             : 0.0f;
+        case doc::ModSourceType::VideoSample:
+        case doc::ModSourceType::VideoRegion:
+            return eval_video(source, video);
         default:
             return 0.0f;
     }
@@ -244,7 +307,8 @@ float eval_lane(const doc::KeyframeLane& lane, double frame) {
 
 doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
-                      double live_seconds, double key_time) {
+                      double live_seconds, double key_time,
+                      const SourceFrameView* video) {
     doc::Document out = doc;
     const double t = live_seconds >= 0.0
                          ? live_seconds
@@ -272,7 +336,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
             const float value =
                 apply_curve(route.curve,
                             eval_source(route.source, t, frame_index,
-                                        analysis, fps, audio_off, key_time));
+                                        analysis, fps, audio_off, key_time,
+                                        video));
             pos += route.amount * value;
         }
         pos = std::clamp(pos, 0.0f, 1.0f);
@@ -316,9 +381,9 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         return nullptr;
     };
 
-    // Keyframe lanes set the base.
+    // Keyframe lanes set the base (muted lanes keep keys, drive nothing).
     for (const doc::KeyframeLane& lane : doc.lanes) {
-        if (lane.keys.empty()) continue;
+        if (lane.keys.empty() || lane.muted) continue;
         float min_v = 0.0f, max_v = 1.0f;
         if (float* mslot = mask_slot(lane.target, &min_v, &max_v)) {
             *mslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
@@ -333,30 +398,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         *slot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
     }
 
-    // Macro knobs add on top of the base (spec §7: 1→N targets, per-target
-    // range + curve). Same normalized-span semantics as a route: the target
-    // gets lerp(lo, hi, curve(value)) · span, so lo=0 is neutral at rest.
-    for (const doc::Layer& layer : doc.layers) {
-        for (const doc::Group& group : layer.groups) {
-            for (const doc::MacroKnob& knob : group.macros) {
-                for (const doc::MacroTarget& mt : knob.targets) {
-                    size_t l = 0, index = 0;
-                    if (!find_effect(out, mt.effect_id, &l, &index)) continue;
-                    doc::EffectInstance& fx = out.layers[l].stack[index];
-                    float* slot = param_slot(fx, mt.param_index);
-                    if (!slot) continue;
-                    float min_v, max_v;
-                    param_range(fx.type, mt.param_index, &min_v, &max_v);
-                    const float x = apply_curve(mt.curve, knob.value);
-                    const float offset = mt.lo + (mt.hi - mt.lo) * x;
-                    *slot = std::clamp(*slot + offset * (max_v - min_v),
-                                       min_v, max_v);
-                }
-            }
-        }
-    }
-
-    // Routes add on top.
+    // Routes add on top. (Group faces are DIRECT param aliases — v5.3 —
+    // they have no resolve-time behavior of their own.)
     for (const doc::ModRoute& route : doc.mod_routes) {
         float min_v = 0.0f, max_v = 1.0f;
         float* slot = mask_slot(route.target, &min_v, &max_v);
@@ -372,7 +415,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         const float value =
             apply_curve(route.curve,
                         eval_source(route.source, t, frame_index, analysis,
-                                    fps, audio_off, key_time));
+                                    fps, audio_off, key_time, video));
         *slot = std::clamp(*slot + route.amount * (max_v - min_v) * value,
                            min_v, max_v);
     }
@@ -384,7 +427,7 @@ float speed_at(const doc::Document& doc, uint32_t frame_index, double fps,
     float speed = doc.speed;
     for (const doc::KeyframeLane& lane : doc.lanes) {
         if (lane.target.effect_id != 0 || lane.target.param_index != 1 ||
-            lane.keys.empty())
+            lane.keys.empty() || lane.muted)
             continue;
         speed = eval_lane(lane, frame_index);   // lane sets the base
     }
@@ -407,7 +450,7 @@ bool time_remap_active(const doc::Document& doc) {
     if (doc.time_mode != 0 || doc.speed != 1.0f) return true;
     for (const doc::KeyframeLane& lane : doc.lanes)
         if (lane.target.effect_id == 0 && lane.target.param_index == 1 &&
-            !lane.keys.empty())
+            !lane.keys.empty() && !lane.muted)
             return true;
     for (const doc::ModRoute& route : doc.mod_routes)
         if (route.target.effect_id == 0 && route.target.param_index == 1)

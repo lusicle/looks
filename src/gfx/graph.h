@@ -53,7 +53,11 @@ struct GraphNode {
 struct RenderGraph {
     std::vector<GraphNode> nodes;
     std::vector<int> order;    // topological evaluation order
-    int output = -1;           // node whose result reaches the viewport
+    int output = -1;           // the REAL output — the composite, always
+    // Viewport tap (v5.4): the node the big preview publishes instead —
+    // selection preview / mask overlay. -1 = show the output. Nothing
+    // else (thumbs, export, out_source) ever reads it.
+    int preview = -1;
     bool valid = false;        // false: cycle or empty
 };
 
@@ -64,8 +68,12 @@ bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order);
 // Document -> graph. Bypassed effects are dropped at compile time; shared
 // masks compile once and fan out. If overlay_mask_id names an existing
 // mask, the graph output becomes that mask's grayscale (viewport overlay
-// visualization, spec §8).
+// visualization, spec §8). preview_node (v5.4) publishes the named
+// node's output instead of the composite — an effect/layer/group id, or
+// a mask id | kMaskParamBit; 0 (and anything unresolvable) keeps the
+// composite. Preview-only: export passes 0.
 RenderGraph compile_graph(const doc::Document& doc,
-                          uint64_t overlay_mask_id = 0);
+                          uint64_t overlay_mask_id = 0,
+                          uint64_t preview_node = 0);
 
 }  // namespace looks::gfx

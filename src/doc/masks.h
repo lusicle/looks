@@ -95,6 +95,10 @@ struct Mask {
 
     // Mini effect chain applied to the mask source before extraction.
     std::vector<EffectInstance> chain;
+
+    // Node-canvas position (docs/flow_canvas.md); (0,0) = unplaced.
+    float node_x = 0.0f;
+    float node_y = 0.0f;
 };
 
 }  // namespace looks::doc

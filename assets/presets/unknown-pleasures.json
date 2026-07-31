@@ -1,31 +1,64 @@
 {
   "looks_preset": 1,
   "name": "unknown pleasures",
-  "tags": ["scan", "joyplot", "mono"],
+  "tags": [
+    "scan",
+    "joyplot",
+    "mono"
+  ],
   "group": {
     "id": 100,
     "name": "unknown pleasures",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "peaks",
-        "value": 0.5,
-        "targets": [
-          {"effect": 1, "param": 1, "lo": 0.0, "hi": 1.0, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 1
       },
       {
-        "name": "rows",
-        "value": 0.4,
-        "targets": [
-          {"effect": 1, "param": 0, "lo": 0.0, "hi": 0.7, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 0
       }
     ]
   },
   "effects": [
-    {"type": "ridgeline", "id": 1, "params": [36, 0.55, 1.2, 0.35, 1.0, 0.0]},
-    {"type": "glow", "id": 2, "params": [0.8, 14, 0.3, 0, 0]}
+    {
+      "type": "ridgeline",
+      "id": 1,
+      "params": [
+        55.040000915527344,
+        1,
+        1.2000000476837158,
+        0.34999999403953552,
+        1,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "glow",
+      "id": 2,
+      "params": [
+        0.80000001192092896,
+        14,
+        0.30000001192092896,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

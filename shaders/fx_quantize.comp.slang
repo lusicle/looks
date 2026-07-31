@@ -51,50 +51,9 @@ cbuffer Push
 [[vk::binding(3, 0)]] Sampler2D flow;        // block MVs (motion lock)
 [[vk::binding(4, 0)]] RWTexture2D<float4> output;
 
-static const float2 kLutSize = float2(512.0, 192.0);
-
-float lut_texel(uint x, uint y)
-{
-    const float2 uv = (float2(float(x), float(y)) + 0.5) / kLutSize;
-    return noise_lut.SampleLevel(uv, 0).r;
-}
-
-float blue_noise(uint2 p)
-{
-    return lut_texel(p.x & 127u, 64u + (p.y & 127u));
-}
-
-float stbn(uint2 p, uint slice)
-{
-    return lut_texel((slice & 7u) * 64u + (p.x & 63u), p.y & 63u);
-}
-
-static const float kBayer2[4] = {0.0, 2.0, 3.0, 1.0};
-static const float kBayer4[16] = {
-    0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
-    3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0};
-
-float bayer8(uint2 p)
-{
-    // 8x8 from the recursive construction over the 4x4.
-    const uint2 q = p & 7;
-    const float base = kBayer4[(q.y & 3) * 4 + (q.x & 3)];
-    const float quad = float(((q.y >> 2) & 1) * 2 + ((q.x >> 2) & 1));
-    return (base * 4.0 + kBayer2[uint(quad)]) / 64.0;
-}
-
-float3 nearest_of4(float3 c, float3 p0, float3 p1, float3 p2, float3 p3)
-{
-    float3 best = p0;
-    float best_d = dot(c - p0, c - p0);
-    float d = dot(c - p1, c - p1);
-    if (d < best_d) { best_d = d; best = p1; }
-    d = dot(c - p2, c - p2);
-    if (d < best_d) { best_d = d; best = p2; }
-    d = dot(c - p3, c - p3);
-    if (d < best_d) { best_d = d; best = p3; }
-    return best;
-}
+// Pattern + palette helpers (bayer/blue/STBN/nearest) live in
+// fx_common.slang — shared with the standalone Dither / Palette Map
+// primitives (docs/flow_canvas.md v5.5).
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -128,7 +87,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float prc = cos(pr), prs = sin(pr);
         pf = float2(pf.x * prc - pf.y * prs, pf.x * prs + pf.y * prc);
     }
-    pf /= clamp(pat_scale, 0.25, 4.0);
+    // Scale floors at 1: one pixel is the finest possible dither
+    // feature, and sub-1 strides alias the matrix onto a near-constant
+    // threshold subset (stride 4 on bayer 8 samples only {0..3}/64).
+    pf /= clamp(pat_scale, 1.0, 4.0);
     pf += float2(shift);
     pf += t * scroll * float2(1.0, 0.37);
     if (warp > 0.001) {
@@ -142,17 +104,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int dm = int(dither + 0.5);
     float pattern = 0.5;
     if (dm == 1)
-        pattern = (kBayer2[(p.y & 1) * 2 + (p.x & 1)] + 0.5) / 4.0;
+        pattern = (kFxBayer2[(p.y & 1) * 2 + (p.x & 1)] + 0.5) / 4.0;
     else if (dm == 2)
-        pattern = (kBayer4[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0;
+        pattern = (kFxBayer4[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0;
     else if (dm == 3)
-        pattern = bayer8(p) + 0.5 / 64.0;
+        pattern = fx_bayer8(p) + 0.5 / 64.0;
     else if (dm == 4)
         pattern = fx_hash01(fx_hash4(seed, boil_tick, tid.x, tid.y));
     else if (dm == 5)
-        pattern = blue_noise(p);
+        pattern = fx_blue_noise(noise_lut, p);
     else if (dm == 6)
-        pattern = stbn(p, boil_hz > 0.01 ? boil_tick : 0u);
+        pattern = fx_stbn(noise_lut, p, boil_hz > 0.01 ? boil_tick : 0u);
     else if (dm == 7) {
         // Moiré: two ordered patterns at drifting scale/angle interfere.
         const float ang = t * 0.15;
@@ -160,8 +122,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 r1 = float2(pf.x * ca - pf.y * sa,
                                  pf.x * sa + pf.y * ca);
         const float2 r2 = pf * 1.09;
-        const float m = bayer8(uint2(int2(floor(r1)) & 0x7FFF)) +
-                        bayer8(uint2(int2(floor(r2)) & 0x7FFF));
+        const float m = fx_bayer8(uint2(int2(floor(r1)) & 0x7FFF)) +
+                        fx_bayer8(uint2(int2(floor(r2)) & 0x7FFF));
         pattern = frac(m);
     }
     else if (dm == 9) {
@@ -196,10 +158,15 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const int pal = int(palette + 0.5);
     const float n = max(levels, 2.0);
+    // Level picks happen in LINEAR light (fx_dither_levels, v5.6a) so
+    // dithered fields average back to the source brightness — code-value
+    // dithering lifts every dark region on display (convex EOTF). The
+    // fixed palettes below keep their stylized encoded-domain snap.
+    const float t01 = clamp(0.5 + threshold, 0.0, 1.0);
     float3 result;
     if (pal == 0)
     {
-        float3 idx = round(saturate(c + threshold / (n - 1.0)) * (n - 1.0));
+        float3 idx = fx_dither_levels(base.rgb, n, t01);
         if (cycle_step != 0u)
             idx = float3(fmod(idx.r + float(cycle_step), n),
                          fmod(idx.g + float(cycle_step), n),
@@ -208,8 +175,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (pal == 1)
     {
-        const float l = fx_luma(c);
-        float idx = round(saturate(l + threshold / (n - 1.0)) * (n - 1.0));
+        const float y = fx_luma(saturate(base.rgb));
+        float idx = fx_dither_levels(float3(y, y, y), n, t01).x;
         if (cycle_step != 0u) idx = fmod(idx + float(cycle_step), n);
         const float q = idx / (n - 1.0);
         result = float3(q, q, q);
@@ -219,11 +186,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         // DMG greens, darkest to lightest. Cycling rotates the luma phase.
         float l = saturate(fx_luma(c) + threshold * 0.34);
         if (cycle_step != 0u) l = frac(l + float(cycle_step & 3u) * 0.25);
-        result = nearest_of4(float3(l, l, l),
-                             float3(0.059, 0.220, 0.059),
-                             float3(0.188, 0.384, 0.188),
-                             float3(0.545, 0.675, 0.059),
-                             float3(0.608, 0.737, 0.059));
+        result = fx_nearest_of4(float3(l, l, l),
+                                float3(0.059, 0.220, 0.059),
+                                float3(0.188, 0.384, 0.188),
+                                float3(0.545, 0.675, 0.059),
+                                float3(0.608, 0.737, 0.059));
     }
     else if (pal == 3)
     {
@@ -231,33 +198,18 @@ void main(uint3 tid : SV_DispatchThreadID)
         float3 dithered = saturate(c + threshold * 0.5);
         if (cycle_step != 0u)
             dithered = frac(dithered + float(cycle_step & 3u) * 0.25);
-        result = nearest_of4(dithered,
-                             float3(0.0, 0.0, 0.0),
-                             float3(0.333, 1.0, 1.0),
-                             float3(1.0, 0.333, 1.0),
-                             float3(1.0, 1.0, 1.0));
+        result = fx_nearest_of4(dithered,
+                                float3(0.0, 0.0, 0.0),
+                                float3(0.333, 1.0, 1.0),
+                                float3(1.0, 0.333, 1.0),
+                                float3(1.0, 1.0, 1.0));
     }
     else if (pal == 4)
     {
-        // NES: a representative 12-entry cut of the 2C02 palette.
-        const float3 nes[12] = {
-            float3(0.0, 0.0, 0.0),       float3(0.33, 0.33, 0.33),
-            float3(0.74, 0.74, 0.74),    float3(1.0, 1.0, 1.0),
-            float3(0.0, 0.47, 0.97),     float3(0.15, 0.15, 0.65),
-            float3(0.9, 0.2, 0.16),      float3(0.65, 0.06, 0.0),
-            float3(0.0, 0.66, 0.14),     float3(0.98, 0.7, 0.0),
-            float3(0.96, 0.46, 0.7),     float3(0.35, 0.2, 0.7),
-        };
         float3 dithered = saturate(c + threshold * 0.5);
         if (cycle_step != 0u)
             dithered = frac(dithered + float(cycle_step & 3u) * 0.25);
-        float3 best = nes[0];
-        float best_d = 1.0e9;
-        for (int i = 0; i < 12; ++i) {
-            const float d = dot(dithered - nes[i], dithered - nes[i]);
-            if (d < best_d) { best_d = d; best = nes[i]; }
-        }
-        result = best;
+        result = fx_nes_nearest(dithered);
     }
     else if (pal == 5)
     {
@@ -276,11 +228,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (cycle_step != 0u) l = frac(l + float(cycle_step & 3u) * 0.25);
         const float3 ha = fx_hue_to_rgb(pal_hue_a);
         const float3 hb = fx_hue_to_rgb(pal_hue_b);
-        result = nearest_of4(float3(l, l, l),
-                             float3(0.02, 0.02, 0.02),
-                             ha * 0.45,
-                             hb * 0.85,
-                             float3(0.98, 0.98, 0.98));
+        result = fx_nearest_of4(float3(l, l, l),
+                                float3(0.02, 0.02, 0.02),
+                                ha * 0.45,
+                                hb * 0.85,
+                                float3(0.98, 0.98, 0.98));
     }
 
     // Dissolve: ordered threshold sweep between input and quantized —

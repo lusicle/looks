@@ -22,6 +22,10 @@ std::unique_ptr<Command> set_route_source_command(uint64_t route_id,
                                                   ModSource source);
 std::unique_ptr<Command> set_route_curve_command(uint64_t route_id,
                                                  ResponseCurve curve);
+// Rewires which param the route drives (docs/flow_canvas.md v4: dropping
+// a value node's out wire onto a param row). {0, -1} = unwired (inert).
+std::unique_ptr<Command> set_route_target_command(uint64_t route_id,
+                                                  ParamKey target);
 
 // Replaces (or creates, or removes when `keys` is empty) the lane for
 // `target`. Coalesces per target.
@@ -56,6 +60,8 @@ std::unique_ptr<Command> set_timeline_region_command(uint32_t trim_in,
 
 // Loopable keyframe region toggle (spec §7), per lane target.
 std::unique_ptr<Command> set_lane_loop_command(ParamKey target, bool loop);
+// Mute keeps the keys but stops the lane driving its param.
+std::unique_ptr<Command> set_lane_mute_command(ParamKey target, bool muted);
 
 // Sidechain + audio nudge (spec §7). Coalesces (offset drags).
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,

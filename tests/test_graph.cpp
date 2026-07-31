@@ -102,12 +102,13 @@ TEST(graph_compile_layers) {
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(out.layer_index, 2);
-    // The adjustment's grain effect reads the overlay blend (the composite
-    // below), not the raw source.
+    // TRUE GRAPH (docs/flow_canvas.md v3): adjustment layers lost their
+    // composite-tap special case — their effects wire like any node and
+    // head at the shared source when unlinked.
     for (const GraphNode& n : g.nodes)
         if (n.kind == GraphNode::Kind::Effect && n.layer_index == 2)
             CHECK(g.nodes[static_cast<size_t>(n.inputs[0])].kind ==
-                  GraphNode::Kind::LayerBlend);
+                  GraphNode::Kind::Source);
     // Invisible layers compile out entirely.
     doc.layers[1].visible = false;
     RenderGraph g2 = compile_graph(doc);
@@ -116,6 +117,49 @@ TEST(graph_compile_layers) {
     for (const GraphNode& n : g2.nodes)
         if (n.kind == GraphNode::Kind::Generator) ++generators2;
     CHECK_EQ(generators2, 0);
+}
+
+TEST(graph_compile_dormant_unwired) {
+    // v4: an effect with NO in-wire is DORMANT — never emitted, nothing
+    // fabricated in its place — and an unwired Output composites nothing
+    // (black display node, which no effect may consume as input).
+    Document doc;
+    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.layers[0].stack[0].id;
+    const uint64_t layer_id = doc.layers[0].id;
+    // Explicit links: source -> output. The effect is NOT wired anywhere.
+    doc.links.push_back({layer_id, 0, 0});
+
+    RenderGraph g = compile_graph(doc);
+    CHECK(g.valid);
+    int effects = 0;
+    for (const GraphNode& n : g.nodes)
+        if (n.kind == GraphNode::Kind::Effect) ++effects;
+    CHECK_EQ(effects, 0);   // dormant: it must not process anything
+    // Composite = the source head straight through.
+    CHECK(g.nodes[static_cast<size_t>(g.output)].kind ==
+          GraphNode::Kind::Source);
+
+    // Wire the effect in: it emits and carries the composite.
+    doc.links.clear();
+    doc.links.push_back({layer_id, fx_id, 0});
+    doc.links.push_back({fx_id, 0, 0});
+    RenderGraph g2 = compile_graph(doc);
+    CHECK(g2.valid);
+    int effects2 = 0;
+    for (const GraphNode& n : g2.nodes)
+        if (n.kind == GraphNode::Kind::Effect) ++effects2;
+    CHECK_EQ(effects2, 1);
+
+    // Nothing wired to Output at all: the composite is the empty-display
+    // generator — never the raw source.
+    doc.links.clear();
+    doc.links.push_back({layer_id, fx_id, 0});   // effect fed, not shown
+    RenderGraph g3 = compile_graph(doc);
+    CHECK(g3.valid);
+    CHECK(g3.nodes[static_cast<size_t>(g3.output)].kind ==
+          GraphNode::Kind::Generator);
+    CHECK_EQ(g3.nodes[static_cast<size_t>(g3.output)].layer_index, -1);
 }
 
 TEST(graph_compile_chain_and_bypass) {

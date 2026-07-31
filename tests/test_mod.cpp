@@ -75,6 +75,65 @@ TEST(mod_lfo_shapes_deterministic) {
     CHECK_EQ(a, mod::eval_source(lfo, 0.1, 0, nullptr));
 }
 
+TEST(mod_video_sampling_sources) {
+    // Synthetic I420 frame: left half black, right half white, flat gray
+    // chroma. 32x16 keeps the tap grids exact.
+    constexpr int W = 32, H = 16;
+    uint8_t y_plane[W * H];
+    uint8_t u_plane[(W / 2) * (H / 2)];
+    uint8_t v_plane[(W / 2) * (H / 2)];
+    for (int r = 0; r < H; ++r)
+        for (int c = 0; c < W; ++c)
+            y_plane[r * W + c] = c < W / 2 ? 0 : 255;
+    for (int i = 0; i < (W / 2) * (H / 2); ++i) u_plane[i] = v_plane[i] = 128;
+    mod::SourceFrameView view;
+    view.y = y_plane;
+    view.y_stride = W;
+    view.u = u_plane;
+    view.u_stride = W / 2;
+    view.v = v_plane;
+    view.v_stride = W / 2;
+    view.width = W;
+    view.height = H;
+
+    doc::ModSource s;
+    s.type = doc::ModSourceType::VideoSample;
+    s.px = 0.85f;   // deep inside the white half (clear of the box blur)
+    s.py = 0.5f;
+    CHECK(mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view) >
+          0.95f);
+    s.px = 0.15f;
+    CHECK(mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view) <
+          0.05f);
+    // No frame view -> inert 0 (the speed target contract).
+    CHECK_EQ(mod::eval_source(s, 0.0, 0, nullptr), 0.0f);
+
+    // Region mean over the full frame straddles both halves.
+    s.type = doc::ModSourceType::VideoRegion;
+    s.px = s.py = 0.5f;
+    s.pw = s.ph = 1.0f;
+    const float mean =
+        mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view);
+    CHECK(mean > 0.35f && mean < 0.65f);
+    // Deterministic: identical inputs, identical value.
+    CHECK_EQ(mean,
+             mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view));
+
+    // A route on a video source resolves through the same view.
+    doc::Document d = make_doc();
+    doc::ModRoute route;
+    route.id = 1;
+    route.source = s;
+    route.target = {d.layers[0].stack[0].id, doc::kWetParam};
+    route.amount = -1.0f;
+    d.mod_routes.push_back(route);
+    const doc::Document lit =
+        mod::resolve(d, 0, 30.0, nullptr, -1.0, -1.0, &view);
+    CHECK(lit.layers[0].stack[0].wet < 1.0f);
+    const doc::Document dark = mod::resolve(d, 0, 30.0, nullptr);
+    CHECK_EQ(dark.layers[0].stack[0].wet, 1.0f);
+}
+
 TEST(mod_lane_eval) {
     doc::KeyframeLane lane;
     lane.keys.push_back({0.0, 0.0f});

@@ -3,6 +3,7 @@
 #include <vk_mem_alloc.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -135,6 +136,18 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_security_mux.comp.spv", 2},    // input + one history slice per pass
     {"fx_audio_scope.comp.spv", 2},     // input + waveform strip
     {"fx_modulate.comp.spv", 2},        // input + FM phase integral
+    {"fx_blend_node.comp.spv", 2},      // In + B aux input (graph merge)
+    {"fx_matte.comp.spv", 1},           // matte maker (v5.2)
+    {"fx_levels.comp.spv", 1},
+    {"fx_hue_sat.comp.spv", 1},
+    {"fx_channel_mix.comp.spv", 1},
+    {"fx_posterize.comp.spv", 1},
+    {"fx_threshold.comp.spv", 1},
+    {"fx_palette_map.comp.spv", 1},
+    {"fx_dither.comp.spv", 3},          // input + LUT + flow (lock)
+    {"fx_transform.comp.spv", 1},
+    {"fx_frame_delay.comp.spv", 2},     // input + ring slice
+    {"fx_text.comp.spv", 2},            // input + string SDF raster
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -294,7 +307,8 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         // Slit-scan, time-displace and security-mux append one extra push
         // word (the history-pass index), velocity-scan one (front-state
         // width); glyph appends four (atlas grid cols/rows + tile px +
-        // color flag, spec §12 custom glyph sets).
+        // color flag, spec §12 custom glyph sets); text appends four
+        // (glyph count + MSDF px range + string width + atlas em px).
         const auto type_i = static_cast<doc::EffectType>(i);
         const uint32_t extra =
             (type_i == doc::EffectType::SlitScan ||
@@ -302,7 +316,10 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
              type_i == doc::EffectType::SecurityMux ||
              type_i == doc::EffectType::VelocityScan)
                 ? 1u
-                : (type_i == doc::EffectType::Glyph ? 4u : 0u);
+                : (type_i == doc::EffectType::Glyph ||
+                           type_i == doc::EffectType::TextOverlay
+                       ? 4u
+                       : 0u);
         desc.push_bytes = static_cast<uint32_t>(
             (kFxPreludeWords + info.param_count + extra) * sizeof(uint32_t));
         fx_[i] = ComputePipeline::create(device_, shader_dir, desc);
@@ -338,6 +355,16 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     mi_desc.push_bytes = 7 * sizeof(uint32_t);
     mod_integrate_ = ComputePipeline::create(device_, shader_dir, mi_desc);
     if (!mod_integrate_) return false;
+
+    // Node-canvas thumbnail tap (docs/flow_canvas.md): one small
+    // downsample dispatch per evaluated graph node into a fixed atlas.
+    ComputePipelineDesc tt_desc;
+    tt_desc.spv_name = "thumb_tap.comp.spv";
+    tt_desc.sampled_inputs = 1;
+    tt_desc.storage_outputs = 1;
+    tt_desc.push_bytes = 2 * sizeof(uint32_t);
+    thumb_tap_ = ComputePipeline::create(device_, shader_dir, tt_desc);
+    if (!thumb_tap_) return false;
 
     ComputePipelineDesc rd_desc;
     rd_desc.spv_name = "rd_step.comp.spv";
@@ -622,6 +649,45 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         if (!noise_lut_ ||
             !upload_gray_oneshot(*noise_lut_, lut.data(), kLutW, kLutH))
             return false;
+    }
+
+    // Text-overlay fonts (docs/flow_canvas.md v5.5b): every .ttf under
+    // assets/fonts, parsed by the in-repo TrueType loader — drop a font
+    // next to the shipped ones and it's index N, no bake step. Sorted by
+    // lowercased filename so the `font` param stays deterministic;
+    // unparseable files (CFF-flavored renames) are skipped. An empty
+    // list just leaves the effect dormant.
+    {
+        const std::filesystem::path fonts_dir =
+            shader_dir.parent_path() / "assets" / "fonts";
+        std::vector<std::filesystem::path> ttfs;
+        std::error_code ec;
+        std::filesystem::directory_iterator it(fonts_dir, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::string ext = it->path().extension().string();
+            for (char& c : ext)
+                c = static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(c)));
+            if (ext == ".ttf") ttfs.push_back(it->path());
+        }
+        std::sort(ttfs.begin(), ttfs.end(),
+                  [](const std::filesystem::path& a,
+                     const std::filesystem::path& b) {
+                      std::string an = a.filename().string();
+                      std::string bn = b.filename().string();
+                      for (char& c : an)
+                          c = static_cast<char>(
+                              std::tolower(static_cast<unsigned char>(c)));
+                      for (char& c : bn)
+                          c = static_cast<char>(
+                              std::tolower(static_cast<unsigned char>(c)));
+                      return an < bn;
+                  });
+        for (const std::filesystem::path& p : ttfs) {
+            if (fx_fonts_.size() >= 8) break;
+            if (auto f = ui::TtfFont::load(p))
+                fx_fonts_.push_back(std::move(*f));
+        }
     }
 
     // Glow's four passes share the standard push layout (5 params — the
@@ -1071,6 +1137,25 @@ void Engine::codec_flush_segment() {
              "vkResetFences(codecbox)");
 }
 
+// Node-canvas thumbnail tap (docs/flow_canvas.md): downsample `src` into
+// the next free atlas cell, keyed for the UI's cell map. Silently drops
+// taps past the fixed grid — 64 previews bound the cost.
+void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
+                              GpuImage* src, uint64_t key) {
+    if (!thumb_tap_ || !thumb_atlas_ || !src) return;
+    if (thumb_next_cell_ >= kThumbGridCols * kThumbGridRows) return;
+    const uint32_t cell = thumb_next_cell_++;
+    thumb_cells_[key] = cell;
+    src->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    thumb_atlas_->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    const uint32_t push[2] = {cell % kThumbGridCols, cell / kThumbGridCols};
+    const GpuImage* sampled[1] = {src};
+    GpuImage* storage[1] = {thumb_atlas_.get()};
+    thumb_tap_->dispatch(rec, arena_, frame_index, sampled, 1, storage, 1,
+                         push, sizeof(push), kThumbCellW, kThumbCellH,
+                         linear_sampler_);
+}
+
 GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          const SourcePlanes& source, const doc::Document& doc,
                          uint32_t timeline_frame, double fps,
@@ -1079,7 +1164,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          size_t mask_source_count, uint64_t cache_ctx,
                          GpuImage** out_source,
                          const LayerSourceFrame* layer_sources,
-                         size_t layer_source_count) {
+                         size_t layer_source_count,
+                         uint64_t preview_node) {
     if (out_source) *out_source = nullptr;
     if (!source.y || !source.u || !source.v || source.width == 0 ||
         source.height == 0)
@@ -1151,7 +1237,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         arm_readback = true;
     }
 
-    const RenderGraph graph = compile_graph(doc, overlay_mask_id);
+    const RenderGraph graph =
+        compile_graph(doc, overlay_mask_id, preview_node);
     if (!graph.valid) {
         log_error("engine: render graph invalid (cycle?)");
         return nullptr;
@@ -1350,13 +1437,29 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 if (!upload_strip(fx)) return nullptr;
     }
 
+    // Thumbnail atlas + cell map: reset only when the graph actually
+    // evaluates (a render-cache hit above kept the previous, still-valid
+    // taps on screen).
+    if (thumb_tap_ && !thumb_atlas_)
+        thumb_atlas_ = GpuImage::create(
+            device_, VK_FORMAT_R8G8B8A8_UNORM, kThumbCellW * kThumbGridCols,
+            kThumbCellH * kThumbGridRows,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    thumb_cells_.clear();
+    thumb_next_cell_ = 0;
+
     std::vector<GpuImage*> results(graph.nodes.size(), nullptr);
     std::vector<int> remaining_uses(graph.nodes.size(), 0);
     for (const GraphNode& node : graph.nodes)
         for (int input : node.inputs)
             remaining_uses[static_cast<size_t>(input)]++;
-    // The viewport blit is the output's final consumer.
+    // The viewport blit is the published node's final consumer — the
+    // preview tap when set, the output otherwise; the output survives
+    // regardless (the Output card thumb reads it at the end).
     remaining_uses[static_cast<size_t>(graph.output)]++;
+    if (graph.preview >= 0)
+        remaining_uses[static_cast<size_t>(graph.preview)]++;
     // A/B wipe (spec §9): keep the converted source alive to the end too.
     if (out_source) remaining_uses[0]++;
 
@@ -1440,7 +1543,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[11] = as_bits(layer.gen_scale);
                     push[12] = as_bits(layer.gen_angle);
                     push[13] = layer.osc_shape;
-                } else {
+                } else if (node.mask_index >= 0) {
                     // Mask generator source (spec §8): white-on-black with
                     // the mask's own scale/angle.
                     const doc::Mask& mask =
@@ -1455,6 +1558,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     }
                     push[11] = as_bits(mask.gen_scale);
                     push[12] = as_bits(mask.gen_angle);
+                } else {
+                    // Unwired Output (v4): a solid with zeroed colors —
+                    // an empty composite renders black, never the source.
+                    push[2] = static_cast<uint32_t>(
+                        doc::LayerSourceKind::Solid);
+                    push[4] = timeline_frame;
+                    push[11] = as_bits(24.0f);
                 }
                 generator_->dispatch(rec, arena_, frame_index, nullptr, 0,
                                      &dst, 1, push, sizeof(push), w, h,
@@ -1894,6 +2004,170 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 4, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::Dither) {
+                    // Standalone ordered dither (v5.5): LUT always rides
+                    // as input 1; the flow field joins as input 2 only in
+                    // motion-locked mode (the LUT doubles as the dummy).
+                    const GpuImage* flow_tex = node.inputs.size() > 1
+                                                   ? input_image(1)
+                                                   : noise_lut_.get();
+                    const GpuImage* sampled[3] = {input_image(0),
+                                                  noise_lut_.get(), flow_tex};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 3, &dst, 1, push,
+                        push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::FrameDelay) {
+                    // Plain N-frame delay (v5.5): the slit-scan ring
+                    // machinery, one slice bound as the second input.
+                    SlitSlot& slot = slit_state_[fx.id];
+                    if (slot.ring[0] &&
+                        (slot.ring[0]->width() != w ||
+                         slot.ring[0]->height() != h)) {
+                        for (auto& img : slot.ring) img.reset();
+                        slot.head = slot.count = 0;
+                        slot.last_frame = 0xFFFFFFFFu;
+                    }
+                    const uint32_t delay = static_cast<uint32_t>(std::clamp(
+                        fx.params[0], 0.0f,
+                        static_cast<float>(kSlitRing - 1)));
+                    GpuImage* in_img =
+                        const_cast<GpuImage*>(input_image(0));
+                    const GpuImage* past = in_img;
+                    if (delay > 0 && slot.count > 0) {
+                        const uint32_t age = std::min(delay, slot.count);
+                        const uint32_t idx =
+                            (slot.head + kSlitRing - age) % kSlitRing;
+                        if (slot.ring[idx]) past = slot.ring[idx].get();
+                    }
+                    const GpuImage* sampled[2] = {in_img, past};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
+                        push_bytes, w, h, linear_sampler_);
+                    // Push the current input once per timeline frame.
+                    if (slot.last_frame != timeline_frame) {
+                        std::unique_ptr<GpuImage>& target =
+                            slot.ring[slot.head];
+                        if (!target) {
+                            target = GpuImage::create(
+                                device_, VK_FORMAT_R16G16B16A16_SFLOAT, w, h,
+                                VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                            if (!target) return nullptr;
+                        }
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                        target->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkImageCopy copy{};
+                        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                               0, 1};
+                        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                               0, 1};
+                        copy.extent = {w, h, 1};
+                        vkCmdCopyImage(rec, in_img->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       target->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &copy);
+                        target->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        slot.head = (slot.head + 1) % kSlitRing;
+                        slot.count = std::min(slot.count + 1, kSlitRing);
+                        slot.last_frame = timeline_frame;
+                    }
+                } else if (fx.type == doc::EffectType::TextOverlay) {
+                    // Runtime-TTF text (v5.5b): pick the size BUCKET
+                    // covering the resolved size param, rasterize the
+                    // string's SDF once per (text, font, bucket), and
+                    // let the kernel scale — a keyframed/modulated size
+                    // walks a bounded raster set instead of
+                    // re-rasterizing every frame. Bucketing keys on the
+                    // PARAM (1080-reference px), so proxy preview and
+                    // export pick identical rasters.
+                    const int font_n = static_cast<int>(fx_fonts_.size());
+                    const int which =
+                        font_n > 0
+                            ? std::clamp(
+                                  !fx.params.empty()
+                                      ? static_cast<int>(fx.params[0] + 0.5f)
+                                      : 0,
+                                  0, font_n - 1)
+                            : -1;
+                    int bucket = 0;
+                    const float size_ref =
+                        fx.params.size() > 1 ? fx.params[1] : 90.0f;
+                    while (bucket < 5 && kTextBuckets[bucket] < size_ref)
+                        ++bucket;
+                    TextRaster* ras = nullptr;
+                    if (which >= 0 && !fx.text.empty()) {
+                        uint64_t thash = hash_combine(
+                            0x7E87ull, static_cast<uint64_t>(which));
+                        for (char ch : fx.text)
+                            thash = hash_combine(
+                                thash, static_cast<uint8_t>(ch));
+                        TextSlot& slot = text_state_[fx.id];
+                        if (slot.hash != thash) {
+                            // Text/font changed: the old rasters may be
+                            // in flight — settle before dropping them.
+                            bool any = false;
+                            for (const TextRaster& tb : slot.buckets)
+                                any = any || tb.tex != nullptr;
+                            if (any) device_.wait_idle();
+                            for (TextRaster& tb : slot.buckets) {
+                                tb.tex.reset();
+                                tb.w = tb.h = 0;
+                            }
+                            slot.hash = thash;
+                        }
+                        TextRaster& tb = slot.buckets[bucket];
+                        if (!tb.tex && tb.w == 0) {
+                            const float bpx = kTextBuckets[bucket];
+                            const float spread =
+                                std::max(4.0f, bpx * 0.1f);
+                            const ui::TtfFont::Sdf s =
+                                fx_fonts_[static_cast<size_t>(which)]
+                                    .rasterize(fx.text, bpx, spread);
+                            if (s.width && s.height) {
+                                tb.tex = GpuImage::create(
+                                    device_, VK_FORMAT_R8_UNORM, s.width,
+                                    s.height,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                                if (!tb.tex) return nullptr;
+                                if (!staging.upload_image(
+                                        rec, s.pixels.data(),
+                                        s.pixels.size(), s.width, *tb.tex))
+                                    return nullptr;
+                                tb.tex->transition(
+                                    rec,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                                tb.w = s.width;
+                                tb.h = s.height;
+                                tb.spread = s.spread_px;
+                            } else {
+                                // Nothing drawable (spaces): remember,
+                                // don't re-rasterize every frame.
+                                tb.w = 1;
+                            }
+                        }
+                        if (tb.tex) ras = &tb;
+                    }
+                    uint32_t* extra = &push[kFxPreludeWords + param_count];
+                    extra[0] = as_bits(
+                        ras ? static_cast<float>(ras->w) : 0.0f);
+                    extra[1] = as_bits(
+                        ras ? static_cast<float>(ras->h) : 0.0f);
+                    extra[2] = as_bits(ras ? ras->spread : 1.0f);
+                    extra[3] = as_bits(kTextBuckets[bucket]);
+                    const GpuImage* sdf_tex =
+                        ras ? ras->tex.get() : noise_lut_.get();
+                    const GpuImage* sampled[2] = {input_image(0), sdf_tex};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
+                        push_bytes + 4 * sizeof(uint32_t), w, h,
+                        linear_sampler_);
                 } else if (fx.type == doc::EffectType::Displace) {
                     // Second input (spec §6.2): the mask's grayscale as the
                     // displacement map when the graph wired one; otherwise
@@ -2508,6 +2782,16 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 2, &dst, 1,
                         push, push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::BlendNode) {
+                    // Graph merge (v3): B rides input 1; unwired B falls
+                    // back to In (the blend becomes identity-ish).
+                    const GpuImage* b = node.inputs.size() > 1
+                        ? input_image(1)
+                        : input_image(0);
+                    const GpuImage* sampled[2] = {input_image(0), b};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
+                        push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::AudioScope) {
                     // The waveform strip was uploaded before graph eval.
                     auto it = audio_strip_.find(fx.id);
@@ -2698,6 +2982,22 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::MaskExtract: {
+                if (node.mask_index < 0) {
+                    // Image-matte adapter (docs/flow_canvas.md v5.2:
+                    // masks ARE images): plain luma, neutral levels —
+                    // the wired image IS the matte.
+                    const uint32_t push[12] = {
+                        w, h, /*mode=*/0u, 0u,
+                        as_bits(0.0f), as_bits(1.0f), as_bits(1.0f),
+                        as_bits(0.5f), as_bits(0.25f), as_bits(0.0f),
+                        as_bits(1.0f), as_bits(0.0f)};
+                    const GpuImage* sampled[1] = {input_image(0)};
+                    mask_extract_->dispatch(rec, arena_, frame_index,
+                                            sampled, 1, &dst, 1, push,
+                                            sizeof(push), w, h,
+                                            linear_sampler_);
+                    break;
+                }
                 const doc::Mask& mask =
                     doc.masks[static_cast<size_t>(node.mask_index)];
                 uint32_t mode = static_cast<uint32_t>(mask.extract);
@@ -2767,12 +3067,60 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
 
         results[static_cast<size_t>(index)] = dst;
+        // Node-canvas thumbnail taps (docs/flow_canvas.md): effects key on
+        // their id, layer sources on layer.id | bit 62 (id spaces
+        // overlap), masks on id | kMaskParamBit — later mask stages
+        // re-key so the map lands on the final matte.
+        constexpr uint64_t kThumbSourceBit = 1ull << 62;
+        if (node.kind == GraphNode::Kind::Effect && node.chain_index < 0 &&
+            node.effect_index >= 0 && node.layer_index >= 0) {
+            const doc::EffectInstance& tfx =
+                doc.layers[static_cast<size_t>(node.layer_index)]
+                    .stack[static_cast<size_t>(node.effect_index)];
+            record_thumb_tap(rec, frame_index, dst, tfx.id);
+        } else if ((node.kind == GraphNode::Kind::Source ||
+                    node.kind == GraphNode::Kind::Generator ||
+                    node.kind == GraphNode::Kind::LayerTransform) &&
+                   node.mask_index < 0) {
+            if (node.layer_index >= 0) {
+                record_thumb_tap(
+                    rec, frame_index, dst,
+                    doc.layers[static_cast<size_t>(node.layer_index)].id |
+                        kThumbSourceBit);
+            } else if (index == 0) {
+                // The shared playhead source backs every untrimmed clip
+                // layer's card.
+                for (const doc::Layer& tl : doc.layers)
+                    if (tl.visible &&
+                        tl.source == doc::LayerSourceKind::Clip &&
+                        !doc::layer_has_trim(tl) &&
+                        !doc::layer_has_transform(tl))
+                        record_thumb_tap(rec, frame_index, dst,
+                                         tl.id | kThumbSourceBit);
+            }
+        } else if ((node.kind == GraphNode::Kind::MaskShape ||
+                    node.kind == GraphNode::Kind::MaskExtract ||
+                    node.kind == GraphNode::Kind::MaskMorphV ||
+                    node.kind == GraphNode::Kind::MaskBlurV ||
+                    node.kind == GraphNode::Kind::MaskCombine) &&
+                   node.mask_index >= 0) {
+            record_thumb_tap(
+                rec, frame_index, dst,
+                doc.masks[static_cast<size_t>(node.mask_index)].id |
+                    doc::kMaskParamBit);
+        }
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
                 pool_.release(results[static_cast<size_t>(input)]);
     }
 
-    GpuImage* out = results[static_cast<size_t>(graph.output)];
+    // The published image: the preview tap when set, the OUTPUT
+    // otherwise. The output itself always feeds the Output card's
+    // thumbnail (cell key 0) — the preview never touches it.
+    GpuImage* out = results[static_cast<size_t>(
+        graph.preview >= 0 ? graph.preview : graph.output)];
+    record_thumb_tap(rec, frame_index,
+                     results[static_cast<size_t>(graph.output)], 0);
     out->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (out_source && results[0]) {
         results[0]->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

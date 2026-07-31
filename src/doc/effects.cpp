@@ -25,7 +25,7 @@ constexpr ParamDesc kGrainParams[] = {
     {"color", "color", 0.0f, 1.0f, 0.3f, "%.2f"},
     // Spec §6.5: film grain OR the CCD sensor-noise flavor (shadow-
     // weighted, per-pixel, with faint row banding).
-    {"mode", "mode (0=film 1=ccd)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "film|ccd"},
 };
 
 constexpr ParamDesc kJitterParams[] = {
@@ -33,19 +33,18 @@ constexpr ParamDesc kJitterParams[] = {
     {"speed", "speed", 0.1f, 12.0f, 2.0f, "%.1f hz"},
     // 0 gate weave, 1 EIS wobble, 2 VHS tracking, 3 rolling-shutter jello
     // (per-row skew — the phone/digicam wobble).
-    {"mode", "mode (3=jello)", 0.0f, 3.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 3.0f, 0.0f, "%.0f",
+     "gate weave|eis wobble|vhs tracking|jello"},
 };
 
 constexpr ParamDesc kQuantizeParams[] = {
     {"levels", "levels", 2.0f, 16.0f, 4.0f, "%.0f"},
-    // 0 rgb, 1 gray, 2 game boy, 3 cga, 4 nes, 5 teletext, 6 custom
-    // duotone (black -> hue a -> hue b -> white)
-    {"palette", "palette", 0.0f, 6.0f, 0.0f, "%.0f"},
-    // 0 none, 1-3 bayer 2/4/8, 4 white, 5 blue noise, 6 STBN, 7 moire,
-    // 8 level cycle (rotate quantization boundaries on the boil clock),
-    // 9 RD stipple (Gray-Scott dots as the threshold — stateful),
-    // 10 spiral, 11 radial rings, 12 diamond cluster (ordered shapes).
-    {"dither", "dither", 0.0f, 12.0f, 3.0f, "%.0f"},
+    {"palette", "palette", 0.0f, 6.0f, 0.0f, "%.0f",
+     "rgb|gray|game boy|cga|nes|teletext|duotone"},
+    // RD stipple = Gray-Scott dots as the threshold (stateful).
+    {"dither", "dither", 0.0f, 12.0f, 3.0f, "%.0f",
+     "none|bayer 2|bayer 4|bayer 8|white noise|blue noise|stbn|moire|"
+     "level cycle|rd stipple|spiral|rings|diamond"},
     {"dither_amt", "dither amt", 0.0f, 1.0f, 1.0f, "%.2f"},
     {"boil_hz", "boil rate", 0.0f, 30.0f, 8.0f, "%.0f hz"},
     {"scroll", "pattern scroll", 0.0f, 64.0f, 0.0f, "%.0f px/s"},
@@ -53,9 +52,11 @@ constexpr ParamDesc kQuantizeParams[] = {
     {"dissolve", "dissolve", 0.0f, 1.0f, 1.0f, "%.2f"},
     // Shared dither controls (spec §6.2): lock mode (motion-locked pattern
     // advection along flow) + the rotate/scale legs of pattern transform.
-    {"lock", "lock (1=motion)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    // Scale floors at 1x — dither can't be finer than one pixel, and
+    // sub-1 strides alias the threshold matrix (v5.6a).
+    {"lock", "lock", 0.0f, 1.0f, 0.0f, "%.0f", "screen|motion"},
     {"pat_rotate", "pattern rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
-    {"pat_scale", "pattern scale", 0.25f, 4.0f, 1.0f, "%.2f x"},
+    {"pat_scale", "pattern scale", 1.0f, 4.0f, 1.0f, "%.2f x"},
     {"pal_hue_a", "custom hue a", 0.0f, 1.0f, 0.08f, "%.2f"},
     {"pal_hue_b", "custom hue b", 0.0f, 1.0f, 0.55f, "%.2f"},
 };
@@ -64,7 +65,8 @@ constexpr ParamDesc kGlowParams[] = {
     {"amount", "amount", 0.0f, 3.0f, 1.0f, "%.2f"},
     {"radius", "radius", 1.0f, 64.0f, 18.0f, "%.0f px"},
     {"threshold", "threshold", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "pro-mist|halation|ccd"},
     // True CCD smear (spec §6.3 CCD mode): clipped highlights bleed a
     // full-height column streak, not just a local bloom.
     {"smear", "ccd smear", 0.0f, 1.0f, 0.0f, "%.2f"},
@@ -91,7 +93,8 @@ constexpr ParamDesc kDatamoshParams[] = {
     // byte corruption, and replace-with-custom-field (pan/zoom/swirl).
     {"mv_rotate", "mv rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
     {"byte_flips", "byte flips", 0.0f, 64.0f, 0.0f, "%.0f"},
-    {"mv_field", "field (0=flow)", 0.0f, 3.0f, 0.0f, "%.0f"},
+    {"mv_field", "field", 0.0f, 3.0f, 0.0f, "%.0f",
+     "flow|pan|zoom|swirl"},
     {"field_amt", "field amt", -32.0f, 32.0f, 8.0f, "%.0f px"},
 };
 
@@ -111,7 +114,7 @@ constexpr ParamDesc kBitrateStarveParams[] = {
 
 constexpr ParamDesc kEchoParams[] = {
     {"decay", "decay", 0.0f, 0.98f, 0.85f, "%.2f"},
-    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "lighten|crossfade"},
 };
 
 constexpr ParamDesc kFeedbackParams[] = {
@@ -125,17 +128,19 @@ constexpr ParamDesc kFeedbackParams[] = {
 
 constexpr ParamDesc kGlyphParams[] = {
     {"cell", "cell size", 2.0f, 32.0f, 8.0f, "%.0f px"},
-    // 3 = braille: procedural 2x4 dot-cell ramp (spec §6.6);
-    // 4 = teletext: procedural 2x3 block-mosaic sextants.
-    {"set", "set (0=dot 1=asc 3=brl 4=ttx)", 0.0f, 4.0f, 1.0f, "%.0f"},
-    {"mode", "mode", 0.0f, 2.0f, 1.0f, "%.0f"},
+    // Braille = procedural 2x4 dot cells; teletext = 2x3 sextants (§6.6).
+    {"set", "set", 0.0f, 4.0f, 1.0f, "%.0f",
+     "halftone|ascii|custom|braille|teletext"},
+    {"mode", "mode", 0.0f, 2.0f, 1.0f, "%.0f",
+     "mono|colored|glyph x pixel"},
     {"jitter", "jitter", 0.0f, 1.0f, 0.0f, "%.2f"},
 };
 
 constexpr ParamDesc kColorScienceParams[] = {
-    // 12 = three-strip technicolor, 13 = expired stock (spec §6.4),
-    // 14 = aerochrome IR false color, 15 = b&w infrared, 16 = instant.
-    {"preset", "stock", 0.0f, 16.0f, 1.0f, "%.0f"},
+    {"preset", "stock", 0.0f, 16.0f, 1.0f, "%.0f",
+     "neutral|kodachrome|portra|vision3|ektachrome|fuji|bleach bypass|"
+     "cross-process|technicolor 2|ccd video|wb warm|wb cool|technicolor 3|"
+     "expired|aerochrome|b&w infrared|instant"},
     {"push", "push/pull", -2.0f, 2.0f, 0.0f, "%+.1f st"},
     {"punch", "punch", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"fade", "fade", 0.0f, 1.0f, 0.0f, "%.2f"},
@@ -152,7 +157,7 @@ constexpr ParamDesc kKaleidoParams[] = {
 };
 
 constexpr ParamDesc kPolarParams[] = {
-    {"mode", "mode (0=to polar)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "to polar|from polar"},
     {"swirl", "swirl", -3.0f, 3.0f, 0.0f, "%.2f"},
     {"zoom", "zoom", 0.25f, 4.0f, 1.0f, "%.2f"},
 };
@@ -166,11 +171,10 @@ constexpr ParamDesc kTurbulenceParams[] = {
 constexpr ParamDesc kDisplaceParams[] = {
     {"amount", "amount", -64.0f, 64.0f, 16.0f, "%.1f px"},
     {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f"},
-    {"mode", "mode (1=gradient)", 0.0f, 1.0f, 0.0f, "%.0f"},
-    // Second-input displacement (spec §6.2): 1 = displace by the
-    // referenced mask's grayscale (mask sources cover other layers,
-    // external videos, and generators, each with a mini chain — spec §8).
-    {"map_mode", "map (1=mask)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "luma|gradient"},
+    // Second-input displacement (spec §6.2): displace by the referenced
+    // map's grayscale instead of the input's own luma.
+    {"map_mode", "map", 0.0f, 1.0f, 0.0f, "%.0f", "self|map input"},
 };
 
 constexpr ParamDesc kLensDistortParams[] = {
@@ -181,14 +185,14 @@ constexpr ParamDesc kLensDistortParams[] = {
 
 constexpr ParamDesc kFringeParams[] = {
     {"amount", "amount", 0.0f, 16.0f, 3.0f, "%.1f px"},
-    {"mode", "mode (1=purple)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "lens ca|purple fringe"},
     {"threshold", "threshold", 0.0f, 1.0f, 0.7f, "%.2f"},
 };
 
 constexpr ParamDesc kInterlaceParams[] = {
     {"shift", "comb shift", 0.0f, 16.0f, 4.0f, "%.1f px"},
     {"darken", "line darken", 0.0f, 1.0f, 0.15f, "%.2f"},
-    {"mode", "mode (1=lines only)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "comb|lines only"},
 };
 
 constexpr ParamDesc kSliceShuffleParams[] = {
@@ -200,7 +204,7 @@ constexpr ParamDesc kSliceShuffleParams[] = {
 
 constexpr ParamDesc kPixelStretchParams[] = {
     {"position", "position", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"mode", "mode (down/up/rt/lt)", 0.0f, 3.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 3.0f, 0.0f, "%.0f", "down|up|right|left"},
 };
 
 constexpr ParamDesc kCompositeParams[] = {
@@ -222,9 +226,10 @@ constexpr ParamDesc kSyncFailParams[] = {
 };
 
 constexpr ParamDesc kTimestampParams[] = {
-    {"mode", "mode (0=date 1=tc)", 0.0f, 2.0f, 2.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 2.0f, "%.0f", "date|timecode|both"},
     {"size", "size", 1.0f, 6.0f, 3.0f, "%.0f"},
-    {"corner", "corner", 0.0f, 3.0f, 3.0f, "%.0f"},
+    {"corner", "corner", 0.0f, 3.0f, 3.0f, "%.0f",
+     "top left|top right|bottom left|bottom right"},
 };
 
 constexpr ParamDesc kOversharpenParams[] = {
@@ -239,10 +244,10 @@ constexpr ParamDesc kNrMushParams[] = {
 
 constexpr ParamDesc kBlurParams[] = {
     {"amount", "amount", 0.0f, 64.0f, 16.0f, "%.0f px"},
-    // Spec §6.5 blur family: 0 directional, 1 spin (arc around center),
-    // 2 zoom, 3 gaussian, 4 tilt-shift, 5 bokeh (flat disc aperture,
-    // highlights bloom into discs), 6 surface (edge-preserving bilateral).
-    {"mode", "mode (5=bokeh 6=surf)", 0.0f, 6.0f, 0.0f, "%.0f"},
+    // Spec §6.5 blur family; bokeh = flat disc aperture, surface =
+    // edge-preserving bilateral.
+    {"mode", "mode", 0.0f, 6.0f, 0.0f, "%.0f",
+     "directional|spin|zoom|gaussian|tilt-shift|bokeh|surface"},
     {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f"},
     {"focus", "tilt focus", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"band", "tilt band", 0.02f, 0.5f, 0.15f, "%.2f"},
@@ -291,9 +296,10 @@ constexpr ParamDesc kDirectFlashParams[] = {
 
 constexpr ParamDesc kEdgeDetectParams[] = {
     {"threshold", "threshold", 0.0f, 1.0f, 0.15f, "%.2f"},
-    {"mode", "mode (0=wht 1=blk 2=over)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "white on black|black on white|overlay"},
     {"thickness", "thickness", 0.5f, 4.0f, 1.0f, "%.1f px"},
-    {"algo", "algo (0=sobel 1=dog)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"algo", "algo", 0.0f, 1.0f, 0.0f, "%.0f", "sobel|dog"},
 };
 
 constexpr ParamDesc kKuwaharaParams[] = {
@@ -311,7 +317,7 @@ constexpr ParamDesc kRuttEtraParams[] = {
     {"line_w", "line width", 0.5f, 4.0f, 1.5f, "%.1f px"},
     // Scan-processor extras: column rasters, oscillator noise riding the
     // trace, and beam-intensity dot breakup (weak signal beads the line).
-    {"mode", "mode (0=rows 1=cols)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "rows|cols"},
     {"wiggle", "trace wiggle", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"beam", "dot breakup", 0.0f, 1.0f, 0.0f, "%.2f"},
     // The raster itself crawls across the image on the timeline clock —
@@ -320,20 +326,22 @@ constexpr ParamDesc kRuttEtraParams[] = {
 };
 
 constexpr ParamDesc kSlitScanParams[] = {
-    {"mode", "mode (0=rows 1=cols)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "rows|cols"},
     {"depth", "depth", 2.0f, 16.0f, 12.0f, "%.0f frames"},
-    {"reverse", "reverse", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"reverse", "reverse", 0.0f, 1.0f, 0.0f, "%.0f", "forward|reverse"},
 };
 
 constexpr ParamDesc kCamcorderHudParams[] = {
     {"size", "size", 1.0f, 6.0f, 3.0f, "%.0f"},
     {"blink_hz", "rec blink", 0.0f, 4.0f, 1.0f, "%.1f hz"},
-    {"elements", "elements (0=rec 2=full)", 0.0f, 2.0f, 2.0f, "%.0f"},
+    {"elements", "elements", 0.0f, 2.0f, 2.0f, "%.0f",
+     "rec|rec + counter|full hud"},
 };
 
 constexpr ParamDesc kGateMaskParams[] = {
-    // 4 = instant print: warm white border, square window, fat bottom.
-    {"gauge", "gauge (s8/16/185/239/inst)", 0.0f, 4.0f, 1.0f, "%.0f"},
+    // Instant print: warm white border, square window, fat bottom.
+    {"gauge", "gauge", 0.0f, 4.0f, 1.0f, "%.0f",
+     "super 8|16mm|1.85|2.39|instant"},
     {"round", "corner round", 0.0f, 1.0f, 0.35f, "%.2f"},
     {"soft", "softness", 0.0f, 1.0f, 0.15f, "%.2f"},
 };
@@ -356,7 +364,7 @@ constexpr ParamDesc kVoronoiParams[] = {
     {"edge", "edge", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"drift", "drift", 0.0f, 2.0f, 0.3f, "%.2f hz"},
     // Spec §6.6: Voronoi cells or the Delaunay-style triangle facets.
-    {"style", "style (0=cell 1=tri)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"style", "style", 0.0f, 1.0f, 0.0f, "%.0f", "cells|triangles"},
 };
 
 constexpr ParamDesc kReactionDiffusionParams[] = {
@@ -364,23 +372,22 @@ constexpr ParamDesc kReactionDiffusionParams[] = {
     {"kill", "kill", 0.040f, 0.070f, 0.060f, "%.3f"},
     {"steps", "steps/frame", 1.0f, 24.0f, 10.0f, "%.0f"},
     {"inject", "frame inject", 0.0f, 1.0f, 0.35f, "%.2f"},
-    {"ink", "ink (0=dark 1=lit)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"ink", "ink", 0.0f, 1.0f, 0.0f, "%.0f", "dark|lit"},
 };
 
 constexpr ParamDesc kErrorDiffusionParams[] = {
     {"levels", "levels", 2.0f, 8.0f, 2.0f, "%.0f"},
-    // Kernel family: 0 Floyd-Steinberg, 1 Atkinson, 2 Jarvis-Judice-Ninke,
-    // 3 Stucki, 4 Burkes, 5 Sierra.
-    {"mode", "kernel (0=fs..5=sierra)", 0.0f, 5.0f, 0.0f, "%.0f"},
-    {"serpentine", "serpentine", 0.0f, 1.0f, 1.0f, "%.0f"},
+    {"mode", "kernel", 0.0f, 5.0f, 0.0f, "%.0f",
+     "floyd-steinberg|atkinson|jarvis|stucki|burkes|sierra"},
+    {"serpentine", "serpentine", 0.0f, 1.0f, 1.0f, "%.0f", "off|on"},
     {"carry", "temporal carry", 0.0f, 1.0f, 0.0f, "%.2f"},
 };
 
 constexpr ParamDesc kFlickerParams[] = {
     {"amount", "amount", 0.0f, 1.0f, 0.4f, "%.2f"},
     {"rate", "rate", 1.0f, 48.0f, 24.0f, "%.0f hz"},
-    // 2 = color strobe: the flicker alternates hue instead of exposure.
-    {"mode", "mode (2=color)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "projector beat|random gate|color strobe"},
 };
 
 constexpr ParamDesc kFrameHoldParams[] = {
@@ -390,14 +397,15 @@ constexpr ParamDesc kFrameHoldParams[] = {
 
 constexpr ParamDesc kStutterParams[] = {
     {"frames", "loop frames", 2.0f, 16.0f, 4.0f, "%.0f"},
-    {"armed", "armed", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"armed", "armed", 0.0f, 1.0f, 0.0f, "%.0f", "off|armed"},
     {"rate", "replay rate", 0.25f, 4.0f, 1.0f, "%.2f"},
 };
 
 constexpr ParamDesc kContourParams[] = {
     {"levels", "levels", 3.0f, 24.0f, 10.0f, "%.0f"},
     {"thickness", "thickness", 0.5f, 3.0f, 1.0f, "%.1f"},
-    {"mode", "mode (0=wht 1=blk 2=over)", 0.0f, 2.0f, 2.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 2.0f, "%.0f",
+     "white on black|black on white|overlay"},
 };
 
 constexpr ParamDesc kFlowParticlesParams[] = {
@@ -414,7 +422,7 @@ constexpr ParamDesc kBallParams[] = {
     {"center_x", "center x", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"center_y", "center y", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"shade", "rim shade", 0.0f, 1.0f, 0.35f, "%.2f"},
-    {"backdrop", "keep bg", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"backdrop", "backdrop", 0.0f, 1.0f, 0.0f, "%.0f", "black|keep bg"},
 };
 
 constexpr ParamDesc kSoftUpscaleParams[] = {
@@ -431,14 +439,16 @@ constexpr ParamDesc kPixelSortParams[] = {
     {"threshold", "threshold", 0.0f, 1.0f, 0.4f, "%.2f"},
     {"range", "band range", 0.05f, 1.0f, 0.35f, "%.2f"},
     {"length", "length", 8.0f, 256.0f, 96.0f, "%.0f px"},
-    {"direction", "dir (0=h 1=v)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"direction", "direction", 0.0f, 1.0f, 0.0f, "%.0f",
+     "horizontal|vertical"},
 };
 
 constexpr ParamDesc kWaveWarpParams[] = {
     {"amount", "amount", 0.0f, 64.0f, 12.0f, "%.0f px"},
     {"freq", "frequency", 0.5f, 24.0f, 4.0f, "%.1f"},
     {"speed", "speed", 0.0f, 4.0f, 0.5f, "%.2f hz"},
-    {"mode", "mode (0=h 1=v 2=rip)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "horizontal|vertical|ripple"},
 };
 
 constexpr ParamDesc kCrtSimParams[] = {
@@ -448,18 +458,18 @@ constexpr ParamDesc kCrtSimParams[] = {
     {"triad", "triad size", 2.0f, 8.0f, 3.0f, "%.0f px"},
     // LCD panel: flat rectangular RGB stripes + row gaps, no tube
     // curvature or scanline beam — the laptop/monitor screen-door look.
-    {"panel", "panel (0=crt 1=lcd)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"panel", "panel", 0.0f, 1.0f, 0.0f, "%.0f", "crt|lcd"},
 };
 
 constexpr ParamDesc kHalftoneParams[] = {
     {"dot_px", "dot size", 2.0f, 32.0f, 8.0f, "%.0f px"},
     {"angle", "screen angle", -90.0f, 90.0f, 15.0f, "%.0f deg"},
-    {"mode", "mode (0=ink 1=inv 2=cmyk)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f", "ink|inverse|cmyk"},
     {"gain", "dot gain", 0.5f, 2.0f, 1.0f, "%.2f"},
     {"soft", "softness", 0.0f, 1.0f, 0.15f, "%.2f"},
-    // Screen shapes: dots, line screen (engraving/banknote — thickness
-    // carries tone), or a spiral screen wound from the frame center.
-    {"shape", "screen (0=dot 1=line 2=spiral)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    // Line screen = engraving/banknote (thickness carries tone); spiral
+    // winds from the frame center.
+    {"shape", "screen", 0.0f, 2.0f, 0.0f, "%.0f", "dots|lines|spiral"},
     // Engraving wave: lines bow around image features (luma displaces
     // the screen coordinate before thresholding).
     {"wave", "engrave wave", 0.0f, 1.0f, 0.0f, "%.2f"},
@@ -501,9 +511,9 @@ constexpr ParamDesc kHeadSwitchParams[] = {
 };
 
 constexpr ParamDesc kVhsOsdParams[] = {
-    {"mode", "mode (0=play 1=rec 2=pse 3=ff)", 0.0f, 3.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 3.0f, 0.0f, "%.0f", "play|rec|pause|ff"},
     {"size", "size", 1.0f, 6.0f, 3.0f, "%.0f"},
-    {"counter", "counter", 0.0f, 1.0f, 1.0f, "%.0f"},
+    {"counter", "counter", 0.0f, 1.0f, 1.0f, "%.0f", "off|on"},
 };
 
 constexpr ParamDesc kCamAutoParams[] = {
@@ -520,9 +530,10 @@ constexpr ParamDesc kMosquitoParams[] = {
 };
 
 constexpr ParamDesc kBitPlaneParams[] = {
-    {"op", "op (0=xor 1=and 2=or)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"op", "op", 0.0f, 2.0f, 0.0f, "%.0f", "xor|and|or"},
     {"value", "pattern", 1.0f, 255.0f, 32.0f, "%.0f"},
-    {"channels", "ch (0=rgb 1=r 2=g 3=b)", 0.0f, 3.0f, 0.0f, "%.0f"},
+    {"channels", "channels", 0.0f, 3.0f, 0.0f, "%.0f",
+     "rgb|red|green|blue"},
 };
 
 constexpr ParamDesc kBlockShuffleParams[] = {
@@ -533,7 +544,8 @@ constexpr ParamDesc kBlockShuffleParams[] = {
 };
 
 constexpr ParamDesc kBufferGlitchParams[] = {
-    {"mode", "mode (0=cols 1=shear 2=both)", 0.0f, 2.0f, 2.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 2.0f, "%.0f",
+     "stuck columns|row shear|both"},
     {"amount", "amount", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"density", "density", 0.0f, 1.0f, 0.3f, "%.2f"},
     {"rate", "rate", 0.0f, 30.0f, 4.0f, "%.0f hz"},
@@ -570,7 +582,8 @@ constexpr ParamDesc kEmulsionParams[] = {
 
 constexpr ParamDesc kTimeDisplaceParams[] = {
     {"range", "range", 2.0f, 16.0f, 12.0f, "%.0f frames"},
-    {"mode", "mode (0=dark lags 2=mask)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "dark lags|bright lags|map input"},
     {"smooth", "band dither", 0.0f, 1.0f, 0.3f, "%.2f"},
 };
 
@@ -586,8 +599,8 @@ constexpr ParamDesc kFmSynthParams[] = {
     {"pm", "phase mod (luma)", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"depth", "depth", 0.0f, 64.0f, 16.0f, "%.0f px"},
     {"speed", "speed", 0.0f, 4.0f, 0.5f, "%.2f hz"},
-    // 0/1: scanline warp along x/y; 2: ring mod (multiply by carrier).
-    {"mode", "mode (0=h 1=v 2=ring)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "h scan|v scan|ring mod"},
 };
 
 constexpr ParamDesc kColorizerParams[] = {
@@ -604,8 +617,9 @@ constexpr ParamDesc kSolarizeParams[] = {
 };
 
 constexpr ParamDesc kInvertParams[] = {
-    // 1 = film negative: inversion through the orange print mask.
-    {"mode", "mode (0=inv 1=neg 2=luma)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    // Film negative = inversion through the orange print mask.
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "invert|film negative|luma only"},
     {"amount", "amount", 0.0f, 1.0f, 1.0f, "%.2f"},
 };
 
@@ -619,14 +633,14 @@ constexpr ParamDesc kTwirlParams[] = {
 constexpr ParamDesc kTileParams[] = {
     {"cols", "columns", 1.0f, 8.0f, 2.0f, "%.0f"},
     {"rows_n", "rows", 1.0f, 8.0f, 2.0f, "%.0f"},
-    {"mirror", "mirror", 0.0f, 1.0f, 1.0f, "%.0f"},
+    {"mirror", "mirror", 0.0f, 1.0f, 1.0f, "%.0f", "repeat|mirror"},
 };
 
 constexpr ParamDesc kEmbossParams[] = {
     {"strength", "strength", 0.0f, 4.0f, 1.5f, "%.1f"},
     {"angle", "light angle", -3.1416f, 3.1416f, -2.356f, "%.2f"},
-    // 0 = gray relief; 1 = colored relief added over the image.
-    {"mode", "mode (0=gray 1=color)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f",
+     "gray relief|color relief"},
 };
 
 constexpr ParamDesc kLensFlareParams[] = {
@@ -642,7 +656,7 @@ constexpr ParamDesc kLidarParams[] = {
     // dots stamp the source onto a persisting phosphor canvas. Scatter
     // samples everywhere; spin sweeps a rotating beam from center; sweep
     // marches a raster column across the frame.
-    {"mode", "mode (0=scatter 1=spin 2=swp)", 0.0f, 2.0f, 1.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 1.0f, "%.0f", "scatter|spin|sweep"},
     {"amount", "density", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"dot_px", "dot size", 1.0f, 8.0f, 2.0f, "%.1f px"},
     {"persist", "persistence", 0.0f, 0.98f, 0.9f, "%.2f"},
@@ -656,7 +670,7 @@ constexpr ParamDesc kVelocityScanParams[] = {
     // Velocity-modulated scanning (dwell-time rendering): sweeping line
     // fronts brake over brightness, so the image emerges as accumulated
     // dwell on a phosphor canvas. Stateful (front field + canvas).
-    {"mode", "mode (0=cols 1=rows)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "cols|rows"},
     {"speed", "sweep speed", 20.0f, 600.0f, 240.0f, "%.0f px/s"},
     {"stick", "stickiness", 0.0f, 1.0f, 0.75f, "%.2f"},
     {"persist", "persistence", 0.0f, 0.98f, 0.92f, "%.2f"},
@@ -670,7 +684,7 @@ constexpr ParamDesc kSlowScanParams[] = {
     // SSTV / slow-scan TV: a beam crawls the frame replacing the held
     // previous image line by line; one full frame takes `period` seconds.
     {"period", "scan period", 0.5f, 20.0f, 6.0f, "%.1f s"},
-    {"mode", "mode (0=rows 1=cols)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "rows|cols"},
     {"beam", "beam glow", 0.0f, 1.0f, 0.6f, "%.2f"},
     {"noise", "sync noise", 0.0f, 1.0f, 0.4f, "%.2f"},
     {"dim", "dim unscanned", 0.0f, 1.0f, 0.15f, "%.2f"},
@@ -691,7 +705,8 @@ constexpr ParamDesc kVectorTraceParams[] = {
 constexpr ParamDesc kScopeParams[] = {
     // Broadcast scopes as aesthetic: luma waveform, RGB parade, or the
     // chroma vectorscope, dots accumulating on decaying phosphor.
-    {"mode", "mode (0=wave 1=parade 2=vec)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "waveform|parade|vectorscope"},
     {"gain", "gain", 0.5f, 2.0f, 1.0f, "%.2f"},
     {"glow", "trace glow", 0.0f, 1.0f, 0.6f, "%.2f"},
     {"persist", "persistence", 0.0f, 0.98f, 0.85f, "%.2f"},
@@ -713,7 +728,7 @@ constexpr ParamDesc kAudioScopeParams[] = {
     // The soundtrack itself traced over the frame — the engine supplies a
     // per-frame min/max waveform strip sampled from the PCM sidecar.
     {"window", "window", 0.05f, 2.0f, 0.5f, "%.2f s"},
-    {"mode", "mode (0=fill 1=mirror 2=line)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f", "fill|mirror|line"},
     {"thick", "edge", 1.0f, 6.0f, 2.0f, "%.0f px"},
     {"height", "height", 0.05f, 1.0f, 0.35f, "%.2f"},
     {"pos_y", "position", 0.0f, 1.0f, 0.5f, "%.2f"},
@@ -736,9 +751,9 @@ constexpr ParamDesc kModulateParams[] = {
     {"lowpass", "lowpass", 0.0f, 1.0f, 0.15f, "%.2f"},
     // Sign = direction (the march integrates from the spawn edge).
     {"speed", "travel speed", -10.0f, 10.0f, 0.3f, "%.2f hz"},
-    {"mode", "mode (0=h 1=v)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "horizontal|vertical"},
     {"line_w", "line width", 0.5f, 3.0f, 1.0f, "%.1f px"},
-    {"channels", "channels", 1.0f, 4.0f, 1.0f, "%.0f"},
+    {"channels", "channels", 1.0f, 4.0f, 1.0f, "%.0f", "1|2|3|4"},
     {"spread", "channel spread", 0.0f, 1.0f, 0.3f, "%.2f"},
     // 0 = one luma signal, white traces; 1 = R/G/B modulated as three
     // separate signals (GenerateMe fm.pde style) — lines split chromatic
@@ -755,7 +770,8 @@ constexpr ParamDesc kAnaglyphParams[] = {
     // bright (near) subjects pop harder than the shadows behind them.
     {"depth", "disparity", 0.0f, 30.0f, 10.0f, "%.0f px"},
     {"pop", "luma pop", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"mode", "mode (0=r/c 1=r/b 2=g/m)", 0.0f, 2.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "red/cyan|red/blue|green/magenta"},
 };
 
 constexpr ParamDesc kPhotocopyParams[] = {
@@ -794,7 +810,7 @@ constexpr ParamDesc kReededGlassParams[] = {
     {"flutes", "flute width", 8.0f, 160.0f, 48.0f, "%.0f px"},
     {"refract", "refraction", 0.0f, 1.0f, 0.6f, "%.2f"},
     {"soften", "soften", 0.0f, 1.0f, 0.3f, "%.2f"},
-    {"mode", "mode (0=vert 1=horiz)", 0.0f, 1.0f, 0.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "vertical|horizontal"},
 };
 
 constexpr ParamDesc kWatercolorParams[] = {
@@ -826,6 +842,131 @@ constexpr ParamDesc kRidgelineParams[] = {
     {"soften", "soften", 0.0f, 1.0f, 0.3f, "%.2f"},
     {"fill", "fill", 0.0f, 1.0f, 0.9f, "%.2f"},
     {"color", "source color", 0.0f, 1.0f, 0.0f, "%.2f"},
+};
+
+constexpr ParamDesc kBlendNodeParams[] = {
+    // Graph merge node (docs/flow_canvas.md v3): blends the B aux input
+    // over In. Wet/opacity give the mix amount; the mode is the operator.
+    {"mode", "mode", 0.0f, 8.0f, 0.0f, "%.0f",
+     "normal|add|multiply|screen|difference|subtract|darken|lighten|"
+     "overlay"},
+};
+
+constexpr ParamDesc kMatteParams[] = {
+    // Matte maker (v5.2 — masks ARE images): turns any image into a
+    // grayscale matte, ready for a mask anchor or more processing.
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "luma|bright key|chroma key"},
+    {"key", "key center", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"range", "key range", 0.01f, 1.0f, 0.25f, "%.2f"},
+    {"black", "black point", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"white", "white point", 0.0f, 1.0f, 1.0f, "%.2f"},
+    {"gamma", "gamma", 0.2f, 5.0f, 1.0f, "%.2f"},
+    {"invert", "invert", 0.0f, 1.0f, 0.0f, "%.2f"},
+};
+
+// ---- The PRIMITIVES batch (docs/flow_canvas.md v5.5): the single-job
+// nodes previously buried inside compound effects.
+
+constexpr ParamDesc kLevelsParams[] = {
+    // Classic levels: input black/white remap + gamma + output range.
+    // Contrast, brightness, and fade all fall out of five knobs.
+    {"black", "in black", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"white", "in white", 0.0f, 1.0f, 1.0f, "%.2f"},
+    {"gamma", "gamma", 0.2f, 5.0f, 1.0f, "%.2f"},
+    {"out_black", "out black", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"out_white", "out white", 0.0f, 1.0f, 1.0f, "%.2f"},
+};
+
+constexpr ParamDesc kHueSatParams[] = {
+    {"hue", "hue shift", -180.0f, 180.0f, 0.0f, "%.0f deg"},
+    {"sat", "saturation", 0.0f, 2.0f, 1.0f, "%.2f"},
+    {"lite", "lightness", -1.0f, 1.0f, 0.0f, "%+.2f"},
+};
+
+constexpr ParamDesc kChannelMixParams[] = {
+    // Output channel sources: 0 R, 1 G, 2 B, 3 luma. Swaps (aerochrome),
+    // duplicated channels, and luma-mono all fall out of three picks.
+    {"r_from", "red from", 0.0f, 3.0f, 0.0f, "%.0f",
+     "red|green|blue|luma"},
+    {"g_from", "green from", 0.0f, 3.0f, 1.0f, "%.0f",
+     "red|green|blue|luma"},
+    {"b_from", "blue from", 0.0f, 3.0f, 2.0f, "%.0f",
+     "red|green|blue|luma"},
+    {"amount", "amount", 0.0f, 1.0f, 1.0f, "%.2f"},
+};
+
+constexpr ParamDesc kPosterizeParams[] = {
+    // Tone mode posterizes the luma only — hue survives, tones band.
+    {"levels", "levels", 2.0f, 16.0f, 4.0f, "%.0f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "rgb|tone"},
+};
+
+constexpr ParamDesc kThresholdParams[] = {
+    {"threshold", "threshold", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"soft", "softness", 0.0f, 1.0f, 0.05f, "%.2f"},
+    {"invert", "invert", 0.0f, 1.0f, 0.0f, "%.2f"},
+};
+
+constexpr ParamDesc kPaletteMapParams[] = {
+    // The Quantizer's palette lock without the level snap or dither:
+    // nearest palette color only. Duotone hues from the two knobs.
+    {"palette", "palette", 0.0f, 4.0f, 4.0f, "%.0f",
+     "game boy|cga|nes|teletext|duotone"},
+    {"pal_hue_a", "duo hue a", 0.0f, 1.0f, 0.08f, "%.2f"},
+    {"pal_hue_b", "duo hue b", 0.0f, 1.0f, 0.55f, "%.2f"},
+};
+
+constexpr ParamDesc kDitherParams[] = {
+    // The Quantizer's ordered-pattern engine (spec §6.2), standalone:
+    // 0-2 bayer 2/4/8, 3 white, 4 blue noise, 5 STBN, 6 moire, 7 spiral,
+    // 8 radial rings, 9 diamond cluster. Same shared pattern-transform
+    // controls (boil / scroll / rotate / scale / motion lock).
+    {"levels", "levels", 2.0f, 16.0f, 2.0f, "%.0f"},
+    {"pattern", "pattern", 0.0f, 9.0f, 2.0f, "%.0f",
+     "bayer 2|bayer 4|bayer 8|white noise|blue noise|stbn|moire|spiral|"
+     "rings|diamond"},
+    {"amount", "amount", 0.0f, 1.0f, 1.0f, "%.2f"},
+    {"boil_hz", "boil rate", 0.0f, 30.0f, 0.0f, "%.0f hz"},
+    {"scroll", "pattern scroll", 0.0f, 64.0f, 0.0f, "%.0f px/s"},
+    {"pat_rotate", "pattern rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
+    {"pat_scale", "pattern scale", 1.0f, 4.0f, 1.0f, "%.2f x"},
+    {"lock", "lock", 0.0f, 1.0f, 0.0f, "%.0f", "screen|motion"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "rgb|gray"},
+};
+
+constexpr ParamDesc kTransformParams[] = {
+    // Mid-chain affine (the layer transform, available anywhere in the
+    // graph). Offsets are frame fractions; edges decide what fills the
+    // uncovered region.
+    {"scale", "scale", 0.1f, 8.0f, 1.0f, "%.2f x"},
+    {"angle", "rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
+    {"pos_x", "offset x", -1.0f, 1.0f, 0.0f, "%+.2f"},
+    {"pos_y", "offset y", -1.0f, 1.0f, 0.0f, "%+.2f"},
+    {"edge_mode", "edges", 0.0f, 3.0f, 1.0f, "%.0f",
+     "black|clamp|wrap|mirror"},
+    {"flip", "flip", 0.0f, 3.0f, 0.0f, "%.0f",
+     "none|horizontal|vertical|both"},
+};
+
+constexpr ParamDesc kFrameDelayParams[] = {
+    {"frames", "delay", 0.0f, 15.0f, 4.0f, "%.0f frames"},
+};
+
+constexpr ParamDesc kTextOverlayParams[] = {
+    // Text burn-in from runtime TTFs (v5.5b: assets/fonts/*.ttf, sorted
+    // by filename — drop a font in, it's index N). The string itself
+    // lives in EffectInstance::text. Size is px at frame height
+    // (proxy-safe: the kernel works in uv).
+    {"font", "font (file # a-z)", 0.0f, 7.0f, 0.0f, "%.0f"},
+    {"size", "size", 12.0f, 400.0f, 90.0f, "%.0f px"},
+    {"pos_x", "position x", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"pos_y", "position y", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"angle", "rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
+    {"hue", "hue", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"sat", "saturation", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"lite", "brightness", 0.0f, 1.0f, 1.0f, "%.2f"},
+    {"outline", "outline", 0.0f, 1.0f, 0.25f, "%.2f"},
 };
 
 constexpr EffectInfo kEffectInfos[] = {
@@ -963,6 +1104,18 @@ constexpr EffectInfo kEffectInfos[] = {
     {"audio_scope", "Audio Scope", kAudioScopeParams, 7,
      FxCategory::Overlay},
     {"modulate", "Modulation", kModulateParams, 10, FxCategory::Mosaic},
+    {"blend_node", "Blend", kBlendNodeParams, 1, FxCategory::Overlay},
+    {"matte", "Matte", kMatteParams, 7, FxCategory::Color},
+    {"levels", "Levels", kLevelsParams, 5, FxCategory::Color},
+    {"hue_sat", "Hue/Sat", kHueSatParams, 3, FxCategory::Color},
+    {"channel_mix", "Channels", kChannelMixParams, 4, FxCategory::Color},
+    {"posterize", "Posterize", kPosterizeParams, 2, FxCategory::Color},
+    {"threshold", "Threshold", kThresholdParams, 3, FxCategory::Color},
+    {"palette_map", "Palette Map", kPaletteMapParams, 3, FxCategory::Color},
+    {"dither", "Dither", kDitherParams, 9, FxCategory::Color},
+    {"transform", "Transform", kTransformParams, 6, FxCategory::Warp},
+    {"delay", "Frame Delay", kFrameDelayParams, 1, FxCategory::Time},
+    {"text", "Text", kTextOverlayParams, 9, FxCategory::Overlay},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));
@@ -990,6 +1143,8 @@ EffectInstance make_effect(Document& doc, EffectType type) {
     fx.params.reserve(info.param_count);
     for (uint32_t i = 0; i < info.param_count; ++i)
         fx.params.push_back(info.params[i].default_value);
+    // A fresh Text node must be visible before its string is edited.
+    if (type == EffectType::TextOverlay) fx.text = "TEXT";
     return fx;
 }
 
@@ -1017,6 +1172,7 @@ bool effect_uses_history(EffectType type) {
         case EffectType::VectorTrace:    // phosphor canvas
         case EffectType::ScopeMonitor:   // phosphor canvas
         case EffectType::SecurityMux:    // past-frames ring
+        case EffectType::FrameDelay:     // past-frames ring
             return true;
         default:
             return false;
@@ -1029,6 +1185,14 @@ namespace {
 // dither mode (9), whose Gray-Scott state accumulates across frames.
 bool instance_uses_history(const EffectInstance& fx) {
     if (effect_uses_history(fx.type)) return true;
+    // Motion-locked dither advects the pattern along the flow field
+    // (previous-frame luma) — history in that mode only.
+    if (fx.type == EffectType::Quantize && fx.params.size() > 8 &&
+        fx.params[8] >= 0.5f)
+        return true;
+    if (fx.type == EffectType::Dither && fx.params.size() > 7 &&
+        fx.params[7] >= 0.5f)
+        return true;
     return fx.type == EffectType::Quantize && fx.params.size() > 2 &&
            fx.params[2] >= 8.5f;
 }

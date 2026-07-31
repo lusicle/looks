@@ -17,7 +17,40 @@ struct ParamDesc {
     float max_value;
     float default_value;
     const char* format;    // slider readout, printf-style
+    // Discrete selector options, '|'-separated ("luma|bright key|...") in
+    // value order from min_value — non-null turns the row into a DROPDOWN
+    // on the canvas card and in the inspector (v5.6 real controls).
+    // Continuous params leave it null and keep the slider.
+    const char* options = nullptr;
 };
+
+// '|'-separated option helpers (v5.6): count, and the start/length of
+// entry `index` (clamped). Header-inline so the canvas and the rail share
+// one parse.
+inline int param_option_count(const char* options) {
+    if (!options || !*options) return 0;
+    int n = 1;
+    for (const char* c = options; *c; ++c)
+        if (*c == '|') ++n;
+    return n;
+}
+
+inline const char* param_option_at(const char* options, int index,
+                                   int* length) {
+    const char* start = options;
+    const char* c = options;
+    int i = 0;
+    for (;; ++c) {
+        if (*c == '|' || *c == '\0') {
+            if (i == index || *c == '\0') {
+                *length = static_cast<int>(c - start);
+                return start;
+            }
+            ++i;
+            start = c + 1;
+        }
+    }
+}
 
 // Spec §6.1 effect families — drives the grouped add-effect browser.
 enum class FxCategory : uint8_t {

@@ -1,6 +1,7 @@
-// Undoable group mutations (spec §5: the Group node collapses a sub-stack
-// and exposes macro knobs). Membership is EffectInstance::group_id; these
-// commands keep that tag and the Layer::groups list consistent.
+// Undoable group mutations (spec §5, v5.3: the Group node collapses a
+// sub-stack and exposes member params on its face as direct aliases).
+// Membership is EffectInstance::group_id; these commands keep that tag
+// and the Layer::groups list consistent.
 
 #pragma once
 
@@ -32,16 +33,16 @@ std::unique_ptr<Command> set_effect_group_command(size_t layer_index,
                                                   size_t effect_index,
                                                   uint64_t group_id);
 
-// Name / folded / bypass / macro values+targets, matched by group id.
-// Merges per group so macro-knob drags coalesce into one undo step.
+// Name / folded / bypass / exposed face, matched by group id. Merges per
+// group so repeated edits coalesce into one undo step.
 std::unique_ptr<Command> set_group_props_command(size_t layer_index,
                                                  Group updated);
 
-std::unique_ptr<Command> add_macro_command(size_t layer_index,
-                                           uint64_t group_id, MacroKnob knob);
-std::unique_ptr<Command> remove_macro_command(size_t layer_index,
-                                              uint64_t group_id,
-                                              size_t macro_index);
+// Toggle one member param on/off the group face (texed expose).
+std::unique_ptr<Command> set_group_exposed_command(size_t layer_index,
+                                                   uint64_t group_id,
+                                                   ParamKey key,
+                                                   bool exposed);
 
 // Append a whole group (its member effects + the Group entry) to a layer's
 // stack — the preset-instantiation path. Effects must already carry

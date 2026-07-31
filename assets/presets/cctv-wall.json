@@ -1,34 +1,97 @@
 {
   "looks_preset": 1,
   "name": "cctv wall",
-  "tags": ["video", "surveillance", "multicam"],
+  "tags": [
+    "video",
+    "surveillance",
+    "multicam"
+  ],
   "group": {
     "id": 100,
     "name": "cctv wall",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "grime",
-        "value": 0.3,
-        "targets": [
-          {"effect": 3, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "exp"},
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"}
-        ]
+        "effect": 3,
+        "param": 0
       },
       {
-        "name": "delay",
-        "value": 1.0,
-        "targets": [
-          {"effect": 1, "param": 2, "lo": 0.0, "hi": 1.0, "curve": "linear"}
-        ]
+        "effect": 2,
+        "param": 0
+      },
+      {
+        "effect": 1,
+        "param": 2
       }
     ]
   },
   "effects": [
-    {"type": "security_mux", "id": 1, "params": [3, 3, 0.0, 0.75, 0.9]},
-    {"type": "interlace", "id": 2, "params": [2.0, 0.25, 0], "wet": 0.7},
-    {"type": "analog_snow", "id": 3, "params": [0.1, 12, 0.12], "wet": 0.8},
-    {"type": "timestamp", "id": 4, "params": [0, 2, 3]}
+    {
+      "type": "security_mux",
+      "id": 1,
+      "params": [
+        3,
+        3,
+        1,
+        0.75,
+        0.89999997615814209
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "interlace",
+      "id": 2,
+      "params": [
+        3.9200000762939453,
+        0.25,
+        0
+      ],
+      "wet": 0.69999998807907104,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "analog_snow",
+      "id": 3,
+      "params": [
+        0.14500001072883606,
+        12,
+        0.11999999731779099
+      ],
+      "wet": 0.80000001192092896,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "timestamp",
+      "id": 4,
+      "params": [
+        0,
+        2,
+        3
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

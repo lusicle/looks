@@ -1,8 +1,8 @@
-// Preset files (spec §5/§10): a saved group IS an "era preset" — one JSON
-// file holding a Group (macros included) plus its member effects, tagged
-// and searchable in the browser. Instantiating mints fresh document ids and
-// rewrites macro targets so a preset can be dropped into any project any
-// number of times.
+// Preset files (spec §5/§10, v5.3): a saved group IS an "era preset" —
+// one JSON file holding a Group (exposed face included) plus its member
+// effects, tagged and searchable in the browser. Instantiating mints
+// fresh document ids and rewrites the face keys so a preset can be
+// dropped into any project any number of times.
 
 #pragma once
 
@@ -40,8 +40,8 @@ std::vector<Preset> scan_presets(const std::filesystem::path& dir);
 Preset make_preset_from_group(const Document& doc, size_t layer_index,
                               uint64_t group_id);
 
-// Mint fresh ids from doc.next_effect_id and rewrite group_id / macro
-// targets; the results feed insert_group_command.
+// Mint fresh ids from doc.next_effect_id and rewrite group_id / face
+// keys; the results feed insert_group_command.
 void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
                         std::vector<EffectInstance>* out_effects);
 

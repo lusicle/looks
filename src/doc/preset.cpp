@@ -88,17 +88,15 @@ Preset make_preset_from_group(const Document& doc, size_t layer_index,
             p.effects.push_back(fx);
             p.effects.back().mask_id = 0;
         }
-    // Keep only macro targets that point at captured members.
-    for (MacroKnob& knob : p.group.macros) {
-        std::vector<MacroTarget> kept;
-        for (const MacroTarget& t : knob.targets)
-            for (const EffectInstance& fx : p.effects)
-                if (fx.id == t.effect_id) {
-                    kept.push_back(t);
-                    break;
-                }
-        knob.targets = std::move(kept);
-    }
+    // Keep only exposed face params that point at captured members.
+    std::vector<ParamKey> kept;
+    for (const ParamKey& k : p.group.exposed)
+        for (const EffectInstance& fx : p.effects)
+            if (fx.id == k.effect_id) {
+                kept.push_back(k);
+                break;
+            }
+    p.group.exposed = std::move(kept);
     return p;
 }
 
@@ -117,16 +115,23 @@ void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
         fx.group_id = group.id;
         fx.mask_id = 0;
     }
-    for (MacroKnob& knob : group.macros) {
-        std::vector<MacroTarget> kept;
-        for (MacroTarget t : knob.targets) {
-            auto it = remap.find(t.effect_id);
-            if (it == remap.end()) continue;
-            t.effect_id = it->second;
-            kept.push_back(t);
-        }
-        knob.targets = std::move(kept);
+    std::vector<ParamKey> exposed;
+    for (ParamKey k : group.exposed) {
+        auto it = remap.find(k.effect_id);
+        if (it == remap.end()) continue;
+        k.effect_id = it->second;
+        exposed.push_back(k);
     }
+    group.exposed = std::move(exposed);
+    // Boundary bindings remap too; default to the chain ends.
+    if (auto it = remap.find(group.face_in); it != remap.end())
+        group.face_in = it->second;
+    else
+        group.face_in = effects.empty() ? 0 : effects.front().id;
+    if (auto it = remap.find(group.face_out); it != remap.end())
+        group.face_out = it->second;
+    else
+        group.face_out = effects.empty() ? 0 : effects.back().id;
     *out_group = std::move(group);
     *out_effects = std::move(effects);
 }

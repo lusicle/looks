@@ -1,33 +1,92 @@
 {
   "looks_preset": 1,
   "name": "teletext",
-  "tags": ["broadcast", "mosaic", "retro"],
+  "tags": [
+    "broadcast",
+    "mosaic",
+    "retro"
+  ],
   "group": {
     "id": 100,
     "name": "teletext",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "cell",
-        "value": 0.33,
-        "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "linear"}
-        ]
+        "effect": 2,
+        "param": 0
       },
       {
-        "name": "tube",
-        "value": 0.4,
-        "targets": [
-          {"effect": 3, "param": 1, "lo": 0.0, "hi": 0.8, "curve": "linear"},
-          {"effect": 3, "param": 2, "lo": 0.0, "hi": 0.6, "curve": "linear"}
-        ]
+        "effect": 3,
+        "param": 1
+      },
+      {
+        "effect": 3,
+        "param": 2
       }
     ]
   },
   "effects": [
-    {"type": "quantize", "id": 1, "params": [4, 5, 1, 0.6, 6]},
-    {"type": "glyph", "id": 2, "params": [12, 4, 1, 0]},
-    {"type": "crt_sim", "id": 3, "params": [0.3, 0.3, 0.25, 3, 0], "wet": 0.8}
+    {
+      "type": "quantize",
+      "id": 1,
+      "params": [
+        4,
+        5,
+        1,
+        0.60000002384185791,
+        6,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0.079999998211860657,
+        0.55000001192092896
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "glyph",
+      "id": 2,
+      "params": [
+        16.950000762939453,
+        4,
+        1,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "crt_sim",
+      "id": 3,
+      "params": [
+        0.30000001192092896,
+        0.62000000476837158,
+        0.49000000953674316,
+        3,
+        0
+      ],
+      "wet": 0.80000001192092896,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

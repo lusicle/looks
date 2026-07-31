@@ -136,7 +136,10 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     layer.id = doc.next_effect_id++;
     layer.source = kind;
     static const char* kNames[] = {"clip",    "solid", "gradient", "noise",
-                                   "pattern", "osc",   "adjust"};
+                                   "pattern", "osc",   "adjust",   "shape"};
+    static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
+                      static_cast<size_t>(LayerSourceKind::Count),
+                  "layer names track the enum");
     layer.name = std::string(kNames[static_cast<size_t>(kind)]) + " " +
                  std::to_string(layer.id);
     // Generators default to half opacity so adding one doesn't blank the
@@ -151,6 +154,14 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
         layer.gen_scale = 8.0f;
         layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
+    }
+    if (kind == LayerSourceKind::Shape) {
+        // A matte maker: white on black, a visible size, a soft edge
+        // (gen_scale = size, gen_angle = feather — see gen.comp.slang).
+        layer.gen_scale = 6.0f;
+        layer.gen_angle = 0.35f;
+        layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
+        layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
     }
     return layer;
 }

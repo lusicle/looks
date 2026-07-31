@@ -1,34 +1,113 @@
 {
   "looks_preset": 1,
   "name": "portra-ish",
-  "tags": ["film", "portrait", "warm", "era"],
+  "tags": [
+    "film",
+    "portrait",
+    "warm",
+    "era"
+  ],
   "group": {
     "id": 100,
     "name": "portra-ish",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "fade",
-        "value": 0.25,
-        "targets": [
-          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.6, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 3
       },
       {
-        "name": "bloom",
-        "value": 0.2,
-        "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.35, "curve": "scurve"}
-        ]
+        "effect": 2,
+        "param": 0
       }
     ]
   },
   "effects": [
-    {"type": "colorscience", "id": 1, "params": [2, 0.0, 0.05, 0.1, 0.35]},
-    {"type": "glow", "id": 2, "params": [0.5, 22, 0.6, 0, 0]},
-    {"type": "grain", "id": 3, "params": [0.22, 1.8, 0.4, 0]},
-    {"type": "corner_soft", "id": 5, "params": [0.3, 0.5, 0.25]},
-    {"type": "vignette", "id": 4, "params": [0.35, 0.65, 0.5]}
+    {
+      "type": "colorscience",
+      "id": 1,
+      "params": [
+        2,
+        0,
+        0.05000000074505806,
+        0.25,
+        0.34999999403953552
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "glow",
+      "id": 2,
+      "params": [
+        0.60920000076293945,
+        22,
+        0.60000002384185791,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "grain",
+      "id": 3,
+      "params": [
+        0.2199999988079071,
+        1.7999999523162842,
+        0.40000000596046448,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "corner_soft",
+      "id": 5,
+      "params": [
+        0.30000001192092896,
+        0.5,
+        0.25
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "vignette",
+      "id": 4,
+      "params": [
+        0.34999999403953552,
+        0.64999997615814209,
+        0.5
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

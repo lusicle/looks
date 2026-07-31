@@ -1,0 +1,303 @@
+// Node canvas (docs/flow_canvas.md v2) — the full node editor. Document-
+// agnostic: the app translates the document into a flow::Graph each frame
+// (positions from the document, derived auto-layout for unplaced nodes)
+// and turns flow::Output events + staged param edits into commands. The
+// widget owns pan/zoom, card chrome, inline sliders, ports, and wires —
+// drawn entirely with Canvas2D primitives in graph space.
+
+#pragma once
+
+#include <cstdint>
+
+#include "ui/layout.h"
+
+namespace looks::ui {
+struct UiTexture;
+}
+
+namespace looks::flow {
+
+enum class NodeKind : uint8_t {
+    Source, Effect, Mask, ModSource, Output,
+    Frame,    // id-tag space for FrameBox move events only
+    Group,    // doc::Group as one card (v4 subgraphs)
+    GroupIn,  // boundary nodes inside the OPEN group's scoped view
+    GroupOut, // (texed sgin/sgout) — derived, never move or delete
+};
+
+// Node identity: tag byte | document id (effect/mask/route ids come from
+// separate counters and may collide across kinds).
+inline uint64_t node_id(NodeKind kind, uint64_t doc_id) {
+    return (static_cast<uint64_t>(kind) + 1ull) << 56 |
+           (doc_id & 0x00FFFFFFFFFFFFFFull);
+}
+inline constexpr uint64_t kOutNodeId = 0xFFull << 56;
+
+// One inline parameter row. The canvas writes staged/changed/released
+// during slider drags — the app's existing post-frame handlers apply them
+// as coalesced commands, exactly like the panel sliders did.
+struct ParamRow {
+    const char* label = "";
+    float min_v = 0.0f, max_v = 1.0f;
+    const char* format = "%.2f";
+    float* staged = nullptr;
+    bool* changed = nullptr;
+    bool* released = nullptr;
+    // Row kind (v5.6 real controls): 0 slider; 1 dropdown — `options` is
+    // a '|'-separated list, *staged holds the index, a pick stages it
+    // exactly like a slider release; 2 text — `text` shows in the field,
+    // a click emits Output::text_edit (the shared inline editor draws in
+    // the field while active). Same geometry as slider rows.
+    uint8_t kind = 0;
+    const char* options = nullptr;
+    const char* text = nullptr;
+    // Row micro-hotspots; null hides each.
+    bool* route_clicked = nullptr;
+    bool* key_clicked = nullptr;
+    // Scoped-view member rows (v5.3): toggle this param on/off the open
+    // group's FACE; `exposed` fills the dot.
+    bool* expose_clicked = nullptr;
+    bool exposed = false;
+    bool modulated = false;          // tint the label: driven by a route
+    bool keyed = false;              // tint the label: has a keyframe lane
+};
+
+struct Node {
+    uint64_t id = 0;
+    NodeKind kind = NodeKind::Effect;
+    const char* title = "";
+    float x = 0.0f, y = 0.0f;        // graph units (top-left)
+    uint8_t tint = 255;              // category strip; 255 = none
+    bool bypassed = false;
+    bool solo = false;
+    bool feedback = false;           // self-loop glyph in the title bar
+    bool has_in = false;
+    bool has_mask_port = false;
+    bool has_aux_port = false;   // second image input (v3 N-ports)
+    const char* aux_label = "b"; // port name on the card ("b", "map")
+    bool has_out = false;
+    // Live preview: an atlas cell (draw_image_quad); null = flat slot.
+    const ui::UiTexture* preview = nullptr;
+    float pu0 = 0.0f, pv0 = 0.0f, pu1 = 1.0f, pv1 = 1.0f;
+    const ParamRow* rows = nullptr;
+    int row_count = 0;
+    // Title-bar actions, staged per frame by the app.
+    bool* remove_clicked = nullptr;  // X (null hides it)
+    bool* bypass_clicked = nullptr;  // enable dot
+    // Text node (v5.5): a title double-click edits the STRING (the same
+    // inline editor groups use for renames).
+    bool text_edit = false;
+};
+
+// kind: 0 = chain (solid, In port), 1 = mask (dashed, Mask port),
+// 2 = mod (dashed dim), 3 = aux (solid, "b" port).
+struct Wire {
+    uint64_t from = 0;   // leaves from's Out port
+    uint64_t to = 0;
+    uint8_t kind = 0;
+    // Mod wires land on the driven PARAM's row (docs/flow_canvas.md v4)
+    // instead of the card edge; -1 = no row (card-edge fallback).
+    int to_row = -1;
+};
+
+// Titled grouping box (texed frames): drawn behind the cards, dragged by
+// its title strip, removed via its X. Pure annotation.
+struct FrameBox {
+    uint64_t id = 0;
+    float x = 0.0f, y = 0.0f, w = 480.0f, h = 360.0f;
+    const char* title = "";
+    uint32_t color = 0;              // 0 none, 1..8 palette hue
+    bool* remove_clicked = nullptr;
+    bool* color_clicked = nullptr;   // title-strip dot cycles the tag
+};
+
+struct Graph {
+    const Node* nodes = nullptr;
+    size_t node_count = 0;
+    const Wire* wires = nullptr;
+    size_t wire_count = 0;
+    const FrameBox* frames = nullptr;
+    size_t frame_count = 0;
+    uint64_t selected = 0;
+    // Multi-selection (texed): every id here draws the accent outline;
+    // group move/delete operate on the set. `selected` stays the primary.
+    const uint64_t* multi = nullptr;
+    size_t multi_count = 0;
+    // Add-menu content (texed openAddMenu): the app passes the FILTERED
+    // effect labels each frame plus the live filter text to display.
+    // add_headers marks category header rows (dim, never pickable).
+    const char* const* add_items = nullptr;
+    size_t add_count = 0;
+    const char* add_filter = "";
+    const uint8_t* add_headers = nullptr;
+    // Context-menu content (texed popupMenu): the app builds the item
+    // list for state.ctx_target each frame while the menu is open.
+    const char* const* ctx_items = nullptr;
+    size_t ctx_count = 0;
+    // Selected wires (click / marquee, texed sel.links): matched by
+    // endpoints + kind (to_row ignored). Draw accent, Delete cuts all.
+    const Wire* sel_wires = nullptr;
+    size_t sel_wire_count = 0;
+    // Inline frame rename in flight: that frame draws rename_text + caret
+    // instead of its title (the app owns the edit buffer). rename_node
+    // does the same for a group CARD's title (texed subgraph rename).
+    uint64_t rename_frame = 0;
+    uint64_t rename_node = 0;
+    const char* rename_text = "";
+    // Inline value edit (texed click-to-type): this node+row draws the
+    // typed buffer + caret instead of its formatted value.
+    uint64_t value_edit_node = 0;
+    int value_edit_row = -1;
+    const char* value_edit_text = "";
+    // Subgraph view (texed breadcrumbs): non-null = the canvas is scoped
+    // to an open group of this name; "main" in the crumb exits.
+    const char* crumb = nullptr;
+};
+
+struct CanvasState {
+    // View transform: screen = graph * zoom + pan.
+    float pan_x = 0.0f, pan_y = 0.0f;
+    float zoom = 1.0f;
+    bool view_inited = false;        // first frame: fit content
+    uint64_t hover = 0;
+    // Interaction in flight (element addressed by node id + row).
+    // 4 = wire from an Out port, 5 = rewire (grabbed a fed In/Mask port),
+    // 6 = marquee (shift+drag on empty canvas), 7 = frame corner resize.
+    uint8_t drag_kind = 0;           // 0 none, 1 node, 2 pan, 3 slider
+    uint64_t drag_id = 0;
+    int drag_row = -1;
+    uint64_t wire_from = 0;          // wire drag origin node
+    uint64_t wire_old_to = 0;        // rewire: the grabbed link's consumer
+    uint32_t wire_old_port = 0;
+    Vec2 press_screen{};
+    float node_grab_x = 0.0f, node_grab_y = 0.0f;   // grab offset (graph)
+    bool drag_moved = false;
+    // Double-click detection (frame-count based; UI clock, not timeline).
+    uint64_t last_click_frame = 0;
+    Vec2 last_click_pos{};
+    uint64_t last_click_id = 0;      // what the click landed on
+    // Cursor tracking published every frame: paste-at-cursor and the
+    // find popup anchor read these outside canvas event flow.
+    Vec2 last_mouse{};
+    float last_gx = 0.0f, last_gy = 0.0f;
+    // One-shot: pan so this node is centered (find jump); 0 = idle.
+    uint64_t center_on = 0;
+    // Add menu at the cursor (texed): open state + anchor (screen) +
+    // spawn point (graph) + the wire being spliced (0 0 0 = none). The
+    // app closes it by clearing add_open (Escape, add applied).
+    bool add_open = false;
+    Vec2 add_anchor{};
+    float add_gx = 0.0f, add_gy = 0.0f;
+    float add_scroll = 0.0f;
+    // With no filter the popup lists CATEGORY rows; the hovered one
+    // opens a flyout submenu (user request). Flat index of the open
+    // category header; -1 = none. Typing collapses to the flat list.
+    int add_cat = -1;
+    uint64_t splice_from = 0, splice_to = 0;
+    uint32_t splice_port = 0;
+    // Param dropdown popup (v5.6): the open field's node/row + its
+    // screen rect captured at open time. Esc/click-away closes.
+    bool dd_open = false;
+    uint64_t dd_node = 0;
+    int dd_row = -1;
+    ui::Rect dd_field{};
+    // Splice-on-drop (texed _findSpliceLink): while dragging a single
+    // unfed node over a wire, that wire highlights and a drop splices.
+    uint64_t drag_splice_from = 0, drag_splice_to = 0;
+    uint32_t drag_splice_port = 0;
+    // Context menu (texed openNodeMenu/openFrameMenu): open state +
+    // anchor (screen) + the card/frame it targets (node_id tagged).
+    bool ctx_open = false;
+    Vec2 ctx_anchor{};
+    uint64_t ctx_target = 0;
+    // Alt held when a frame drag started: move the frame WITHOUT its
+    // contained nodes (texed alt+drag).
+    bool drag_alt = false;
+};
+
+struct Output {
+    uint64_t clicked = 0;            // select (kOutNodeId = Output card)
+    bool clicked_shift = false;      // shift-click: toggle in the multi set
+    bool clicked_empty = false;      // deselect
+    // Marquee (shift+drag on empty): graph-space rect, min/max order,
+    // plus every wire whose stroke crosses the rect (texed link marquee).
+    bool marquee_done = false;
+    float mq_x0 = 0.0f, mq_y0 = 0.0f, mq_x1 = 0.0f, mq_y1 = 0.0f;
+    int mq_wire_count = 0;
+    Wire mq_wires[64];
+    // Node move: streamed while dragging (coalesced command), released on
+    // mouse-up so the app can break coalescing.
+    uint64_t moved = 0;
+    float moved_x = 0.0f, moved_y = 0.0f;
+    bool move_released = false;
+    // Double-click on empty canvas: add-node request at this graph pos.
+    bool add_requested = false;
+    float add_x = 0.0f, add_y = 0.0f;
+    // Cursor add menu: opened this frame (app focuses the filter), or an
+    // item picked (index into Graph::add_items; splice data in state).
+    bool add_menu_opened = false;
+    int add_pick = -1;
+    // Wire edits (v3): connect from→(to, port); port 0 = In, 1 = Mask.
+    // A rewire release emits disconnect (the grabbed link) + connect.
+    bool connect_requested = false;
+    uint64_t connect_from = 0, connect_to = 0;
+    uint32_t connect_port = 0;
+    bool disconnect_requested = false;
+    uint64_t disconnect_from = 0, disconnect_to = 0;
+    uint32_t disconnect_port = 0;
+    // Value-node wiring (v4): a ModSource out wire dropped on a param row
+    // retargets that route to the row's param.
+    bool route_drop_requested = false;
+    uint64_t route_drop_from = 0;    // ModSource canvas id
+    uint64_t route_drop_to = 0;      // target card canvas id
+    int route_drop_row = -1;         // row index on the target card
+    // Wire click-select: a still click landing on a wire's bezier.
+    // Shift toggles it in the wire selection instead of replacing.
+    bool wire_clicked = false;
+    bool wire_clicked_shift = false;
+    uint64_t wire_from = 0, wire_to = 0;
+    uint8_t wire_kind = 0;
+    // Context menu: item picked this frame (index into Graph::ctx_items;
+    // -1 = none — the app MUST re-init the sentinel after arena alloc),
+    // with the target the menu was opened on.
+    int ctx_pick = -1;
+    uint64_t ctx_node = 0;
+    // Double-click on a group CARD's title strip: inline rename request
+    // (texed renames subgraphs by title, opens by body).
+    uint64_t group_rename = 0;
+    // Double-click on a Text card's title strip: edit its string (v5.5).
+    uint64_t text_edit = 0;
+    // Frame gestures: corner-resize stream (coalesced command) and the
+    // double-click rename request on a title strip.
+    uint64_t frame_resized = 0;
+    float frame_w = 0.0f, frame_h = 0.0f;
+    bool frame_resize_released = false;
+    uint64_t frame_rename = 0;
+    // Double-click on a Group card: ENTER its scoped subgraph view
+    // (texed enterSubgraph).
+    uint64_t group_open = 0;
+    // Breadcrumb "main" clicked: exit the open group's view.
+    bool crumb_clicked = false;
+    // Double-click on a row's slider: type the exact value.
+    uint64_t value_edit_node = 0;
+    int value_edit_row = -1;
+    // Splice-on-drop: the dragged node released over this wire.
+    bool node_splice_requested = false;
+    uint64_t splice_node = 0;
+    uint64_t splice_wire_from = 0, splice_wire_to = 0;
+    uint32_t splice_wire_port = 0;
+    // Frame move with alt held: the frame moves alone.
+    bool moved_alt = false;
+};
+
+ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,
+                           CanvasState* state, Output* out);
+
+// Card geometry helpers shared with the app's auto-layout. Mask/aux
+// ports occupy dedicated strip rows between the preview and the param
+// rows (they must never overlap a param row), so height depends on them.
+float node_width();
+float node_height(int row_count, bool has_preview, int port_rows = 0);
+float node_height_of(const Node& nd);
+
+}  // namespace looks::flow

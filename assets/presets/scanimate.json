@@ -1,33 +1,87 @@
 {
   "looks_preset": 1,
   "name": "scanimate",
-  "tags": ["synth", "scan", "phosphor"],
+  "tags": [
+    "synth",
+    "scan",
+    "phosphor"
+  ],
   "group": {
     "id": 100,
     "name": "scanimate",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "deflect",
-        "value": 0.4,
-        "targets": [
-          {"effect": 1, "param": 1, "lo": 0.0, "hi": 0.8, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 1
       },
       {
-        "name": "phosphor",
-        "value": 0.35,
-        "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.6, "curve": "linear"},
-          {"effect": 3, "param": 0, "lo": 0.0, "hi": 0.5, "curve": "linear"}
-        ]
+        "effect": 2,
+        "param": 0
+      },
+      {
+        "effect": 3,
+        "param": 0
       }
     ]
   },
   "effects": [
-    {"type": "rutt_etra", "id": 1, "params": [5, 28, 1.5, 0, 0.25, 0.2, 12]},
-    {"type": "glow", "id": 2, "params": [1.2, 24, 0.25, 0, 0]},
-    {"type": "feedback", "id": 3, "params": [0.35, 1.01, 0.005, 0.1, 0], "wet": 0.5}
+    {
+      "type": "rutt_etra",
+      "id": 1,
+      "params": [
+        5,
+        48.480003356933594,
+        1.5,
+        0,
+        0.25,
+        0.20000000298023224,
+        12
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "glow",
+      "id": 2,
+      "params": [
+        1.8300000429153442,
+        24,
+        0.25,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "feedback",
+      "id": 3,
+      "params": [
+        0.52499997615814209,
+        1.0099999904632568,
+        0.004999999888241291,
+        0.10000000149011612,
+        0
+      ],
+      "wet": 0.5,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

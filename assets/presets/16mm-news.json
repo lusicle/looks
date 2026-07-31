@@ -1,40 +1,164 @@
 {
   "looks_preset": 1,
   "name": "'70s 16mm news",
-  "tags": ["film", "16mm", "vintage", "era"],
+  "tags": [
+    "film",
+    "16mm",
+    "vintage",
+    "era"
+  ],
   "group": {
     "id": 100,
     "name": "'70s 16mm news",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "wear",
-        "value": 0.3,
-        "targets": [
-          {"effect": 3, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"},
-          {"effect": 1, "param": 0, "lo": 0.0, "hi": 0.12, "curve": "exp"},
-          {"effect": 2, "param": 3, "lo": 0.0, "hi": 0.3, "curve": "linear"},
-          {"effect": 6, "param": 0, "lo": 0.0, "hi": 0.6, "curve": "linear"},
-          {"effect": 6, "param": 1, "lo": 0.0, "hi": 0.4, "curve": "exp"}
-        ]
+        "effect": 3,
+        "param": 0
       },
       {
-        "name": "halation",
-        "value": 0.25,
-        "targets": [
-          {"effect": 4, "param": 0, "lo": 0.0, "hi": 0.3, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 0
+      },
+      {
+        "effect": 2,
+        "param": 3
+      },
+      {
+        "effect": 6,
+        "param": 0
+      },
+      {
+        "effect": 6,
+        "param": 1
+      },
+      {
+        "effect": 4,
+        "param": 0
       }
     ]
   },
   "effects": [
-    {"type": "jitter", "id": 1, "params": [2.5, 1.2, 0]},
-    {"type": "colorscience", "id": 2, "params": [3, -0.3, 0.15, 0.15, 0.4]},
-    {"type": "grain", "id": 3, "params": [0.5, 2.6, 0.5, 0]},
-    {"type": "glow", "id": 4, "params": [0.35, 14, 0.55, 1, 0]},
-    {"type": "dust_scratches", "id": 6, "params": [0.35, 0.4, 1.0, 0.25, 0.15, 24]},
-    {"type": "flicker", "id": 7, "params": [0.12, 24, 0]},
-    {"type": "vignette", "id": 5, "params": [0.45, 0.6, 0.45]}
+    {
+      "type": "jitter",
+      "id": 1,
+      "params": [
+        3.0183999538421631,
+        1.2000000476837158,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "colorscience",
+      "id": 2,
+      "params": [
+        3,
+        -0.30000001192092896,
+        0.15000000596046448,
+        0.24000000953674316,
+        0.40000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "grain",
+      "id": 3,
+      "params": [
+        0.62000000476837158,
+        2.5999999046325684,
+        0.5,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "glow",
+      "id": 4,
+      "params": [
+        0.57499998807907104,
+        14,
+        0.55000001192092896,
+        1,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "dust_scratches",
+      "id": 6,
+      "params": [
+        0.52999997138977051,
+        0.43600001931190491,
+        1,
+        0.25,
+        0.15000000596046448,
+        24
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "flicker",
+      "id": 7,
+      "params": [
+        0.11999999731779099,
+        24,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "vignette",
+      "id": 5,
+      "params": [
+        0.44999998807907104,
+        0.60000002384185791,
+        0.44999998807907104
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

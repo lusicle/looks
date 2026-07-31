@@ -1,37 +1,146 @@
 {
   "looks_preset": 1,
   "name": "2003 point-and-shoot",
-  "tags": ["digital", "y2k", "digicam", "era"],
+  "tags": [
+    "digital",
+    "y2k",
+    "digicam",
+    "era"
+  ],
   "group": {
     "id": 100,
     "name": "2003 point-and-shoot",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "crush",
-        "value": 0.3,
-        "targets": [
-          {"effect": 4, "param": 0, "lo": 0.0, "hi": -0.18, "curve": "linear"}
-        ]
+        "effect": 4,
+        "param": 0
       },
       {
-        "name": "smear",
-        "value": 0.25,
-        "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.3, "curve": "linear"},
-          {"effect": 2, "param": 4, "lo": 0.0, "hi": 0.4, "curve": "exp"}
-        ]
+        "effect": 2,
+        "param": 0
+      },
+      {
+        "effect": 2,
+        "param": 4
       }
     ]
   },
   "effects": [
-    {"type": "colorscience", "id": 1, "params": [9, 0.2, 0.25, 0.0, -0.15]},
-    {"type": "glow", "id": 2, "params": [0.6, 10, 0.75, 2, 0.25]},
-    {"type": "fringe", "id": 5, "params": [4.0, 1.0, 0.6]},
-    {"type": "oversharpen", "id": 6, "params": [1.6, 1.5]},
-    {"type": "grain", "id": 3, "params": [0.18, 1.0, 0.8, 1]},
-    {"type": "timestamp", "id": 7, "params": [0, 3, 3]},
-    {"type": "jpeg_blocking", "id": 4, "params": [24]}
+    {
+      "type": "colorscience",
+      "id": 1,
+      "params": [
+        9,
+        0.20000000298023224,
+        0.25,
+        0,
+        -0.15000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "glow",
+      "id": 2,
+      "params": [
+        0.82500004768371582,
+        10,
+        0.75,
+        2,
+        0.27500000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "fringe",
+      "id": 5,
+      "params": [
+        4,
+        1,
+        0.60000002384185791
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "oversharpen",
+      "id": 6,
+      "params": [
+        1.6000000238418579,
+        1.5
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "grain",
+      "id": 3,
+      "params": [
+        0.18000000715255737,
+        1,
+        0.80000001192092896,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "timestamp",
+      "id": 7,
+      "params": [
+        0,
+        3,
+        3
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "jpeg_blocking",
+      "id": 4,
+      "params": [
+        18.653999328613281
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

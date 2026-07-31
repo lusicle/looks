@@ -1,32 +1,80 @@
 {
   "looks_preset": 1,
   "name": "riso zine",
-  "tags": ["print", "riso", "zine"],
+  "tags": [
+    "print",
+    "riso",
+    "zine"
+  ],
   "group": {
     "id": 100,
     "name": "riso zine",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "misreg",
-        "value": 0.35,
-        "targets": [
-          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.65, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 3
       },
       {
-        "name": "ink",
-        "value": 0.3,
-        "targets": [
-          {"effect": 1, "param": 4, "lo": 0.0, "hi": 0.8, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 4
       }
     ]
   },
   "effects": [
-    {"type": "soft_upscale", "id": 2, "params": [2, 0.4], "wet": 0.5},
-    {"type": "risograph", "id": 1, "params": [2, 0.55, 0.93, 4, 0.45, 0.4]},
-    {"type": "dust_scratches", "id": 3, "params": [0.12, 0.0, 1.0, 0.0, 0.3, 0]}
+    {
+      "type": "soft_upscale",
+      "id": 2,
+      "params": [
+        2,
+        0.40000000596046448
+      ],
+      "wet": 0.5,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "risograph",
+      "id": 1,
+      "params": [
+        2,
+        0.55000001192092896,
+        0.93000000715255737,
+        6.7300000190734863,
+        0.68999999761581421,
+        0.40000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "dust_scratches",
+      "id": 3,
+      "params": [
+        0.11999999731779099,
+        0,
+        1,
+        0,
+        0.30000001192092896,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

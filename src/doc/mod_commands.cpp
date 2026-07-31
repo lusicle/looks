@@ -120,6 +120,33 @@ private:
     bool old_ = false;
 };
 
+class SetLaneMuteCommand final : public Command {
+public:
+    SetLaneMuteCommand(ParamKey target, bool muted)
+        : target_(target), muted_(muted) {}
+    std::string name() const override {
+        return muted_ ? "Mute Keyframes" : "Unmute Keyframes";
+    }
+
+    void apply(Document& doc) override {
+        for (KeyframeLane& lane : doc.lanes) {
+            if (!(lane.target == target_)) continue;
+            old_ = lane.muted;
+            lane.muted = muted_;
+        }
+    }
+
+    void revert(Document& doc) override {
+        for (KeyframeLane& lane : doc.lanes)
+            if (lane.target == target_) lane.muted = old_;
+    }
+
+private:
+    ParamKey target_;
+    bool muted_;
+    bool old_ = false;
+};
+
 class SetAudioConfigCommand final : public Command {
 public:
     SetAudioConfigCommand(std::string sidechain_path, bool sidechain_mux,
@@ -333,6 +360,29 @@ private:
     ResponseCurve old_curve_ = ResponseCurve::Linear;
 };
 
+class SetRouteTargetCommand final : public Command {
+public:
+    SetRouteTargetCommand(uint64_t route_id, ParamKey target)
+        : route_id_(route_id), target_(target) {}
+    std::string name() const override { return "Wire Route"; }
+
+    void apply(Document& doc) override {
+        ModRoute* r = find_route(doc, route_id_);
+        assert(r);
+        old_target_ = r->target;
+        r->target = target_;
+    }
+
+    void revert(Document& doc) override {
+        if (ModRoute* r = find_route(doc, route_id_)) r->target = old_target_;
+    }
+
+private:
+    uint64_t route_id_;
+    ParamKey target_;
+    ParamKey old_target_;
+};
+
 class SetLaneCommand final : public Command {
 public:
     SetLaneCommand(ParamKey target, std::vector<Keyframe> keys)
@@ -530,6 +580,11 @@ std::unique_ptr<Command> set_route_amount_command(uint64_t route_id,
                                                   float amount) {
     return std::make_unique<SetRouteAmountCommand>(route_id, amount);
 }
+std::unique_ptr<Command> set_route_target_command(uint64_t route_id,
+                                                  ParamKey target) {
+    return std::make_unique<SetRouteTargetCommand>(route_id, target);
+}
+
 std::unique_ptr<Command> set_route_source_command(uint64_t route_id,
                                                   ModSource source) {
     return std::make_unique<SetRouteSourceCommand>(route_id, source);
@@ -566,6 +621,9 @@ std::unique_ptr<Command> set_timeline_region_command(uint32_t trim_in,
 }
 std::unique_ptr<Command> set_lane_loop_command(ParamKey target, bool loop) {
     return std::make_unique<SetLaneLoopCommand>(target, loop);
+}
+std::unique_ptr<Command> set_lane_mute_command(ParamKey target, bool muted) {
+    return std::make_unique<SetLaneMuteCommand>(target, muted);
 }
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
                                                   bool sidechain_mux,

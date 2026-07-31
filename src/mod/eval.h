@@ -33,17 +33,36 @@ struct AnalysisCurves {
     }
 };
 
+// CPU view of the decoded source frame (I420) for the video-sampling
+// sources (docs/flow_canvas.md v4: sample-at-point / region-average).
+// Callers pass the SAME frame they are about to render, so preview and
+// export sample identical decoded pixels and determinism holds (spec §11).
+// A null view (or null planes) reads as 0.
+struct SourceFrameView {
+    const uint8_t* y = nullptr;
+    int y_stride = 0;
+    const uint8_t* u = nullptr;
+    int u_stride = 0;
+    const uint8_t* v = nullptr;
+    int v_stride = 0;
+    int width = 0, height = 0;
+};
+
 // One source's value at time t (seconds, = frame/fps). Deterministic.
 // fps feeds the envelope's frame->seconds conversion and the BPM-synced
 // LFO's fallback clock; sources that don't need it ignore it.
 // audio_offset_seconds (spec §7 nudge): shifts every audio-derived source
 // (bands, onsets, beat, BPM clocks) against video — positive = audio
 // later. key_time: seconds of the last live keypress trigger (-1 = none;
-// live mode only, spec §11 exempts it).
+// live mode only, spec §11 exempts it). video: the current source frame
+// for VideoSample/VideoRegion; those sources read 0 without it — notably
+// on the speed target, where the sampled frame would itself depend on
+// speed (speed_at never passes a view).
 float eval_source(const doc::ModSource& source, double t_seconds,
                   uint32_t frame_index, const AnalysisCurves* analysis,
                   double fps = 30.0, double audio_offset_seconds = 0.0,
-                  double key_time = -1.0);
+                  double key_time = -1.0,
+                  const SourceFrameView* video = nullptr);
 
 float apply_curve(doc::ResponseCurve curve, float x);   // [0,1] -> [0,1]
 
@@ -56,7 +75,8 @@ float eval_lane(const doc::KeyframeLane& lane, double frame);
 // sources and lanes stay on the playhead either way.
 doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
-                      double live_seconds = -1.0, double key_time = -1.0);
+                      double live_seconds = -1.0, double key_time = -1.0,
+                      const SourceFrameView* video = nullptr);
 
 // Playback speed at one timeline frame (spec §6.1 speed ramp): doc.speed,
 // overridden by a lane on ParamKey {0, 1} ("global.speed"), plus routes on

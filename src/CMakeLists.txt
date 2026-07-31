@@ -102,7 +102,9 @@ target_compile_definitions(looks_gfx PUBLIC
 if(MSVC)
     target_compile_options(looks_gfx PRIVATE $<$<CONFIG:Debug>:/O2 /Ob2 /Oi>)
 endif()
-target_link_libraries(looks_gfx PUBLIC looks_util looks_doc)
+# looks_ui_core supplies the baked-MSDF font loader the Text effect
+# re-uses (ui/font.h is CPU-only — no Vulkan, no cycle).
+target_link_libraries(looks_gfx PUBLIC looks_util looks_doc looks_ui_core)
 
 # ---- ui core: CPU-side toolkit (canvas2d recorder, font, text). No Vulkan
 # includes — unit-testable without a GPU or the vulkan headers.
@@ -112,6 +114,7 @@ add_library(looks_ui_core STATIC
     ui/input.cpp
     ui/layout.cpp
     ui/text.cpp
+    ui/truetype.cpp
     ui/ui_context.cpp
     ui/widgets.cpp)
 target_include_directories(looks_ui_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -125,6 +128,7 @@ target_link_libraries(looks_ui PUBLIC looks_ui_core looks_gfx looks_util)
 
 # ---- app
 add_executable(looks WIN32
+    app/flow_canvas.cpp
     app/main.cpp)
 target_link_libraries(looks PRIVATE
     looks_platform looks_gfx looks_ui looks_doc looks_media looks_mod

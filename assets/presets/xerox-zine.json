@@ -1,32 +1,67 @@
 {
   "looks_preset": 1,
   "name": "xerox zine",
-  "tags": ["print", "photocopy", "zine"],
+  "tags": [
+    "print",
+    "photocopy",
+    "zine"
+  ],
   "group": {
     "id": 100,
     "name": "xerox zine",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "copies",
-        "value": 0.3,
-        "targets": [
-          {"effect": 1, "param": 1, "lo": 0.0, "hi": 1.0, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 1
       },
       {
-        "name": "toner",
-        "value": 0.35,
-        "targets": [
-          {"effect": 1, "param": 2, "lo": 0.0, "hi": 1.0, "curve": "linear"},
-          {"effect": 1, "param": 3, "lo": 0.0, "hi": 0.8, "curve": "linear"}
-        ]
+        "effect": 1,
+        "param": 2
+      },
+      {
+        "effect": 1,
+        "param": 3
       }
     ]
   },
   "effects": [
-    {"type": "dust_scratches", "id": 2, "params": [0.3, 0.1, 1.0, 0.0, 0.4, 0]},
-    {"type": "photocopy", "id": 1, "params": [0.7, 3, 0.45, 0.4]}
+    {
+      "type": "dust_scratches",
+      "id": 2,
+      "params": [
+        0.30000001192092896,
+        0.10000000149011612,
+        1,
+        0,
+        0.40000000596046448,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "photocopy",
+      "id": 1,
+      "params": [
+        0.69999998807907104,
+        5.1000003814697266,
+        0.79999995231628418,
+        0.68000000715255737
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

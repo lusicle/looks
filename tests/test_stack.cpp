@@ -1,6 +1,9 @@
 #include "doc/stack_commands.h"
 
+#include <algorithm>
+
 #include "doc/effects.h"
+#include "doc/layer_commands.h"
 #include "doc/randomize.h"
 #include "test_framework.h"
 
@@ -175,4 +178,39 @@ TEST(stack_bypass_and_move) {
     CHECK_EQ(doc.layers[0].stack[0].id, first_id);
     undo.redo(doc);
     CHECK_EQ(doc.layers[0].stack[1].id, first_id);
+}
+
+TEST(stack_connect_output_replaces_same_layer_end) {
+    // The Output composites ONE contribution per owner layer; wiring a
+    // new chain end must replace the same layer's old link (the ghost
+    // double-composited the chain prefix) and keep other layers'.
+    Document doc = make_doc_with_two();          // layer 0: rgb, vignette
+    doc.layers.push_back(make_layer(doc, LayerSourceKind::Solid));
+    doc.layers[1].stack.push_back(make_effect(doc, EffectType::Pixelate));
+    const uint64_t fx0 = doc.layers[0].stack[0].id;
+    const uint64_t fx1 = doc.layers[0].stack[1].id;
+    const uint64_t other_end = doc.layers[1].stack[0].id;
+
+    ensure_links(doc);   // l0: src->fx0->fx1->out, l1: src->pix->out
+    auto out_ends = [&] {
+        std::vector<uint64_t> ends;
+        for (const auto& l : doc.links)
+            if (l.to == 0 && l.to_port == 0) ends.push_back(l.from);
+        return ends;
+    };
+    CHECK_EQ(out_ends().size(), size_t{2});
+
+    UndoStack undo;
+    undo.execute(doc, connect_command({fx0, 0, 0}));
+    auto ends = out_ends();
+    CHECK_EQ(ends.size(), size_t{2});
+    CHECK(std::find(ends.begin(), ends.end(), fx0) != ends.end());
+    CHECK(std::find(ends.begin(), ends.end(), other_end) != ends.end());
+    CHECK(std::find(ends.begin(), ends.end(), fx1) == ends.end());
+
+    CHECK(undo.undo(doc));
+    ends = out_ends();
+    CHECK_EQ(ends.size(), size_t{2});
+    CHECK(std::find(ends.begin(), ends.end(), fx1) != ends.end());
+    CHECK(std::find(ends.begin(), ends.end(), fx0) == ends.end());
 }

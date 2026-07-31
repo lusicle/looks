@@ -112,7 +112,20 @@ add_slang_shaders(looks_shaders
         fx_security_mux.comp.slang
         fx_audio_scope.comp.slang
         fx_modulate.comp.slang
+        fx_blend_node.comp.slang
+        fx_matte.comp.slang
+        fx_levels.comp.slang
+        fx_hue_sat.comp.slang
+        fx_channel_mix.comp.slang
+        fx_posterize.comp.slang
+        fx_threshold.comp.slang
+        fx_palette_map.comp.slang
+        fx_dither.comp.slang
+        fx_transform.comp.slang
+        fx_frame_delay.comp.slang
+        fx_text.comp.slang
         mod_integrate.comp.slang
+        thumb_tap.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang

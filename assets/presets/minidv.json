@@ -1,43 +1,133 @@
 {
   "looks_preset": 1,
   "name": "MiniDV",
-  "tags": ["digital", "video", "dv", "era"],
+  "tags": [
+    "digital",
+    "video",
+    "dv",
+    "era"
+  ],
   "group": {
     "id": 100,
     "name": "MiniDV",
     "folded": true,
     "bypass": false,
-    "macros": [
+    "exposed": [
       {
-        "name": "starve",
-        "value": 0.2,
-        "targets": [
-          {"effect": 3, "param": 0, "lo": 0.0, "hi": -0.11, "curve": "exp"},
-          {"effect": 6, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"}
-        ]
+        "effect": 3,
+        "param": 0
       },
       {
-        "name": "fringe",
-        "value": 0.2,
-        "targets": [
-          {"effect": 2, "param": 0, "lo": 0.0, "hi": 0.05, "curve": "linear"}
-        ]
+        "effect": 6,
+        "param": 0
       },
       {
-        "name": "comb",
-        "value": 0.25,
-        "targets": [
-          {"effect": 5, "param": 0, "lo": 0.0, "hi": 0.4, "curve": "linear"}
-        ]
+        "effect": 2,
+        "param": 0
+      },
+      {
+        "effect": 5,
+        "param": 0
       }
     ]
   },
   "effects": [
-    {"type": "colorscience", "id": 1, "params": [9, 0.0, 0.1, 0.0]},
-    {"type": "rgb_split", "id": 2, "params": [1.5, 0.0], "wet": 0.6},
-    {"type": "interlace", "id": 5, "params": [3.0, 0.2, 0]},
-    {"type": "mosquito", "id": 6, "params": [0.4, 3, 15]},
-    {"type": "bitrate_starve", "id": 3, "params": [26, 15]},
-    {"type": "grain", "id": 4, "params": [0.12, 1.0, 0.9, 1]}
+    {
+      "type": "colorscience",
+      "id": 1,
+      "params": [
+        9,
+        0,
+        0.10000000149011612,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "rgb_split",
+      "id": 2,
+      "params": [
+        2.7800002098083496,
+        0
+      ],
+      "wet": 0.60000002384185791,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "interlace",
+      "id": 5,
+      "params": [
+        4.5999999046325684,
+        0.20000000298023224,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "mosquito",
+      "id": 6,
+      "params": [
+        0.48000001907348633,
+        3,
+        15
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "bitrate_starve",
+      "id": 3,
+      "params": [
+        25.124399185180664,
+        15
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    },
+    {
+      "type": "grain",
+      "id": 4,
+      "params": [
+        0.11999999731779099,
+        1,
+        0.89999997615814209,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "mask": 0,
+      "group": 100
+    }
   ]
 }

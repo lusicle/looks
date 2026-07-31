@@ -19,11 +19,12 @@ const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
 const char* const kSourceKindNames[] = {"clip",       "solid", "gradient",
                                         "noise",      "test",  "oscillator",
-                                        "adjustment"};
+                                        "adjustment", "shape"};
 const char* const kModSourceNames[] = {
     "lfo",         "drift",       "audio_low",    "audio_mid",
     "audio_high",  "audio_onset", "video_motion", "video_brightness",
-    "lfo_beat",    "envelope",    "video_cut",    "beat"};
+    "lfo_beat",    "envelope",    "video_cut",    "beat",
+    "video_sample", "video_region"};
 const char* const kLfoShapeNames[] = {"sine", "triangle", "square",
                                       "sample_hold"};
 const char* const kCurveNames[] = {"linear", "exp", "scurve", "inverted"};
@@ -103,6 +104,16 @@ Value mod_source_to_json(const ModSource& s) {
     v.set("attack", static_cast<double>(s.attack));
     v.set("decay", static_cast<double>(s.decay));
     v.set("trigger", static_cast<int64_t>(s.trigger));
+    // Sampling geometry only for the video-sampling types — older files
+    // stay byte-identical through a load/save roundtrip.
+    if (s.type == ModSourceType::VideoSample ||
+        s.type == ModSourceType::VideoRegion) {
+        v.set("px", static_cast<double>(s.px));
+        v.set("py", static_cast<double>(s.py));
+        v.set("pw", static_cast<double>(s.pw));
+        v.set("ph", static_cast<double>(s.ph));
+        v.set("channel", static_cast<int64_t>(s.channel));
+    }
     return v;
 }
 
@@ -118,6 +129,11 @@ ModSource mod_source_from_json(const Value& v) {
     s.attack = num(v, "attack", 0.02f);
     s.decay = num(v, "decay", 0.4f);
     s.trigger = static_cast<uint32_t>(v.get("trigger").as_int(0));
+    s.px = num(v, "px", 0.5f);
+    s.py = num(v, "py", 0.5f);
+    s.pw = num(v, "pw", 0.25f);
+    s.ph = num(v, "ph", 0.25f);
+    s.channel = static_cast<uint32_t>(v.get("channel").as_int(0));
     return s;
 }
 
@@ -128,6 +144,10 @@ Value route_to_json(const ModRoute& r) {
     v.set("target", param_key_to_json(r.target));
     v.set("amount", static_cast<double>(r.amount));
     v.set("curve", enum_name(kCurveNames, static_cast<uint32_t>(r.curve)));
+    if (r.node_x != 0.0f || r.node_y != 0.0f) {
+        v.set("node_x", static_cast<double>(r.node_x));
+        v.set("node_y", static_cast<double>(r.node_y));
+    }
     return v;
 }
 
@@ -139,6 +159,8 @@ ModRoute route_from_json(const Value& v) {
     r.amount = num(v, "amount", 0.0f);
     r.curve = static_cast<ResponseCurve>(
         enum_index(kCurveNames, v.get("curve").as_string()));
+    r.node_x = num(v, "node_x", 0.0f);
+    r.node_y = num(v, "node_y", 0.0f);
     return r;
 }
 
@@ -146,6 +168,7 @@ Value lane_to_json(const KeyframeLane& lane) {
     Value v = Value::make_object();
     v.set("target", param_key_to_json(lane.target));
     if (lane.loop) v.set("loop", true);
+    if (lane.muted) v.set("muted", true);
     Value keys = Value::make_array();
     for (const Keyframe& k : lane.keys) {
         Value kv = Value::make_object();
@@ -166,6 +189,7 @@ KeyframeLane lane_from_json(const Value& v) {
     KeyframeLane lane;
     lane.target = param_key_from_json(v.get("target"));
     lane.loop = v.get("loop").as_bool(false);
+    lane.muted = v.get("muted").as_bool(false);
     for (const Value& kv : v.get("keys").array()) {
         Keyframe k;
         k.frame = kv.get("frame").as_number(0.0);
@@ -261,6 +285,10 @@ Value mask_to_json(const Mask& m) {
     Value chain = Value::make_array();
     for (const EffectInstance& fx : m.chain) chain.push(effect_to_json(fx));
     v.set("chain", std::move(chain));
+    if (m.node_x != 0.0f || m.node_y != 0.0f) {
+        v.set("node_x", static_cast<double>(m.node_x));
+        v.set("node_y", static_cast<double>(m.node_y));
+    }
     return v;
 }
 
@@ -314,6 +342,8 @@ Mask mask_from_json(const Value& v) {
         enum_index(kMaskCombineNames, v.get("combine_op").as_string()));
     for (const Value& fv : v.get("chain").array())
         if (auto fx = effect_from_json(fv)) m.chain.push_back(std::move(*fx));
+    m.node_x = num(v, "node_x", 0.0f);
+    m.node_y = num(v, "node_y", 0.0f);
     return m;
 }
 
@@ -351,6 +381,10 @@ Value layer_to_json(const Layer& l) {
     }
     if (l.trim_in > 0) v.set("trim_in", static_cast<int64_t>(l.trim_in));
     if (l.trim_out > 0) v.set("trim_out", static_cast<int64_t>(l.trim_out));
+    if (l.node_x != 0.0f || l.node_y != 0.0f) {
+        v.set("node_x", static_cast<double>(l.node_x));
+        v.set("node_y", static_cast<double>(l.node_y));
+    }
     Value stack = Value::make_array();
     for (const EffectInstance& fx : l.stack) stack.push(effect_to_json(fx));
     v.set("stack", std::move(stack));
@@ -388,6 +422,8 @@ Layer layer_from_json(const Value& v) {
     }
     l.trim_in = static_cast<uint32_t>(v.get("trim_in").as_int(0));
     l.trim_out = static_cast<uint32_t>(v.get("trim_out").as_int(0));
+    l.node_x = num(v, "node_x", 0.0f);
+    l.node_y = num(v, "node_y", 0.0f);
     for (const Value& fv : v.get("stack").array())
         if (auto fx = effect_from_json(fv)) l.stack.push_back(std::move(*fx));
     for (const Value& gv : v.get("groups").array())
@@ -414,6 +450,11 @@ json::Value effect_to_json(const EffectInstance& fx) {
     v.set("seed", static_cast<int64_t>(fx.seed));
     v.set("mask", static_cast<int64_t>(fx.mask_id));
     v.set("group", static_cast<int64_t>(fx.group_id));
+    if (!fx.text.empty()) v.set("text", fx.text);
+    if (fx.node_x != 0.0f || fx.node_y != 0.0f) {
+        v.set("node_x", static_cast<double>(fx.node_x));
+        v.set("node_y", static_cast<double>(fx.node_y));
+    }
     return v;
 }
 
@@ -439,6 +480,9 @@ std::optional<EffectInstance> effect_from_json(const json::Value& v) {
     fx.seed = static_cast<uint64_t>(v.get("seed").as_int(0));
     fx.mask_id = static_cast<uint64_t>(v.get("mask").as_int(0));
     fx.group_id = static_cast<uint64_t>(v.get("group").as_int(0));
+    fx.text = v.get("text").as_string();
+    fx.node_x = num(v, "node_x", 0.0f);
+    fx.node_y = num(v, "node_y", 0.0f);
     return fx;
 }
 
@@ -450,26 +494,29 @@ json::Value group_to_json(const Group& g) {
     v.set("name", g.name);
     v.set("folded", g.folded);
     v.set("bypass", g.bypass);
-    Value macros = Value::make_array();
-    for (const MacroKnob& knob : g.macros) {
-        Value kv = Value::make_object();
-        kv.set("name", knob.name);
-        kv.set("value", static_cast<double>(knob.value));
-        Value targets = Value::make_array();
-        for (const MacroTarget& t : knob.targets) {
-            Value tv = Value::make_object();
-            tv.set("effect", static_cast<int64_t>(t.effect_id));
-            tv.set("param", t.param_index);
-            tv.set("lo", static_cast<double>(t.lo));
-            tv.set("hi", static_cast<double>(t.hi));
-            tv.set("curve",
-                   enum_name(kCurveNames, static_cast<uint32_t>(t.curve)));
-            targets.push(std::move(tv));
-        }
-        kv.set("targets", std::move(targets));
-        macros.push(std::move(kv));
+    if (g.node_x != 0.0f || g.node_y != 0.0f) {
+        v.set("node_x", static_cast<double>(g.node_x));
+        v.set("node_y", static_cast<double>(g.node_y));
     }
-    v.set("macros", std::move(macros));
+    // The group face (v5.3): exposed member params — direct aliases.
+    Value exposed = Value::make_array();
+    for (const ParamKey& k : g.exposed) {
+        Value ev = Value::make_object();
+        ev.set("effect", static_cast<int64_t>(k.effect_id));
+        ev.set("param", k.param_index);
+        exposed.push(std::move(ev));
+    }
+    v.set("exposed", std::move(exposed));
+    if (g.face_in) v.set("face_in", static_cast<int64_t>(g.face_in));
+    if (g.face_out) v.set("face_out", static_cast<int64_t>(g.face_out));
+    if (g.in_x != 0.0f || g.in_y != 0.0f) {
+        v.set("in_x", static_cast<double>(g.in_x));
+        v.set("in_y", static_cast<double>(g.in_y));
+    }
+    if (g.out_x != 0.0f || g.out_y != 0.0f) {
+        v.set("out_x", static_cast<double>(g.out_x));
+        v.set("out_y", static_cast<double>(g.out_y));
+    }
     return v;
 }
 
@@ -479,22 +526,18 @@ Group group_from_json(const json::Value& v) {
     g.name = v.get("name").as_string();
     g.folded = v.get("folded").as_bool(false);
     g.bypass = v.get("bypass").as_bool(false);
-    for (const Value& kv : v.get("macros").array()) {
-        MacroKnob knob;
-        knob.name = kv.get("name").as_string();
-        knob.value = num(kv, "value", 0.0f);
-        for (const Value& tv : kv.get("targets").array()) {
-            MacroTarget t;
-            t.effect_id = static_cast<uint64_t>(tv.get("effect").as_int(0));
-            t.param_index = static_cast<int>(tv.get("param").as_int(0));
-            t.lo = num(tv, "lo", 0.0f);
-            t.hi = num(tv, "hi", 0.5f);
-            t.curve = static_cast<ResponseCurve>(
-                enum_index(kCurveNames, tv.get("curve").as_string()));
-            knob.targets.push_back(t);
-        }
-        g.macros.push_back(std::move(knob));
-    }
+    g.node_x = num(v, "node_x", 0.0f);
+    g.node_y = num(v, "node_y", 0.0f);
+    for (const Value& ev : v.get("exposed").array())
+        g.exposed.push_back(
+            {static_cast<uint64_t>(ev.get("effect").as_int(0)),
+             static_cast<int>(ev.get("param").as_int(0))});
+    g.face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
+    g.face_out = static_cast<uint64_t>(v.get("face_out").as_int(0));
+    g.in_x = num(v, "in_x", 0.0f);
+    g.in_y = num(v, "in_y", 0.0f);
+    g.out_x = num(v, "out_x", 0.0f);
+    g.out_y = num(v, "out_y", 0.0f);
     return g;
 }
 
@@ -556,6 +599,36 @@ json::Value doc_to_json(const Document& doc) {
     Value masks = Value::make_array();
     for (const Mask& m : doc.masks) masks.push(mask_to_json(m));
     v.set("masks", std::move(masks));
+    if (doc.out_node_x != 0.0f || doc.out_node_y != 0.0f) {
+        v.set("out_node_x", static_cast<double>(doc.out_node_x));
+        v.set("out_node_y", static_cast<double>(doc.out_node_y));
+    }
+    if (!doc.links.empty()) {
+        Value links = Value::make_array();
+        for (const Document::NodeLink& l : doc.links) {
+            Value lv = Value::make_object();
+            lv.set("from", static_cast<int64_t>(l.from));
+            lv.set("to", static_cast<int64_t>(l.to));
+            lv.set("port", static_cast<int64_t>(l.to_port));
+            links.push(std::move(lv));
+        }
+        v.set("links", std::move(links));
+    }
+    if (!doc.frames.empty()) {
+        Value frames = Value::make_array();
+        for (const Document::Frame& f : doc.frames) {
+            Value fv = Value::make_object();
+            fv.set("id", static_cast<int64_t>(f.id));
+            fv.set("x", static_cast<double>(f.x));
+            fv.set("y", static_cast<double>(f.y));
+            fv.set("w", static_cast<double>(f.w));
+            fv.set("h", static_cast<double>(f.h));
+            fv.set("title", f.title);
+            if (f.color) fv.set("color", static_cast<int64_t>(f.color));
+            frames.push(std::move(fv));
+        }
+        v.set("frames", std::move(frames));
+    }
     return v;
 }
 
@@ -597,6 +670,26 @@ Document doc_from_json(const json::Value& v) {
     doc.audio_offset_ms = num(v, "audio_offset_ms", 0.0f);
     for (const Value& mv : v.get("masks").array())
         doc.masks.push_back(mask_from_json(mv));
+    doc.out_node_x = num(v, "out_node_x", 0.0f);
+    doc.out_node_y = num(v, "out_node_y", 0.0f);
+    // Legacy chain documents carry no links; consumers call ensure_links
+    // when they need the graph — the loader stays byte-roundtrip-stable.
+    for (const Value& lv : v.get("links").array())
+        doc.links.push_back(
+            {static_cast<uint64_t>(lv.get("from").as_int(0)),
+             static_cast<uint64_t>(lv.get("to").as_int(0)),
+             static_cast<uint32_t>(lv.get("port").as_int(0))});
+    for (const Value& fv : v.get("frames").array()) {
+        Document::Frame f;
+        f.id = static_cast<uint64_t>(fv.get("id").as_int(0));
+        f.x = num(fv, "x", 0.0f);
+        f.y = num(fv, "y", 0.0f);
+        f.w = num(fv, "w", 480.0f);
+        f.h = num(fv, "h", 360.0f);
+        f.title = fv.get("title").as_string();
+        f.color = static_cast<uint32_t>(fv.get("color").as_int(0));
+        doc.frames.push_back(std::move(f));
+    }
 
     // Re-derive id counters from the content: stored values are honored but
     // never allowed below (max seen id + 1), so a hand-edited file cannot

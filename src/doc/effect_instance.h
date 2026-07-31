@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace looks::doc {
@@ -111,6 +112,21 @@ enum class EffectType : uint32_t {
     SecurityMux,       // camera-wall grid, per-tile time offsets (ring)
     AudioScope,        // the soundtrack's waveform traced over the frame
     Modulate,          // luma-PM'd fine raster weave (FM engraving)
+    BlendNode,         // graph merge: blends the B input over In (v3)
+    Matte,             // matte maker: luma/key extract + levels (v5.2 —
+                       // masks ARE images; feeds any mask anchor)
+    // The PRIMITIVES batch (docs/flow_canvas.md v5.5): single-job nodes
+    // for operations previously buried inside compound effects.
+    Levels,            // in/out black-white points + gamma (tone primitive)
+    HueSat,            // hue rotate / saturation / lightness
+    ChannelMix,        // per-output source-channel pick (swap / mono)
+    Posterize,         // plain level quantization, no dither, no palette
+    Threshold,         // soft-knee luma threshold to black & white
+    PaletteMap,        // nearest-color palette snap (gb/cga/nes/ttx/duo)
+    Dither,            // the ordered-pattern threshold engine, standalone
+    Transform,         // mid-chain affine: scale/rotate/offset/flip + edges
+    FrameDelay,        // plain N-frame delay from a past-frames ring
+    TextOverlay,       // MSDF text burn-in (EffectInstance::text)
     Count,
 };
 
@@ -121,6 +137,19 @@ inline bool is_stateful_feedback(EffectType type) {
            type == EffectType::Lidar || type == EffectType::SlowScan ||
            type == EffectType::VectorTrace ||
            type == EffectType::ScopeMonitor;
+}
+
+// Second sampled image input reachable as a canvas aux port (docs/
+// flow_canvas.md v3 N-ports). The string names the port on the card;
+// null = no aux port. Wired aux wins over the legacy mask-as-map path
+// (Displace / Time Displace); Blend's B is the graph merge input.
+inline const char* effect_aux_port(EffectType type) {
+    switch (type) {
+        case EffectType::BlendNode: return "b";
+        case EffectType::Displace: return "map";
+        case EffectType::TimeDisplace: return "map";
+        default: return nullptr;
+    }
 }
 
 // True for the Codec-Box effects (CPU roundtrip through the mosh codec).
@@ -162,6 +191,14 @@ struct EffectInstance {
     uint64_t seed = 0;
     uint64_t mask_id = 0;          // 0 = unmasked; else a Document mask
     uint64_t group_id = 0;         // 0 = ungrouped; else a Layer group
+    // The one string param (v5.5): only TextOverlay reads it. Serialized
+    // when non-empty; edited through set_effect_text_command.
+    std::string text;
+    // Node-canvas position (docs/flow_canvas.md), graph units. Pure UI
+    // placement — never read by the renderer. (0,0) = unplaced; the
+    // canvas auto-lays-out unplaced nodes once and commits positions.
+    float node_x = 0.0f;
+    float node_y = 0.0f;
 };
 
 }  // namespace looks::doc

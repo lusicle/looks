@@ -1,5 +1,6 @@
 #include "doc/serialize.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 
@@ -7,6 +8,7 @@
 #include "doc/group_commands.h"
 #include "doc/mod_commands.h"
 #include "doc/preset.h"
+#include "doc/stack_commands.h"
 #include "gfx/graph.h"
 #include "mod/eval.h"
 #include "test_framework.h"
@@ -45,17 +47,16 @@ Document make_rich_doc() {
     overlay.color_a[0] = 0.9f;
     overlay.gen_scale = 3.0f;
     overlay.stack.push_back(make_effect(d, EffectType::Pixelate));
+    // The one string param (v5.5): Text's string must survive the trip.
+    overlay.stack.push_back(make_effect(d, EffectType::TextOverlay));
+    overlay.stack.back().text = "REC · SP";
     d.layers.push_back(overlay);
 
-    // Group the base layer's first two effects with a macro.
+    // Group the base layer's first two effects; expose a member param
+    // on the face (v5.3: the face is direct param aliases).
     doc::Group g = doc::make_group(d, "combo");
     g.folded = true;
-    doc::MacroKnob knob;
-    knob.name = "wreck";
-    knob.value = 0.5f;
-    knob.targets.push_back({d.layers[0].stack[1].id, 4, 0.0f, 0.6f,
-                            doc::ResponseCurve::Exp});
-    g.macros.push_back(knob);
+    g.exposed.push_back({d.layers[0].stack[1].id, 4});
     d.layers[0].stack[0].group_id = g.id;
     d.layers[0].stack[1].group_id = g.id;
     d.layers[0].groups.push_back(g);
@@ -132,10 +133,8 @@ TEST(serialize_roundtrip_stable) {
     CHECK_EQ(d2.layers[1].opacity, 0.4f);
     CHECK_EQ(d2.layers[0].groups.size(), size_t{1});
     CHECK(d2.layers[0].groups[0].folded);
-    CHECK_EQ(d2.layers[0].groups[0].macros.size(), size_t{1});
-    CHECK_EQ(d2.layers[0].groups[0].macros[0].targets.size(), size_t{1});
-    CHECK(d2.layers[0].groups[0].macros[0].targets[0].curve ==
-          doc::ResponseCurve::Exp);
+    CHECK_EQ(d2.layers[0].groups[0].exposed.size(), size_t{1});
+    CHECK_EQ(d2.layers[0].groups[0].exposed[0].param_index, 4);
     CHECK_EQ(d2.layers[0].stack[0].group_id, d2.layers[0].groups[0].id);
     CHECK_EQ(d2.masks.size(), size_t{1});
     CHECK(d2.masks[0].invert);
@@ -205,30 +204,24 @@ TEST(group_commands_lifecycle) {
     CHECK_EQ(d.layers[0].stack[1].group_id, g.id);
     CHECK_EQ(d.layers[0].stack[2].group_id, uint64_t{0});
 
-    // Macro add + coalescing value drags.
-    doc::MacroKnob knob;
-    knob.name = "wear";
-    knob.targets.push_back({d.layers[0].stack[1].id, 0, 0.0f, 0.5f,
-                            doc::ResponseCurve::Linear});
-    undo.execute(d, doc::add_macro_command(0, g.id, knob));
-    CHECK_EQ(d.layers[0].groups[0].macros.size(), size_t{1});
-
-    doc::Group edited = d.layers[0].groups[0];
-    edited.macros[0].value = 0.4f;
-    undo.execute(d, doc::set_group_props_command(0, edited), true);
-    edited.macros[0].value = 0.8f;
-    undo.execute(d, doc::set_group_props_command(0, edited), true);
-    CHECK_EQ(d.layers[0].groups[0].macros[0].value, 0.8f);
-    undo.undo(d);   // coalesced drag: one step back to 0
-    CHECK_EQ(d.layers[0].groups[0].macros[0].value, 0.0f);
-    undo.redo(d);
+    // Face exposure (v5.3): expose, de-dup, hide, undo both ways.
+    const doc::ParamKey pk{d.layers[0].stack[1].id, 0};
+    undo.execute(d, doc::set_group_exposed_command(0, g.id, pk, true));
+    CHECK_EQ(d.layers[0].groups[0].exposed.size(), size_t{1});
+    undo.execute(d, doc::set_group_exposed_command(0, g.id, pk, true));
+    CHECK_EQ(d.layers[0].groups[0].exposed.size(), size_t{1});   // no dup
+    undo.execute(d, doc::set_group_exposed_command(0, g.id, pk, false));
+    CHECK(d.layers[0].groups[0].exposed.empty());
+    undo.undo(d);   // un-hide
+    CHECK_EQ(d.layers[0].groups[0].exposed.size(), size_t{1});
+    CHECK(d.layers[0].groups[0].exposed[0] == pk);
 
     undo.execute(d, doc::ungroup_command(0, g.id));
     CHECK(d.layers[0].groups.empty());
     CHECK_EQ(d.layers[0].stack[0].group_id, uint64_t{0});
     undo.undo(d);
     CHECK_EQ(d.layers[0].groups.size(), size_t{1});
-    CHECK_EQ(d.layers[0].groups[0].macros[0].value, 0.8f);
+    CHECK_EQ(d.layers[0].groups[0].exposed.size(), size_t{1});
     CHECK_EQ(d.layers[0].stack[1].group_id, g.id);
 }
 
@@ -248,37 +241,6 @@ TEST(group_bypass_compiles_out) {
     CHECK_EQ(graph.nodes[1].effect_index, 1);
 }
 
-TEST(macro_eval_applies_offsets) {
-    Document d;
-    d.layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
-    const uint64_t fx_id = d.layers[0].stack[0].id;
-    d.layers[0].stack[0].params[0] = 0.2f;   // amount, range 0..1
-
-    doc::Group g = doc::make_group(d, "m");
-    doc::MacroKnob knob;
-    knob.name = "k";
-    knob.value = 0.5f;
-    knob.targets.push_back({fx_id, 0, 0.0f, 0.4f, doc::ResponseCurve::Linear});
-    g.macros.push_back(knob);
-    d.layers[0].stack[0].group_id = g.id;
-    d.layers[0].groups.push_back(g);
-
-    Document r = mod::resolve(d, 0, 30.0, nullptr);
-    // 0.2 + lerp(0, 0.4, 0.5) * span(1.0) = 0.4
-    CHECK(std::fabs(r.layers[0].stack[0].params[0] - 0.4f) < 1e-5f);
-
-    // Knob at zero with lo=0 is neutral.
-    d.layers[0].groups[0].macros[0].value = 0.0f;
-    r = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK(std::fabs(r.layers[0].stack[0].params[0] - 0.2f) < 1e-5f);
-
-    // Clamped at the param ceiling.
-    d.layers[0].groups[0].macros[0].value = 1.0f;
-    d.layers[0].groups[0].macros[0].targets[0].hi = 4.0f;
-    r = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK_EQ(r.layers[0].stack[0].params[0], 1.0f);
-}
-
 TEST(preset_capture_and_instantiate) {
     Document d;
     doc::UndoStack undo;
@@ -288,13 +250,9 @@ TEST(preset_capture_and_instantiate) {
     d.layers[0].stack[0].mask_id = 77;   // must not leak into the preset
 
     doc::Group g = doc::make_group(d, "era");
-    doc::MacroKnob knob;
-    knob.name = "fade";
-    knob.targets.push_back({d.layers[0].stack[0].id, 3, 0.0f, 0.5f,
-                            doc::ResponseCurve::Linear});
-    // A dangling target (no such member) must be dropped on capture.
-    knob.targets.push_back({9999, 0, 0.0f, 0.5f, doc::ResponseCurve::Linear});
-    g.macros.push_back(knob);
+    g.exposed.push_back({d.layers[0].stack[0].id, 3});
+    // A dangling face key (no such member) must be dropped on capture.
+    g.exposed.push_back({9999, 0});
     d.layers[0].stack[0].group_id = g.id;
     d.layers[0].stack[1].group_id = g.id;
     d.layers[0].groups.push_back(g);
@@ -303,7 +261,7 @@ TEST(preset_capture_and_instantiate) {
     CHECK_EQ(p.name, "era");
     CHECK_EQ(p.effects.size(), size_t{2});
     CHECK_EQ(p.effects[0].mask_id, uint64_t{0});
-    CHECK_EQ(p.group.macros[0].targets.size(), size_t{1});
+    CHECK_EQ(p.group.exposed.size(), size_t{1});
 
     // File roundtrip.
     json::Value pj = doc::preset_to_json(p);
@@ -311,7 +269,7 @@ TEST(preset_capture_and_instantiate) {
     CHECK(p2.has_value());
     CHECK(doc::preset_to_json(*p2) == pj);
 
-    // Instantiate into a fresh doc: fresh ids, remapped macro targets.
+    // Instantiate into a fresh doc: fresh ids, remapped face keys.
     Document target;
     doc::Group ng;
     std::vector<doc::EffectInstance> nfx;
@@ -319,8 +277,8 @@ TEST(preset_capture_and_instantiate) {
     CHECK_EQ(nfx.size(), size_t{2});
     CHECK(nfx[0].id != p2->effects[0].id);
     CHECK_EQ(nfx[0].group_id, ng.id);
-    CHECK_EQ(ng.macros[0].targets.size(), size_t{1});
-    CHECK_EQ(ng.macros[0].targets[0].effect_id, nfx[0].id);
+    CHECK_EQ(ng.exposed.size(), size_t{1});
+    CHECK_EQ(ng.exposed[0].effect_id, nfx[0].id);
     CHECK(ng.folded);
 
     undo.execute(target, doc::insert_group_command(0, ng, nfx));
@@ -372,7 +330,8 @@ TEST(morph_interpolates_snapshots) {
 TEST(era_presets_ship_valid) {
     // The shipped presets in assets/presets (the five spec §14 era looks
     // plus the wave-2 style set) must load, carry effects, and have every
-    // macro target resolve to a member effect.
+    // exposed face param resolve to a member effect (v5.3: the group
+    // face is exposed params — direct aliases, no macro offsets).
     const std::filesystem::path dir =
         std::filesystem::path(LOOKS_REPO_ROOT) / "assets" / "presets";
     std::vector<doc::Preset> presets = doc::scan_presets(dir);
@@ -380,19 +339,18 @@ TEST(era_presets_ship_valid) {
     for (const doc::Preset& p : presets) {
         CHECK(!p.effects.empty());
         CHECK(!p.tags.empty());
-        for (const doc::MacroKnob& knob : p.group.macros)
-            for (const doc::MacroTarget& t : knob.targets) {
-                bool found = false;
-                for (const doc::EffectInstance& fx : p.effects) {
-                    if (fx.id != t.effect_id) continue;
-                    found = true;
-                    // Param index must exist on the target effect.
-                    CHECK(t.param_index <
-                          static_cast<int>(
-                              doc::effect_info(fx.type).param_count));
-                }
-                CHECK(found);
+        for (const doc::ParamKey& k : p.group.exposed) {
+            bool found = false;
+            for (const doc::EffectInstance& fx : p.effects) {
+                if (fx.id != k.effect_id) continue;
+                found = true;
+                CHECK(k.param_index <
+                      static_cast<int>(
+                          doc::effect_info(fx.type).param_count));
+                CHECK(k.param_index >= doc::kOpacityParam);
             }
+            CHECK(found);
+        }
     }
 }
 
@@ -430,3 +388,4 @@ TEST(serialize_mask_param_key_roundtrip) {
     CHECK_EQ(d2.lanes[0].target.param_index, doc::kMaskPointParamBase + 2);
     CHECK(doc::doc_to_json(d2) == j);
 }
+
