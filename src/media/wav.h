@@ -1,5 +1,5 @@
-// WAV read/write (spec §12): minimal RIFF/WAVE codec for the sidechain
-// path (spec §7 — analyze an external WAV instead of the clip's audio).
+// WAV read/write: minimal RIFF/WAVE codec for the sidechain
+// path (— analyze an external WAV instead of the clip's audio).
 // Reader accepts PCM16/24/32 and float32, any channel count, and converts
 // to interleaved s16; writer emits canonical PCM16.
 

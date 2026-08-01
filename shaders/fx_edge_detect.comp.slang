@@ -1,4 +1,4 @@
-// Edge detect (spec §6.6): Sobel magnitude OR difference-of-gaussians as
+// Edge detect: Sobel magnitude OR difference-of-gaussians as
 // stylized lines — white on black, black on white, or inked over the
 // image. Encoded-space gradients (edges are perceptual).
 //
@@ -19,7 +19,7 @@ cbuffer Push
     float threshold;
     float mode;        // 0 white-on-black, 1 black-on-white, 2 over image
     float thickness;   // sample radius, px
-    float algo;        // 0 sobel, 1 difference-of-gaussians (spec §6.6)
+    float algo;        // 0 sobel, 1 difference-of-gaussians
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

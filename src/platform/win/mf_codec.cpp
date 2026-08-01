@@ -235,7 +235,7 @@ struct H264Decoder::Impl {
     uint32_t height = 0;
     bool sent_params = false;
 
-    // D3D11/DXVA acceleration (spec §3): kept alive for the MFT's lifetime.
+    // D3D11/DXVA acceleration: kept alive for the MFT's lifetime.
     Com<IMFDXGIDeviceManager> dxgi_mgr;
     Com<ID3D11Device> d3d;
 
@@ -348,7 +348,7 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
                                  MFMediaType_Video, d.mft.put());
     if (FAILED(hr)) return set_error(error, "H.264 decoder MFT not found", hr);
 
-    // Wire the D3D11 manager for speed (spec §3) — before type negotiation
+    // Wire the D3D11 manager for speed — before type negotiation
     // so the decoder can plan its DXVA surface pool.
     if (allow_d3d && d.try_d3d())
         log_info("mf: H.264 decode D3D11-accelerated (DXVA)");
@@ -602,7 +602,7 @@ struct H264Encoder::Impl {
     uint32_t width = 0;
     uint32_t height = 0;
 
-    // Async hardware path (spec §3): hardware MFTs only run in hardware
+    // Async hardware path: hardware MFTs only run in hardware
     // with an IMFDXGIDeviceManager attached, and they speak the async
     // event-pump protocol (METransformNeedInput / HaveOutput) instead of
     // the sync ProcessInput/Output model. Software fallback keeps the sync
@@ -808,7 +808,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
     CoTaskMemFree(activates);
     if (!e.mft) return fail(last_stage, last_hr);
 
-    // D3D11 device + DXGI manager (spec §3): hardware MFTs only run in
+    // D3D11 device + DXGI manager: hardware MFTs only run in
     // hardware with a device manager attached.
     UINT reset_token = 0;
     Com<ID3D11DeviceContext> ctx;
@@ -824,7 +824,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
     if (SUCCEEDED(hr)) hr = e.dxgi_mgr->ResetDevice(e.d3d.get(), reset_token);
     if (FAILED(hr)) return fail("DXGI manager", hr);
 
-    // Attach the DXGI manager (spec §3). Some encoder MFTs accept it only
+    // Attach the DXGI manager. Some encoder MFTs accept it only
     // after type negotiation; a refusal is non-fatal — the async hardware
     // MFT still encodes on the GPU from CPU samples, the manager merely
     // enables zero-copy D3D surface input.
@@ -865,7 +865,7 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     e.width = width;
     e.height = height;
 
-    // Hardware first (spec §3): async MFT + IMFDXGIDeviceManager. Any
+    // Hardware first: async MFT + IMFDXGIDeviceManager. Any
     // failure resets to a clean slate and falls through to software —
     // import/export are offline, so the fallback is only a speed loss.
     if (e.try_hardware(width, height, fps_num, fps_den, bitrate_bps)) {

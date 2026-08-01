@@ -1,4 +1,4 @@
-// Gauge / gate masks (spec §6.8): the black projection gate for Super 8,
+// Gauge / gate masks: the black projection gate for Super 8,
 // 16mm, 1.85 flat, and 2.39 scope — rounded gate corners, soft edge. The
 // mask multiplies (it is an aperture, so it runs in linear light).
 //

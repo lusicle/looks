@@ -1,4 +1,4 @@
-// Flow smear (spec §6.1 category 1): accumulate taps backward along the
+// Flow smear (category 1): accumulate taps backward along the
 // motion vector — moving regions streak, still regions stay sharp.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).

@@ -18,7 +18,7 @@ if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     # Drop /RTC1 from Debug: it is incompatible with per-target /O2, and the
     # pixel-loop libraries (mezzanine codec) must run optimized even in
-    # Debug builds or import crawls (spec §13: import ≥ 2× realtime).
+    # Debug builds or import crawls (import ≥ 2× realtime).
     # Coverage lost is stack-frame/uninitialized checks; the test suites and
     # Vulkan validation are the project's real safety nets.
     string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")

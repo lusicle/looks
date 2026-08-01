@@ -1,4 +1,4 @@
-// Frame fetch (spec §4): I420 planes -> linear RGB f16. BT.709 limited
+// Frame fetch: I420 planes -> linear RGB f16. BT.709 limited
 // range, transfer decoded with the sRGB EOTF (close enough to BT.709 camera
 // gamma for v1; a proper transfer selector rides in with ColorScience).
 

@@ -1,5 +1,5 @@
 // Halftone (print sim): angled dot screens with dot gain. Beyond the glyph
-// engine's grid dots (spec §6.6) — the screens rotate, and CMYK mode runs
+// engine's grid dots — the screens rotate, and CMYK mode runs
 // four screens at classic press angles so their interference produces the
 // authentic rosette. Display-referred: dots live on the print.
 //

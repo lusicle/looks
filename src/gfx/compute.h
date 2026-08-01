@@ -1,4 +1,4 @@
-// Compute pipeline + per-frame descriptor arena (spec §4: compute-first).
+// Compute pipeline + per-frame descriptor arena (compute-first).
 //
 // Every effect kernel shares one shape: N sampled inputs (one shared
 // sampler), M storage outputs, one push-constant block. Descriptor sets are

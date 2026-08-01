@@ -1,4 +1,4 @@
-// Build-time blue-noise generator (spec §6.2/§12): void-and-cluster over a
+// Build-time blue-noise generator: void-and-cluster over a
 // toroidal grid, 2D for the classic blue-noise tile and 3D for the STBN
 // volume (each temporal slice is spatially blue; threshold sequences are
 // blue along time). Fully deterministic — same binary output every build.

@@ -1,4 +1,4 @@
-// Node canvas implementation (docs/flow_canvas.md v2). Everything draws
+// Node canvas implementation (docs/flow_canvas.md). Everything draws
 // in graph space through one screen transform; interaction resolves
 // geometrically against the same transform. One WidgetId owns the whole
 // surface; drags hold ctx capture with the element remembered in
@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "doc/effects.h"   // param_option_count/_at (v5.6 dropdown rows)
+#include "doc/effects.h"   // param_option_count/_at (dropdown rows)
 #include "ui/text.h"
 #include "ui/theme.h"
 
@@ -60,11 +60,11 @@ bool is_boundary(const Node& nd) {
     return nd.kind == NodeKind::GroupIn || nd.kind == NodeKind::GroupOut;
 }
 
-// Mask/aux ports get dedicated strip rows between the preview and the
+// Matte/aux ports get dedicated strip rows between the preview and the
 // param rows — a port pinned at a fixed offset lands on top of row 0
-// (the "mask" label painted over wet/dry shipped once).
+// (the port label painted over wet/dry shipped once).
 int port_row_count(const Node& nd) {
-    return (nd.has_mask_port ? 1 : 0) + (nd.has_aux_port ? 1 : 0);
+    return (nd.has_matte_port ? 1 : 0) + (nd.has_aux_port ? 1 : 0);
 }
 
 void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
@@ -198,16 +198,16 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                               : kTitleH * 0.5f;
         return to_screen({nd.x + kNodeW, nd.y + py});
     };
-    auto port_mask = [&](const Node& nd) {
+    auto port_matte = [&](const Node& nd) {
         return to_screen(
             {nd.x, nd.y + strip_top(nd) + 0.5f * kRowH});
     };
     auto port_aux = [&](const Node& nd) {
         return to_screen(
             {nd.x, nd.y + strip_top(nd) +
-                       (nd.has_mask_port ? 1.5f : 0.5f) * kRowH});
+                       (nd.has_matte_port ? 1.5f : 0.5f) * kRowH});
     };
-    // Left-edge anchor of a param row — where mod wires land (v4: routes
+    // Left-edge anchor of a param row — where mod wires land (routes
     // wire into the PARAM, not the card).
     auto row_anchor = [&](const Node& nd, int row) {
         return to_screen({nd.x, nd.y + rows_top_g(nd) +
@@ -257,23 +257,17 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     };
     // Which node outputs may feed a given input port — one truth for the
     // reverse wire drag's candidate rings and its drop resolution.
-    // port 1 (matte): ANY image out — masks ARE images (v5.2); legacy
-    // Mask cards still qualify. In on a Mask card: Source outs
-    // (pre-stack rule). Image In / aux: Source, Effect, Group (boundary
-    // proxy), or GroupIn outs. Value nodes never feed image ports; only
-    // image nodes feed GroupOut.
+    // port 1 (matte): ANY image out — masks ARE images. Image In / aux:
+    // Source, Effect, Group (boundary proxy), or GroupIn outs. Value
+    // nodes never feed image ports; only image nodes feed GroupOut.
     auto out_feeds_input = [](const Node& src_nd, const Node& to_nd,
                               uint32_t port) {
         if (!src_nd.has_out) return false;
         if (src_nd.kind == NodeKind::ModSource) return false;
         if (port == 1)
-            return src_nd.kind == NodeKind::Mask ||
-                   src_nd.kind == NodeKind::Source ||
+            return src_nd.kind == NodeKind::Source ||
                    src_nd.kind == NodeKind::Effect ||
                    src_nd.kind == NodeKind::Group;
-        if (src_nd.kind == NodeKind::Mask) return false;
-        if (to_nd.kind == NodeKind::Mask)
-            return src_nd.kind == NodeKind::Source;
         if (to_nd.kind == NodeKind::GroupOut)
             return src_nd.kind == NodeKind::Effect;
         if (src_nd.kind == NodeKind::GroupIn)
@@ -290,7 +284,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         *p0 = port_out(*a);
         const bool row_end =
             w.kind == 2 && w.to_row >= 0 && w.to_row < b->row_count;
-        *p3 = w.kind == 1 ? port_mask(*b)
+        *p3 = w.kind == 1 ? port_matte(*b)
             : w.kind == 3 ? port_aux(*b)
             : row_end     ? row_anchor(*b, w.to_row)
                           : port_in(*b);
@@ -567,7 +561,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Param dropdown popup (v5.6): resolve the open field's row each
+    // Param dropdown popup: resolve the open field's row each
     // frame (pointers are per-frame); a pick stages the option index
     // exactly like a slider release, so the existing param appliers and
     // undo coalescing do the rest. Clicks route here before the nodes.
@@ -677,7 +671,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.drag_moved = false;
         st.press_screen = mouse;
         // Port grabs win over everything: Out starts a wire, a FED In or
-        // Mask port grabs its wire for rewiring (texed editor idiom).
+        // matte port grabs its wire for rewiring (texed editor idiom).
         bool port_handled = false;
         for (size_t i = 0; i < n && !port_handled; ++i) {
             const Node& nd = g.nodes[i];
@@ -713,8 +707,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 port_handled = true;
             };
             if (!port_handled && nd.has_in) grab_input(port_in(nd), 0, 0);
-            if (!port_handled && nd.has_mask_port)
-                grab_input(port_mask(nd), 1, 1);
+            if (!port_handled && nd.has_matte_port)
+                grab_input(port_matte(nd), 1, 1);
             if (!port_handled && nd.has_aux_port)
                 grab_input(port_aux(nd), 3, 2);
         }
@@ -752,7 +746,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     handled = true;
                 } else if (rh.row >= 0 && nd.rows[rh.row].kind != 0 &&
                            (rh.zone == 1 || rh.zone == 2)) {
-                    // Non-slider rows (v5.6): the whole field is one
+                    // Non-slider rows: the whole field is one
                     // control — dropdowns open their option popup, text
                     // rows open the shared inline editor.
                     const ParamRow& pr = nd.rows[rh.row];
@@ -788,7 +782,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
             if (!handled) {
                 // Body press: select now, drag moves the node. A double
-                // click on a folded Group card enters it (v4 subgraphs).
+                // click on a folded Group card enters it (subgraphs).
                 const uint64_t fnum = frame.ctx.frame();
                 const float dd =
                     std::fabs(mouse.x - st.last_click_pos.x) +
@@ -807,7 +801,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                            fnum - st.last_click_frame < 24 && dd < 8.0f &&
                            st.last_click_id == nd.id &&
                            mouse.y < cr.y + kTitleH * z) {
-                    // Text card (v5.5): title double-click edits the
+                    // Text card: title double-click edits the
                     // string through the shared inline editor.
                     out.text_edit = nd.id;
                     st.last_click_frame = 0;
@@ -982,15 +976,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.wire_old_port = 0;
         } else if (st.drag_kind == 4 || st.drag_kind == 5) {
             // Drop resolution: nearest compatible port under the cursor.
-            // Mask nodes wire into Mask ports; mod sources wire into a
-            // PARAM ROW (v4); everything else into In.
+            // Mod sources wire into a PARAM ROW; everything else into
+            // In / aux / matte.
             const Node* from_nd = find_node(st.wire_from);
-            const bool from_mask =
-                from_nd && from_nd->kind == NodeKind::Mask;
             const bool from_mod =
                 from_nd && from_nd->kind == NodeKind::ModSource;
-            const bool from_src =
-                from_nd && from_nd->kind == NodeKind::Source;
             uint64_t to = 0;
             uint32_t port = 0;
             bool found = false;
@@ -1010,13 +1000,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             for (size_t i = 0; i < n && !found && !from_mod; ++i) {
                 const Node& nd = g.nodes[i];
                 if (nd.id == st.wire_from) continue;
-                if (from_mask) {
-                    if (nd.has_mask_port && near2(port_mask(nd), 324.0f)) {
-                        to = nd.id;
-                        port = 1;
-                        found = true;
-                    }
-                } else if (nd.has_in && near2(port_in(nd), 324.0f)) {
+                if (nd.has_in && near2(port_in(nd), 324.0f)) {
                     to = nd.id;
                     port = 0;
                     found = true;
@@ -1025,10 +1009,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     to = nd.id;
                     port = 2;
                     found = true;
-                } else if (nd.has_mask_port &&
-                           near2(port_mask(nd), 324.0f)) {
-                    // ANY image out on a matte anchor (v5.2: masks ARE
-                    // images) — the app wires a plain port-1 link.
+                } else if (nd.has_matte_port &&
+                           near2(port_matte(nd), 324.0f)) {
+                    // ANY image out on a matte anchor (masks ARE images)
+                    // — the app wires a plain port-1 link.
                     to = nd.id;
                     port = 1;
                     found = true;
@@ -1255,7 +1239,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 
     // Wires under the cards. Mod wires land on the driven param's row
-    // gutter (v4) with a terminal dot; the rest end on ports.
+    // gutter with a terminal dot; the rest end on ports.
     for (size_t w = 0; w < g.wire_count; ++w) {
         const Node* a = find_node(g.wires[w].from);
         const Node* b = find_node(g.wires[w].to);
@@ -1265,7 +1249,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                              g.wires[w].to_row >= 0 &&
                              g.wires[w].to_row < b->row_count;
         const Vec2 p3 = g.wires[w].kind == 1
-            ? port_mask(*b)
+            ? port_matte(*b)
             : (g.wires[w].kind == 3
                    ? port_aux(*b)
                    : (row_end ? row_anchor(*b, g.wires[w].to_row)
@@ -1348,7 +1332,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                      : (hovered ? theme.text_disabled
                                                 : theme.hairline)));
             canvas.push_clip({tb.x, tb.y, tb.w - 40.0f * z, tb.h});
-            // Cards with a TEXT row (v5.6) edit in the row, not the
+            // Cards with a TEXT row edit in the row, not the
             // title — suppress the title editor there.
             bool has_text_row = false;
             for (int tr = 0; tr < nd.row_count; ++tr)
@@ -1403,7 +1387,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                 4.0f * z, theme.text_dim,
                                 theme.control_bg);
 
-            // Preview slot, then the port strip (mask/aux live in their
+            // Preview slot, then the port strip (matte/aux live in their
             // own rows so their labels never overlap params).
             float cy = cr.y + kTitleH * z;
             if (node_has_preview(nd)) {
@@ -1456,7 +1440,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                 : theme.text_disabled);
                     label_x = cr.x + 17.0f * z;
                 }
-                // Expose toggle (v5.3 group face): square dot beside the
+                // Expose toggle (group face): square dot beside the
                 // key dot on scoped member rows — filled = on the face.
                 if (pr.expose_clicked) {
                     const float er = 2.8f * z;
@@ -1481,7 +1465,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 canvas.pop_clip();
                 if (pr.kind != 0) {
                     // Dropdown / text FIELD spanning the slider + value
-                    // area — same row height and margins (v5.6).
+                    // area — same row height and margins.
                     const float fx0 = cr.x + 64.0f * z;
                     const Rect fr{fx0, ry + 1.5f * z,
                                   (cr.right() - 8.0f * z) - fx0,
@@ -1628,14 +1612,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             // the port under the cursor lights accent (texed port hover
             // + connected-port fill).
             const float pr2 = 4.0f * z;
-            bool in_fed = false, mask_fed = false, aux_fed = false,
+            bool in_fed = false, matte_fed = false, aux_fed = false,
                  out_fed = false;
             for (size_t w = 0; w < g.wire_count; ++w) {
                 const Wire& wr = g.wires[w];
                 if (wr.from == nd.id) out_fed = true;
                 if (wr.to != nd.id) continue;
                 if (wr.kind == 0) in_fed = true;
-                else if (wr.kind == 1) mask_fed = true;
+                else if (wr.kind == 1) matte_fed = true;
                 else if (wr.kind == 3) aux_fed = true;
             }
             auto draw_port = [&](Vec2 c, Color col, bool fed) {
@@ -1653,11 +1637,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                      in_fed);
             if (nd.has_out) draw_port(port_out(nd), theme.text_disabled,
                                       out_fed);
-            if (nd.has_mask_port) {
-                draw_port(port_mask(nd), theme.accent_dim, mask_fed);
-                ui::draw_text(canvas, frame.font, "mask",
+            if (nd.has_matte_port) {
+                draw_port(port_matte(nd), theme.accent_dim, matte_fed);
+                ui::draw_text(canvas, frame.font, "matte",
                               {cr.x + 8.0f * z,
-                               port_mask(nd).y - rs * 0.5f},
+                               port_matte(nd).y - rs * 0.5f},
                               rs * 0.9f, theme.text_disabled);
             }
             if (nd.has_aux_port) {
@@ -1699,30 +1683,24 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 
     // Live wire drag: rubber band from the origin Out port + accent rings
-    // on every compatible drop port (mask nodes wire into Mask ports; a
-    // mod source targets param ROWS — the hovered row lights up).
+    // on every compatible drop port (a mod source targets param ROWS —
+    // the hovered row lights up).
     if (st.drag_kind == 4 || st.drag_kind == 5) {
         const Node* from_nd = find_node(st.wire_from);
         if (from_nd) {
-            const bool from_mask = from_nd->kind == NodeKind::Mask;
             const bool from_mod = from_nd->kind == NodeKind::ModSource;
             draw_wire(canvas, port_out(*from_nd), mouse,
-                      std::max(1.4f, 1.8f * z), theme.accent,
-                      from_mask || from_mod);
+                      std::max(1.4f, 1.8f * z), theme.accent, from_mod);
             const float pr3 = 6.0f * z;
             for (size_t i = 0; i < n && !from_mod; ++i) {
                 const Node& nd = g.nodes[i];
                 if (nd.id == st.wire_from) continue;
                 Vec2 candidates[3]{};
                 int n_cand = 0;
-                if (from_mask && nd.has_mask_port)
-                    candidates[n_cand++] = port_mask(nd);
-                if (!from_mask && nd.has_in)
-                    candidates[n_cand++] = port_in(nd);
-                if (!from_mask && nd.has_aux_port)
-                    candidates[n_cand++] = port_aux(nd);
-                if (!from_mask && nd.has_mask_port)
-                    candidates[n_cand++] = port_mask(nd);
+                if (nd.has_in) candidates[n_cand++] = port_in(nd);
+                if (nd.has_aux_port) candidates[n_cand++] = port_aux(nd);
+                if (nd.has_matte_port)
+                    candidates[n_cand++] = port_matte(nd);
                 for (int c = 0; c < n_cand; ++c) {
                     const Vec2 p = candidates[c];
                     canvas.draw_sdf_rect_outline(
@@ -1766,7 +1744,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const Node* to_nd = find_node(st.wire_old_to);
         if (to_nd) {
             const Vec2 fixed_p = st.wire_old_port == 1
-                ? port_mask(*to_nd)
+                ? port_matte(*to_nd)
                 : (st.wire_old_port == 2 ? port_aux(*to_nd)
                                          : port_in(*to_nd));
             draw_wire(canvas, mouse, fixed_p, std::max(1.4f, 1.8f * z),
@@ -1922,7 +1900,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Param dropdown popup (v5.6): options under the field, current one
+    // Param dropdown popup: options under the field, current one
     // in accent, hover fill — the ctx menu's visual language.
     if (dd_row_p) {
         const int n = doc::param_option_count(dd_row_p->options);

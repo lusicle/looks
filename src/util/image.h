@@ -1,4 +1,4 @@
-// PNG decoder + TGA loader (spec §12) — glyph atlases, LUT strips,
+// PNG decoder + TGA loader — glyph atlases, LUT strips,
 // dust/leak/screen textures. PNG scope: 8-bit gray / RGB / RGBA, critical
 // chunks, CRC-verified, no interlace, own inflate. TGA: uncompressed + RLE
 // truecolor 24/32-bit. Both decode to tightly-packed RGBA8.

@@ -4,7 +4,7 @@
 // (velocity modulation: brightness = dwell time, the 1930s TV scheme).
 // Slots respawn from the frame edge on a staggered tick cadence and die
 // after one full cycle so stuck fronts always recycle. Deterministic:
-// frame-clocked, seeded (spec §11).
+// frame-clocked, seeded.
 //
 // State texel: R = front position (px along the sweep axis), G = active,
 // B = spawn tick + 1 (0 = never spawned).

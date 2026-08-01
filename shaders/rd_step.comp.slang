@@ -1,4 +1,4 @@
-// One Gray-Scott reaction-diffusion step (spec §6.6). State is (A, B) in
+// One Gray-Scott reaction-diffusion step. State is (A, B) in
 // RG16F; the frame seeds the sim by injecting B where the input has
 // midtone luma — the picture literally grows the pattern. No randomness:
 // the sim is deterministic given the sequential frame stream.

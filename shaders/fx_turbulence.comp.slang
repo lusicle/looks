@@ -1,4 +1,4 @@
-// Liquify / turbulence (spec §6.2): curl-noise warp. The stream function is
+// Liquify / turbulence: curl-noise warp. The stream function is
 // smooth value noise over (cell, time step); its rotated gradient gives a
 // divergence-free flow, so the warp swirls instead of tearing. Time is
 // quantized on frame/fps and cross-faded between steps — deterministic.

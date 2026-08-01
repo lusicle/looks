@@ -1,4 +1,4 @@
-// Polar coordinates (spec §6.2): rect→polar wraps the frame around the
+// Polar coordinates: rect→polar wraps the frame around the
 // center (x = angle, y = radius); polar→rect unwraps it into a strip.
 // swirl shears the angle by radius; the angle axis wraps, radius clamps.
 //

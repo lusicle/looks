@@ -1,4 +1,4 @@
-// Light leaks (spec §6.3): warm blobs of fogging light breathing in from
+// Light leaks: warm blobs of fogging light breathing in from
 // the frame edge — additive in LINEAR light, which is what makes leaks
 // glow instead of paint. Position/intensity drift on seeded value noise.
 //
@@ -19,7 +19,7 @@ cbuffer Push
     float amount;
     float hue;      // 0 = orange-red, 1 = magenta
     float drift;    // breathing rate, hz
-    float burn;     // film-burn reel end (spec §6.3): 0 = off
+    float burn;     // film-burn reel end: 0 = off
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -58,7 +58,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 result_rgb = base.rgb + tint * leak;
 
-    // Film-burn reel end (spec §6.3): a flickering burn-through creeping
+    // Film-burn reel end: a flickering burn-through creeping
     // in from the corners — orange fringe around a blown white core, the
     // emulsion melting look. Fully seeded/frame-driven.
     if (burn > 0.001) {

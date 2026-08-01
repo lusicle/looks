@@ -1,8 +1,8 @@
-// Camcorder HUD (spec §6.8): blinking REC dot + label, battery gauge,
+// Camcorder HUD: blinking REC dot + label, battery gauge,
 // tape counter off the timeline clock, safe-frame corner brackets. Drawn
 // procedurally in encoded space (it is signal, not scene). Put this
 // BEFORE a Codec-Box in the stack and the HUD gets JPEG-crushed with the
-// picture — the authentic ordering (spec §5).
+// picture — the authentic ordering.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
 

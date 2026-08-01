@@ -1,4 +1,4 @@
-// Undoable mutations of a layer's effect stack (spec §10: every mutation is
+// Undoable mutations of a layer's effect stack (every mutation is
 // a Command). Param drags execute with coalesce=true — SetParamCommand
 // merges consecutive edits of the same knob so a whole gesture is one undo
 // step; the app calls break_coalescing() on mouse-up.
@@ -22,11 +22,11 @@ std::unique_ptr<Command> set_param_command(size_t layer_index,
                                            int param_index, float new_value);
 std::unique_ptr<Command> set_bypass_command(size_t layer_index,
                                             size_t effect_index, bool bypass);
-// The Text effect's string (v5.5) — the one non-float param.
+// The Text effect's string — the one non-float param.
 std::unique_ptr<Command> set_effect_text_command(size_t layer_index,
                                                  size_t effect_index,
                                                  std::string text);
-// Solo (spec §5): any soloed effect mutes the rest of its stack.
+// Solo: any soloed effect mutes the rest of its stack.
 std::unique_ptr<Command> set_solo_command(size_t layer_index,
                                           size_t effect_index, bool solo);
 // Takes the fully-formed instance (id already assigned via make_effect) so
@@ -45,13 +45,13 @@ std::unique_ptr<Command> move_effect_command(size_t layer_index,
 // coalesce so a whole drag is one undo step. Positions are pure UI state
 // on the document — the renderer never reads them.
 enum class NodeRef : uint32_t {
-    Effect, Layer, Mask, Route, Output, Frame, Group,
+    Effect, Layer, Route, Output, Frame, Group,
     GroupIn, GroupOut,   // a group's boundary nodes (id = the group)
 };
 std::unique_ptr<Command> set_node_pos_command(NodeRef kind, uint64_t id,
                                               float x, float y);
 
-// TRUE GRAPH link edits (docs/flow_canvas.md v3). Both materialize the
+// TRUE GRAPH link edits (docs/flow_canvas.md). Both materialize the
 // synthesized legacy links on first edit, so the table becomes the single
 // topology truth from then on. connect replaces any existing link at
 // (to, port) — except the Output node (to 0), which accepts any number of
@@ -59,12 +59,16 @@ std::unique_ptr<Command> set_node_pos_command(NodeRef kind, uint64_t id,
 // commands themselves apply unconditionally.
 std::unique_ptr<Command> connect_command(Document::NodeLink link);
 std::unique_ptr<Command> disconnect_command(Document::NodeLink link);
+// Freeze the synthesized legacy wiring: run before ANY node add so
+// the newborn spawns unwired instead of being chained in by stack-order
+// synthesis. No-op when links are already materialized (or no layers).
+std::unique_ptr<Command> materialize_links_command();
 
 // True when adding from→to would close a cycle: to already reaches from
 // through the (effective) link table. The texed reachability guard.
 bool link_would_cycle(const Document& doc, uint64_t from, uint64_t to);
 
-// Canvas frames (docs/flow_canvas.md v3): titled grouping boxes.
+// Canvas frames (docs/flow_canvas.md): titled grouping boxes.
 std::unique_ptr<Command> add_frame_command(Document::Frame frame);
 std::unique_ptr<Command> remove_frame_command(uint64_t frame_id);
 // Resize coalesces per frame id (corner drag = one undo step).

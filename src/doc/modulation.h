@@ -1,4 +1,4 @@
-// Modulation data model (spec §7), stored in the Document: the global mod
+// Modulation data model, stored in the Document: the global mod
 // matrix (routes), per-param keyframe lanes, and snapshot slots. Evaluation
 // lives in src/mod/ — this header is pure data so the document stays
 // self-contained.
@@ -21,15 +21,15 @@ namespace looks::doc {
 // param_index >= 0 indexes EffectInstance::params; negatives address the
 // built-ins (kWetParam / kOpacityParam in stack_commands.h).
 //
-// Masks are mod targets too (spec §8): their keys set kMaskParamBit and
-// carry the MASK id (mask ids come from a separate counter, so the bit
-// keeps the two id spaces from colliding). Mask param indices: 0 feather,
-// 1 center_x, 2 center_y, 3 radius_x, 4 radius_y, 5 blur_px,
-// 6 black_point, 7 white_point, 8 gamma, 9 key_center, 10 key_range.
-// Bezier shape points are addressable past kMaskPointParamBase (spec §8
-// "keyframable points"): base + 2i = point i x, base + 2i + 1 = point i y.
-inline constexpr uint64_t kMaskParamBit = 1ull << 63;
-inline constexpr int kMaskPointParamBase = 16;
+// Layer params are mod targets too: keys set kLayerParamBit and
+// carry the LAYER id (layers share the effect id counter, but the bit
+// keeps the addressing self-describing and JSON stores it as its own
+// field). Indices — the continuous Layer fields:
+//   0 opacity, 1-3 color_a rgb, 4-6 color_b rgb, 7 gen_scale,
+//   8 gen_angle, 9 crop_l, 10 crop_r, 11 crop_t, 12 crop_b,
+//   13 xf_scale, 14 xf_rotate.
+inline constexpr uint64_t kLayerParamBit = 1ull << 62;
+inline constexpr int kLayerParamCount = 15;
 
 struct ParamKey {
     uint64_t effect_id = 0;
@@ -49,7 +49,7 @@ enum class ModSourceType : uint32_t {
     AudioOnset,
     VideoMotion,
     VideoBrightness,
-    LfoBeat,           // BPM-synced LFO: rate_hz = beats per cycle (spec §7)
+    LfoBeat,           // BPM-synced LFO: rate_hz = beats per cycle
     Envelope,          // attack-decay burst fired by triggers (see below)
     VideoCut,          // scene-cut trigger curve
     Beat,              // deterministic pulse train from the BPM estimate
@@ -68,13 +68,13 @@ struct ModSource {
     float rate_hz = 1.0f;     // LFO / drift / S&H rate; LfoBeat: beats/cycle
     float phase = 0.0f;       // cycles
     uint64_t seed = 0;        // S&H / drift
-    // Envelope (spec §7): attack-decay burst fired by a trigger. Keypress
-    // fires live only (spec §11 exempts live mode from determinism); the
+    // Envelope: attack-decay burst fired by a trigger. Keypress
+    // fires live only (exempts live mode from determinism); the
     // Beat source reuses attack/decay for its pulse shape.
     float attack = 0.02f;     // seconds to peak
     float decay = 0.4f;       // exponential decay constant, seconds
     uint32_t trigger = 0;     // 0 onset, 1 scene cut, 2 beat, 3 keypress
-    // Video sampling (docs/flow_canvas.md v4): point / centered region on
+    // Video sampling (docs/flow_canvas.md): point / centered region on
     // the CURRENT decoded source frame, uv 0..1. VideoSample ignores the
     // extent (it averages a small fixed box so 8-bit code-value steps
     // don't pop). channel: 0 luma, 1 R, 2 G, 3 B.
@@ -108,7 +108,7 @@ struct Keyframe {
 struct KeyframeLane {
     ParamKey target;
     std::vector<Keyframe> keys;   // sorted by frame
-    // Loopable region (spec §7): once the playhead passes the first key,
+    // Loopable region: once the playhead passes the first key,
     // evaluation wraps through the key span instead of holding the last
     // value — draw a cycle once, it repeats forever.
     bool loop = false;
@@ -117,7 +117,7 @@ struct KeyframeLane {
     bool muted = false;
 };
 
-// Full parameter snapshot (spec §7): stack param values keyed by effect id.
+// Full parameter snapshot: stack param values keyed by effect id.
 struct SnapshotEntry {
     uint64_t effect_id = 0;
     std::vector<float> params;

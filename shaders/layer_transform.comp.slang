@@ -1,4 +1,4 @@
-// Layer transform (spec §5): crop / flip / scale / rotate, applied to the
+// Layer transform: crop / flip / scale / rotate, applied to the
 // layer source before its effect stack. Inverse-maps each output pixel
 // into the source: rotate and scale about the frame center (aspect-
 // corrected so rotation stays rigid), then flips, then the crop gate.

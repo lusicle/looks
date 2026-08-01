@@ -35,7 +35,7 @@ void normalize_curve(std::vector<float>& curve) {
     scale_curve(curve, percentile95(curve));
 }
 
-// Envelope-follower smoothing baked at import (spec §7: attack/release).
+// Envelope-follower smoothing baked at import (attack/release).
 void smooth_curve(std::vector<float>& curve, double fps, float attack_s,
                   float release_s) {
     if (curve.empty() || fps <= 0.0) return;

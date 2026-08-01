@@ -1,4 +1,4 @@
-// Glyph renderer (spec §6.6): per-cell luma -> glyph from a 16x6 tile atlas
+// Glyph renderer: per-cell luma -> glyph from a 16x6 tile atlas
 // (8x8 px tiles) ordered by ink coverage, dark to light. One engine covers
 // ASCII, halftone (dots are glyphs), and later custom tilesets — the atlas
 // is just a texture. Per-cell jitter offsets the tile choice.
@@ -21,7 +21,7 @@ cbuffer Push
     float set_index;   // engine picks the atlas; kept for UI readout
     float mode;        // 0 mono, 1 colored glyphs, 2 glyph * pixel
     float jitter;      // 0..1 per-cell tile index jitter
-    // Engine-appended atlas grid (spec §12 custom glyph sets).
+    // Engine-appended atlas grid (custom glyph sets).
     uint atlas_cols;
     uint atlas_rows;
     float tile_px;

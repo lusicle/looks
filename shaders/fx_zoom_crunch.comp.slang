@@ -1,4 +1,4 @@
-// Digital-zoom crunch (spec §6.5): crop-zoom + cheap resample — the
+// Digital-zoom crunch: crop-zoom + cheap resample — the
 // camcorder digital zoom. Crunch snaps sampling onto the pre-zoom pixel
 // grid (fat aliased blocks) and adds the oversharpen ring cameras used to
 // hide the mush.

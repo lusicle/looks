@@ -1,4 +1,4 @@
-// Codec-Box mosh codec (spec §6.3): an in-node lossy codec — encode ->
+// Codec-Box mosh codec: an in-node lossy codec — encode ->
 // optional bitstream/vector mangling -> decode — with PERSISTENT decoder
 // state across timeline frames and no error resets, so smear accumulates
 // until an I-frame lands. I+P frames over the shared codec_core; motion
@@ -28,7 +28,7 @@ struct MoshParams {
     float mv_scale = 1.0f;        // MV mangling
     float mv_rotate = 0.0f;       // radians
     float mv_random = 0.0f;       // +/- px of seeded randomization
-    // Replace-with-custom-field (spec §6.3): 0 = flow MVs, 1 = pan,
+    // Replace-with-custom-field: 0 = flow MVs, 1 = pan,
     // 2 = zoom (radial), 3 = swirl; scale/rotate/random apply on top.
     int mv_field = 0;
     float mv_field_amount = 8.0f; // px at the frame edge (signed)

@@ -1,4 +1,4 @@
-// Global addressable param table (spec §5): every numeric param of the
+// Global addressable param table: every numeric param of the
 // document enumerated with a string path ("layer0.fx2.shift_x") plus range
 // metadata. Rebuilt from the document on demand (it's tiny); modulation
 // targets address params by stable ParamKey — the path is display/serialize
@@ -37,12 +37,16 @@ const doc::EffectInstance* find_effect(const doc::Document& doc,
 void param_range(doc::EffectType type, int param_index, float* min_value,
                  float* max_value);
 
+// True for integer-semantics params (selectors and flagged counts) —
+// resolve snaps their modulated value to whole numbers.
+bool param_discrete(doc::EffectType type, int param_index);
+
 // Current value of a param on an instance (wet/opacity aware).
 float param_value(const doc::EffectInstance& fx, int param_index);
 
-// Mask params as mod targets (spec §8). Slot for a mask param index (see
-// kMaskParamBit in modulation.h); null for out-of-range indices.
-float* mask_param_slot(doc::Mask& mask, int param_index);
-void mask_param_range(int param_index, float* min_value, float* max_value);
+// Layer params as mod targets (kLayerParamBit): opacity, generator
+// fields, transform. Null for out-of-range indices.
+float* layer_param_slot(doc::Layer& layer, int param_index);
+void layer_param_range(int param_index, float* min_value, float* max_value);
 
 }  // namespace looks::mod

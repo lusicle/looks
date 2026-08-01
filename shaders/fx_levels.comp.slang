@@ -1,4 +1,4 @@
-// Levels (docs/flow_canvas.md v5.5 primitives): input black/white remap,
+// Levels (docs/flow_canvas.md primitives): input black/white remap,
 // gamma, output range — the plain tone node. Display-referred core.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).

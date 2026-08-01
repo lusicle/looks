@@ -1,4 +1,4 @@
-// Frame render cache (spec §10): LRU byte budget, context invalidation,
+// Frame render cache: LRU byte budget, context invalidation,
 // and the history scan that gates cacheability.
 
 #include "test_framework.h"
@@ -101,13 +101,6 @@ TEST(history_scan_gates_cache) {
     CHECK(doc::document_uses_history(doc));
     doc.layers[0].stack.back().bypass = true;   // bypassed never dispatches
     CHECK(!doc::document_uses_history(doc));
-    // Mask mini-chains render like stacks (spec §8) — they count too.
-    doc::Mask mask;
-    mask.id = doc.next_mask_id++;
-    mask.type = doc::MaskType::Luma;
-    mask.chain.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
-    doc.masks.push_back(mask);
-    CHECK(doc::document_uses_history(doc));
 }
 
 TEST(history_scan_quantize_rd_stipple) {
@@ -121,4 +114,6 @@ TEST(history_scan_quantize_rd_stipple) {
     CHECK(!doc::document_uses_history(doc));
     doc.layers[0].stack[0].params[2] = 9.0f;   // RD stipple: stateful
     CHECK(doc::document_uses_history(doc));
+    doc.layers[0].stack[0].params[2] = 13.0f;  // ordered patterns: pure
+    CHECK(!doc::document_uses_history(doc));
 }

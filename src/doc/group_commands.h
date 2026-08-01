@@ -1,4 +1,4 @@
-// Undoable group mutations (spec §5, v5.3: the Group node collapses a
+// Undoable group mutations (the Group node collapses a
 // sub-stack and exposes member params on its face as direct aliases).
 // Membership is EffectInstance::group_id; these commands keep that tag
 // and the Layer::groups list consistent.

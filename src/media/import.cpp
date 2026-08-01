@@ -55,7 +55,7 @@ void nv12_to_i420(const platform::VideoFrameNV12& src, I420Frame& dst) {
     }
 }
 
-// Half-res proxy downsample (spec §3): 2x2 box average per plane, even
+// Half-res proxy downsample: 2x2 box average per plane, even
 // output dims (the codec paths like them and so does NV12 export).
 void downsample_half(const I420Frame& src, I420Frame& dst) {
     const uint32_t dw = std::max(2u, (src.width / 2) & ~1u);
@@ -88,7 +88,7 @@ void downsample_half(const I420Frame& src, I420Frame& dst) {
     box(src.v, scw, sch, dst.v, dcw, dch);
 }
 
-// Thumbnail strip (spec §3): fixed-height RGB thumbs appended to a flat
+// Thumbnail strip: fixed-height RGB thumbs appended to a flat
 // buffer; written as <stem>.thumbs = 'THM1' u16 w, u16 h, u16 count + RGB.
 struct ThumbStrip {
     uint32_t w = 0, h = 36;
@@ -240,7 +240,7 @@ bool import_video(BmffFile& file, const TrackInfo& track,
 
     BatchEncoder encoder(writer, options.quality, options.encode_threads);
 
-    // Half-res proxy (spec §3): second mezzanine, same timeline.
+    // Half-res proxy: second mezzanine, same timeline.
     codec::MezWriter proxy_writer;
     const std::filesystem::path proxy_path = [&] {
         std::filesystem::path p = mez_path;
@@ -256,7 +256,7 @@ bool import_video(BmffFile& file, const TrackInfo& track,
     BatchEncoder proxy_encoder(proxy_writer, options.quality,
                                options.encode_threads);
 
-    // Thumbnail strip (spec §3): every Nth frame, budgeted count.
+    // Thumbnail strip: every Nth frame, budgeted count.
     ThumbStrip strip;
     const size_t thumb_every =
         options.thumb_count > 0
@@ -326,7 +326,7 @@ bool import_video(BmffFile& file, const TrackInfo& track,
     decoder.drain();
     pump_decoder();
 
-    // Stage split for the speed target (spec §13: import ≥ 2× realtime).
+    // Stage split for the speed target (import ≥ 2× realtime).
     const double t_total =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       t_start)
@@ -431,10 +431,10 @@ bool import_audio(BmffFile& file, const TrackInfo& track,
     return true;
 }
 
-// Still-image import (PNG/TGA through the in-repo decoders, spec §12):
+// Still-image import (PNG/TGA through the in-repo decoders, ):
 // the image is encoded ONCE and every timeline frame's index entry points
 // at that payload — a 10-second clip for one frame of storage. Downstream
-// the bundle is indistinguishable from footage, so the whole rack (masks,
+// the bundle is indistinguishable from footage, so the whole rack (mattes,
 // modulation, trim, export) works on stills untouched.
 constexpr uint32_t kStillFps = 30;
 constexpr uint32_t kStillFrames = 300;   // 10 s at 30 fps
@@ -675,7 +675,7 @@ ImportResult import_media(const std::filesystem::path& source,
             return result;
     }
 
-    // ---- analysis sidecar (spec §7): video curves from the decode pass,
+    // ---- analysis sidecar: video curves from the decode pass,
     // audio curves from the PCM sidecar we just wrote.
     {
         mod::AnalysisData analysis;

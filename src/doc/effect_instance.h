@@ -1,5 +1,4 @@
-// EffectInstance (spec §5) — shared by the document's stack and by mask
-// mini-chains (spec §8), so it lives in its own header below document.h.
+// EffectInstance — one node in a layer's stack.
 
 #pragma once
 
@@ -19,15 +18,14 @@ enum class EffectType : uint32_t {
     Glow,
     FlowSmear,
     MotionExtract,
-    Datamosh,          // Codec-Box family (spec §6.3): one box,
-    GenerationLoss,    // four named effects
-    JpegBlocking,
+    Datamosh,          // Codec-Box family: one box,
+    GenerationLoss,    // three named effects (generations 1 = one JPEG)
     BitrateStarve,
     Echo,              // stateful: previous own output (one-frame delay)
     Feedback,
     Glyph,             // per-cell luma -> tile from a glyph atlas
-    ColorScience,      // film-stock matrices/curves (spec §6.4)
-    Kaleido,           // wave 2 (spec §6.2/§6.3/§6.7): warp + optics + signal
+    FilmStock,         // film-stock matrices/curves
+    Kaleido,           // wave 2: warp + optics + signal
     Polar,
     Turbulence,        // liquify: curl-noise warp
     Displace,          // displacement by own luma
@@ -41,8 +39,7 @@ enum class EffectType : uint32_t {
     SyncFail,          // vertical roll + horizontal tear
     Timestamp,         // 7-seg camcorder date/timecode burn
     Oversharpen,       // unsharp-mask halos
-    NrMush,            // watercolor over-smoothing
-    Blur,              // directional / radial / zoom
+    Blur,              // directional / radial / zoom / surface (denoise)
     DustScratches,     // procedural dust flecks + wobbling scratch lines
     LightLeak,         // warm edge-anchored leak blobs
     Anamorphic,        // horizontal streak flare + squeeze
@@ -58,14 +55,14 @@ enum class EffectType : uint32_t {
     ScreenTexture,     // projection screen weave + hotspot
     Voronoi,           // cellular shatter
     ReactionDiffusion, // Gray-Scott sim seeded by the frame (stateful)
-    ErrorDiffusion,    // CPU serpentine FS/Atkinson dither (spec §6.2)
+    ErrorDiffusion,    // CPU error diffusion (raster kernels + Hilbert)
     Flicker,           // exposure / projector flicker
     FrameHold,         // frame-rate sim: hold at N fps + shutter blend
     Stutter,           // beat-repeat: loop the last N frames when armed
     Contour,           // topo iso-lines from luma
     FlowParticles,     // dissolve + advect along the flow field (stateful)
-    Ball,              // spherize: frame wrapped onto a sphere
-    SoftUpscale,       // soft low-res upscale (spec §6.5)
+    Spherize,          // frame wrapped onto a sphere / pinch
+    SoftUpscale,       // soft low-res upscale
     ZoomCrunch,        // digital-zoom crunch: crop-zoom + resample
     PixelSort,         // threshold-gated luma sort streaks
     WaveWarp,          // sine / ripple displacement
@@ -111,11 +108,11 @@ enum class EffectType : uint32_t {
     ScopeMonitor,      // waveform / parade / vectorscope as aesthetic
     SecurityMux,       // camera-wall grid, per-tile time offsets (ring)
     AudioScope,        // the soundtrack's waveform traced over the frame
-    Modulate,          // luma-PM'd fine raster weave (FM engraving)
-    BlendNode,         // graph merge: blends the B input over In (v3)
-    Matte,             // matte maker: luma/key extract + levels (v5.2 —
+    Engraver,          // luma-PM'd fine raster weave (FM engraving)
+    BlendNode,         // graph merge: blends the B input over In
+    Matte,             // matte maker: luma/key extract + levels (—
                        // masks ARE images; feeds any mask anchor)
-    // The PRIMITIVES batch (docs/flow_canvas.md v5.5): single-job nodes
+    // The PRIMITIVES batch (docs/flow_canvas.md): single-job nodes
     // for operations previously buried inside compound effects.
     Levels,            // in/out black-white points + gamma (tone primitive)
     HueSat,            // hue rotate / saturation / lightness
@@ -126,12 +123,17 @@ enum class EffectType : uint32_t {
     Dither,            // the ordered-pattern threshold engine, standalone
     Transform,         // mid-chain affine: scale/rotate/offset/flip + edges
     FrameDelay,        // plain N-frame delay from a past-frames ring
-    TextOverlay,       // MSDF text burn-in (EffectInstance::text)
+    Text,              // SDF TTF text burn-in (EffectInstance::text)
+    // v5.7 primitives: the two clean tools the roster only had as
+    // deliberately-degraded looks.
+    WhiteBalance,      // temperature / tint, linear-light channel gains
+    Sharpen,           // clean unsharp mask (Oversharpen is the artifact)
+    CornerPin,         // perspective quad warp: offset the four corners
     Count,
 };
 
 // True for effects that read their own previous output (engine keeps a
-// persistent per-instance target; the one-frame-delay rule, spec §4).
+// persistent per-instance target; the one-frame-delay rule, ).
 inline bool is_stateful_feedback(EffectType type) {
     return type == EffectType::Echo || type == EffectType::Feedback ||
            type == EffectType::Lidar || type == EffectType::SlowScan ||
@@ -139,10 +141,10 @@ inline bool is_stateful_feedback(EffectType type) {
            type == EffectType::ScopeMonitor;
 }
 
-// Second sampled image input reachable as a canvas aux port (docs/
-// flow_canvas.md v3 N-ports). The string names the port on the card;
-// null = no aux port. Wired aux wins over the legacy mask-as-map path
-// (Displace / Time Displace); Blend's B is the graph merge input.
+// Second sampled image input reachable as a canvas aux port. The string
+// names the port on the card; null = no aux port. A wired aux wins over
+// the matte-as-map fallback (Displace / Time Displace); Blend's B is the
+// graph merge input.
 inline const char* effect_aux_port(EffectType type) {
     switch (type) {
         case EffectType::BlendNode: return "b";
@@ -156,12 +158,11 @@ inline const char* effect_aux_port(EffectType type) {
 inline bool is_codec_box(EffectType type) {
     return type == EffectType::Datamosh ||
            type == EffectType::GenerationLoss ||
-           type == EffectType::JpegBlocking ||
            type == EffectType::BitrateStarve;
 }
 
 // Blend modes, shared by per-effect composition and layer compositing
-// (spec §5). All operate in the linear working space.
+//. All operate in the linear working space.
 enum class BlendMode : uint32_t {
     Normal = 0,
     Add,
@@ -171,7 +172,7 @@ enum class BlendMode : uint32_t {
     Count,
 };
 
-// Type + ordered params + wet/dry + opacity/blend + bypass + seed (spec §5).
+// Type + ordered params + wet/dry + opacity/blend + bypass + seed.
 // Param metadata (ranges, labels, defaults) lives in effects.h; params here
 // parallel that table.
 //
@@ -185,14 +186,13 @@ struct EffectInstance {
     float opacity = 1.0f;
     BlendMode blend = BlendMode::Normal;
     bool bypass = false;
-    // Solo (spec §5): when any effect in a stack is soloed, only soloed
+    // Solo: when any effect in a stack is soloed, only soloed
     // effects run (bypass still wins for the soloed effect itself).
     bool solo = false;
     uint64_t seed = 0;
-    uint64_t mask_id = 0;          // 0 = unmasked; else a Document mask
     uint64_t group_id = 0;         // 0 = ungrouped; else a Layer group
-    // The one string param (v5.5): only TextOverlay reads it. Serialized
-    // when non-empty; edited through set_effect_text_command.
+    // The one string param: only Text reads it. Serialized when
+    // non-empty; edited through set_effect_text_command.
     std::string text;
     // Node-canvas position (docs/flow_canvas.md), graph units. Pure UI
     // placement — never read by the renderer. (0,0) = unplaced; the

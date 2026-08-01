@@ -1,4 +1,4 @@
-// Single TU compiling miniaudio. Playback only (spec §3): no decoding,
+// Single TU compiling miniaudio. Playback only: no decoding,
 // no encoding — miniaudio is strictly the audio OUTPUT device; all decode
 // is ours.
 

@@ -1,4 +1,4 @@
-// Undoable layer mutations (spec §10). Layer property edits are whole-
+// Undoable layer mutations. Layer property edits are whole-
 // object replacements minus the stack; coalesces per layer so opacity
 // drags are one undo step.
 

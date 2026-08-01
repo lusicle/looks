@@ -30,7 +30,7 @@ public:
             old_group_ids_.push_back(layer.stack[i].group_id);
             layer.stack[i].group_id = group_.id;
         }
-        // Boundary bindings default to the span's ends (v5.3).
+        // Boundary bindings default to the span's ends.
         if (group_.face_in == 0) group_.face_in = layer.stack[from_].id;
         if (group_.face_out == 0) group_.face_out = layer.stack[to_].id;
         layer.groups.push_back(group_);
@@ -211,37 +211,24 @@ public:
     std::string name() const override { return "Add Preset"; }
 
     void apply(Document& doc) override {
+        // Materialize FIRST: with the table empty, stack-order
+        // synthesis would chain the newcomers straight into the
+        // composite. The members chain INTERNALLY only — the group card
+        // lands DORMANT; wiring it into the graph is the user's wire
+        // gesture, never a side effect of adding a preset.
+        materialized_ = doc.links.empty();
+        ensure_links(doc);
         Layer& layer = doc.layers[layer_index_];
         insert_at_ = layer.stack.size();
         layer.stack.insert(layer.stack.end(), effects_.begin(),
                            effects_.end());
         layer.groups.push_back(group_);
-        // A materialized link table gets the wiring stack-order synthesis
-        // would have produced: the internal chain among the members, and
-        // the group spliced between the layer's old chain end and the
-        // Output. Without this the preset landed fully DORMANT (unwired
-        // inputs process nothing) the moment any wire had been edited.
         added_links_.clear();
-        had_replaced_ = false;
-        if (!doc.links.empty() && !effects_.empty()) {
-            for (size_t i = 0; i + 1 < effects_.size(); ++i)
-                added_links_.push_back(
-                    {effects_[i].id, effects_[i + 1].id, 0});
-            for (auto it = doc.links.begin(); it != doc.links.end(); ++it)
-                if (it->to == 0 && it->to_port == 0 &&
-                    link_owner(doc, it->from) == layer.id) {
-                    replaced_ = *it;
-                    had_replaced_ = true;
-                    doc.links.erase(it);
-                    break;
-                }
-            if (had_replaced_)
-                added_links_.push_back(
-                    {replaced_.from, effects_.front().id, 0});
-            added_links_.push_back({effects_.back().id, 0, 0});
-            doc.links.insert(doc.links.end(), added_links_.begin(),
-                             added_links_.end());
-        }
+        for (size_t i = 0; i + 1 < effects_.size(); ++i)
+            added_links_.push_back(
+                {effects_[i].id, effects_[i + 1].id, 0});
+        doc.links.insert(doc.links.end(), added_links_.begin(),
+                         added_links_.end());
     }
 
     void revert(Document& doc) override {
@@ -259,27 +246,16 @@ public:
                     doc.links.erase(std::next(it).base());
                     break;
                 }
-        if (had_replaced_) doc.links.push_back(replaced_);
+        if (materialized_) doc.links.clear();
     }
 
 private:
-    // Owner layer of a link endpoint (layer id itself or a stack member).
-    static uint64_t link_owner(const Document& doc, uint64_t id) {
-        for (const Layer& l : doc.layers) {
-            if (l.id == id) return l.id;
-            for (const EffectInstance& fx : l.stack)
-                if (fx.id == id) return l.id;
-        }
-        return 0;
-    }
-
     size_t layer_index_;
     Group group_;
     std::vector<EffectInstance> effects_;
     size_t insert_at_ = 0;
     std::vector<Document::NodeLink> added_links_;
-    Document::NodeLink replaced_{};
-    bool had_replaced_ = false;
+    bool materialized_ = false;
 };
 
 }  // namespace

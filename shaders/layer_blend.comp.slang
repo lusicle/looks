@@ -1,8 +1,8 @@
-// Layer compositing (spec §5): blends a layer's output over the composite
+// Layer compositing: blends a layer's output over the composite
 // below it in linear space, then mixes by layer opacity. Adjustment layers
 // use Normal — the adjusted composite crossfades over the original.
 //
-// When the layer has a transform (spec §5 crop/flip/scale/rotate), the
+// When the layer has a transform (crop/flip/scale/rotate), the
 // same gate the transform pass rendered as black is recomputed here as a
 // per-pixel coverage on opacity — cropped or scaled-down layers reveal the
 // composite below instead of stamping black over it.

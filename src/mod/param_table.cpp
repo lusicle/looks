@@ -38,6 +38,13 @@ void param_range(doc::EffectType type, int param_index, float* min_value,
     }
 }
 
+bool param_discrete(doc::EffectType type, int param_index) {
+    if (param_index < 0) return false;   // wet / opacity are continuous
+    const doc::EffectInfo& info = doc::effect_info(type);
+    return static_cast<uint32_t>(param_index) < info.param_count &&
+           doc::param_is_discrete(info.params[param_index]);
+}
+
 float param_value(const doc::EffectInstance& fx, int param_index) {
     if (param_index == doc::kWetParam) return fx.wet;
     if (param_index == doc::kOpacityParam) return fx.opacity;
@@ -46,52 +53,65 @@ float param_value(const doc::EffectInstance& fx, int param_index) {
     return 0.0f;
 }
 
-float* mask_param_slot(doc::Mask& mask, int param_index) {
-    if (param_index >= doc::kMaskPointParamBase) {
-        const size_t slot =
-            static_cast<size_t>(param_index - doc::kMaskPointParamBase);
-        return slot < mask.points.size() ? &mask.points[slot] : nullptr;
-    }
+float* layer_param_slot(doc::Layer& layer, int param_index) {
     switch (param_index) {
-        case 0: return &mask.feather;
-        case 1: return &mask.center_x;
-        case 2: return &mask.center_y;
-        case 3: return &mask.radius_x;
-        case 4: return &mask.radius_y;
-        case 5: return &mask.blur_px;
-        case 6: return &mask.black_point;
-        case 7: return &mask.white_point;
-        case 8: return &mask.gamma;
-        case 9: return &mask.key_center;
-        case 10: return &mask.key_range;
+        case 0: return &layer.opacity;
+        case 1: return &layer.color_a[0];
+        case 2: return &layer.color_a[1];
+        case 3: return &layer.color_a[2];
+        case 4: return &layer.color_b[0];
+        case 5: return &layer.color_b[1];
+        case 6: return &layer.color_b[2];
+        case 7: return &layer.gen_scale;
+        case 8: return &layer.gen_angle;
+        case 9: return &layer.crop_l;
+        case 10: return &layer.crop_r;
+        case 11: return &layer.crop_t;
+        case 12: return &layer.crop_b;
+        case 13: return &layer.xf_scale;
+        case 14: return &layer.xf_rotate;
         default: return nullptr;
     }
 }
 
-void mask_param_range(int param_index, float* min_value, float* max_value) {
+void layer_param_range(int param_index, float* min_value, float* max_value) {
     *min_value = 0.0f;
     *max_value = 1.0f;
     switch (param_index) {
-        case 0: *max_value = 0.5f; break;    // feather
-        case 5: *max_value = 64.0f; break;   // blur_px
-        case 8: *min_value = 0.1f; *max_value = 4.0f; break;   // gamma
-        default: break;                      // normalized 0..1 fields
+        case 7: *min_value = 1.0f; *max_value = 64.0f; break;  // gen_scale
+        case 8:                                                // gen_angle
+            *min_value = -3.14159265f;
+            *max_value = 3.14159265f;
+            break;
+        case 9:
+        case 10:
+        case 11:
+        case 12: *max_value = 0.45f; break;                    // crops
+        case 13: *min_value = 0.25f; *max_value = 4.0f; break; // xf_scale
+        case 14: *min_value = -180.0f; *max_value = 180.0f; break;
+        default: break;   // opacity + colors, normalized 0..1
     }
 }
 
 namespace {
 
-constexpr const char* kMaskParamIds[] = {
-    "feather",     "center_x", "center_y", "radius_x",   "radius_y",
-    "blur",        "black",    "white",    "gamma",      "key_center",
-    "key_range"};
+constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
+    "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
+    "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
+    "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate"};
+
+constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
+    "opacity", "color a r", "color a g", "color a b", "color b r",
+    "color b g", "color b b", "scale",   "angle",     "crop left",
+    "crop right", "crop top", "crop bottom", "transform scale",
+    "transform rotate"};
 
 }  // namespace
 
 std::vector<ParamEntry> build_param_table(const doc::Document& doc) {
     std::vector<ParamEntry> table;
     {
-        // Global morph position (spec §7): ParamKey {0, 0}.
+        // Global morph position: ParamKey {0, 0}.
         ParamEntry e;
         e.key = {0, 0};
         e.path = "global.morph";
@@ -102,7 +122,7 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc) {
         table.push_back(std::move(e));
     }
     {
-        // Global playback speed (spec §6.1): ParamKey {0, 1}.
+        // Global playback speed: ParamKey {0, 1}.
         ParamEntry e;
         e.key = {0, 1};
         e.path = "global.speed";
@@ -136,37 +156,22 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc) {
             add(static_cast<int>(p), info.params[p].id, info.params[p].label,
                 fx.params[p]);
     }
-    // Mask params (spec §8): mod targets like everything else.
-    for (const doc::Mask& mask : doc.masks) {
-        doc::Mask probe = mask;
-        for (int p = 0; p < 11; ++p) {
-            float* slot = mask_param_slot(probe, p);
+    // Layer params: opacity, generator fields, and the transform —
+    // mod targets exactly like effect params.
+    for (size_t l = 0; l < doc.layers.size(); ++l) {
+        doc::Layer probe = doc.layers[l];
+        const std::string lname =
+            probe.name.empty() ? "layer" + std::to_string(l) : probe.name;
+        for (int p = 0; p < doc::kLayerParamCount; ++p) {
+            float* slot = layer_param_slot(probe, p);
             if (!slot) continue;
             ParamEntry e;
-            e.key = {mask.id | doc::kMaskParamBit, p};
-            e.path = "mask." + (mask.name.empty() ? "?" : mask.name) + "." +
-                     kMaskParamIds[p];
-            e.label = "mask " + mask.name + " " + kMaskParamIds[p];
-            mask_param_range(p, &e.min_value, &e.max_value);
+            e.key = {probe.id | doc::kLayerParamBit, p};
+            e.path = "layer" + std::to_string(l) + "." + kLayerParamIds[p];
+            e.label = lname + " " + kLayerParamLabels[p];
+            layer_param_range(p, &e.min_value, &e.max_value);
             e.base = *slot;
             table.push_back(std::move(e));
-        }
-        // Bezier path points (spec §8 "keyframable points"): every
-        // coordinate is addressable past kMaskPointParamBase.
-        for (size_t pt = 0; pt * 2 + 1 < mask.points.size(); ++pt) {
-            for (int a = 0; a < 2; ++a) {
-                const int p = doc::kMaskPointParamBase +
-                              static_cast<int>(pt) * 2 + a;
-                ParamEntry e;
-                e.key = {mask.id | doc::kMaskParamBit, p};
-                e.path = "mask." + (mask.name.empty() ? "?" : mask.name) +
-                         ".p" + std::to_string(pt) + (a ? ".y" : ".x");
-                e.label = "mask " + mask.name + " point " +
-                          std::to_string(pt) + (a ? " y" : " x");
-                mask_param_range(p, &e.min_value, &e.max_value);
-                e.base = mask.points[pt * 2 + static_cast<size_t>(a)];
-                table.push_back(std::move(e));
-            }
         }
     }
     return table;

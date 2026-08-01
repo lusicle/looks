@@ -1,4 +1,4 @@
-// Dust / scratches / hair (spec §6.5): procedural damage. Default is a
+// Dust / scratches / hair: procedural damage. Default is a
 // FIXED PLATE — every mark seed-locked in place, the damage of one
 // photographed plate or print. `boil` > 0 switches to projected-print
 // behavior: dust re-rolls at that rate, scratches persist ~12 ticks and
@@ -100,7 +100,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // Texture-driven damage (spec §6.5): the plate tiled over the frame,
+    // Texture-driven damage: the plate tiled over the frame,
     // re-offset per scratch epoch when boiling; parked when fixed. Dark
     // plate marks become dark print damage.
     if (tex_amt > 0.001) {
@@ -113,7 +113,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         dark = max(dark, saturate(1.0 - tv) * tex_amt);
     }
 
-    // Gate hairs (spec §6.5): a few curved fibers anchored at the frame
+    // Gate hairs: a few curved fibers anchored at the frame
     // edge. Boiling prints re-seed them per hair epoch and tremble in
     // between; a fixed plate freezes them. Each is a quadratic arc;
     // distance is checked against sampled arc points.

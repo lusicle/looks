@@ -1,5 +1,5 @@
 // Bitstream I/O + exp-Golomb VLC — shared by the mezzanine and mosh codecs
-// (codec_core, spec §3/§6.3). MSB-first bit order. Fully deterministic:
+// (codec_core). MSB-first bit order. Fully deterministic:
 // identical input produces identical bytes on every platform.
 
 #pragma once

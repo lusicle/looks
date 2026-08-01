@@ -1,4 +1,4 @@
-// Posterize (docs/flow_canvas.md v5.5 primitives): plain level
+// Posterize (docs/flow_canvas.md primitives): plain level
 // quantization — the Quantizer with dither off and no palette. Tone mode
 // bands the luma only, so hue survives. Display-referred core.
 //

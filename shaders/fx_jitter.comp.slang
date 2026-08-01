@@ -1,4 +1,4 @@
-// Unified Jitter (spec §6.1 category 1): gate weave / EIS wobble / VHS
+// Unified Jitter (category 1): gate weave / EIS wobble / VHS
 // tracking / rolling-shutter jello are one transform-noise effect with
 // mode presets. Deterministic value noise over the frame clock.
 //

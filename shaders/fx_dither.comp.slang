@@ -1,7 +1,9 @@
-// Dither (docs/flow_canvas.md v5.5 primitives): the Quantizer's ordered-
-// pattern threshold engine (spec §6.2), standalone. Patterns: 0-2 Bayer
+// Dither (docs/flow_canvas.md primitives): the Quantizer's ordered-
+// pattern threshold engine, standalone. Patterns: 0-2 Bayer
 // 2/4/8, 3 white noise, 4 blue noise, 5 STBN (temporal slices on the
-// boil clock), 6 moiré, 7 spiral, 8 radial rings, 9 diamond cluster.
+// boil clock), 6 moiré, 7 spiral, 8 radial rings, 9 diamond cluster,
+// 10 clustered dot (45-degree screen), 11 line screen, 12 checker,
+// 13 interleaved gradient noise.
 // Shared pattern-transform controls: boil / scroll / rotate / scale /
 // motion lock (flow advection). Levels are encoded-uniform but the pick
 // is made in LINEAR light (fx_dither_levels) so brightness is preserved.
@@ -54,7 +56,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint2 shift = uint2(fx_hash3(seed, boil_tick, 11u) & 127u,
                               fx_hash3(seed, boil_tick, 13u) & 127u);
 
-    // Pattern coordinates (spec §6.2 shared controls — same construction
+    // Pattern coordinates (shared controls — same construction
     // as the Quantizer's dither leg).
     float2 pf = float2(tid.xy);
     if (lock_mode >= 0.5) {
@@ -111,6 +113,18 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 f = frac(pf * 0.125) - 0.5;
         pattern = saturate((abs(f.x) + abs(f.y)) * 1.4);
     }
+    else if (dm == 10)
+        pattern = fx_cluster_dot(pf);
+    else if (dm == 11) {
+        // Line screen: the threshold ramps across a 4 px row period, so
+        // tone renders as variable-weight lines (pattern rotate angles
+        // them).
+        pattern = (float(p.y & 3) + 0.5) * 0.25;
+    }
+    else if (dm == 12)
+        pattern = ((p.x ^ p.y) & 1u) != 0u ? 0.75 : 0.25;
+    else if (dm == 13)
+        pattern = fx_ign(p);
     // Ordered threshold in [0, 1]; amount narrows it toward the plain
     // midpoint round.
     const float t01 =

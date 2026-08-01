@@ -1,4 +1,4 @@
-// Glow pass 1 (spec §6.3 unified Glow): soft-knee bright pass in linear
+// Glow pass 1 (unified Glow): soft-knee bright pass in linear
 // space. Downstream: blur H -> blur V -> composite.
 
 #include "fx_common.slang"

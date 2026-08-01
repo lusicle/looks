@@ -1,4 +1,4 @@
-// Node canvas (docs/flow_canvas.md v2) — the full node editor. Document-
+// Node canvas (docs/flow_canvas.md) — the full node editor. Document-
 // agnostic: the app translates the document into a flow::Graph each frame
 // (positions from the document, derived auto-layout for unplaced nodes)
 // and turns flow::Output events + staged param edits into commands. The
@@ -18,14 +18,14 @@ struct UiTexture;
 namespace looks::flow {
 
 enum class NodeKind : uint8_t {
-    Source, Effect, Mask, ModSource, Output,
+    Source, Effect, ModSource, Output,
     Frame,    // id-tag space for FrameBox move events only
-    Group,    // doc::Group as one card (v4 subgraphs)
+    Group,    // doc::Group as one card (subgraphs)
     GroupIn,  // boundary nodes inside the OPEN group's scoped view
     GroupOut, // (texed sgin/sgout) — derived, never move or delete
 };
 
-// Node identity: tag byte | document id (effect/mask/route ids come from
+// Node identity: tag byte | document id (effect/route ids come from
 // separate counters and may collide across kinds).
 inline uint64_t node_id(NodeKind kind, uint64_t doc_id) {
     return (static_cast<uint64_t>(kind) + 1ull) << 56 |
@@ -43,7 +43,7 @@ struct ParamRow {
     float* staged = nullptr;
     bool* changed = nullptr;
     bool* released = nullptr;
-    // Row kind (v5.6 real controls): 0 slider; 1 dropdown — `options` is
+    // Row kind (real controls): 0 slider; 1 dropdown — `options` is
     // a '|'-separated list, *staged holds the index, a pick stages it
     // exactly like a slider release; 2 text — `text` shows in the field,
     // a click emits Output::text_edit (the shared inline editor draws in
@@ -54,7 +54,7 @@ struct ParamRow {
     // Row micro-hotspots; null hides each.
     bool* route_clicked = nullptr;
     bool* key_clicked = nullptr;
-    // Scoped-view member rows (v5.3): toggle this param on/off the open
+    // Scoped-view member rows: toggle this param on/off the open
     // group's FACE; `exposed` fills the dot.
     bool* expose_clicked = nullptr;
     bool exposed = false;
@@ -72,8 +72,8 @@ struct Node {
     bool solo = false;
     bool feedback = false;           // self-loop glyph in the title bar
     bool has_in = false;
-    bool has_mask_port = false;
-    bool has_aux_port = false;   // second image input (v3 N-ports)
+    bool has_matte_port = false;
+    bool has_aux_port = false;   // second image input (N-ports)
     const char* aux_label = "b"; // port name on the card ("b", "map")
     bool has_out = false;
     // Live preview: an atlas cell (draw_image_quad); null = flat slot.
@@ -84,18 +84,18 @@ struct Node {
     // Title-bar actions, staged per frame by the app.
     bool* remove_clicked = nullptr;  // X (null hides it)
     bool* bypass_clicked = nullptr;  // enable dot
-    // Text node (v5.5): a title double-click edits the STRING (the same
+    // Text node: a title double-click edits the STRING (the same
     // inline editor groups use for renames).
     bool text_edit = false;
 };
 
-// kind: 0 = chain (solid, In port), 1 = mask (dashed, Mask port),
+// kind: 0 = chain (solid, In port), 1 = matte (dashed, matte port),
 // 2 = mod (dashed dim), 3 = aux (solid, "b" port).
 struct Wire {
     uint64_t from = 0;   // leaves from's Out port
     uint64_t to = 0;
     uint8_t kind = 0;
-    // Mod wires land on the driven PARAM's row (docs/flow_canvas.md v4)
+    // Mod wires land on the driven PARAM's row (docs/flow_canvas.md)
     // instead of the card edge; -1 = no row (card-edge fallback).
     int to_row = -1;
 };
@@ -161,7 +161,7 @@ struct CanvasState {
     bool view_inited = false;        // first frame: fit content
     uint64_t hover = 0;
     // Interaction in flight (element addressed by node id + row).
-    // 4 = wire from an Out port, 5 = rewire (grabbed a fed In/Mask port),
+    // 4 = wire from an Out port, 5 = rewire (grabbed a fed In/matte port),
     // 6 = marquee (shift+drag on empty canvas), 7 = frame corner resize.
     uint8_t drag_kind = 0;           // 0 none, 1 node, 2 pan, 3 slider
     uint64_t drag_id = 0;
@@ -195,7 +195,7 @@ struct CanvasState {
     int add_cat = -1;
     uint64_t splice_from = 0, splice_to = 0;
     uint32_t splice_port = 0;
-    // Param dropdown popup (v5.6): the open field's node/row + its
+    // Param dropdown popup: the open field's node/row + its
     // screen rect captured at open time. Esc/click-away closes.
     bool dd_open = false;
     uint64_t dd_node = 0;
@@ -237,7 +237,7 @@ struct Output {
     // item picked (index into Graph::add_items; splice data in state).
     bool add_menu_opened = false;
     int add_pick = -1;
-    // Wire edits (v3): connect from→(to, port); port 0 = In, 1 = Mask.
+    // Wire edits: connect from→(to, port); port 0 = In, 1 = matte.
     // A rewire release emits disconnect (the grabbed link) + connect.
     bool connect_requested = false;
     uint64_t connect_from = 0, connect_to = 0;
@@ -245,7 +245,7 @@ struct Output {
     bool disconnect_requested = false;
     uint64_t disconnect_from = 0, disconnect_to = 0;
     uint32_t disconnect_port = 0;
-    // Value-node wiring (v4): a ModSource out wire dropped on a param row
+    // Value-node wiring: a ModSource out wire dropped on a param row
     // retargets that route to the row's param.
     bool route_drop_requested = false;
     uint64_t route_drop_from = 0;    // ModSource canvas id
@@ -265,7 +265,7 @@ struct Output {
     // Double-click on a group CARD's title strip: inline rename request
     // (texed renames subgraphs by title, opens by body).
     uint64_t group_rename = 0;
-    // Double-click on a Text card's title strip: edit its string (v5.5).
+    // Double-click on a Text card's title strip: edit its string.
     uint64_t text_edit = 0;
     // Frame gestures: corner-resize stream (coalesced command) and the
     // double-click rename request on a title strip.
@@ -293,7 +293,7 @@ struct Output {
 ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,
                            CanvasState* state, Output* out);
 
-// Card geometry helpers shared with the app's auto-layout. Mask/aux
+// Card geometry helpers shared with the app's auto-layout. Matte/aux
 // ports occupy dedicated strip rows between the preview and the param
 // rows (they must never overlap a param row), so height depends on them.
 float node_width();

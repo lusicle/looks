@@ -1,4 +1,4 @@
-// Platform window + input abstraction (spec §1: all platform code stays in
+// Platform window + input abstraction (all platform code stays in
 // src/platform/ so a macOS port swaps implementations, not callers).
 //
 // Model: one window, polled events. Each frame the app drains the queue via

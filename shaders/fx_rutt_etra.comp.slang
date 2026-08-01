@@ -1,4 +1,4 @@
-// Rutt-Etra (spec §6.6): the frame becomes raster scanlines displaced by
+// Rutt-Etra: the frame becomes raster scanlines displaced by
 // luma — bright areas push their line into a relief. Mode picks row or
 // column rasters; `wiggle` rides oscillator noise on every trace (the
 // unstable-deflection look), and `beam` breaks the trace into beads where
@@ -53,7 +53,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float wig_max = wiggle * amount * 0.4;
     // Raster crawl: the whole line grid drifts on the timeline clock —
     // the animated scan-render. Wrapped into one spacing so the grid is
-    // seamless; deterministic (frame-clocked, spec §11).
+    // seamless; deterministic (frame-clocked, ).
     const float phase = frac(t * scroll / sp) * sp;
 
     // Lines whose displaced trace can reach p.

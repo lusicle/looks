@@ -1,4 +1,4 @@
-// Slice shuffle (spec §6.7): the frame splits into horizontal bands; a
+// Slice shuffle: the frame splits into horizontal bands; a
 // seeded per-band coin decides which bands displace sideways, re-rolled at
 // `rate` Hz on the timeline clock. Displaced bands wrap around — the
 // classic corrupted-scan look. Deterministic: (seed, step, band) hash.

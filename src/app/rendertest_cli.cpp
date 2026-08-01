@@ -1,4 +1,4 @@
-// Determinism harness (spec §11): same project + seeds => identical frames.
+// Determinism harness: same project + seeds => identical frames.
 // Renders a deterministic synthetic clip through the full GPU path (upload
 // -> YCbCr->linear -> effect chain -> NV12 readback) TWICE with independent
 // Engine/readback instances and compares per-frame FNV-1a hashes. With
@@ -111,7 +111,7 @@ doc::Document make_document() {
     // Stateful one-frame-delay effects (persistent GPU targets).
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Echo));
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Feedback));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::ColorScience));
+    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FilmStock));
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
     // Wave 2: seeded slice shuffle, time-quantized curl-noise warp, and a
     // pure-geometry fold.
@@ -131,7 +131,7 @@ doc::Document make_document() {
     doc.layers[0].stack.back().wet = 0.5f;
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SlitScan));
     doc.layers[0].stack.back().params[1] = 8.0f;   // depth
-    // RD-stipple dither (spec §6.2 mode 9): the quantizer's own Gray-Scott
+    // RD-stipple dither (mode 9): the quantizer's own Gray-Scott
     // state must evolve bit-exact across evaluations.
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
     doc.layers[0].stack.back().params[2] = 9.0f;
@@ -150,15 +150,8 @@ doc::Document make_document() {
     doc.layers[0].stack.back().params[0] = 3.0f;   // levels
     doc.layers[0].stack.back().params[3] = 0.4f;   // carry
     doc.layers[0].stack.back().wet = 0.6f;
-    // A shape mask on the pixelate exercises the mask subgraph too.
-    doc::Mask mask;
-    mask.id = doc.next_mask_id++;
-    mask.name = "m";
-    mask.type = doc::MaskType::Shape;
-    doc.masks.push_back(mask);
-    doc.layers[0].stack[1].mask_id = mask.id;
-    // Compositing (spec §5): a noise generator layer multiplied over the
-    // base, with its own mini stack.
+    // Compositing: a noise generator layer multiplied over the base, with
+    // its own mini stack.
     doc::Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.name = "noise";
@@ -168,11 +161,32 @@ doc::Document make_document() {
     overlay.gen_scale = 24.0f;
     overlay.stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
     doc.layers.push_back(std::move(overlay));
+    // Port-1 matte on the pixelate (masks ARE images): a Shape layer wired
+    // into the matte port gates the effect through extract + apply. The
+    // layer feeds ONLY the gate — no link to the composite.
+    doc::Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.name = "matte";
+    matte.source = doc::LayerSourceKind::Shape;
+    matte.gen_scale = 8.0f;
+    matte.gen_angle = 0.35f;
+    doc.layers.push_back(std::move(matte));
+    for (const doc::Layer& l : doc.layers) {
+        if (l.source == doc::LayerSourceKind::Shape) continue;
+        uint64_t prev = l.id;
+        for (const doc::EffectInstance& fx : l.stack) {
+            doc.links.push_back({prev, fx.id, 0});
+            prev = fx.id;
+        }
+        doc.links.push_back({prev, 0, 0});
+    }
+    doc.links.push_back(
+        {doc.layers.back().id, doc.layers[0].stack[1].id, 1});
     return doc;
 }
 
 // History-free slice of the roster for the render-cache coherence check
-// (spec §10): every effect here is a pure function of (document, frame).
+//: every effect here is a pure function of (document, frame).
 doc::Document make_cacheable_document() {
     doc::Document doc;
     doc.master_seed = 555;
@@ -186,12 +200,22 @@ doc::Document make_cacheable_document() {
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
     doc.layers[0].stack.back().wet = 0.5f;
     doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
-    doc::Mask mask;
-    mask.id = doc.next_mask_id++;
-    mask.name = "m";
-    mask.type = doc::MaskType::Shape;
-    doc.masks.push_back(mask);
-    doc.layers[0].stack[1].mask_id = mask.id;
+    // Port-1 matte on the pixelate — the wire path must stay cacheable.
+    doc::Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.name = "matte";
+    matte.source = doc::LayerSourceKind::Shape;
+    matte.gen_scale = 8.0f;
+    matte.gen_angle = 0.35f;
+    doc.layers.push_back(std::move(matte));
+    uint64_t prev = doc.layers[0].id;
+    for (const doc::EffectInstance& fx : doc.layers[0].stack) {
+        doc.links.push_back({prev, fx.id, 0});
+        prev = fx.id;
+    }
+    doc.links.push_back({prev, 0, 0});
+    doc.links.push_back(
+        {doc.layers.back().id, doc.layers[0].stack[1].id, 1});
     return doc;
 }
 
@@ -217,13 +241,13 @@ bool cache_coherence_check(gfx::Device& device,
     std::vector<uint64_t> miss_hashes, hit_hashes;
     for (uint32_t f = 0; f < frames; ++f) {
         if (!readback->render(*engine, source.planes(f), doc, f, 30.0, nv12,
-                              nullptr, 0, ctx))
+                              ctx))
             return false;
         miss_hashes.push_back(fnv1a(nv12.data(), nv12.size()));
     }
     for (uint32_t f = 0; f < frames; ++f) {
         if (!readback->render(*engine, source.planes(f), doc, f, 30.0, nv12,
-                              nullptr, 0, ctx))
+                              ctx))
             return false;
         hit_hashes.push_back(fnv1a(nv12.data(), nv12.size()));
     }

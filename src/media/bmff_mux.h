@@ -1,4 +1,4 @@
-// BMFF muxer (spec §3): one H.264 video track + optional AAC audio track,
+// BMFF muxer: one H.264 video track + optional AAC audio track,
 // avcC/esds, faststart moov.
 //
 // Sample payloads stream to a temp .mdat sidecar while metadata accumulates

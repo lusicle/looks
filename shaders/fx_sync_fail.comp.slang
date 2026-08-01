@@ -1,4 +1,4 @@
-// Sync failure (spec §6.7): vertical roll (the picture wraps around at a
+// Sync failure: vertical roll (the picture wraps around at a
 // steady rate) and a horizontal tear band that wanders the frame shearing
 // scanlines sideways. All motion is timeline-clocked — deterministic.
 //

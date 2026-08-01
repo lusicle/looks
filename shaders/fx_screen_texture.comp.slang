@@ -1,4 +1,4 @@
-// Projection screen texture (spec §6.8): the woven screen surface (fine
+// Projection screen texture: the woven screen surface (fine
 // two-axis weave modulation) plus the projector hotspot — center brighter,
 // corners falling off. Multiplicative in linear light.
 //

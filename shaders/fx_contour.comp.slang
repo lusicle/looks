@@ -1,4 +1,4 @@
-// Contour / topo lines (spec §6.6): iso-lines where luma crosses N evenly
+// Contour / topo lines: iso-lines where luma crosses N evenly
 // spaced levels — the picture becomes an elevation map. Line width from
 // the local luma gradient so lines stay uniform on steep and shallow
 // slopes alike. Encoded-space luma.

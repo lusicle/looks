@@ -1,4 +1,4 @@
-// Frame Delay (docs/flow_canvas.md v5.5 primitives): plain N-frame delay
+// Frame Delay (docs/flow_canvas.md primitives): plain N-frame delay
 // — the engine binds the right slice of the per-instance past-frames
 // ring as the second input; the kernel just presents it. Composes with
 // Blend / Motion Extract for echo and difference rigs.

@@ -1,4 +1,4 @@
-// Timestamp burn (spec §6.8): orange 7-segment camcorder burn — a fixed
+// Timestamp burn: orange 7-segment camcorder burn — a fixed
 // era-appropriate date and a timecode counted off the timeline clock.
 // Segments are drawn procedurally (no font anywhere near this). Encoded
 // space: the burn is an overlay on the signal, not scene light.

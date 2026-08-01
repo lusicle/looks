@@ -1,4 +1,4 @@
-# Build-time asset tools (spec §12). The dither LUT is generated once per
+# Build-time asset tools. The dither LUT is generated once per
 # build into gen/ and staged next to the exe with the other assets.
 
 add_executable(looks_bluenoise bluenoise/bluenoise.cpp)
@@ -15,7 +15,7 @@ add_custom_command(
     VERBATIM)
 set(_gen_outputs "${_gen}/dither_lut.bin")
 
-# UI font bake (spec §12 fontbake): TTF -> MSDF atlas + metrics via the
+# UI font bake (fontbake): TTF -> MSDF atlas + metrics via the
 # vendored msdf-atlas-gen CLI, decoded at runtime by our own PNG/JSON
 # readers and drawn by the first-party MSDF text shader. Skipped (debug
 # font fallback) when the tool or font is absent.

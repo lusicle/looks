@@ -1,4 +1,4 @@
-// Text (docs/flow_canvas.md v5.5b): runtime-TTF text burn-in. The
+// Text (docs/flow_canvas.md): runtime-TTF text burn-in. The
 // engine rasterizes the whole string into a single-channel signed
 // distance bitmap (in-repo TrueType loader, one raster per size BUCKET
 // so keyframed size scales between cached rasters), and this kernel

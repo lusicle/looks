@@ -1,4 +1,4 @@
-// Blur family (spec §6.5): directional streak, spin (arc around the
+// Blur family: directional streak, spin (arc around the
 // center), zoom (along the ray from center), gaussian (spiral disc taps),
 // tilt-shift (gaussian scaled outside a sharp band), bokeh (flat disc
 // aperture — highlights bloom into discs), and surface (bilateral,

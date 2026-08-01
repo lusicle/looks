@@ -1,4 +1,4 @@
-// Motion extraction (spec §6.1 category 1): frame differencing against the
+// Motion extraction (category 1): frame differencing against the
 // previous source frame. gain lifts the difference; mix blends between
 // difference-only (1) and difference-tinted source (0).
 //

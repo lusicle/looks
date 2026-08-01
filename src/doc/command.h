@@ -1,4 +1,4 @@
-// Command pattern + undo stack over the whole document (spec §10).
+// Command pattern + undo stack over the whole document.
 //
 // Rules:
 //  - Every document mutation is a Command executed through UndoStack. No
@@ -7,7 +7,7 @@
 //  - Continuous gestures (param drag) execute with coalesce=true; the stack
 //    asks the top command to merge() the newcomer so a drag is one undo step.
 //  - begin_group/end_group wraps several commands into a single undo entry
-//    (e.g. "delete layer" = unroute mods + drop masks + remove layer).
+//    (e.g. "delete layer" = unroute mods + unlink + remove layer).
 
 #pragma once
 

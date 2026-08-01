@@ -1,4 +1,4 @@
-// Vulkan instance/device bootstrap (spec §4).
+// Vulkan instance/device bootstrap.
 //
 // One graphics+compute queue for all rendering, plus a dedicated transfer
 // queue for async frame-upload staging when the hardware has a DMA family

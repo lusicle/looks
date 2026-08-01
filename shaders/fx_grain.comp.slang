@@ -1,4 +1,4 @@
-// Film grain (spec §6.1 category 5): size scales like ISO, optional
+// Film grain (category 5): size scales like ISO, optional
 // per-channel color, midtone-weighted. Counter-based hash on
 // (seed, frame, cell) — deterministic, re-seeded every frame.
 //
@@ -19,7 +19,7 @@ cbuffer Push
     float amount;      // 0..1 strength
     float size;        // grain cell size in px
     float color;       // 0 = mono grain, 1 = fully per-channel
-    float mode;        // 0 film grain, 1 CCD sensor noise (spec §6.5)
+    float mode;        // 0 film grain, 1 CCD sensor noise
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -52,7 +52,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float l = fx_luma(encoded);
     float weight;
     if (ccd) {
-        // Sensor noise (spec §6.5 CCD mode): strongest in the shadows,
+        // Sensor noise (CCD mode): strongest in the shadows,
         // plus a faint per-row banding term (readout noise).
         weight = 0.25 + 0.75 * (1.0 - l);
         const float row =

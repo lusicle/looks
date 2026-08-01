@@ -1,4 +1,4 @@
-// Composite video artifacts (spec §6.7): chroma bleed/delay (color smeared
+// Composite video artifacts: chroma bleed/delay (color smeared
 // right of where it belongs), dot crawl (checkerboard climbing chroma
 // edges), and rainbow shimmer (cross-color on fine luma detail). Runs in
 // encoded space — these live in the signal domain, not the scene.

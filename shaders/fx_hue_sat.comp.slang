@@ -1,4 +1,4 @@
-// Hue/Sat (docs/flow_canvas.md v5.5 primitives): hue rotation about the
+// Hue/Sat (docs/flow_canvas.md primitives): hue rotation about the
 // gray axis (Rodrigues), saturation toward/away from luma, lightness
 // lift. Display-referred core.
 //

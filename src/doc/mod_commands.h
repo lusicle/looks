@@ -1,5 +1,5 @@
 // Undoable mutations of the mod matrix, keyframe lanes, and snapshots
-// (spec §10: every mutation is a Command). Lane edits are whole-lane
+// (every mutation is a Command). Lane edits are whole-lane
 // replacements (lanes are tiny) — one command type covers add/move/delete
 // key and drags coalesce naturally.
 
@@ -22,7 +22,7 @@ std::unique_ptr<Command> set_route_source_command(uint64_t route_id,
                                                   ModSource source);
 std::unique_ptr<Command> set_route_curve_command(uint64_t route_id,
                                                  ResponseCurve curve);
-// Rewires which param the route drives (docs/flow_canvas.md v4: dropping
+// Rewires which param the route drives (docs/flow_canvas.md: dropping
 // a value node's out wire onto a param row). {0, -1} = unwired (inert).
 std::unique_ptr<Command> set_route_target_command(uint64_t route_id,
                                                   ParamKey target);
@@ -45,30 +45,39 @@ std::unique_ptr<Command> apply_snapshot_command(int slot);
 // Helper shared with the UI: the snapshot of the current document state.
 Snapshot capture_snapshot(const Document& doc);
 
-// Morph position/endpoints (spec §7). Coalesces (slider drags).
+// Morph position/endpoints. Coalesces (slider drags).
 std::unique_ptr<Command> set_morph_command(int from, int to, float pos);
 
-// Time remap (spec §6.1): base speed + playback mode. Coalesces.
+// Time remap: base speed + playback mode. Coalesces.
 std::unique_ptr<Command> set_time_remap_command(float speed, uint32_t mode);
 
-// Timeline region (spec §3/§9): clip trim + transport loop region.
+// Timeline region: clip trim + transport loop region.
 // Coalesces (ruler handle drags).
 std::unique_ptr<Command> set_timeline_region_command(uint32_t trim_in,
                                                      uint32_t trim_out,
                                                      uint32_t loop_in,
                                                      uint32_t loop_out);
 
-// Loopable keyframe region toggle (spec §7), per lane target.
+// Loopable keyframe region toggle, per lane target.
 std::unique_ptr<Command> set_lane_loop_command(ParamKey target, bool loop);
 // Mute keeps the keys but stops the lane driving its param.
 std::unique_ptr<Command> set_lane_mute_command(ParamKey target, bool muted);
 
-// Sidechain + audio nudge (spec §7). Coalesces (offset drags).
+// Sidechain + audio nudge. Coalesces (offset drags).
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
                                                   bool sidechain_mux,
                                                   float audio_offset_ms);
 
-// Half-res proxy toggle (spec §3/§10).
+// Export settings: bitrate / output scale divisor / audio mute.
+std::unique_ptr<Command> set_export_config_command(float bitrate_mbps,
+                                                   uint32_t scale,
+                                                   bool audio);
+
+// Timeline marker at `frame`: adds when absent, removes when
+// present; the list stays sorted.
+std::unique_ptr<Command> toggle_marker_command(uint32_t frame);
+
+// Half-res proxy toggle.
 std::unique_ptr<Command> set_use_proxy_command(bool use_proxy);
 
 }  // namespace looks::doc

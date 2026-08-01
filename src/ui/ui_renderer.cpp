@@ -258,7 +258,7 @@ bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader
 const UiTexture* UiRenderer::register_font(Font& font) {
     const uint32_t width = font.atlas_width();
     const uint32_t height = font.atlas_height();
-    // MSDF fonts (spec §12 fontbake): RGBA atlas, linear sampling, and the
+    // MSDF fonts (fontbake): RGBA atlas, linear sampling, and the
     // text shader's median-of-RGB decode (flagged via push constant).
     const bool msdf = font.msdf();
     const std::vector<uint8_t>& pixels =

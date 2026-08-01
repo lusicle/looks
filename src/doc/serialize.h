@@ -1,4 +1,4 @@
-// Project serialization (spec §10): the whole Document to/from a single
+// Project serialization: the whole Document to/from a single
 // JSON file. Presets reuse the effect/group encoders so a saved group is
 // the same on-disk shape as a group inside a project.
 //

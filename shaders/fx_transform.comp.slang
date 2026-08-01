@@ -1,4 +1,4 @@
-// Transform (docs/flow_canvas.md v5.5 primitives): mid-chain affine —
+// Transform (docs/flow_canvas.md primitives): mid-chain affine —
 // scale / rotate / offset / flip with an edge policy for the uncovered
 // region (black, clamp, wrap, mirror). Inverse-maps in pixel space so
 // rotation is aspect-true; offsets are frame fractions.

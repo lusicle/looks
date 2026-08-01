@@ -1,4 +1,4 @@
-// Slit-scan (spec §6.1): rows (or columns) sample progressively older
+// Slit-scan: rows (or columns) sample progressively older
 // frames from a past-frames ring buffer — the frame becomes a time
 // gradient. The engine dispatches this kernel once per age band with the
 // matching history frame bound; bands are disjoint, so the passes tile the

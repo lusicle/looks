@@ -15,7 +15,6 @@ add_library(looks_doc STATIC
     doc/effects.cpp
     doc/stack_commands.cpp
     doc/mod_commands.cpp
-    doc/mask_commands.cpp
     doc/layer_commands.cpp
     doc/group_commands.cpp
     doc/serialize.cpp
@@ -182,7 +181,7 @@ target_link_libraries(looks_makefixture PRIVATE looks_media)
 add_executable(looks_playtest app/playtest_cli.cpp)
 target_link_libraries(looks_playtest PRIVATE looks_media)
 
-# Determinism harness + headless export smoke (spec §11); shaders are staged
+# Determinism harness + headless export smoke; shaders are staged
 # into the shared runtime dir by the `looks` target.
 add_executable(looks_rendertest app/rendertest_cli.cpp)
 target_compile_definitions(looks_rendertest PRIVATE

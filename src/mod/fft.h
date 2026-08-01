@@ -1,4 +1,4 @@
-// Hand-rolled radix-2 FFT (spec §12) for the import-time audio analysis.
+// Hand-rolled radix-2 FFT for the import-time audio analysis.
 // In-place, iterative, f32. Sizes must be powers of two.
 
 #pragma once

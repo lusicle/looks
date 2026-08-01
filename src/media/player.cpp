@@ -2,6 +2,7 @@
 
 #include <miniaudio.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -40,12 +41,15 @@ struct Player::Impl {
     std::atomic<bool> looping{true};
     std::atomic<uint32_t> trim_in{0};
     std::atomic<uint32_t> trim_out{0};
-    // Loop region (spec §9): confines looping inside the trim; 0/0 = the
+    // Loop region: confines looping inside the trim; 0/0 = the
     // whole trim loops.
     std::atomic<uint32_t> loop_in{0};
     std::atomic<uint32_t> loop_out{0};
-    // Audio nudge (spec §7): positive delays audio against video.
+    // Audio nudge: positive delays audio against video.
     std::atomic<int64_t> audio_offset_samples{0};
+    // Monitor gain: applied in the callback; mute is gain 0 with
+    // the previous value remembered UI-side. Clock never depends on it.
+    std::atomic<float> gain{1.0f};
     uint32_t clock_rate = 48000;      // cursor units per second
 
     // Silent-clip fallback clock. `tick_mutex` guards last_tick: both the
@@ -148,15 +152,21 @@ struct Player::Impl {
         const uint64_t total_pcm = self->pcm.size() / ch;
         const int64_t offset =
             self->audio_offset_samples.load(std::memory_order_relaxed);
+        const float gain =
+            self->gain.load(std::memory_order_relaxed);
         for (ma_uint32 i = 0; i < frame_count; ++i) {
             // Audio nudge: at cursor c the monitored sample is c - offset
             // (positive offset = audio later); out of range = silence.
             const int64_t s =
                 static_cast<int64_t>(c) - offset;
-            if (s >= 0 && s < static_cast<int64_t>(total_pcm)) {
+            if (s >= 0 && s < static_cast<int64_t>(total_pcm) &&
+                gain > 0.0f) {
                 const int16_t* src =
                     self->pcm.data() + static_cast<uint64_t>(s) * ch;
-                for (uint32_t k = 0; k < ch; ++k) out[i * ch + k] = src[k];
+                for (uint32_t k = 0; k < ch; ++k)
+                    out[i * ch + k] = static_cast<int16_t>(
+                        std::clamp(static_cast<float>(src[k]) * gain,
+                                   -32768.0f, 32767.0f));
             }
             c = self->advance_cursor(c, 1);
             if (!self->playing.load(std::memory_order_relaxed)) break;
@@ -332,6 +342,10 @@ void Player::tick() { impl_->tick_synthetic_clock(); }
 void Player::pause() { impl_->playing.store(false); }
 bool Player::playing() const { return impl_->playing.load(); }
 void Player::set_looping(bool loop) { impl_->looping.store(loop); }
+void Player::set_gain(float gain) {
+    impl_->gain.store(std::clamp(gain, 0.0f, 2.0f));
+}
+float Player::gain() const { return impl_->gain.load(); }
 
 uint32_t Player::frame_count() const { return impl_->frames; }
 double Player::fps() const { return impl_->frames_per_second; }

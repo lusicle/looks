@@ -1,4 +1,4 @@
-// Pixelate/mosaic (proof effect, spec §6.1 category 5). Block-averaged?
+// Pixelate/mosaic (proof effect, category 5). Block-averaged?
 // No — classic point-sample at block centers (the crunchy look).
 //
 // Composition (canonical): wet is interior to the blend, opacity outside:

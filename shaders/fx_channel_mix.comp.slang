@@ -1,4 +1,4 @@
-// Channels (docs/flow_canvas.md v5.5 primitives): each output channel
+// Channels (docs/flow_canvas.md primitives): each output channel
 // picks its source — R/G/B/luma. Swaps (aerochrome false color),
 // duplicated channels, and luma-mono all fall out. Display-referred.
 //

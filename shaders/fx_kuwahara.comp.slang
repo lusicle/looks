@@ -1,4 +1,4 @@
-// Kuwahara (spec §6.6): classic 4-quadrant filter — each pixel takes the
+// Kuwahara: classic 4-quadrant filter — each pixel takes the
 // mean of whichever surrounding quadrant has the least variance. Flattens
 // texture into paint daubs while keeping edges crisp. Encoded space.
 //

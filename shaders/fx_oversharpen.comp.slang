@@ -1,4 +1,4 @@
-// Oversharpen halos (spec §6.5): unsharp mask pushed past taste — bright
+// Oversharpen halos: unsharp mask pushed past taste — bright
 // rims around dark edges and vice versa. Encoded space, cross-tap blur.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).

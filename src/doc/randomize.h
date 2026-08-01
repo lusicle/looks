@@ -1,4 +1,4 @@
-// Randomize / mutate (spec §10): per-effect or whole stack, intensity 0..1,
+// Randomize / mutate: per-effect or whole stack, intensity 0..1,
 // respecting param ranges and per-param randomizable-ness. One undo step
 // per gesture. Deterministic per rng_seed — callers advance a counter.
 

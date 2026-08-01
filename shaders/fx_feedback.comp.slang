@@ -1,4 +1,4 @@
-// Feedback node (spec §6.1 category 1, §4): reads the previous frame's own
+// Feedback node: reads the previous frame's own
 // output (one-frame-delay rule — the only legal "cycle" in the graph),
 // transformed per pass: zoom/rotate around center + fade. The classic video
 // feedback tunnel.
@@ -21,7 +21,7 @@ cbuffer Push
     float zoom;        // scale per pass (1 = none)
     float rotate;      // radians per pass
     float fade;        // brightness decay per pass
-    float hue_shift;   // degrees per pass (spec §6.1 color-shift)
+    float hue_shift;   // degrees per pass (color-shift)
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -53,7 +53,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (all(prev_uv >= 0.0) && all(prev_uv <= 1.0))
         fb = prev_out.SampleLevel(prev_uv, 0).rgb * (1.0 - saturate(fade));
 
-    // Per-pass color-shift (spec §6.1): rotate the fed-back frame's hue
+    // Per-pass color-shift: rotate the fed-back frame's hue
     // around the luma axis — trails cycle through the spectrum.
     if (abs(hue_shift) > 0.01) {
         const float ha = hue_shift * 0.01745329252;

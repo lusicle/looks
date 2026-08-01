@@ -25,7 +25,7 @@ add_slang_shaders(looks_shaders
         fx_echo.comp.slang
         fx_feedback.comp.slang
         fx_glyph.comp.slang
-        fx_colorscience.comp.slang
+        fx_film_stock.comp.slang
         fx_kaleido.comp.slang
         fx_polar.comp.slang
         fx_turbulence.comp.slang
@@ -40,7 +40,6 @@ add_slang_shaders(looks_shaders
         fx_sync_fail.comp.slang
         fx_timestamp.comp.slang
         fx_oversharpen.comp.slang
-        fx_nr_mush.comp.slang
         fx_blur.comp.slang
         fx_dust_scratches.comp.slang
         fx_light_leak.comp.slang
@@ -63,7 +62,7 @@ add_slang_shaders(looks_shaders
         fx_stutter.comp.slang
         fx_contour.comp.slang
         fx_flow_particles.comp.slang
-        fx_ball.comp.slang
+        fx_spherize.comp.slang
         fx_soft_upscale.comp.slang
         fx_zoom_crunch.comp.slang
         fx_pixel_sort.comp.slang
@@ -111,7 +110,7 @@ add_slang_shaders(looks_shaders
         fx_scope.comp.slang
         fx_security_mux.comp.slang
         fx_audio_scope.comp.slang
-        fx_modulate.comp.slang
+        fx_engraver.comp.slang
         fx_blend_node.comp.slang
         fx_matte.comp.slang
         fx_levels.comp.slang
@@ -124,18 +123,16 @@ add_slang_shaders(looks_shaders
         fx_transform.comp.slang
         fx_frame_delay.comp.slang
         fx_text.comp.slang
+        fx_white_balance.comp.slang
+        fx_sharpen.comp.slang
+        fx_corner_pin.comp.slang
         mod_integrate.comp.slang
         thumb_tap.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang
-        mask_shape.comp.slang
-        mask_source.comp.slang
-        mask_extract.comp.slang
-        mask_morph.comp.slang
-        mask_combine.comp.slang
-        mask_blur.comp.slang
-        mask_apply.comp.slang
+        matte_extract.comp.slang
+        matte_apply.comp.slang
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_common.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_glow_blur_body.slang)

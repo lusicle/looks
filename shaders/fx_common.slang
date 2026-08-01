@@ -1,4 +1,4 @@
-// Shared kernel helpers (spec §11): all randomness is a counter-based hash
+// Shared kernel helpers: all randomness is a counter-based hash
 // keyed on (seed, frame, cell) — no stateful RNG anywhere, so preview and
 // export are bit-exact. Included by effect kernels via #include.
 
@@ -61,7 +61,7 @@ float3 fx_srgb_eotf(float3 encoded)
     return lerp(hi, lo, step(encoded, 0.04045));
 }
 
-// ---- Ordered-dither pattern helpers (spec §6.2): shared by the
+// ---- Ordered-dither pattern helpers: shared by the
 // Quantizer's dither leg and the standalone Dither node. The packed LUT
 // is 512x192 R8: rows 0..63 hold the STBN 64x64x8 atlas (slice s at
 // x = s*64), rows 64..191 the 128x128 blue noise (tools/bluenoise).
@@ -78,6 +78,24 @@ float fx_bayer8(uint2 p)
     const float base = kFxBayer4[(q.y & 3) * 4 + (q.x & 3)];
     const float quad = float(((q.y >> 2) & 1) * 2 + ((q.x >> 2) & 1));
     return (base * 4.0 + kFxBayer2[uint(quad)]) / 64.0;
+}
+
+// Clustered-dot screen threshold at 45 degrees: the black dot grows
+// from the cell center of an 8 px lattice, and the radial map keeps dot
+// area tracking tone (dots merge into the corners in the shadows).
+float fx_cluster_dot(float2 pf)
+{
+    const float2 r45 = float2(pf.x - pf.y, pf.x + pf.y) * 0.70710678;
+    const float2 cell = frac(r45 * 0.125) * 8.0 - 4.0;
+    return saturate(1.0 - dot(cell, cell) * 0.04908739);
+}
+
+// Interleaved gradient noise: a screen-space ordered pattern between
+// bayer's regularity and white noise's grain.
+float fx_ign(uint2 p)
+{
+    const float g = 0.06711056 * float(p.x) + 0.00583715 * float(p.y);
+    return frac(52.9829189 * frac(g));
 }
 
 float fx_lut_texel(Sampler2D lut, uint x, uint y)
@@ -130,7 +148,7 @@ float3 fx_nes_nearest(float3 c)
     return best;
 }
 
-// Linear-light level pick (v5.6a): choose between the two encoded
+// Linear-light level pick: choose between the two encoded
 // levels bracketing `lin` with probability from the LINEAR interpolant,
 // so the displayed (linear) average of a dithered field reproduces the
 // input. Dithering in code values alone preserves the encoded mean, and

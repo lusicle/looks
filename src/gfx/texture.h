@@ -1,4 +1,4 @@
-// GPU image + staging upload helpers (spec §4). VMA-backed images with
+// GPU image + staging upload helpers. VMA-backed images with
 // simple explicit layout tracking; pooled RGBA16F intermediates for the
 // render graph. Uploads go through per-frame staging rings on the graphics
 // queue for now — the dedicated transfer queue path arrives with async

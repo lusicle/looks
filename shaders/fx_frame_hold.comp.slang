@@ -1,4 +1,4 @@
-// Frame-rate / shutter sim (spec §6.1): the engine refreshes the held
+// Frame-rate / shutter sim: the engine refreshes the held
 // frame only when the target-fps tick advances, so 30 fps footage judders
 // like 16 mm. Shutter blend mixes the live frame back in — a cheap stand-in
 // for 180° accumulation smear.

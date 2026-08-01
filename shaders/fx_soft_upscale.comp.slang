@@ -1,4 +1,4 @@
-// Soft low-res upscale (spec §6.5): the look of footage decimated to a
+// Soft low-res upscale: the look of footage decimated to a
 // fraction of its resolution and stretched back up — bilinear mush between
 // fat texels, with softness sweeping from blocky-nearest to fully smeared.
 //

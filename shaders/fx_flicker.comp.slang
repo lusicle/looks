@@ -1,4 +1,4 @@
-// Exposure / projector flicker (spec §6.1): whole-frame brightness beats.
+// Exposure / projector flicker: whole-frame brightness beats.
 // Projector mode superimposes two shutter-harmonic sines (the 24 Hz blade
 // beat against mains); random mode gates exposure per tick. Linear light,
 // uniform across the frame, timeline-clocked.

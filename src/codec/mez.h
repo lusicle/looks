@@ -1,4 +1,4 @@
-// Mezzanine codec (spec §3): intra-only, MJPEG-class, YCbCr 4:2:0 (I420
+// Mezzanine codec: intra-only, MJPEG-class, YCbCr 4:2:0 (I420
 // planar), 16x16 macroblocks of four 8x8 luma + one 8x8 per chroma over
 // codec_core. Every frame independent -> instant scrub. Decode is CPU-side
 // on worker threads; frames reach the GPU as plain uploads.
@@ -51,7 +51,7 @@ void encode_frame(const FrameView& frame, int quality, std::vector<uint8_t>& out
 bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
                   uint32_t height, DecodedFrame& out, bool parallel = false);
 
-// Two-phase intra encode (Codec-Box rate loops, spec §6.3): the DCT is
+// Two-phase intra encode (Codec-Box rate loops, ): the DCT is
 // quality-independent, so transform once (optionally across threads) and
 // re-run only quantize+entropy per quality step. intra_entropy output is
 // byte-identical to encode_frame at the same quality. Import stays on

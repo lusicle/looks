@@ -32,7 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 size = float2(width, height);
     const float2 uv = (float2(tid.xy) + 0.5) / size;
 
-    // CCD smear (spec §6.3): a sensor-readout COLUMN, not a bloom — the
+    // CCD smear: a sensor-readout COLUMN, not a bloom — the
     // horizontal pass collapses to nothing and the vertical pass runs a
     // long, flat-weighted streak the height of several radii.
     const bool ccd = int(mode + 0.5) == 2;

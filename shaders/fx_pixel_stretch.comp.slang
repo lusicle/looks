@@ -1,4 +1,4 @@
-// Pixel stretch (spec §6.2): freeze one row (or column) and smear it across
+// Pixel stretch: freeze one row (or column) and smear it across
 // the rest of the frame — everything past the frozen line samples the line.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).

@@ -188,6 +188,83 @@ private:
     float old_offset_ = 0.0f;
 };
 
+class ToggleMarkerCommand final : public Command {
+public:
+    explicit ToggleMarkerCommand(uint32_t frame) : frame_(frame) {}
+    std::string name() const override { return "Toggle Marker"; }
+
+    void apply(Document& doc) override {
+        auto it = std::find(doc.markers.begin(), doc.markers.end(), frame_);
+        if (it != doc.markers.end()) {
+            removed_ = true;
+            doc.markers.erase(it);
+        } else {
+            removed_ = false;
+            doc.markers.insert(
+                std::upper_bound(doc.markers.begin(), doc.markers.end(),
+                                 frame_),
+                frame_);
+        }
+    }
+
+    void revert(Document& doc) override {
+        if (removed_) {
+            doc.markers.insert(
+                std::upper_bound(doc.markers.begin(), doc.markers.end(),
+                                 frame_),
+                frame_);
+        } else {
+            auto it =
+                std::find(doc.markers.begin(), doc.markers.end(), frame_);
+            if (it != doc.markers.end()) doc.markers.erase(it);
+        }
+    }
+
+private:
+    uint32_t frame_;
+    bool removed_ = false;
+};
+
+class SetExportConfigCommand final : public Command {
+public:
+    SetExportConfigCommand(float bitrate_mbps, uint32_t scale, bool audio)
+        : bitrate_(bitrate_mbps), scale_(scale), audio_(audio) {}
+    std::string name() const override { return "Export Settings"; }
+
+    void apply(Document& doc) override {
+        old_bitrate_ = doc.export_bitrate_mbps;
+        old_scale_ = doc.export_scale;
+        old_audio_ = doc.export_audio;
+        doc.export_bitrate_mbps = bitrate_;
+        doc.export_scale = scale_;
+        doc.export_audio = audio_;
+    }
+
+    void revert(Document& doc) override {
+        doc.export_bitrate_mbps = old_bitrate_;
+        doc.export_scale = old_scale_;
+        doc.export_audio = old_audio_;
+    }
+
+    bool merge(const Command& next) override {
+        const auto* other =
+            dynamic_cast<const SetExportConfigCommand*>(&next);
+        if (!other) return false;
+        bitrate_ = other->bitrate_;
+        scale_ = other->scale_;
+        audio_ = other->audio_;
+        return true;
+    }
+
+private:
+    float bitrate_;
+    uint32_t scale_;
+    bool audio_;
+    float old_bitrate_ = 8.0f;
+    uint32_t old_scale_ = 1;
+    bool old_audio_ = true;
+};
+
 class SetUseProxyCommand final : public Command {
 public:
     explicit SetUseProxyCommand(bool use_proxy) : use_proxy_(use_proxy) {}
@@ -631,6 +708,17 @@ std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
     return std::make_unique<SetAudioConfigCommand>(std::move(sidechain_path),
                                                    sidechain_mux,
                                                    audio_offset_ms);
+}
+
+std::unique_ptr<Command> set_export_config_command(float bitrate_mbps,
+                                                   uint32_t scale,
+                                                   bool audio) {
+    return std::make_unique<SetExportConfigCommand>(bitrate_mbps, scale,
+                                                    audio);
+}
+
+std::unique_ptr<Command> toggle_marker_command(uint32_t frame) {
+    return std::make_unique<ToggleMarkerCommand>(frame);
 }
 std::unique_ptr<Command> set_use_proxy_command(bool use_proxy) {
     return std::make_unique<SetUseProxyCommand>(use_proxy);

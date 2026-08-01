@@ -72,19 +72,26 @@ public:
         tooltip_ = nullptr;
     }
 
-    // ---- deferred dropdown popup. The open Dropdown registers its list
+    // ---- deferred overlay popup. The open widget registers its overlay
     // each frame during draw; the app runs RunPopup right after run_frame —
     // BEFORE the frame's edit handlers — so a selection lands in its
     // out-param in time to be applied the same frame. `owner` (persistent)
     // enforces a single open popup.
+    enum class PopupKind : uint8_t { List, Color };
     struct PopupRequest {
+        PopupKind kind = PopupKind::List;
         Rect anchor;
         Rect rect;
+        // List: dropdown option rows.
         const char* const* items = nullptr;
         int count = 0;
         int selected = -1;
         void* state = nullptr;
         int* out_selected = nullptr;
+        // Color: picker writing an rgb triplet as it drags.
+        float* out_rgb = nullptr;
+        bool* out_changed = nullptr;
+        bool* out_released = nullptr;
     };
     void set_popup(const PopupRequest& request) {
         popup_ = request;

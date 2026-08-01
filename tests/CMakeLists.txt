@@ -10,7 +10,6 @@ add_executable(looks_tests
     test_codec.cpp
     test_mux.cpp
     test_mod.cpp
-    test_mask.cpp
     test_mosh.cpp
     test_image.cpp
     test_serialize.cpp

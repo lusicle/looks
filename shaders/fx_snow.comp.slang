@@ -1,4 +1,4 @@
-// Analog snow + ghosting (spec §6.7): sparse white/dark RF speckle bursts
+// Analog snow + ghosting: sparse white/dark RF speckle bursts
 // re-seeded every frame, plus a displaced low-contrast ghost image
 // (multipath reflection). Encoded space — snow rides on the signal.
 //

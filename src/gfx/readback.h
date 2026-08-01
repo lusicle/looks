@@ -1,4 +1,4 @@
-// Export readback (spec §3): offline frame-by-frame graph evaluation at
+// Export readback: offline frame-by-frame graph evaluation at
 // full res with a fenced staging readback. Owns its own command pool/fence
 // and NV12 conversion targets so an export worker can drive a private
 // Engine instance concurrently with the preview loop (queue submissions are
@@ -30,9 +30,7 @@ public:
     // render cache — the default for export, which visits each frame once).
     bool render(Engine& engine, const SourcePlanes& source,
                 const doc::Document& doc, uint32_t timeline_frame, double fps,
-                std::vector<uint8_t>& out,
-                const Engine::MaskSourceFrame* mask_sources = nullptr,
-                size_t mask_source_count = 0, uint64_t cache_ctx = 0,
+                std::vector<uint8_t>& out, uint64_t cache_ctx = 0,
                 const Engine::LayerSourceFrame* layer_sources = nullptr,
                 size_t layer_source_count = 0);
 

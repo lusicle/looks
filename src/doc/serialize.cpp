@@ -28,11 +28,6 @@ const char* const kModSourceNames[] = {
 const char* const kLfoShapeNames[] = {"sine", "triangle", "square",
                                       "sample_hold"};
 const char* const kCurveNames[] = {"linear", "exp", "scurve", "inverted"};
-const char* const kMaskTypeNames[] = {"shape", "luma", "luma_key",
-                                      "chroma_key", "motion"};
-const char* const kMaskExtractNames[] = {"luma", "red", "green", "blue",
-                                         "alpha"};
-const char* const kMaskCombineNames[] = {"add", "subtract", "intersect"};
 
 template <size_t N>
 const char* enum_name(const char* const (&names)[N], uint32_t index) {
@@ -74,10 +69,10 @@ float num(const Value& obj, std::string_view key, float fallback) {
 
 Value param_key_to_json(const ParamKey& k) {
     Value v = Value::make_object();
-    // Mask keys carry bit 63, past the JSON number's 2^53 exact-integer
-    // range — store the bare mask id in its own field instead.
-    if (k.effect_id & kMaskParamBit)
-        v.set("mask", static_cast<int64_t>(k.effect_id & ~kMaskParamBit));
+    // Layer keys carry bit 62, past the JSON number's 2^53 exact-integer
+    // range — store the bare id in its own field instead.
+    if (k.effect_id & kLayerParamBit)
+        v.set("layer", static_cast<int64_t>(k.effect_id & ~kLayerParamBit));
     else
         v.set("effect", static_cast<int64_t>(k.effect_id));
     v.set("param", k.param_index);
@@ -86,10 +81,11 @@ Value param_key_to_json(const ParamKey& k) {
 
 ParamKey param_key_from_json(const Value& v) {
     ParamKey k;
-    const int64_t mask_id = v.get("mask").as_int(-1);
-    k.effect_id = mask_id >= 0
-        ? static_cast<uint64_t>(mask_id) | kMaskParamBit
-        : static_cast<uint64_t>(v.get("effect").as_int(0));
+    const int64_t layer_id = v.get("layer").as_int(-1);
+    if (layer_id >= 0)
+        k.effect_id = static_cast<uint64_t>(layer_id) | kLayerParamBit;
+    else
+        k.effect_id = static_cast<uint64_t>(v.get("effect").as_int(0));
     k.param_index = static_cast<int>(v.get("param").as_int(0));
     return k;
 }
@@ -201,6 +197,12 @@ KeyframeLane lane_from_json(const Value& v) {
         k.hold = kv.get("hold").as_bool(false);
         lane.keys.push_back(k);
     }
+    // eval_lane assumes ascending frames; the command path sorts on every
+    // edit but hand-authored files may not — sort here so both hold.
+    std::stable_sort(lane.keys.begin(), lane.keys.end(),
+                     [](const Keyframe& a, const Keyframe& b) {
+                         return a.frame < b.frame;
+                     });
     return lane;
 }
 
@@ -237,116 +239,6 @@ Snapshot snapshot_from_json(const Value& v) {
     return s;
 }
 
-// ---- masks
-
-Value mask_to_json(const Mask& m) {
-    Value v = Value::make_object();
-    v.set("id", static_cast<int64_t>(m.id));
-    v.set("name", m.name);
-    v.set("type", enum_name(kMaskTypeNames, static_cast<uint32_t>(m.type)));
-    v.set("center", Value(Array{Value(static_cast<double>(m.center_x)),
-                                Value(static_cast<double>(m.center_y))}));
-    v.set("radius", Value(Array{Value(static_cast<double>(m.radius_x)),
-                                Value(static_cast<double>(m.radius_y))}));
-    v.set("roundness", static_cast<double>(m.roundness));
-    v.set("feather", static_cast<double>(m.feather));
-    if (!m.points.empty()) {
-        Value pts = Value::make_array();
-        for (float p : m.points) pts.push(static_cast<double>(p));
-        v.set("points", std::move(pts));
-    }
-    v.set("extract",
-          enum_name(kMaskExtractNames, static_cast<uint32_t>(m.extract)));
-    v.set("key_center", static_cast<double>(m.key_center));
-    v.set("key_range", static_cast<double>(m.key_range));
-    v.set("key_rgb", Value(Array{Value(static_cast<double>(m.key_r)),
-                                 Value(static_cast<double>(m.key_g)),
-                                 Value(static_cast<double>(m.key_b))}));
-    v.set("blur_px", static_cast<double>(m.blur_px));
-    v.set("black_point", static_cast<double>(m.black_point));
-    v.set("white_point", static_cast<double>(m.white_point));
-    v.set("gamma", static_cast<double>(m.gamma));
-    v.set("invert", m.invert);
-    v.set("source", m.source_path);
-    if (m.source_layer_id)
-        v.set("source_layer", static_cast<int64_t>(m.source_layer_id));
-    if (m.source_gen) v.set("source_gen", static_cast<int64_t>(m.source_gen));
-    v.set("gen_scale", static_cast<double>(m.gen_scale));
-    v.set("gen_angle", static_cast<double>(m.gen_angle));
-    v.set("free_run", m.free_run);
-    v.set("fit", static_cast<int64_t>(m.fit));
-    if (m.grow_px != 0.0f) v.set("grow_px", static_cast<double>(m.grow_px));
-    if (m.combine_id) {
-        v.set("combine", static_cast<int64_t>(m.combine_id));
-        v.set("combine_op",
-              enum_name(kMaskCombineNames,
-                        static_cast<uint32_t>(m.combine_op)));
-    }
-    Value chain = Value::make_array();
-    for (const EffectInstance& fx : m.chain) chain.push(effect_to_json(fx));
-    v.set("chain", std::move(chain));
-    if (m.node_x != 0.0f || m.node_y != 0.0f) {
-        v.set("node_x", static_cast<double>(m.node_x));
-        v.set("node_y", static_cast<double>(m.node_y));
-    }
-    return v;
-}
-
-Mask mask_from_json(const Value& v) {
-    Mask m;
-    m.id = static_cast<uint64_t>(v.get("id").as_int(0));
-    m.name = v.get("name").as_string();
-    m.type = static_cast<MaskType>(
-        enum_index(kMaskTypeNames, v.get("type").as_string()));
-    const Array& c = v.get("center").array();
-    if (c.size() >= 2) {
-        m.center_x = static_cast<float>(c[0].as_number(0.5));
-        m.center_y = static_cast<float>(c[1].as_number(0.5));
-    }
-    const Array& r = v.get("radius").array();
-    if (r.size() >= 2) {
-        m.radius_x = static_cast<float>(r[0].as_number(0.3));
-        m.radius_y = static_cast<float>(r[1].as_number(0.3));
-    }
-    m.roundness = num(v, "roundness", 1.0f);
-    m.feather = num(v, "feather", 0.05f);
-    for (const Value& p : v.get("points").array())
-        m.points.push_back(static_cast<float>(p.as_number(0.0)));
-    if (m.points.size() % 2) m.points.pop_back();
-    m.extract = static_cast<MaskExtract>(
-        enum_index(kMaskExtractNames, v.get("extract").as_string()));
-    m.key_center = num(v, "key_center", 0.5f);
-    m.key_range = num(v, "key_range", 0.25f);
-    const Array& k = v.get("key_rgb").array();
-    if (k.size() >= 3) {
-        m.key_r = static_cast<float>(k[0].as_number(0.0));
-        m.key_g = static_cast<float>(k[1].as_number(1.0));
-        m.key_b = static_cast<float>(k[2].as_number(0.0));
-    }
-    m.blur_px = num(v, "blur_px", 0.0f);
-    m.black_point = num(v, "black_point", 0.0f);
-    m.white_point = num(v, "white_point", 1.0f);
-    m.gamma = num(v, "gamma", 1.0f);
-    m.invert = v.get("invert").as_bool(false);
-    m.source_path = v.get("source").as_string();
-    m.source_layer_id =
-        static_cast<uint64_t>(v.get("source_layer").as_int(0));
-    m.source_gen = static_cast<uint32_t>(v.get("source_gen").as_int(0));
-    m.gen_scale = num(v, "gen_scale", 24.0f);
-    m.gen_angle = num(v, "gen_angle", 0.0f);
-    m.free_run = v.get("free_run").as_bool(false);
-    m.fit = static_cast<uint32_t>(v.get("fit").as_int(0));
-    m.grow_px = num(v, "grow_px", 0.0f);
-    m.combine_id = static_cast<uint64_t>(v.get("combine").as_int(0));
-    m.combine_op = static_cast<MaskCombineOp>(
-        enum_index(kMaskCombineNames, v.get("combine_op").as_string()));
-    for (const Value& fv : v.get("chain").array())
-        if (auto fx = effect_from_json(fv)) m.chain.push_back(std::move(*fx));
-    m.node_x = num(v, "node_x", 0.0f);
-    m.node_y = num(v, "node_y", 0.0f);
-    return m;
-}
-
 // ---- layers
 
 Value layer_to_json(const Layer& l) {
@@ -364,8 +256,7 @@ Value layer_to_json(const Layer& l) {
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
-    if (l.mask_id) v.set("mask", static_cast<int64_t>(l.mask_id));
-    // Transform + trim (spec §5): written only when non-default so
+    // Transform + trim: written only when non-default so
     // pre-transform projects stay byte-stable.
     if (layer_has_transform(l)) {
         Value xf = Value::make_object();
@@ -409,7 +300,6 @@ Layer layer_from_json(const Value& v) {
         enum_index(kBlendNames, v.get("blend").as_string()));
     l.opacity = num(v, "opacity", 1.0f);
     l.visible = v.get("visible").as_bool(true);
-    l.mask_id = static_cast<uint64_t>(v.get("mask").as_int(0));
     if (const Value& xf = v.get("transform"); xf.is_object()) {
         l.crop_l = num(xf, "crop_l", 0.0f);
         l.crop_r = num(xf, "crop_r", 0.0f);
@@ -448,7 +338,6 @@ json::Value effect_to_json(const EffectInstance& fx) {
     v.set("bypass", fx.bypass);
     if (fx.solo) v.set("solo", true);
     v.set("seed", static_cast<int64_t>(fx.seed));
-    v.set("mask", static_cast<int64_t>(fx.mask_id));
     v.set("group", static_cast<int64_t>(fx.group_id));
     if (!fx.text.empty()) v.set("text", fx.text);
     if (fx.node_x != 0.0f || fx.node_y != 0.0f) {
@@ -478,7 +367,6 @@ std::optional<EffectInstance> effect_from_json(const json::Value& v) {
     fx.bypass = v.get("bypass").as_bool(false);
     fx.solo = v.get("solo").as_bool(false);
     fx.seed = static_cast<uint64_t>(v.get("seed").as_int(0));
-    fx.mask_id = static_cast<uint64_t>(v.get("mask").as_int(0));
     fx.group_id = static_cast<uint64_t>(v.get("group").as_int(0));
     fx.text = v.get("text").as_string();
     fx.node_x = num(v, "node_x", 0.0f);
@@ -498,7 +386,7 @@ json::Value group_to_json(const Group& g) {
         v.set("node_x", static_cast<double>(g.node_x));
         v.set("node_y", static_cast<double>(g.node_y));
     }
-    // The group face (v5.3): exposed member params — direct aliases.
+    // The group face: exposed member params — direct aliases.
     Value exposed = Value::make_array();
     for (const ParamKey& k : g.exposed) {
         Value ev = Value::make_object();
@@ -553,7 +441,6 @@ json::Value doc_to_json(const Document& doc) {
     if (doc.use_proxy) v.set("use_proxy", true);
     v.set("next_effect_id", static_cast<int64_t>(doc.next_effect_id));
     v.set("next_route_id", static_cast<int64_t>(doc.next_route_id));
-    v.set("next_mask_id", static_cast<int64_t>(doc.next_mask_id));
 
     Value layers = Value::make_array();
     for (const Layer& l : doc.layers) layers.push(layer_to_json(l));
@@ -589,16 +476,25 @@ json::Value doc_to_json(const Document& doc) {
     if (doc.still_duration_frames)
         v.set("still_duration",
               static_cast<int64_t>(doc.still_duration_frames));
+    if (!doc.markers.empty()) {
+        Value markers = Value::make_array();
+        for (const uint32_t m : doc.markers)
+            markers.push(Value(static_cast<int64_t>(m)));
+        v.set("markers", std::move(markers));
+    }
     if (!doc.sidechain_path.empty()) {
         v.set("sidechain", doc.sidechain_path);
         v.set("sidechain_mux", doc.sidechain_mux);
     }
     if (doc.audio_offset_ms != 0.0f)
         v.set("audio_offset_ms", static_cast<double>(doc.audio_offset_ms));
+    if (doc.export_bitrate_mbps != 8.0f)
+        v.set("export_bitrate_mbps",
+              static_cast<double>(doc.export_bitrate_mbps));
+    if (doc.export_scale != 1)
+        v.set("export_scale", static_cast<int64_t>(doc.export_scale));
+    if (!doc.export_audio) v.set("export_audio", false);
 
-    Value masks = Value::make_array();
-    for (const Mask& m : doc.masks) masks.push(mask_to_json(m));
-    v.set("masks", std::move(masks));
     if (doc.out_node_x != 0.0f || doc.out_node_y != 0.0f) {
         v.set("out_node_x", static_cast<double>(doc.out_node_x));
         v.set("out_node_y", static_cast<double>(doc.out_node_y));
@@ -665,11 +561,17 @@ Document doc_from_json(const json::Value& v) {
     doc.loop_out = static_cast<uint32_t>(v.get("loop_out").as_int(0));
     doc.still_duration_frames =
         static_cast<uint32_t>(v.get("still_duration").as_int(0));
+    for (const Value& mv : v.get("markers").array())
+        doc.markers.push_back(static_cast<uint32_t>(mv.as_int(0)));
+    std::sort(doc.markers.begin(), doc.markers.end());
     doc.sidechain_path = v.get("sidechain").as_string();
     doc.sidechain_mux = v.get("sidechain_mux").as_bool(false);
     doc.audio_offset_ms = num(v, "audio_offset_ms", 0.0f);
-    for (const Value& mv : v.get("masks").array())
-        doc.masks.push_back(mask_from_json(mv));
+    doc.export_bitrate_mbps =
+        std::clamp(num(v, "export_bitrate_mbps", 8.0f), 1.0f, 60.0f);
+    doc.export_scale = std::clamp(
+        static_cast<uint32_t>(v.get("export_scale").as_int(1)), 1u, 4u);
+    doc.export_audio = v.get("export_audio").as_bool(true);
     doc.out_node_x = num(v, "out_node_x", 0.0f);
     doc.out_node_y = num(v, "out_node_y", 0.0f);
     // Legacy chain documents carry no links; consumers call ensure_links
@@ -679,6 +581,21 @@ Document doc_from_json(const json::Value& v) {
             {static_cast<uint64_t>(lv.get("from").as_int(0)),
              static_cast<uint64_t>(lv.get("to").as_int(0)),
              static_cast<uint32_t>(lv.get("port").as_int(0))});
+    // In ports hold ONE producer — only the Output composites
+    // fan-in (the layer merge). Hand-edited files keep the LAST link per
+    // (to, port), matching connect's replace-on-connect.
+    for (size_t i = doc.links.size(); i-- > 0;) {
+        const Document::NodeLink& l = doc.links[i];
+        if (l.to == 0) continue;
+        for (size_t j = i; j-- > 0;) {
+            if (doc.links[j].to == l.to &&
+                doc.links[j].to_port == l.to_port) {
+                doc.links.erase(doc.links.begin() +
+                                static_cast<ptrdiff_t>(j));
+                --i;
+            }
+        }
+    }
     for (const Value& fv : v.get("frames").array()) {
         Document::Frame f;
         f.id = static_cast<uint64_t>(fv.get("id").as_int(0));
@@ -694,7 +611,7 @@ Document doc_from_json(const json::Value& v) {
     // Re-derive id counters from the content: stored values are honored but
     // never allowed below (max seen id + 1), so a hand-edited file cannot
     // mint duplicate ids.
-    uint64_t max_effect_id = 0, max_mask_id = 0, max_route_id = 0;
+    uint64_t max_effect_id = 0, max_route_id = 0;
     auto see_stack = [&](const std::vector<EffectInstance>& stack) {
         for (const EffectInstance& fx : stack)
             max_effect_id = std::max(max_effect_id, fx.id);
@@ -705,10 +622,6 @@ Document doc_from_json(const json::Value& v) {
         for (const Group& g : l.groups)
             max_effect_id = std::max(max_effect_id, g.id);
     }
-    for (const Mask& m : doc.masks) {
-        max_mask_id = std::max(max_mask_id, m.id);
-        see_stack(m.chain);
-    }
     for (const ModRoute& r : doc.mod_routes)
         max_route_id = std::max(max_route_id, r.id);
     doc.next_effect_id =
@@ -717,9 +630,6 @@ Document doc_from_json(const json::Value& v) {
     doc.next_route_id =
         std::max(static_cast<uint64_t>(v.get("next_route_id").as_int(1)),
                  max_route_id + 1);
-    doc.next_mask_id =
-        std::max(static_cast<uint64_t>(v.get("next_mask_id").as_int(1)),
-                 max_mask_id + 1);
 
     if (doc.layers.empty()) {
         Layer base;

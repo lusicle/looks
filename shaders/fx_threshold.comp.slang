@@ -1,4 +1,4 @@
-// Threshold (docs/flow_canvas.md v5.5 primitives): soft-knee luma
+// Threshold (docs/flow_canvas.md primitives): soft-knee luma
 // threshold to black & white — the matte/print primitive Photocopy and
 // Halftone bury inside their stacks. Display-referred core.
 //

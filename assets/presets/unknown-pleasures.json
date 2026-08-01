@@ -39,7 +39,6 @@
       "blend": "normal",
       "bypass": false,
       "seed": 0,
-      "mask": 0,
       "group": 100
     },
     {
@@ -57,7 +56,6 @@
       "blend": "normal",
       "bypass": false,
       "seed": 0,
-      "mask": 0,
       "group": 100
     }
   ]

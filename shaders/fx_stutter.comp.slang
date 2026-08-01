@@ -1,4 +1,4 @@
-// Stutter / beat-repeat (spec §6.1): while armed, the engine replays the
+// Stutter / beat-repeat: while armed, the engine replays the
 // last N recorded frames cyclically (the ring frame arrives on binding 1);
 // unarmed it records and passes through. Route a beat trigger onto the
 // "armed" param and the picture beat-repeats with the music.

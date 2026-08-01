@@ -1,4 +1,4 @@
-// Import-time analysis (spec §7): PCM -> FFT band-energy curves +
+// Import-time analysis: PCM -> FFT band-energy curves +
 // spectral-flux onsets + naive BPM; video pass -> motion/brightness/cut
 // curves. Everything is sampled per VIDEO frame and stored in the
 // `.analysis` sidecar so audio-reactive params scrub instantly and

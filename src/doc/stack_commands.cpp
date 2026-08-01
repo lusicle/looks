@@ -274,10 +274,6 @@ private:
                 for (Layer& l : doc.layers)
                     if (l.id == id_) return {&l.node_x, &l.node_y};
                 return {};
-            case NodeRef::Mask:
-                for (Mask& m : doc.masks)
-                    if (m.id == id_) return {&m.node_x, &m.node_y};
-                return {};
             case NodeRef::Route:
                 for (ModRoute& r : doc.mod_routes)
                     if (r.id == id_) return {&r.node_x, &r.node_y};
@@ -313,7 +309,31 @@ private:
     float old_x_ = 0.0f, old_y_ = 0.0f;
 };
 
-// TRUE GRAPH link edits (docs/flow_canvas.md v3). apply/revert address
+// Freezes the synthesized legacy wiring into the link table:
+// every node-creation path runs this FIRST so newborns spawn UNWIRED —
+// with the table empty, stack-order synthesis would chain them straight
+// into the composite. Wiring is a wire gesture, never a side effect of
+// adding. On a document with no layers the synthesis is empty and this
+// stays a no-op: the very first source keeps auto-wiring to the Output
+// (a black one-node composite would be hostile).
+class MaterializeLinksCommand final : public Command {
+public:
+    std::string name() const override { return "Materialize Links"; }
+
+    void apply(Document& doc) override {
+        materialized_ = doc.links.empty();
+        ensure_links(doc);
+    }
+
+    void revert(Document& doc) override {
+        if (materialized_) doc.links.clear();
+    }
+
+private:
+    bool materialized_ = false;
+};
+
+// TRUE GRAPH link edits (docs/flow_canvas.md). apply/revert address
 // links by value — ids are stable, indices are not. First edit
 // materializes the synthesized legacy table (reverted symmetrically).
 class ConnectCommand final : public Command {
@@ -407,7 +427,7 @@ private:
     bool materialized_ = false;
 };
 
-// Canvas frames (docs/flow_canvas.md v3): pure annotations, but still
+// Canvas frames (docs/flow_canvas.md): pure annotations, but still
 // undoable like every mutation.
 class AddFrameCommand final : public Command {
 public:
@@ -597,6 +617,10 @@ bool link_would_cycle(const Document& doc, uint64_t from, uint64_t to) {
             if (l.from == n && l.to != 0) stack.push_back(l.to);
     }
     return false;
+}
+
+std::unique_ptr<Command> materialize_links_command() {
+    return std::make_unique<MaterializeLinksCommand>();
 }
 
 std::unique_ptr<Command> connect_command(Document::NodeLink link) {

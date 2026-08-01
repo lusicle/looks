@@ -44,7 +44,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 lit = base.rgb + bloom * tint * amount;
 
-    // True CCD smear (spec §6.3): a clipped highlight floods its readout
+    // True CCD smear: a clipped highlight floods its readout
     // column — a full-height, near-constant streak, not a local bloom.
     // Averages hard-clipped energy from the DRY input down the column.
     if (m == 2 && smear > 0.001) {

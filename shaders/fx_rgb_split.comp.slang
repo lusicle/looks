@@ -1,4 +1,4 @@
-// RGB split/shift (proof effect, spec §6.1 category 7). Per-channel UV
+// RGB split/shift (proof effect, category 7). Per-channel UV
 // offsets in pixels.
 //
 // Composition (canonical): wet is interior to the blend, opacity outside:

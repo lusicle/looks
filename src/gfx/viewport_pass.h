@@ -1,4 +1,4 @@
-// Viewport blit (spec §4): samples the engine's final linear RGBA16F target
+// Viewport blit: samples the engine's final linear RGBA16F target
 // and draws it letterboxed into a screen rect inside the active present
 // pass. The sRGB swapchain performs the OETF encode on write — this is the
 // only place preview pixels leave the linear working space.
@@ -28,7 +28,7 @@ public:
     // (SHADER_READ_ONLY layout) into the dst rect (physical px), aspect
     // preserved and centered; restores the full-extent scissor afterwards.
     // clip_x0/clip_x1 (fractions of the fitted rect) confine the draw
-    // horizontally — the A/B before-after wipe (spec §9) is two draws with
+    // horizontally — the A/B before-after wipe is two draws with
     // complementary clips.
     void draw(VkCommandBuffer cmd, DescriptorArena& arena, uint32_t frame_index,
               GpuImage& image, VkSampler sampler, VkExtent2D extent,

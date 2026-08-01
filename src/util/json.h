@@ -1,4 +1,4 @@
-// Minimal hand-rolled JSON reader/writer (spec §10, §12).
+// Minimal hand-rolled JSON reader/writer.
 //
 // Projects and presets are single JSON files. This is a small DOM model:
 // parse to a Value tree, mutate, write back. Objects preserve insertion

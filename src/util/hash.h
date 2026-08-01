@@ -1,4 +1,4 @@
-// Counter-based deterministic hashing (spec §11): all randomness derives
+// Counter-based deterministic hashing: all randomness derives
 // from seeded hashes keyed on (seed, frame, cell...) — no stateful RNG
 // anywhere. Same inputs => same values on every platform.
 

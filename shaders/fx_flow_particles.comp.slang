@@ -1,4 +1,4 @@
-// Flow-field particles (spec §6.6): the frame dissolves into a persistent
+// Flow-field particles: the frame dissolves into a persistent
 // particle field advected along the optical flow. A seeded per-pixel gate
 // injects fresh pixels each frame; everything else is history pulled back
 // along the motion (with optional swirl) and decayed — moving subjects

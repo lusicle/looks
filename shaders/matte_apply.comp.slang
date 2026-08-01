@@ -1,8 +1,8 @@
-// Masked composite (spec §8): the effect's composed output replaces the
-// dry input only where the mask is white. Runs after the effect kernel
-// (which already folded wet/blend/opacity), closing the DAG diamond:
+// Matted composite: the effect's composed output replaces the dry input
+// only where the matte is white. Runs after the effect kernel (which
+// already folded wet/blend/opacity), closing the DAG diamond:
 //   dry ──┬── fx ──┐
-//         └────────┴─ apply(dry, fx, mask)
+//         └────────┴─ apply(dry, fx, matte)
 
 [[vk::push_constant]]
 cbuffer Push

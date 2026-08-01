@@ -1,5 +1,5 @@
 // Viewport blit fragment: sample the linear RGBA16F result; the sRGB
-// swapchain performs the OETF encode on write (spec §4: OETF only at the
+// swapchain performs the OETF encode on write (OETF only at the
 // viewport blit and export).
 
 [[vk::binding(0, 0)]] Sampler2D frame;

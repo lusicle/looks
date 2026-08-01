@@ -1,4 +1,4 @@
-// Effect metadata (spec §5): a static per-type table of param descriptors —
+// Effect metadata: a static per-type table of param descriptors —
 // the inspector, randomizer, and the future global param table all read one
 // source of truth. The instance type itself lives in document.h.
 
@@ -19,12 +19,23 @@ struct ParamDesc {
     const char* format;    // slider readout, printf-style
     // Discrete selector options, '|'-separated ("luma|bright key|...") in
     // value order from min_value — non-null turns the row into a DROPDOWN
-    // on the canvas card and in the inspector (v5.6 real controls).
+    // on the canvas card and in the inspector (real controls).
     // Continuous params leave it null and keep the slider.
     const char* options = nullptr;
+    // True integer semantics (counts, indices, ring depths): resolve snaps
+    // the modulated value to whole numbers so keyframe/route/morph
+    // interpolation never feeds kernels fractional counts (a
+    // fractional dither `levels` puts a hard band through the frame).
+    // Selector params are integer implicitly via `options`; %.0f params
+    // where fractions are meaningful (px radii, hz rates) stay false.
+    bool integer = false;
 };
 
-// '|'-separated option helpers (v5.6): count, and the start/length of
+inline bool param_is_discrete(const ParamDesc& d) {
+    return d.integer || d.options != nullptr;
+}
+
+// '|'-separated option helpers: count, and the start/length of
 // entry `index` (clamped). Header-inline so the canvas and the rail share
 // one parse.
 inline int param_option_count(const char* options) {
@@ -52,14 +63,16 @@ inline const char* param_option_at(const char* options, int index,
     }
 }
 
-// Spec §6.1 effect families — drives the grouped add-effect browser.
+// effect families — drives the grouped add-effect browser.
+// Enum order IS the menu order; not serialized, safe to restructure.
 enum class FxCategory : uint8_t {
     Time = 0,     // time & motion
     Warp,         // warp & displace
     Optics,       // optics & light
     Color,        // color & tone
     Texture,      // texture & detail
-    Mosaic,       // mosaic & structure
+    Mosaic,       // structure & scan (line render, sims, scan synths)
+    PaintPrint,   // paint & print (painterly + repro processes)
     Signal,       // signal & codec
     Overlay,      // frame & overlay
     Count,
@@ -84,11 +97,11 @@ EffectInstance make_effect(Document& doc, EffectType type);
 // engine state (feedback, slit ring, Codec-Box decoder, RD sim, temporal
 // error carry) or the previous frame's luma (flow consumers). Their frames
 // are not pure functions of (document, frame index), so the frame render
-// cache must not serve them (spec §10 vs §11).
+// cache must not serve them.
 bool effect_uses_history(EffectType type);
 
-// Scans every layer stack and mask mini-chain (bypassed effects excluded:
-// they never dispatch). True disables the render cache for the document.
+// Scans every layer stack (bypassed effects excluded: they never
+// dispatch). True disables the render cache for the document.
 bool document_uses_history(const Document& doc);
 
 }  // namespace looks::doc

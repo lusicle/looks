@@ -2,7 +2,7 @@
 //
 // The swapchain format is *_SRGB so UI/blit writes blend in linear and store
 // encoded — matching the reference toolkit's pipeline expectations. The
-// engine's working space stays linear RGBA16F offscreen (spec §4); only the
+// engine's working space stays linear RGBA16F offscreen; only the
 // viewport blit and UI touch this surface.
 
 #pragma once

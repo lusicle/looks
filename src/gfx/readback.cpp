@@ -91,14 +91,19 @@ bool Nv12Readback::ensure_targets(uint32_t width, uint32_t height) {
 bool Nv12Readback::render(Engine& engine, const SourcePlanes& source,
                           const doc::Document& doc, uint32_t timeline_frame,
                           double fps, std::vector<uint8_t>& out,
-                          const Engine::MaskSourceFrame* mask_sources,
-                          size_t mask_source_count, uint64_t cache_ctx,
+                          uint64_t cache_ctx,
                           const Engine::LayerSourceFrame* layer_sources,
                           size_t layer_source_count) {
-    const uint32_t w = source.width;
-    const uint32_t h = source.height;
-    if (w == 0 || h == 0 || (w & 1) || (h & 1)) {
-        log_error("readback: dimensions must be even (%ux%u)", w, h);
+    // Output dims follow the engine's divisor (export scale) with the
+    // exact working-target math from Engine::render, so the NV12 planes
+    // match the composite instead of resampling it back up.
+    const uint32_t div = engine.preview_divisor();
+    const uint32_t w = std::max((source.width / div) & ~1u, 2u);
+    const uint32_t h = std::max((source.height / div) & ~1u, 2u);
+    if (source.width == 0 || source.height == 0 || (source.width & 1) ||
+        (source.height & 1)) {
+        log_error("readback: dimensions must be even (%ux%u)", source.width,
+                  source.height);
         return false;
     }
     if (!ensure_targets(w, h)) return false;
@@ -110,9 +115,8 @@ bool Nv12Readback::render(Engine& engine, const SourcePlanes& source,
     vk_check(vkBeginCommandBuffer(cmd_, &begin), "vkBeginCommandBuffer(readback)");
 
     GpuImage* final_image =
-        engine.render(cmd_, 0, source, doc, timeline_frame, fps, 0,
-                      mask_sources, mask_source_count, cache_ctx, nullptr,
-                      layer_sources, layer_source_count);
+        engine.render(cmd_, 0, source, doc, timeline_frame, fps, cache_ctx,
+                      nullptr, layer_sources, layer_source_count);
     if (!final_image) {
         vkEndCommandBuffer(cmd_);
         return false;

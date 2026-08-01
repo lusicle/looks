@@ -1,4 +1,4 @@
-// Direct flash (spec §6.3): on-camera flash look — a hard center-weighted
+// Direct flash: on-camera flash look — a hard center-weighted
 // lift with steep radial falloff, flattened shadows, and the cold white
 // cast of a xenon tube. Linear light (it IS light).
 //
@@ -19,7 +19,7 @@ cbuffer Push
     float strength;
     float falloff;   // radial exponent — higher = harder edge
     float cool;      // blue-white tint amount
-    float red_eye;   // spec §6.3: red lift in dark center regions
+    float red_eye;   // red lift in dark center regions
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -48,7 +48,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     col += lit * strength * 0.02;              // flat fill
     col *= lerp(0.55, 1.0, lit);               // background falls off
 
-    // Red-eye (spec §6.3): the retina bounce — dark pupil-like regions
+    // Red-eye: the retina bounce — dark pupil-like regions
     // near the center pick up a red glow under the flash.
     if (red_eye > 0.001) {
         const float l = fx_luma(base.rgb);

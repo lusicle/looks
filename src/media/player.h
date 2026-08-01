@@ -1,4 +1,4 @@
-// Preview player (spec §3): mezzanine-only. A decode worker keeps a ring of
+// Preview player: mezzanine-only. A decode worker keeps a ring of
 // decoded frames ahead of the playhead (CPU-side I420 — they reach the GPU
 // as plain uploads in the engine milestone). The miniaudio output callback
 // is the MASTER CLOCK: it advances the timeline sample cursor; video chases
@@ -39,6 +39,11 @@ public:
     bool playing() const;
     void set_looping(bool loop);
 
+    // Monitor gain: 0 = mute, 1 = unity, up to 2. Never touches
+    // the clock — silence still advances the timeline.
+    void set_gain(float gain);
+    float gain() const;
+
     // Advances the silent-clip fallback clock (no-op with an audio master
     // clock). Polling threads must call this even on cycles they skip —
     // the clock only moves when someone ticks it.
@@ -54,11 +59,11 @@ public:
     uint32_t trim_in() const;
     uint32_t trim_out() const;
 
-    // Loop region (spec §9): looping playback wraps inside [in, out) when
+    // Loop region: looping playback wraps inside [in, out) when
     // out > in (clamped to the trim); 0/0 loops the whole trim.
     void set_loop_region(uint32_t in_frame, uint32_t out_frame);
 
-    // Audio nudge (spec §7): positive delays monitored audio against video.
+    // Audio nudge: positive delays monitored audio against video.
     void set_audio_offset(double seconds);
 
     void seek_frame(uint32_t frame_index);

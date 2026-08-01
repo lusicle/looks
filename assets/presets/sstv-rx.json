@@ -28,7 +28,7 @@
   },
   "effects": [
     {
-      "type": "colorscience",
+      "type": "film_stock",
       "id": 3,
       "params": [
         9,
@@ -42,7 +42,6 @@
       "blend": "normal",
       "bypass": false,
       "seed": 0,
-      "mask": 0,
       "group": 100
     },
     {
@@ -60,7 +59,6 @@
       "blend": "normal",
       "bypass": false,
       "seed": 0,
-      "mask": 0,
       "group": 100
     },
     {
@@ -76,7 +74,6 @@
       "blend": "normal",
       "bypass": false,
       "seed": 0,
-      "mask": 0,
       "group": 100
     },
     {
@@ -94,7 +91,6 @@
       "blend": "normal",
       "bypass": false,
       "seed": 0,
-      "mask": 0,
       "group": 100
     }
   ]

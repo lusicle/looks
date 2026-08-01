@@ -1,5 +1,5 @@
 // codec_core — transform/quant/entropy shared by the mezzanine codec and
-// the Codec-Box mosh codec (spec §3: one core, two wrappers).
+// the Codec-Box mosh codec (one core, two wrappers).
 //
 // - 8x8 fixed-point DCT-II / inverse (13-bit coefficients, int32
 //   accumulators) — bit-exact across platforms, no float in the loop.
@@ -54,7 +54,7 @@ bool decode_pixel_block(BitReader& br, uint8_t* dst, size_t stride,
                         int avail_w, int avail_h,
                         const uint16_t qtab[kBlockCoeffs], int16_t* dc_pred);
 
-// Transform-only halves (two-phase encoders, spec §6.3): the DCT of a
+// Transform-only halves (two-phase encoders, ): the DCT of a
 // source is quality-independent, so rate-control loops transform once and
 // re-run only quantize+entropy per quality step. Both produce the exact
 // coefficients the one-shot pipeline would.

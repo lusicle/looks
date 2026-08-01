@@ -1,4 +1,4 @@
-// Modulation evaluation (spec §7, §11): deterministic, fixed-timestep on
+// Modulation evaluation: deterministic, fixed-timestep on
 // frame index — never wall clock. resolve() bakes lanes + routes into a
 // copy of the document; the engine renders the copy untouched, so preview
 // and export share one code path by construction.
@@ -17,7 +17,7 @@
 
 namespace looks::mod {
 
-// Import-time analysis curves, sampled per video frame (spec §7). Empty
+// Import-time analysis curves, sampled per video frame. Empty
 // vectors read as 0 — a missing .analysis silently disables those sources.
 struct AnalysisCurves {
     std::vector<float> low, mid, high;   // band energy, normalized 0..1
@@ -34,9 +34,9 @@ struct AnalysisCurves {
 };
 
 // CPU view of the decoded source frame (I420) for the video-sampling
-// sources (docs/flow_canvas.md v4: sample-at-point / region-average).
+// sources (docs/flow_canvas.md: sample-at-point / region-average).
 // Callers pass the SAME frame they are about to render, so preview and
-// export sample identical decoded pixels and determinism holds (spec §11).
+// export sample identical decoded pixels and determinism holds.
 // A null view (or null planes) reads as 0.
 struct SourceFrameView {
     const uint8_t* y = nullptr;
@@ -51,10 +51,10 @@ struct SourceFrameView {
 // One source's value at time t (seconds, = frame/fps). Deterministic.
 // fps feeds the envelope's frame->seconds conversion and the BPM-synced
 // LFO's fallback clock; sources that don't need it ignore it.
-// audio_offset_seconds (spec §7 nudge): shifts every audio-derived source
+// audio_offset_seconds (nudge): shifts every audio-derived source
 // (bands, onsets, beat, BPM clocks) against video — positive = audio
 // later. key_time: seconds of the last live keypress trigger (-1 = none;
-// live mode only, spec §11 exempts it). video: the current source frame
+// live mode only, exempts it). video: the current source frame
 // for VideoSample/VideoRegion; those sources read 0 without it — notably
 // on the speed target, where the sampled frame would itself depend on
 // speed (speed_at never passes a view).
@@ -71,14 +71,14 @@ float eval_lane(const doc::KeyframeLane& lane, double frame);
 
 // Bakes modulation into a document copy for one frame. live_seconds >= 0
 // switches LFO/drift onto that clock instead of frame/fps (live mode,
-// spec §9 — explicitly exempt from determinism, spec §11); analysis-backed
+// — explicitly exempt from determinism, ); analysis-backed
 // sources and lanes stay on the playhead either way.
 doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
                       double live_seconds = -1.0, double key_time = -1.0,
                       const SourceFrameView* video = nullptr);
 
-// Playback speed at one timeline frame (spec §6.1 speed ramp): doc.speed,
+// Playback speed at one timeline frame (speed ramp): doc.speed,
 // overridden by a lane on ParamKey {0, 1} ("global.speed"), plus routes on
 // that key. Clamped to [0, doc::kMaxSpeed].
 float speed_at(const doc::Document& doc, uint32_t frame_index, double fps,
@@ -88,7 +88,7 @@ float speed_at(const doc::Document& doc, uint32_t frame_index, double fps,
 // mode, or any lane/route on the speed param.
 bool time_remap_active(const doc::Document& doc);
 
-// Deterministic time remap (spec §6.1 / §11): the source position at frame
+// Deterministic time remap: the source position at frame
 // t is the prefix sum of speed over frames [0, t) — fixed timestep on the
 // frame index, identical in preview and export. Incremental during
 // sequential playback; a backward seek recomputes the prefix from zero.

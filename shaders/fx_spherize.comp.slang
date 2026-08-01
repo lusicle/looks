@@ -1,4 +1,4 @@
-// Ball (spec §6.2 warp & displace): wraps the frame onto a sphere — an
+// Ball (warp & displace): wraps the frame onto a sphere — an
 // extreme fisheye. Inside the ball the radial arcsine map magnifies the
 // center and compresses the rim (orthographic front hemisphere); outside
 // shows black or the untouched source. Rim shade darkens toward the edge

@@ -1,4 +1,4 @@
-// Interlace / combing sim (spec §6.7): alternate scanlines shift in
+// Interlace / combing sim: alternate scanlines shift in
 // opposite horizontal directions, flipping with the frame parity — the
 // tearing comb of a deinterlaced field pair. Mode 1 keeps only the
 // scanline darkening (CRT line structure without motion tearing).

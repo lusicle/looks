@@ -1,7 +1,7 @@
 // Muxer <-> demuxer roundtrip: our BmffMuxer writes a file, our BmffFile
 // parses it back — sample tables, avcC/esds, offsets, and payload bytes
 // must survive. No codecs involved (payloads are arbitrary bytes).
-// Also home to the WAV codec roundtrip (spec §12).
+// Also home to the WAV codec roundtrip.
 
 #include <cmath>
 #include <filesystem>

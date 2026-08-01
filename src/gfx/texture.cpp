@@ -139,7 +139,7 @@ GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
         }
     }
     // TRANSFER_DST: the render cache's hit path re-uploads a stored frame
-    // straight into a pooled target (spec §10).
+    // straight into a pooled target.
     auto image = GpuImage::create(
         device_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |

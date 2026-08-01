@@ -87,11 +87,17 @@ const char* vk_result_name(VkResult result) {
 
 void vk_check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return;
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "%s failed: %s (%d)", what,
-                  vk_result_name(result), static_cast<int>(result));
-    log_error("%s", buf);
-    std::abort();
+    // Unrecoverable — log_fatal persists the reason to looks.log and
+    // raises the app's fatal sink (message box) before aborting; autosave
+    // recovery offers the document back on the next launch.
+    if (result == VK_ERROR_DEVICE_LOST)
+        log_fatal(
+            "%s failed: VK_ERROR_DEVICE_LOST — the GPU or driver reset. "
+            "looks must close; unsaved work up to the last autosave will "
+            "be offered on the next launch.",
+            what);
+    log_fatal("%s failed: %s (%d)", what, vk_result_name(result),
+              static_cast<int>(result));
 }
 
 }  // namespace looks::gfx

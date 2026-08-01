@@ -1,4 +1,4 @@
-// Cel shade (spec §6.6): quantize luma into flat bands (hue preserved) and
+// Cel shade: quantize luma into flat bands (hue preserved) and
 // ink the edges dark. Encoded space for perceptually even bands.
 //
 // Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).

@@ -32,7 +32,7 @@ Document make_rich_doc() {
 
     d.layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
     d.layers[0].stack.push_back(make_effect(d, EffectType::Datamosh));
-    d.layers[0].stack.push_back(make_effect(d, EffectType::ColorScience));
+    d.layers[0].stack.push_back(make_effect(d, EffectType::FilmStock));
     d.layers[0].stack[1].params[3] = 6.0f;
     d.layers[0].stack[1].wet = 0.8f;
     d.layers[0].stack[1].blend = doc::BlendMode::Screen;
@@ -47,32 +47,19 @@ Document make_rich_doc() {
     overlay.color_a[0] = 0.9f;
     overlay.gen_scale = 3.0f;
     overlay.stack.push_back(make_effect(d, EffectType::Pixelate));
-    // The one string param (v5.5): Text's string must survive the trip.
-    overlay.stack.push_back(make_effect(d, EffectType::TextOverlay));
+    // The one string param: Text's string must survive the trip.
+    overlay.stack.push_back(make_effect(d, EffectType::Text));
     overlay.stack.back().text = "REC · SP";
     d.layers.push_back(overlay);
 
     // Group the base layer's first two effects; expose a member param
-    // on the face (v5.3: the face is direct param aliases).
+    // on the face (the face is direct param aliases).
     doc::Group g = doc::make_group(d, "combo");
     g.folded = true;
     g.exposed.push_back({d.layers[0].stack[1].id, 4});
     d.layers[0].stack[0].group_id = g.id;
     d.layers[0].stack[1].group_id = g.id;
     d.layers[0].groups.push_back(g);
-
-    doc::Mask m;
-    m.id = d.next_mask_id++;
-    m.name = "shape";
-    m.type = doc::MaskType::Luma;
-    m.blur_px = 4.0f;
-    m.invert = true;
-    m.source_path = "C:/clips/maskloop.mez";
-    m.free_run = true;
-    m.fit = 2;
-    m.chain.push_back(make_effect(d, EffectType::Pixelate));
-    d.masks.push_back(m);
-    d.layers[0].stack[0].mask_id = m.id;
 
     doc::ModRoute r;
     r.id = d.next_route_id++;
@@ -136,12 +123,6 @@ TEST(serialize_roundtrip_stable) {
     CHECK_EQ(d2.layers[0].groups[0].exposed.size(), size_t{1});
     CHECK_EQ(d2.layers[0].groups[0].exposed[0].param_index, 4);
     CHECK_EQ(d2.layers[0].stack[0].group_id, d2.layers[0].groups[0].id);
-    CHECK_EQ(d2.masks.size(), size_t{1});
-    CHECK(d2.masks[0].invert);
-    CHECK_EQ(d2.masks[0].source_path, "C:/clips/maskloop.mez");
-    CHECK(d2.masks[0].free_run);
-    CHECK_EQ(d2.masks[0].fit, 2u);
-    CHECK_EQ(d2.masks[0].chain.size(), size_t{1});
     CHECK_EQ(d2.mod_routes.size(), size_t{2});
     CHECK(d2.mod_routes[0].source.shape == doc::LfoShape::Triangle);
     CHECK(d2.mod_routes[1].source.type == doc::ModSourceType::Envelope);
@@ -155,7 +136,6 @@ TEST(serialize_roundtrip_stable) {
     CHECK(!d2.snapshots[0].valid);
     // Counters stay usable.
     CHECK(d2.next_effect_id >= d.next_effect_id);
-    CHECK(d2.next_mask_id >= d.next_mask_id);
 }
 
 TEST(serialize_tolerant_load) {
@@ -190,6 +170,126 @@ TEST(serialize_tolerant_load) {
     CHECK(!json::parse("{nope").value.has_value());
 }
 
+TEST(serialize_v57_roundtrip) {
+    // Markers, export settings, layer-param lanes — byte-stable.
+    Document d;
+    d.markers = {12, 45, 90};
+    d.export_bitrate_mbps = 22.0f;
+    d.export_scale = 2;
+    d.export_audio = false;
+    doc::KeyframeLane lane;
+    lane.target = {d.layers[0].id | doc::kLayerParamBit, 8};
+    lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    lane.keys.push_back({30.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    d.lanes.push_back(lane);
+
+    json::Value a = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(a);
+    CHECK_EQ(d2.markers.size(), size_t{3});
+    CHECK_EQ(d2.markers[1], uint32_t{45});
+    CHECK_EQ(d2.export_bitrate_mbps, 22.0f);
+    CHECK_EQ(d2.export_scale, uint32_t{2});
+    CHECK(!d2.export_audio);
+    CHECK_EQ(d2.lanes.size(), size_t{1});
+    CHECK_EQ(d2.lanes[0].target.effect_id,
+             d.layers[0].id | doc::kLayerParamBit);
+    CHECK_EQ(d2.lanes[0].target.param_index, 8);
+    json::Value b = doc::doc_to_json(d2);
+    CHECK(a == b);
+}
+
+TEST(preset_insert_lands_dormant) {
+    // v5.8: adding never wires. The preset's members chain INTERNALLY
+    // only; the group card joins the graph through a wire gesture. The
+    // pre-existing chain wiring freezes as-is.
+    Document d;
+    d.layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
+    doc::UndoStack undo;
+
+    doc::Group g;
+    g.id = d.next_effect_id++;
+    g.name = "preset";
+    std::vector<doc::EffectInstance> members;
+    members.push_back(make_effect(d, EffectType::Grain));
+    members.push_back(make_effect(d, EffectType::Posterize));
+    const uint64_t m0 = members[0].id, m1 = members[1].id;
+    undo.execute(d, doc::insert_group_command(0, g, std::move(members)));
+
+    // The old chain froze: source -> vignette -> output.
+    CHECK(!d.links.empty());
+    bool internal = false, boundary = false, chain_out = false;
+    for (const Document::NodeLink& l : d.links) {
+        if (l.from == m0 && l.to == m1 && l.to_port == 0) internal = true;
+        if ((l.from == m1 || l.from == m0) && l.to == 0) boundary = true;
+        if (l.to == m0) boundary = true;   // nothing feeds the group
+        if (l.to == 0 && l.from == d.layers[0].stack[0].id)
+            chain_out = true;
+    }
+    CHECK(internal);
+    CHECK(!boundary);
+    CHECK(chain_out);
+
+    // Undo restores the un-materialized document exactly.
+    undo.undo(d);
+    CHECK(d.links.empty());
+    CHECK_EQ(d.layers[0].groups.size(), size_t{0});
+    CHECK_EQ(d.layers[0].stack.size(), size_t{1});
+}
+
+TEST(serialize_dedupes_input_fanin) {
+    // In ports hold ONE producer; only the Output composites
+    // fan-in. Hand-edited files keep the LAST link per (to, port).
+    const char* text = R"({
+        "looks_project": 1,
+        "layers": [{"id": 1, "stack": [
+            {"type": "vignette", "id": 2},
+            {"type": "grain", "id": 3}
+        ]}],
+        "links": [
+            {"from": 1, "to": 2, "port": 0},
+            {"from": 3, "to": 2, "port": 0},
+            {"from": 1, "to": 0, "port": 0},
+            {"from": 2, "to": 0, "port": 0}
+        ]
+    })";
+    json::ParseResult parsed = json::parse(text);
+    CHECK(parsed.value.has_value());
+    Document d = doc::doc_from_json(*parsed.value);
+    int into_effect2 = 0, into_output = 0;
+    uint64_t producer = 0;
+    for (const Document::NodeLink& l : d.links) {
+        if (l.to == 2 && l.to_port == 0) {
+            ++into_effect2;
+            producer = l.from;
+        }
+        if (l.to == 0) ++into_output;
+    }
+    CHECK_EQ(into_effect2, 1);
+    CHECK_EQ(producer, uint64_t{3});   // the LAST one wins
+    CHECK_EQ(into_output, 2);          // the Output merge keeps fan-in
+}
+
+TEST(serialize_lane_keys_sorted_on_load) {
+    // Hand-authored files may list keys out of order; eval assumes sorted
+    // — the loader must sort.
+    const char* text = R"({
+        "looks_project": 1,
+        "layers": [{"id": 1, "stack": [{"type": "dither", "id": 2}]}],
+        "lanes": [{"target": {"effect": 2, "param": 0},
+                   "keys": [{"frame": 60, "value": 8},
+                            {"frame": 0, "value": 2},
+                            {"frame": 30, "value": 16}]}]
+    })";
+    json::ParseResult parsed = json::parse(text);
+    CHECK(parsed.value.has_value());
+    Document d = doc::doc_from_json(*parsed.value);
+    CHECK_EQ(d.lanes.size(), size_t{1});
+    CHECK_EQ(d.lanes[0].keys.size(), size_t{3});
+    CHECK_EQ(d.lanes[0].keys[0].frame, 0.0);
+    CHECK_EQ(d.lanes[0].keys[1].frame, 30.0);
+    CHECK_EQ(d.lanes[0].keys[2].frame, 60.0);
+}
+
 TEST(group_commands_lifecycle) {
     Document d;
     doc::UndoStack undo;
@@ -204,7 +304,7 @@ TEST(group_commands_lifecycle) {
     CHECK_EQ(d.layers[0].stack[1].group_id, g.id);
     CHECK_EQ(d.layers[0].stack[2].group_id, uint64_t{0});
 
-    // Face exposure (v5.3): expose, de-dup, hide, undo both ways.
+    // Face exposure: expose, de-dup, hide, undo both ways.
     const doc::ParamKey pk{d.layers[0].stack[1].id, 0};
     undo.execute(d, doc::set_group_exposed_command(0, g.id, pk, true));
     CHECK_EQ(d.layers[0].groups[0].exposed.size(), size_t{1});
@@ -244,10 +344,9 @@ TEST(group_bypass_compiles_out) {
 TEST(preset_capture_and_instantiate) {
     Document d;
     doc::UndoStack undo;
-    d.layers[0].stack.push_back(make_effect(d, EffectType::ColorScience));
+    d.layers[0].stack.push_back(make_effect(d, EffectType::FilmStock));
     d.layers[0].stack.push_back(make_effect(d, EffectType::Grain));
     d.layers[0].stack[0].params[3] = 0.3f;
-    d.layers[0].stack[0].mask_id = 77;   // must not leak into the preset
 
     doc::Group g = doc::make_group(d, "era");
     g.exposed.push_back({d.layers[0].stack[0].id, 3});
@@ -260,7 +359,6 @@ TEST(preset_capture_and_instantiate) {
     doc::Preset p = doc::make_preset_from_group(d, 0, g.id);
     CHECK_EQ(p.name, "era");
     CHECK_EQ(p.effects.size(), size_t{2});
-    CHECK_EQ(p.effects[0].mask_id, uint64_t{0});
     CHECK_EQ(p.group.exposed.size(), size_t{1});
 
     // File roundtrip.
@@ -328,9 +426,9 @@ TEST(morph_interpolates_snapshots) {
 }
 
 TEST(era_presets_ship_valid) {
-    // The shipped presets in assets/presets (the five spec §14 era looks
+    // The shipped presets in assets/presets (the five era looks
     // plus the wave-2 style set) must load, carry effects, and have every
-    // exposed face param resolve to a member effect (v5.3: the group
+    // exposed face param resolve to a member effect (the group
     // face is exposed params — direct aliases, no macro offsets).
     const std::filesystem::path dir =
         std::filesystem::path(LOOKS_REPO_ROOT) / "assets" / "presets";
@@ -354,38 +452,4 @@ TEST(era_presets_ship_valid) {
     }
 }
 
-TEST(serialize_mask_param_key_roundtrip) {
-    // Mask target keys carry bit 63 — past the JSON number's 2^53 exact
-    // range, so the mask id gets its own field. A route and a point lane
-    // must survive save/load with the id intact.
-    Document d;
-    doc::Mask mask;
-    mask.id = 3;
-    mask.name = "m";
-    mask.points = {0.2f, 0.2f, 0.8f, 0.2f, 0.5f, 0.8f};
-    d.masks.push_back(mask);
-    d.next_mask_id = 4;
-
-    doc::ModRoute route;
-    route.id = d.next_route_id++;
-    route.target = {mask.id | doc::kMaskParamBit, 0};
-    route.amount = 0.4f;
-    d.mod_routes.push_back(route);
-
-    doc::KeyframeLane lane;
-    lane.target = {mask.id | doc::kMaskParamBit,
-                   doc::kMaskPointParamBase + 2};
-    lane.keys = {{0.0, 0.2f}, {12.0, 0.7f}};
-    d.lanes.push_back(lane);
-
-    json::Value j = doc::doc_to_json(d);
-    Document d2 = doc::doc_from_json(j);
-    CHECK_EQ(d2.mod_routes.size(), size_t{1});
-    CHECK_EQ(d2.mod_routes[0].target.effect_id,
-             mask.id | doc::kMaskParamBit);
-    CHECK_EQ(d2.lanes.size(), size_t{1});
-    CHECK_EQ(d2.lanes[0].target.effect_id, mask.id | doc::kMaskParamBit);
-    CHECK_EQ(d2.lanes[0].target.param_index, doc::kMaskPointParamBase + 2);
-    CHECK(doc::doc_to_json(d2) == j);
-}
 

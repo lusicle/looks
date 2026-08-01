@@ -1,4 +1,4 @@
-// Fringing (spec §6.3): mode 0 = lateral chromatic aberration (R and B
+// Fringing: mode 0 = lateral chromatic aberration (R and B
 // sampled at radially scaled positions, growing toward the edges); mode 1 =
 // digicam purple fringe (violet bloom past a contrast threshold, weighted
 // toward blown highlights the way CCD blooming reads).

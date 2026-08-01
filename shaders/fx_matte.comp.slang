@@ -1,4 +1,4 @@
-// Matte maker (docs/flow_canvas.md v5.2 — masks ARE images): turns any
+// Matte maker (docs/flow_canvas.md — masks ARE images): turns any
 // image into a grayscale matte. Luma pass-through, brightness key
 // (window around a luma center), or chroma key (distance to the key
 // color), then levels + gamma + soft invert. Feed the result to a mask

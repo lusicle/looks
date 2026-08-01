@@ -35,11 +35,8 @@ std::optional<Preset> preset_from_json(const json::Value& v) {
     for (const json::Value& fv : v.get("effects").array())
         if (auto fx = effect_from_json(fv)) p.effects.push_back(std::move(*fx));
     if (p.effects.empty()) return std::nullopt;
-    // Normalize: members carry the group's file-local id, no mask refs.
-    for (EffectInstance& fx : p.effects) {
-        fx.group_id = p.group.id;
-        fx.mask_id = 0;
-    }
+    // Normalize: members carry the group's file-local id.
+    for (EffectInstance& fx : p.effects) fx.group_id = p.group.id;
     return p;
 }
 
@@ -60,13 +57,17 @@ std::optional<Preset> load_preset(const std::filesystem::path& path) {
     return p;
 }
 
-std::vector<Preset> scan_presets(const std::filesystem::path& dir) {
+std::vector<Preset> scan_presets(const std::filesystem::path& dir,
+                                 int* failed) {
     std::vector<Preset> out;
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         if (!entry.is_regular_file(ec)) continue;
         if (entry.path().extension() != ".json") continue;
-        if (auto p = load_preset(entry.path())) out.push_back(std::move(*p));
+        if (auto p = load_preset(entry.path()))
+            out.push_back(std::move(*p));
+        else if (failed)
+            ++*failed;   // a corrupt preset must not vanish silently
     }
     std::sort(out.begin(), out.end(),
               [](const Preset& a, const Preset& b) { return a.name < b.name; });
@@ -84,10 +85,7 @@ Preset make_preset_from_group(const Document& doc, size_t layer_index,
         }
     p.name = p.group.name.empty() ? "preset" : p.group.name;
     for (const EffectInstance& fx : layer.stack)
-        if (fx.group_id == group_id) {
-            p.effects.push_back(fx);
-            p.effects.back().mask_id = 0;
-        }
+        if (fx.group_id == group_id) p.effects.push_back(fx);
     // Keep only exposed face params that point at captured members.
     std::vector<ParamKey> kept;
     for (const ParamKey& k : p.group.exposed)
@@ -113,7 +111,6 @@ void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
         remap[fx.id] = fresh;
         fx.id = fresh;
         fx.group_id = group.id;
-        fx.mask_id = 0;
     }
     std::vector<ParamKey> exposed;
     for (ParamKey k : group.exposed) {

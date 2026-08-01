@@ -1,4 +1,4 @@
-// Kaleidoscope / mirror symmetry (spec §6.2): fold the angle around N
+// Kaleidoscope / mirror symmetry: fold the angle around N
 // wedges about a movable center; every wedge samples the first, mirrored
 // at the seam so edges meet cleanly.
 //

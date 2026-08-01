@@ -45,12 +45,11 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_motion_extract.comp.spv", 3},  // input + prev/cur luma
     {nullptr, 1},                       // Datamosh (Codec-Box, CPU)
     {nullptr, 1},                       // Generation Loss
-    {nullptr, 1},                       // JPEG Blocking
     {nullptr, 1},                       // Bitrate Starve
     {"fx_echo.comp.spv", 2},            // input + own previous output
     {"fx_feedback.comp.spv", 2},
     {"fx_glyph.comp.spv", 2},           // input + glyph atlas
-    {"fx_colorscience.comp.spv", 1},
+    {"fx_film_stock.comp.spv", 1},
     {"fx_kaleido.comp.spv", 1},
     {"fx_polar.comp.spv", 1},
     {"fx_turbulence.comp.spv", 1},
@@ -65,7 +64,6 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_sync_fail.comp.spv", 1},
     {"fx_timestamp.comp.spv", 1},
     {"fx_oversharpen.comp.spv", 1},
-    {"fx_nr_mush.comp.spv", 1},
     {"fx_blur.comp.spv", 1},
     {"fx_dust_scratches.comp.spv", 2},   // input + damage plate
     {"fx_light_leak.comp.spv", 1},
@@ -88,7 +86,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_stutter.comp.spv", 2},              // input + ring frame
     {"fx_contour.comp.spv", 1},
     {"fx_flow_particles.comp.spv", 3},       // input + own prev + flow
-    {"fx_ball.comp.spv", 1},
+    {"fx_spherize.comp.spv", 1},
     {"fx_soft_upscale.comp.spv", 1},
     {"fx_zoom_crunch.comp.spv", 1},
     {"fx_pixel_sort.comp.spv", 1},
@@ -135,9 +133,9 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_scope.comp.spv", 2},
     {"fx_security_mux.comp.spv", 2},    // input + one history slice per pass
     {"fx_audio_scope.comp.spv", 2},     // input + waveform strip
-    {"fx_modulate.comp.spv", 2},        // input + FM phase integral
+    {"fx_engraver.comp.spv", 2},        // input + FM phase integral
     {"fx_blend_node.comp.spv", 2},      // In + B aux input (graph merge)
-    {"fx_matte.comp.spv", 1},           // matte maker (v5.2)
+    {"fx_matte.comp.spv", 1},           // matte maker
     {"fx_levels.comp.spv", 1},
     {"fx_hue_sat.comp.spv", 1},
     {"fx_channel_mix.comp.spv", 1},
@@ -148,6 +146,9 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_transform.comp.spv", 1},
     {"fx_frame_delay.comp.spv", 2},     // input + ring slice
     {"fx_text.comp.spv", 2},            // input + string SDF raster
+    {"fx_white_balance.comp.spv", 1},
+    {"fx_sharpen.comp.spv", 1},
+    {"fx_corner_pin.comp.spv", 1},
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -179,7 +180,7 @@ float half_to_float(uint16_t h) {
     return f;
 }
 
-// Maps a Codec-Box effect's params onto the mosh codec (spec §6.3: same
+// Maps a Codec-Box effect's params onto the mosh codec (same
 // box, different params = the four named effects).
 codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
     codec::MoshParams mp;
@@ -204,10 +205,6 @@ codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
         case doc::EffectType::GenerationLoss:
             mp.quality = static_cast<int>(p[0]);
             mp.generations = static_cast<int>(p[1]);
-            mp.gop_length = 1;
-            break;
-        case doc::EffectType::JpegBlocking:
-            mp.quality = static_cast<int>(p[0]);
             mp.gop_length = 1;
             break;
         case doc::EffectType::BitrateStarve:
@@ -307,7 +304,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         // Slit-scan, time-displace and security-mux append one extra push
         // word (the history-pass index), velocity-scan one (front-state
         // width); glyph appends four (atlas grid cols/rows + tile px +
-        // color flag, spec §12 custom glyph sets); text appends four
+        // color flag, custom glyph sets); text appends four
         // (glyph count + MSDF px range + string width + atlas em px).
         const auto type_i = static_cast<doc::EffectType>(i);
         const uint32_t extra =
@@ -317,7 +314,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
              type_i == doc::EffectType::VelocityScan)
                 ? 1u
                 : (type_i == doc::EffectType::Glyph ||
-                           type_i == doc::EffectType::TextOverlay
+                           type_i == doc::EffectType::Text
                        ? 4u
                        : 0u);
         desc.push_bytes = static_cast<uint32_t>(
@@ -391,7 +388,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     fx_mix_ = ComputePipeline::create(device_, shader_dir, mix_desc);
     if (!to_nv12_ || !fx_mix_) return false;
 
-    // Compositing (spec §5): layer generators + blend.
+    // Compositing: layer generators + blend.
     ComputePipelineDesc gen_desc;
     gen_desc.spv_name = "gen.comp.spv";
     gen_desc.sampled_inputs = 0;
@@ -431,7 +428,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                            &codec_io_.fence),
              "vkCreateFence(codecbox)");
 
-    // Procedural halftone atlas (spec §6.6: dots are glyphs): 96 tiles of
+    // Procedural halftone atlas (dots are glyphs): 96 tiles of
     // 8x8, dot area grows with the tile index.
     {
         constexpr uint32_t kAtlasW = 128, kAtlasH = 48;
@@ -462,7 +459,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Procedural braille atlas (spec §6.6): 2x4 dot cells on the same
+    // Procedural braille atlas: 2x4 dot cells on the same
     // 96-tile grid, lit-dot count rising with the tile index; which dots
     // light is a stable per-tile hash so the ramp reads organically.
     {
@@ -506,7 +503,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Procedural teletext atlas (spec §6.6/§12): 2x3 block-mosaic sextant
+    // Procedural teletext atlas: 2x3 block-mosaic sextant
     // cells — filled rectangles, not dots — lit-block count rising with
     // the tile index, hash-shuffled per tile like the braille ramp.
     {
@@ -549,7 +546,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Dust/damage plate (spec §6.5 texture-driven dust, §12 dust textures):
+    // Dust/damage plate (texture-driven dust):
     // a user-droppable assets/textures/dust.png (dark marks = damage);
     // missing file synthesizes a procedural grunge plate so the binding
     // always exists.
@@ -620,7 +617,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Dither LUT (spec §6.2): STBN + blue noise generated by the build-time
+    // Dither LUT: STBN + blue noise generated by the build-time
     // tool, staged under assets/noise next to the exe. Missing file falls
     // back to deterministic hash noise so headless runs never hard-fail.
     {
@@ -651,7 +648,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Text-overlay fonts (docs/flow_canvas.md v5.5b): every .ttf under
+    // Text-overlay fonts (docs/flow_canvas.md): every .ttf under
     // assets/fonts, parsed by the in-repo TrueType loader — drop a font
     // next to the shipped ones and it's index N, no bake step. Sorted by
     // lowercased filename so the `font` param stays deterministic;
@@ -710,58 +707,23 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         }
     }
 
-    // Mask pipeline family (spec §8).
-    ComputePipelineDesc shape_desc;
-    shape_desc.spv_name = "mask_shape.comp.spv";
-    shape_desc.sampled_inputs = 1;   // flattened bezier path (or dummy)
-    shape_desc.storage_outputs = 1;
-    shape_desc.push_bytes = 10 * sizeof(uint32_t);
-    mask_shape_ = ComputePipeline::create(device_, shader_dir, shape_desc);
-
+    // Matte pair: port-1 wires gate through luma extract + apply.
     ComputePipelineDesc extract_desc;
-    extract_desc.spv_name = "mask_extract.comp.spv";
+    extract_desc.spv_name = "matte_extract.comp.spv";
     extract_desc.sampled_inputs = 1;
     extract_desc.storage_outputs = 1;
-    extract_desc.push_bytes = 12 * sizeof(uint32_t);
-    mask_extract_ = ComputePipeline::create(device_, shader_dir, extract_desc);
-
-    ComputePipelineDesc blur_desc;
-    blur_desc.spv_name = "mask_blur.comp.spv";
-    blur_desc.sampled_inputs = 1;
-    blur_desc.storage_outputs = 1;
-    blur_desc.push_bytes = 4 * sizeof(uint32_t);
-    mask_blur_ = ComputePipeline::create(device_, shader_dir, blur_desc);
+    extract_desc.push_bytes = 2 * sizeof(uint32_t);
+    matte_extract_ =
+        ComputePipeline::create(device_, shader_dir, extract_desc);
 
     ComputePipelineDesc apply_desc;
-    apply_desc.spv_name = "mask_apply.comp.spv";
+    apply_desc.spv_name = "matte_apply.comp.spv";
     apply_desc.sampled_inputs = 3;
     apply_desc.storage_outputs = 1;
     apply_desc.push_bytes = 2 * sizeof(uint32_t);
-    mask_apply_ = ComputePipeline::create(device_, shader_dir, apply_desc);
+    matte_apply_ = ComputePipeline::create(device_, shader_dir, apply_desc);
 
-    ComputePipelineDesc msrc_desc;
-    msrc_desc.spv_name = "mask_source.comp.spv";
-    msrc_desc.sampled_inputs = 3;
-    msrc_desc.storage_outputs = 1;
-    msrc_desc.push_bytes = 5 * sizeof(uint32_t);
-    mask_source_ = ComputePipeline::create(device_, shader_dir, msrc_desc);
-
-    ComputePipelineDesc morph_desc;
-    morph_desc.spv_name = "mask_morph.comp.spv";
-    morph_desc.sampled_inputs = 1;
-    morph_desc.storage_outputs = 1;
-    morph_desc.push_bytes = 4 * sizeof(uint32_t);
-    mask_morph_ = ComputePipeline::create(device_, shader_dir, morph_desc);
-
-    ComputePipelineDesc comb_desc;
-    comb_desc.spv_name = "mask_combine.comp.spv";
-    comb_desc.sampled_inputs = 2;
-    comb_desc.storage_outputs = 1;
-    comb_desc.push_bytes = 3 * sizeof(uint32_t);
-    mask_combine_ = ComputePipeline::create(device_, shader_dir, comb_desc);
-
-    return mask_shape_ && mask_extract_ && mask_blur_ && mask_apply_ &&
-           mask_source_ && mask_morph_ && mask_combine_;
+    return matte_extract_ && matte_apply_;
 }
 
 bool Engine::ensure_planes(uint32_t width, uint32_t height) {
@@ -880,27 +842,65 @@ float cpu_srgb_eotf(float x) {
 
 }  // namespace
 
-// Serpentine Floyd-Steinberg / Atkinson in the sRGB domain (spec §6.2).
-// Temporal carry feeds each pixel's quantization error into the next
-// frame's starting values — low = smooth, high = ghosting.
+// Hilbert d -> (x, y) on a 2^order square (the standard rotate-and-
+// reflect walk). The curve visits 4^order cells; callers skip the ones
+// outside the image.
+static void hilbert_d2xy(int order, uint64_t d, uint32_t* out_x,
+                         uint32_t* out_y) {
+    uint32_t x = 0, y = 0;
+    for (int s = 0; s < order; ++s) {
+        const uint32_t rx = 1u & static_cast<uint32_t>(d >> 1);
+        const uint32_t ry = 1u & static_cast<uint32_t>(d ^ rx);
+        if (ry == 0) {
+            if (rx == 1) {
+                x = (1u << s) - 1u - x;
+                y = (1u << s) - 1u - y;
+            }
+            const uint32_t t = x;
+            x = y;
+            y = t;
+        }
+        x += rx << s;
+        y += ry << s;
+        d >>= 2;
+    }
+    *out_x = x;
+    *out_y = y;
+}
+
+// Error diffusion in LINEAR light: the error is conserved in the
+// domain the display averages in, so dithered fields keep the source
+// brightness — encoded-domain diffusion lifts every dark region (Jensen).
+// The output palette stays the encoded-uniform levels k/steps (perceptual
+// spacing); the level pick is nearest-in-encoded via exact linear
+// thresholds, no per-pixel transfer function needed. Temporal carry feeds
+// each pixel's quantization error into the next frame's starting values —
+// low = smooth, high = ghosting.
+// Kernels 0-5 are the fixed-tap serpentine rasters. Kernel 6 is
+// Ostromoukhov's variable-coefficient diffusion: three taps whose weights
+// come from a per-intensity table (indexed by the pixel's encoded input
+// level, mirrored above mid-gray). Kernel 7 is Riemersma dither: the
+// pixels are visited along a Hilbert curve and each is nudged by the
+// exponentially-decaying sum of the last 16 quantization errors, giving
+// a wormy structure no raster kernel produces (serpentine does not apply).
 void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
                                  uint32_t height,
                                  const doc::EffectInstance& fx, EdSlot& slot) {
     const size_t n = static_cast<size_t>(width) * height;
     const float levels = std::clamp(fx.params[0], 2.0f, 16.0f);
     const int kernel =
-        static_cast<int>(std::clamp(fx.params[1], 0.0f, 5.0f) + 0.5f);
+        static_cast<int>(std::clamp(fx.params[1], 0.0f, 7.0f) + 0.5f);
     const bool serp = fx.params[2] >= 0.5f;
     const float carry_amt = std::clamp(fx.params[3], 0.0f, 1.0f);
     const float steps = levels - 1.0f;
 
-    // Half is 16-bit, so the input transfer function is exactly a table —
-    // 12M powf calls per 1080p frame collapse to lookups, bit-identically.
-    static const std::vector<float>& oetf_lut = [] {
+    // Half is 16-bit, so the input clamp is exactly a table — and the
+    // working values stay in the linear domain the planes arrive in.
+    static const std::vector<float>& lin_lut = [] {
         static std::vector<float> lut(65536);
         for (uint32_t h16 = 0; h16 < 65536; ++h16)
-            lut[h16] = cpu_srgb_oetf(std::clamp(
-                half_to_float(static_cast<uint16_t>(h16)), 0.0f, 1.0f));
+            lut[h16] = std::clamp(
+                half_to_float(static_cast<uint16_t>(h16)), 0.0f, 1.0f);
         return lut;
     }();
 
@@ -916,7 +916,7 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
                 for (size_t x = 0; x < width; ++x)
                     for (size_t c = 0; c < 3; ++c)
                         v[(base + x) * 3 + c] =
-                            oetf_lut[halves[(base + x) * 4 + c]];
+                            lin_lut[halves[(base + x) * 4 + c]];
             }
         });
     if (carry_amt > 0.0f && slot.carry.size() == n * 3)
@@ -937,7 +937,7 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
     static constexpr Tap kAtk[6] = {{1, 0, 1.0f / 8.0f}, {2, 0, 1.0f / 8.0f},
                                     {-1, 1, 1.0f / 8.0f}, {0, 1, 1.0f / 8.0f},
                                     {1, 1, 1.0f / 8.0f}, {0, 2, 1.0f / 8.0f}};
-    // The classic wide kernels (spec §6.2 family, DitherBoy-league).
+    // The classic wide kernels (family, DitherBoy-league).
     static constexpr Tap kJarvis[12] = {
         {1, 0, 7.0f / 48.0f},  {2, 0, 5.0f / 48.0f},  {-2, 1, 3.0f / 48.0f},
         {-1, 1, 5.0f / 48.0f}, {0, 1, 7.0f / 48.0f},  {1, 1, 5.0f / 48.0f},
@@ -969,68 +969,237 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
         default: break;
     }
 
+    // Level tables: the encoded-uniform palette in linear light, plus the
+    // encoded midpoints as linear thresholds — `count(thresh < value)` IS
+    // nearest-in-encoded, exactly, with ≤15 compares and no transfer
+    // function in the hot loop. After the pick, v[] holds the level INDEX.
+    const int nlevels_q =
+        std::min(17, static_cast<int>(std::lround(std::ceil(steps))) + 1);
+    float level_lin[17];
+    float thresh_lin[16];
+    for (int k = 0; k < nlevels_q; ++k)
+        level_lin[k] = cpu_srgb_eotf(
+            std::clamp(static_cast<float>(k) / steps, 0.0f, 1.0f));
+    for (int k = 0; k + 1 < nlevels_q; ++k)
+        thresh_lin[k] = cpu_srgb_eotf(std::clamp(
+            (static_cast<float>(k) + 0.5f) / steps, 0.0f, 1.0f));
+
     const int iw = static_cast<int>(width);
     const int ih = static_cast<int>(height);
-    for (int y = 0; y < ih; ++y) {
-        const bool reverse = serp && ((y & 1) != 0);
-        const int dir = reverse ? -1 : 1;
-        // Flat index deltas for this row direction (interior fast path —
-        // no per-tap bounds checks on ~99% of pixels).
-        ptrdiff_t delta[12];
-        for (int t = 0; t < ntaps; ++t)
-            delta[t] = (static_cast<ptrdiff_t>(taps[t].dy) * iw +
-                        taps[t].dx * dir) * 3;
-        const bool row_interior = y < ih - margin;
-        for (int xi = 0; xi < iw; ++xi) {
-            const int x = reverse ? (iw - 1 - xi) : xi;
-            const size_t i =
-                (static_cast<size_t>(y) * width + static_cast<size_t>(x)) * 3;
-            const bool interior =
-                row_interior && x >= margin && x < iw - margin;
-            for (size_t c = 0; c < 3; ++c) {
-                // Quantize and diffuse the CLAMPED-domain error only —
-                // unclamped error cascades row over row (and explodes
-                // through the temporal carry). trunc(x+0.5) == round(x) on
-                // this non-negative domain including ties, and avoids 6M
-                // libm calls per frame.
-                const float clamped = std::clamp(v[i + c], 0.0f, 1.0f);
-                const float q =
-                    static_cast<float>(static_cast<int>(
-                        clamped * steps + 0.5f)) / steps;
-                const float err = clamped - q;
-                v[i + c] = q;
-                if (interior) {
-                    for (int t = 0; t < ntaps; ++t)
-                        v[static_cast<size_t>(
-                            static_cast<ptrdiff_t>(i + c) + delta[t])] +=
-                            err * taps[t].wgt;
-                } else {
-                    for (int t = 0; t < ntaps; ++t) {
-                        const int nx = x + taps[t].dx * dir;
-                        const int ny = y + taps[t].dy;
-                        if (nx < 0 || ny < 0 || nx >= iw || ny >= ih)
-                            continue;
-                        v[(static_cast<size_t>(ny) * width +
-                           static_cast<size_t>(nx)) * 3 + c] +=
-                            err * taps[t].wgt;
+
+    if (kernel == 6) {
+        // Ostromoukhov variable-coefficient diffusion: three taps (next
+        // in the processing direction, down-behind, down) whose weights
+        // come from a per-intensity table. Rows cover [0..127] as
+        // integer triples normalized by their sum; levels above mirror
+        // (row(i) = row(255 - i)).
+        static constexpr int16_t kOstro[128][3] = {
+            {13, 0, 5},      {13, 0, 5},      {21, 0, 10},
+            {7, 0, 4},       {8, 0, 5},       {47, 3, 28},
+            {23, 3, 13},     {15, 3, 8},      {22, 6, 11},
+            {43, 15, 20},    {7, 3, 3},       {501, 224, 211},
+            {249, 116, 103}, {165, 80, 67},   {123, 62, 49},
+            {489, 256, 191}, {81, 44, 31},    {483, 272, 181},
+            {60, 35, 22},    {53, 32, 19},    {237, 148, 83},
+            {471, 304, 161}, {3, 2, 1},       {481, 314, 185},
+            {354, 226, 155}, {1389, 866, 685},{227, 138, 125},
+            {267, 158, 163}, {327, 188, 220}, {61, 34, 45},
+            {627, 338, 505}, {1227, 638, 1075},{20, 10, 19},
+            {1937, 1000, 1767},{977, 520, 855},{657, 360, 551},
+            {71, 40, 57},    {2005, 1160, 1539},{337, 200, 247},
+            {2039, 1240, 1425},{257, 160, 171},{691, 440, 437},
+            {1045, 680, 627},{301, 200, 171}, {177, 120, 95},
+            {2141, 1480, 1083},{1079, 760, 513},{725, 520, 323},
+            {137, 100, 57},  {2209, 1640, 855},{53, 40, 19},
+            {2243, 1720, 741},{565, 440, 171},{759, 600, 209},
+            {1147, 920, 285},{2311, 1880, 513},{97, 80, 19},
+            {335, 280, 57},  {1181, 1000, 171},{793, 680, 95},
+            {599, 520, 57},  {2413, 2120, 171},{405, 360, 19},
+            {2447, 2200, 57},{11, 10, 0},     {158, 151, 3},
+            {178, 179, 7},   {1030, 1091, 63},{248, 277, 21},
+            {318, 375, 35},  {458, 571, 63},  {878, 1159, 147},
+            {5, 7, 1},       {172, 181, 37},  {97, 76, 22},
+            {72, 41, 17},    {119, 47, 29},   {4, 1, 1},
+            {4, 1, 1},       {4, 1, 1},       {4, 1, 1},
+            {4, 1, 1},       {4, 1, 1},       {4, 1, 1},
+            {4, 1, 1},       {4, 1, 1},       {65, 18, 17},
+            {95, 29, 26},    {185, 62, 53},   {30, 11, 9},
+            {35, 14, 11},    {85, 37, 28},    {55, 26, 19},
+            {80, 41, 29},    {155, 86, 59},   {5, 3, 2},
+            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
+            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
+            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
+            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
+            {305, 176, 119}, {155, 86, 59},   {105, 56, 39},
+            {80, 41, 29},    {65, 32, 23},    {55, 26, 19},
+            {335, 152, 113}, {85, 37, 28},    {115, 48, 37},
+            {35, 14, 11},    {355, 136, 109}, {30, 11, 9},
+            {365, 128, 107}, {185, 62, 53},   {25, 8, 7},
+            {95, 29, 26},    {385, 112, 103}, {65, 18, 17},
+            {395, 104, 101}, {4, 1, 1},
+        };
+        float ostro_w[128][3];
+        for (int r = 0; r < 128; ++r) {
+            const float m = static_cast<float>(
+                kOstro[r][0] + kOstro[r][1] + kOstro[r][2]);
+            for (int t = 0; t < 3; ++t)
+                ostro_w[r][t] = static_cast<float>(kOstro[r][t]) / m;
+        }
+        // The table's domain is the encoded input level. Nearest encoded
+        // byte of a linear value via midpoint thresholds, folded into a
+        // 4096-bin lookup: sub-byte exact except the darkest rows, whose
+        // coefficients are near-identical anyway.
+        uint8_t row_lut[4096];
+        {
+            int b = 0;
+            for (int j = 0; j < 4096; ++j) {
+                const float vj = (static_cast<float>(j) + 0.5f) / 4096.0f;
+                while (b < 255 &&
+                       vj > cpu_srgb_eotf(
+                                (static_cast<float>(b) + 0.5f) / 255.0f))
+                    ++b;
+                row_lut[j] = static_cast<uint8_t>(b < 128 ? b : 255 - b);
+            }
+        }
+        for (int y = 0; y < ih; ++y) {
+            const bool reverse = serp && ((y & 1) != 0);
+            const int dir = reverse ? -1 : 1;
+            const bool has_down = y + 1 < ih;
+            for (int xi = 0; xi < iw; ++xi) {
+                const int x = reverse ? (iw - 1 - xi) : xi;
+                const size_t i = (static_cast<size_t>(y) * width +
+                                  static_cast<size_t>(x)) * 3;
+                const int xn = x + dir;
+                const int xb = x - dir;
+                const bool has_next = xn >= 0 && xn < iw;
+                const bool has_back = xb >= 0 && xb < iw;
+                for (size_t c = 0; c < 3; ++c) {
+                    // Weights index off the ORIGINAL input level (the
+                    // domain the table was tuned in), not the
+                    // error-shifted working value.
+                    const float orig =
+                        lin_lut[halves[(static_cast<size_t>(y) * width +
+                                        static_cast<size_t>(x)) * 4 + c]];
+                    const float* wv = ostro_w[row_lut[std::min(
+                        4095, static_cast<int>(orig * 4096.0f))]];
+                    const float clamped =
+                        std::clamp(v[i + c], 0.0f, 1.0f);
+                    int k = 0;
+                    while (k + 1 < nlevels_q && clamped > thresh_lin[k])
+                        ++k;
+                    const float err = clamped - level_lin[k];
+                    v[i + c] = static_cast<float>(k);
+                    if (has_next)
+                        v[(static_cast<size_t>(y) * width +
+                           static_cast<size_t>(xn)) * 3 + c] += err * wv[0];
+                    if (has_down) {
+                        if (has_back)
+                            v[(static_cast<size_t>(y + 1) * width +
+                               static_cast<size_t>(xb)) * 3 + c] +=
+                                err * wv[1];
+                        v[(static_cast<size_t>(y + 1) * width +
+                           static_cast<size_t>(x)) * 3 + c] += err * wv[2];
                     }
+                    if (carry_amt > 0.0f) next_carry[i + c] = err;
                 }
-                if (carry_amt > 0.0f) next_carry[i + c] = err;
+            }
+        }
+    } else if (kernel == 7) {
+        // Riemersma dither: pixels are visited along the Hilbert curve
+        // covering the next power-of-two square (off-image points are
+        // skipped); each pixel is nudged by the decaying weighted sum of
+        // the last 16 quantization errors (newest weight 1, oldest 1/16)
+        // and its own pure residual joins the list. The serpentine flag
+        // has no meaning on a space-filling path.
+        int order = 0;
+        while ((1u << order) < width || (1u << order) < height) ++order;
+        float wts[16];
+        const float decay = std::exp(std::log(16.0f) / 15.0f);
+        for (int a = 0; a < 16; ++a)
+            wts[a] = std::pow(decay, -static_cast<float>(a));
+        float ring[16][3] = {};
+        int head = 0;
+        const uint64_t total = uint64_t{1} << (2 * order);
+        for (uint64_t d = 0; d < total; ++d) {
+            uint32_t hx = 0, hy = 0;
+            hilbert_d2xy(order, d, &hx, &hy);
+            if (hx >= width || hy >= height) continue;
+            const size_t i = (static_cast<size_t>(hy) * width + hx) * 3;
+            float errs[3];
+            for (size_t c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int a = 0; a < 16; ++a)
+                    sum += ring[(head + 15 - a) & 15][c] * wts[a];
+                const float clamped = std::clamp(v[i + c], 0.0f, 1.0f);
+                const float nudged = clamped + sum;
+                int k = 0;
+                while (k + 1 < nlevels_q && nudged > thresh_lin[k]) ++k;
+                errs[c] = clamped - level_lin[k];
+                v[i + c] = static_cast<float>(k);
+                if (carry_amt > 0.0f) next_carry[i + c] = errs[c];
+            }
+            for (size_t c = 0; c < 3; ++c) ring[head][c] = errs[c];
+            head = (head + 1) & 15;
+        }
+    } else {
+        for (int y = 0; y < ih; ++y) {
+            const bool reverse = serp && ((y & 1) != 0);
+            const int dir = reverse ? -1 : 1;
+            // Flat index deltas for this row direction (interior fast
+            // path — no per-tap bounds checks on ~99% of pixels).
+            ptrdiff_t delta[12];
+            for (int t = 0; t < ntaps; ++t)
+                delta[t] = (static_cast<ptrdiff_t>(taps[t].dy) * iw +
+                            taps[t].dx * dir) * 3;
+            const bool row_interior = y < ih - margin;
+            for (int xi = 0; xi < iw; ++xi) {
+                const int x = reverse ? (iw - 1 - xi) : xi;
+                const size_t i = (static_cast<size_t>(y) * width +
+                                  static_cast<size_t>(x)) * 3;
+                const bool interior =
+                    row_interior && x >= margin && x < iw - margin;
+                for (size_t c = 0; c < 3; ++c) {
+                    // Quantize and diffuse the CLAMPED-domain error only
+                    // — unclamped error cascades row over row (and
+                    // explodes through the temporal carry). Linear-light
+                    // pick: count thresholds below the value
+                    // (nearest-in-encoded, exact), error against the
+                    // level's LINEAR value.
+                    const float clamped = std::clamp(v[i + c], 0.0f, 1.0f);
+                    int k = 0;
+                    while (k + 1 < nlevels_q && clamped > thresh_lin[k])
+                        ++k;
+                    const float err = clamped - level_lin[k];
+                    v[i + c] = static_cast<float>(k);
+                    if (interior) {
+                        for (int t = 0; t < ntaps; ++t)
+                            v[static_cast<size_t>(
+                                static_cast<ptrdiff_t>(i + c) +
+                                delta[t])] += err * taps[t].wgt;
+                    } else {
+                        for (int t = 0; t < ntaps; ++t) {
+                            const int nx = x + taps[t].dx * dir;
+                            const int ny = y + taps[t].dy;
+                            if (nx < 0 || ny < 0 || nx >= iw || ny >= ih)
+                                continue;
+                            v[(static_cast<size_t>(ny) * width +
+                               static_cast<size_t>(nx)) * 3 + c] +=
+                                err * taps[t].wgt;
+                        }
+                    }
+                    if (carry_amt > 0.0f) next_carry[i + c] = err;
+                }
             }
         }
     }
     if (carry_amt > 0.0f) slot.carry = std::move(next_carry);
     else slot.carry.clear();
 
-    // Post-dither values are EXACTLY the quantizer levels k/steps, so the
-    // outbound transfer function is a small exact table (fractional level
-    // counts included: k tops out at lround(steps)).
-    const int nlevels =
-        std::min(17, static_cast<int>(std::lround(std::ceil(steps))) + 1);
-    uint16_t eotf_lut[17];
-    for (int k = 0; k < nlevels; ++k)
-        eotf_lut[k] = float_to_half(cpu_srgb_eotf(std::clamp(
-            static_cast<float>(k) / steps, 0.0f, 1.0f)));
+    // v[] holds level indices now; the outbound linear values are a small
+    // exact table shared with the pick above.
+    uint16_t out_lut[17];
+    for (int k = 0; k < nlevels_q; ++k)
+        out_lut[k] = float_to_half(level_lin[k]);
     slot.out.resize(n * 4);
     codec::parallel_blocks(
         static_cast<int>(height), true, [&](int begin, int end) {
@@ -1040,11 +1209,9 @@ void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
                     const size_t i = base + x;
                     for (size_t c = 0; c < 3; ++c) {
                         const int k = std::clamp(
-                            static_cast<int>(
-                                std::clamp(v[i * 3 + c], 0.0f, 1.0f) * steps +
-                                0.5f),
-                            0, nlevels - 1);
-                        slot.out[i * 4 + c] = eotf_lut[k];
+                            static_cast<int>(v[i * 3 + c] + 0.5f), 0,
+                            nlevels_q - 1);
+                        slot.out[i * 4 + c] = out_lut[k];
                     }
                     slot.out[i * 4 + 3] = 0x3C00;   // alpha = 1
                 }
@@ -1159,9 +1326,7 @@ void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
 GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          const SourcePlanes& source, const doc::Document& doc,
                          uint32_t timeline_frame, double fps,
-                         uint64_t overlay_mask_id,
-                         const MaskSourceFrame* mask_sources,
-                         size_t mask_source_count, uint64_t cache_ctx,
+                         uint64_t cache_ctx,
                          GpuImage** out_source,
                          const LayerSourceFrame* layer_sources,
                          size_t layer_source_count,
@@ -1178,7 +1343,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     staging.reset();
 
     // Upload dimensions (full-res planes) vs working dimensions (preview
-    // proxy, spec §10). Kernels sample the planes by uv, so the working
+    // proxy, ). Kernels sample the planes by uv, so the working
     // targets shrink cleanly; even dims keep the codec paths happy.
     const uint32_t src_h = source.height;
     const uint32_t ch = (src_h + 1) / 2;
@@ -1187,7 +1352,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     const uint32_t h =
         std::max((source.height / preview_divisor_) & ~1u, 2u);
 
-    // ---- frame render cache (spec §10). First harvest the readback this
+    // ---- frame render cache. First harvest the readback this
     // slot recorded kFramesInFlight renders ago — the caller has waited the
     // slot's fence, so the copy is complete and the buffer is ours again.
     CacheIo& cio = cache_io_[frame_index % kFramesInFlight];
@@ -1237,8 +1402,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         arm_readback = true;
     }
 
-    const RenderGraph graph =
-        compile_graph(doc, overlay_mask_id, preview_node);
+    const RenderGraph graph = compile_graph(doc, preview_node);
     if (!graph.valid) {
         log_error("engine: render graph invalid (cycle?)");
         return nullptr;
@@ -1246,16 +1410,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
     // Codec-Box nodes need the frame on the CPU mid-graph: evaluate in
     // fenced segments on an internal command buffer instead of `cmd`
-    // (correctness-first; the roundtrip stalls preview, spec §6.3 accepts).
+    // (correctness-first; the roundtrip stalls preview, accepts).
     bool segmented = false;
     for (const GraphNode& n : graph.nodes) {
         if (n.kind != GraphNode::Kind::Effect) continue;
         const doc::EffectInstance& fx =
-            n.chain_index >= 0
-                ? doc.masks[static_cast<size_t>(n.mask_index)]
-                      .chain[static_cast<size_t>(n.chain_index)]
-                : doc.layers[static_cast<size_t>(n.layer_index)]
-                      .stack[static_cast<size_t>(n.effect_index)];
+            doc.layers[static_cast<size_t>(n.layer_index)]
+                .stack[static_cast<size_t>(n.effect_index)];
         if (doc::is_codec_box(fx.type) ||
             fx.type == doc::EffectType::ErrorDiffusion) {
             segmented = true;
@@ -1296,49 +1457,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         !staging.upload_image(rec, source.v, source.v_stride * ch,
                               source.v_stride, *plane_v_))
         return nullptr;
-    // External mask-source planes (spec §8): per-mask I420 uploads.
-    for (size_t i = 0; i < mask_source_count; ++i) {
-        const MaskSourceFrame& mf = mask_sources[i];
-        if (!mf.planes.y || !mf.planes.u || !mf.planes.v ||
-            mf.planes.width == 0)
-            continue;
-        MaskPlanes& mp = mask_planes_[mf.mask_id];
-        if (mp.width != mf.planes.width || mp.height != mf.planes.height) {
-            device_.wait_idle();
-            const VkImageUsageFlags mu =
-                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            const uint32_t mcw = (mf.planes.width + 1) / 2;
-            const uint32_t mch = (mf.planes.height + 1) / 2;
-            mp.y = GpuImage::create(device_, VK_FORMAT_R8_UNORM,
-                                    mf.planes.width, mf.planes.height, mu);
-            mp.u = GpuImage::create(device_, VK_FORMAT_R8_UNORM, mcw, mch, mu);
-            mp.v = GpuImage::create(device_, VK_FORMAT_R8_UNORM, mcw, mch, mu);
-            if (!mp.y || !mp.u || !mp.v) return nullptr;
-            mp.width = mf.planes.width;
-            mp.height = mf.planes.height;
-        }
-        const uint32_t mch = (mp.height + 1) / 2;
-        if (!staging.upload_image(rec, mf.planes.y,
-                                  mf.planes.y_stride * mp.height,
-                                  mf.planes.y_stride, *mp.y) ||
-            !staging.upload_image(rec, mf.planes.u,
-                                  mf.planes.u_stride * mch,
-                                  mf.planes.u_stride, *mp.u) ||
-            !staging.upload_image(rec, mf.planes.v,
-                                  mf.planes.v_stride * mch,
-                                  mf.planes.v_stride, *mp.v))
-            return nullptr;
-        mp.y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        mp.u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        mp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-    // Per-layer trim sources (spec §5): same upload shape, keyed by layer.
+    // Per-layer trim sources: per-layer I420 uploads.
     for (size_t i = 0; i < layer_source_count; ++i) {
         const LayerSourceFrame& lf = layer_sources[i];
         if (!lf.planes.y || !lf.planes.u || !lf.planes.v ||
             lf.planes.width == 0 || lf.layer_index < 0)
             continue;
-        MaskPlanes& lp = layer_planes_[lf.layer_index];
+        LayerPlanes& lp = layer_planes_[lf.layer_index];
         if (lp.width != lf.planes.width || lp.height != lf.planes.height) {
             device_.wait_idle();
             const VkImageUsageFlags lu =
@@ -1432,9 +1557,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         for (const doc::Layer& layer : doc.layers)
             for (const doc::EffectInstance& fx : layer.stack)
                 if (!upload_strip(fx)) return nullptr;
-        for (const doc::Mask& mask : doc.masks)
-            for (const doc::EffectInstance& fx : mask.chain)
-                if (!upload_strip(fx)) return nullptr;
     }
 
     // Thumbnail atlas + cell map: reset only when the graph actually
@@ -1460,7 +1582,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     remaining_uses[static_cast<size_t>(graph.output)]++;
     if (graph.preview >= 0)
         remaining_uses[static_cast<size_t>(graph.preview)]++;
-    // A/B wipe (spec §9): keep the converted source alive to the end too.
+    // A/B wipe: keep the converted source alive to the end too.
     if (out_source) remaining_uses[0]++;
 
     auto as_bits = [](float v) {
@@ -1488,8 +1610,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
         switch (node.kind) {
             case GraphNode::Kind::Source: {
-                // layer_index >= 0: a private per-layer source (trim, spec
-                // §5). Falls back to the playhead planes when the caller
+                // layer_index >= 0: a private per-layer source (trim).
+                // Falls back to the playhead planes when the caller
                 // supplied no frame for that layer.
                 const GpuImage* planes[3] = {plane_y_.get(), plane_u_.get(),
                                              plane_v_.get()};
@@ -1543,23 +1665,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[11] = as_bits(layer.gen_scale);
                     push[12] = as_bits(layer.gen_angle);
                     push[13] = layer.osc_shape;
-                } else if (node.mask_index >= 0) {
-                    // Mask generator source (spec §8): white-on-black with
-                    // the mask's own scale/angle.
-                    const doc::Mask& mask =
-                        doc.masks[static_cast<size_t>(node.mask_index)];
-                    push[2] = mask.source_gen;
-                    push[3] = static_cast<uint32_t>(
-                        hash_combine(doc.master_seed, mask.id));
-                    push[4] = timeline_frame;
-                    for (int c = 0; c < 3; ++c) {
-                        push[5 + c] = as_bits(1.0f);
-                        push[8 + c] = as_bits(0.0f);
-                    }
-                    push[11] = as_bits(mask.gen_scale);
-                    push[12] = as_bits(mask.gen_angle);
                 } else {
-                    // Unwired Output (v4): a solid with zeroed colors —
+                    // Unwired Output: a solid with zeroed colors —
                     // an empty composite renders black, never the source.
                     push[2] = static_cast<uint32_t>(
                         doc::LayerSourceKind::Solid);
@@ -1579,7 +1686,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 push[1] = h;
                 push[2] = static_cast<uint32_t>(layer.blend);
                 push[3] = as_bits(layer.opacity);
-                // Transform gate (spec §5): cropped / scaled-down regions
+                // Transform gate: cropped / scaled-down regions
                 // reveal the composite below instead of stamping black.
                 push[4] = doc::layer_has_transform(layer) ? 1u : 0u;
                 push[5] = as_bits(layer.crop_l);
@@ -1597,14 +1704,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             }
             case GraphNode::Kind::Effect: {
                 const doc::EffectInstance& fx =
-                    node.chain_index >= 0
-                        ? doc.masks[static_cast<size_t>(node.mask_index)]
-                              .chain[static_cast<size_t>(node.chain_index)]
-                        : doc.layers[static_cast<size_t>(node.layer_index)]
-                              .stack[static_cast<size_t>(node.effect_index)];
+                    doc.layers[static_cast<size_t>(node.layer_index)]
+                        .stack[static_cast<size_t>(node.effect_index)];
 
                 if (doc::is_codec_box(fx.type)) {
-                    // --- Codec-Box (spec §6.3): GPU->CPU->GPU roundtrip.
+                    // --- Codec-Box: GPU->CPU->GPU roundtrip.
                     GpuImage* in = input_image(0);
                     GpuImage* flow_img =
                         fx.type == doc::EffectType::Datamosh &&
@@ -1678,7 +1782,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
                     // 2. CPU: mosh with persistent per-instance state. A
                     // paused re-render reuses the cached output so the
-                    // decoder does not keep stewing (spec §11 vs export).
+                    // decoder does not keep stewing (vs export).
                     MoshSlot& slot = mosh_state_[fx.id];
                     if (!slot.valid || slot.last_frame != timeline_frame) {
                         vmaInvalidateAllocation(device_.allocator(),
@@ -1813,7 +1917,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                          &ed_host, 0, nullptr, 0, nullptr);
                     codec_flush_segment();
 
-                    // 2. CPU: serpentine diffusion (spec §6.2 — inherently
+                    // 2. CPU: serpentine diffusion (— inherently
                     // serial). Paused re-renders reuse the cached output so
                     // temporal carry does not re-stew.
                     EdSlot& slot = ed_state_[fx.id];
@@ -1853,7 +1957,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 }
 
                 // Shared push layout: uint2 size, wet, opacity, seed, frame,
-                // fps, params (spec §11: seeded counter-based randomness).
+                // fps, params (seeded counter-based randomness).
                 const uint64_t seed64 = hash_combine(
                     hash_combine(doc.master_seed, fx.id), fx.seed);
                 uint32_t push[kFxPreludeWords + 16] = {};
@@ -1898,7 +2002,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 3, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::Glyph) {
-                    // set: 0 halftone, 1 ascii, 2 custom (spec §12 user-
+                    // set: 0 halftone, 1 ascii, 2 custom (user-
                     // droppable tilesets), 3 braille, 4 teletext; missing
                     // slots fall back down.
                     int which = std::clamp(
@@ -1921,7 +2025,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + 4 * sizeof(uint32_t), w, h,
                         linear_sampler_);
                 } else if (fx.type == doc::EffectType::Quantize) {
-                    // RD-stipple dither (spec §6.2 mode 9) reuses the RD
+                    // RD-stipple dither (mode 9) reuses the RD
                     // sim: a per-instance Gray-Scott state seeded by the
                     // frame becomes the threshold pattern. Other modes
                     // bind the noise LUT in that slot as a dummy.
@@ -1992,7 +2096,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                         stipple = st;
                     }
-                    // Motion lock (spec §6.2): the graph wires the flow
+                    // Motion lock: the graph wires the flow
                     // node as a second input when lock is on; the LUT
                     // doubles as an unread dummy otherwise.
                     const GpuImage* flow_tex = node.inputs.size() > 1
@@ -2005,7 +2109,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 4, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::Dither) {
-                    // Standalone ordered dither (v5.5): LUT always rides
+                    // Standalone ordered dither: LUT always rides
                     // as input 1; the flow field joins as input 2 only in
                     // motion-locked mode (the LUT doubles as the dummy).
                     const GpuImage* flow_tex = node.inputs.size() > 1
@@ -2017,7 +2121,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 3, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::FrameDelay) {
-                    // Plain N-frame delay (v5.5): the slit-scan ring
+                    // Plain N-frame delay: the slit-scan ring
                     // machinery, one slice bound as the second input.
                     SlitSlot& slot = slit_state_[fx.id];
                     if (slot.ring[0] &&
@@ -2077,8 +2181,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.count = std::min(slot.count + 1, kSlitRing);
                         slot.last_frame = timeline_frame;
                     }
-                } else if (fx.type == doc::EffectType::TextOverlay) {
-                    // Runtime-TTF text (v5.5b): pick the size BUCKET
+                } else if (fx.type == doc::EffectType::Text) {
+                    // Runtime-TTF text: pick the size BUCKET
                     // covering the resolved size param, rasterize the
                     // string's SDF once per (text, font, bucket), and
                     // let the kernel scale — a keyframed/modulated size
@@ -2169,7 +2273,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + 4 * sizeof(uint32_t), w, h,
                         linear_sampler_);
                 } else if (fx.type == doc::EffectType::Displace) {
-                    // Second input (spec §6.2): the mask's grayscale as the
+                    // Second input: the wired map/matte as the
                     // displacement map when the graph wired one; otherwise
                     // the input doubles as its own map (self-luma).
                     const GpuImage* map = node.inputs.size() > 1
@@ -2180,7 +2284,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::DustScratches) {
-                    // The damage plate rides as a second input (spec §6.5
+                    // The damage plate rides as a second input (
                     // texture-driven dust); always present (fallback).
                     const GpuImage* sampled[2] = {input_image(0),
                                                   dust_tex_.get()};
@@ -2255,7 +2359,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 } else if (fx.type == doc::EffectType::TimeDisplace) {
                     // Same ring mechanism as SlitScan: one dispatch per
                     // age band; the shader masks pixels to its band from
-                    // the delay map (self-luma, or a wired mask input).
+                    // the delay map (self-luma, or a wired map input).
                     SlitSlot& slot = slit_state_[fx.id];
                     if (slot.ring[0] &&
                         (slot.ring[0]->width() != w ||
@@ -2732,7 +2836,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.count = std::min(slot.count + 1, kSlitRing);
                         slot.last_frame = timeline_frame;
                     }
-                } else if (fx.type == doc::EffectType::Modulate) {
+                } else if (fx.type == doc::EffectType::Engraver) {
                     // FM raster: run the phase integrator over this
                     // node's input, then render iso-phase traces from
                     // the integral (GenerateMe fm.pde model).
@@ -2783,7 +2887,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1,
                         push, push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::BlendNode) {
-                    // Graph merge (v3): B rides input 1; unwired B falls
+                    // Graph merge: B rides input 1; unwired B falls
                     // back to In (the blend becomes identity-ish).
                     const GpuImage* b = node.inputs.size() > 1
                         ? input_image(1)
@@ -2871,197 +2975,23 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                 dst->height(), linear_sampler_);
                 break;
             }
-            case GraphNode::Kind::MaskShape: {
-                const doc::Mask& mask =
-                    doc.masks[static_cast<size_t>(node.mask_index)];
-                // Bezier path (spec §8): flatten the closed Catmull-Rom
-                // through the control points; cached per mask until edited.
-                const GpuImage* path = nullptr;
-                uint32_t path_count = 0;
-                if (mask.points.size() >= 6) {
-                    uint64_t phash =
-                        hash_combine(0x9A7Bull, mask.points.size());
-                    for (float f : mask.points)
-                        phash = hash_combine(phash, as_bits(f));
-                    PathSlot& slot = path_state_[mask.id];
-                    const size_t n = mask.points.size() / 2;
-                    const uint32_t flat = static_cast<uint32_t>(n) * 16u;
-                    if (slot.hash != phash || !slot.tex ||
-                        slot.count != flat) {
-                        std::vector<float> poly(size_t{flat} * 2);
-                        auto px = [&](size_t k) {
-                            return mask.points[(k % n) * 2];
-                        };
-                        auto py = [&](size_t k) {
-                            return mask.points[(k % n) * 2 + 1];
-                        };
-                        for (size_t i = 0; i < n; ++i) {
-                            for (uint32_t s = 0; s < 16; ++s) {
-                                const float t = s / 16.0f;
-                                const float t2 = t * t, t3 = t2 * t;
-                                auto cr = [&](float p0, float p1, float p2,
-                                              float p3) {
-                                    return 0.5f *
-                                           (2.0f * p1 + (-p0 + p2) * t +
-                                            (2.0f * p0 - 5.0f * p1 +
-                                             4.0f * p2 - p3) *
-                                                t2 +
-                                            (-p0 + 3.0f * p1 - 3.0f * p2 +
-                                             p3) *
-                                                t3);
-                                };
-                                poly[(i * 16 + s) * 2] =
-                                    cr(px(i + n - 1), px(i), px(i + 1),
-                                       px(i + 2));
-                                poly[(i * 16 + s) * 2 + 1] =
-                                    cr(py(i + n - 1), py(i), py(i + 1),
-                                       py(i + 2));
-                            }
-                        }
-                        if (!slot.tex || slot.count != flat) {
-                            device_.wait_idle();
-                            slot.tex = GpuImage::create(
-                                device_, VK_FORMAT_R32G32_SFLOAT, flat, 1,
-                                VK_IMAGE_USAGE_SAMPLED_BIT |
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-                            if (!slot.tex) return nullptr;
-                        }
-                        if (!staging.upload_image(rec, poly.data(),
-                                                  poly.size() * sizeof(float),
-                                                  flat, *slot.tex))
-                            return nullptr;
-                        slot.hash = phash;
-                        slot.count = flat;
-                    }
-                    slot.tex->transition(
-                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    path = slot.tex.get();
-                    path_count = slot.count;
-                }
-                if (!path) {
-                    if (!path_dummy_) {
-                        path_dummy_ = GpuImage::create(
-                            device_, VK_FORMAT_R32G32_SFLOAT, 1, 1,
-                            VK_IMAGE_USAGE_SAMPLED_BIT |
-                                VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-                        if (!path_dummy_) return nullptr;
-                    }
-                    path_dummy_->transition(
-                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    path = path_dummy_.get();
-                }
-                const uint32_t push[10] = {
-                    w, h, as_bits(mask.center_x), as_bits(mask.center_y),
-                    as_bits(mask.radius_x), as_bits(mask.radius_y),
-                    as_bits(mask.roundness), as_bits(mask.feather),
-                    mask.invert ? 1u : 0u, path_count};
-                const GpuImage* sampled[1] = {path};
-                mask_shape_->dispatch(rec, arena_, frame_index, sampled, 1,
-                                      &dst, 1, push, sizeof(push), w, h,
-                                      linear_sampler_);
-                break;
-            }
-            case GraphNode::Kind::MaskSource: {
-                const doc::Mask& mask =
-                    doc.masks[static_cast<size_t>(node.mask_index)];
-                const auto it = mask_planes_.find(mask.id);
-                const bool have = it != mask_planes_.end() &&
-                                  it->second.y != nullptr;
-                // Fall back to the main source planes when the caller did
-                // not (or could not) provide frames for this mask.
-                const uint32_t sw = have ? it->second.width : source.width;
-                const uint32_t sh = have ? it->second.height : src_h;
-                const uint32_t push_ms[5] = {w, h, sw, sh, mask.fit};
-                const GpuImage* planes3[3] = {
-                    have ? it->second.y.get() : plane_y_.get(),
-                    have ? it->second.u.get() : plane_u_.get(),
-                    have ? it->second.v.get() : plane_v_.get()};
-                mask_source_->dispatch(rec, arena_, frame_index, planes3, 3,
-                                       &dst, 1, push_ms, sizeof(push_ms), w,
-                                       h, linear_sampler_);
-                break;
-            }
-            case GraphNode::Kind::MaskExtract: {
-                if (node.mask_index < 0) {
-                    // Image-matte adapter (docs/flow_canvas.md v5.2:
-                    // masks ARE images): plain luma, neutral levels —
-                    // the wired image IS the matte.
-                    const uint32_t push[12] = {
-                        w, h, /*mode=*/0u, 0u,
-                        as_bits(0.0f), as_bits(1.0f), as_bits(1.0f),
-                        as_bits(0.5f), as_bits(0.25f), as_bits(0.0f),
-                        as_bits(1.0f), as_bits(0.0f)};
-                    const GpuImage* sampled[1] = {input_image(0)};
-                    mask_extract_->dispatch(rec, arena_, frame_index,
-                                            sampled, 1, &dst, 1, push,
-                                            sizeof(push), w, h,
-                                            linear_sampler_);
-                    break;
-                }
-                const doc::Mask& mask =
-                    doc.masks[static_cast<size_t>(node.mask_index)];
-                uint32_t mode = static_cast<uint32_t>(mask.extract);
-                if (mode == static_cast<uint32_t>(doc::MaskExtract::Alpha))
-                    mode = 6;
-                if (mask.type == doc::MaskType::LumaKey) mode = 4;
-                else if (mask.type == doc::MaskType::ChromaKey) mode = 5;
-                else if (mask.type == doc::MaskType::Motion) mode = 7;
-                const uint32_t push[12] = {
-                    w, h, mode, mask.invert ? 1u : 0u,
-                    as_bits(mask.black_point), as_bits(mask.white_point),
-                    as_bits(mask.gamma), as_bits(mask.key_center),
-                    as_bits(mask.key_range), as_bits(mask.key_r),
-                    as_bits(mask.key_g), as_bits(mask.key_b)};
+            case GraphNode::Kind::MatteExtract: {
+                // Image-matte adapter (masks ARE images): the wired
+                // image's luma IS the matte.
+                const uint32_t push[2] = {w, h};
                 const GpuImage* sampled[1] = {input_image(0)};
-                mask_extract_->dispatch(rec, arena_, frame_index, sampled, 1,
-                                        &dst, 1, push, sizeof(push), w, h,
-                                        linear_sampler_);
+                matte_extract_->dispatch(rec, arena_, frame_index, sampled,
+                                         1, &dst, 1, push, sizeof(push), w,
+                                         h, linear_sampler_);
                 break;
             }
-            case GraphNode::Kind::MaskBlurH:
-            case GraphNode::Kind::MaskBlurV: {
-                const doc::Mask& mask =
-                    doc.masks[static_cast<size_t>(node.mask_index)];
-                const uint32_t push[4] = {
-                    w, h, as_bits(mask.blur_px),
-                    node.kind == GraphNode::Kind::MaskBlurV ? 1u : 0u};
-                const GpuImage* sampled[1] = {input_image(0)};
-                mask_blur_->dispatch(rec, arena_, frame_index, sampled, 1,
-                                     &dst, 1, push, sizeof(push), w, h,
-                                     linear_sampler_);
-                break;
-            }
-            case GraphNode::Kind::MaskMorphH:
-            case GraphNode::Kind::MaskMorphV: {
-                const doc::Mask& mask =
-                    doc.masks[static_cast<size_t>(node.mask_index)];
-                const uint32_t push[4] = {
-                    w, h, as_bits(mask.grow_px),
-                    node.kind == GraphNode::Kind::MaskMorphV ? 1u : 0u};
-                const GpuImage* sampled[1] = {input_image(0)};
-                mask_morph_->dispatch(rec, arena_, frame_index, sampled, 1,
-                                      &dst, 1, push, sizeof(push), w, h,
-                                      linear_sampler_);
-                break;
-            }
-            case GraphNode::Kind::MaskCombine: {
-                const doc::Mask& mask =
-                    doc.masks[static_cast<size_t>(node.mask_index)];
-                const uint32_t push[3] = {
-                    w, h, static_cast<uint32_t>(mask.combine_op)};
-                const GpuImage* sampled[2] = {input_image(0), input_image(1)};
-                mask_combine_->dispatch(rec, arena_, frame_index, sampled, 2,
-                                        &dst, 1, push, sizeof(push), w, h,
-                                        linear_sampler_);
-                break;
-            }
-            case GraphNode::Kind::MaskApply: {
+            case GraphNode::Kind::MatteApply: {
                 const uint32_t push[2] = {w, h};
                 const GpuImage* sampled[3] = {input_image(0), input_image(1),
                                               input_image(2)};
-                mask_apply_->dispatch(rec, arena_, frame_index, sampled, 3,
-                                      &dst, 1, push, sizeof(push), w, h,
-                                      linear_sampler_);
+                matte_apply_->dispatch(rec, arena_, frame_index, sampled, 3,
+                                       &dst, 1, push, sizeof(push), w, h,
+                                       linear_sampler_);
                 break;
             }
         }
@@ -3069,19 +2999,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         results[static_cast<size_t>(index)] = dst;
         // Node-canvas thumbnail taps (docs/flow_canvas.md): effects key on
         // their id, layer sources on layer.id | bit 62 (id spaces
-        // overlap), masks on id | kMaskParamBit — later mask stages
-        // re-key so the map lands on the final matte.
+        // overlap).
         constexpr uint64_t kThumbSourceBit = 1ull << 62;
-        if (node.kind == GraphNode::Kind::Effect && node.chain_index < 0 &&
+        if (node.kind == GraphNode::Kind::Effect &&
             node.effect_index >= 0 && node.layer_index >= 0) {
             const doc::EffectInstance& tfx =
                 doc.layers[static_cast<size_t>(node.layer_index)]
                     .stack[static_cast<size_t>(node.effect_index)];
             record_thumb_tap(rec, frame_index, dst, tfx.id);
-        } else if ((node.kind == GraphNode::Kind::Source ||
-                    node.kind == GraphNode::Kind::Generator ||
-                    node.kind == GraphNode::Kind::LayerTransform) &&
-                   node.mask_index < 0) {
+        } else if (node.kind == GraphNode::Kind::Source ||
+                   node.kind == GraphNode::Kind::Generator ||
+                   node.kind == GraphNode::Kind::LayerTransform) {
             if (node.layer_index >= 0) {
                 record_thumb_tap(
                     rec, frame_index, dst,
@@ -3098,16 +3026,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         record_thumb_tap(rec, frame_index, dst,
                                          tl.id | kThumbSourceBit);
             }
-        } else if ((node.kind == GraphNode::Kind::MaskShape ||
-                    node.kind == GraphNode::Kind::MaskExtract ||
-                    node.kind == GraphNode::Kind::MaskMorphV ||
-                    node.kind == GraphNode::Kind::MaskBlurV ||
-                    node.kind == GraphNode::Kind::MaskCombine) &&
-                   node.mask_index >= 0) {
-            record_thumb_tap(
-                rec, frame_index, dst,
-                doc.masks[static_cast<size_t>(node.mask_index)].id |
-                    doc::kMaskParamBit);
         }
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)

@@ -1,8 +1,8 @@
-// Displacement by luma or second input (spec §6.2). The displacement
+// Displacement by luma or second input. The displacement
 // field always comes from `map`: the engine binds the effect input itself
 // (self-luma) or, with map_mode = 1 and a mask reference, the mask's
 // grayscale — whose source can be another layer, an external video, or a
-// generator, each with its own mini chain (spec §8). Mode 0 shifts along
+// generator, each with its own mini chain. Mode 0 shifts along
 // a fixed direction scaled by (map luma - 0.5); mode 1 pushes along the
 // local map-luma gradient (relief-like bulge).
 //

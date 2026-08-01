@@ -1,4 +1,4 @@
-// Palette Map (docs/flow_canvas.md v5.5 primitives): nearest-color snap
+// Palette Map (docs/flow_canvas.md primitives): nearest-color snap
 // to a fixed palette — the Quantizer's palette lock without the level
 // snap or dither. Duotone ramps black -> hue A -> hue B -> white by
 // luma. Display-referred core.

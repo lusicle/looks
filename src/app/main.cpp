@@ -8,6 +8,8 @@
 
 #include <windows.h>
 
+#include <shellapi.h>
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -41,7 +43,6 @@
 
 #include "doc/group_commands.h"
 #include "doc/layer_commands.h"
-#include "doc/mask_commands.h"
 #include "doc/mod_commands.h"
 #include "doc/preset.h"
 #include "doc/randomize.h"
@@ -158,7 +159,7 @@ struct ImportJob {
     }
 };
 
-// Import bundles live on the scratch disk (spec §3), never next to the
+// Import bundles live on the scratch disk, never next to the
 // user's footage: cache/<source-path-hash>/ beside the exe. Hashing the
 // lowercased absolute path keeps one bundle per source on Windows'
 // case-insensitive filesystems.
@@ -176,7 +177,7 @@ std::filesystem::path bundle_dir_for(const std::filesystem::path& source) {
     return executable_dir() / "cache" / hex;
 }
 
-// Still-image clips (spec §3 import scope: PNG/TGA) get different clip UI:
+// Still-image clips (import scope: PNG/TGA) get different clip UI:
 // a duration entry instead of the time/audio rows, which are meaningless
 // when every frame is identical and there is no clip audio.
 bool is_still_source(const std::filesystem::path& source) {
@@ -193,7 +194,7 @@ std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
     ImportJob* raw = job.get();
     job->thread = std::thread([raw, source, lossless, dest] {
         media::ImportOptions options;
-        if (lossless) options.quality = 0;   // spec §3 lossless mode
+        if (lossless) options.quality = 0;   // lossless mode
         raw->result =
             media::import_media(source, dest, options, &raw->progress);
         raw->done = true;
@@ -219,68 +220,11 @@ struct ExportJob {
     }
 };
 
-// External mask-source decode state (spec §8), keyed by mask id. One
-// instance per consumer (preview loop / export worker) — MezReader is not
-// shareable across threads. Map nodes are address-stable, so the returned
-// plane pointers stay valid until the next collect().
-struct MaskSourceReaders {
-    struct Entry {
-        codec::MezReader reader;
-        std::string path;
-        bool ok = false;
-        codec::DecodedFrame frame;
-        uint32_t last_index = 0xFFFFFFFFu;
-    };
-    std::map<uint64_t, Entry> entries;
-
-    std::vector<gfx::Engine::MaskSourceFrame> collect(
-        const doc::Document& doc, uint32_t timeline_frame) {
-        std::vector<gfx::Engine::MaskSourceFrame> out;
-        for (const doc::Mask& mask : doc.masks) {
-            if (mask.source_path.empty() ||
-                mask.type == doc::MaskType::Shape)
-                continue;
-            Entry& st = entries[mask.id];
-            if (st.path != mask.source_path || !st.ok) {
-                st.reader.close();
-                std::string err;
-                st.ok = st.reader.open(mask.source_path, &err);
-                st.path = mask.source_path;
-                st.last_index = 0xFFFFFFFFu;
-                if (!st.ok) continue;
-            }
-            const uint32_t count = st.reader.frame_count();
-            if (count == 0) continue;
-            // Locked follows the playhead and holds on the last frame;
-            // free-running loops forever (deterministic either way).
-            const uint32_t idx = mask.free_run
-                                     ? timeline_frame % count
-                                     : std::min(timeline_frame, count - 1);
-            if (st.last_index != idx) {
-                if (!st.reader.decode(idx, st.frame)) continue;
-                st.last_index = idx;
-            }
-            const codec::FrameView view = st.frame.view();
-            gfx::Engine::MaskSourceFrame mf;
-            mf.mask_id = mask.id;
-            mf.planes.y = view.y.data;
-            mf.planes.y_stride = view.y.stride;
-            mf.planes.u = view.u.data;
-            mf.planes.u_stride = view.u.stride;
-            mf.planes.v = view.v.data;
-            mf.planes.v_stride = view.v.stride;
-            mf.planes.width = view.width;
-            mf.planes.height = view.height;
-            out.push_back(mf);
-        }
-        return out;
-    }
-};
-
-// Per-layer trim decode state (spec §5): a clip layer whose trim selects a
+// Per-layer trim decode state: a clip layer whose trim selects a
 // different source frame than the playhead decodes through its own random-
 // access reader (intra-only mezzanine makes these seeks free). One instance
-// per consumer, same threading rules as MaskSourceReaders.
+// per consumer (preview loop / export worker) — MezReader is not shareable
+// across threads.
 struct LayerTrimReaders {
     struct Entry {
         codec::MezReader reader;
@@ -347,7 +291,7 @@ struct LayerTrimReaders {
 
 // ---------------------------------------------------- preview render thread
 //
-// Spec §13's fourth thread: the preview graph evaluates OFF the UI thread,
+// The preview graph evaluates OFF the UI thread,
 // so a heavy stack — or a fenced Codec-Box roundtrip — slows the viewport,
 // never the interface. The worker owns the preview Engine outright. The UI
 // posts latest-wins snapshots of the document (copied only when its
@@ -364,8 +308,7 @@ struct RenderWorker {
         bool has_analysis = false;
         uint64_t analysis_stamp = ~0ull;
         std::filesystem::path mez_path;   // full-res (layer-trim readers)
-        uint64_t overlay_mask_id = 0;
-        // Selection-follows preview (v5.4): node whose output the big
+        // Selection-follows preview: node whose output the big
         // preview publishes; 0 = the composite.
         uint64_t preview_node = 0;
         uint32_t preview_div = 1;
@@ -375,7 +318,7 @@ struct RenderWorker {
         bool want_source = false;         // A/B wipe or bypass-all
         bool have_clip = false;
         bool proxy_active = false;        // cache-context ingredient
-        // Custom glyph set hand-off (spec §12): the drop happens on the UI
+        // Custom glyph set hand-off: the drop happens on the UI
         // thread, the engine lives here. Gray ramp bytes, or RGBA when
         // `glyph_is_color` (emoji tilesets — coverage from alpha).
         std::vector<uint8_t> glyph_data;
@@ -606,7 +549,6 @@ bool RenderWorker::ensure_published(Published& p, uint32_t w, uint32_t h,
 void RenderWorker::run() {
     // Worker-local decode/remap state (moved off AppState — these hold
     // FILE handles and are single-thread objects).
-    MaskSourceReaders mask_readers;
     LayerTrimReaders trim_readers;
     mod::TimeRemap remap;
     codec::MezReader remap_reader;
@@ -631,7 +573,6 @@ void RenderWorker::run() {
 
     for (;;) {
         // Small-field snapshot; doc/analysis copied only on change.
-        uint64_t overlay_mask_id;
         uint64_t preview_node;
         uint32_t preview_div;
         bool live_mode, want_source, have_clip, proxy_active;
@@ -687,7 +628,6 @@ void RenderWorker::run() {
                 lock.lock();
                 doc_changed = true;
             }
-            overlay_mask_id = job_.overlay_mask_id;
             preview_node = job_.preview_node;
             preview_div = job_.preview_div;
             live_mode = job_.live_mode;
@@ -736,8 +676,8 @@ void RenderWorker::run() {
         double mod_fps = player.fps() > 0.0 ? player.fps() : 30.0;
         uint32_t playhead_src = mod_frame;
 
-        // Time remap (spec §6.1): only the SOURCE frame remaps; modulation
-        // stays fixed-timestep on the playhead (spec §11).
+        // Time remap: only the SOURCE frame remaps; modulation
+        // stays fixed-timestep on the playhead.
         const uint32_t remap_src = remap.source_frame(
             doc, mod_frame, mod_fps, has_analysis ? &analysis : nullptr,
             player.frame_count(), live_mode ? app_seconds : -1.0);
@@ -768,7 +708,7 @@ void RenderWorker::run() {
             }
         }
 
-        // Video-sampling sources (docs/flow_canvas.md v4) read the exact
+        // Video-sampling sources (docs/flow_canvas.md) read the exact
         // frame this pass renders — post-remap planes, same as export.
         mod::SourceFrameView sfv;
         sfv.y = planes.y;
@@ -786,7 +726,7 @@ void RenderWorker::run() {
         engine->set_preview_divisor(preview_div);
         engine->cache().set_budget(static_cast<size_t>(doc.cache_mb) << 20);
 
-        // Frame render cache context (spec §10) — the doc-hash leg is
+        // Frame render cache context — the doc-hash leg is
         // recomputed only when the document changed.
         uint64_t cache_ctx = 0;
         if (!live_mode && !want_source && doc.cache_mb > 0) {
@@ -804,7 +744,6 @@ void RenderWorker::run() {
             if (!cache_doc_history) {
                 uint64_t ctx = cache_doc_hash;
                 ctx = hash_combine(ctx, preview_div);
-                ctx = hash_combine(ctx, overlay_mask_id);
                 ctx = hash_combine(ctx, preview_node);
                 ctx = hash_combine(ctx, has_analysis ? 1u : 0u);
                 ctx = hash_combine(ctx, proxy_active ? 2u : 3u);
@@ -814,7 +753,6 @@ void RenderWorker::run() {
             }
         }
 
-        const auto msrc = mask_readers.collect(resolved, mod_frame);
         const auto lsrc = trim_readers.collect(resolved, mez_path,
                                                playhead_src,
                                                player.frame_count());
@@ -852,9 +790,8 @@ void RenderWorker::run() {
 
         gfx::GpuImage* source_image = nullptr;
         gfx::GpuImage* final_image = engine->render(
-            cmd_, slot, planes, resolved, mod_frame, mod_fps,
-            overlay_mask_id, msrc.empty() ? nullptr : msrc.data(),
-            msrc.size(), cache_ctx, want_source ? &source_image : nullptr,
+            cmd_, slot, planes, resolved, mod_frame, mod_fps, cache_ctx,
+            want_source ? &source_image : nullptr,
             lsrc.empty() ? nullptr : lsrc.data(), lsrc.size(),
             preview_node);
         slot = (slot + 1) % gfx::kFramesInFlight;
@@ -930,7 +867,7 @@ void RenderWorker::run() {
     }
 }
 
-// Audio Scope source (spec §7 family): mono copy of the PCM sidecar,
+// Audio Scope source (family): mono copy of the PCM sidecar,
 // block-averaged down to ~16 kHz for the engine's per-frame waveform
 // strip. Deterministic — preview and export run the same reduction.
 std::vector<int16_t> load_scope_audio(const std::filesystem::path& pcm_path,
@@ -1002,20 +939,27 @@ std::unique_ptr<ExportJob> start_export(gfx::Device& device,
             raw->done = true;
             return;
         }
-        // Audio Scope parity with preview (spec §11): same PCM reduction.
+        // Output scale: the export engine rides the same proxy
+        // divisor preview uses — kernels sample by uv, so working targets
+        // and the NV12 readback shrink cleanly together.
+        engine->set_preview_divisor(doc_copy.export_scale);
+        const uint32_t out_w =
+            std::max((reader.width() / doc_copy.export_scale) & ~1u, 2u);
+        const uint32_t out_h =
+            std::max((reader.height() / doc_copy.export_scale) & ~1u, 2u);
+        // Audio Scope parity with preview: same PCM reduction.
         {
             uint32_t scope_rate = 0;
             auto scope_mono = load_scope_audio(pcm_path, &scope_rate);
             engine->set_scope_audio(std::move(scope_mono), scope_rate);
         }
         codec::DecodedFrame decoded;
-        MaskSourceReaders mask_readers;
         LayerTrimReaders trim_readers;
         mod::TimeRemap remap;
         const double fps = reader.fps();
-        // Clip trim (spec §3/§9): export renders exactly the trim region;
+        // Clip trim: export renders exactly the trim region;
         // modulation still resolves on absolute timeline frames so preview
-        // and export stay bit-identical (spec §11).
+        // and export stay bit-identical.
         const uint32_t total = reader.frame_count();
         const uint32_t t_in =
             std::min(doc_copy.clip_trim_in, total ? total - 1 : 0u);
@@ -1025,7 +969,7 @@ std::unique_ptr<ExportJob> start_export(gfx::Device& device,
         const uint32_t span = t_out > t_in ? t_out - t_in : total;
         auto producer = [&](uint32_t f, std::vector<uint8_t>& nv12) {
             const uint32_t abs_f = t_in + f;
-            // Same time-remap math as preview (spec §6.1/§11): export
+            // Same time-remap math as preview: export
             // walks frames sequentially, so the prefix sum is incremental.
             const uint32_t src = remap.source_frame(
                 doc_copy, abs_f, fps, has_analysis ? &curves_copy : nullptr,
@@ -1041,7 +985,7 @@ std::unique_ptr<ExportJob> start_export(gfx::Device& device,
             planes.v_stride = view.v.stride;
             planes.width = view.width;
             planes.height = view.height;
-            // Same resolve as preview (spec §11: one code path, fixed
+            // Same resolve as preview (one code path, fixed
             // timestep on frame index) — including the video-sample view
             // of the identical post-remap decoded frame.
             mod::SourceFrameView sfv;
@@ -1056,26 +1000,26 @@ std::unique_ptr<ExportJob> start_export(gfx::Device& device,
             const doc::Document resolved = mod::resolve(
                 doc_copy, abs_f, fps, has_analysis ? &curves_copy : nullptr,
                 -1.0, -1.0, &sfv);
-            const auto msrc = mask_readers.collect(resolved, abs_f);
             const auto lsrc = trim_readers.collect(resolved, mez_path, src,
                                                    reader.frame_count());
             return readback->render(*engine, planes, resolved, abs_f, fps,
-                                    nv12,
-                                    msrc.empty() ? nullptr : msrc.data(),
-                                    msrc.size(), 0,
+                                    nv12, 0,
                                     lsrc.empty() ? nullptr : lsrc.data(),
                                     lsrc.size());
         };
         media::ExportOptions options;
+        options.video_bitrate_bps = static_cast<uint32_t>(
+            std::clamp(doc_copy.export_bitrate_mbps, 1.0f, 60.0f) *
+            1'000'000.0f);
         // Trimmed exports keep audio in sync by skipping the same lead-in;
-        // the user nudge (spec §7, positive = audio later) subtracts.
+        // the user nudge (positive = audio later) subtracts.
         options.audio_offset_seconds =
             (fps > 0.0 ? t_in / fps : 0.0) -
             static_cast<double>(doc_copy.audio_offset_ms) * 0.001;
         raw->result = media::export_movie(
-            reader.width(), reader.height(), reader.timescale(),
-            reader.frame_duration(), span, producer, pcm_path,
-            out_path, options, &raw->progress);
+            out_w, out_h, reader.timescale(), reader.frame_duration(), span,
+            producer, doc_copy.export_audio ? pcm_path : "", out_path,
+            options, &raw->progress);
         raw->done = true;
     });
     return job;
@@ -1093,8 +1037,8 @@ struct EffectUiState {
     ui::ButtonState route_buttons[18], key_buttons[18], expose_buttons[18];
     ui::ButtonState group_button, rnd_button;
     ui::ButtonState solo_button, copy_button;
-    ui::DropdownState mask_dd;
-    // Selector-param dropdowns + the Text card's string field (v5.6).
+    ui::ButtonState value_edit_button;   // rail type-in field
+    // Selector-param dropdowns + the Text card's string field.
     ui::DropdownState param_dd[16];
     ui::ButtonState text_button;
 };
@@ -1102,10 +1046,10 @@ struct EffectUiState {
 struct GroupUiState {
     ui::ButtonState fold_button, ungroup_button, save_button;
     ui::ButtonState bypass_check;
-    // Face rows (v5.3): exposed member params as direct aliases.
+    // Face rows: exposed member params as direct aliases.
     ui::SliderState face_sliders[8];
     ui::ButtonState face_remove[8];
-    ui::DropdownState face_dd[8];   // selector aliases (v5.6)
+    ui::DropdownState face_dd[8];   // selector aliases
 };
 
 struct RouteUiState {
@@ -1114,27 +1058,20 @@ struct RouteUiState {
     ui::SliderState rate_slider, amount_slider;
 };
 
-struct MaskUiState {
-    ui::ButtonState remove_button, view_button,
-        invert_check, chain_add_button, key_points_button;
-    ui::ButtonState freerun_check;
-    ui::DropdownState type_dd, extract_dd, fit_dd, source_dd, combine_dd,
-        combine_op_dd;
-    ui::SliderState sliders[15];
-    ui::ButtonState route_buttons[15], key_buttons[15];
-    ui::ButtonState chain_remove[4];
-    ui::SliderState chain_sliders[4][8];
-};
-
 struct LayerUiState {
     ui::ButtonState select_button, visible_check, remove_button;
     ui::ButtonState up_button, down_button;
-    ui::DropdownState blend_dd, mask_dd, osc_dd;
+    ui::DropdownState blend_dd, osc_dd;
+    ui::SwatchState swatch_a, swatch_b;
     ui::SliderState sliders[9];
-    // Transform + trim (spec §5), folded by default.
+    ui::ButtonState value_edit_button;   // rail type-in field
+    // Layer params are mod targets — route/key micros per row.
+    ui::ButtonState route_buttons[9], key_buttons[9];
+    // Transform + trim, folded by default.
     bool xf_open = false;
     ui::ButtonState xf_header, flip_h_btn, flip_v_btn;
     ui::SliderState xf_sliders[8];
+    ui::ButtonState xf_route_buttons[8], xf_key_buttons[8];
 };
 
 struct LaneUiState {
@@ -1145,7 +1082,20 @@ struct LaneUiState {
     // A key added this frame: reselected next frame by exact frame match
     // (nearest-to-mouse picked the WRONG key when keys clustered).
     double pending_add_frame = -1.0;
-    ui::ButtonState loop_button;   // loopable region chip (spec §7)
+    // Multi-select: identity by key FRAME so the set survives the
+    // sort the lane command applies. `selected` stays the primary key
+    // (handles, readout). Box-select drags a marquee on empty strip.
+    std::vector<double> sel_frames;
+    bool box_select = false;
+    Vec2 box_anchor{};
+    // Group drag transforms a snapshot from the press — re-deriving from
+    // the live keys every motion would accumulate rounding.
+    bool group_drag = false;
+    double drag_anchor_frame = 0.0;
+    float drag_anchor_value = 0.0f;
+    std::vector<doc::Keyframe> drag_orig;
+    std::vector<double> drag_sel;   // selected frames at press time
+    ui::ButtonState loop_button;   // loopable region chip
     ui::ButtonState mute_button;   // disable chip
     ui::ButtonState kill_button;   // delete-lane X
 };
@@ -1159,13 +1109,13 @@ struct RulerState {
 // Flow-canvas selection (docs/flow_canvas.md): the inspector shows exactly
 // one selected thing. View state — never document state, no undo.
 enum class SelKind : uint8_t {
-    None, Effect, Group, LayerSource, Mask, ModSource, Output,
+    None, Effect, Group, LayerSource, ModSource, Output,
     AddEffect,   // add-effect browser targeting a layer (+ optional slot)
     AddLayer,    // add-layer source picker
 };
 struct Selection {
     SelKind kind = SelKind::None;
-    uint64_t id = 0;   // effect / group / layer / mask / route id by kind
+    uint64_t id = 0;   // effect / group / layer / route id by kind
 };
 
 
@@ -1186,30 +1136,30 @@ struct AppState {
     // Bumped whenever `analysis` is replaced — the render worker copies
     // the curves only when this moves.
     uint64_t analysis_stamp = 1;
-    // Preview render thread (spec §13); owned by wWinMain, pointer here so
+    // Preview render thread; owned by wWinMain, pointer here so
     // clip open/close paths can pause it around player mutation.
     RenderWorker* render_worker = nullptr;
     uint64_t ui_frame_counter = 0;
-    // Sidechain (spec §7): analysis = clip video curves + (sidechain or
+    // Sidechain: analysis = clip video curves + (sidechain or
     // clip) audio curves. clip_analysis keeps the clip's own set.
     mod::AnalysisCurves clip_analysis;
     bool has_clip_analysis = false;
     std::string sc_active_path;         // sidechain merged into `analysis`
     std::filesystem::path sc_pcm_path;  // extracted PCM cache (export mux)
     bool sc_ok = false;
-    double env_key_time = -1.0;         // live keypress trigger (spec §7)
-    // Thumbnail strip (spec §3): RGBA staging until the renderer registers
+    double env_key_time = -1.0;         // live keypress trigger
+    // Thumbnail strip: RGBA staging until the renderer registers
     // it (textures are long-lived; a new clip just registers another one).
     std::vector<uint8_t> thumbs_rgba;
     uint32_t thumbs_w = 0, thumbs_h = 0, thumbs_count = 0;
     bool thumbs_dirty = false;
     const ui::UiTexture* thumbs_tex = nullptr;
-    // Half-res proxy (spec §3): which file the player currently plays.
+    // Half-res proxy: which file the player currently plays.
     bool proxy_active = false;
-    // Lossless import (spec §3 mezzanine option), applies to the NEXT
+    // Lossless import (mezzanine option), applies to the NEXT
     // import. App preference (ui.json), not project state.
     bool import_lossless = false;
-    // Preset browser search (spec §9): plain substring filter. While the
+    // Preset browser search: plain substring filter. While the
     // field has focus, Char events type into it and letter shortcuts stay
     // inert; Enter/Escape release focus.
     std::string preset_filter;
@@ -1227,7 +1177,6 @@ struct AppState {
     TestPattern pattern;
     uint64_t pattern_frame = 0;
 
-    uint64_t overlay_mask_id = 0;   // viewport mask overlay (view state)
     size_t selected_layer = 0;      // the stack panel edits this layer
 
     // Node canvas (docs/flow_canvas.md): selection drives the rail;
@@ -1251,7 +1200,6 @@ struct AppState {
         bool valid = false;
         std::vector<doc::EffectInstance> effects;
         std::vector<doc::ModRoute> routes;
-        std::vector<doc::Mask> masks;
         std::vector<doc::Document::NodeLink> links;
         float origin_x = 0.0f, origin_y = 0.0f;
     } clipboard;
@@ -1261,7 +1209,7 @@ struct AppState {
     // Inline group-card rename (texed subgraph title rename).
     uint64_t group_rename_id = 0;
     std::string group_rename_buf;
-    // Inline Text-card string edit (v5.5): the effect id + edit buffer.
+    // Inline Text-card string edit: the effect id + edit buffer.
     uint64_t text_edit_id = 0;
     std::string text_edit_buf;
     // Rail multi-selection tools (align/distribute).
@@ -1300,7 +1248,7 @@ struct AppState {
     // Menu bar (file / edit / view over the dropdown popup machinery).
     ui::DropdownState menu_states[3];
 
-    // Project file (spec §10). autosaved_revision tracks what the last
+    // Project file. autosaved_revision tracks what the last
     // autosave captured so quiet frames cost nothing.
     std::filesystem::path project_path;
     uint64_t saved_revision = 0;
@@ -1308,59 +1256,93 @@ struct AppState {
     std::chrono::steady_clock::time_point last_autosave =
         std::chrono::steady_clock::now();
 
-    // Preset browser (spec §10): shipped era presets + user-saved ones.
+    // Preset browser: shipped era presets + user-saved ones.
     std::filesystem::path shipped_preset_dir, user_preset_dir;
-    // Text-effect font list (v5.5b): '|'-joined stems of assets/fonts/
+    // Text-effect font list: '|'-joined stems of assets/fonts/
     // *.ttf, same lowercased-filename order the engine indexes — feeds
     // the font dropdown. Scanned once at startup.
     std::string font_options;
     std::vector<doc::Preset> presets;
     int preset_tag_index = -1;      // -1 = all tags
 
-    // Randomize (spec §10): chaos = intensity; counter advances per gesture
+    // Randomize: chaos = intensity; counter advances per gesture
     // so repeated clicks explore, undo walks back one gesture at a time.
     float chaos = 0.5f;
     uint64_t rng_counter = 1;
 
-    // Live mode (spec §9): timeline collapses, transport loops, LFO/drift
-    // run on this wall clock (exempt from determinism, spec §11).
+    // Live mode: timeline collapses, transport loops, LFO/drift
+    // run on this wall clock (exempt from determinism, ).
     bool live_mode = false;
     double app_seconds = 0.0;
 
-    // Preview proxy divisor (spec §10): 1 full, 2 half, 4 quarter.
+    // Preview proxy divisor: 1 full, 2 half, 4 quarter.
     uint32_t preview_div = 1;
 
     // UI preferences — app-level view state persisted in ui.json next to
     // the exe (deliberately not project state): active theme + sidebar
-    // section folds (layers, stack, presets, masks, mod matrix).
+    // section folds (layers, stack, presets, mod matrix).
     int theme_index = 0;
     bool sec_open[5] = {true, true, true, true, true};
     ui::ButtonState sec_buttons[5];
     ui::DropdownState theme_dd;
     ui::ScrollState timeline_scroll;
 
-    // Add-effect browser (view state): one fold per spec §6.1 category
+    // Timeline view: the visible frame range shared by the ruler,
+    // audio strip, and every lane so they stay column-aligned. v1 <= v0
+    // reads as "whole clip". Wheel zooms around the cursor, shift+wheel
+    // pans; zooming fully out restores the whole-clip view.
+    double tl_v0 = 0.0, tl_v1 = 0.0;
+    // Timeline region rect: strips union into _accum during draw, the
+    // frame loop swaps it in — the wheel pre-router and the keyboard
+    // router (Delete / Ctrl+C / Ctrl+V go to keys when hovered) read the
+    // one-frame-stale copy.
+    ui::Rect tl_rect{}, tl_rect_accum{};
+    float tl_strip_x = 0.0f, tl_strip_w = 0.0f;   // ruler column x span
+    // Key clipboard: copies the selected keys of one lane,
+    // normalized to the first key; paste lands at the playhead in the
+    // source lane.
+    std::vector<doc::Keyframe> key_clipboard;
+    doc::ParamKey key_clip_target{};
+    // Inline key readout editor: click the selected key's value
+    // readout to type it (shift+click types the frame); identity by frame
+    // so the doc round-trip cannot lose the key.
+    int key_edit_mode = 0;   // 0 closed, 1 value, 2 frame
+    doc::ParamKey key_edit_target{};
+    double key_edit_frame = 0.0;
+    std::string key_edit_buf;
+    // Rail inline value editor: click a slider's value text to
+    // type it; the commit flows through the row's normal staged path on
+    // the next build. effect_id 0 = closed.
+    doc::ParamKey rail_edit_key{};
+    float rail_edit_scale = 1.0f;   // the row's display multiplier (deg)
+    std::string rail_edit_buf;
+    bool rail_edit_commit = false;
+    // Param clipboard (ctx menu): whole param set of one effect,
+    // pasteable onto any same-type instance.
+    bool param_clip_valid = false;
+    doc::EffectType param_clip_type = doc::EffectType::RgbSplit;
+    std::vector<float> param_clip_values;
+    float param_clip_wet = 1.0f, param_clip_opacity = 1.0f;
+
+    // Add-effect browser (view state): one fold per category
     // nested inside the stack section.
     bool add_fx_open = false;
-    bool fx_cat_open[8] = {};
-    ui::ButtonState add_fx_button, fx_cat_buttons[8];
-    // Add-node search (docs/flow_canvas.md v3): same capture-the-keyboard
+    bool fx_cat_open[static_cast<size_t>(doc::FxCategory::Count)] = {};
+    ui::ButtonState add_fx_button,
+        fx_cat_buttons[static_cast<size_t>(doc::FxCategory::Count)];
+    // Add-node search (docs/flow_canvas.md): same capture-the-keyboard
     // field pattern as the preset search; non-empty = flat filtered list.
     std::string fx_filter;
     bool fx_search_focus = false;
     ui::ButtonState fx_search_btn;
 
-    // Viewport A/B wipe + bypass-all (spec §9). View state, not document
+    // Viewport A/B wipe + bypass-all. View state, not document
     // state — no undo, never exported.
     bool ab_wipe = false;
     float wipe_pos = 0.5f;
     bool bypass_all = false;
 
-    // Bezier mask point editor (spec §8): index of the point being
-    // dragged in the viewport, -1 when idle. View state.
-    int drag_point = -1;
-
-    // Render queue (spec §9): pending exports, each a full snapshot taken
+    // Render queue: pending exports, each a full snapshot taken
     // at queue time (document, analysis, clip bundle) so edits made while
     // a job runs don't leak into it. FIFO; the front starts when the
     // active job finishes.
@@ -1375,7 +1357,7 @@ struct AppState {
     ui::ButtonState queue_remove_buttons[8];
 
     // (Preview-side decode/remap/cache state lives on the render worker —
-    // spec §13 render thread.)
+    // render thread.)
 
     // Widget state
     std::unordered_map<uint64_t, LayerUiState> layer_ui;
@@ -1401,14 +1383,31 @@ struct AppState {
     ui::ButtonState add_layer_buttons[7];
     std::unordered_map<uint64_t, EffectUiState> fx_ui;
     std::unordered_map<uint64_t, RouteUiState> route_ui;
-    std::unordered_map<uint64_t, MaskUiState> mask_ui;
-    ui::ButtonState add_mask_button;
     ui::ButtonState add_layer_open_button;
     ui::ButtonState add_frame_button;
     ui::ButtonState open_add_button;
     std::map<std::pair<uint64_t, int>, LaneUiState> lane_ui;
     ui::ButtonState open_button, open_big_button, play_button, undo_button,
         redo_button, export_button;
+    ui::ButtonState export_cancel_button, export_audio_check;
+    ui::SliderState export_bitrate_slider;
+    ui::DropdownState export_scale_dd;
+    // Monitor volume: app-level prefs, persisted in ui.json.
+    bool audio_muted = false;
+    float audio_gain = 1.0f;
+    ui::ButtonState mute_button;
+    ui::SliderState volume_slider;
+    // Recent projects: newest first, capped, persisted in ui.json;
+    // listed on the project tab.
+    std::vector<std::string> recent_projects;
+    ui::ButtonState recent_buttons[6];
+    // Cache management: size scanned at startup and after edits.
+    uint64_t cache_bytes = 0;
+    ui::ButtonState cache_open_button, cache_clear_button;
+    // Status history: every distinct status line, newest last —
+    // errors stop vanishing when the next status overwrites the strip.
+    std::vector<std::string> status_log;
+    std::string status_log_last;
     ui::ButtonState add_buttons[static_cast<size_t>(doc::EffectType::Count)];
     ui::ButtonState snap_apply[3], snap_store[3];
     ui::SliderState seek_slider;
@@ -1480,12 +1479,6 @@ void validate_selection(AppState& app) {
         case SelKind::AddEffect:
             if (layer_index_by_id(d, app.sel.id) < 0) app.sel = {};
             break;
-        case SelKind::Mask: {
-            bool ok = false;
-            for (const doc::Mask& m : d.masks) ok = ok || m.id == app.sel.id;
-            if (!ok) app.sel = {};
-            break;
-        }
         case SelKind::ModSource: {
             bool ok = false;
             for (const doc::ModRoute& r : d.mod_routes)
@@ -1512,10 +1505,6 @@ void validate_selection(AppState& app) {
                 size_t li = 0, fi = 0;
                 return find_effect_by_id(d, did, &li, &fi);
             }
-            case flow::NodeKind::Mask:
-                for (const doc::Mask& m : d.masks)
-                    if (m.id == did) return true;
-                return false;
             case flow::NodeKind::ModSource:
                 for (const doc::ModRoute& r : d.mod_routes)
                     if (r.id == did) return true;
@@ -1554,7 +1543,7 @@ void load_clip_analysis(AppState& app) {
         app.has_analysis = true;
     }
 
-    // Thumbnail strip (spec §3): RGB thumbs -> one horizontal RGBA strip,
+    // Thumbnail strip: RGB thumbs -> one horizontal RGBA strip,
     // registered as a UI texture by the main loop.
     app.thumbs_tex = nullptr;
     app.thumbs_count = 0;
@@ -1599,7 +1588,7 @@ void load_clip_analysis(AppState& app) {
     }
 }
 
-// Sidechain (spec §7): keep `analysis` = clip video curves + the sidechain
+// Sidechain: keep `analysis` = clip video curves + the sidechain
 // audio curves. Extraction result is cached next to the clip bundle as
 // <stem>.sc.pcm and re-analyzed only when the document path changes.
 void sync_sidechain(AppState& app) {
@@ -1670,6 +1659,14 @@ void save_ui_prefs(const AppState& app) {
     v.set("split_right", static_cast<double>(app.split_right));
     v.set("split_timeline", static_cast<double>(app.split_timeline));
     v.set("split_preview", static_cast<double>(app.split_preview));
+    // Monitor volume + recent projects.
+    v.set("volume", static_cast<double>(app.audio_gain));
+    if (app.audio_muted) v.set("muted", true);
+    if (!app.recent_projects.empty()) {
+        json::Value recents = json::Value::make_array();
+        for (const std::string& r : app.recent_projects) recents.push(r);
+        v.set("recent", std::move(recents));
+    }
     const std::string text = json::write(v, true);
     write_file_bytes(executable_dir() / "ui.json", text.data(), text.size());
 }
@@ -1696,6 +1693,15 @@ void load_ui_prefs(AppState& app) {
     load_frac("split_right", &app.split_right, 0.15f, 0.5f);
     load_frac("split_timeline", &app.split_timeline, 0.1f, 0.6f);
     load_frac("split_preview", &app.split_preview, 0.15f, 0.7f);
+    app.audio_gain = std::clamp(
+        static_cast<float>(parsed.value->get("volume").as_number(1.0)),
+        0.0f, 1.5f);
+    app.audio_muted = parsed.value->get("muted").as_bool(false);
+    for (const json::Value& rv : parsed.value->get("recent").array()) {
+        if (app.recent_projects.size() >= 6) break;
+        std::string p = rv.as_string();
+        if (!p.empty()) app.recent_projects.push_back(std::move(p));
+    }
     ui::set_active_theme(app.theme_index);
 }
 
@@ -1720,22 +1726,34 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
             if (app.render_worker) app.render_worker->resume();
         }
     } resume_guard{app};
-    // Bundle location (spec §3 scratch disk): a bundle that already sits
+    // Bundle location (scratch disk): a bundle that already sits
     // next to the source (hand-built, or from before the cache move) is
     // honored; otherwise bundles live under cache/<path-hash>/ beside the
     // exe so the app never dumps files into footage folders.
+    //
+    // A bundle only counts when it is no older than its source —
+    // footage overwritten at the same path must re-import instead of
+    // silently serving stale frames (the sidechain-audio rule, applied to
+    // the primary bundle). Unreadable timestamps serve what exists.
+    auto usable_bundle = [&](const std::filesystem::path& b) {
+        std::error_code e1, e2;
+        if (!std::filesystem::exists(b, e1)) return false;
+        const auto bundle_t = std::filesystem::last_write_time(b, e1);
+        const auto source_t = std::filesystem::last_write_time(picked, e2);
+        return e1 || e2 || bundle_t >= source_t;
+    };
     std::filesystem::path mez = picked;
     if (mez.extension() != ".mez") {
         std::filesystem::path beside = picked;
         beside.replace_extension(".mez");
-        std::error_code bec;
-        if (std::filesystem::exists(beside, bec))
+        if (usable_bundle(beside))
             mez = beside;
         else
             mez = bundle_dir_for(picked) /
                   (picked.stem().wstring() + L".mez");
     }
-    if (std::filesystem::exists(mez)) {
+    if (mez == picked ? std::filesystem::exists(mez)
+                      : usable_bundle(mez)) {
         std::filesystem::path pcm = mez;
         pcm.replace_extension(".pcm");
         if (!std::filesystem::exists(pcm)) pcm.clear();
@@ -1839,13 +1857,57 @@ void apply_still_duration(AppState& app, double seconds) {
 }
 
 void rescan_presets(AppState& app) {
-    app.presets = doc::scan_presets(app.shipped_preset_dir);
-    std::vector<doc::Preset> user = doc::scan_presets(app.user_preset_dir);
+    int failed = 0;
+    app.presets = doc::scan_presets(app.shipped_preset_dir, &failed);
+    std::vector<doc::Preset> user =
+        doc::scan_presets(app.user_preset_dir, &failed);
     for (doc::Preset& p : user) app.presets.push_back(std::move(p));
+    // A corrupt preset must not vanish silently.
+    if (failed > 0)
+        app.status = std::to_string(failed) +
+                     " preset file(s) failed to load";
+}
+
+// Cache footprint: summed on demand — startup and after clears —
+// never per frame.
+uint64_t scan_cache_bytes() {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             executable_dir() / "cache", ec);
+         !ec && it != std::filesystem::recursive_directory_iterator();
+         it.increment(ec)) {
+        if (it->is_regular_file(ec)) total += it->file_size(ec);
+    }
+    return total;
+}
+
+// Recent-projects list: newest first, deduped, capped; persisted
+// with the ui prefs and listed on the project tab.
+void remember_recent_project(AppState& app,
+                             const std::filesystem::path& path) {
+    const std::string s = path.string();
+    auto& recents = app.recent_projects;
+    recents.erase(std::remove(recents.begin(), recents.end(), s),
+                  recents.end());
+    recents.insert(recents.begin(), s);
+    if (recents.size() > 6) recents.resize(6);
+    save_ui_prefs(app);
+}
+
+// Autosave target: titled projects snapshot beside their file,
+// untitled sessions under cache/ — the highest-risk case (new work never
+// saved) is exactly the one that must be covered.
+std::filesystem::path autosave_path_for(const AppState& app) {
+    if (app.project_path.empty())
+        return executable_dir() / "cache" / "untitled.autosave.json";
+    std::filesystem::path p = app.project_path;
+    p.replace_extension(".autosave.json");
+    return p;
 }
 
 void save_project(AppState& app, const std::filesystem::path& path) {
-    // Rolling project versions (spec §10): <name>.v1.json is the previous
+    // Rolling project versions: <name>.v1.json is the previous
     // save, .v2 the one before, .v3 the oldest kept. Rotated by copy, so
     // nothing is ever deleted — only overwritten by older history.
     std::error_code ec;
@@ -1868,18 +1930,52 @@ void save_project(AppState& app, const std::filesystem::path& path) {
     }
     app.document.name = path.stem().string();
     if (doc::save_document(path, app.document)) {
+        const bool was_untitled = app.project_path.empty();
         app.project_path = path;
         app.saved_revision = app.document.revision;
         app.autosaved_revision = app.document.revision;
         app.status = "saved " + path.filename().string();
+        remember_recent_project(app, path);
+        // The work now lives in a real file — retire the autosaves that
+        // covered it.
+        std::filesystem::remove(autosave_path_for(app), ec);
+        if (was_untitled)
+            std::filesystem::remove(
+                executable_dir() / "cache" / "untitled.autosave.json", ec);
     } else {
         app.status = "save failed: " + path.string();
     }
 }
 
-void open_project(AppState& app, const std::filesystem::path& path) {
+void open_project(AppState& app, const std::filesystem::path& path,
+                  platform::Window* window) {
+    // Crash recovery: a newer .autosave.json beside the project
+    // holds work the last session never saved — offer it before loading.
+    std::filesystem::path load_from = path;
+    bool restored = false;
+    {
+        std::filesystem::path auto_path = path;
+        auto_path.replace_extension(".autosave.json");
+        std::error_code e1, e2;
+        if (window && std::filesystem::exists(auto_path, e1) &&
+            std::filesystem::last_write_time(auto_path, e1) >
+                std::filesystem::last_write_time(path, e2) &&
+            !e1 && !e2) {
+            if (platform::show_confirm(
+                    window, "looks",
+                    "a newer autosave of " + path.filename().string() +
+                        " exists - restore it?",
+                    false) == platform::ConfirmResult::Yes) {
+                load_from = auto_path;
+                restored = true;
+            } else {
+                std::filesystem::remove(auto_path, e1);   // declined = stale
+            }
+        }
+    }
     std::string error;
-    auto loaded = doc::load_document(path, &error);
+    auto loaded = doc::load_document(load_from, &error);
+    if (!loaded && restored) loaded = doc::load_document(path, &error);
     if (!loaded) {
         app.status = "open failed: " + error;
         return;
@@ -1887,7 +1983,6 @@ void open_project(AppState& app, const std::filesystem::path& path) {
     app.document = std::move(*loaded);
     app.undo.clear();
     app.selected_layer = 0;
-    app.overlay_mask_id = 0;
     // Land on something editable: the base layer's first effect (or its
     // source) so the inspector never opens empty on a real project.
     app.sel = {};
@@ -1900,6 +1995,10 @@ void open_project(AppState& app, const std::filesystem::path& path) {
     }
     app.project_path = path;
     app.saved_revision = app.autosaved_revision = app.document.revision;
+    // A restored autosave is unsaved work — keep the dirty star lit so
+    // the exit guard covers it until a real save.
+    if (restored) app.saved_revision = app.document.revision - 1;
+    remember_recent_project(app, path);
     std::string note = "opened " + path.filename().string();
     if (!app.document.clip_path.empty()) {
         const std::filesystem::path clip = app.document.clip_path;
@@ -1928,7 +2027,33 @@ void open_project(AppState& app, const std::filesystem::path& path) {
     if (app.status.empty()) app.status = std::move(note);
 }
 
-// UI-side per-frame job post (spec §13 render thread): copies only what
+// Unsaved-changes guard: called before anything that would drop the
+// document (close, open-over). True = proceed (saved or discarded), false =
+// the user cancelled. Untitled documents route through Save-As.
+bool confirm_discard_changes(AppState& app, platform::Window* window) {
+    if (app.document.revision == app.saved_revision) return true;
+    const std::string name = app.project_path.empty()
+        ? std::string("untitled")
+        : app.project_path.filename().string();
+    const auto r = platform::show_confirm(
+        window, "looks", "save changes to " + name + "?", true);
+    if (r == platform::ConfirmResult::Cancel) return false;
+    if (r == platform::ConfirmResult::No) return true;
+    std::filesystem::path path = app.project_path;
+    if (path.empty()) {
+        auto picked = platform::show_save_dialog(
+            window, {{"looks project", "*.json"}},
+            app.document.name + ".json");
+        if (!picked) return false;
+        if (picked->extension() != ".json")
+            picked->replace_extension(".json");
+        path = *picked;
+    }
+    save_project(app, path);
+    return app.document.revision == app.saved_revision;  // save can fail
+}
+
+// UI-side per-frame job post (render thread): copies only what
 // changed — the document rides its revision, the analysis its stamp — and
 // bumps the serial so the worker wakes when a re-render is due.
 void push_render_job(RenderWorker& w, AppState& app) {
@@ -1956,19 +2081,15 @@ void push_render_job(RenderWorker& w, AppState& app) {
             }
         };
         set(j.mez_path, app.mez_path);
-        set(j.overlay_mask_id, app.overlay_mask_id);
-        // Selection-follows preview (v5.4): effects/sources/groups show
-        // their own output; masks their matte. Output / value nodes /
-        // boundary nodes / no selection = the composite.
+        // Selection-follows preview: effects/sources/groups show
+        // their own output. Output / value nodes / boundary nodes / no
+        // selection = the composite.
         uint64_t preview_key = 0;
         switch (app.sel.kind) {
             case SelKind::Effect:
             case SelKind::LayerSource:
             case SelKind::Group:
                 preview_key = app.sel.id;
-                break;
-            case SelKind::Mask:
-                preview_key = app.sel.id | doc::kMaskParamBit;
                 break;
             default:
                 break;
@@ -2011,9 +2132,9 @@ struct FxRowActions {
     bool* bypass_staged;
     bool* group_toggle;   // "g": group with above / join above's / leave
     bool* randomize;      // "r": mutate this effect at the chaos intensity
-    bool* solo_changed = nullptr;    // spec §5 solo toggle
+    bool* solo_changed = nullptr;    // solo toggle
     bool* solo_staged = nullptr;
-    bool* duplicate = nullptr;       // spec §5 stack duplicate
+    bool* duplicate = nullptr;       // stack duplicate
 };
 
 struct FrameUi {
@@ -2030,12 +2151,49 @@ struct FrameUi {
     bool* seek_changed = nullptr;
     ui::LayoutNode* preview = nullptr;
 
+    // Rail inline value editors: a click on a slider's value text
+    // opens the type-in for that ParamKey.
+    struct RailEdit {
+        doc::ParamKey key;
+        float scale;         // display multiplier (deg rows)
+        const char* seed;    // current shown value, pre-formatted
+        bool* clicked;
+    };
+    std::vector<RailEdit> rail_edits;
+
+    // Export settings + cancel.
+    bool* export_cancel_clicked = nullptr;
+    // Monitor volume.
+    bool* mute_clicked = nullptr;
+    float* volume_staged = nullptr;
+    bool* volume_changed = nullptr;
+    bool* volume_released = nullptr;
+    // Recent-project rows (project tab).
+    struct RecentRow {
+        size_t index;
+        bool* clicked;
+    };
+    std::vector<RecentRow> recent_rows;
+    // Cache management.
+    bool* cache_open_clicked = nullptr;
+    bool* cache_clear_clicked = nullptr;
+    float* export_bitrate_staged = nullptr;
+    bool* export_bitrate_changed = nullptr;
+    bool* export_bitrate_released = nullptr;
+    int* export_scale_selected = nullptr;
+    bool* export_audio_staged = nullptr;
+    bool* export_audio_changed = nullptr;
+
     // Modulation UI staging.
     struct RouteRow {
         uint64_t id;
         int* source_selected;   // dropdown picks; -1 = untouched
         int* shape_selected;
         int* curve_selected;
+        // Canvas card dropdowns: the flow rows write staged floats;
+        // post-frame these translate into the picks above.
+        float* cv_pick_staged[3] = {};   // source / shape / curve
+        bool* cv_pick_changed[3] = {};
         bool* remove;
         float* rate_staged;
         bool* rate_changed;
@@ -2045,7 +2203,7 @@ struct FrameUi {
         bool* amount_changed;
         bool* amount_released;
         float amount_original;
-        // Video-sampling geometry rows (v4): px, py, pw, ph. Null when the
+        // Video-sampling geometry rows: px, py, pw, ph. Null when the
         // source type has no sampling window.
         float* pos_staged[4];
         bool* pos_changed[4];
@@ -2064,10 +2222,10 @@ struct FrameUi {
         doc::ParamKey key;
         float value;    // current base value, keyed at the playhead
         bool* clicked;
-        // Canvas rows: the toggle ENABLES/DISABLES keyframing (a lane
-        // with keys → remove it); rail rows keep the key-at-playhead
-        // toggle for scrub-and-key workflows.
-        bool lane_toggle = false;
+        // Both surfaces: the k dot toggles ONE key at the playhead
+        // — scrub-and-key everywhere. Lane deletion lives on the lane's X
+        // in the timeline; a same-looking control must never wipe an
+        // animation.
     };
     std::vector<KeyToggle> key_toggles;
 
@@ -2081,7 +2239,7 @@ struct FrameUi {
 
     // Add-effect browser folds.
     bool* add_fx_toggle = nullptr;
-    bool* fx_cat_clicked[8] = {};
+    bool* fx_cat_clicked[static_cast<size_t>(doc::FxCategory::Count)] = {};
     // Multi-selection align/distribute (rail): left, top, spread h/v.
     bool* align_clicked[4] = {};
 
@@ -2094,7 +2252,7 @@ struct FrameUi {
     bool lane_release = false;
 
     float seek_to = -1.0f;    // ruler scrub target (frames)
-    // Timeline region edits (spec §9: trim handles + loop region), from
+    // Timeline region edits (trim handles + loop region), from
     // ruler drags. -1 = untouched this frame.
     float trim_in_to = -1.0f;
     float trim_out_to = -1.0f;
@@ -2106,7 +2264,7 @@ struct FrameUi {
         doc::ParamKey target;
         bool* clicked;
     };
-    std::vector<LaneLoop> lane_loops;   // per-lane loop chip (spec §7)
+    std::vector<LaneLoop> lane_loops;   // per-lane loop chip
     struct LaneMute {
         doc::ParamKey target;
         bool* clicked;
@@ -2121,11 +2279,14 @@ struct FrameUi {
     bool* snap_store_clicked[3] = {};
 
     // Layer panel staging.
+    // Fields ≤ Rotate double as the kLayerParamBit param indices (v5.7
+    // layer-param modulation) — keep the two in lockstep.
     enum class LayerField : int {
         Opacity, ColorAR, ColorAG, ColorAB, ColorBR, ColorBG, ColorBB,
         Scale, Angle,
-        // Transform + trim (spec §5).
+        // Transform + trim.
         CropL, CropR, CropT, CropB, XfScale, Rotate, TrimIn, TrimOut,
+        OscShape,   // waveform/shape selector (canvas dropdown row)
     };
     struct LayerStage {
         uint64_t layer_id;
@@ -2136,6 +2297,17 @@ struct FrameUi {
         bool* released;
     };
     std::vector<LayerStage> layer_stages;
+    // A picker edit stages the whole rgb triplet at once — one coalesced
+    // layer command instead of three channel commands.
+    struct ColorStage {
+        uint64_t layer_id;
+        bool color_b;
+        float* staged;   // [3]
+        float original[3];
+        bool* changed;
+        bool* released;
+    };
+    std::vector<ColorStage> color_stages;
     struct LayerRow {
         size_t index;
         uint64_t id;
@@ -2143,13 +2315,12 @@ struct FrameUi {
         bool* visible_changed;
         bool* visible_staged;
         int* blend_selected;    // dropdown pick; -1 = untouched
-        int* mask_selected;     // [none, masks...]; -1 = untouched
         int* osc_shape_selected = nullptr;   // oscillator waveform pick
         bool* remove;
         bool* up = nullptr;     // swap toward index 0 (bottom of composite)
         bool* down = nullptr;
         bool* xf_toggle = nullptr;   // fold/unfold the transform section
-        bool* flip_h = nullptr;      // toggle clicks (spec §5 transform)
+        bool* flip_h = nullptr;      // toggle clicks (transform)
         bool* flip_v = nullptr;
     };
     std::vector<LayerRow> layer_rows;
@@ -2166,7 +2337,7 @@ struct FrameUi {
         bool* save;
     };
     std::vector<GroupActions> group_actions;
-    // Group face (v5.3): expose/hide one member param (texed expose).
+    // Group face: expose/hide one member param (texed expose).
     struct ExposeToggle {
         size_t layer_index;
         uint64_t group_id;
@@ -2200,19 +2371,19 @@ struct FrameUi {
     float* speed_staged = nullptr;
     bool* speed_changed = nullptr;
     int* time_mode_selected = nullptr;   // dropdown pick; -1 = untouched
-    // Sidechain + audio nudge (spec §7).
+    // Sidechain + audio nudge.
     int* sc_selected = nullptr;          // [clip, <file>, pick]; -1 untouched
     bool* sc_mux_changed = nullptr;
     bool* sc_mux_staged = nullptr;
     float* nudge_staged = nullptr;
     bool* nudge_changed = nullptr;
     bool* nudge_released = nullptr;
-    bool* proxy_toggle_changed = nullptr;   // spec §3 half-res proxy
+    bool* proxy_toggle_changed = nullptr;   // half-res proxy
     bool* proxy_toggle_staged = nullptr;
-    bool* lossless_changed = nullptr;       // spec §3 lossless import pref
+    bool* lossless_changed = nullptr;       // lossless import pref
     bool* lossless_staged = nullptr;
-    bool* preset_search_clicked = nullptr;  // spec §9 searchable browser
-    bool* preset_import_clicked = nullptr;  // spec §9 single-file import
+    bool* preset_search_clicked = nullptr;  // searchable browser
+    bool* preset_import_clicked = nullptr;  // single-file import
     bool* duration_clicked = nullptr;       // still-clip duration field
     bool* ab_clicked = nullptr;
     float* wipe_staged = nullptr;
@@ -2226,74 +2397,11 @@ struct FrameUi {
     };
     std::vector<QueueRow> queue_rows;
 
-    // Mask UI staging.
-    enum class MaskField : int {
-        CenterX, CenterY, RadiusX, RadiusY, Roundness, Feather,
-        BlackPoint, WhitePoint, Gamma, KeyCenter, KeyRange, KeyR, KeyG, KeyB,
-        BlurPx, GrowPx, GenScale, GenAngle,
-    };
-    struct MaskStage {
-        uint64_t mask_id;
-        MaskField field;
-        float* staged;
-        float original;
-        bool* changed;
-        bool* released;
-    };
-    std::vector<MaskStage> mask_stages;
-    struct MaskActions {
-        uint64_t mask_id;
-        int* type_selected;      // dropdown picks; -1 = untouched
-        int* extract_selected;
-        bool* remove;
-        bool* view;
-        bool* invert_changed;
-        bool* invert_staged;
-        bool* chain_add;
-        // Source dropdown (spec §8: clip | layers | generators | file |
-        // pick). The build stage records the index layout so the handler
-        // decodes the pick without re-deriving it.
-        int* source_selected = nullptr;
-        int src_layer_base = -1;
-        int src_layer_count = 0;
-        int src_gen_base = -1;
-        int src_file_index = -1;
-        int src_pick_index = -1;
-        int* fit_selected = nullptr;
-        bool* freerun_changed = nullptr;
-        bool* freerun_staged = nullptr;
-        bool* key_points = nullptr;    // whole-shape keyframe at playhead
-        int* combine_selected = nullptr;      // [none, other masks...]
-        int* combine_op_selected = nullptr;   // add/subtract/intersect
-    };
-    std::vector<MaskActions> mask_actions;
-    struct MaskChainStage {
-        uint64_t mask_id;
-        size_t chain_index;
-        int param_index;
-        float* staged;
-        float original;
-        bool* changed;
-        bool* released;
-    };
-    std::vector<MaskChainStage> mask_chain_stages;
-    struct MaskChainRemove {
-        uint64_t mask_id;
-        size_t chain_index;
-        bool* clicked;
-    };
-    std::vector<MaskChainRemove> mask_chain_removes;
-    bool* add_mask_clicked = nullptr;
     bool* add_layer_open = nullptr;   // switch the rail to the layer picker
     bool* fx_search_clicked = nullptr;
     bool* add_frame_clicked = nullptr;
     bool* open_add_clicked = nullptr;   // None-selection "+ add node..."
-    struct EffectMaskCycle {
-        size_t fx_index;
-        int* selected;   // dropdown pick into [none, masks...]; -1 = none
-    };
-    std::vector<EffectMaskCycle> effect_mask_cycles;
-    // Rail selector dropdown (v5.6): a picked option index lands as the
+    // Rail selector dropdown: a picked option index lands as the
     // param's value through set_param_command.
     struct ParamPick {
         size_t layer_index;
@@ -2303,7 +2411,7 @@ struct FrameUi {
         int* selected;   // -1 = untouched this frame
     };
     std::vector<ParamPick> param_picks;
-    // Rail text field (v5.6): clicking opens the shared inline editor.
+    // Rail text field: clicking opens the shared inline editor.
     struct TextEditOpen {
         uint64_t effect_id;
         bool* clicked;
@@ -2490,7 +2598,7 @@ ui::LayoutNode* SplitterBar(ui::LayoutArena& arena, AppState& app,
     return n;
 }
 
-// ASCII ramp atlas for the glyph renderer (spec §6.6): 96 tiles of 8x8,
+// ASCII ramp atlas for the glyph renderer: 96 tiles of 8x8,
 // printable ASCII sorted by ink coverage so tile index tracks luma.
 std::vector<uint8_t> build_ascii_atlas(const ui::Font& font) {
     constexpr uint32_t kW = 128, kH = 48;
@@ -2555,9 +2663,64 @@ struct RulerUser {
     uint32_t trim_out;
     uint32_t loop_in;
     uint32_t loop_out;   // 0/0 = no loop region
-    const ui::UiTexture* thumbs = nullptr;   // filmstrip (spec §3)
+    const ui::UiTexture* thumbs = nullptr;   // filmstrip
     uint32_t thumb_count = 0;
+    double v0 = 0.0, v1 = 0.0;   // visible frame range (zoom)
 };
+
+// Timeline strips union their rects into tl_rect_accum every draw; the
+// frame loop swaps it in and pre-routes the wheel against LAST frame's
+// region (zoom) — run_frame would otherwise hand the wheel to the
+// lane scroll area before any strip could see it.
+void tl_extend_rect(AppState& app, const ui::Rect& r) {
+    ui::Rect& a = app.tl_rect_accum;
+    if (a.w <= 0.0f) {
+        a = r;
+        return;
+    }
+    const float x0 = std::min(a.x, r.x);
+    const float y0 = std::min(a.y, r.y);
+    const float x1 = std::max(a.right(), r.right());
+    const float y1 = std::max(a.bottom(), r.bottom());
+    a = {x0, y0, x1 - x0, y1 - y0};
+}
+
+// Wheel over the timeline region: zoom around the cursor; shift+wheel
+// pans. Zooming out clamps back to the whole clip. The x mapping uses the
+// ruler column (label column excluded via tl_strip_x/w).
+void timeline_zoom_wheel(AppState& app, ui::UiInput& input,
+                         uint32_t frame_count) {
+    if (input.wheel_y == 0.0f || frame_count == 0) return;
+    const ui::Rect& r = app.tl_rect;
+    if (r.w <= 0.0f || input.mouse.x < r.x || input.mouse.x >= r.right() ||
+        input.mouse.y < r.y || input.mouse.y >= r.bottom())
+        return;
+    double v0 = app.tl_v0, v1 = app.tl_v1;
+    if (v1 - v0 < 1.0 || v1 > frame_count) {
+        v0 = 0.0;
+        v1 = frame_count;
+    }
+    const double span = v1 - v0;
+    if (input.mods & platform::kModShift) {
+        const double step = span * 0.1 * -input.wheel_y;
+        v0 = std::clamp(v0 + step, 0.0,
+                        static_cast<double>(frame_count) - span);
+        v1 = v0 + span;
+    } else {
+        const float sx = app.tl_strip_x, sw = std::max(1.0f, app.tl_strip_w);
+        const double t =
+            std::clamp((input.mouse.x - sx) / sw, 0.0f, 1.0f);
+        const double at = v0 + t * span;
+        double ns = std::clamp(span * std::pow(1.25, -input.wheel_y), 4.0,
+                               static_cast<double>(frame_count));
+        v0 = std::clamp(at - (at - v0) * ns / span, 0.0,
+                        static_cast<double>(frame_count) - ns);
+        v1 = v0 + ns;
+    }
+    app.tl_v0 = v0;
+    app.tl_v1 = v1;
+    input.wheel_y = 0.0f;
+}
 
 void hit_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<RulerUser*>(node.user);
@@ -2573,40 +2736,80 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     frame.canvas.draw_sdf_rect(r, 2.0f, theme.control_bg_active);
 
     if (u->frame_count == 0) return;
-    const float per_frame = r.w / static_cast<float>(u->frame_count);
+    tl_extend_rect(*u->app, r);
+    u->app->tl_strip_x = r.x;
+    u->app->tl_strip_w = r.w;
+    const double v0 = u->v0;
+    const double vspan = std::max(1.0, u->v1 - u->v0);
     auto frame_x = [&](double f) {
-        return r.x + static_cast<float>(f) * per_frame;
+        return r.x + static_cast<float>((f - v0) / vspan) * r.w;
     };
 
-    // Filmstrip (spec §3 thumbnail strip) under everything else.
+    // Filmstrip (thumbnail strip) under everything else — the
+    // visible view range maps to the matching slice of the strip.
     if (u->thumbs && u->thumb_count > 0) {
-        frame.canvas.draw_image_quad(r, u->thumbs, 0.0f, 0.0f, 1.0f, 1.0f,
+        const float u0 =
+            static_cast<float>(v0 / std::max(1u, u->frame_count));
+        const float u1 = static_cast<float>(
+            std::min<double>(u->v1, u->frame_count) /
+            std::max(1u, u->frame_count));
+        frame.canvas.draw_image_quad(r, u->thumbs, u0, 0.0f, u1, 1.0f,
                                      ui::Color{1.0f, 1.0f, 1.0f, 0.85f},
                                      2.0f);
     }
 
+    frame.canvas.push_clip(r);
     // Trimmed-out zones read as inert.
     ui::Color dim = theme.window_bg;
     dim.a = 0.55f;
-    if (u->trim_in > 0)
+    if (u->trim_in > 0 && frame_x(u->trim_in) > r.x)
         frame.canvas.draw_sdf_rect(
             {r.x, r.y, frame_x(u->trim_in) - r.x, r.h}, 2.0f, dim);
-    if (u->trim_out < u->frame_count)
+    if (u->trim_out < u->frame_count && frame_x(u->trim_out) < r.right())
         frame.canvas.draw_sdf_rect(
             {frame_x(u->trim_out), r.y,
              r.right() - frame_x(u->trim_out), r.h},
             2.0f, dim);
 
-    // Second ticks.
+    // Second ticks + time labels: ticks every second, a "12s"
+    // label whenever the second spacing leaves ≥ 48 px between labels.
     if (u->fps > 0.0) {
-        for (double f = 0.0; f < u->frame_count; f += u->fps) {
+        const float px_per_sec =
+            static_cast<float>(u->fps / vspan) * r.w;
+        const int label_every =
+            px_per_sec >= 48.0f
+                ? 1
+                : static_cast<int>(std::ceil(48.0f / px_per_sec));
+        const int s0 = std::max(0, static_cast<int>(v0 / u->fps));
+        const int s1 =
+            static_cast<int>((v0 + vspan) / u->fps) + 1;
+        char tick_buf[16];
+        for (int s = s0; s <= s1; ++s) {
+            const double f = s * u->fps;
+            if (f > u->frame_count) break;
             const float x = frame_x(f);
             frame.canvas.draw_line({x, r.y + r.h * 0.5f}, {x, r.bottom()},
                                    1.0f, theme.hairline);
+            if (s % label_every == 0 && x + 30.0f < r.right()) {
+                std::snprintf(tick_buf, sizeof(tick_buf), "%ds", s);
+                ui::draw_text(frame.canvas, frame.font, tick_buf,
+                              {x + 3.0f, r.y + r.h * 0.5f - 5.0f}, 9.0f,
+                              theme.text_disabled);
+            }
         }
     }
 
-    // Loop region band (spec §9) along the top edge.
+    // Markers: M toggles one at the playhead; diamonds on the top
+    // edge, [ ] snap the playhead across keys AND markers.
+    for (const uint32_t m : u->app->document.markers) {
+        const float x = frame_x(m + 0.5);
+        if (x < r.x - 4.0f || x > r.right() + 4.0f) continue;
+        const float my = r.y + 5.0f;
+        frame.canvas.draw_sdf_rect({x - 3.0f, my - 3.0f, 6.0f, 6.0f}, 3.0f,
+                                   theme.accent);
+    }
+
+    // Loop region band along the top edge.
     const float band_h = 4.0f;
     if (u->loop_out > u->loop_in) {
         frame.canvas.draw_sdf_rect(
@@ -2627,6 +2830,7 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // Playhead.
     const float px = frame_x(u->playhead + 0.5);
     frame.canvas.draw_line({px, r.y}, {px, r.bottom()}, 2.0f, theme.accent);
+    frame.canvas.pop_clip();
 
     // Interaction: trim handles > loop band (top strip) > scrub.
     RulerState& state = u->app->ruler;
@@ -2634,7 +2838,8 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto mouse_frame = [&] {
         const float t =
             std::clamp((frame.input.mouse.x - r.x) / r.w, 0.0f, 1.0f);
-        return static_cast<double>(t) * u->frame_count;
+        return std::clamp(v0 + static_cast<double>(t) * vspan, 0.0,
+                          static_cast<double>(u->frame_count));
     };
     if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id)) {
         const float mx = frame.input.mouse.x;
@@ -2686,6 +2891,67 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 }
 
+// Audio strip: loudness silhouette from the import analysis (the
+// same per-frame band curves the mod sources read), onset ticks on the top
+// edge, scene cuts as full-height lines — keyframing gets the material's
+// rhythm in view without touching PCM.
+struct AudioStripUser {
+    AppState* app;
+    const mod::AnalysisCurves* curves;
+    uint32_t frame_count;
+    uint32_t playhead;
+    double v0, v1;
+};
+
+void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<AudioStripUser*>(node.user);
+    const ui::Rect& r = node.rect;
+    const ui::Theme& theme = frame.theme;
+    frame.canvas.draw_sdf_rect(r, 2.0f, theme.control_bg_active);
+    if (u->frame_count == 0) return;
+    tl_extend_rect(*u->app, r);
+    const double v0 = u->v0;
+    const double vspan = std::max(1.0, u->v1 - u->v0);
+    const auto& c = *u->curves;
+    frame.canvas.push_clip(r);
+    const float cy = r.y + r.h * 0.5f;
+    const int cols = std::max(1, static_cast<int>(r.w));
+    for (int i = 0; i < cols; ++i) {
+        // Per-column MAX over the covered frames — averaging (or point
+        // sampling) would swallow one-frame onsets when zoomed out.
+        const double fa = v0 + static_cast<double>(i) / cols * vspan;
+        const double fb = v0 + static_cast<double>(i + 1) / cols * vspan;
+        const uint32_t f0 = static_cast<uint32_t>(std::max(0.0, fa));
+        const uint32_t f1 = std::min(
+            u->frame_count,
+            std::max(f0 + 1, static_cast<uint32_t>(std::max(0.0, fb))));
+        float amp = 0.0f, onset = 0.0f, cut = 0.0f;
+        for (uint32_t f = f0; f < f1; ++f) {
+            amp = std::max(amp, std::max({c.sample(c.low, f),
+                                          c.sample(c.mid, f),
+                                          c.sample(c.high, f)}));
+            onset = std::max(onset, c.sample(c.onset, f));
+            cut = std::max(cut, c.sample(c.cut, f));
+        }
+        const float x = r.x + static_cast<float>(i) + 0.5f;
+        if (cut > 0.5f)
+            frame.canvas.draw_line({x, r.y}, {x, r.bottom()}, 1.0f,
+                                   theme.text_dim.with_alpha(0.8f));
+        const float h =
+            std::max(1.0f, amp * (r.h * 0.5f - 1.0f));
+        frame.canvas.draw_line({x, cy - h}, {x, cy + h}, 1.0f,
+                               theme.accent_dim.with_alpha(0.6f));
+        if (onset > 0.5f)
+            frame.canvas.draw_line({x, r.y}, {x, r.y + 4.0f}, 1.0f,
+                                   theme.accent);
+    }
+    const float px =
+        r.x + static_cast<float>((u->playhead + 0.5 - v0) / vspan) * r.w;
+    frame.canvas.draw_line({px, r.y}, {px, r.bottom()}, 1.0f,
+                           theme.accent.with_alpha(0.5f));
+    frame.canvas.pop_clip();
+}
+
 struct LaneWidgetUser {
     AppState* app;
     FrameUi* out;
@@ -2695,6 +2961,7 @@ struct LaneWidgetUser {
     float min_value, max_value;
     uint32_t frame_count;
     uint32_t playhead;
+    double v0 = 0.0, v1 = 0.0;   // shared visible range
 };
 
 void hit_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
@@ -2711,20 +2978,32 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const ui::Theme& theme = frame.theme;
     const float span = std::max(1.0e-6f, u->max_value - u->min_value);
     const uint32_t frames = std::max(1u, u->frame_count);
+    tl_extend_rect(*u->app, r);
+    const double v0 = u->v0;
+    const double vspan = std::max(1.0, u->v1 - u->v0);
 
     auto to_x = [&](double f) {
-        return r.x + static_cast<float>(f / frames) * r.w;
+        return r.x + static_cast<float>((f - v0) / vspan) * r.w;
     };
     auto to_y = [&](float v) {
         return r.bottom() - (v - u->min_value) / span * r.h;
     };
     auto from_x = [&](float x) {
-        return std::clamp(static_cast<double>((x - r.x) / r.w) * frames, 0.0,
-                          static_cast<double>(frames - 1));
+        return std::clamp(
+            v0 + static_cast<double>((x - r.x) / r.w) * vspan, 0.0,
+            static_cast<double>(frames - 1));
     };
     auto from_y = [&](float y) {
         return std::clamp(u->min_value + (r.bottom() - y) / r.h * span,
                           u->min_value, u->max_value);
+    };
+    // Selection is identified by key FRAME (survives the sort a lane
+    // command applies); resolve the index set for this frame's key list.
+    const auto& keys = u->lane->keys;
+    auto is_selected = [&](size_t i) {
+        for (const double f : state.sel_frames)
+            if (keys[i].frame == f) return true;
+        return false;
     };
 
     frame.canvas.draw_sdf_rect(r, 2.0f, theme.control_bg_active);
@@ -2735,15 +3014,14 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // Muted lanes render dimmed (keys kept, param not driven).
     const float lane_alpha = u->lane->muted ? 0.35f : 1.0f;
 
-    const auto& keys = u->lane->keys;
     if (state.selected >= static_cast<int>(keys.size())) state.selected = -1;
 
-    // Sampled curve.
+    // Sampled curve (over the visible range only).
     if (!keys.empty()) {
         const int steps = std::max(2, static_cast<int>(r.w / 3.0f));
         Vec2 prev{};
         for (int i = 0; i <= steps; ++i) {
-            const double f = static_cast<double>(i) / steps * frames;
+            const double f = v0 + static_cast<double>(i) / steps * vspan;
             const float v = std::clamp(mod::eval_lane(*u->lane, f),
                                        u->min_value, u->max_value);
             const Vec2 p{to_x(f), to_y(v)};
@@ -2755,6 +3033,18 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
+    // Value axis: range labels so a key's height means something.
+    {
+        char axis_buf[24];
+        std::snprintf(axis_buf, sizeof(axis_buf), "%.5g", u->max_value);
+        ui::draw_text(frame.canvas, frame.font, axis_buf,
+                      {r.x + 3.0f, r.y + 1.0f}, 9.0f, theme.text_disabled);
+        std::snprintf(axis_buf, sizeof(axis_buf), "%.5g", u->min_value);
+        ui::draw_text(frame.canvas, frame.font, axis_buf,
+                      {r.x + 3.0f, r.bottom() - 11.0f}, 9.0f,
+                      theme.text_disabled);
+    }
+
     // Playhead.
     const float px = to_x(u->playhead + 0.5);
     frame.canvas.draw_line({px, r.y}, {px, r.bottom()}, 1.0f,
@@ -2763,11 +3053,12 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // Keys (+ selected key's bezier handle dots).
     for (size_t i = 0; i < keys.size(); ++i) {
         const Vec2 p{to_x(keys[i].frame), to_y(keys[i].value)};
-        const bool selected = static_cast<int>(i) == state.selected;
+        const bool selected =
+            static_cast<int>(i) == state.selected || is_selected(i);
         frame.canvas.draw_sdf_rect({p.x - 3, p.y - 3, 6, 6}, 1.0f,
                                    (selected ? theme.text : theme.accent)
                                        .with_alpha(lane_alpha));
-        if (selected && !keys[i].hold) {
+        if (static_cast<int>(i) == state.selected && !keys[i].hold) {
             const Vec2 out_p{to_x(keys[i].frame + keys[i].out_dx),
                                  to_y(keys[i].value + keys[i].out_dy)};
             const Vec2 in_p{to_x(keys[i].frame + keys[i].in_dx),
@@ -2780,22 +3071,69 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                        theme.text_dim);
         }
     }
+
+    // Interp chips: lin / ease / hold for the selected set, drawn
+    // top-right of the strip; ease sets flat thirds tangents (easy-ease).
+    const bool has_sel = state.selected >= 0 || !state.sel_frames.empty();
+    ui::Rect chip_rects[3]{};
+    static const char* kChipNames[3] = {"lin", "ease", "hold"};
+    if (has_sel) {
+        float cx = r.right() - 4.0f;
+        for (int ci = 2; ci >= 0; --ci) {
+            const float cw = ci == 1 ? 30.0f : 24.0f;
+            cx -= cw + 2.0f;
+            chip_rects[ci] = {cx, r.y + 2.0f, cw, 12.0f};
+            frame.canvas.draw_sdf_rect(chip_rects[ci], 2.0f,
+                                       theme.control_bg);
+            ui::draw_text(frame.canvas, frame.font, kChipNames[ci],
+                          {chip_rects[ci].x + 4.0f,
+                           chip_rects[ci].y + 1.5f},
+                          9.0f, theme.text_dim);
+        }
+    }
+
+    // Selected-key readout: click the value to type it, shift+click
+    // the frame; the open editor shows the buffer with a caret.
+    ui::Rect readout_rect{};
+    if (state.selected >= 0 && state.selected < static_cast<int>(keys.size())) {
+        const doc::Keyframe& sk = keys[static_cast<size_t>(state.selected)];
+        const bool editing = u->app->key_edit_mode != 0 &&
+                             u->app->key_edit_target == u->target &&
+                             u->app->key_edit_frame == sk.frame;
+        char ro[64];
+        if (editing)
+            std::snprintf(ro, sizeof(ro), "%s %s_",
+                          u->app->key_edit_mode == 2 ? "f" : "v",
+                          u->app->key_edit_buf.c_str());
+        else
+            std::snprintf(ro, sizeof(ro), "f %.0f  %.4g", sk.frame,
+                          sk.value);
+        readout_rect = {r.x + 34.0f, r.y + 2.0f,
+                        10.0f + 5.4f * static_cast<float>(std::strlen(ro)),
+                        12.0f};
+        frame.canvas.draw_sdf_rect(readout_rect, 2.0f, theme.control_bg);
+        ui::draw_text(frame.canvas, frame.font, ro,
+                      {readout_rect.x + 4.0f, readout_rect.y + 1.5f}, 9.0f,
+                      editing ? theme.text : theme.text_dim);
+    }
     frame.canvas.pop_clip();
 
     // ---- interaction (queued into FrameUi, applied post-frame).
     const ui::WidgetId id = frame.ctx.acquire_widget_id(&state);
     const bool owns = frame.ctx.widget_owns_mouse(id);
     const Vec2 mouse = frame.input.mouse;
-    const bool dragging =
-        state.dragging_key || state.dragging_in || state.dragging_out;
+    const bool dragging = state.dragging_key || state.dragging_in ||
+                          state.dragging_out || state.group_drag ||
+                          state.box_select;
 
     auto emit = [&](std::vector<doc::Keyframe> new_keys) {
         u->out->lane_edits.push_back({u->target, std::move(new_keys)});
     };
-
-    // Right-click a key deletes it (Ctrl+click still works).
-    if ((frame.input.buttons_pressed & ui::kMouseRight) && owns &&
-        !dragging) {
+    auto in_rect = [&](const ui::Rect& rc) {
+        return rc.w > 0.0f && mouse.x >= rc.x && mouse.x < rc.right() &&
+               mouse.y >= rc.y && mouse.y < rc.bottom();
+    };
+    auto nearest_key = [&]() {
         int hit = -1;
         float best = 8.0f;
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -2807,77 +3145,230 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 hit = static_cast<int>(i);
             }
         }
+        return hit;
+    };
+
+    // Right-click deletes the hit key — and its whole selected set when
+    // it is part of one.
+    if ((frame.input.buttons_pressed & ui::kMouseRight) && owns &&
+        !dragging) {
+        const int hit = nearest_key();
         if (hit >= 0) {
-            std::vector<doc::Keyframe> edited = keys;
-            edited.erase(edited.begin() + hit);
+            std::vector<doc::Keyframe> edited;
+            if (is_selected(static_cast<size_t>(hit))) {
+                for (size_t i = 0; i < keys.size(); ++i)
+                    if (!is_selected(i)) edited.push_back(keys[i]);
+            } else {
+                edited = keys;
+                edited.erase(edited.begin() + hit);
+            }
             state.selected = -1;
+            state.sel_frames.clear();
             emit(std::move(edited));
+            u->out->lane_release = true;
         }
     }
 
     if (frame.input.left_pressed() && owns && !dragging) {
-        // Nearest key within grab range?
-        int grabbed = -1;
-        float best = 8.0f;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const float dx = to_x(keys[i].frame) - mouse.x;
-            const float dy = to_y(keys[i].value) - mouse.y;
-            const float d = std::sqrt(dx * dx + dy * dy);
-            if (d < best) {
-                best = d;
-                grabbed = static_cast<int>(i);
+        bool consumed = false;
+        // Interp chips.
+        if (has_sel) {
+            for (int ci = 0; ci < 3 && !consumed; ++ci) {
+                if (!in_rect(chip_rects[ci])) continue;
+                std::vector<doc::Keyframe> edited = keys;
+                for (size_t i = 0; i < edited.size(); ++i) {
+                    if (!(static_cast<int>(i) == state.selected ||
+                          is_selected(i)))
+                        continue;
+                    doc::Keyframe& k = edited[i];
+                    if (ci == 0) {
+                        k.hold = false;
+                        k.in_dx = k.in_dy = k.out_dx = k.out_dy = 0.0f;
+                    } else if (ci == 1) {
+                        k.hold = false;
+                        const double prev_f =
+                            i > 0 ? edited[i - 1].frame : k.frame - 8.0;
+                        const double next_f = i + 1 < edited.size()
+                                                  ? edited[i + 1].frame
+                                                  : k.frame + 8.0;
+                        k.out_dx =
+                            static_cast<float>((next_f - k.frame) / 3.0);
+                        k.out_dy = 0.0f;
+                        k.in_dx =
+                            static_cast<float>(-((k.frame - prev_f) / 3.0));
+                        k.in_dy = 0.0f;
+                    } else {
+                        k.hold = true;
+                    }
+                }
+                emit(std::move(edited));
+                u->out->lane_release = true;
+                consumed = true;
             }
         }
-        if (grabbed >= 0 && (frame.input.mods & platform::kModCtrl)) {
-            std::vector<doc::Keyframe> edited = keys;
-            edited.erase(edited.begin() + grabbed);
-            state.selected = -1;
-            emit(std::move(edited));
-        } else if (grabbed >= 0) {
-            state.selected = grabbed;
-            state.dragging_key = true;
-            frame.ctx.set_capture(id);
-        } else {
-            // Handle dots of the selected key?
-            bool on_handle = false;
-            if (state.selected >= 0) {
-                const doc::Keyframe& k = keys[state.selected];
-                const Vec2 out_p{to_x(k.frame + k.out_dx),
-                                     to_y(k.value + k.out_dy)};
-                const Vec2 in_p{to_x(k.frame + k.in_dx),
-                                    to_y(k.value + k.in_dy)};
-                auto near_point = [&](Vec2 p) {
-                    const float dx = p.x - mouse.x;
-                    const float dy = p.y - mouse.y;
-                    return dx * dx + dy * dy < 36.0f;
-                };
-                if (near_point(out_p)) {
-                    state.dragging_out = true;
-                    on_handle = true;
-                } else if (near_point(in_p)) {
-                    state.dragging_in = true;
-                    on_handle = true;
-                }
-                if (on_handle) frame.ctx.set_capture(id);
-            }
-            if (!on_handle) {
-                // Add a key at the click point; remember its frame so
-                // the recovery below grabs THIS key, never a neighbour.
-                doc::Keyframe k;
-                k.frame = std::round(from_x(mouse.x));
-                k.value = from_y(mouse.y);
+        // Readout → inline numeric editor.
+        if (!consumed && state.selected >= 0 && in_rect(readout_rect)) {
+            const doc::Keyframe& sk =
+                keys[static_cast<size_t>(state.selected)];
+            AppState& a = *u->app;
+            a.key_edit_mode =
+                (frame.input.mods & platform::kModShift) ? 2 : 1;
+            a.key_edit_target = u->target;
+            a.key_edit_frame = sk.frame;
+            char seed[32];
+            if (a.key_edit_mode == 2)
+                std::snprintf(seed, sizeof(seed), "%.0f", sk.frame);
+            else
+                std::snprintf(seed, sizeof(seed), "%g", sk.value);
+            a.key_edit_buf = seed;
+            consumed = true;
+        }
+        if (!consumed) {
+            const int grabbed = nearest_key();
+            if (grabbed >= 0 && (frame.input.mods & platform::kModCtrl)) {
                 std::vector<doc::Keyframe> edited = keys;
-                edited.push_back(k);
+                edited.erase(edited.begin() + grabbed);
                 state.selected = -1;
-                state.pending_add_frame = k.frame;
-                state.dragging_key = true;   // allow drag-through placement
-                frame.ctx.set_capture(id);
+                state.sel_frames.clear();
                 emit(std::move(edited));
+                u->out->lane_release = true;
+            } else if (grabbed >= 0 &&
+                       (frame.input.mods & platform::kModShift)) {
+                // Shift+click toggles set membership.
+                const double f = keys[static_cast<size_t>(grabbed)].frame;
+                auto it = std::find(state.sel_frames.begin(),
+                                    state.sel_frames.end(), f);
+                if (it != state.sel_frames.end())
+                    state.sel_frames.erase(it);
+                else
+                    state.sel_frames.push_back(f);
+                state.selected = grabbed;
+            } else if (grabbed >= 0 &&
+                       is_selected(static_cast<size_t>(grabbed))) {
+                // Dragging inside the selected set moves the whole set.
+                state.group_drag = true;
+                state.selected = -1;
+                state.drag_anchor_frame = from_x(mouse.x);
+                state.drag_anchor_value = from_y(mouse.y);
+                state.drag_orig = keys;
+                state.drag_sel = state.sel_frames;
+                frame.ctx.set_capture(id);
+            } else if (grabbed >= 0) {
+                state.sel_frames.clear();
+                state.selected = grabbed;
+                state.dragging_key = true;
+                frame.ctx.set_capture(id);
+            } else {
+                // Handle dots of the selected key?
+                bool on_handle = false;
+                if (state.selected >= 0 &&
+                    state.selected < static_cast<int>(keys.size())) {
+                    const doc::Keyframe& k =
+                        keys[static_cast<size_t>(state.selected)];
+                    const Vec2 out_p{to_x(k.frame + k.out_dx),
+                                         to_y(k.value + k.out_dy)};
+                    const Vec2 in_p{to_x(k.frame + k.in_dx),
+                                        to_y(k.value + k.in_dy)};
+                    auto near_point = [&](Vec2 p) {
+                        const float dx = p.x - mouse.x;
+                        const float dy = p.y - mouse.y;
+                        return dx * dx + dy * dy < 36.0f;
+                    };
+                    if (near_point(out_p)) {
+                        state.dragging_out = true;
+                        on_handle = true;
+                    } else if (near_point(in_p)) {
+                        state.dragging_in = true;
+                        on_handle = true;
+                    }
+                    if (on_handle) frame.ctx.set_capture(id);
+                }
+                if (!on_handle) {
+                    // Near the curve adds a key; empty strip starts a
+                    // box-select marquee.
+                    const double mf = from_x(mouse.x);
+                    const float curve_y =
+                        keys.empty()
+                            ? 1.0e9f
+                            : to_y(std::clamp(mod::eval_lane(*u->lane, mf),
+                                              u->min_value, u->max_value));
+                    if (keys.empty() ||
+                        std::fabs(curve_y - mouse.y) < 7.0f) {
+                        // Remember the added frame so the recovery below
+                        // grabs THIS key, never a neighbour.
+                        doc::Keyframe k;
+                        k.frame = std::round(mf);
+                        k.value = from_y(mouse.y);
+                        std::vector<doc::Keyframe> edited = keys;
+                        edited.push_back(k);
+                        state.selected = -1;
+                        state.sel_frames.clear();
+                        state.pending_add_frame = k.frame;
+                        state.dragging_key = true;   // drag-through place
+                        frame.ctx.set_capture(id);
+                        emit(std::move(edited));
+                    } else {
+                        state.box_select = true;
+                        state.box_anchor = mouse;
+                        frame.ctx.set_capture(id);
+                    }
+                }
             }
         }
     }
 
-    if (dragging && frame.input.left_down() && state.selected >= 0 &&
+    // Box-select marquee: draw + finalize on release.
+    if (state.box_select) {
+        const ui::Rect bx{std::min(state.box_anchor.x, mouse.x),
+                          std::min(state.box_anchor.y, mouse.y),
+                          std::fabs(mouse.x - state.box_anchor.x),
+                          std::fabs(mouse.y - state.box_anchor.y)};
+        frame.canvas.draw_rect_outline(bx, 1.0f, theme.accent_dim);
+        if (frame.input.left_released()) {
+            if (!(frame.input.mods & platform::kModShift))
+                state.sel_frames.clear();
+            for (size_t i = 0; i < keys.size(); ++i) {
+                const Vec2 p{to_x(keys[i].frame), to_y(keys[i].value)};
+                if (p.x >= bx.x && p.x <= bx.right() && p.y >= bx.y &&
+                    p.y <= bx.bottom()) {
+                    if (!is_selected(i))
+                        state.sel_frames.push_back(keys[i].frame);
+                    state.selected = static_cast<int>(i);
+                }
+            }
+            state.box_select = false;
+            frame.ctx.clear_capture();
+        }
+    }
+
+    // Group drag: transform the press-time snapshot by the mouse delta.
+    if (state.group_drag && frame.input.left_down() &&
+        !state.drag_orig.empty()) {
+        const double df =
+            std::round(from_x(mouse.x) - state.drag_anchor_frame);
+        const float dv = from_y(mouse.y) - state.drag_anchor_value;
+        std::vector<doc::Keyframe> edited = state.drag_orig;
+        std::vector<double> new_sel;
+        for (doc::Keyframe& k : edited) {
+            bool sel = false;
+            for (const double f : state.drag_sel)
+                if (k.frame == f) {
+                    sel = true;
+                    break;
+                }
+            if (!sel) continue;
+            k.frame = std::clamp(k.frame + df, 0.0,
+                                 static_cast<double>(frames - 1));
+            k.value =
+                std::clamp(k.value + dv, u->min_value, u->max_value);
+            new_sel.push_back(k.frame);
+        }
+        state.sel_frames = std::move(new_sel);
+        emit(std::move(edited));
+    }
+
+    if ((state.dragging_key || state.dragging_in || state.dragging_out) &&
+        frame.input.left_down() && state.selected >= 0 &&
         state.selected < static_cast<int>(keys.size())) {
         std::vector<doc::Keyframe> edited = keys;
         doc::Keyframe& k = edited[state.selected];
@@ -2925,8 +3416,13 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    if (dragging && frame.input.left_released()) {
+    if ((state.dragging_key || state.dragging_in || state.dragging_out ||
+         state.group_drag) &&
+        frame.input.left_released()) {
         state.dragging_key = state.dragging_in = state.dragging_out = false;
+        state.group_drag = false;
+        state.drag_orig.clear();
+        state.drag_sel.clear();
         frame.ctx.clear_capture();
         u->out->lane_release = true;
     }
@@ -2941,10 +3437,15 @@ ui::LayoutNode* param_row(ui::LayoutArena& arena, const char* label,
                           ui::ButtonState* key_state, bool* key_clicked,
                           ui::ButtonState* expose_state = nullptr,
                           bool* expose_clicked = nullptr,
-                          const char* expose_tip = nullptr) {
+                          const char* expose_tip = nullptr,
+                          bool keyed = false, bool routed = false) {
     using namespace ui;
     LabelOpts small_dim;
-    small_dim.color = active_theme().text_dim;
+    // Driven params tint like the canvas rows: keyed = accent,
+    // routed = dim accent — the inspector shows animation state in place.
+    small_dim.color = keyed ? active_theme().accent
+                     : routed ? active_theme().accent_dim
+                              : active_theme().text_dim;
     small_dim.size = active_theme().font_size_small;
     // The mod gutter is ALWAYS three 18 px slots (wave, key, knob) — absent
     // controls leave blank slots so the label and value columns never shift
@@ -2953,12 +3454,17 @@ ui::LayoutNode* param_row(ui::LayoutArena& arena, const char* label,
     if (route_clicked) {
         ButtonOpts micro;
         micro.width = SizeSpec::fixed(18);
-        micro.tooltip = "add modulation route";
+        micro.tooltip = routed ? "add modulation route (routed)"
+                               : "add modulation route";
+        micro.active = routed;
         cells.push_back(
             IconButton(arena, Icon::Wave, route_state, route_clicked, micro));
-        micro.tooltip = "toggle keyframe at playhead";
+        micro.tooltip = keyed ? "toggle keyframe at playhead (keyed)"
+                              : "toggle keyframe at playhead";
+        micro.active = keyed;
         cells.push_back(
             IconButton(arena, Icon::Key, key_state, key_clicked, micro));
+        micro.active = false;
         if (expose_clicked) {
             micro.tooltip = expose_tip ? expose_tip
                                        : "expose on the group face";
@@ -2983,8 +3489,26 @@ ui::LayoutNode* param_row(ui::LayoutArena& arena, const char* label,
     return n;
 }
 
+// Category members sorted by display label: both add menus list
+// alphabetically, so newly appended effects sort into place instead of
+// sinking to the bottom of their fold (enum order stays frozen for the
+// shader/info tables, never for the user).
+std::vector<doc::EffectType> category_effects_sorted(doc::FxCategory cat) {
+    std::vector<doc::EffectType> sorted;
+    for (size_t t = 0; t < static_cast<size_t>(doc::EffectType::Count); ++t)
+        if (doc::effect_info(static_cast<doc::EffectType>(t)).category ==
+            cat)
+            sorted.push_back(static_cast<doc::EffectType>(t));
+    std::sort(sorted.begin(), sorted.end(),
+              [](doc::EffectType a, doc::EffectType b) {
+                  return std::strcmp(doc::effect_info(a).label,
+                                     doc::effect_info(b).label) < 0;
+              });
+    return sorted;
+}
+
 // Label/value row on the same grid: [blank gutter][label][value control].
-// Enum-ish values (mask, blend, time mode) all share this shape.
+// Enum-ish values (blend, time mode) all share this shape.
 ui::LayoutNode* value_row(ui::LayoutArena& arena, const char* label,
                           ui::LayoutNode* value) {
     using namespace ui;
@@ -3035,7 +3559,7 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
 
     // Group context: "g" groups with the effect above (or joins its group);
     // grouped effects leave on "g". The knob micro next to a param
-    // toggles it on the group FACE (v5.3 exposed params).
+    // toggles it on the group FACE (exposed params).
     const doc::Group* fx_group = nullptr;
     for (const doc::Group& g :
          app.document.layers[app.selected_layer].groups)
@@ -3092,34 +3616,25 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                        tiny_x),
         }));
 
-    // Mask assignment: label + dropdown of [none, every mask] on the grid.
-    {
-        FrameUi::EffectMaskCycle pick{fx_index, arena.alloc<int>()};
-        *pick.selected = -1;
-        const int mask_count =
-            static_cast<int>(std::min<size_t>(app.document.masks.size(), 16));
-        const char** items = arena.alloc<const char*>(
-            static_cast<size_t>(mask_count) + 1);
-        items[0] = "none";
-        int current = 0;
-        for (int m = 0; m < mask_count; ++m) {
-            const doc::Mask& mk = app.document.masks[static_cast<size_t>(m)];
-            items[m + 1] = arena.dup(mk.name.c_str(), mk.name.size());
-            if (mk.id == fx.mask_id) current = m + 1;
-        }
-        rows.push_back(value_row(
-            arena, "mask",
-            Dropdown(arena, items, mask_count + 1, current, &state.mask_dd,
-                     pick.selected, SizeSpec::fill(),
-                     "gate this effect with a mask")));
-        out.effect_mask_cycles.push_back(pick);
-    }
-
     uint32_t ordinal = 0;
+    // Driven-state lookups: tint the row + light the dots exactly
+    // like the canvas cards.
+    auto rail_keyed = [&](const doc::ParamKey& k) {
+        for (const doc::KeyframeLane& l : app.document.lanes)
+            if (l.target == k && !l.keys.empty()) return true;
+        return false;
+    };
+    auto rail_routed = [&](const doc::ParamKey& k) {
+        for (const doc::ModRoute& r : app.document.mod_routes)
+            if (r.target == k) return true;
+        return false;
+    };
+
     auto stage_slider = [&](int param_index, const char* label, float min_v,
                             float max_v, float value, const char* format,
                             SliderState* slider_state,
-                            const char* options = nullptr) {
+                            const char* options = nullptr,
+                            const char* tip = nullptr) {
         value = shown_param_value(app, {fx.id, param_index}, value, min_v,
                                   max_v);
         ParamStage stage{};
@@ -3135,15 +3650,48 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         opts.format = format;
         opts.out_changed = stage.changed;
         opts.out_released = stage.released;
+        opts.tooltip = tip;
 
         // One grid row: [~ k (m)] mod gutter, label, slider (param_row).
         const doc::ParamKey key{fx.id, param_index};
         FrameUi::AddRoute add_route{key, arena.alloc<bool>()};
         FrameUi::KeyToggle key_toggle{key, value, arena.alloc<bool>()};
+
+        // Rail type-in: commit lands through this row's staged
+        // path; while open, the slider is replaced by the edit field.
+        bool editing = app.rail_edit_key == key;
+        if (editing && app.rail_edit_commit) {
+            char* endp = nullptr;
+            const double typed =
+                std::strtod(app.rail_edit_buf.c_str(), &endp);
+            if (endp != app.rail_edit_buf.c_str()) {
+                const float scale = app.rail_edit_scale != 0.0f
+                                        ? app.rail_edit_scale
+                                        : 1.0f;
+                *stage.staged = std::clamp(
+                    static_cast<float>(typed / scale), min_v, max_v);
+                *stage.changed = true;
+                *stage.released = true;
+            }
+            app.rail_edit_key = {};
+            app.rail_edit_commit = false;
+            editing = false;
+        }
+        FrameUi::RailEdit redit{};
+        redit.key = key;
+        redit.scale = 1.0f;
+        redit.clicked = arena.alloc<bool>();
+        {
+            char seed[32];
+            std::snprintf(seed, sizeof(seed), "%g", value);
+            redit.seed = arena.dup(seed, std::strlen(seed));
+        }
+        out.rail_edits.push_back(redit);
+        opts.out_value_clicked = redit.clicked;
         const uint32_t o = ordinal < 18 ? ordinal : 17;
         ++ordinal;
         // Grouped member: the knob micro toggles this param on/off the
-        // group FACE (v5.3 exposed params — direct aliases, no macros).
+        // group FACE (exposed params — direct aliases, no macros).
         ui::ButtonState* expose_state = nullptr;
         bool* expose_clicked = nullptr;
         const char* expose_tip = nullptr;
@@ -3160,7 +3708,7 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                             : "expose on the group face";
             out.expose_toggles.push_back(toggle);
         }
-        // Selector params render as DROPDOWNS (v5.6): a pick lands as
+        // Selector params render as DROPDOWNS: a pick lands as
         // the param value through the same undoable command path.
         LayoutNode* control;
         if (options && param_index >= 0) {
@@ -3182,6 +3730,19 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
             control = Dropdown(arena, items, n, cur,
                                &state.param_dd[o < 16 ? o : 15],
                                pick.selected, SizeSpec::fill());
+        } else if (editing) {
+            // The open type-in editor: buffer + caret in the slider slot.
+            std::string shown = app.rail_edit_buf + "_";
+            ButtonOpts bo;
+            bo.align_left = true;
+            bo.width = SizeSpec::fill();
+            bo.tooltip = "enter commits, esc cancels";
+            control = Button(arena,
+                             arena.dup(shown.c_str(), shown.size()),
+                             &state.value_edit_button, nullptr, bo);
+        } else if (format && std::strstr(format, "deg")) {
+            control = DialF(arena, stage.staged, min_v, max_v, slider_state,
+                            opts);
         } else {
             control = SliderF(arena, stage.staged, min_v, max_v,
                               slider_state, opts);
@@ -3190,29 +3751,40 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
             arena, label, control,
             &state.route_buttons[o], add_route.clicked,
             &state.key_buttons[o], key_toggle.clicked, expose_state,
-            expose_clicked, expose_tip));
+            expose_clicked, expose_tip, rail_keyed(key),
+            rail_routed(key)));
         out.add_routes.push_back(add_route);
         out.key_toggles.push_back(key_toggle);
         out.params.push_back(stage);
     };
 
     stage_slider(doc::kWetParam, "wet/dry", 0.0f, 1.0f, fx.wet, "%.2f",
-                 &state.wet);
+                 &state.wet, nullptr,
+                 "processed vs input mix - click the value to type it");
     stage_slider(doc::kOpacityParam, "opacity", 0.0f, 1.0f, fx.opacity, "%.2f",
-                 &state.opacity);
+                 &state.opacity, nullptr,
+                 "final blend over the input - click the value to type it");
     for (uint32_t p = 0; p < info.param_count && p < 16; ++p) {
         const doc::ParamDesc& desc = info.params[p];
         const char* options =
-            fx.type == doc::EffectType::TextOverlay && p == 0 &&
+            fx.type == doc::EffectType::Text && p == 0 &&
                     !app.font_options.empty()
                 ? app.font_options.c_str()
                 : desc.options;
+        // Auto tooltip: full label + range + default, so truncated
+        // labels and bare numbers explain themselves on hover.
+        char tipbuf[96];
+        std::snprintf(tipbuf, sizeof(tipbuf),
+                      "%s - %g to %g, default %g. click the value to type.",
+                      desc.label, desc.min_value, desc.max_value,
+                      desc.default_value);
         stage_slider(static_cast<int>(p), desc.label, desc.min_value,
                      desc.max_value, fx.params[p], desc.format,
-                     &state.params[p], options);
+                     &state.params[p], options,
+                     arena.dup(tipbuf, std::strlen(tipbuf)));
     }
-    if (fx.type == doc::EffectType::TextOverlay) {
-        // The STRING field (v5.6): click opens the shared inline editor;
+    if (fx.type == doc::EffectType::Text) {
+        // The STRING field: click opens the shared inline editor;
         // the buffer (with caret) shows here while editing.
         FrameUi::TextEditOpen open{fx.id, arena.alloc<bool>()};
         const bool editing = app.text_edit_id == fx.id;
@@ -3238,7 +3810,7 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                  PanelOpts{Edges::all(8), -1.0f, /*outline=*/false});
 }
 
-// Group container (spec §5): ONE outlined panel holding the header
+// Group container: ONE outlined panel holding the header
 // (fold/eye/save/ungroup), the exposed FACE rows, and the member cards
 // nested inside with an indent — grouping is containment, not a floating
 // header. Folded, the container collapses to header + face.
@@ -3292,7 +3864,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
     hdr_stack->kind = NodeKind::HStack;
     rows.push_back(hdr_stack);
 
-    // The FACE (v5.3): exposed member params as DIRECT aliases — same
+    // The FACE: exposed member params as DIRECT aliases — same
     // ParamStage path as any effect slider, the x hides from the face.
     size_t face_i = 0;
     for (const doc::ParamKey& fkey : group.exposed) {
@@ -3322,7 +3894,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
             max_v = d.max_value;
             pname = d.label;
             fmt = d.format;
-            fopts = mfx.type == doc::EffectType::TextOverlay &&
+            fopts = mfx.type == doc::EffectType::Text &&
                             fkey.param_index == 0 &&
                             !app.font_options.empty()
                         ? app.font_options.c_str()
@@ -3346,7 +3918,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
         ButtonOpts mx;
         mx.width = SizeSpec::fixed(20);
         mx.tooltip = "hide from the group face";
-        // Selector aliases keep their dropdown (v5.6).
+        // Selector aliases keep their dropdown.
         LayoutNode* fctl;
         if (fopts && fkey.param_index >= 0) {
             const int fn = doc::param_option_count(fopts);
@@ -3403,7 +3975,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
                  PanelOpts{Edges::all(6), -1.0f, /*outline=*/true});
 }
 
-// Popup source entries (docs/flow_canvas.md v3/v4): sources are just
+// Popup source entries (docs/flow_canvas.md/v4): sources are just
 // nodes you add like anything else. "source: clip" is THE input — a tap
 // off the project clip (the adjustment type is gone; a clip tap merged
 // back through a Blend IS an adjustment). Order here MUST match the pick
@@ -3420,7 +3992,7 @@ static const doc::LayerSourceKind kSrcAddKinds[] = {
 constexpr int kSrcAddCount =
     static_cast<int>(sizeof(kSrcAddLabels) / sizeof(kSrcAddLabels[0]));
 
-// Popup value-node entries (docs/flow_canvas.md v4): each spawns an
+// Popup value-node entries (docs/flow_canvas.md): each spawns an
 // UNWIRED mod route (target {0, -1} is inert) at the click point — wiring
 // happens by dragging its out port onto a param row. Order here MUST
 // match the pick handler's walk.
@@ -3438,7 +4010,7 @@ static const doc::ModSourceType kValAddTypes[] = {
 constexpr int kValAddCount =
     static_cast<int>(sizeof(kValAddLabels) / sizeof(kValAddLabels[0]));
 
-// Node-canvas graph (docs/flow_canvas.md v2): the document translated
+// Node-canvas graph (docs/flow_canvas.md): the document translated
 // into cards + wires each frame. Positions come from the document; nodes
 // never dragged flow through a derived auto-layout (chains left→right per
 // layer, aux row below) and only commit a position when moved. Param rows
@@ -3458,6 +4030,9 @@ enum class CtxAction : uint8_t {
     Bypass, Duplicate, Group, Ungroup, OpenGroup, RenameGroup, SavePreset,
     AlignLeft, AlignTop, SpreadH, SpreadV, Delete, Export, RenameFrame,
     FrameColor, DeleteFrame,
+    // Param housekeeping: defaults / clipboard across same-type
+    // effects.
+    ResetParams, CopyParams, PasteParams,
 };
 
 struct FlowBuild {
@@ -3528,7 +4103,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     std::vector<flow::Node> nodes;
     std::vector<flow::Wire> wires;
     std::unordered_map<uint64_t, uint64_t> fx_node;   // effect id → node id
-    // Folded groups (v4 subgraphs): members collapse into ONE card that
+    // Folded groups (subgraphs): members collapse into ONE card that
     // shows the exposed face; links crossing the boundary re-anchor there.
     std::unordered_set<uint64_t> emitted_groups;
 
@@ -3583,37 +4158,113 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             *lrow.visible_staged = !layer.visible;
             lrow.blend_selected = arena.alloc<int>();
             *lrow.blend_selected = -1;
-            lrow.mask_selected = arena.alloc<int>();
-            *lrow.mask_selected = -1;
             lrow.remove = arena.alloc<bool>();
             lrow.up = arena.alloc<bool>();
             lrow.down = arena.alloc<bool>();
             out.layer_rows.push_back(lrow);
 
-            flow::ParamRow* rows = arena.alloc<flow::ParamRow>(1);
-            FrameUi::LayerStage stage{};
-            stage.layer_id = layer.id;
-            stage.field = FrameUi::LayerField::Opacity;
-            stage.staged = arena.alloc<float>();
-            *stage.staged = layer.opacity;
-            stage.original = layer.opacity;
-            stage.changed = arena.alloc<bool>();
-            stage.released = arena.alloc<bool>();
-            out.layer_stages.push_back(stage);
-            rows[0].label = "opacity";
-            rows[0].min_v = 0.0f;
-            rows[0].max_v = 1.0f;
-            rows[0].format = "%.2f";
-            rows[0].staged = stage.staged;
-            rows[0].changed = stage.changed;
-            rows[0].released = stage.released;
+            // Source card rows (parity): the same conditional field
+            // set the rail shows — each continuous field a mod target
+            // with key/route dots; the waveform stays a dropdown.
+            flow::ParamRow* rows = arena.alloc<flow::ParamRow>(10);
+            int srow = 0;
+            auto layer_row = [&](FrameUi::LayerField field,
+                                 const char* label, float min_v,
+                                 float max_v, float value, const char* fmt,
+                                 const char* options = nullptr) {
+                if (srow >= 10) return;
+                FrameUi::LayerStage lstage{};
+                lstage.layer_id = layer.id;
+                lstage.field = field;
+                lstage.staged = arena.alloc<float>();
+                *lstage.staged = value;
+                lstage.original = value;
+                lstage.changed = arena.alloc<bool>();
+                lstage.released = arena.alloc<bool>();
+                out.layer_stages.push_back(lstage);
+                rows[srow].label = label;
+                rows[srow].min_v = min_v;
+                rows[srow].max_v = max_v;
+                rows[srow].format = fmt;
+                if (options) {
+                    rows[srow].kind = 1;
+                    rows[srow].options = options;
+                } else {
+                    const doc::ParamKey lkey{
+                        layer.id | doc::kLayerParamBit,
+                        static_cast<int>(field)};
+                    FrameUi::KeyToggle ktog{lkey, value,
+                                            arena.alloc<bool>()};
+                    out.key_toggles.push_back(ktog);
+                    FrameUi::AddRoute aroute{lkey, arena.alloc<bool>()};
+                    out.add_routes.push_back(aroute);
+                    rows[srow].key_clicked = ktog.clicked;
+                    rows[srow].route_clicked = aroute.clicked;
+                    rows[srow].modulated =
+                        param_modulated(lkey.effect_id, lkey.param_index);
+                    rows[srow].keyed =
+                        param_keyed(lkey.effect_id, lkey.param_index);
+                }
+                rows[srow].staged = lstage.staged;
+                rows[srow].changed = lstage.changed;
+                rows[srow].released = lstage.released;
+                ++srow;
+            };
+            using LFs = FrameUi::LayerField;
+            using LSK = doc::LayerSourceKind;
+            layer_row(LFs::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
+                      "%.2f");
+            if (layer.source == LSK::Solid ||
+                layer.source == LSK::Gradient ||
+                layer.source == LSK::Noise ||
+                layer.source == LSK::Oscillator) {
+                layer_row(LFs::ColorAR, "color a r", 0.0f, 1.0f,
+                          layer.color_a[0], "%.2f");
+                layer_row(LFs::ColorAG, "color a g", 0.0f, 1.0f,
+                          layer.color_a[1], "%.2f");
+                layer_row(LFs::ColorAB, "color a b", 0.0f, 1.0f,
+                          layer.color_a[2], "%.2f");
+            }
+            if (layer.source == LSK::Gradient ||
+                layer.source == LSK::Noise ||
+                layer.source == LSK::Oscillator) {
+                layer_row(LFs::ColorBR, "color b r", 0.0f, 1.0f,
+                          layer.color_b[0], "%.2f");
+                layer_row(LFs::ColorBG, "color b g", 0.0f, 1.0f,
+                          layer.color_b[1], "%.2f");
+                layer_row(LFs::ColorBB, "color b b", 0.0f, 1.0f,
+                          layer.color_b[2], "%.2f");
+            }
+            if (layer.source == LSK::Gradient ||
+                layer.source == LSK::Oscillator)
+                layer_row(LFs::Angle, "angle", -3.1416f, 3.1416f,
+                          layer.gen_angle, "%.2f");
+            if (layer.source == LSK::Noise)
+                layer_row(LFs::Scale, "scale", 2.0f, 128.0f,
+                          layer.gen_scale, "%.0f px");
+            if (layer.source == LSK::Oscillator) {
+                layer_row(LFs::Scale, "frequency", 0.5f, 32.0f,
+                          layer.gen_scale, "%.1f cyc");
+                layer_row(LFs::OscShape, "wave", 0.0f, 3.0f,
+                          static_cast<float>(layer.osc_shape), "%.0f",
+                          "sine bars|rings|plasma|lissajous");
+            }
+            if (layer.source == LSK::Shape) {
+                layer_row(LFs::Scale, "size", 0.5f, 30.0f, layer.gen_scale,
+                          "%.1f");
+                layer_row(LFs::Angle, "feather", 0.0f, 3.1416f,
+                          layer.gen_angle, "%.2f");
+                layer_row(LFs::OscShape, "shape", 0.0f, 2.0f,
+                          static_cast<float>(layer.osc_shape % 3), "%.0f",
+                          "circle|box|diamond");
+            }
 
             flow::Node src{};
             src.id = flow::node_id(flow::NodeKind::Source, layer.id);
             src.kind = flow::NodeKind::Source;
             // The card names WHAT the node is — "clip" is the project's
             // source input, generators name their kind. "layer N" was
-            // storage-bag residue (v4 flat graph). Legacy Adjustment
+            // storage-bag residue (flat graph). Legacy Adjustment
             // layers are clip taps.
             static const char* kSrcTitles[] = {"clip",    "solid",
                                                "gradient", "noise",
@@ -3629,9 +4280,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                doc::LayerSourceKind::Count)];
             src.bypassed = !layer.visible;
             src.has_out = true;
-            src.has_mask_port = true;
+            src.has_matte_port = true;
             src.rows = rows;
-            src.row_count = 1;
+            src.row_count = srow;
             src.bypass_clicked = lrow.visible_changed;
             src.remove_clicked = lrow.remove;
             set_preview(src, layer.id | (1ull << 62));
@@ -3641,7 +4292,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             } else {
                 src.x = auto_x;
                 src.y = auto_y;
-                // Materialize the derived slot (docs/flow_canvas.md v2
+                // Materialize the derived slot (docs/flow_canvas.md
                 // "auto-layout once"): committed the first frame it
                 // appears so later deletions never re-slot survivors.
                 // Positions are pure UI state the renderer never reads —
@@ -3655,10 +4306,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             // node never shifts auto-laid neighbours.
             auto_x += kAutoPitch;
             nodes.push_back(src);
-            if (layer.mask_id)
-                wires.push_back({flow::node_id(flow::NodeKind::Mask,
-                                               layer.mask_id),
-                                 src.id, 1});
         }
 
         for (size_t i = 0; i < layer.stack.size(); ++i) {
@@ -3679,13 +4326,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 const uint64_t gid =
                     flow::node_id(flow::NodeKind::Group, folded->id);
                 fx_node[fx.id] = gid;
-                if (fx.mask_id)
-                    wires.push_back({flow::node_id(flow::NodeKind::Mask,
-                                                   fx.mask_id),
-                                     gid, 1});
                 if (!emitted_groups.insert(folded->id).second) continue;
 
-                // Face rows (v5.3): exposed member params as DIRECT
+                // Face rows: exposed member params as DIRECT
                 // aliases — the same ParamStage path as effect cards,
                 // keyed/modulated tints included.
                 flow::ParamRow* rows = arena.alloc<flow::ParamRow>(6);
@@ -3720,9 +4363,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         max_v = pd.max_value;
                         pname = pd.label;
                         fmt = pd.format;
-                        // Selector aliases keep their dropdown (v5.6);
+                        // Selector aliases keep their dropdown;
                         // the Text font selector keeps the runtime list.
-                        fopts = mfx.type == doc::EffectType::TextOverlay &&
+                        fopts = mfx.type == doc::EffectType::Text &&
                                         fkey.param_index == 0 &&
                                         !app.font_options.empty()
                                     ? app.font_options.c_str()
@@ -3737,7 +4380,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     *stage.staged = cur;
                     out.params.push_back(stage);
                     FrameUi::KeyToggle ktog{fkey, cur,
-                                            arena.alloc<bool>(), true};
+                                            arena.alloc<bool>()};
                     out.key_toggles.push_back(ktog);
                     rows[slot].label = arena.dup(pname,
                                                  std::strlen(pname));
@@ -3830,9 +4473,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             for (const doc::Group& g : layer.groups)
                 if (g.id == fx.group_id) fx_group = &g;
 
-            // Text cards (v5.6) append the STRING row after the params.
+            // Text cards append the STRING row after the params.
             const bool is_text_fx =
-                fx.type == doc::EffectType::TextOverlay;
+                fx.type == doc::EffectType::Text;
             const uint32_t n_rows = 2 +
                                     std::min<uint32_t>(info.param_count, 16) +
                                     (is_text_fx ? 1 : 0);
@@ -3856,8 +4499,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 const doc::ParamKey key{fx.id, param_index};
                 FrameUi::AddRoute add_route{key, arena.alloc<bool>()};
                 FrameUi::KeyToggle key_toggle{key, value,
-                                              arena.alloc<bool>(),
-                                              /*lane_toggle=*/true};
+                                              arena.alloc<bool>()};
                 out.add_routes.push_back(add_route);
                 out.key_toggles.push_back(key_toggle);
                 flow::ParamRow& row = rows[slot];
@@ -3870,7 +4512,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 row.released = stage.released;
                 row.route_clicked = add_route.clicked;
                 row.key_clicked = key_toggle.clicked;
-                // Scoped member rows carry the FACE toggle (v5.3): the
+                // Scoped member rows carry the FACE toggle: the
                 // e-dot exposes/hides this param on the open group.
                 if (scope && fx_group) {
                     const bool on =
@@ -3898,7 +4540,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             for (uint32_t p = 0; p < info.param_count && p < 16; ++p) {
                 const doc::ParamDesc& desc = info.params[p];
                 // The Text card's font selector lists the DISCOVERED
-                // .ttf files (v5.5b), not a static table.
+                // .ttf files, not a static table.
                 const char* options =
                     is_text_fx && p == 0 && !app.font_options.empty()
                         ? app.font_options.c_str()
@@ -3908,7 +4550,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                           desc.format, options);
             }
             if (is_text_fx) {
-                // The STRING row (v5.6): a real field on the card — click
+                // The STRING row: a real field on the card — click
                 // to edit inline, same editor the app already runs.
                 flow::ParamRow& trow = rows[n_rows - 1];
                 trow = {};
@@ -3927,7 +4569,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             en.feedback = doc::is_stateful_feedback(fx.type);
             en.has_in = true;
             en.has_out = true;
-            en.has_mask_port = true;
+            en.has_matte_port = true;
             en.has_aux_port = doc::effect_aux_port(fx.type) != nullptr;
             if (en.has_aux_port)
                 en.aux_label = doc::effect_aux_port(fx.type);
@@ -3935,7 +4577,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             en.row_count = static_cast<int>(n_rows);
             en.bypass_clicked = act.bypass_changed;
             en.remove_clicked = act.remove;
-            en.text_edit = fx.type == doc::EffectType::TextOverlay;
+            en.text_edit = fx.type == doc::EffectType::Text;
             set_preview(en, fx.id);
             if (fx.node_x != 0.0f || fx.node_y != 0.0f) {
                 en.x = fx.node_x;
@@ -3949,10 +4591,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             auto_x += kAutoPitch;
             nodes.push_back(en);
             fx_node[fx.id] = en.id;
-            if (fx.mask_id)
-                wires.push_back({flow::node_id(flow::NodeKind::Mask,
-                                               fx.mask_id),
-                                 en.id, 1});
         }
         grid_max_x = std::max(grid_max_x, auto_x);
     }
@@ -3968,7 +4606,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             if (nd.x <= min_x) first_y = nd.y;
         }
         if (nodes.empty()) min_x = max_x = kAutoX0 + kAutoPitch;
-        // Boundary nodes hold their OWN positions (v5.4) — the member
+        // Boundary nodes hold their OWN positions — the member
         // extent only seeds them once, then they materialize like every
         // other card and member drags never tow them.
         flow::Node gin{};
@@ -4030,11 +4668,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             wires.push_back({it->second, gout.id, 0});
     }
 
-    // Chain + composite wires come from the TRUE-GRAPH link table
-    // (docs/flow_canvas.md v3); legacy documents draw the synthesized
-    // equivalent. Mask wires were emitted above from the mask_id fields.
-    // In a scoped view, links crossing the group boundary re-anchor on
-    // the In/Out boundary nodes.
+    // Chain + composite wires come from the TRUE-GRAPH link table; chain
+    // documents draw the synthesized equivalent. In a scoped view, links
+    // crossing the group boundary re-anchor on the In/Out boundary nodes.
     {
         const std::vector<doc::Document::NodeLink> doc_links =
             d.links.empty() ? doc::synthesize_links(d) : d.links;
@@ -4075,57 +4711,12 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
     }
 
-    // Scoped view: only masks worn by members (and value nodes driving
-    // member params, below) surface alongside the members.
-    std::unordered_set<uint64_t> scope_masks;
-    if (scope)
-        for (const doc::Layer& sl : d.layers)
-            for (const doc::EffectInstance& sfx : sl.stack)
-                if (sfx.group_id == scope && sfx.mask_id)
-                    scope_masks.insert(sfx.mask_id);
-
-    // Aux row: masks, then mod-route sources with inline rate/amount.
+    // Aux row: mod-route sources with inline rate/amount.
     const float aux_y = 40.0f + static_cast<float>(n_layers) * kLanePitch;
     float aux_x = kAutoX0;
-    for (size_t mi = 0; mi < d.masks.size(); ++mi) {
-        const doc::Mask& m = d.masks[mi];
-        if (scope && scope_masks.count(m.id) == 0) continue;
-        flow::Node mn{};
-        mn.id = flow::node_id(flow::NodeKind::Mask, m.id);
-        mn.kind = flow::NodeKind::Mask;
-        mn.title = arena.dup(m.name.c_str(), m.name.size());
-        // In = the mask's image source (v4: any SOURCE node wires in;
-        // the wire mirrors mask.source_layer_id, not the link table).
-        mn.has_in = true;
-        mn.has_out = true;
-        set_preview(mn, m.id | doc::kMaskParamBit);
-        if (m.source_layer_id && !scope &&
-            layer_index_by_id(d, m.source_layer_id) >= 0)
-            wires.push_back({flow::node_id(flow::NodeKind::Source,
-                                           m.source_layer_id),
-                             mn.id, 0});
-        if (m.node_x != 0.0f || m.node_y != 0.0f) {
-            mn.x = m.node_x;
-            mn.y = m.node_y;
-        } else {
-            mn.x = aux_x;
-            mn.y = aux_y;
-            app.document.masks[mi].node_x = mn.x;
-            app.document.masks[mi].node_y = mn.y;
-        }
-        aux_x += kAutoPitch;
-        nodes.push_back(mn);
-    }
     for (size_t ri = 0; ri < d.mod_routes.size(); ++ri) {
         const doc::ModRoute& r = d.mod_routes[ri];
-        if (scope) {
-            const uint64_t te = r.target.effect_id;
-            const bool member_target =
-                (te & doc::kMaskParamBit)
-                    ? scope_masks.count(te & ~doc::kMaskParamBit) != 0
-                    : fx_node.count(te) != 0;
-            if (!member_target) continue;
-        }
+        if (scope && fx_node.count(r.target.effect_id) == 0) continue;
         FrameUi::RouteRow rr{};
         rr.id = r.id;
         rr.source_selected = arena.alloc<int>();
@@ -4159,8 +4750,49 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         *rr.rate_staged = is_pulse ? r.source.decay : r.source.rate_hz;
         rr.rate_original = *rr.rate_staged;
 
-        flow::ParamRow* rows = arena.alloc<flow::ParamRow>(6);
+        flow::ParamRow* rows = arena.alloc<flow::ParamRow>(9);
         int slot = 0;
+        // Selector rows on the card (parity with the rail): source,
+        // context shape, curve — picks land through cv_pick_* and the
+        // same route commands as the rail dropdowns.
+        auto route_dd = [&](int which, const char* label,
+                            const char* options, int current) {
+            rr.cv_pick_staged[which] = arena.alloc<float>();
+            *rr.cv_pick_staged[which] = static_cast<float>(current);
+            rr.cv_pick_changed[which] = arena.alloc<bool>();
+            rows[slot].label = label;
+            rows[slot].min_v = 0.0f;
+            rows[slot].max_v = static_cast<float>(
+                std::max(1, doc::param_option_count(options) - 1));
+            rows[slot].format = "%.0f";
+            rows[slot].kind = 1;
+            rows[slot].options = options;
+            rows[slot].staged = rr.cv_pick_staged[which];
+            rows[slot].changed = rr.cv_pick_changed[which];
+            rows[slot].released = arena.alloc<bool>();
+            ++slot;
+        };
+        static const std::string kModOptions = [] {
+            std::string s;
+            for (size_t i = 0; i < kModNameCount; ++i) {
+                if (i) s += '|';
+                s += kModNames[i];
+            }
+            return s;
+        }();
+        route_dd(0, "source", kModOptions.c_str(),
+                 static_cast<int>(r.source.type));
+        if (is_lfo)
+            route_dd(1, "shape", "sine|triangle|square|s&h",
+                     static_cast<int>(r.source.shape));
+        else if (r.source.type == doc::ModSourceType::Envelope)
+            route_dd(1, "trigger", "onset|cut|beat|key",
+                     static_cast<int>(r.source.trigger % 4));
+        else if (is_video)
+            route_dd(1, "channel", "luma|red|green|blue",
+                     static_cast<int>(r.source.channel % 4));
+        route_dd(2, "curve", "linear|exp|s-curve|inverted",
+                 static_cast<int>(r.curve));
         if (has_rate) {
             rows[slot].label = is_pulse ? "decay" : "rate";
             rows[slot].min_v = 0.05f;
@@ -4172,7 +4804,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             ++slot;
         }
         if (is_video) {
-            // Sampling window rows (v4): point x/y, region w/h.
+            // Sampling window rows: point x/y, region w/h.
             static const char* kPosLabels[4] = {"x", "y", "w", "h"};
             const float cur[4] = {r.source.px, r.source.py, r.source.pw,
                                   r.source.ph};
@@ -4228,13 +4860,10 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
 
         uint64_t target = 0;
         int to_row = -1;
-        if (r.target.effect_id & doc::kMaskParamBit) {
-            target = flow::node_id(flow::NodeKind::Mask,
-                                   r.target.effect_id & ~doc::kMaskParamBit);
-        } else if (auto it = fx_node.find(r.target.effect_id);
-                   it != fx_node.end()) {
+        if (auto it = fx_node.find(r.target.effect_id);
+            it != fx_node.end()) {
             target = it->second;
-            // Effect cards: row 0 wet, 1 opacity, 2+p params (v4: the mod
+            // Effect cards: row 0 wet, 1 opacity, 2+p params (the mod
             // wire lands on the driven row's gutter). A target hidden in a
             // folded group re-anchors on the group card edge.
             const bool grouped =
@@ -4283,9 +4912,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         case SelKind::LayerSource:
             selected = flow::node_id(flow::NodeKind::Source, app.sel.id);
             break;
-        case SelKind::Mask:
-            selected = flow::node_id(flow::NodeKind::Mask, app.sel.id);
-            break;
         case SelKind::ModSource:
             selected = flow::node_id(flow::NodeKind::ModSource, app.sel.id);
             break;
@@ -4296,7 +4922,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             break;
     }
 
-    // Frames (v3): titled grouping boxes, removable from the canvas.
+    // Frames: titled grouping boxes, removable from the canvas.
     // Hidden in a scoped view (they annotate the main graph).
     const size_t n_frames = scope ? 0 : d.frames.size();
     flow::FrameBox* frame_arr = arena.alloc<flow::FrameBox>(
@@ -4438,16 +5064,14 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 const char* cat = doc::fx_category_label(
                     static_cast<doc::FxCategory>(c));
                 head = false;
-                for (size_t t = 0;
-                     t < static_cast<size_t>(doc::EffectType::Count);
-                     ++t) {
-                    const doc::EffectInfo& info = doc::effect_info(
-                        static_cast<doc::EffectType>(t));
-                    if (static_cast<size_t>(info.category) != c) continue;
+                for (const doc::EffectType et : category_effects_sorted(
+                         static_cast<doc::FxCategory>(c))) {
+                    const doc::EffectInfo& info = doc::effect_info(et);
                     if (!matches(info.label, cat)) continue;
                     if (!head) push(cat, true, {}), head = true;
                     push(info.label, false,
-                         {AddAction::Effect, static_cast<int32_t>(t), 0});
+                         {AddAction::Effect,
+                          static_cast<int32_t>(et), 0});
                 }
             }
         }
@@ -4509,11 +5133,22 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      CtxAction::Bypass);
             }
             if (kind == flow::NodeKind::Effect ||
-                kind == flow::NodeKind::ModSource ||
-                kind == flow::NodeKind::Mask)
+                kind == flow::NodeKind::ModSource)
                 push("duplicate (ctrl+d)", CtxAction::Duplicate);
-            if (kind == flow::NodeKind::Effect)
+            if (kind == flow::NodeKind::Effect) {
                 push("group selection (ctrl+g)", CtxAction::Group);
+                // Param housekeeping.
+                push("reset params", CtxAction::ResetParams);
+                push("copy params", CtxAction::CopyParams);
+                if (app.param_clip_valid) {
+                    size_t cli = 0, cfi = 0;
+                    if (find_effect_by_id(app.document, doc_id, &cli,
+                                          &cfi) &&
+                        app.document.layers[cli].stack[cfi].type ==
+                            app.param_clip_type)
+                        push("paste params", CtxAction::PasteParams);
+                }
+            }
             if (app.multi_sel.size() >= 2) {
                 push("align left", CtxAction::AlignLeft);
                 push("align top", CtxAction::AlignTop);
@@ -4544,7 +5179,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     return {graph, events, add_actions, ctx_actions};
 }
 
-// Two side panels from one pass (spec §9): LEFT = project, layers, masks,
+// Two side panels from one pass: LEFT = project, layers,
 // presets. RIGHT = the selected layer's stack + modulation — always visible
 // beside the viewport, so picking a layer and editing its stack never
 // scrolls. Blocks that belong to the right panel shadow `rows` with
@@ -4620,7 +5255,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 Button(arena, arena.dup(label.c_str(), label.size()),
                        &app.duration_btn, out.duration_clicked, dur_opts)));
         }
-        // Time remap (spec §6.1) — a DOCUMENT parameter, so it lives here
+        // Time remap — a DOCUMENT parameter, so it lives here
         // rather than in the transport bar. "~" routes a mod source onto
         // speed, "k" drops a keyframe (lanes make it a true speed ramp).
         if (!is_still) {
@@ -4650,7 +5285,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      static_cast<int>(app.document.time_mode),
                      &app.time_mode_dd, out.time_mode_selected,
                      SizeSpec::fill(), "playback direction")));
-        // Sidechain + audio nudge (spec §7).
+        // Sidechain + audio nudge.
         {
             out.sc_selected = arena.alloc<int>();
             *out.sc_selected = -1;
@@ -4696,7 +5331,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         &app.nudge_slider, nopts)));
         }
         }   // !is_still
-        // Half-res proxy toggle (spec §3/§10), shown when the import
+        // Half-res proxy toggle, shown when the import
         // produced one.
         {
             std::filesystem::path proxy = app.mez_path;
@@ -4715,7 +5350,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     } else if (!app.import) {
         rows.push_back(Label(arena, "test pattern", small_dim));
     }
-    // Lossless import (spec §3): applies to the next import.
+    // Lossless import: applies to the next import.
     {
         out.lossless_changed = arena.alloc<bool>();
         out.lossless_staged = arena.alloc<bool>();
@@ -4724,7 +5359,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                 out.lossless_staged, &app.lossless_check,
                                 out.lossless_changed));
     }
-    // ---- project (spec §10): save / open, dirty star, Ctrl+S / Ctrl+O.
+    // ---- project: save / open, dirty star, Ctrl+S / Ctrl+O.
     {
         // Project name (status) + its two actions on ONE row.
         out.save_clicked = arena.alloc<bool>();
@@ -4751,6 +5386,64 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     }
     if (!app.status.empty())
         rows.push_back(Label(arena, app.status.c_str(), small_dim));
+    // Recent projects: newest first, click to open (dirty-guarded
+    // in the handler).
+    for (size_t r = 0; r < app.recent_projects.size() && r < 6; ++r) {
+        const std::filesystem::path rp = app.recent_projects[r];
+        if (rp == app.project_path) continue;
+        FrameUi::RecentRow rrow{r, arena.alloc<bool>()};
+        out.recent_rows.push_back(rrow);
+        ButtonOpts ropts;
+        ropts.flat = true;
+        ropts.align_left = true;
+        ropts.width = SizeSpec::fill();
+        ropts.tooltip = "open this recent project";
+        const std::string rname = rp.filename().string();
+        rows.push_back(Button(arena,
+                              arena.dup(rname.c_str(), rname.size()),
+                              &app.recent_buttons[r], rrow.clicked, ropts));
+    }
+    // Cache management: size + open + clear-unused.
+    {
+        char cache_line[64];
+        std::snprintf(cache_line, sizeof(cache_line), "cache  %.1f gb",
+                      app.cache_bytes / (1024.0 * 1024.0 * 1024.0));
+        out.cache_open_clicked = arena.alloc<bool>();
+        out.cache_clear_clicked = arena.alloc<bool>();
+        ButtonOpts tiny;
+        tiny.width = SizeSpec::fixed(48);
+        tiny.flat = true;
+        StackOpts crow_opts;
+        crow_opts.gap = 4.0f;
+        crow_opts.cross_align = AlignMode::Center;
+        ButtonOpts tiny_clear = tiny;
+        tiny_clear.tooltip =
+            "delete every cached import bundle except the open clip's";
+        tiny.tooltip = "open the cache folder";
+        std::vector<LayoutNode*> crow{
+            Label(arena, arena.dup(cache_line, std::strlen(cache_line)),
+                  small_dim),
+            Spacer(arena),
+            Button(arena, "open", &app.cache_open_button,
+                   out.cache_open_clicked, tiny),
+            Button(arena, "clear", &app.cache_clear_button,
+                   out.cache_clear_clicked, tiny_clear)};
+        LayoutNode* cstack = VStackDyn(arena, crow_opts, crow);
+        cstack->kind = NodeKind::HStack;
+        rows.push_back(cstack);
+    }
+    // Message log: the transient status strip, kept — a failure
+    // that flashed by is still readable here.
+    if (!app.status_log.empty()) {
+        LabelOpts log_dim = small_dim;
+        log_dim.color = active_theme().text_disabled;
+        const size_t n = app.status_log.size();
+        for (size_t i = n > 4 ? n - 4 : 0; i < n; ++i)
+            rows.push_back(Label(arena,
+                                 arena.dup(app.status_log[i].c_str(),
+                                           app.status_log[i].size()),
+                                 log_dim));
+    }
     rows.push_back(Separator(arena));
 
     // ---- layer inspector (docs/flow_canvas.md): the selected layer's
@@ -4765,17 +5458,14 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                       ? "new layer"
                                       : "layer"));
     if (app.sel.kind == SelKind::AddLayer) {
-        // Masks and frames stay addable from here too — an empty graph
-        // must offer every node kind (docs/flow_canvas.md v3).
-        out.add_mask_clicked = arena.alloc<bool>();
+        // Frames stay addable from here — an empty graph must offer the
+        // layout node too.
         out.add_frame_clicked = arena.alloc<bool>();
         ButtonOpts half;
         half.width = SizeSpec::fill();
         rows.push_back(HStack(
             arena, {4.0f},
-            {Button(arena, "+ mask", &app.add_mask_button,
-                    out.add_mask_clicked, half),
-             Button(arena, "+ frame", &app.add_frame_button,
+            {Button(arena, "+ frame", &app.add_frame_button,
                     out.add_frame_clicked, half)}));
     }
     for (size_t li = 0; li < app.document.layers.size(); ++li) {
@@ -4792,8 +5482,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         *lrow.visible_staged = !layer.visible;   // eye click applies this
         lrow.blend_selected = arena.alloc<int>();
         *lrow.blend_selected = -1;
-        lrow.mask_selected = arena.alloc<int>();
-        *lrow.mask_selected = -1;
         lrow.remove = arena.alloc<bool>();
         lrow.up = arena.alloc<bool>();
         lrow.down = arena.alloc<bool>();
@@ -4834,37 +5522,29 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 IconButton(arena, Icon::Close, &ls.remove_button, lrow.remove,
                            x_opts),
             }));
-        // Blend + layer mask on the value grid, dropdowns like every enum.
+        // Blend on the value grid, a dropdown like every enum.
         layer_rows_ui.push_back(value_row(
             arena, "blend",
             Dropdown(arena, kBlendNames, 5,
                      static_cast<int>(layer.blend), &ls.blend_dd,
                      lrow.blend_selected, SizeSpec::fill(),
                      "blend mode over the composite below")));
-        {
-            const int mask_count = static_cast<int>(
-                std::min<size_t>(app.document.masks.size(), 16));
-            const char** items = arena.alloc<const char*>(
-                static_cast<size_t>(mask_count) + 1);
-            items[0] = "none";
-            int current = 0;
-            for (int m = 0; m < mask_count; ++m) {
-                const doc::Mask& mk =
-                    app.document.masks[static_cast<size_t>(m)];
-                items[m + 1] = arena.dup(mk.name.c_str(), mk.name.size());
-                if (mk.id == layer.mask_id) current = m + 1;
-            }
-            layer_rows_ui.push_back(value_row(
-                arena, "mask",
-                Dropdown(arena, items, mask_count + 1, current, &ls.mask_dd,
-                         lrow.mask_selected, SizeSpec::fill(),
-                         "gate this layer's contribution with a mask")));
-        }
 
         int lslider = 0;
+        auto lkeyed = [&](const doc::ParamKey& k) {
+            for (const doc::KeyframeLane& l : app.document.lanes)
+                if (l.target == k && !l.keys.empty()) return true;
+            return false;
+        };
+        auto lrouted = [&](const doc::ParamKey& k) {
+            for (const doc::ModRoute& r : app.document.mod_routes)
+                if (r.target == k) return true;
+            return false;
+        };
         auto layer_slider = [&](FrameUi::LayerField field, const char* label,
                                 float min_v, float max_v, float value,
-                                const char* format) {
+                                const char* format,
+                                float display_scale = 1.0f) {
             if (lslider >= 9) return;
             FrameUi::LayerStage stage{};
             stage.layer_id = layer.id;
@@ -4878,21 +5558,99 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             opts.format = format;
             opts.out_changed = stage.changed;
             opts.out_released = stage.released;
+            opts.display_scale = display_scale;
+            // Layer params are mod targets: LayerField indices ≤
+            // Rotate ARE the kLayerParamBit param indices.
+            const doc::ParamKey lkey{layer.id | doc::kLayerParamBit,
+                                     static_cast<int>(field)};
+            FrameUi::AddRoute add_route{lkey, arena.alloc<bool>()};
+            out.add_routes.push_back(add_route);
+            FrameUi::KeyToggle ktog{lkey, value, arena.alloc<bool>()};
+            out.key_toggles.push_back(ktog);
+            // Rail type-in, same contract as effect rows.
+            bool editing = app.rail_edit_key == lkey;
+            if (editing && app.rail_edit_commit) {
+                char* endp = nullptr;
+                const double typed =
+                    std::strtod(app.rail_edit_buf.c_str(), &endp);
+                if (endp != app.rail_edit_buf.c_str()) {
+                    const float scale = app.rail_edit_scale != 0.0f
+                                            ? app.rail_edit_scale
+                                            : 1.0f;
+                    *stage.staged = std::clamp(
+                        static_cast<float>(typed / scale), min_v, max_v);
+                    *stage.changed = true;
+                    *stage.released = true;
+                }
+                app.rail_edit_key = {};
+                app.rail_edit_commit = false;
+                editing = false;
+            }
+            FrameUi::RailEdit redit{};
+            redit.key = lkey;
+            redit.scale = display_scale;
+            redit.clicked = arena.alloc<bool>();
+            {
+                char seed[32];
+                std::snprintf(seed, sizeof(seed), "%g",
+                              value * display_scale);
+                redit.seed = arena.dup(seed, std::strlen(seed));
+            }
+            out.rail_edits.push_back(redit);
+            opts.out_value_clicked = redit.clicked;
+            LayoutNode* control;
+            if (editing) {
+                std::string shown = app.rail_edit_buf + "_";
+                ButtonOpts bo;
+                bo.align_left = true;
+                bo.width = SizeSpec::fill();
+                bo.tooltip = "enter commits, esc cancels";
+                control = Button(arena,
+                                 arena.dup(shown.c_str(), shown.size()),
+                                 &ls.value_edit_button, nullptr, bo);
+            } else if (format && std::strstr(format, "deg")) {
+                control = DialF(arena, stage.staged, min_v, max_v,
+                                &ls.sliders[lslider], opts);
+            } else {
+                control = SliderF(arena, stage.staged, min_v, max_v,
+                                  &ls.sliders[lslider], opts);
+            }
             layer_rows_ui.push_back(param_row(
-                arena, label,
-                SliderF(arena, stage.staged, min_v, max_v,
-                        &ls.sliders[lslider], opts),
-                nullptr, nullptr, nullptr, nullptr));
+                arena, label, control,
+                &ls.route_buttons[lslider], add_route.clicked,
+                &ls.key_buttons[lslider], ktog.clicked, nullptr, nullptr,
+                nullptr, lkeyed(lkey), lrouted(lkey)));
             out.layer_stages.push_back(stage);
             ++lslider;
         };
         using LF = FrameUi::LayerField;
         layer_slider(LF::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                      "%.2f");
+        // Swatch opens the picker (fast visual edit); the channel rows
+        // below stay because they carry the key/route mod affordances.
+        auto color_swatch_row = [&](const char* label, const float rgb[3],
+                                    bool is_b, ui::SwatchState& swatch) {
+            FrameUi::ColorStage cstage{};
+            cstage.layer_id = layer.id;
+            cstage.color_b = is_b;
+            cstage.staged = arena.alloc<float>(3);
+            for (int c = 0; c < 3; ++c) {
+                cstage.staged[c] = rgb[c];
+                cstage.original[c] = rgb[c];
+            }
+            cstage.changed = arena.alloc<bool>();
+            cstage.released = arena.alloc<bool>();
+            out.color_stages.push_back(cstage);
+            layer_rows_ui.push_back(value_row(
+                arena, label,
+                ColorSwatch(arena, rgb, &swatch, cstage.staged,
+                            cstage.changed, cstage.released)));
+        };
         if (layer.source == doc::LayerSourceKind::Solid ||
             layer.source == doc::LayerSourceKind::Gradient ||
             layer.source == doc::LayerSourceKind::Noise ||
             layer.source == doc::LayerSourceKind::Oscillator) {
+            color_swatch_row("color a", layer.color_a, false, ls.swatch_a);
             layer_slider(LF::ColorAR, "color a r", 0.0f, 1.0f,
                          layer.color_a[0], "%.2f");
             layer_slider(LF::ColorAG, "color a g", 0.0f, 1.0f,
@@ -4903,6 +5661,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         if (layer.source == doc::LayerSourceKind::Gradient ||
             layer.source == doc::LayerSourceKind::Noise ||
             layer.source == doc::LayerSourceKind::Oscillator) {
+            color_swatch_row("color b", layer.color_b, true, ls.swatch_b);
             layer_slider(LF::ColorBR, "color b r", 0.0f, 1.0f,
                          layer.color_b[0], "%.2f");
             layer_slider(LF::ColorBG, "color b g", 0.0f, 1.0f,
@@ -4912,15 +5671,16 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
         if (layer.source == doc::LayerSourceKind::Gradient ||
             layer.source == doc::LayerSourceKind::Oscillator)
+            // Stored in radians; the readout speaks degrees (units).
             layer_slider(LF::Angle, "angle", -3.1416f, 3.1416f,
-                         layer.gen_angle, "%.2f");
+                         layer.gen_angle, "%.0f deg", 57.29578f);
         if (layer.source == doc::LayerSourceKind::Noise)
             layer_slider(LF::Scale, "scale", 2.0f, 128.0f, layer.gen_scale,
                          "%.0f px");
         if (layer.source == doc::LayerSourceKind::Oscillator) {
             layer_slider(LF::Scale, "frequency", 0.5f, 32.0f,
                          layer.gen_scale, "%.1f cyc");
-            // Waveform dropdown (spec §5 generators): the oscillator is a
+            // Waveform dropdown (generators): the oscillator is a
             // patchable periodic source, shape picks its geometry.
             static const char* kOscShapes[] = {"sine bars", "rings",
                                                "plasma", "lissajous"};
@@ -4934,7 +5694,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                          "oscillator waveform")));
         }
         if (layer.source == doc::LayerSourceKind::Shape) {
-            // The matte maker (v5.2): size + feather + geometry; place
+            // The matte maker: size + feather + geometry; place
             // and rotate it with the layer transform, texture it with
             // the effect chain it feeds.
             layer_slider(LF::Scale, "size", 0.5f, 30.0f, layer.gen_scale,
@@ -4953,7 +5713,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                          "matte geometry")));
         }
 
-        // Transform + trim (spec §5: crop/flip/scale/rotate + the clip
+        // Transform + trim (crop/flip/scale/rotate + the clip
         // segment live on the layer). Folded per layer; the header marks
         // itself when the transform is active so a folded card still tells.
         lrow.xf_toggle = arena.alloc<bool>();
@@ -4981,11 +5741,23 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 opts.format = format;
                 opts.out_changed = stage.changed;
                 opts.out_released = stage.released;
+                const doc::ParamKey lkey{layer.id | doc::kLayerParamBit,
+                                         static_cast<int>(field)};
+                FrameUi::AddRoute add_route{lkey, arena.alloc<bool>()};
+                out.add_routes.push_back(add_route);
+                FrameUi::KeyToggle ktog{lkey, value, arena.alloc<bool>()};
+                out.key_toggles.push_back(ktog);
+                LayoutNode* xcontrol =
+                    format && std::strstr(format, "deg")
+                        ? DialF(arena, stage.staged, min_v, max_v,
+                                &ls.xf_sliders[xslider], opts)
+                        : SliderF(arena, stage.staged, min_v, max_v,
+                                  &ls.xf_sliders[xslider], opts);
                 layer_rows_ui.push_back(param_row(
-                    arena, label,
-                    SliderF(arena, stage.staged, min_v, max_v,
-                            &ls.xf_sliders[xslider], opts),
-                    nullptr, nullptr, nullptr, nullptr));
+                    arena, label, xcontrol,
+                    &ls.xf_route_buttons[xslider], add_route.clicked,
+                    &ls.xf_key_buttons[xslider], ktog.clicked, nullptr,
+                    nullptr, nullptr, lkeyed(lkey), lrouted(lkey)));
                 out.layer_stages.push_back(stage);
                 ++xslider;
             };
@@ -5094,7 +5866,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     if ((app.sel.kind == SelKind::None || app.sel.kind == SelKind::Effect ||
          app.sel.kind == SelKind::Group) &&
         !app.document.layers.empty()) {
-        // Randomize (spec §10): chaos slider + whole-stack button; each
+        // Randomize: chaos slider + whole-stack button; each
         // effect row also carries its own dice.
         out.randomize_all = arena.alloc<bool>();
         out.chaos_staged = arena.alloc<float>();
@@ -5160,9 +5932,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
     }
 
-    // Add-node browser: spec §6.1 category folds, shown after a
-    // double-click on the canvas (or an explicit add request). Masks and
-    // layers add from the same place.
+    // Add-node browser: category folds, shown after a
+    // double-click on the canvas (or an explicit add request). Layers add
+    // from the same place.
     if (app.sel.kind == SelKind::AddEffect &&
         layer_index_by_id(app.document, app.sel.id) >= 0) {
         app.selected_layer = static_cast<size_t>(
@@ -5173,20 +5945,17 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                  : "at the end of the chain",
                              small_dim));
         {
-            out.add_mask_clicked = arena.alloc<bool>();
             out.add_layer_open = arena.alloc<bool>();
             ButtonOpts half;
             half.width = SizeSpec::fill();
             out.add_frame_clicked = arena.alloc<bool>();
             rows.push_back(HStack(
                 arena, {4.0f},
-                {Button(arena, "+ mask", &app.add_mask_button,
-                        out.add_mask_clicked, half),
-                 Button(arena, "+ layer...", &app.add_layer_open_button,
+                {Button(arena, "+ layer...", &app.add_layer_open_button,
                         out.add_layer_open, half),
                  Button(arena, "+ frame", &app.add_frame_button,
                         out.add_frame_clicked, half)}));
-            // Search (v3): type-to-filter across every category.
+            // Search: type-to-filter across every category.
             out.fx_search_clicked = arena.alloc<bool>();
             std::string label = app.fx_filter;
             if (app.fx_search_focus) label += "_";
@@ -5251,7 +6020,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             // an outlined body under the header, not loose rows drifting
             // in the stack list (same containment treatment as groups).
             std::vector<LayoutNode*> browser;
-            for (int c = 0; c < 8; ++c) {
+            for (int c = 0;
+                 c < static_cast<int>(doc::FxCategory::Count); ++c) {
                 const auto cat = static_cast<doc::FxCategory>(c);
                 out.fx_cat_clicked[c] = arena.alloc<bool>();
                 browser.push_back(SectionHeader(arena,
@@ -5264,11 +6034,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 ButtonOpts half;
                 half.width = SizeSpec::fill();
                 LayoutNode* pending = nullptr;
-                for (size_t t = 0;
-                     t < static_cast<size_t>(doc::EffectType::Count); ++t) {
-                    const doc::EffectInfo& info =
-                        doc::effect_info(static_cast<doc::EffectType>(t));
-                    if (info.category != cat) continue;
+                for (const doc::EffectType et :
+                     category_effects_sorted(cat)) {
+                    const size_t t = static_cast<size_t>(et);
+                    const doc::EffectInfo& info = doc::effect_info(et);
                     out.add_clicked[t] = arena.alloc<bool>();
                     LayoutNode* b =
                         Button(arena, info.label, &app.add_buttons[t],
@@ -5297,7 +6066,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     rows.push_back(Separator(arena));
     }   // end right panel (inspector)
 
-    // ---- preset browser (spec §10): click = drop the group onto the
+    // ---- preset browser: click = drop the group onto the
     // selected layer's stack. Its OWN inspector tab (it was buried
     // behind a fold in the project tab — "where are the presets?").
     std::vector<LayoutNode*> preset_rows;
@@ -5327,7 +6096,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             Dropdown(arena, tag_items, tag_count + 1,
                      app.preset_tag_index + 1, &app.tag_dd, out.tag_selected,
                      SizeSpec::fill(), "filter presets by tag")));
-        // Text search (spec §9: browser is searchable). A flat field that
+        // Text search (browser is searchable). A flat field that
         // captures the keyboard while focused; enter/escape release it.
         {
             out.preset_search_clicked = arena.alloc<bool>();
@@ -5374,354 +6143,12 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
         if (app.presets.empty())
             rows.push_back(Label(arena, "no presets found", small_dim));
-        // Single-file preset import (spec §9); drag-and-drop works too.
+        // Single-file preset import; drag-and-drop works too.
         out.preset_import_clicked = arena.alloc<bool>();
         rows.push_back(Button(arena, "import preset...",
                               &app.preset_import_btn,
                               out.preset_import_clicked));
     }
-
-    // ---- mask inspector (spec §8, docs/flow_canvas.md): the selected
-    // canvas mask node's full block — right panel; the canvas aux lane
-    // replaced the mask list.
-    if (app.sel.kind == SelKind::Mask) {
-    std::vector<LayoutNode*>& rows = right_rows;   // inspector content
-    rows.push_back(Heading(arena, "mask"));
-    static const char* kMaskTypeNames[] = {"shape", "luma", "luma key",
-                                           "chroma key", "motion"};
-    static const char* kExtractNames[] = {"luma", "red", "green", "blue",
-                                          "alpha"};
-    for (const doc::Mask& mask : app.document.masks) {
-        if (mask.id != app.sel.id) continue;
-        MaskUiState& ms = app.mask_ui[mask.id];
-        FrameUi::MaskActions actions{};
-        actions.mask_id = mask.id;
-        actions.type_selected = arena.alloc<int>();
-        *actions.type_selected = -1;
-        actions.extract_selected = arena.alloc<int>();
-        *actions.extract_selected = -1;
-        actions.remove = arena.alloc<bool>();
-        actions.view = arena.alloc<bool>();
-        actions.invert_changed = arena.alloc<bool>();
-        actions.invert_staged = arena.alloc<bool>();
-        *actions.invert_staged = mask.invert;
-        actions.chain_add = arena.alloc<bool>();
-
-        std::vector<LayoutNode*> mask_rows;
-        ButtonOpts tiny;
-        tiny.width = SizeSpec::fixed(20);
-        tiny.tooltip = "remove mask";
-        const bool viewing = app.overlay_mask_id == mask.id;
-        ButtonOpts view_opts;
-        view_opts.width = SizeSpec::fixed(20);
-        view_opts.tooltip = viewing ? "hide mask overlay"
-                                    : "view mask in the viewport";
-        mask_rows.push_back(HStack(
-            arena, {2.0f},
-            {
-                Label(arena, mask.name.c_str()),
-                Spacer(arena),
-                IconButton(arena, viewing ? Icon::EyeOff : Icon::Eye,
-                           &ms.view_button, actions.view, view_opts),
-                IconButton(arena, Icon::Close, &ms.remove_button,
-                           actions.remove, tiny),
-            }));
-        mask_rows.push_back(value_row(
-            arena, "type",
-            Dropdown(arena, kMaskTypeNames, 5,
-                     static_cast<int>(mask.type), &ms.type_dd,
-                     actions.type_selected, SizeSpec::fill(), nullptr)));
-        if (mask.type == doc::MaskType::Luma)
-            mask_rows.push_back(value_row(
-                arena, "extract",
-                Dropdown(arena, kExtractNames, 5,
-                         static_cast<int>(mask.extract), &ms.extract_dd,
-                         actions.extract_selected, SizeSpec::fill(),
-                         nullptr)));
-        mask_rows.push_back(Checkbox(arena, "invert", actions.invert_staged,
-                                     &ms.invert_check,
-                                     actions.invert_changed));
-        if (mask.type == doc::MaskType::Shape && mask.points.size() >= 6) {
-            // Whole-shape keyframe at the playhead (spec §8 "keyframable
-            // points"): keys every point coordinate; pressed again on a
-            // keyed frame it removes the shape key (mirrors [k]).
-            actions.key_points = arena.alloc<bool>();
-            ButtonOpts kp;
-            kp.width = SizeSpec::fixed(84);
-            mask_rows.push_back(Button(arena, "key points",
-                                       &ms.key_points_button,
-                                       actions.key_points, kp));
-        }
-
-        int slider_i = 0;
-        auto mask_slider = [&](FrameUi::MaskField field, const char* label,
-                               float min_v, float max_v, float value,
-                               const char* format) {
-            if (slider_i >= 15) return;
-            FrameUi::MaskStage stage{};
-            stage.mask_id = mask.id;
-            stage.field = field;
-            stage.staged = arena.alloc<float>();
-            *stage.staged = value;
-            stage.original = value;
-            stage.changed = arena.alloc<bool>();
-            stage.released = arena.alloc<bool>();
-            SliderOpts opts;
-            opts.format = format;
-            opts.out_changed = stage.changed;
-            opts.out_released = stage.released;
-            // Mask params are mod targets (spec §8): [~] route, [k] key,
-            // keyed under kMaskParamBit. Fields outside the mod set
-            // (roundness, key RGB) keep a plain label.
-            int mod_index = -1;
-            using MFF = FrameUi::MaskField;
-            switch (field) {
-                case MFF::Feather: mod_index = 0; break;
-                case MFF::CenterX: mod_index = 1; break;
-                case MFF::CenterY: mod_index = 2; break;
-                case MFF::RadiusX: mod_index = 3; break;
-                case MFF::RadiusY: mod_index = 4; break;
-                case MFF::BlurPx: mod_index = 5; break;
-                case MFF::BlackPoint: mod_index = 6; break;
-                case MFF::WhitePoint: mod_index = 7; break;
-                case MFF::Gamma: mod_index = 8; break;
-                case MFF::KeyCenter: mod_index = 9; break;
-                case MFF::KeyRange: mod_index = 10; break;
-                default: break;
-            }
-            LayoutNode* slider = SliderF(arena, stage.staged, min_v, max_v,
-                                         &ms.sliders[slider_i], opts);
-            if (mod_index >= 0) {
-                const doc::ParamKey mkey{mask.id | doc::kMaskParamBit,
-                                         mod_index};
-                FrameUi::AddRoute mroute{mkey, arena.alloc<bool>()};
-                FrameUi::KeyToggle mkeyt{mkey, value, arena.alloc<bool>()};
-                mask_rows.push_back(param_row(
-                    arena, label, slider, &ms.route_buttons[slider_i],
-                    mroute.clicked, &ms.key_buttons[slider_i],
-                    mkeyt.clicked));
-                out.add_routes.push_back(mroute);
-                out.key_toggles.push_back(mkeyt);
-            } else {
-                mask_rows.push_back(param_row(arena, label, slider, nullptr,
-                                              nullptr, nullptr, nullptr));
-            }
-            out.mask_stages.push_back(stage);
-            ++slider_i;
-        };
-        using MF = FrameUi::MaskField;
-        if (mask.type == doc::MaskType::Shape) {
-            mask_slider(MF::CenterX, "center x", 0.0f, 1.0f, mask.center_x, "%.2f");
-            mask_slider(MF::CenterY, "center y", 0.0f, 1.0f, mask.center_y, "%.2f");
-            mask_slider(MF::RadiusX, "radius x", 0.01f, 1.0f, mask.radius_x, "%.2f");
-            mask_slider(MF::RadiusY, "radius y", 0.01f, 1.0f, mask.radius_y, "%.2f");
-            mask_slider(MF::Roundness, "roundness", 0.0f, 1.0f, mask.roundness, "%.2f");
-            mask_slider(MF::Feather, "feather", 0.0f, 0.5f, mask.feather, "%.3f");
-        } else {
-            if (mask.type == doc::MaskType::LumaKey) {
-                mask_slider(MF::KeyCenter, "key center", 0.0f, 1.0f,
-                            mask.key_center, "%.2f");
-                mask_slider(MF::KeyRange, "key range", 0.01f, 1.0f,
-                            mask.key_range, "%.2f");
-            } else if (mask.type == doc::MaskType::ChromaKey) {
-                mask_slider(MF::KeyR, "key r", 0.0f, 1.0f, mask.key_r, "%.2f");
-                mask_slider(MF::KeyG, "key g", 0.0f, 1.0f, mask.key_g, "%.2f");
-                mask_slider(MF::KeyB, "key b", 0.0f, 1.0f, mask.key_b, "%.2f");
-                mask_slider(MF::KeyRange, "key range", 0.01f, 2.0f,
-                            mask.key_range, "%.2f");
-            }
-            // Mask source (spec §8: "source can be anything"): the shared
-            // clip, another layer's source, a built-in generator, or an
-            // external video + fit + time-sync. Motion masks read the flow
-            // field and need no source.
-            const bool motion = mask.type == doc::MaskType::Motion;
-            const bool file_active = mask.source_gen == 0 &&
-                                     mask.source_layer_id == 0 &&
-                                     !mask.source_path.empty();
-            if (!motion) {
-                actions.source_selected = arena.alloc<int>();
-                *actions.source_selected = -1;
-                actions.freerun_changed = arena.alloc<bool>();
-                actions.freerun_staged = arena.alloc<bool>();
-                *actions.freerun_staged = mask.free_run;
-                const char** src_items = arena.alloc<const char*>(
-                    doc::kMaxLayers + 6);
-                int n = 0;
-                int current = 0;
-                src_items[n++] = "clip";
-                actions.src_layer_base = n;
-                for (const doc::Layer& sl : app.document.layers) {
-                    if (n >= static_cast<int>(doc::kMaxLayers) + 1) break;
-                    src_items[n] = arena.dup(sl.name.c_str(),
-                                             sl.name.size());
-                    if (mask.source_gen == 0 &&
-                        mask.source_layer_id == sl.id)
-                        current = n;
-                    ++n;
-                }
-                actions.src_layer_count = n - actions.src_layer_base;
-                actions.src_gen_base = n;
-                src_items[n++] = "gen: noise";
-                src_items[n++] = "gen: gradient";
-                src_items[n++] = "gen: bars";
-                if (mask.source_gen ==
-                    static_cast<uint32_t>(doc::LayerSourceKind::Noise))
-                    current = actions.src_gen_base;
-                else if (mask.source_gen ==
-                         static_cast<uint32_t>(
-                             doc::LayerSourceKind::Gradient))
-                    current = actions.src_gen_base + 1;
-                else if (mask.source_gen ==
-                         static_cast<uint32_t>(
-                             doc::LayerSourceKind::TestPattern))
-                    current = actions.src_gen_base + 2;
-                if (!mask.source_path.empty()) {
-                    const std::string file =
-                        std::filesystem::path(mask.source_path)
-                            .filename()
-                            .string();
-                    actions.src_file_index = n;
-                    src_items[n] = arena.dup(file.c_str(), file.size());
-                    if (file_active) current = n;
-                    ++n;
-                }
-                actions.src_pick_index = n;
-                src_items[n++] = "pick video...";
-                mask_rows.push_back(value_row(
-                    arena, "source",
-                    Dropdown(arena, src_items, n, current, &ms.source_dd,
-                             actions.source_selected, SizeSpec::fill(),
-                             "grayscale source for this mask")));
-                if (mask.source_gen != 0) {
-                    mask_slider(MF::GenScale, "gen scale", 2.0f, 256.0f,
-                                mask.gen_scale, "%.0f px");
-                    if (mask.source_gen ==
-                        static_cast<uint32_t>(
-                            doc::LayerSourceKind::Gradient))
-                        mask_slider(MF::GenAngle, "gen angle", -3.1416f,
-                                    3.1416f, mask.gen_angle, "%.2f");
-                }
-                if (file_active) {
-                    static const char* kFitNames[] = {"stretch", "fill",
-                                                      "tile"};
-                    actions.fit_selected = arena.alloc<int>();
-                    *actions.fit_selected = -1;
-                    mask_rows.push_back(value_row(
-                        arena, "fit",
-                        Dropdown(arena, kFitNames, 3,
-                                 static_cast<int>(mask.fit % 3), &ms.fit_dd,
-                                 actions.fit_selected, SizeSpec::fill(),
-                                 "resolution-mismatch handling")));
-                    mask_rows.push_back(Checkbox(
-                        arena, "free run", actions.freerun_staged,
-                        &ms.freerun_check, actions.freerun_changed));
-                }
-            }
-
-            mask_slider(MF::BlackPoint, "black", 0.0f, 1.0f,
-                        mask.black_point, "%.2f");
-            mask_slider(MF::WhitePoint, "white", 0.0f, 1.0f,
-                        mask.white_point, "%.2f");
-            mask_slider(MF::Gamma, "gamma", 0.1f, 4.0f, mask.gamma, "%.2f");
-            mask_slider(MF::GrowPx, "grow", -64.0f, 64.0f, mask.grow_px,
-                        "%.0f px");
-            mask_slider(MF::BlurPx, "feather px", 0.0f, 64.0f, mask.blur_px,
-                        "%.0f");
-
-            // Mini effect chain (spec §8: mask sources own a chain).
-            // Motion masks read the flow field — no chain.
-            for (size_t c = 0; !motion && c < mask.chain.size() && c < 4;
-                 ++c) {
-                const doc::EffectInstance& cfx = mask.chain[c];
-                const doc::EffectInfo& cinfo = doc::effect_info(cfx.type);
-                FrameUi::MaskChainRemove remove{mask.id, c,
-                                                arena.alloc<bool>()};
-                ButtonOpts chain_x;
-                chain_x.width = SizeSpec::fixed(20);
-                chain_x.tooltip = "remove chain effect";
-                mask_rows.push_back(HStack(
-                    arena, {2.0f},
-                    {
-                        Label(arena, cinfo.label, small_dim),
-                        Spacer(arena),
-                        IconButton(arena, Icon::Close, &ms.chain_remove[c],
-                                   remove.clicked, chain_x),
-                    }));
-                out.mask_chain_removes.push_back(remove);
-                for (uint32_t p = 0; p < cinfo.param_count && p < 8; ++p) {
-                    FrameUi::MaskChainStage stage{};
-                    stage.mask_id = mask.id;
-                    stage.chain_index = c;
-                    stage.param_index = static_cast<int>(p);
-                    stage.staged = arena.alloc<float>();
-                    *stage.staged = cfx.params[p];
-                    stage.original = cfx.params[p];
-                    stage.changed = arena.alloc<bool>();
-                    stage.released = arena.alloc<bool>();
-                    SliderOpts copts;
-                    copts.format = cinfo.params[p].format;
-                    copts.out_changed = stage.changed;
-                    copts.out_released = stage.released;
-                    mask_rows.push_back(Label(arena, cinfo.params[p].label,
-                                              small_dim));
-                    mask_rows.push_back(
-                        SliderF(arena, stage.staged,
-                                cinfo.params[p].min_value,
-                                cinfo.params[p].max_value,
-                                &ms.chain_sliders[c][p], copts));
-                    out.mask_chain_stages.push_back(stage);
-                }
-            }
-            if (!motion && mask.chain.size() < 4)
-                mask_rows.push_back(Button(arena, "+ chain pixelate",
-                                           &ms.chain_add_button,
-                                           actions.chain_add));
-        }
-
-        // Combine (spec §8): fold another mask in — add/subtract/intersect.
-        if (app.document.masks.size() > 1) {
-            actions.combine_selected = arena.alloc<int>();
-            *actions.combine_selected = -1;
-            const char** comb_items = arena.alloc<const char*>(17);
-            int n = 0;
-            int current = 0;
-            comb_items[n++] = "none";
-            for (const doc::Mask& other : app.document.masks) {
-                if (other.id == mask.id || n >= 17) continue;
-                comb_items[n] = arena.dup(other.name.c_str(),
-                                          other.name.size());
-                if (other.id == mask.combine_id) current = n;
-                ++n;
-            }
-            mask_rows.push_back(value_row(
-                arena, "combine",
-                Dropdown(arena, comb_items, n, current, &ms.combine_dd,
-                         actions.combine_selected, SizeSpec::fill(),
-                         "fold another mask into this one")));
-            if (mask.combine_id != 0) {
-                static const char* kOpNames[] = {"add", "subtract",
-                                                 "intersect"};
-                actions.combine_op_selected = arena.alloc<int>();
-                *actions.combine_op_selected = -1;
-                mask_rows.push_back(value_row(
-                    arena, "op",
-                    Dropdown(arena, kOpNames, 3,
-                             static_cast<int>(mask.combine_op) % 3,
-                             &ms.combine_op_dd,
-                             actions.combine_op_selected, SizeSpec::fill(),
-                             nullptr)));
-            }
-        }
-
-        StackOpts mask_col;
-        mask_col.gap = 4.0f;
-        mask_col.cross_align = AlignMode::Stretch;
-        rows.push_back(Panel(arena, VStackDyn(arena, mask_col, mask_rows),
-                             PanelOpts{Edges::all(6), -1.0f}));
-        out.mask_actions.push_back(actions);
-    }
-    rows.push_back(Separator(arena));
-    }   // end mask inspector ("+ mask" lives on the canvas aux lane)
 
     // ---- RIGHT PANEL: modulation routes (selection-filtered) + the
     // Output inspector (snapshots/morph) + the persistent undo/export tail.
@@ -5757,7 +6184,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(Separator(arena));
     }
     const bool show_matrix = app.sel.kind == SelKind::Effect ||
-                             app.sel.kind == SelKind::Mask ||
                              app.sel.kind == SelKind::ModSource ||
                              app.sel.kind == SelKind::Output;
     if (app.sel.kind == SelKind::Output)
@@ -5786,14 +6212,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     static const char* kCurveNames[] = {"lin", "exp", "s", "inv"};
     for (const doc::ModRoute& route : app.document.mod_routes) {
         // Selection filter (docs/flow_canvas.md): an effect shows its own
-        // routes, a mask its mask-param routes, a mod node just itself.
+        // routes, a mod node just itself.
         const bool match =
             app.sel.kind == SelKind::Output ? true
             : app.sel.kind == SelKind::ModSource ? route.id == app.sel.id
-            : app.sel.kind == SelKind::Effect
-                ? route.target.effect_id == app.sel.id
-                : route.target.effect_id ==
-                      (app.sel.id | doc::kMaskParamBit);
+            : route.target.effect_id == app.sel.id;
         if (!match) continue;
         ++routes_shown;
         RouteUiState& rs = app.route_ui[route.id];
@@ -5818,7 +6241,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         row.amount_released = arena.alloc<bool>();
 
         // The shape dropdown doubles as the envelope's trigger selector;
-        // the rate slider doubles as decay for envelope AND beat (spec §7).
+        // the rate slider doubles as decay for envelope AND beat.
         const bool is_lfo = route.source.type == doc::ModSourceType::Lfo ||
                             route.source.type == doc::ModSourceType::LfoBeat;
         const bool is_env =
@@ -5837,7 +6260,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             row.rate_original = route.source.decay;
         }
 
-        // Unwired value node (v4): target {0, -1} is inert until its out
+        // Unwired value node: target {0, -1} is inert until its out
         // port is dropped on a param row.
         const bool unwired = route.target.effect_id == 0 &&
                              route.target.param_index < 0;
@@ -5955,7 +6378,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         out.snap_store_clicked[1] = store[1];
         out.snap_store_clicked[2] = store[2];
 
-        // Morph A>B (spec §7): live once both slots are stored; "~" routes
+        // Morph A>B: live once both slots are stored; "~" routes
         // a mod source onto the morph position (ParamKey {0, 0}).
         out.morph_staged = arena.alloc<float>();
         *out.morph_staged = app.document.morph_pos;
@@ -6007,7 +6430,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(Label(arena, line, small_dim));
     }
 
-    // ---- export + render queue (spec §9). The button stays live while a
+    // ---- export + render queue. The button stays live while a
     // job runs — further exports snapshot the current state and queue up.
     if (app.export_job) {
         const uint32_t total = app.export_job->progress.frames_total.load();
@@ -6015,9 +6438,53 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         std::snprintf(line, sizeof(line), "exporting %s %u%%",
                       app.export_job->out_path.filename().string().c_str(),
                       total ? done * 100 / total : 0);
-        rows.push_back(Label(arena, line, dim));
+        out.export_cancel_clicked = arena.alloc<bool>();
+        ButtonOpts cancel_opts;
+        cancel_opts.width = SizeSpec::fixed(56);
+        std::vector<LayoutNode*> prow{
+            Label(arena, line, dim), Spacer(arena),
+            Button(arena, "cancel", &app.export_cancel_button,
+                   out.export_cancel_clicked, cancel_opts)};
+        LayoutNode* pstack = VStackDyn(arena, {}, prow);
+        pstack->kind = NodeKind::HStack;
+        pstack->gap = 4.0f;
+        rows.push_back(pstack);
     }
     if (has_clip) {
+        // Export settings: bitrate / output scale / audio — project
+        // state through set_export_config_command like every other edit.
+        out.export_bitrate_staged = arena.alloc<float>();
+        *out.export_bitrate_staged = app.document.export_bitrate_mbps;
+        out.export_bitrate_changed = arena.alloc<bool>();
+        out.export_bitrate_released = arena.alloc<bool>();
+        SliderOpts bopts;
+        bopts.format = "%.0f mbps";
+        bopts.out_changed = out.export_bitrate_changed;
+        bopts.out_released = out.export_bitrate_released;
+        rows.push_back(value_row(
+            arena, "bitrate",
+            SliderF(arena, out.export_bitrate_staged, 1.0f, 60.0f,
+                    &app.export_bitrate_slider, bopts)));
+        static const char* kExportScaleItems[] = {"full size", "half",
+                                                  "quarter"};
+        const int scale_current = app.document.export_scale >= 4   ? 2
+                                  : app.document.export_scale == 2 ? 1
+                                                                   : 0;
+        out.export_scale_selected = arena.alloc<int>();
+        *out.export_scale_selected = -1;
+        rows.push_back(value_row(
+            arena, "size",
+            Dropdown(arena, kExportScaleItems, 3, scale_current,
+                     &app.export_scale_dd, out.export_scale_selected,
+                     SizeSpec::fill(),
+                     "output resolution: source / half / quarter")));
+        out.export_audio_staged = arena.alloc<bool>();
+        *out.export_audio_staged = app.document.export_audio;
+        out.export_audio_changed = arena.alloc<bool>();
+        rows.push_back(Checkbox(arena, "export audio",
+                                out.export_audio_staged,
+                                &app.export_audio_check,
+                                out.export_audio_changed));
         out.export_clicked = arena.alloc<bool>();
         rows.push_back(Button(arena,
                               app.export_job ? "export (queue)..."
@@ -6077,9 +6544,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         PanelOpts{panel_pad, -1.0f});
 }
 
-// Bottom timeline: ruler + one row per keyframe lane (spec §9). Lanes are
+// Bottom timeline: ruler + one row per keyframe lane. Lanes are
 // created with the [k] button next to any param.
-// Transport bar under the viewport (spec §9): playback + monitoring only —
+// Transport bar under the viewport: playback + monitoring only —
 // play, scrubber, time readout, then the view chips (loop, live, preview
 // res, a/b wipe, fx bypass). Document parameters (speed, time mode) stay
 // in the sidebar.
@@ -6106,12 +6573,39 @@ ui::LayoutNode* build_transport(ui::LayoutArena& arena, AppState& app,
                              static_cast<float>(frames), &app.scrubber,
                              out.seek_changed));
 
+    // Frame counter + mm:ss:ff timecode.
     char line[64];
-    std::snprintf(line, sizeof(line), "%u / %u  %.2fs",
-                  app.player.current_frame_index(), frames,
-                  app.player.position_seconds());
-    items.push_back(SizedBox(arena, SizeSpec::fixed(104), SizeSpec::fixed(18),
+    const double fps = app.player.fps();
+    const uint32_t at = app.player.current_frame_index();
+    const int tc_min = fps > 0.0
+        ? static_cast<int>(at / fps) / 60 : 0;
+    const int tc_sec = fps > 0.0
+        ? static_cast<int>(at / fps) % 60 : 0;
+    const int tc_frm = fps > 0.0
+        ? static_cast<int>(at - static_cast<uint32_t>(
+              static_cast<int>(at / fps) * fps))
+        : 0;
+    std::snprintf(line, sizeof(line), "%u / %u  %02d:%02d:%02d", at, frames,
+                  tc_min, tc_sec, tc_frm);
+    items.push_back(SizedBox(arena, SizeSpec::fixed(120), SizeSpec::fixed(18),
                              Label(arena, line, small_dim)));
+
+    // Monitor volume: mute chip + gain slider, app-level prefs.
+    out.mute_clicked = arena.alloc<bool>();
+    items.push_back(Chip(arena, "mute", app.audio_muted, &app.mute_button,
+                         out.mute_clicked, "mute monitoring"));
+    out.volume_staged = arena.alloc<float>();
+    *out.volume_staged = app.audio_gain;
+    out.volume_changed = arena.alloc<bool>();
+    out.volume_released = arena.alloc<bool>();
+    SliderOpts vol_opts;
+    vol_opts.format = nullptr;
+    vol_opts.out_changed = out.volume_changed;
+    vol_opts.out_released = out.volume_released;
+    vol_opts.tooltip = "monitor volume";
+    items.push_back(SizedBox(arena, SizeSpec::fixed(64), SizeSpec::fixed(22),
+                             SliderF(arena, out.volume_staged, 0.0f, 1.5f,
+                                     &app.volume_slider, vol_opts)));
 
     out.loop_clicked = arena.alloc<bool>();
     items.push_back(Chip(arena, "loop", app.loop, &app.loop_check,
@@ -6120,7 +6614,7 @@ ui::LayoutNode* build_transport(ui::LayoutArena& arena, AppState& app,
     items.push_back(Chip(arena, "live", app.live_mode, &app.live_button,
                          out.live_clicked,
                          "live mode: realtime mod sources, timeline hidden"));
-    // Proxy indicator (spec §9): plain text, only when the player is on
+    // Proxy indicator: plain text, only when the player is on
     // the half-res file.
     if (app.proxy_active) {
         LabelOpts pxy;
@@ -6165,6 +6659,135 @@ ui::LayoutNode* build_transport(ui::LayoutArena& arena, AppState& app,
     return Panel(arena, row, PanelOpts{Edges::xy(8.0f, 4.0f), -1.0f});
 }
 
+// ---- timeline keyboard helpers. Selection lives per lane in
+// lane_ui, identified by key frame; edits collect first and execute after
+// (set_lane_command can erase lanes — never mutate doc.lanes mid-walk).
+
+// Commits the inline key readout editor: parses the buffer into the
+// selected key's value or frame (frame edits clamp between neighbors).
+void commit_key_edit(AppState& app) {
+    const int mode = app.key_edit_mode;
+    app.key_edit_mode = 0;
+    if (mode == 0 || app.key_edit_buf.empty()) return;
+    char* end = nullptr;
+    const double num = std::strtod(app.key_edit_buf.c_str(), &end);
+    if (end == app.key_edit_buf.c_str()) return;
+    for (const doc::KeyframeLane& lane : app.document.lanes) {
+        if (!(lane.target == app.key_edit_target)) continue;
+        std::vector<doc::Keyframe> keys = lane.keys;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i].frame != app.key_edit_frame) continue;
+            if (mode == 1) {
+                keys[i].value = static_cast<float>(num);
+            } else {
+                double f = std::round(num);
+                if (i > 0) f = std::max(f, keys[i - 1].frame + 1.0);
+                if (i + 1 < keys.size())
+                    f = std::min(f, keys[i + 1].frame - 1.0);
+                keys[i].frame = std::max(0.0, f);
+            }
+            app.undo.execute(
+                app.document,
+                doc::set_lane_command(app.key_edit_target, std::move(keys)));
+            return;
+        }
+        return;
+    }
+}
+
+bool timeline_delete_selected_keys(AppState& app) {
+    std::vector<std::pair<doc::ParamKey, std::vector<doc::Keyframe>>> edits;
+    for (auto& entry : app.lane_ui) {
+        LaneUiState& ls = entry.second;
+        if (ls.sel_frames.empty() && ls.selected < 0) continue;
+        const doc::ParamKey target{entry.first.first, entry.first.second};
+        for (const doc::KeyframeLane& lane : app.document.lanes) {
+            if (!(lane.target == target)) continue;
+            std::vector<doc::Keyframe> kept;
+            for (size_t i = 0; i < lane.keys.size(); ++i) {
+                bool sel = ls.selected == static_cast<int>(i);
+                for (const double f : ls.sel_frames)
+                    if (lane.keys[i].frame == f) sel = true;
+                if (!sel) kept.push_back(lane.keys[i]);
+            }
+            if (kept.size() != lane.keys.size())
+                edits.emplace_back(target, std::move(kept));
+            break;
+        }
+        ls.selected = -1;
+        ls.sel_frames.clear();
+    }
+    for (auto& e : edits)
+        app.undo.execute(app.document,
+                         doc::set_lane_command(e.first, std::move(e.second)));
+    return !edits.empty();
+}
+
+bool timeline_copy_selected_keys(AppState& app) {
+    for (auto& entry : app.lane_ui) {
+        LaneUiState& ls = entry.second;
+        if (ls.sel_frames.empty() && ls.selected < 0) continue;
+        const doc::ParamKey target{entry.first.first, entry.first.second};
+        for (const doc::KeyframeLane& lane : app.document.lanes) {
+            if (!(lane.target == target)) continue;
+            std::vector<doc::Keyframe> out;
+            for (size_t i = 0; i < lane.keys.size(); ++i) {
+                bool sel = ls.selected == static_cast<int>(i);
+                for (const double f : ls.sel_frames)
+                    if (lane.keys[i].frame == f) sel = true;
+                if (sel) out.push_back(lane.keys[i]);
+            }
+            if (out.empty()) break;
+            const double base = out.front().frame;
+            for (doc::Keyframe& k : out) k.frame -= base;
+            app.key_clipboard = std::move(out);
+            app.key_clip_target = target;
+            app.status = "copied " +
+                         std::to_string(app.key_clipboard.size()) + " keys";
+            return true;
+        }
+    }
+    return false;
+}
+
+bool timeline_paste_keys(AppState& app) {
+    if (app.key_clipboard.empty() || !app.player.is_open()) return false;
+    const double at = app.player.current_frame_index();
+    for (const doc::KeyframeLane& lane : app.document.lanes) {
+        if (!(lane.target == app.key_clip_target)) continue;
+        std::vector<doc::Keyframe> keys = lane.keys;
+        for (doc::Keyframe k : app.key_clipboard) {
+            k.frame += at;
+            for (size_t i = 0; i < keys.size(); ++i)
+                if (keys[i].frame == k.frame) {
+                    keys.erase(keys.begin() + i);
+                    break;
+                }
+            keys.push_back(k);
+        }
+        app.undo.execute(
+            app.document,
+            doc::set_lane_command(app.key_clip_target, std::move(keys)));
+        return true;
+    }
+    return false;
+}
+
+// Nearest key or marker strictly before/after the playhead ([ and ]).
+double timeline_adjacent_mark(AppState& app, bool forward) {
+    const double at = app.player.current_frame_index();
+    double best = -1.0;
+    auto consider = [&](double f) {
+        if (forward ? f > at + 0.5 : f < at - 0.5) {
+            if (best < 0.0 || (forward ? f < best : f > best)) best = f;
+        }
+    };
+    for (const doc::KeyframeLane& lane : app.document.lanes)
+        for (const doc::Keyframe& k : lane.keys) consider(k.frame);
+    for (const uint32_t m : app.document.markers) consider(m);
+    return best;
+}
+
 ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                                FrameUi& out) {
     using namespace ui;
@@ -6176,6 +6799,16 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     const uint32_t playhead = app.player.current_frame_index();
     const auto table = mod::build_param_table(app.document);
 
+    // Resolve the shared view range (zoom): invalid/stale = whole
+    // clip. Every strip below maps through the same [v0, v1).
+    double v0 = app.tl_v0, v1 = app.tl_v1;
+    if (v1 - v0 < 1.0 || v1 > frame_count || v0 < 0.0) {
+        v0 = 0.0;
+        v1 = frame_count;
+        app.tl_v0 = v0;
+        app.tl_v1 = v1;
+    }
+
     std::vector<LayoutNode*> rows;
 
     auto* ruler_user = arena.alloc<RulerUser>();
@@ -6184,6 +6817,8 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     ruler_user->frame_count = frame_count;
     ruler_user->playhead = playhead;
     ruler_user->fps = app.player.fps();
+    ruler_user->v0 = v0;
+    ruler_user->v1 = v1;
     ruler_user->trim_in =
         std::min(app.document.clip_trim_in, frame_count ? frame_count - 1 : 0u);
     ruler_user->trim_out = app.document.clip_trim_out
@@ -6194,7 +6829,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     ruler_user->loop_out = app.document.loop_out;
     ruler_user->thumbs = app.thumbs_tex;
     ruler_user->thumb_count = app.thumbs_count;
-    // With a filmstrip the ruler earns more height (spec §3 thumbnails).
+    // With a filmstrip the ruler earns more height (thumbnails).
     const float ruler_h = app.thumbs_tex ? 34.0f : 20.0f;
     LayoutNode* ruler = make_node(arena, NodeKind::Leaf);
     ruler->width = SizeSpec::fill();
@@ -6208,6 +6843,30 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                                     Label(arena, "timeline", small_dim)),
                            ruler}));
 
+    // Audio strip: loudness + onsets + cuts from the analysis,
+    // aligned to the same view range — keyframe against the material.
+    if (app.has_analysis &&
+        (!app.analysis.low.empty() || !app.analysis.onset.empty())) {
+        auto* strip_user = arena.alloc<AudioStripUser>();
+        strip_user->app = &app;
+        strip_user->curves = &app.analysis;
+        strip_user->frame_count = frame_count;
+        strip_user->playhead = playhead;
+        strip_user->v0 = v0;
+        strip_user->v1 = v1;
+        LayoutNode* strip = make_node(arena, NodeKind::Leaf);
+        strip->width = SizeSpec::fill();
+        strip->height = SizeSpec::fixed(16.0f);
+        strip->user = strip_user;
+        strip->draw_fn = draw_audio_strip;
+        rows.push_back(
+            HStack(arena, {6.0f},
+                   {SizedBox(arena, SizeSpec::fixed(150),
+                             SizeSpec::fixed(16.0f),
+                             Label(arena, "audio", small_dim)),
+                    strip}));
+    }
+
     // Lanes shown: only LIVE targets (a deleted node's lanes keep their
     // keys for undo but must not render — the 0..1 fallback range flung
     // their keys outside the strip), filtered to the canvas selection
@@ -6219,13 +6878,13 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             const uint64_t did = cid & 0x00FFFFFFFFFFFFFFull;
             switch (static_cast<flow::NodeKind>((cid >> 56) - 1)) {
                 case flow::NodeKind::Effect:
-                    if (!(target.effect_id & doc::kMaskParamBit) &&
+                    if (!(target.effect_id & doc::kLayerParamBit) &&
                         target.effect_id == did)
                         return true;
                     break;
-                case flow::NodeKind::Mask:
-                    if ((target.effect_id & doc::kMaskParamBit) &&
-                        (target.effect_id & ~doc::kMaskParamBit) == did)
+                case flow::NodeKind::Source:
+                    if ((target.effect_id & doc::kLayerParamBit) &&
+                        (target.effect_id & ~doc::kLayerParamBit) == did)
                         return true;
                     break;
                 case flow::NodeKind::Group: {
@@ -6246,11 +6905,13 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     };
     std::vector<LayoutNode*> lane_rows;
     for (const doc::KeyframeLane& lane : app.document.lanes) {
+        // Human name ("Dither levels"), not the raw address — the path
+        // stays serialize/display sugar elsewhere.
         std::string path;
         float min_v = 0.0f, max_v = 1.0f;
         for (const auto& e : table) {
             if (e.key == lane.target) {
-                path = e.path;
+                path = e.label.empty() ? e.path : e.label;
                 min_v = e.min_value;
                 max_v = e.max_value;
                 break;
@@ -6271,6 +6932,8 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         user->max_value = max_v;
         user->frame_count = frame_count;
         user->playhead = playhead;
+        user->v0 = v0;
+        user->v1 = v1;
         LayoutNode* widget = make_node(arena, NodeKind::Leaf);
         widget->width = SizeSpec::fill();
         widget->height = SizeSpec::fixed(42);
@@ -6326,7 +6989,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         rows.push_back(Label(
             arena,
             app.document.lanes.empty()
-                ? "no keyframe lanes - press k next to a param"
+                ? "no keyframe lanes - click the k dot next to a param"
                 : "no lanes for this selection",
             small_dim));
 
@@ -6343,6 +7006,9 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     platform::init();
+    // Fatal failures (device loss, allocation) tell the user before the
+    // process dies — the reason also persists to looks.log.
+    set_fatal_sink(platform::show_fatal);
 
     platform::WindowDesc window_desc;
     window_desc.title = "looks";
@@ -6375,7 +7041,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         return 1;
     }
 
-    // Baked MSDF fonts (spec §12 fontbake) when the build staged them:
+    // Baked MSDF fonts (fontbake) when the build staged them:
     // Outfit (sans) for body text, Cormorant (serif) for headers. The
     // compiled-in debug font covers machines without the bake tool.
     const std::filesystem::path fonts_dir = executable_dir() / "assets/fonts";
@@ -6445,8 +7111,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     app.user_preset_dir = executable_dir() / "presets";
     load_ui_prefs(app);
     rescan_presets(app);
+    app.cache_bytes = scan_cache_bytes();
 
-    // Preview render thread (spec §13): takes ownership of the preview
+    // Preview render thread: takes ownership of the preview
     // engine — from here on the UI thread never touches it directly.
     RenderWorker render_worker(renderer->device(), app.player,
                                std::move(engine));
@@ -6476,7 +7143,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
     }
 
-    // A fresh document starts MINIMAL (v5.4, user demand — the demo
+    // A fresh document starts MINIMAL (user demand — the demo
     // stack got deleted every launch): one clip source wired to the
     // Output, nothing else. Opening a clip shows immediately; presets
     // and the add menu build from there.
@@ -6499,8 +7166,41 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         trim(arg);
         std::filesystem::path source(arg);
         if (std::filesystem::exists(source)) {
-            if (source.extension() == L".json") open_project(app, source);
-            else open_source(app, source);
+            if (source.extension() == L".json")
+                open_project(app, source, window.get());
+            else
+                open_source(app, source);
+        }
+    } else {
+        // Crash recovery for untitled sessions: work that only ever
+        // lived in cache/untitled.autosave.json is offered back on the
+        // next plain launch, then the file retires either way.
+        const std::filesystem::path unsaved =
+            executable_dir() / "cache" / "untitled.autosave.json";
+        std::error_code ec;
+        if (std::filesystem::exists(unsaved, ec)) {
+            if (platform::show_confirm(
+                    window.get(), "looks",
+                    "restore unsaved work from your last session?",
+                    false) == platform::ConfirmResult::Yes) {
+                std::string error;
+                if (auto rec = doc::load_document(unsaved, &error)) {
+                    app.document = std::move(*rec);
+                    app.undo.clear();
+                    app.saved_revision = app.document.revision - 1;
+                    app.autosaved_revision = app.document.revision;
+                    if (!app.document.clip_path.empty()) {
+                        const std::filesystem::path clip =
+                            app.document.clip_path;
+                        if (std::filesystem::exists(clip, ec))
+                            open_source(app, clip);
+                    }
+                    app.status = "restored unsaved session";
+                } else {
+                    app.status = "autosave restore failed: " + error;
+                }
+            }
+            std::filesystem::remove(unsaved, ec);
         }
     }
 
@@ -6526,10 +7226,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         bool do_paste = false;       // Ctrl+V at the canvas cursor
         float nudge_dx = 0.0f, nudge_dy = 0.0f;   // arrow-key node nudge
         std::string dropped_file;
+        // Timeline keyboard routing: Delete / Ctrl+C / Ctrl+V act
+        // on keys when the mouse sits over the timeline region (last
+        // frame's rect — layout has not run yet).
+        const bool tl_hovered =
+            app.tl_rect.w > 0.0f && input.mouse.x >= app.tl_rect.x &&
+            input.mouse.x < app.tl_rect.right() &&
+            input.mouse.y >= app.tl_rect.y &&
+            input.mouse.y < app.tl_rect.bottom();
+        float key_seek = -1.0f;   // keyboard playhead move (frames)
         for (const platform::Event& e : events) {
             switch (e.type) {
                 case platform::Event::Type::CloseRequested:
-                    running = false;
+                    // Unsaved-changes guard: closing never silently
+                    // drops edits.
+                    if (confirm_discard_changes(app, window.get()))
+                        running = false;
                     break;
                 case platform::Event::Type::Char:
                     // Still duration typing: digits and one decimal point.
@@ -6539,6 +7251,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                              app.duration_edit.find('.') ==
                                  std::string::npos))
                             app.duration_edit.push_back(
+                                static_cast<char>(e.codepoint));
+                        break;
+                    }
+                    // Key readout typing (timeline inline editor).
+                    if (app.key_edit_mode != 0) {
+                        if (((e.codepoint >= '0' && e.codepoint <= '9') ||
+                             e.codepoint == '.' || e.codepoint == '-') &&
+                            app.key_edit_buf.size() < 15)
+                            app.key_edit_buf.push_back(
+                                static_cast<char>(e.codepoint));
+                        break;
+                    }
+                    // Rail value typing (slider type-in).
+                    if (app.rail_edit_key.effect_id != 0) {
+                        if (((e.codepoint >= '0' && e.codepoint <= '9') ||
+                             e.codepoint == '.' || e.codepoint == '-') &&
+                            app.rail_edit_buf.size() < 15)
+                            app.rail_edit_buf.push_back(
                                 static_cast<char>(e.codepoint));
                         break;
                     }
@@ -6567,7 +7297,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<char>(e.codepoint));
                         break;
                     }
-                    // Text card string typing (v5.5 inline edit).
+                    // Text card string typing (inline edit).
                     if (app.text_edit_id) {
                         if (e.codepoint >= 32 && e.codepoint < 127 &&
                             app.text_edit_buf.size() < 64)
@@ -6575,12 +7305,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<char>(e.codepoint));
                         break;
                     }
-                    // Preset search typing (spec §9): printable ASCII only.
+                    // Preset search typing: printable ASCII only.
                     if (app.preset_search_focus && e.codepoint >= 32 &&
                         e.codepoint < 127)
                         app.preset_filter.push_back(
                             static_cast<char>(e.codepoint));
-                    // Add-node search (docs/flow_canvas.md v3).
+                    // Add-node search (docs/flow_canvas.md).
                     if (app.fx_search_focus && e.codepoint >= 32 &&
                         e.codepoint < 127)
                         app.fx_filter.push_back(
@@ -6695,6 +7425,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                         break;
                     }
+                    if (app.key_edit_mode != 0) {
+                        // Inline key readout editor: Enter commits,
+                        // Escape cancels, Backspace edits the buffer.
+                        if (e.key == platform::Key::Backspace) {
+                            if (!app.key_edit_buf.empty())
+                                app.key_edit_buf.pop_back();
+                        } else if (e.key == platform::Key::Enter) {
+                            commit_key_edit(app);
+                        } else if (e.key == platform::Key::Escape) {
+                            app.key_edit_mode = 0;
+                        }
+                        break;
+                    }
+                    if (app.rail_edit_key.effect_id != 0) {
+                        // Rail value type-in: the commit flag lands
+                        // through the row's staged path on this frame's
+                        // build.
+                        if (e.key == platform::Key::Backspace) {
+                            if (!app.rail_edit_buf.empty())
+                                app.rail_edit_buf.pop_back();
+                        } else if (e.key == platform::Key::Enter) {
+                            app.rail_edit_commit = true;
+                        } else if (e.key == platform::Key::Escape) {
+                            app.rail_edit_key = {};
+                            app.rail_edit_commit = false;
+                        }
+                        break;
+                    }
                     if (app.preset_search_focus) {
                         // The search field swallows the keyboard: only
                         // backspace/enter/escape mean anything here.
@@ -6742,16 +7500,59 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         } else if (app.sel.kind != SelKind::None) {
                             app.sel = {};
                             app.insert_before_id = 0;
-                        } else {
-                            running = false;
                         }
+                        // Esc never quits — closing goes through
+                        // the window X / Alt+F4 and the dirty guard.
                     } else if ((e.key == platform::Key::Delete ||
                                 e.key == platform::Key::Backspace) &&
                                !e.repeat) {
-                        do_delete_sel = true;   // texed: both keys delete
+                        // Over the timeline, Delete removes selected keys
+                        //; elsewhere both keys delete the canvas
+                        // selection (texed).
+                        if (!(tl_hovered &&
+                              timeline_delete_selected_keys(app)))
+                            do_delete_sel = true;
                     }
                     else if (e.key == platform::Key::Space && !e.repeat)
                         toggle_play = true;
+                    else if ((e.key == platform::Key::Comma ||
+                              e.key == platform::Key::Period) &&
+                             app.player.is_open()) {
+                        // Frame step: , / . nudge the paused
+                        // playhead one frame.
+                        const uint32_t fc = app.player.frame_count();
+                        const uint32_t at =
+                            app.player.current_frame_index();
+                        app.player.pause();
+                        key_seek = static_cast<float>(
+                            e.key == platform::Key::Comma
+                                ? (at > 0 ? at - 1 : 0u)
+                                : std::min(at + 1, fc ? fc - 1 : 0u));
+                    } else if (e.key == platform::Key::Home &&
+                               app.player.is_open()) {
+                        key_seek = 0.0f;
+                    } else if (e.key == platform::Key::End &&
+                               app.player.is_open()) {
+                        const uint32_t fc = app.player.frame_count();
+                        key_seek = static_cast<float>(fc ? fc - 1 : 0u);
+                    } else if ((e.key == platform::Key::LeftBracket ||
+                                e.key == platform::Key::RightBracket) &&
+                               app.player.is_open()) {
+                        // [ / ] snap the playhead across keys + markers.
+                        const double f = timeline_adjacent_mark(
+                            app, e.key == platform::Key::RightBracket);
+                        if (f >= 0.0) key_seek = static_cast<float>(f);
+                    } else if (e.key == platform::Key::M && !e.repeat &&
+                               !(e.mods & (platform::kModCtrl |
+                                           platform::kModAlt |
+                                           platform::kModShift)) &&
+                               app.player.is_open()) {
+                        // M toggles a marker at the playhead.
+                        app.undo.execute(
+                            app.document,
+                            doc::toggle_marker_command(
+                                app.player.current_frame_index()));
+                    }
                     else if (e.key == platform::Key::Z &&
                              (e.mods & platform::kModCtrl)) {
                         if (e.mods & platform::kModShift) do_redo = true;
@@ -6812,18 +7613,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.canvas_state.view_inited = false;
                     } else if (e.key == platform::Key::C && !e.repeat &&
                                (e.mods & platform::kModCtrl)) {
-                        do_copy = true;    // texed Ctrl+C
+                        // Over the timeline Ctrl+C copies keys.
+                        if (!(tl_hovered &&
+                              timeline_copy_selected_keys(app)))
+                            do_copy = true;    // texed Ctrl+C
                     } else if (e.key == platform::Key::X && !e.repeat &&
                                (e.mods & platform::kModCtrl)) {
                         do_copy = true;    // texed Ctrl+X = copy + delete
                         do_cut = true;
                     } else if (e.key == platform::Key::V && !e.repeat &&
                                (e.mods & platform::kModCtrl)) {
-                        do_paste = true;   // texed Ctrl+V
+                        if (!(tl_hovered && timeline_paste_keys(app)))
+                            do_paste = true;   // texed Ctrl+V
                     } else if (e.key == platform::Key::A && !e.repeat &&
                                (e.mods & (platform::kModCtrl |
                                           platform::kModAlt)) == 0) {
-                        app.ab_wipe = !app.ab_wipe;   // spec §9 A/B wipe
+                        app.ab_wipe = !app.ab_wipe;   // A/B wipe
                     } else if (e.key == platform::Key::B && !e.repeat &&
                                (e.mods & (platform::kModCtrl |
                                           platform::kModAlt)) == 0) {
@@ -6871,21 +7676,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                         if (any) app.undo.end_group();
                         else app.bypass_all = !app.bypass_all;
-                    } else if (e.key == platform::Key::M && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        // Cycle the viewport mask overlay (spec §8/§9):
-                        // off -> mask 1 -> mask 2 -> ... -> off.
-                        const auto& masks = app.document.masks;
-                        size_t cur = masks.size();
-                        for (size_t i = 0; i < masks.size(); ++i)
-                            if (masks[i].id == app.overlay_mask_id) cur = i;
-                        const size_t next = cur + 1;
-                        app.overlay_mask_id =
-                            next < masks.size() ? masks[next].id
-                            : (cur == masks.size() && !masks.empty()
-                                   ? masks[0].id
-                                   : 0);
                     } else if (e.key == platform::Key::T && !e.repeat &&
                                (e.mods & (platform::kModCtrl |
                                           platform::kModAlt)) == 0) {
@@ -6897,9 +7687,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     } else if (e.key == platform::Key::G && !e.repeat &&
                                (e.mods & (platform::kModCtrl |
                                           platform::kModAlt)) == 0) {
-                        // Envelope keypress trigger (spec §7): live-mode
+                        // Envelope keypress trigger: live-mode
                         // only — wall-clock triggers are exempt from
-                        // determinism (spec §11) there and only there.
+                        // determinism there and only there.
                         if (app.live_mode) app.env_key_time = app.app_seconds;
                     }
                     break;
@@ -6975,9 +7765,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (app.export_job && app.export_job->done.load()) {
             auto job = std::move(app.export_job);
             if (job->thread.joinable()) job->thread.join();
-            app.status = job->result.ok
-                ? "exported " + job->out_path.filename().string()
-                : "export failed: " + job->result.error;
+            if (job->progress.cancel.load())
+                app.status =
+                    "export cancelled: " + job->out_path.filename().string();
+            else
+                app.status = job->result.ok
+                    ? "exported " + job->out_path.filename().string()
+                    : "export failed: " + job->result.error;
             if (!app.export_queue.empty()) {
                 AppState::QueuedExport next =
                     std::move(app.export_queue.front());
@@ -6998,7 +7792,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         gfx::FrameContext frame;
         if (!renderer->begin_frame(frame)) continue;
-        // Render-thread bookkeeping (spec §13): begin_frame waited this
+        // Render-thread bookkeeping: begin_frame waited this
         // slot's fence, so UI submissions kFramesInFlight back have
         // retired — the worker may rewrite publish images they sampled.
         ++app.ui_frame_counter;
@@ -7013,10 +7807,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<float>(frame.extent.height) / scale};
 
         input.begin_frame(events, scale);
+        // Timeline zoom/pan: pre-routed against LAST frame's region
+        // rect so the lane scroll area cannot swallow the wheel first.
+        app.tl_rect = app.tl_rect_accum;
+        app.tl_rect_accum = {};
+        timeline_zoom_wheel(app, input, app.player.frame_count());
         canvas.begin_frame(scale, {viewport.w, viewport.h});
         arena.reset();
 
         FrameUi frame_ui;
+        // Keyboard playhead moves (frame step, Home/End, [ ]).
+        if (key_seek >= 0.0f) frame_ui.seek_to = key_seek;
 
         ui::LayoutNode* preview = ui::make_node(arena, ui::NodeKind::Leaf);
         preview->width = ui::SizeSpec::fill();
@@ -7078,8 +7879,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             "ungroup  (ctrl+shift+g)", "select all  (ctrl+a)"};
         static const char* kViewItems[] = {
             "fit graph  (f)",   "find node...  (ctrl+f)",
-            "cycle theme  (t)", "mask overlay  (m)",
-            "a/b wipe  (a)",    "bypass fx  (b)"};
+            "cycle theme  (t)", "a/b wipe  (a)",
+            "bypass fx  (b)"};
         int* menu_picks = arena.alloc<int>(3);
         for (int m = 0; m < 3; ++m) menu_picks[m] = -1;
         char fps_buf[32];
@@ -7097,7 +7898,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         &app.menu_states[0], &menu_picks[0]),
              MenuButton(arena, "edit", kEditItems, 6,
                         &app.menu_states[1], &menu_picks[1]),
-             MenuButton(arena, "view", kViewItems, 6,
+             MenuButton(arena, "view", kViewItems, 5,
                         &app.menu_states[2], &menu_picks[2]),
              ui::Spacer(arena),
              ui::Label(arena, app.status.c_str(), bar_dim),
@@ -7297,23 +8098,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 ui::set_active_theme(app.theme_index);
                 save_ui_prefs(app);
                 break;
-            case 3: {
-                // Cycle the viewport mask overlay — the M path.
-                const auto& masks = app.document.masks;
-                size_t cur = masks.size();
-                for (size_t i = 0; i < masks.size(); ++i)
-                    if (masks[i].id == app.overlay_mask_id) cur = i;
-                const size_t next = cur + 1;
-                app.overlay_mask_id =
-                    next < masks.size()
-                        ? masks[next].id
-                        : (cur == masks.size() && !masks.empty()
-                               ? masks[0].id
-                               : 0);
-                break;
-            }
-            case 4: app.ab_wipe = !app.ab_wipe; break;
-            case 5: app.bypass_all = !app.bypass_all; break;
+            case 3: app.ab_wipe = !app.ab_wipe; break;
+            case 4: app.bypass_all = !app.bypass_all; break;
         }
         // Inspector tab switch.
         if (*tab_node) app.inspector_tab = 0;
@@ -7330,173 +8116,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             : std::min(app.selected_layer, app.document.layers.size() - 1);
         bool did_break = false;
 
-        // ---- bezier mask point editor (spec §8): live while the mask
-        // overlay shows a shape mask. Left-drag moves the nearest point,
-        // left-click on empty canvas appends one, right-click removes.
-        // Handles + control polygon draw on the UI canvas over the video.
-        if (app.overlay_mask_id != 0 && app.player.is_open() &&
-            frame_ui.preview) {
-            const doc::Mask* om =
-                doc::find_mask(app.document, app.overlay_mask_id);
-            auto decoded_now = app.player.current_frame();
-            if (om && om->type == doc::MaskType::Shape && decoded_now) {
-                const codec::FrameView v = decoded_now->view();
-                const ui::Rect pr = frame_ui.preview->rect.inset(1.0f);
-                const float aspect = static_cast<float>(v.width) /
-                                     static_cast<float>(v.height);
-                float fit_w = pr.w, fit_h = fit_w / aspect;
-                if (fit_h > pr.h) {
-                    fit_h = pr.h;
-                    fit_w = fit_h * aspect;
-                }
-                const float left = pr.x + (pr.w - fit_w) * 0.5f;
-                const float top = pr.y + (pr.h - fit_h) * 0.5f;
-                const float ux = (input.mouse.x - left) / fit_w;
-                const float uy = (input.mouse.y - top) / fit_h;
-                const bool inside =
-                    ux >= 0.0f && ux <= 1.0f && uy >= 0.0f && uy <= 1.0f;
-
-                const size_t np = om->points.size() / 2;
-                // Per-point keyframes (spec §8 "keyframable points"):
-                // handles track the lane-resolved positions at the
-                // playhead, and dragging a keyed point writes keyframes
-                // there instead of moving the base shape.
-                const double playhead = app.player.current_frame_index();
-                const uint64_t okey = om->id | doc::kMaskParamBit;
-                std::vector<float> disp = om->points;
-                std::vector<bool> keyed(np, false);
-                for (const doc::KeyframeLane& lane : app.document.lanes) {
-                    if (lane.target.effect_id != okey || lane.keys.empty() ||
-                        lane.target.param_index < doc::kMaskPointParamBase)
-                        continue;
-                    const size_t s = static_cast<size_t>(
-                        lane.target.param_index - doc::kMaskPointParamBase);
-                    if (s >= disp.size()) continue;
-                    disp[s] = std::clamp(mod::eval_lane(lane, playhead),
-                                         0.0f, 1.0f);
-                    keyed[s / 2] = true;
-                }
-                auto nearest = [&]() {
-                    int best = -1;
-                    float best_d = 0.035f;
-                    for (size_t i = 0; i < np; ++i) {
-                        const float dx = disp[i * 2] - ux;
-                        const float dy = disp[i * 2 + 1] - uy;
-                        const float d = std::sqrt(dx * dx + dy * dy);
-                        if (d < best_d) {
-                            best_d = d;
-                            best = static_cast<int>(i);
-                        }
-                    }
-                    return best;
-                };
-
-                if (input.left_pressed() && !input.consumed && inside) {
-                    const int idx = nearest();
-                    if (idx >= 0) {
-                        app.drag_point = idx;
-                    } else {
-                        doc::Mask m = *om;
-                        m.points.push_back(ux);
-                        m.points.push_back(uy);
-                        app.undo.execute(app.document,
-                                         doc::set_mask_params_command(m));
-                        app.drag_point = static_cast<int>(np);
-                    }
-                }
-                if (app.drag_point >= 0 && input.left_down() &&
-                    static_cast<size_t>(app.drag_point) * 2 + 1 <
-                        om->points.size()) {
-                    const float nx = std::clamp(ux, 0.0f, 1.0f);
-                    const float ny = std::clamp(uy, 0.0f, 1.0f);
-                    const size_t pi = static_cast<size_t>(app.drag_point);
-                    // keyed/disp predate a same-frame append; a fresh
-                    // point is never keyed.
-                    if (pi < keyed.size() && keyed[pi]) {
-                        // Upsert x + y keys at the playhead atomically so
-                        // the drag coalesces into one undo step.
-                        if (disp[pi * 2] != nx || disp[pi * 2 + 1] != ny) {
-                            std::vector<doc::KeyframeLane> lanes(2);
-                            const float vals[2] = {nx, ny};
-                            for (int a = 0; a < 2; ++a) {
-                                doc::KeyframeLane& lane =
-                                    lanes[static_cast<size_t>(a)];
-                                lane.target = {
-                                    okey, doc::kMaskPointParamBase +
-                                              static_cast<int>(pi) * 2 + a};
-                                for (const doc::KeyframeLane& l :
-                                     app.document.lanes)
-                                    if (l.target == lane.target)
-                                        lane.keys = l.keys;
-                                bool updated = false;
-                                for (doc::Keyframe& k : lane.keys) {
-                                    if (std::fabs(k.frame - playhead) < 0.5) {
-                                        k.value = vals[a];
-                                        updated = true;
-                                        break;
-                                    }
-                                }
-                                if (!updated) {
-                                    doc::Keyframe k;
-                                    k.frame = playhead;
-                                    k.value = vals[a];
-                                    lane.keys.push_back(k);
-                                }
-                            }
-                            app.undo.execute(
-                                app.document,
-                                doc::set_lanes_command(std::move(lanes)),
-                                /*coalesce=*/true);
-                        }
-                    } else if (om->points[pi * 2] != nx ||
-                               om->points[pi * 2 + 1] != ny) {
-                        doc::Mask m = *om;
-                        m.points[pi * 2] = nx;
-                        m.points[pi * 2 + 1] = ny;
-                        app.undo.execute(app.document,
-                                         doc::set_mask_params_command(m),
-                                         /*coalesce=*/true);
-                    }
-                }
-                if (input.left_released() && app.drag_point >= 0) {
-                    app.drag_point = -1;
-                    if (!did_break) {
-                        app.undo.break_coalescing();
-                        did_break = true;
-                    }
-                }
-                if ((input.buttons_pressed & ui::kMouseRight) && inside) {
-                    const int idx = nearest();
-                    if (idx >= 0) {
-                        app.undo.execute(
-                            app.document,
-                            doc::remove_mask_point_command(
-                                om->id, static_cast<size_t>(idx)));
-                        app.drag_point = -1;
-                    }
-                }
-
-                // Handles: control polygon + point squares (amber = the
-                // point has keyframe lanes).
-                const ui::Color line_col{0.3f, 0.8f, 1.0f, 0.55f};
-                const ui::Color pt_col{1.0f, 1.0f, 1.0f, 0.9f};
-                const ui::Color key_col{1.0f, 0.72f, 0.25f, 0.95f};
-                const size_t nn = disp.size() / 2;
-                for (size_t i = 0; i < nn; ++i) {
-                    const float x = left + disp[i * 2] * fit_w;
-                    const float y = top + disp[i * 2 + 1] * fit_h;
-                    if (nn >= 2) {
-                        const size_t j = (i + 1) % nn;
-                        const float x2 = left + disp[j * 2] * fit_w;
-                        const float y2 = top + disp[j * 2 + 1] * fit_h;
-                        canvas.draw_line({x, y}, {x2, y2}, 1.0f, line_col);
-                    }
-                    canvas.draw_rect({x - 3.0f, y - 3.0f, 6.0f, 6.0f},
-                                     i < keyed.size() && keyed[i] ? key_col
-                                                                  : pt_col);
-                }
-            }
-        }
         for (const ParamStage& stage : frame_ui.params) {
             if (*stage.changed && *stage.staged != stage.original &&
                 stage.layer_index < app.document.layers.size() &&
@@ -7569,17 +8188,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                        *row.solo_staged));
                 structure_done = true;
             } else if (row.duplicate && *row.duplicate) {
-                // Duplicate (spec §5): identical clone right below, with a
+                // Duplicate: identical clone right below, with a
                 // fresh id (and seed offset so "same settings" doesn't mean
-                // "identical noise").
+                // "identical noise"). Spawns unwired.
                 doc::EffectInstance copy =
                     app.document.layers[row_layer].stack[row.fx_index];
                 copy.id = app.document.next_effect_id++;
                 copy.seed = copy.id;
+                app.undo.begin_group("Duplicate");
+                app.undo.execute(app.document,
+                                 doc::materialize_links_command());
                 app.undo.execute(app.document,
                                  doc::add_effect_command(row_layer,
                                                          std::move(copy),
                                                          row.fx_index + 1));
+                app.undo.end_group();
                 structure_done = true;
             } else if (*row.remove) {
                 app.undo.execute(
@@ -7665,9 +8288,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case flow::NodeKind::Effect:
                         *ref = doc::NodeRef::Effect;
                         return true;
-                    case flow::NodeKind::Mask:
-                        *ref = doc::NodeRef::Mask;
-                        return true;
                     case flow::NodeKind::ModSource:
                         *ref = doc::NodeRef::Route;
                         return true;
@@ -7732,23 +8352,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     cb.routes.push_back(copy);
                                 }
                             break;
-                        case flow::NodeKind::Mask:
-                            for (const doc::Mask& m : app.document.masks)
-                                if (m.id == did) {
-                                    doc::Mask copy = m;
-                                    copy.node_x = nx;
-                                    copy.node_y = ny;
-                                    cb.masks.push_back(std::move(copy));
-                                }
-                            break;
                         default:
                             break;
                     }
                     ox = std::min(ox, nx);
                     oy = std::min(oy, ny);
                 }
-                if (!cb.effects.empty() || !cb.routes.empty() ||
-                    !cb.masks.empty()) {
+                if (!cb.effects.empty() || !cb.routes.empty()) {
                     const std::vector<doc::Document::NodeLink> all_links =
                         app.document.links.empty()
                             ? doc::synthesize_links(app.document)
@@ -7789,9 +8399,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             app.selected_layer = li;
                         }
                         break;
-                    case flow::NodeKind::Mask:
-                        app.sel = {SelKind::Mask, fdoc};
-                        break;
                     case flow::NodeKind::ModSource:
                         app.sel = {SelKind::ModSource, fdoc};
                         break;
@@ -7805,7 +8412,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case flow::NodeKind::GroupOut:
                         // Boundary nodes have no output of their own —
                         // deselect so the big preview shows the
-                        // composite (v5.4).
+                        // composite.
                         app.sel = {};
                         break;
                     default:
@@ -7956,6 +8563,86 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case CtxAction::Delete:
                         do_delete_sel = true;
                         break;
+                    case CtxAction::ResetParams: {
+                        // Back to table defaults, one undo step.
+                        size_t rli = 0, rfi = 0;
+                        if (!find_effect_by_id(app.document, did, &rli,
+                                               &rfi))
+                            break;
+                        const doc::EffectInstance& rfx =
+                            app.document.layers[rli].stack[rfi];
+                        const doc::EffectInfo& rinfo =
+                            doc::effect_info(rfx.type);
+                        app.undo.begin_group("Reset Params");
+                        for (uint32_t p = 0;
+                             p < rinfo.param_count &&
+                             p < rfx.params.size();
+                             ++p)
+                            if (rfx.params[p] !=
+                                rinfo.params[p].default_value)
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_param_command(
+                                        rli, rfi, static_cast<int>(p),
+                                        rinfo.params[p].default_value));
+                        app.undo.execute(app.document,
+                                         doc::set_param_command(
+                                             rli, rfi, doc::kWetParam,
+                                             1.0f));
+                        app.undo.execute(app.document,
+                                         doc::set_param_command(
+                                             rli, rfi, doc::kOpacityParam,
+                                             1.0f));
+                        app.undo.end_group();
+                        break;
+                    }
+                    case CtxAction::CopyParams: {
+                        size_t rli = 0, rfi = 0;
+                        if (!find_effect_by_id(app.document, did, &rli,
+                                               &rfi))
+                            break;
+                        const doc::EffectInstance& rfx =
+                            app.document.layers[rli].stack[rfi];
+                        app.param_clip_valid = true;
+                        app.param_clip_type = rfx.type;
+                        app.param_clip_values = rfx.params;
+                        app.param_clip_wet = rfx.wet;
+                        app.param_clip_opacity = rfx.opacity;
+                        app.status = "params copied";
+                        break;
+                    }
+                    case CtxAction::PasteParams: {
+                        size_t rli = 0, rfi = 0;
+                        if (!app.param_clip_valid ||
+                            !find_effect_by_id(app.document, did, &rli,
+                                               &rfi))
+                            break;
+                        const doc::EffectInstance& rfx =
+                            app.document.layers[rli].stack[rfi];
+                        if (rfx.type != app.param_clip_type) break;
+                        app.undo.begin_group("Paste Params");
+                        const size_t n =
+                            std::min(rfx.params.size(),
+                                     app.param_clip_values.size());
+                        for (size_t p = 0; p < n; ++p)
+                            if (rfx.params[p] != app.param_clip_values[p])
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_param_command(
+                                        rli, rfi, static_cast<int>(p),
+                                        app.param_clip_values[p]));
+                        app.undo.execute(app.document,
+                                         doc::set_param_command(
+                                             rli, rfi, doc::kWetParam,
+                                             app.param_clip_wet));
+                        app.undo.execute(
+                            app.document,
+                            doc::set_param_command(
+                                rli, rfi, doc::kOpacityParam,
+                                app.param_clip_opacity));
+                        app.undo.end_group();
+                        break;
+                    }
                     case CtxAction::Export:
                         if (frame_ui.export_clicked)
                             *frame_ui.export_clicked = true;
@@ -8009,9 +8696,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             return true;
                         case flow::NodeKind::Effect:
                             *ref = doc::NodeRef::Effect;
-                            return true;
-                        case flow::NodeKind::Mask:
-                            *ref = doc::NodeRef::Mask;
                             return true;
                         case flow::NodeKind::ModSource:
                             *ref = doc::NodeRef::Route;
@@ -8122,10 +8806,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.undo.break_coalescing();
                 did_break = true;
             }
-            // Wire edits (docs/flow_canvas.md v3): port 0 goes through the
-            // link commands with the cycle guard; port 1 (mask) maps onto
-            // the mask_id fields — their existing commands and UI stay the
-            // single source of truth.
+            // Wire edits: every port goes through the link commands with
+            // the cycle guard.
             if ((fe.connect_requested || fe.disconnect_requested) &&
                 !structure_done) {
                 auto doc_id_of = [&](uint64_t cid) {
@@ -8157,7 +8839,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             if (!first) first = e.id;
                             last_id = e.id;
                             // The boundary BINDINGS win when they name a
-                            // live member (v5.3 intermediaries).
+                            // live member (intermediaries).
                             if (gr2 &&
                                 e.id == (last ? gr2->face_out
                                               : gr2->face_in))
@@ -8300,53 +8982,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     fe.connect_requested && fe.disconnect_requested;
                 if (grouped) app.undo.begin_group("Rewire");
                 if (fe.disconnect_requested) {
-                    const uint64_t tdoc = doc_id_of(fe.disconnect_to);
-                    size_t li = 0, fi = 0;
-                    if (fe.disconnect_port == 1 &&
-                        tag_kind(fe.disconnect_from) !=
-                            flow::NodeKind::Mask) {
-                        // Image matte (v5.2): a plain port-1 link cut.
+                    if (fe.disconnect_port == 1) {
+                        // Image matte: a plain port-1 link cut.
                         app.undo.execute(
                             app.document,
                             doc::disconnect_command(
-                                {resolve_src(fe.disconnect_from), tdoc,
-                                 1}));
-                    } else if (fe.disconnect_port == 1) {
-                        if (tag_kind(fe.disconnect_to) ==
-                                flow::NodeKind::Effect &&
-                            find_effect_by_id(app.document, tdoc, &li,
-                                              &fi)) {
-                            app.undo.execute(app.document,
-                                             doc::set_effect_mask_command(
-                                                 li, fi, 0));
-                        } else if (tag_kind(fe.disconnect_to) ==
-                                   flow::NodeKind::Source) {
-                            const int idx =
-                                layer_index_by_id(app.document, tdoc);
-                            if (idx >= 0) {
-                                doc::Layer edited = app.document.layers
-                                    [static_cast<size_t>(idx)];
-                                edited.mask_id = 0;
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_layer_props_command(
-                                        std::move(edited)));
-                            }
-                        }
-                    } else if (fe.disconnect_to != flow::kOutNodeId &&
-                               tag_kind(fe.disconnect_to) ==
-                                   flow::NodeKind::Mask) {
-                        // In port of a mask card = its image source
-                        // (mask.source_layer_id, not the link table).
-                        if (const doc::Mask* m =
-                                doc::find_mask(app.document, tdoc)) {
-                            doc::Mask edited = *m;
-                            edited.source_layer_id = 0;
-                            app.undo.execute(
-                                app.document,
-                                doc::set_mask_params_command(
-                                    std::move(edited)));
-                        }
+                                {resolve_src(fe.disconnect_from),
+                                 doc_id_of(fe.disconnect_to), 1}));
                     } else {
                         app.undo.execute(
                             app.document,
@@ -8357,45 +8999,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                 }
                 if (fe.connect_requested) {
-                    const uint64_t fdoc2 = doc_id_of(fe.connect_from);
                     const uint64_t tdoc2 = doc_id_of(fe.connect_to);
-                    size_t li = 0, fi = 0;
                     if (fe.connect_port == 1) {
                         if (tag_kind(fe.connect_from) ==
-                            flow::NodeKind::Mask) {
-                            if (tag_kind(fe.connect_to) ==
-                                    flow::NodeKind::Effect &&
-                                find_effect_by_id(app.document, tdoc2, &li,
-                                                  &fi)) {
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_effect_mask_command(li, fi,
-                                                                 fdoc2));
-                            } else if (tag_kind(fe.connect_to) ==
-                                       flow::NodeKind::Source) {
-                                const int idx = layer_index_by_id(
-                                    app.document, tdoc2);
-                                if (idx >= 0) {
-                                    doc::Layer edited = app.document.layers
-                                        [static_cast<size_t>(idx)];
-                                    edited.mask_id = fdoc2;
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::set_layer_props_command(
-                                            std::move(edited)));
-                                }
-                            }
-                        } else if (tag_kind(fe.connect_from) ==
-                                       flow::NodeKind::Source ||
-                                   tag_kind(fe.connect_from) ==
-                                       flow::NodeKind::Effect ||
-                                   tag_kind(fe.connect_from) ==
-                                       flow::NodeKind::Group) {
-                            // v5.2 masks ARE images: the matte anchor is
-                            // a plain port-1 image link — the engine
-                            // reads the wired image's luma as the gate.
-                            // The legacy mask_id entity clears so one
-                            // matte rules the consumer.
+                                flow::NodeKind::Source ||
+                            tag_kind(fe.connect_from) ==
+                                flow::NodeKind::Effect ||
+                            tag_kind(fe.connect_from) ==
+                                flow::NodeKind::Group) {
+                            // Masks ARE images: the matte anchor is a
+                            // plain port-1 image link — the engine reads
+                            // the wired image's luma as the gate.
                             const uint64_t rf =
                                 resolve_src(fe.connect_from);
                             if (!rf) {
@@ -8405,67 +9019,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 app.status =
                                     "refused: that matte would loop";
                             } else {
-                                const bool own_group = !grouped;
-                                if (own_group)
-                                    app.undo.begin_group("Wire Matte");
                                 app.undo.execute(
                                     app.document,
                                     doc::connect_command({rf, tdoc2, 1}));
-                                if (tag_kind(fe.connect_to) ==
-                                        flow::NodeKind::Effect &&
-                                    find_effect_by_id(app.document, tdoc2,
-                                                      &li, &fi) &&
-                                    app.document.layers[li]
-                                            .stack[fi].mask_id != 0) {
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::set_effect_mask_command(
-                                            li, fi, 0));
-                                } else if (tag_kind(fe.connect_to) ==
-                                           flow::NodeKind::Source) {
-                                    const int idx = layer_index_by_id(
-                                        app.document, tdoc2);
-                                    if (idx >= 0 &&
-                                        app.document
-                                            .layers[static_cast<size_t>(
-                                                idx)]
-                                            .mask_id != 0) {
-                                        doc::Layer edited =
-                                            app.document.layers
-                                                [static_cast<size_t>(
-                                                    idx)];
-                                        edited.mask_id = 0;
-                                        app.undo.execute(
-                                            app.document,
-                                            doc::set_layer_props_command(
-                                                std::move(edited)));
-                                    }
-                                }
-                                if (own_group) app.undo.end_group();
-                            }
-                        }
-                    } else if (fe.connect_to != flow::kOutNodeId &&
-                               tag_kind(fe.connect_to) ==
-                                   flow::NodeKind::Mask) {
-                        // In port of a mask card: retarget its image
-                        // source. Pre-stack sources only (spec §8 — post-
-                        // stack would allow cycles).
-                        if (tag_kind(fe.connect_from) ==
-                            flow::NodeKind::Source) {
-                            if (const doc::Mask* m = doc::find_mask(
-                                    app.document, tdoc2)) {
-                                doc::Mask edited = *m;
-                                edited.source_layer_id = fdoc2;
-                                edited.source_gen = 0;
-                                edited.source_path.clear();
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_mask_params_command(
-                                        std::move(edited)));
                             }
                         } else {
-                            app.status = "masks sample SOURCE nodes "
-                                         "(pre-stack, no cycles)";
+                            app.status =
+                                "only image nodes feed matte ports";
                         }
                     } else if (tag_kind(fe.connect_from) !=
                                    flow::NodeKind::Source &&
@@ -8572,7 +9132,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
             }
 
-            // Value-node wiring (v4): a ModSource out wire dropped on an
+            // Value-node wiring: a ModSource out wire dropped on an
             // effect card's param row retargets that route. Row 0 = wet,
             // 1 = opacity, 2+p = params — the card build order. Rows past
             // the param span (the Text card's string row, v5.6) are not
@@ -8607,8 +9167,62 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         structure_done = true;
                     }
                 } else if (tag_kind(fe.route_drop_to) ==
+                           flow::NodeKind::Source) {
+                    // Source rows are layer params. The row->field
+                    // map mirrors the card builder's conditional order —
+                    // keep the two in lockstep.
+                    const int idx = layer_index_by_id(
+                        app.document, tag_doc(fe.route_drop_to));
+                    if (idx >= 0) {
+                        const doc::Layer& sl =
+                            app.document.layers[static_cast<size_t>(idx)];
+                        using LSK = doc::LayerSourceKind;
+                        std::vector<int> map;
+                        map.push_back(0);   // opacity
+                        if (sl.source == LSK::Solid ||
+                            sl.source == LSK::Gradient ||
+                            sl.source == LSK::Noise ||
+                            sl.source == LSK::Oscillator) {
+                            map.push_back(1);
+                            map.push_back(2);
+                            map.push_back(3);
+                        }
+                        if (sl.source == LSK::Gradient ||
+                            sl.source == LSK::Noise ||
+                            sl.source == LSK::Oscillator) {
+                            map.push_back(4);
+                            map.push_back(5);
+                            map.push_back(6);
+                        }
+                        if (sl.source == LSK::Gradient ||
+                            sl.source == LSK::Oscillator)
+                            map.push_back(8);
+                        if (sl.source == LSK::Noise) map.push_back(7);
+                        if (sl.source == LSK::Oscillator) {
+                            map.push_back(7);
+                            map.push_back(-1);   // wave dropdown
+                        }
+                        if (sl.source == LSK::Shape) {
+                            map.push_back(7);
+                            map.push_back(8);
+                            map.push_back(-1);   // shape dropdown
+                        }
+                        const int row = fe.route_drop_row;
+                        if (row >= 0 &&
+                            row < static_cast<int>(map.size()) &&
+                            map[static_cast<size_t>(row)] >= 0) {
+                            app.undo.execute(
+                                app.document,
+                                doc::set_route_target_command(
+                                    rid,
+                                    {sl.id | doc::kLayerParamBit,
+                                     map[static_cast<size_t>(row)]}));
+                            structure_done = true;
+                        }
+                    }
+                } else if (tag_kind(fe.route_drop_to) ==
                            flow::NodeKind::Group) {
-                    // Face rows are member-param ALIASES (v5.3): the
+                    // Face rows are member-param ALIASES: the
                     // drop retargets onto the row'th valid exposed key.
                     const uint64_t gid = tag_doc(fe.route_drop_to);
                     size_t gli = 0;
@@ -8672,7 +9286,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         if (gr.id == gid) app.group_rename_buf = gr.name;
             }
             // Text card title double-click: edit its string through the
-            // shared inline editor (v5.5).
+            // shared inline editor.
             if (fe.text_edit) {
                 const uint64_t tid = tag_doc(fe.text_edit);
                 app.text_edit_id = tid;
@@ -8745,7 +9359,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         // their staged writes still land.
                         bool applied = false;
                         // Group face rows are member-param ALIASES
-                        // (v5.3): resolve the row to its exposed key so
+                        //: resolve the row to its exposed key so
                         // typed values commit through the same direct
                         // path as effect rows.
                         doc::ParamKey face_key{0, 0};
@@ -8842,7 +9456,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.value_edit_buf.clear();
             }
 
-            // Frame removal (v3): X on a frame's title strip.
+            // Frame removal: X on a frame's title strip.
             for (size_t f = 0;
                  f < flow_ui.graph->frame_count && !structure_done; ++f) {
                 if (flow_ui.graph->frames[f].remove_clicked &&
@@ -8926,9 +9540,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                             app.selected_layer = fli;
                                         }
                                         break;
-                                    case flow::NodeKind::Mask:
-                                        app.sel = {SelKind::Mask, fdoc3};
-                                        break;
                                     case flow::NodeKind::ModSource:
                                         app.sel = {SelKind::ModSource,
                                                    fdoc3};
@@ -8981,24 +9592,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                     if (src_kind >= 0 &&
                         app.document.layers.size() < doc::kMaxLayers) {
-                        // Source node at the click point (v3).
+                        // Source node at the click point. Spawns
+                        // UNWIRED — materialize freezes the graph
+                        // first so synthesis cannot chain it in. The very
+                        // first source in an empty document still wires
+                        // (materialize no-ops on zero layers).
                         doc::Layer nl = doc::make_layer(
                             app.document, kSrcAddKinds[src_kind]);
                         nl.node_x = app.canvas_state.add_gx;
                         nl.node_y = app.canvas_state.add_gy;
                         const uint64_t lid = nl.id;
+                        app.undo.begin_group("Add Source");
+                        app.undo.execute(app.document,
+                                         doc::materialize_links_command());
                         app.undo.execute(
                             app.document,
                             doc::add_layer_command(
                                 std::move(nl),
                                 app.document.layers.size()));
+                        app.undo.end_group();
                         app.sel = {SelKind::LayerSource, lid};
                         app.multi_sel.assign(
                             1, flow::node_id(flow::NodeKind::Source, lid));
                         structure_done = true;
                     }
                     if (val_kind >= 0 && !structure_done) {
-                        // Value node (v4): an unwired route at the click
+                        // Value node: an unwired route at the click
                         // point — drag its out port onto a param row to
                         // drive something.
                         doc::ModRoute route;
@@ -9019,6 +9638,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                     if (chosen != doc::EffectType::Count) {
                         app.undo.begin_group("Add Node");
+                        // Freeze wiring FIRST: everything added in
+                        // this gesture spawns unwired.
+                        app.undo.execute(app.document,
+                                         doc::materialize_links_command());
                         if (app.document.layers.empty()) {
                             // v3: effects need a storage bag, never a
                             // user-facing precondition — conjure the
@@ -9073,15 +9696,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 ? 0ull
                                 : (cid & 0x00FFFFFFFFFFFFFFull);
                         };
-                        if (app.document.links.empty()) {
-                            // Materialize the legacy links FIRST so the
-                            // new node spawns unwired instead of being
-                            // chained in by stack-order synthesis (this
-                            // disconnect matches nothing by design).
-                            app.undo.execute(
-                                app.document,
-                                doc::disconnect_command({0, 0, 9999}));
-                        }
                         app.undo.execute(
                             app.document,
                             doc::add_effect_command(
@@ -9167,12 +9781,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         copy.node_y = py + 26.0f;
                         const uint64_t nid = copy.id;
                         app.undo.begin_group("Duplicate");
-                        if (app.document.links.empty())
-                            // Materialize first so the copy spawns
-                            // unwired (matches the popup add).
-                            app.undo.execute(
-                                app.document,
-                                doc::disconnect_command({0, 0, 9999}));
+                        // Materialize first so the copy spawns unwired
+                        // (matches the popup add, v5.8).
+                        app.undo.execute(app.document,
+                                         doc::materialize_links_command());
                         app.undo.execute(
                             app.document,
                             doc::add_effect_command(
@@ -9208,32 +9820,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             structure_done = true;
                             break;
                         }
-                } else if (app.sel.kind == SelKind::Mask) {
-                    for (const doc::Mask& m : app.document.masks)
-                        if (m.id == app.sel.id) {
-                            doc::Mask copy = m;
-                            copy.id = app.document.next_mask_id++;
-                            copy.name = m.name + " copy";
-                            node_pos_of(
-                                flow::node_id(flow::NodeKind::Mask,
-                                              app.sel.id),
-                                &px, &py);
-                            copy.node_x = px + 26.0f;
-                            copy.node_y = py + 26.0f;
-                            const uint64_t nid = copy.id;
-                            app.undo.execute(
-                                app.document,
-                                doc::add_mask_command(std::move(copy)));
-                            app.sel = {SelKind::Mask, nid};
-                            app.multi_sel.assign(
-                                1, flow::node_id(flow::NodeKind::Mask,
-                                                 nid));
-                            structure_done = true;
-                            break;
-                        }
                 } else if (app.sel.kind != SelKind::None) {
-                    app.status = "duplicate: select an effect, value, or "
-                                 "mask node";
+                    app.status =
+                        "duplicate: select an effect or value node";
                 }
             }
 
@@ -9362,32 +9951,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 const float px0 = app.canvas_state.last_gx;
                 const float py0 = app.canvas_state.last_gy;
                 std::unordered_map<uint64_t, uint64_t> fx_remap;
-                std::unordered_map<uint64_t, uint64_t> mask_remap;
                 std::vector<uint64_t> pasted;
                 app.undo.begin_group("Paste");
+                // Materialize BEFORE any add: pasted nodes spawn
+                // wired only to each other — materializing after the adds
+                // baked synthesis-chained links alongside the clipboard's
+                // (the fan-in bug).
+                if (!cb.effects.empty())
+                    app.undo.execute(app.document,
+                                     doc::materialize_links_command());
                 if (!cb.effects.empty() && app.document.layers.empty()) {
                     doc::Layer host = doc::make_layer(
                         app.document, doc::LayerSourceKind::Clip);
                     app.undo.execute(app.document,
                                      doc::add_layer_command(
                                          std::move(host), 0));
-                }
-                if (!cb.effects.empty() && app.document.links.empty())
-                    // Materialize so pasted effects spawn wired only to
-                    // each other (this disconnect matches nothing).
-                    app.undo.execute(app.document,
-                                     doc::disconnect_command({0, 0,
-                                                              9999}));
-                for (const doc::Mask& m0 : cb.masks) {
-                    doc::Mask nm = m0;
-                    nm.id = app.document.next_mask_id++;
-                    nm.node_x = m0.node_x - cb.origin_x + px0;
-                    nm.node_y = m0.node_y - cb.origin_y + py0;
-                    mask_remap[m0.id] = nm.id;
-                    pasted.push_back(
-                        flow::node_id(flow::NodeKind::Mask, nm.id));
-                    app.undo.execute(app.document,
-                                     doc::add_mask_command(std::move(nm)));
                 }
                 uint64_t first_fx = 0;
                 if (!cb.effects.empty()) {
@@ -9398,9 +9976,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         doc::EffectInstance fx = f0;
                         fx.id = app.document.next_effect_id++;
                         fx.group_id = 0;
-                        if (auto itm = mask_remap.find(fx.mask_id);
-                            itm != mask_remap.end())
-                            fx.mask_id = itm->second;
                         fx.node_x = f0.node_x - cb.origin_x + px0;
                         fx.node_y = f0.node_y - cb.origin_y + py0;
                         fx_remap[f0.id] = fx.id;
@@ -9423,18 +9998,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 for (const doc::ModRoute& r0 : cb.routes) {
                     doc::ModRoute r = r0;
                     r.id = app.document.next_route_id++;
-                    if (r.target.effect_id & doc::kMaskParamBit) {
-                        const uint64_t mid =
-                            r.target.effect_id & ~doc::kMaskParamBit;
-                        if (auto itm = mask_remap.find(mid);
-                            itm != mask_remap.end())
-                            r.target.effect_id =
-                                itm->second | doc::kMaskParamBit;
-                    } else if (auto itf =
-                                   fx_remap.find(r.target.effect_id);
-                               itf != fx_remap.end()) {
+                    if (auto itf = fx_remap.find(r.target.effect_id);
+                        itf != fx_remap.end())
                         r.target.effect_id = itf->second;
-                    }
                     r.node_x = r0.node_x - cb.origin_x + px0;
                     r.node_y = r0.node_y - cb.origin_y + py0;
                     pasted.push_back(flow::node_id(
@@ -9647,73 +10213,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         : (is_cid_kind(sw.to, flow::NodeKind::Group)
                                ? boundary_of(sw.to, false)
                                : tag_doc(sw.to));
-                    if (sw.kind == 1 &&
-                        is_cid_kind(sw.to, flow::NodeKind::Group)) {
-                        // Mask wire re-anchored on a group card: clear
-                        // the MEMBER that actually wears this mask.
-                        const uint64_t gid = tag_doc(sw.to);
-                        size_t gli = 0;
-                        if (find_group_by_id(app.document, gid, &gli)) {
-                            const auto& stk =
-                                app.document.layers[gli].stack;
-                            for (size_t s = 0; s < stk.size(); ++s)
-                                if (stk[s].group_id == gid &&
-                                    stk[s].mask_id == tag_doc(sw.from))
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::set_effect_mask_command(
-                                            gli, s, 0));
-                        }
-                        continue;
-                    }
                     if (sw.kind == 0 || sw.kind == 3) {
-                        if (sw.to != flow::kOutNodeId &&
-                            tag_kind(sw.to) == flow::NodeKind::Mask) {
-                            if (const doc::Mask* m =
-                                    doc::find_mask(app.document, wt)) {
-                                doc::Mask edited = *m;
-                                edited.source_layer_id = 0;
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_mask_params_command(
-                                        std::move(edited)));
-                            }
-                        } else {
-                            app.undo.execute(
-                                app.document,
-                                doc::disconnect_command(
-                                    {wf, wt,
-                                     sw.kind == 3 ? 2u : 0u}));
-                        }
-                    } else if (sw.kind == 1 &&
-                               !is_cid_kind(sw.from,
-                                            flow::NodeKind::Mask)) {
-                        // Image matte (v5.2): a plain port-1 link cut.
+                        app.undo.execute(
+                            app.document,
+                            doc::disconnect_command(
+                                {wf, wt, sw.kind == 3 ? 2u : 0u}));
+                    } else if (sw.kind == 1) {
+                        // Image matte: a plain port-1 link cut.
                         app.undo.execute(
                             app.document,
                             doc::disconnect_command({wf, wt, 1}));
-                    } else if (sw.kind == 1) {
-                        size_t li = 0, fi = 0;
-                        if (tag_kind(sw.to) == flow::NodeKind::Effect &&
-                            find_effect_by_id(app.document, wt, &li,
-                                              &fi)) {
-                            app.undo.execute(
-                                app.document,
-                                doc::set_effect_mask_command(li, fi, 0));
-                        } else if (tag_kind(sw.to) ==
-                                   flow::NodeKind::Source) {
-                            const int idx =
-                                layer_index_by_id(app.document, wt);
-                            if (idx >= 0) {
-                                doc::Layer edited = app.document.layers
-                                    [static_cast<size_t>(idx)];
-                                edited.mask_id = 0;
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_layer_props_command(
-                                        std::move(edited)));
-                            }
-                        }
                     } else if (sw.kind == 2) {
                         app.undo.execute(
                             app.document,
@@ -9742,13 +10251,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                         static_cast<size_t>(idx)));
                             break;
                         }
-                        case flow::NodeKind::Mask:
-                            if (app.overlay_mask_id == did)
-                                app.overlay_mask_id = 0;
-                            app.undo.execute(
-                                app.document,
-                                doc::remove_mask_command(did));
-                            break;
                         case flow::NodeKind::ModSource:
                             app.undo.execute(
                                 app.document,
@@ -9772,8 +10274,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.selected_layer = app.document.layers.size() - 1;
                 structure_done = true;
             }
-            // Delete removes the selected effect or mask (layer removal
-            // stays behind its inspector button — docs/flow_canvas.md).
+            // Delete removes the selected effect (layer removal stays
+            // behind its inspector button — docs/flow_canvas.md).
             if (do_delete_sel && !structure_done) {
                 if (app.sel.kind == SelKind::Effect) {
                     size_t li = 0, fi = 0;
@@ -9793,13 +10295,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                             .id};
                         structure_done = true;
                     }
-                } else if (app.sel.kind == SelKind::Mask) {
-                    if (app.overlay_mask_id == app.sel.id)
-                        app.overlay_mask_id = 0;
-                    app.undo.execute(app.document,
-                                     doc::remove_mask_command(app.sel.id));
-                    app.sel = {};
-                    structure_done = true;
                 } else if (app.sel.kind == SelKind::ModSource) {
                     app.undo.execute(app.document,
                                      doc::remove_route_command(app.sel.id));
@@ -9870,9 +10365,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.add_pos_valid = false;
                 }
                 const uint64_t new_id = fx.id;
+                app.undo.begin_group("Add Effect");
+                // Spawns unwired: wiring is a wire gesture.
+                app.undo.execute(app.document,
+                                 doc::materialize_links_command());
                 app.undo.execute(app.document,
                                  doc::add_effect_command(
                                      ui_layer, std::move(fx), insert_at));
+                app.undo.end_group();
                 // Select the newborn so its params appear immediately.
                 app.sel = {SelKind::Effect, new_id};
                 app.insert_before_id = 0;
@@ -9892,7 +10392,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 /*coalesce=*/true);
         }
 
-        // ---- time remap (spec §6.1): speed drag + mode cycle
+        // ---- time remap: speed drag + mode cycle
         if (frame_ui.speed_changed && *frame_ui.speed_changed &&
             frame_ui.speed_staged &&
             *frame_ui.speed_staged != app.document.speed) {
@@ -9912,7 +10412,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     static_cast<uint32_t>(*frame_ui.time_mode_selected)));
         }
 
-        // ---- sidechain + audio nudge (spec §7)
+        // ---- sidechain + audio nudge
         if (frame_ui.sc_selected && *frame_ui.sc_selected >= 0) {
             const int sel = *frame_ui.sc_selected;
             const bool has_sc = !app.document.sidechain_path.empty();
@@ -9957,6 +10457,49 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.break_coalescing();
             did_break = true;
         }
+        // ---- export settings + cancel
+        if (frame_ui.export_bitrate_changed &&
+            *frame_ui.export_bitrate_changed &&
+            *frame_ui.export_bitrate_staged !=
+                app.document.export_bitrate_mbps) {
+            app.undo.execute(app.document,
+                             doc::set_export_config_command(
+                                 *frame_ui.export_bitrate_staged,
+                                 app.document.export_scale,
+                                 app.document.export_audio),
+                             /*coalesce=*/true);
+        }
+        if (frame_ui.export_bitrate_released &&
+            *frame_ui.export_bitrate_released && !did_break) {
+            app.undo.break_coalescing();
+            did_break = true;
+        }
+        if (frame_ui.export_scale_selected &&
+            *frame_ui.export_scale_selected >= 0) {
+            const uint32_t div = *frame_ui.export_scale_selected == 2   ? 4u
+                                 : *frame_ui.export_scale_selected == 1 ? 2u
+                                                                        : 1u;
+            if (div != app.document.export_scale)
+                app.undo.execute(app.document,
+                                 doc::set_export_config_command(
+                                     app.document.export_bitrate_mbps, div,
+                                     app.document.export_audio));
+        }
+        if (frame_ui.export_audio_changed && *frame_ui.export_audio_changed) {
+            app.undo.execute(app.document,
+                             doc::set_export_config_command(
+                                 app.document.export_bitrate_mbps,
+                                 app.document.export_scale,
+                                 *frame_ui.export_audio_staged));
+        }
+        if (frame_ui.export_cancel_clicked &&
+            *frame_ui.export_cancel_clicked && app.export_job) {
+            // Cancel stops the run AND drains the queue — "stop exporting"
+            // must not mean "start the next one".
+            app.export_job->progress.cancel = true;
+            app.export_queue.clear();
+            app.status = "cancelling export...";
+        }
         if (frame_ui.proxy_toggle_changed && *frame_ui.proxy_toggle_changed)
             app.undo.execute(app.document,
                              doc::set_use_proxy_command(
@@ -9971,7 +10514,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             did_break = true;
         }
 
-        // ---- randomize (spec §10): one gesture = one undo step
+        // ---- randomize: one gesture = one undo step
         if (frame_ui.chaos_changed && *frame_ui.chaos_changed &&
             frame_ui.chaos_staged)
             app.chaos = *frame_ui.chaos_staged;
@@ -9994,7 +10537,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
 
-        // ---- group edits (spec §5, v5.3: groups + the exposed face)
+        // ---- group edits (groups + the exposed face)
         for (const FrameUi::ExposeToggle& et : frame_ui.expose_toggles) {
             if (!*et.clicked) continue;
             if (et.layer_index >= app.document.layers.size()) continue;
@@ -10225,6 +10768,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             for (const doc::ModRoute& r : app.document.mod_routes)
                 if (r.id == row.id) route = &r;
             if (!route) continue;
+            // Canvas card dropdown picks fold into the rail's
+            // pick slots so one handler applies both surfaces.
+            for (int w = 0; w < 3; ++w) {
+                if (!row.cv_pick_changed[w] || !*row.cv_pick_changed[w])
+                    continue;
+                const int sel = static_cast<int>(
+                    *row.cv_pick_staged[w] + 0.5f);
+                if (w == 0) *row.source_selected = sel;
+                else if (w == 1) *row.shape_selected = sel;
+                else *row.curve_selected = sel;
+            }
             if (*row.source_selected >= 0 &&
                 *row.source_selected !=
                     static_cast<int>(route->source.type)) {
@@ -10284,7 +10838,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     doc::set_route_amount_command(row.id, *row.amount_staged),
                     /*coalesce=*/true);
             }
-            // Sampling-window drags (v4): px/py/pw/ph, one coalesced
+            // Sampling-window drags: px/py/pw/ph, one coalesced
             // source edit per changed knob.
             bool pos_released = false;
             for (int pi = 0; pi < 4; ++pi) {
@@ -10331,13 +10885,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             std::vector<doc::Keyframe> keys;
             for (const doc::KeyframeLane& lane : app.document.lanes)
                 if (lane.target == toggle.key) keys = lane.keys;
-            if (toggle.lane_toggle && !keys.empty()) {
-                // Canvas keyframe toggle OFF: the whole lane goes (the
-                // timeline below is where individual keys are edited).
-                app.undo.execute(app.document,
-                                 doc::set_lane_command(toggle.key, {}));
-                break;
-            }
             bool removed = false;
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (std::fabs(keys[i].frame - playhead) < 0.5) {
@@ -10354,7 +10901,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             app.undo.execute(app.document,
                              doc::set_lane_command(toggle.key, std::move(keys)));
-            // Jump-to-lane (docs/flow_canvas.md v4): k on a card also
+            // Jump-to-lane (docs/flow_canvas.md): k on a card also
             // scrolls the timeline so the param's lane editor is in view
             // (rows are 42 px + 4 gap).
             for (size_t i = 0; i < app.document.lanes.size(); ++i)
@@ -10370,22 +10917,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 /*coalesce=*/true);
         }
         if (frame_ui.lane_release) app.undo.break_coalescing();
-
-        // ---- mask edits
-        if (frame_ui.add_mask_clicked && *frame_ui.add_mask_clicked) {
-            doc::Mask mask;
-            mask.id = app.document.next_mask_id++;
-            mask.name = "mask " + std::to_string(mask.id);
-            if (app.add_pos_valid) {
-                mask.node_x = app.add_gx;
-                mask.node_y = app.add_gy;
-                app.add_pos_valid = false;
-            }
-            const uint64_t mid = mask.id;
-            app.undo.execute(app.document,
-                             doc::add_mask_command(std::move(mask)));
-            app.sel = {SelKind::Mask, mid};
+        // Rail type-in opens: a click on a slider's value text.
+        for (const FrameUi::RailEdit& re : frame_ui.rail_edits) {
+            if (!re.clicked || !*re.clicked) continue;
+            app.rail_edit_key = re.key;
+            app.rail_edit_scale = re.scale;
+            app.rail_edit_buf = re.seed ? re.seed : "";
+            app.rail_edit_commit = false;
+            break;
         }
+
         if (frame_ui.add_layer_open && *frame_ui.add_layer_open)
             app.sel = {SelKind::AddLayer, 0};
         if (frame_ui.open_add_clicked && *frame_ui.open_add_clicked) {
@@ -10414,26 +10955,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.execute(app.document,
                              doc::add_frame_command(std::move(fr)));
         }
-        for (const FrameUi::EffectMaskCycle& pick :
-             frame_ui.effect_mask_cycles) {
-            if (*pick.selected < 0 || app.document.layers.empty() ||
-                pick.fx_index >= app.document.layers[ui_layer].stack.size())
-                continue;
-            const int sel = *pick.selected;   // 0 = none, 1.. = mask index
-            const uint64_t next =
-                sel == 0 || static_cast<size_t>(sel) >
-                                app.document.masks.size()
-                    ? 0
-                    : app.document.masks[static_cast<size_t>(sel - 1)].id;
-            const uint64_t current =
-                app.document.layers[ui_layer].stack[pick.fx_index].mask_id;
-            if (next != current)
-                app.undo.execute(app.document,
-                                 doc::set_effect_mask_command(
-                                     ui_layer, pick.fx_index, next));
-            break;
-        }
-        // Rail selector dropdowns (v5.6): a pick becomes the param value.
+        // Rail selector dropdowns: a pick becomes the param value.
         for (const FrameUi::ParamPick& pick : frame_ui.param_picks) {
             if (*pick.selected < 0 ||
                 pick.layer_index >= app.document.layers.size() ||
@@ -10447,7 +10969,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                     pick.fx_index,
                                                     pick.param_index, next));
         }
-        // Rail text field (v5.6): open the shared inline editor.
+        // Rail text field: open the shared inline editor.
         for (const FrameUi::TextEditOpen& open : frame_ui.text_edit_opens) {
             if (!*open.clicked) continue;
             app.text_edit_id = open.effect_id;
@@ -10487,19 +11009,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     static_cast<uint32_t>(*lrow.osc_shape_selected);
                 app.undo.execute(app.document,
                                  doc::set_layer_props_command(edited));
-            } else if (lrow.mask_selected && *lrow.mask_selected >= 0) {
-                const int sel = *lrow.mask_selected;   // 0 = none
-                const uint64_t next =
-                    sel == 0 || static_cast<size_t>(sel) >
-                                    app.document.masks.size()
-                        ? 0
-                        : app.document.masks[static_cast<size_t>(sel - 1)].id;
-                if (next != layer->mask_id) {
-                    doc::Layer edited = *layer;
-                    edited.mask_id = next;
-                    app.undo.execute(app.document,
-                                     doc::set_layer_props_command(edited));
-                }
             } else if (lrow.xf_toggle && *lrow.xf_toggle) {
                 // View state, no undo (like section folds).
                 app.layer_ui[lrow.id].xf_open =
@@ -10575,10 +11084,40 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         edited.trim_out =
                             static_cast<uint32_t>(v + 0.5f);
                         break;
+                    case LF::OscShape:
+                        edited.osc_shape = static_cast<uint32_t>(
+                            std::clamp(v, 0.0f, 3.0f) + 0.5f);
+                        break;
                 }
                 app.undo.execute(app.document,
                                  doc::set_layer_props_command(std::move(edited)),
                                  /*coalesce=*/true);
+            }
+            if (*stage.released && !did_break) {
+                app.undo.break_coalescing();
+                did_break = true;
+            }
+        }
+        for (const FrameUi::ColorStage& stage : frame_ui.color_stages) {
+            if (*stage.changed &&
+                (stage.staged[0] != stage.original[0] ||
+                 stage.staged[1] != stage.original[1] ||
+                 stage.staged[2] != stage.original[2])) {
+                doc::Layer* layer = nullptr;
+                for (doc::Layer& l : app.document.layers)
+                    if (l.id == stage.layer_id) layer = &l;
+                if (layer) {
+                    doc::Layer edited = *layer;
+                    float* dst =
+                        stage.color_b ? edited.color_b : edited.color_a;
+                    dst[0] = stage.staged[0];
+                    dst[1] = stage.staged[1];
+                    dst[2] = stage.staged[2];
+                    app.undo.execute(
+                        app.document,
+                        doc::set_layer_props_command(std::move(edited)),
+                        /*coalesce=*/true);
+                }
             }
             if (*stage.released && !did_break) {
                 app.undo.break_coalescing();
@@ -10598,10 +11137,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.document.layers.size() < doc::kMaxLayers) {
                     doc::Layer layer =
                         doc::make_layer(app.document, kAddKinds[t]);
+                    // Spawns unwired — except the very first
+                    // source in an empty document (materialize no-ops).
+                    app.undo.begin_group("Add Source");
+                    app.undo.execute(app.document,
+                                     doc::materialize_links_command());
                     app.undo.execute(app.document,
                                      doc::add_layer_command(
                                          std::move(layer),
                                          app.document.layers.size()));
+                    app.undo.end_group();
                     app.selected_layer = app.document.layers.size() - 1;
                     break;
                 }
@@ -10622,269 +11167,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.add_fx_toggle && *frame_ui.add_fx_toggle)
             app.add_fx_open = !app.add_fx_open;
-        for (int c = 0; c < 8; ++c)
+        for (int c = 0; c < static_cast<int>(doc::FxCategory::Count); ++c)
             if (frame_ui.fx_cat_clicked[c] && *frame_ui.fx_cat_clicked[c])
                 app.fx_cat_open[c] = !app.fx_cat_open[c];
-        for (const FrameUi::MaskActions& actions : frame_ui.mask_actions) {
-            const doc::Mask* mask =
-                doc::find_mask(app.document, actions.mask_id);
-            if (!mask) continue;
-            if (*actions.view) {
-                app.overlay_mask_id = app.overlay_mask_id == actions.mask_id
-                    ? 0 : actions.mask_id;
-            }
-            if (*actions.type_selected >= 0 &&
-                *actions.type_selected != static_cast<int>(mask->type)) {
-                doc::Mask edited = *mask;
-                edited.type =
-                    static_cast<doc::MaskType>(*actions.type_selected);
-                app.undo.execute(app.document,
-                                 doc::set_mask_params_command(edited));
-            } else if (*actions.extract_selected >= 0 &&
-                       mask->type == doc::MaskType::Luma &&
-                       *actions.extract_selected !=
-                           static_cast<int>(mask->extract)) {
-                doc::Mask edited = *mask;
-                edited.extract = static_cast<doc::MaskExtract>(
-                    *actions.extract_selected);
-                app.undo.execute(app.document,
-                                 doc::set_mask_params_command(edited));
-            } else if (*actions.invert_changed) {
-                doc::Mask edited = *mask;
-                edited.invert = *actions.invert_staged;
-                app.undo.execute(app.document,
-                                 doc::set_mask_params_command(edited));
-            } else if (*actions.chain_add) {
-                app.undo.execute(
-                    app.document,
-                    doc::mask_chain_add_command(
-                        actions.mask_id,
-                        doc::make_effect(app.document,
-                                         doc::EffectType::Pixelate)));
-            } else if (actions.source_selected &&
-                       *actions.source_selected >= 0) {
-                // Decode the pick with the index layout the build recorded
-                // (clip | layers | generators | file | pick video).
-                const int sel = *actions.source_selected;
-                doc::Mask edited = *mask;
-                bool apply = false;
-                if (sel == 0) {
-                    apply = edited.source_gen != 0 ||
-                            edited.source_layer_id != 0 ||
-                            !edited.source_path.empty();
-                    edited.source_gen = 0;
-                    edited.source_layer_id = 0;
-                    edited.source_path.clear();
-                } else if (sel >= actions.src_layer_base &&
-                           sel < actions.src_layer_base +
-                                     actions.src_layer_count) {
-                    const size_t li = static_cast<size_t>(
-                        sel - actions.src_layer_base);
-                    if (li < app.document.layers.size()) {
-                        const uint64_t id = app.document.layers[li].id;
-                        apply = edited.source_gen != 0 ||
-                                edited.source_layer_id != id;
-                        edited.source_gen = 0;
-                        edited.source_layer_id = id;
-                    }
-                } else if (sel >= actions.src_gen_base &&
-                           sel < actions.src_gen_base + 3) {
-                    static const doc::LayerSourceKind kGens[3] = {
-                        doc::LayerSourceKind::Noise,
-                        doc::LayerSourceKind::Gradient,
-                        doc::LayerSourceKind::TestPattern};
-                    const uint32_t gen = static_cast<uint32_t>(
-                        kGens[sel - actions.src_gen_base]);
-                    apply = edited.source_gen != gen;
-                    edited.source_gen = gen;
-                    edited.source_layer_id = 0;
-                } else if (sel == actions.src_file_index) {
-                    apply = mask->source_gen != 0 ||
-                            mask->source_layer_id != 0;
-                    edited.source_gen = 0;
-                    edited.source_layer_id = 0;
-                } else if (sel == actions.src_pick_index) {
-                    auto picked = platform::show_open_dialog(
-                        window.get(),
-                        {{"mezzanine video", "*.mez"}, {"all files", "*.*"}});
-                    if (picked) {
-                        edited.source_path = picked->string();
-                        edited.source_gen = 0;
-                        edited.source_layer_id = 0;
-                        apply = true;
-                    }
-                }
-                if (apply)
-                    app.undo.execute(app.document,
-                                     doc::set_mask_params_command(edited));
-            } else if (actions.combine_selected &&
-                       *actions.combine_selected >= 0) {
-                // [none, every other mask] in document order (self skipped).
-                const int sel = *actions.combine_selected;
-                uint64_t next = 0;
-                if (sel > 0) {
-                    int i = 0;
-                    for (const doc::Mask& other : app.document.masks) {
-                        if (other.id == mask->id) continue;
-                        if (++i == sel) {
-                            next = other.id;
-                            break;
-                        }
-                    }
-                }
-                if (next != mask->combine_id) {
-                    doc::Mask edited = *mask;
-                    edited.combine_id = next;
-                    app.undo.execute(app.document,
-                                     doc::set_mask_params_command(edited));
-                }
-            } else if (actions.combine_op_selected &&
-                       *actions.combine_op_selected >= 0 &&
-                       *actions.combine_op_selected !=
-                           static_cast<int>(mask->combine_op)) {
-                doc::Mask edited = *mask;
-                edited.combine_op = static_cast<doc::MaskCombineOp>(
-                    *actions.combine_op_selected);
-                app.undo.execute(app.document,
-                                 doc::set_mask_params_command(edited));
-            } else if (actions.fit_selected && *actions.fit_selected >= 0 &&
-                       *actions.fit_selected !=
-                           static_cast<int>(mask->fit % 3)) {
-                doc::Mask edited = *mask;
-                edited.fit = static_cast<uint32_t>(*actions.fit_selected);
-                app.undo.execute(app.document,
-                                 doc::set_mask_params_command(edited));
-            } else if (actions.freerun_changed && *actions.freerun_changed) {
-                doc::Mask edited = *mask;
-                edited.free_run = *actions.freerun_staged;
-                app.undo.execute(app.document,
-                                 doc::set_mask_params_command(edited));
-            } else if (actions.key_points && *actions.key_points) {
-                // Whole-shape key at the playhead: every point coordinate
-                // gets a key at its lane-resolved value; if the shape is
-                // already fully keyed on this frame, remove that key.
-                const double playhead = app.player.is_open()
-                    ? app.player.current_frame_index() : 0.0;
-                const uint64_t key_id = actions.mask_id | doc::kMaskParamBit;
-                std::vector<doc::KeyframeLane> lanes;
-                bool all_keyed = true;
-                for (size_t s = 0; s < mask->points.size(); ++s) {
-                    doc::KeyframeLane lane;
-                    lane.target = {key_id, doc::kMaskPointParamBase +
-                                               static_cast<int>(s)};
-                    for (const doc::KeyframeLane& l : app.document.lanes)
-                        if (l.target == lane.target) lane.keys = l.keys;
-                    bool keyed = false;
-                    for (const doc::Keyframe& k : lane.keys)
-                        if (std::fabs(k.frame - playhead) < 0.5) keyed = true;
-                    all_keyed = all_keyed && keyed;
-                    lanes.push_back(std::move(lane));
-                }
-                for (size_t s = 0; s < lanes.size(); ++s) {
-                    auto& keys = lanes[s].keys;
-                    if (all_keyed) {
-                        for (size_t i = 0; i < keys.size(); ++i) {
-                            if (std::fabs(keys[i].frame - playhead) < 0.5) {
-                                keys.erase(keys.begin() +
-                                           static_cast<ptrdiff_t>(i));
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    const float value = keys.empty()
-                        ? mask->points[s]
-                        : std::clamp(mod::eval_lane(lanes[s], playhead),
-                                     0.0f, 1.0f);
-                    bool updated = false;
-                    for (doc::Keyframe& k : keys) {
-                        if (std::fabs(k.frame - playhead) < 0.5) {
-                            k.value = value;
-                            updated = true;
-                            break;
-                        }
-                    }
-                    if (!updated) {
-                        doc::Keyframe k;
-                        k.frame = playhead;
-                        k.value = value;
-                        keys.push_back(k);
-                    }
-                }
-                app.undo.execute(app.document,
-                                 doc::set_lanes_command(std::move(lanes)));
-            } else if (*actions.remove) {
-                if (app.overlay_mask_id == actions.mask_id)
-                    app.overlay_mask_id = 0;
-                app.undo.execute(app.document,
-                                 doc::remove_mask_command(actions.mask_id));
-                break;
-            }
-        }
-        for (const FrameUi::MaskStage& stage : frame_ui.mask_stages) {
-            if (!*stage.changed || *stage.staged == stage.original) {
-                if (*stage.released && !did_break) {
-                    app.undo.break_coalescing();
-                    did_break = true;
-                }
-                continue;
-            }
-            const doc::Mask* mask = doc::find_mask(app.document, stage.mask_id);
-            if (!mask) continue;
-            doc::Mask edited = *mask;
-            const float v = *stage.staged;
-            using MF = FrameUi::MaskField;
-            switch (stage.field) {
-                case MF::CenterX: edited.center_x = v; break;
-                case MF::CenterY: edited.center_y = v; break;
-                case MF::RadiusX: edited.radius_x = v; break;
-                case MF::RadiusY: edited.radius_y = v; break;
-                case MF::Roundness: edited.roundness = v; break;
-                case MF::Feather: edited.feather = v; break;
-                case MF::BlackPoint: edited.black_point = v; break;
-                case MF::WhitePoint: edited.white_point = v; break;
-                case MF::Gamma: edited.gamma = v; break;
-                case MF::KeyCenter: edited.key_center = v; break;
-                case MF::KeyRange: edited.key_range = v; break;
-                case MF::KeyR: edited.key_r = v; break;
-                case MF::KeyG: edited.key_g = v; break;
-                case MF::KeyB: edited.key_b = v; break;
-                case MF::BlurPx: edited.blur_px = v; break;
-                case MF::GrowPx: edited.grow_px = v; break;
-                case MF::GenScale: edited.gen_scale = v; break;
-                case MF::GenAngle: edited.gen_angle = v; break;
-            }
-            app.undo.execute(app.document,
-                             doc::set_mask_params_command(std::move(edited)),
-                             /*coalesce=*/true);
-            if (*stage.released && !did_break) {
-                app.undo.break_coalescing();
-                did_break = true;
-            }
-        }
-        for (const FrameUi::MaskChainStage& stage :
-             frame_ui.mask_chain_stages) {
-            if (*stage.changed && *stage.staged != stage.original) {
-                app.undo.execute(app.document,
-                                 doc::mask_chain_set_param_command(
-                                     stage.mask_id, stage.chain_index,
-                                     stage.param_index, *stage.staged),
-                                 /*coalesce=*/true);
-            }
-            if (*stage.released && !did_break) {
-                app.undo.break_coalescing();
-                did_break = true;
-            }
-        }
-        for (const FrameUi::MaskChainRemove& remove :
-             frame_ui.mask_chain_removes) {
-            if (*remove.clicked) {
-                app.undo.execute(app.document,
-                                 doc::mask_chain_remove_command(
-                                     remove.mask_id, remove.chain_index));
-                break;
-            }
-        }
         for (int s = 0; s < 3; ++s) {
             if (frame_ui.snap_store_clicked[s] &&
                 *frame_ui.snap_store_clicked[s])
@@ -10900,7 +11185,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if ((frame_ui.redo_clicked && *frame_ui.redo_clicked) || do_redo)
             app.undo.redo(app.document);
 
-        // ---- project save / open (spec §10)
+        // ---- project save / open
         if ((frame_ui.save_clicked && *frame_ui.save_clicked) || do_save ||
             do_save_as) {
             std::filesystem::path path = app.project_path;
@@ -10918,22 +11203,67 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             if (!path.empty()) save_project(app, path);
         }
-        if ((frame_ui.open_project_clicked &&
-             *frame_ui.open_project_clicked) ||
-            do_open_project) {
+        if (((frame_ui.open_project_clicked &&
+              *frame_ui.open_project_clicked) ||
+             do_open_project) &&
+            confirm_discard_changes(app, window.get())) {
             auto picked = platform::show_open_dialog(
                 window.get(),
                 {{"looks project", "*.json"}, {"all files", "*.*"}});
-            if (picked) open_project(app, *picked);
+            if (picked) open_project(app, *picked, window.get());
         }
-        // Autosave: once a project has a path, dirty documents snapshot to
-        // <name>.autosave.json at most once a minute.
-        if (!app.project_path.empty() &&
-            app.document.revision != app.autosaved_revision &&
+        // Recent-project opens, dirty-guarded like every open.
+        for (const FrameUi::RecentRow& rrow : frame_ui.recent_rows) {
+            if (!*rrow.clicked) continue;
+            if (rrow.index < app.recent_projects.size() &&
+                confirm_discard_changes(app, window.get()))
+                open_project(app, app.recent_projects[rrow.index],
+                             window.get());
+            break;
+        }
+        // Cache management.
+        if (frame_ui.cache_open_clicked && *frame_ui.cache_open_clicked) {
+            const std::wstring dir =
+                (executable_dir() / "cache").wstring();
+            ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr,
+                          SW_SHOWNORMAL);
+        }
+        if (frame_ui.cache_clear_clicked &&
+            *frame_ui.cache_clear_clicked) {
+            // Every bundle dir except the open clip's; autosaves stay.
+            const std::filesystem::path root = executable_dir() / "cache";
+            const std::filesystem::path keep =
+                app.document.clip_path.empty()
+                    ? std::filesystem::path{}
+                    : bundle_dir_for(app.document.clip_path);
+            std::error_code ec;
+            uint64_t removed = 0;
+            for (auto it = std::filesystem::directory_iterator(root, ec);
+                 !ec && it != std::filesystem::directory_iterator();
+                 it.increment(ec)) {
+                if (!it->is_directory(ec)) continue;
+                if (!keep.empty() && it->path() == keep) continue;
+                std::error_code rec_ec;
+                removed +=
+                    std::filesystem::remove_all(it->path(), rec_ec);
+            }
+            app.cache_bytes = scan_cache_bytes();
+            app.status =
+                "cache cleared (" + std::to_string(removed) + " files)";
+        }
+        // Status history: keep what the transient strip drops.
+        if (!app.status.empty() && app.status != app.status_log_last) {
+            app.status_log_last = app.status;
+            app.status_log.push_back(app.status);
+            if (app.status_log.size() > 30)
+                app.status_log.erase(app.status_log.begin());
+        }
+        // Autosave: dirty documents snapshot at most once a minute
+        // — titled beside their project file, untitled under cache/ — and
+        // are offered back on the next run (crash recovery).
+        if (app.document.revision != app.autosaved_revision &&
             now - app.last_autosave > std::chrono::seconds(60)) {
-            std::filesystem::path auto_path = app.project_path;
-            auto_path.replace_extension(".autosave.json");
-            if (doc::save_document(auto_path, app.document))
+            if (doc::save_document(autosave_path_for(app), app.document))
                 app.autosaved_revision = app.document.revision;
             app.last_autosave = now;
         }
@@ -10948,7 +11278,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         // Drag-and-drop: video files open like the dialog would; preset
         // files import into the browser; other .json loads as a project;
-        // a PNG installs a custom glyph set (spec §12).
+        // a PNG installs a custom glyph set.
         if (!dropped_file.empty() && !app.import) {
             const std::filesystem::path p(dropped_file);
             const auto ext = p.extension();
@@ -10977,8 +11307,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     } else {
                         app.status = "preset import failed";
                     }
-                } else {
-                    open_project(app, p);
+                } else if (confirm_discard_changes(app, window.get())) {
+                    open_project(app, p, window.get());
                 }
             } else if (ext == ".mp4" || ext == ".mov" || ext == ".mez" ||
                        ext == ".tga") {
@@ -10986,7 +11316,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             } else if (ext == ".png") {
                 // A PNG with a sibling .json grid descriptor ({"tile": 8,
                 // "cols": 16, "rows": 6}) installs as a custom glyph set
-                // (spec §12); a bare PNG opens as a still clip.
+                //; a bare PNG opens as a still clip.
                 std::filesystem::path desc = p;
                 desc.replace_extension(".json");
                 std::error_code dec;
@@ -11015,7 +11345,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                static_cast<uint32_t>(tile)));
                     const uint32_t rows = std::max(
                         1u, img.height / static_cast<uint32_t>(tile));
-                    // Color tilesets (emoji, spec §6.6): any real chroma
+                    // Color tilesets (emoji, ): any real chroma
                     // in the PNG keeps it RGBA — coverage comes from
                     // alpha, tiles keep their own hue. Monochrome art
                     // collapses to the gray ramp as before.
@@ -11071,7 +11401,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (frame_ui.seek_to >= 0.0f && app.player.is_open())
             app.player.seek_frame(
                 static_cast<uint32_t>(frame_ui.seek_to + 0.5f));
-        // Timeline region edits (spec §9): ruler trim handles + loop band.
+        // Timeline region edits: ruler trim handles + loop band.
         if (frame_ui.trim_in_to >= 0.0f || frame_ui.trim_out_to >= 0.0f ||
             frame_ui.loop_in_to >= 0.0f || frame_ui.loop_clear) {
             uint32_t t_in = app.document.clip_trim_in;
@@ -11146,7 +11476,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 static_cast<double>(app.document.audio_offset_ms) * 0.001);
         }
         sync_sidechain(app);
-        // Half-res proxy (spec §3): swap the player between the full and
+        // Half-res proxy: swap the player between the full and
         // proxy mezzanine when the toggle disagrees with reality.
         if (app.player.is_open()) {
             std::filesystem::path proxy = app.mez_path;
@@ -11171,7 +11501,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 render_worker.resume();
             }
         }
-        // Thumbnail strip (spec §3): register the staged RGBA once.
+        // Thumbnail strip: register the staged RGBA once.
         if (app.thumbs_dirty) {
             app.thumbs_dirty = false;
             if (app.thumbs_count > 0)
@@ -11185,6 +11515,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.loop = !app.loop;
             app.player.set_looping(app.loop);
         }
+        // Monitor volume: mute is gain 0, the slider value stays.
+        if (frame_ui.mute_clicked && *frame_ui.mute_clicked) {
+            app.audio_muted = !app.audio_muted;
+            save_ui_prefs(app);
+        }
+        if (frame_ui.volume_changed && *frame_ui.volume_changed)
+            app.audio_gain = *frame_ui.volume_staged;
+        if (frame_ui.volume_released && *frame_ui.volume_released)
+            save_ui_prefs(app);
+        app.player.set_gain(app.audio_muted ? 0.0f : app.audio_gain);
         if (frame_ui.proxy_selected && *frame_ui.proxy_selected >= 0)
             app.preview_div = *frame_ui.proxy_selected == 0
                                   ? 1u
@@ -11213,7 +11553,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 default_name.string() + "_look.mp4");
             if (out) {
                 if (out->extension() != ".mp4") out->replace_extension(".mp4");
-                // Sidechain mux (spec §7): export the sidechain's audio
+                // Sidechain mux: export the sidechain's audio
                 // instead of the clip's when asked (and available).
                 const std::filesystem::path export_pcm =
                     app.document.sidechain_mux && app.sc_ok
@@ -11225,7 +11565,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         export_pcm, app.document,
                         app.has_analysis ? &app.analysis : nullptr, *out);
                 } else {
-                    // Render queue (spec §9): snapshot now, render later.
+                    // Render queue: snapshot now, render later.
                     AppState::QueuedExport q;
                     q.out_path = *out;
                     q.doc = app.document;
@@ -11245,7 +11585,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             break;   // indices shifted; one removal per frame
         }
 
-        // ---- preview (spec §13 render thread): post the latest snapshot
+        // ---- preview (render thread): post the latest snapshot
         // and sample the newest published frame. Decode, time remap,
         // modulation resolve, and the whole graph evaluation happen on the
         // worker — a heavy stack never stalls this loop.
@@ -11271,7 +11611,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     ui_view_sampler, frame.extent,
                                     px, py, pw, ph);
             } else if (app.ab_wipe && source_image) {
-                // Before left of the split, after right of it (spec §9).
+                // Before left of the split, after right of it.
                 viewport_pass->draw(frame.cmd, ui_view_arena,
                                     frame.frame_index, *source_image,
                                     ui_view_sampler, frame.extent,

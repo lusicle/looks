@@ -38,7 +38,7 @@ float eval_lfo(const doc::ModSource& s, double t) {
                                static_cast<double>(s.phase));
 }
 
-// BPM-synced LFO (spec §7): rate_hz holds beats-per-cycle. Falls back to
+// BPM-synced LFO: rate_hz holds beats-per-cycle. Falls back to
 // 120 BPM when the clip has no analysis/estimate.
 float eval_lfo_beat(const doc::ModSource& s, double t,
                     const AnalysisCurves* analysis) {
@@ -50,7 +50,7 @@ float eval_lfo_beat(const doc::ModSource& s, double t,
     return lfo_shape_at(s, beats / per_cycle + static_cast<double>(s.phase));
 }
 
-// Deterministic pulse train on the BPM grid (spec §7 beat trigger): sharp
+// Deterministic pulse train on the BPM grid (beat trigger): sharp
 // attack into an exponential decay, one burst per beat.
 float eval_beat(const doc::ModSource& s, double t,
                 const AnalysisCurves* analysis) {
@@ -66,7 +66,7 @@ float eval_beat(const doc::ModSource& s, double t,
     return static_cast<float>(std::exp(-(dt - attack) / decay));
 }
 
-// Envelope (spec §7): attack-decay burst fired by the most recent trigger
+// Envelope: attack-decay burst fired by the most recent trigger
 // (audio onset / scene cut / beat / live keypress) at or before this
 // frame. Onset/cut/beat variants are pure functions of the frame index —
 // scrubbing and export land on identical values; keypress is live-only.
@@ -104,7 +104,7 @@ float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
     return 0.0f;
 }
 
-// Video sampling (docs/flow_canvas.md v4). Averages the channel over a
+// Video sampling (docs/flow_canvas.md). Averages the channel over a
 // decimated tap grid: the point variant uses a small fixed box and the
 // region variant caps its grid, so cost stays bounded and single 8-bit
 // code-value steps get band-averaged instead of popping when a large
@@ -223,7 +223,7 @@ float eval_source(const doc::ModSource& source, double t_seconds,
                   uint32_t frame_index, const AnalysisCurves* analysis,
                   double fps, double audio_offset_seconds, double key_time,
                   const SourceFrameView* video) {
-    // Audio nudge (spec §7): audio-derived sources read a shifted clock so
+    // Audio nudge: audio-derived sources read a shifted clock so
     // a positive offset delays audio-driven wiggles against video.
     const double ta = t_seconds - audio_offset_seconds;
     uint32_t af = frame_index;
@@ -286,7 +286,7 @@ float apply_curve(doc::ResponseCurve curve, float x) {
 float eval_lane(const doc::KeyframeLane& lane, double frame) {
     const auto& keys = lane.keys;
     if (keys.empty()) return 0.0f;
-    // Loopable region (spec §7): wrap through the key span once inside it.
+    // Loopable region: wrap through the key span once inside it.
     if (lane.loop && keys.size() >= 2) {
         const double start = keys.front().frame;
         const double span = keys.back().frame - start;
@@ -325,7 +325,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         return nullptr;
     };
 
-    // Morph (spec §7): interpolate between two snapshot slots; the position
+    // Morph: interpolate between two snapshot slots; the position
     // itself is a mod target (ParamKey {0, 0}) so routes are applied to it
     // first. Runs before lanes — morph sets base values like snapshots do.
     {
@@ -368,15 +368,15 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         }
     }
 
-    // Mask targets (spec §8): keys carry kMaskParamBit + the mask id.
-    auto mask_slot = [&](const doc::ParamKey& key, float* min_v,
-                         float* max_v) -> float* {
-        if (!(key.effect_id & doc::kMaskParamBit)) return nullptr;
-        const uint64_t id = key.effect_id & ~doc::kMaskParamBit;
-        for (doc::Mask& m : out.masks)
-            if (m.id == id) {
-                mask_param_range(key.param_index, min_v, max_v);
-                return mask_param_slot(m, key.param_index);
+    // Layer targets: keys carry kLayerParamBit + the layer id.
+    auto layer_slot = [&](const doc::ParamKey& key, float* min_v,
+                          float* max_v) -> float* {
+        if (!(key.effect_id & doc::kLayerParamBit)) return nullptr;
+        const uint64_t id = key.effect_id & ~doc::kLayerParamBit;
+        for (doc::Layer& l : out.layers)
+            if (l.id == id) {
+                layer_param_range(key.param_index, min_v, max_v);
+                return layer_param_slot(l, key.param_index);
             }
         return nullptr;
     };
@@ -385,8 +385,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     for (const doc::KeyframeLane& lane : doc.lanes) {
         if (lane.keys.empty() || lane.muted) continue;
         float min_v = 0.0f, max_v = 1.0f;
-        if (float* mslot = mask_slot(lane.target, &min_v, &max_v)) {
-            *mslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
+        if (float* lslot = layer_slot(lane.target, &min_v, &max_v)) {
+            *lslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
             continue;
         }
         size_t layer = 0, index = 0;
@@ -402,7 +402,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     // they have no resolve-time behavior of their own.)
     for (const doc::ModRoute& route : doc.mod_routes) {
         float min_v = 0.0f, max_v = 1.0f;
-        float* slot = mask_slot(route.target, &min_v, &max_v);
+        float* slot = layer_slot(route.target, &min_v, &max_v);
         if (!slot) {
             size_t layer = 0, index = 0;
             if (!find_effect(out, route.target.effect_id, &layer, &index))
@@ -419,6 +419,17 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         *slot = std::clamp(*slot + route.amount * (max_v - min_v) * value,
                            min_v, max_v);
     }
+
+    // Discrete params (selectors + flagged counts) snap to whole numbers
+    // after every driver — lanes, routes, and morph all interpolate
+    // fractionally, and fractional counts alias kernel math (a dither
+    // `levels` of 2.2 cuts a hard band through the frame). Untouched
+    // params already sit on integers, so this only affects driven ones.
+    for (doc::Layer& snap_layer : out.layers)
+        for (doc::EffectInstance& fx : snap_layer.stack)
+            for (size_t p = 0; p < fx.params.size(); ++p)
+                if (param_discrete(fx.type, static_cast<int>(p)))
+                    fx.params[p] = std::round(fx.params[p]);
     return out;
 }
 

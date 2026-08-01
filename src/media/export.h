@@ -1,4 +1,4 @@
-// Export (spec §3): rendered frames -> H.264 + AAC encoder MFTs ->
+// Export: rendered frames -> H.264 + AAC encoder MFTs ->
 // hand-rolled BMFF mux -> MP4. Frame pixels arrive through a producer
 // callback (the app supplies mezzanine decode + engine render + readback),
 // keeping this module free of any GPU dependency; audio comes from the PCM
@@ -18,7 +18,7 @@ namespace looks::media {
 struct ExportOptions {
     uint32_t video_bitrate_bps = 8'000'000;
     uint32_t audio_bitrate_bps = 128'000;
-    // Source-audio offset (spec §3/§7): seconds of PCM skipped before the
+    // Source-audio offset: seconds of PCM skipped before the
     // first exported video frame — clip trim plus the user nudge. Negative
     // delays the audio with leading silence. Out-of-range reads are
     // silence, so any offset is safe.

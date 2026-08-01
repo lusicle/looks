@@ -1,4 +1,4 @@
-// Voronoi / Delaunay shatter (spec §6.6): the frame breaks into cellular
+// Voronoi / Delaunay shatter: the frame breaks into cellular
 // shards. Seed points live on a jittered grid (seeded, slowly drifting);
 // every pixel finds its nearest seed, the whole shard displaces by a
 // per-cell offset, and shard borders darken like cracks.
@@ -94,7 +94,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float border = sqrt(second) - sqrt(best);
     float3 col;
     if (style >= 0.5) {
-        // Delaunay-style facets (spec §6.6): flat-shade each triangle of
+        // Delaunay-style facets: flat-shade each triangle of
         // three mutually nearest seeds from its centroid; ink the
         // bisector edges as the wireframe.
         const float2 centroid_p = (sp1 + sp2 + sp3) / 3.0;

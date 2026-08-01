@@ -1,4 +1,4 @@
-// Preset files (spec §5/§10, v5.3): a saved group IS an "era preset" —
+// Preset files: a saved group IS an "era preset" —
 // one JSON file holding a Group (exposed face included) plus its member
 // effects, tagged and searchable in the browser. Instantiating mints
 // fresh document ids and rewrites the face keys so a preset can be
@@ -33,10 +33,12 @@ bool save_preset(const std::filesystem::path& path, const Preset& p);
 std::optional<Preset> load_preset(const std::filesystem::path& path);
 
 // All *.json presets in `dir`, sorted by name. Unreadable files are skipped.
-std::vector<Preset> scan_presets(const std::filesystem::path& dir);
+// `failed` (optional) counts unreadable/invalid preset files so the UI
+// can surface them instead of silently dropping them.
+std::vector<Preset> scan_presets(const std::filesystem::path& dir,
+                                 int* failed = nullptr);
 
-// Capture a live group as a preset. Mask references are dropped (masks are
-// document-level objects a preset cannot carry).
+// Capture a live group as a preset.
 Preset make_preset_from_group(const Document& doc, size_t layer_index,
                               uint64_t group_id);
 

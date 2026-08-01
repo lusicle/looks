@@ -1,4 +1,4 @@
-// Anamorphic (spec §6.3): horizontal squeeze (the stretched-oval geometry
+// Anamorphic: horizontal squeeze (the stretched-oval geometry
 // of a scope lens shown 16:9) plus the signature blue horizontal streak
 // flare gathered from thresholded highlights. Linear light throughout.
 //
@@ -19,7 +19,7 @@ cbuffer Push
     float streak;      // flare gain
     float threshold;   // highlight gate (encoded-ish)
     float squeeze;     // horizontal squeeze factor about center
-    float bokeh;       // oval-bokeh approximation (spec §6.3)
+    float bokeh;       // oval-bokeh approximation
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -59,7 +59,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 blue_tint = float3(0.35, 0.55, 1.0);
     col += flare * blue_tint * streak * 6.0;
 
-    // Oval bokeh (spec §6.3): highlights bloom into vertical ellipses —
+    // Oval bokeh: highlights bloom into vertical ellipses —
     // the anamorphic signature. 12 taps on a 2:1 tall ellipse.
     if (bokeh > 0.001) {
         float3 oval = 0.0;

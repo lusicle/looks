@@ -291,6 +291,7 @@ struct IconUser {
     ButtonState* state;
     bool* out_clicked;
     bool disabled;
+    bool active;
     const char* tooltip;
 };
 
@@ -321,7 +322,9 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
             bg.a *= u->state->hover_t;
             frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
         }
-        fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
+        fg = u->active
+            ? theme.accent
+            : lerp(theme.text_dim, theme.text, u->state->hover_t);
     }
 
     const float cx = r.x + r.w * 0.5f;
@@ -677,6 +680,9 @@ struct SliderUser {
     const char* format;
     bool* out_changed;
     bool* out_released;
+    bool* out_value_clicked;
+    float display_scale;
+    const char* tooltip;
 };
 
 Vec2 measure_slider(LayoutNode&, const Constraints& c, const LayoutFrame& frame) {
@@ -695,27 +701,72 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     const Rect& r = node.rect;
     SliderState& s = *u->state;
 
+    // Value readout measured up front — its zone doubles as the type-in
+    // hotspot (canvas rule, applied to the rail: ONLY the value
+    // text opens the editor, the track always jump-drags).
+    char buf[32] = {};
+    float text_w = 0.0f;
+    if (u->format) {
+        std::snprintf(buf, sizeof(buf), u->format,
+                      *u->value * u->display_scale);
+        text_w = measure_text(frame.font, buf, theme.font_size_small).x;
+    }
+    const float value_zone_x = r.right() - text_w - 10.0f;
+
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
     const bool owns = frame.ctx.widget_owns_mouse(id);
     if (frame.input.left_pressed() && owns && !s.dragging) {
-        s.dragging = true;
-        frame.ctx.set_capture(id);
+        if (u->out_value_clicked && u->format &&
+            frame.input.mouse.x >= value_zone_x) {
+            *u->out_value_clicked = true;
+        } else {
+            s.dragging = true;
+            s.fine = false;
+            frame.ctx.set_capture(id);
+        }
     }
     if (s.dragging) {
         const float span = u->max_value - u->min_value;
-        const float t = r.w > 1.0f
-            ? std::clamp((frame.input.mouse.x - r.x) / r.w, 0.0f, 1.0f) : 0.0f;
-        const float next = u->min_value + t * span;
+        // Shift = fine drag: 0.1x, relative from the anchor so
+        // engaging shift mid-drag never jumps the handle.
+        const bool want_fine =
+            (frame.input.mods & platform::kModShift) != 0;
+        if (want_fine != s.fine) {
+            s.fine = want_fine;
+            s.fine_anchor_value = *u->value;
+            s.fine_anchor_x = frame.input.mouse.x;
+        }
+        float next;
+        if (s.fine) {
+            next = s.fine_anchor_value +
+                   (r.w > 1.0f
+                        ? (frame.input.mouse.x - s.fine_anchor_x) / r.w
+                        : 0.0f) *
+                       span * 0.1f;
+            next = std::clamp(next, u->min_value, u->max_value);
+        } else {
+            const float t = r.w > 1.0f
+                ? std::clamp((frame.input.mouse.x - r.x) / r.w, 0.0f, 1.0f)
+                : 0.0f;
+            next = u->min_value + t * span;
+        }
         if (next != *u->value) {
             *u->value = next;
             if (u->out_changed) *u->out_changed = true;
         }
         if (frame.input.left_released()) {
             s.dragging = false;
+            s.fine = false;
             frame.ctx.clear_capture();
             if (u->out_released) *u->out_released = true;
         }
     }
+    s.hover_seconds =
+        owns && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
+    if (u->tooltip && s.hover_seconds > 0.5f)
+        frame.ctx.set_tooltip(u->tooltip,
+                              {frame.input.mouse.x + 12.0f,
+                               frame.input.mouse.y + 18.0f});
 
     const float span = u->max_value - u->min_value;
     const float t = span != 0.0f
@@ -732,15 +783,341 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
                                        theme.stroke_width, theme.hairline);
 
     if (u->format) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), u->format, *u->value);
-        const float text_w =
-            measure_text(frame.font, buf, theme.font_size_small).x;
         draw_text(frame.canvas, frame.font, buf,
                   {r.right() - text_w - 6.0f,
                    r.y + (r.h - frame.font.line_height() * theme.font_size_small) * 0.5f},
                   theme.font_size_small, theme.text);
     }
+}
+
+// ---- Dial
+
+struct DialUser {
+    float* value;
+    float min_value;
+    float max_value;
+    SliderState* state;
+    const char* format;
+    bool* out_changed;
+    bool* out_released;
+    bool* out_value_clicked;
+    float display_scale;
+    const char* tooltip;
+};
+
+constexpr float kDialRadius = 8.0f;
+
+// Mouse angle around `center` in display degrees: 0 at 12 o'clock,
+// clockwise positive (screen y grows downward).
+float dial_mouse_angle(Vec2 mouse, Vec2 center) {
+    return std::atan2(mouse.x - center.x, center.y - mouse.y) * 57.29578f;
+}
+
+float wrap_half_turn(float deg) {
+    while (deg > 180.0f) deg -= 360.0f;
+    while (deg < -180.0f) deg += 360.0f;
+    return deg;
+}
+
+Vec2 measure_dial(LayoutNode&, const Constraints& c, const LayoutFrame& frame) {
+    const float w = c.bounded_w() ? c.max_w : 160.0f;
+    return {w, frame.theme.control_height};
+}
+
+void hit_dial(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const DialUser*>(node.user);
+    register_rect_hit(node, frame, u->state);
+}
+
+void draw_dial(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const DialUser*>(node.user);
+    const Theme& theme = frame.theme;
+    const Rect& r = node.rect;
+    SliderState& s = *u->state;
+
+    char buf[32] = {};
+    float text_w = 0.0f;
+    if (u->format) {
+        std::snprintf(buf, sizeof(buf), u->format,
+                      *u->value * u->display_scale);
+        text_w = measure_text(frame.font, buf, theme.font_size_small).x;
+    }
+    const float value_zone_x = r.right() - text_w - 10.0f;
+    const Vec2 center{r.x + kDialRadius + 3.0f, r.y + r.h * 0.5f};
+
+    const WidgetId id = frame.ctx.acquire_widget_id(&s);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    if (frame.input.left_pressed() && owns && !s.dragging) {
+        if (u->out_value_clicked && u->format &&
+            frame.input.mouse.x >= value_zone_x) {
+            *u->out_value_clicked = true;
+        } else {
+            s.dragging = true;
+            s.dial_angle = dial_mouse_angle(frame.input.mouse, center);
+            frame.ctx.set_capture(id);
+        }
+    }
+    if (s.dragging) {
+        const float a = dial_mouse_angle(frame.input.mouse, center);
+        float delta = wrap_half_turn(a - s.dial_angle);
+        s.dial_angle = a;
+        if (frame.input.mods & platform::kModShift) delta *= 0.1f;
+        const float scale =
+            u->display_scale != 0.0f ? u->display_scale : 1.0f;
+        const float next = std::clamp(*u->value + delta / scale,
+                                      u->min_value, u->max_value);
+        if (next != *u->value) {
+            *u->value = next;
+            if (u->out_changed) *u->out_changed = true;
+        }
+        if (frame.input.left_released()) {
+            s.dragging = false;
+            frame.ctx.clear_capture();
+            if (u->out_released) *u->out_released = true;
+        }
+    }
+    s.hover_seconds = owns && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
+    if (u->tooltip && s.hover_seconds > 0.5f)
+        frame.ctx.set_tooltip(u->tooltip,
+                              {frame.input.mouse.x + 12.0f,
+                               frame.input.mouse.y + 18.0f});
+
+    const Rect knob{center.x - kDialRadius, center.y - kDialRadius,
+                    kDialRadius * 2.0f, kDialRadius * 2.0f};
+    frame.canvas.draw_sdf_rect(knob, kDialRadius, theme.control_bg_active);
+    frame.canvas.draw_sdf_rect_outline(knob, kDialRadius, theme.stroke_width,
+                                       theme.hairline);
+    // Zero notch at 12 o'clock, outside the rim.
+    frame.canvas.draw_line({center.x, knob.y - 3.0f}, {center.x, knob.y - 1.0f},
+                           1.0f, theme.text_dim);
+    const float shown = std::fmod(*u->value * u->display_scale, 360.0f);
+    const float rad = shown * 0.0174533f;
+    const Color pointer = s.dragging ? theme.accent : theme.text;
+    frame.canvas.draw_line(
+        {center.x, center.y},
+        {center.x + std::sin(rad) * (kDialRadius - 2.0f),
+         center.y - std::cos(rad) * (kDialRadius - 2.0f)},
+        1.5f, pointer);
+
+    if (u->format) {
+        draw_text(frame.canvas, frame.font, buf,
+                  {r.right() - text_w - 6.0f,
+                   r.y + (r.h - frame.font.line_height() *
+                                    theme.font_size_small) * 0.5f},
+                  theme.font_size_small, theme.text);
+    }
+}
+
+// ---- ColorSwatch
+
+void hsv_to_rgb(float h, float s, float v, float out[3]) {
+    h = std::fmod(std::fmod(h, 360.0f) + 360.0f, 360.0f) / 60.0f;
+    const float c = v * s;
+    const float x = c * (1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f));
+    const float m = v - c;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    switch (static_cast<int>(h)) {
+        case 0: r = c; g = x; break;
+        case 1: r = x; g = c; break;
+        case 2: g = c; b = x; break;
+        case 3: g = x; b = c; break;
+        case 4: r = x; b = c; break;
+        default: r = c; b = x; break;
+    }
+    out[0] = r + m;
+    out[1] = g + m;
+    out[2] = b + m;
+}
+
+void rgb_to_hsv(const float rgb[3], float& h, float& s, float& v) {
+    const float mx = std::max(rgb[0], std::max(rgb[1], rgb[2]));
+    const float mn = std::min(rgb[0], std::min(rgb[1], rgb[2]));
+    const float d = mx - mn;
+    v = mx;
+    s = mx > 0.0f ? d / mx : 0.0f;
+    if (d <= 0.0f) return;   // hue keeps its previous value on gray
+    if (mx == rgb[0])
+        h = 60.0f * std::fmod((rgb[1] - rgb[2]) / d + 6.0f, 6.0f);
+    else if (mx == rgb[1])
+        h = 60.0f * ((rgb[2] - rgb[0]) / d + 2.0f);
+    else
+        h = 60.0f * ((rgb[0] - rgb[1]) / d + 4.0f);
+}
+
+struct SwatchUser {
+    float rgb[3];
+    SwatchState* state;
+    float* out_rgb;
+    bool* out_changed;
+    bool* out_released;
+};
+
+constexpr float kPickerW = 168.0f;
+constexpr float kPickerSvH = 96.0f;
+constexpr float kPickerHueH = 12.0f;
+constexpr float kPickerH = 6.0f + kPickerSvH + 6.0f + kPickerHueH + 6.0f +
+                           16.0f + 6.0f;
+
+Rect swatch_popup_rect(const Rect& anchor, const LayoutFrame& frame) {
+    float y = anchor.bottom() + 2.0f;
+    const Vec2 view = frame.canvas.viewport();
+    if (y + kPickerH > view.y - 4.0f) y = anchor.y - kPickerH - 2.0f;
+    const float x =
+        std::max(4.0f, std::min(anchor.x, view.x - kPickerW - 4.0f));
+    return {x, y, kPickerW, kPickerH};
+}
+
+Vec2 measure_swatch(LayoutNode&, const Constraints& c, const LayoutFrame&) {
+    return {c.bounded_w() ? c.max_w : 120.0f, 14.0f};
+}
+
+void hit_swatch(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const SwatchUser*>(node.user);
+    register_rect_hit(node, frame, &u->state->button);
+    if (u->state->open)   // the popup owns everything under it while open
+        frame.ctx.add_hit(swatch_popup_rect(node.rect, frame),
+                          frame.ctx.acquire_widget_id(u->state),
+                          HitLayer::Popup);
+}
+
+void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const SwatchUser*>(node.user);
+    const Theme& theme = frame.theme;
+    const Rect& r = node.rect;
+    SwatchState& st = *u->state;
+
+    const WidgetId id = frame.ctx.acquire_widget_id(&st.button);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    if (tick_press_release(st.button, id, r, frame)) {
+        st.open = !st.open;
+        if (st.open) {
+            rgb_to_hsv(u->rgb, st.hue, st.sat, st.val);
+            st.drag_zone = 0;
+            frame.ctx.set_popup_owner(&st);
+        }
+    }
+    if (st.open && frame.ctx.popup_owner() != &st) st.open = false;
+    const bool over_popup =
+        st.open && frame.ctx.widget_owns_mouse(
+                       frame.ctx.acquire_widget_id(u->state));
+    if (st.open && !owns && !over_popup && frame.input.left_pressed())
+        st.open = false;
+
+    frame.canvas.draw_sdf_rect(r, 3.0f,
+                               Color{u->rgb[0], u->rgb[1], u->rgb[2], 1.0f});
+    frame.canvas.draw_sdf_rect_outline(
+        r, 3.0f, theme.stroke_width,
+        lerp(theme.hairline, theme.text_dim, st.button.hover_t));
+
+    if (st.open) {
+        Context::PopupRequest req;
+        req.kind = Context::PopupKind::Color;
+        req.anchor = r;
+        req.rect = swatch_popup_rect(r, frame);
+        req.state = &st;
+        req.out_rgb = u->out_rgb;
+        req.out_changed = u->out_changed;
+        req.out_released = u->out_released;
+        frame.ctx.set_popup(req);
+    }
+}
+
+void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
+                     const Context::PopupRequest& req, UiInput& input) {
+    auto* st = static_cast<SwatchState*>(req.state);
+    if (!st || !st->open) return;
+
+    const Rect& r = req.rect;
+    canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg);
+    canvas.draw_sdf_rect_outline(r, theme.corner_radius, theme.stroke_width,
+                                 theme.hairline);
+    const Rect sv{r.x + 6.0f, r.y + 6.0f, r.w - 12.0f, kPickerSvH};
+    const Rect hue{sv.x, sv.bottom() + 6.0f, sv.w, kPickerHueH};
+
+    if (input.left_pressed()) {
+        if (sv.contains(input.mouse)) st->drag_zone = 1;
+        else if (hue.contains(input.mouse)) st->drag_zone = 2;
+    }
+    if (st->drag_zone != 0) {
+        if (st->drag_zone == 1) {
+            st->sat = std::clamp((input.mouse.x - sv.x) / sv.w, 0.0f, 1.0f);
+            st->val =
+                1.0f - std::clamp((input.mouse.y - sv.y) / sv.h, 0.0f, 1.0f);
+        } else {
+            st->hue =
+                std::clamp((input.mouse.x - hue.x) / hue.w, 0.0f, 1.0f) *
+                360.0f;
+        }
+        float rgb[3];
+        hsv_to_rgb(st->hue, st->sat, st->val, rgb);
+        if (req.out_rgb) {
+            req.out_rgb[0] = rgb[0];
+            req.out_rgb[1] = rgb[1];
+            req.out_rgb[2] = rgb[2];
+        }
+        if (req.out_changed) *req.out_changed = true;
+        if (input.left_released()) {
+            st->drag_zone = 0;
+            if (req.out_released) *req.out_released = true;
+        }
+    }
+
+    // SV square banded from solid strips (no gradient primitive): hue
+    // ramp columns, then a black alpha ramp down the rows.
+    constexpr int kBands = 32;
+    float hue_rgb[3];
+    hsv_to_rgb(st->hue, 1.0f, 1.0f, hue_rgb);
+    for (int i = 0; i < kBands; ++i) {
+        const float t0 = static_cast<float>(i) / kBands;
+        const float t1 = static_cast<float>(i + 1) / kBands;
+        const Color c{1.0f + (hue_rgb[0] - 1.0f) * t0,
+                      1.0f + (hue_rgb[1] - 1.0f) * t0,
+                      1.0f + (hue_rgb[2] - 1.0f) * t0, 1.0f};
+        canvas.draw_rect({sv.x + sv.w * t0, sv.y,
+                          sv.w * (t1 - t0) + 0.5f, sv.h}, c);
+    }
+    for (int i = 0; i < kBands; ++i) {
+        const float t0 = static_cast<float>(i) / kBands;
+        const float t1 = static_cast<float>(i + 1) / kBands;
+        canvas.draw_rect({sv.x, sv.y + sv.h * t0, sv.w,
+                          sv.h * (t1 - t0) + 0.5f},
+                         Color{0.0f, 0.0f, 0.0f, t0});
+    }
+    const Vec2 svc{sv.x + sv.w * st->sat, sv.y + sv.h * (1.0f - st->val)};
+    canvas.draw_sdf_rect_outline({svc.x - 4.0f, svc.y - 4.0f, 8.0f, 8.0f},
+                                 4.0f, 1.5f,
+                                 st->val > 0.6f && st->sat < 0.6f
+                                     ? Color{0.0f, 0.0f, 0.0f, 0.9f}
+                                     : Color{1.0f, 1.0f, 1.0f, 0.9f});
+
+    for (int i = 0; i < kBands; ++i) {
+        const float t0 = static_cast<float>(i) / kBands;
+        const float t1 = static_cast<float>(i + 1) / kBands;
+        float c[3];
+        hsv_to_rgb(t0 * 360.0f, 1.0f, 1.0f, c);
+        canvas.draw_rect({hue.x + hue.w * t0, hue.y,
+                          hue.w * (t1 - t0) + 0.5f, hue.h},
+                         Color{c[0], c[1], c[2], 1.0f});
+    }
+    const float hx = hue.x + hue.w * st->hue / 360.0f;
+    canvas.draw_rect({hx - 1.0f, hue.y - 1.0f, 2.0f, hue.h + 2.0f},
+                     Color{1.0f, 1.0f, 1.0f, 0.9f});
+
+    // Result chip + rgb readout.
+    float rgb[3];
+    hsv_to_rgb(st->hue, st->sat, st->val, rgb);
+    const Rect chip{hue.x, hue.bottom() + 6.0f, 16.0f, 16.0f};
+    canvas.draw_sdf_rect(chip, 3.0f, Color{rgb[0], rgb[1], rgb[2], 1.0f});
+    canvas.draw_sdf_rect_outline(chip, 3.0f, theme.stroke_width,
+                                 theme.hairline);
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.2f  %.2f  %.2f", rgb[0], rgb[1],
+                  rgb[2]);
+    draw_text(canvas, font, buf,
+              {chip.right() + 8.0f,
+               chip.y + (chip.h - font.line_height() *
+                                      theme.font_size_small) * 0.5f},
+              theme.font_size_small, theme.text_dim);
 }
 
 // ---- SectionHeader
@@ -901,6 +1278,7 @@ LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
     u->state = state;
     u->out_clicked = out_clicked;
     u->disabled = opts.disabled;
+    u->active = opts.active;
     u->tooltip = opts.tooltip;
     n->user = u;
     n->width = opts.width;
@@ -936,6 +1314,10 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
     if (!ctx.has_popup()) return;
     const Context::PopupRequest req = ctx.popup();
     ctx.clear_popup();
+    if (req.kind == Context::PopupKind::Color) {
+        run_color_popup(canvas, font, theme, req, input);
+        return;
+    }
     auto* st = static_cast<DropdownState*>(req.state);
     if (!st || !st->open) return;
 
@@ -1010,12 +1392,61 @@ LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
     u->format = opts.format;
     u->out_changed = opts.out_changed;
     u->out_released = opts.out_released;
+    u->out_value_clicked = opts.out_value_clicked;
+    u->display_scale = opts.display_scale;
+    u->tooltip = opts.tooltip;
     n->user = u;
     n->width = SizeSpec::fill();
     n->measure_fn = measure_slider;
     n->draw_fn = draw_slider;
     n->hit_fn = hit_slider;
     n->debug_name = "slider";
+    return n;
+}
+
+LayoutNode* DialF(LayoutArena& arena, float* value, float min_value,
+                  float max_value, SliderState* state,
+                  const SliderOpts& opts) {
+    LayoutNode* n = make_node(arena, NodeKind::Leaf);
+    auto* u = arena.alloc<DialUser>();
+    u->value = value;
+    u->min_value = min_value;
+    u->max_value = max_value;
+    u->state = state;
+    u->format = opts.format;
+    u->out_changed = opts.out_changed;
+    u->out_released = opts.out_released;
+    u->out_value_clicked = opts.out_value_clicked;
+    u->display_scale = opts.display_scale;
+    u->tooltip = opts.tooltip;
+    n->user = u;
+    n->width = SizeSpec::fill();
+    n->measure_fn = measure_dial;
+    n->draw_fn = draw_dial;
+    n->hit_fn = hit_dial;
+    n->debug_name = "dial";
+    return n;
+}
+
+LayoutNode* ColorSwatch(LayoutArena& arena, const float rgb[3],
+                        SwatchState* state, float* out_rgb,
+                        bool* out_changed, bool* out_released) {
+    LayoutNode* n = make_node(arena, NodeKind::Leaf);
+    auto* u = arena.alloc<SwatchUser>();
+    u->rgb[0] = rgb[0];
+    u->rgb[1] = rgb[1];
+    u->rgb[2] = rgb[2];
+    u->state = state;
+    u->out_rgb = out_rgb;
+    u->out_changed = out_changed;
+    u->out_released = out_released;
+    n->user = u;
+    n->width = SizeSpec::fill();
+    n->height = SizeSpec::fixed(14.0f);
+    n->measure_fn = measure_swatch;
+    n->draw_fn = draw_swatch;
+    n->hit_fn = hit_swatch;
+    n->debug_name = "swatch";
     return n;
 }
 

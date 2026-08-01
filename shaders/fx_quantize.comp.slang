@@ -1,4 +1,4 @@
-// Quantizer (spec §6.4): palette lock × dither engine (§6.2). Display-
+// Quantizer: palette lock × dither engine. Display-
 // referred by nature — the kernel converts linear -> sRGB around its core.
 //
 // Dither modes: 0 none, 1-3 Bayer 2/4/8, 4 white noise, 5 blue noise,
@@ -6,10 +6,12 @@
 // patterns drifting in scale/angle), 8 level cycle (quantization levels
 // rotate on the boil clock — the demoscene palette-cycling crawl),
 // 9 RD stipple (the engine steps a per-instance Gray-Scott sim and binds
-// its B field at binding 2). Shared controls: boil rate (pattern re-seed
-// at N Hz), pattern scroll, wave-warp, and dissolve (ordered threshold
-// sweep — 1 = fully quantized, sweeping to 0 reveals the input; doubles
-// as a transition).
+// its B field at binding 2), 10 spiral, 11 radial rings, 12 diamond
+// cluster, 13 clustered dot (45-degree screen), 14 line screen,
+// 15 checker, 16 interleaved gradient noise. Shared controls: boil rate
+// (pattern re-seed at N Hz), pattern scroll, wave-warp, and dissolve
+// (ordered threshold sweep — 1 = fully quantized, sweeping to 0 reveals
+// the input; doubles as a transition).
 //
 // Binding 1 is the packed dither LUT (512x192 R8): rows 0..63 hold the
 // STBN 64x64x8 atlas (slice s at x = s*64), rows 64..191 the 128x128 blue
@@ -53,7 +55,7 @@ cbuffer Push
 
 // Pattern + palette helpers (bayer/blue/STBN/nearest) live in
 // fx_common.slang — shared with the standalone Dither / Palette Map
-// primitives (docs/flow_canvas.md v5.5).
+// primitives (docs/flow_canvas.md).
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -74,7 +76,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                               fx_hash3(seed, boil_tick, 13u) & 127u);
 
     // Pattern coordinates: scroll drifts diagonally on the timeline clock;
-    // rotate/scale are the other pattern-transform legs (spec §6.2);
+    // rotate/scale are the other pattern-transform legs;
     // motion lock advects the pattern along the flow field so it rides
     // the content instead of the screen; wave-warp bends the result.
     float2 pf = float2(tid.xy);
@@ -132,7 +134,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (dm == 10) {
         // Spiral screen: an archimedean spiral threshold wound from the
-        // pattern origin (ordered-shape family, spec §6.2).
+        // pattern origin (ordered-shape family, ).
         const float2 d = pf - float2(float(width), float(height)) * 0.5;
         pattern =
             frac(length(d) * 0.125 - atan2(d.y, d.x) * 0.15915494);
@@ -148,6 +150,18 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 f = frac(pf * 0.125) - 0.5;
         pattern = saturate((abs(f.x) + abs(f.y)) * 1.4);
     }
+    else if (dm == 13)
+        pattern = fx_cluster_dot(pf);
+    else if (dm == 14) {
+        // Line screen: the threshold ramps across a 4 px row period, so
+        // tone renders as variable-weight lines (pattern rotate angles
+        // them).
+        pattern = (float(p.y & 3) + 0.5) * 0.25;
+    }
+    else if (dm == 15)
+        pattern = ((p.x ^ p.y) & 1u) != 0u ? 0.75 : 0.25;
+    else if (dm == 16)
+        pattern = fx_ign(p);
     float threshold = (pattern - 0.5) * saturate(dither_amt);
     if (dm == 0 || dm == 8) threshold = 0.0;
 
@@ -222,7 +236,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else
     {
-        // Custom duotone ramp (spec §6.4 custom palette): black -> hue A
+        // Custom duotone ramp (custom palette): black -> hue A
         // -> hue B -> white by luma, hues from the two knobs.
         float l = saturate(fx_luma(c) + threshold * 0.34);
         if (cycle_step != 0u) l = frac(l + float(cycle_step & 3u) * 0.25);
@@ -236,7 +250,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 
     // Dissolve: ordered threshold sweep between input and quantized —
-    // keyframe it 0 -> 1 and it is a dither transition (spec §6.2).
+    // keyframe it 0 -> 1 and it is a dither transition.
     if (dissolve < 0.999) {
         // Patternless modes (none, level cycle) gate on a hash instead.
         const float gate = (dm == 0 || dm == 8)

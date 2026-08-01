@@ -107,7 +107,7 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
 
     if (intra) {
         int quality = std::clamp(params.quality, 1, 100);
-        // Two-phase (spec §6.3 rate loop): DCT once (parallel), then only
+        // Two-phase (rate loop): DCT once (parallel), then only
         // quantize+entropy per quality step; decode once at the end. The
         // bitstream is byte-identical to the one-shot encoder's.
         intra_dct(in, intra_scratch_, /*parallel=*/true);
@@ -252,7 +252,7 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
     // parses serially (reusing the encode coeff buffer); reconstruction —
     // dequant + IDCT + add onto the prediction — runs across threads.
     // Desync mid-stream leaves every later block on bare prediction,
-    // exactly like the serial walk (that's the aesthetic, spec §6.3).
+    // exactly like the serial walk (that's the aesthetic, ).
     out = pred;
     {
         BitReader br(bitstream_.data(), bitstream_.size());
@@ -339,7 +339,7 @@ void MoshCodec::predict_from_state(uint32_t frame_index,
                 vx = mvs.mx[my * static_cast<int>(mvs.blocks_w) + mx];
                 vy = mvs.my[my * static_cast<int>(mvs.blocks_w) + mx];
             }
-            // Replace-with-custom-field (spec §6.3): synthetic MV fields
+            // Replace-with-custom-field: synthetic MV fields
             // swap in for the flow-supplied vectors; the mangling ops
             // below still apply, so rotate steers the pan and scale
             // amplifies the whole field.

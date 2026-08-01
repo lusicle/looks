@@ -1,4 +1,4 @@
-// Bitmap font (spec §9/§12: baked bitmap atlas; the offline fontbake tool
+// Bitmap font (baked bitmap atlas; the offline fontbake tool
 // will emit atlas + metrics in exactly this model). Until fontbake lands,
 // Font::create_debug() provides a compiled-in 8x8 monospace pixel font so
 // the toolkit has text from day one.
@@ -33,7 +33,7 @@ public:
     // Compiled-in 8x8 ASCII debug font.
     static Font create_debug();
 
-    // Baked MSDF font (spec §12 fontbake): atlas PNG + metrics JSON as
+    // Baked MSDF font (fontbake): atlas PNG + metrics JSON as
     // emitted by msdf-atlas-gen (-yorigin top). Empty on missing files or
     // parse failure — callers fall back to create_debug().
     static std::optional<Font> load_msdf(

@@ -1,7 +1,6 @@
 #include <cmath>
 
 #include "doc/effects.h"
-#include "doc/mask_commands.h"
 #include "doc/mod_commands.h"
 #include "doc/stack_commands.h"
 #include "mod/analysis.h"
@@ -31,8 +30,9 @@ TEST(mod_param_table_paths) {
     doc::Document d = make_doc();
     auto table = mod::build_param_table(d);
     // global.morph + global.speed + vignette (wet, opacity, amount,
-    // radius, softness = 5) + rgb split (4).
-    CHECK_EQ(table.size(), size_t{11});
+    // radius, softness = 5) + rgb split (4) + layer params (v5.7:
+    // opacity, colors, gen, transform = kLayerParamCount).
+    CHECK_EQ(table.size(), size_t{11 + doc::kLayerParamCount});
     CHECK_EQ(table[0].path, "global.morph");
     CHECK_EQ(table[0].key.effect_id, uint64_t{0});
     CHECK_EQ(table[1].path, "global.speed");
@@ -44,6 +44,56 @@ TEST(mod_param_table_paths) {
     CHECK_EQ(table[9].key.effect_id, d.layers[0].stack[1].id);
     CHECK_EQ(table[9].min_value, -64.0f);
     CHECK_EQ(table[9].max_value, 64.0f);
+    // Layer entries carry kLayerParamBit + the layer id.
+    CHECK_EQ(table[11].path, "layer0.opacity");
+    CHECK_EQ(table[11].key.effect_id,
+             d.layers[0].id | doc::kLayerParamBit);
+    CHECK_EQ(table[11].key.param_index, 0);
+    CHECK_EQ(table[25].path, "layer0.xf_rotate");
+    CHECK_EQ(table[25].min_value, -180.0f);
+}
+
+TEST(mod_resolve_snaps_discrete_params) {
+    // Integer-semantics params (counts, selectors) snap to whole numbers
+    // after lanes/routes/morph — fractional level counts alias the
+    // kernel math (a dither `levels` of 2.2 cuts a band into the frame).
+    doc::Document d;
+    d.layers[0].stack.push_back(
+        doc::make_effect(d, doc::EffectType::Dither));
+    doc::KeyframeLane lane;
+    lane.target = {d.layers[0].stack[0].id, 0};   // levels, integer count
+    lane.keys.push_back({0.0, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    lane.keys.push_back({10.0, 7.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    d.lanes.push_back(lane);
+    // A continuous param lane stays fractional: dither amount (index 2).
+    doc::KeyframeLane amt;
+    amt.target = {d.layers[0].stack[0].id, 2};
+    amt.keys.push_back({0.0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    amt.keys.push_back({10.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    d.lanes.push_back(amt);
+
+    const doc::Document r = mod::resolve(d, 3, 30.0, nullptr);
+    const float levels = r.layers[0].stack[0].params[0];
+    CHECK_EQ(levels, std::round(levels));
+    CHECK(levels >= 2.0f && levels <= 7.0f);
+    const float amount = r.layers[0].stack[0].params[2];
+    CHECK(amount > 0.05f && amount < 0.95f);
+    CHECK(amount != std::round(amount));
+}
+
+TEST(mod_resolve_layer_params) {
+    // Layer params are mod targets (kLayerParamBit): a lane on the
+    // gradient angle drives the resolved layer field.
+    doc::Document d;
+    doc::KeyframeLane lane;
+    lane.target = {d.layers[0].id | doc::kLayerParamBit, 8};   // gen_angle
+    lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    lane.keys.push_back({10.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
+    d.lanes.push_back(lane);
+    const doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
+    const doc::Document r10 = mod::resolve(d, 10, 30.0, nullptr);
+    CHECK(near(r0.layers[0].gen_angle, -1.0f));
+    CHECK(near(r10.layers[0].gen_angle, 1.0f));
 }
 
 TEST(mod_lfo_shapes_deterministic) {
@@ -473,89 +523,11 @@ TEST(mod_video_cut_source) {
     CHECK_EQ(mod::eval_source(src, 0.0, 0, nullptr, 30.0), 0.0f);
 }
 
-TEST(mod_mask_param_targets) {
-    doc::Document d;
-    doc::Mask mask;
-    mask.id = d.next_mask_id++;
-    mask.name = "m";
-    mask.feather = 0.1f;
-    d.masks.push_back(mask);
-
-    // The table exposes mask params under the namespaced key (spec S8).
-    auto table = mod::build_param_table(d);
-    bool found = false;
-    for (const auto& e : table)
-        if (e.path == "mask.m.feather") {
-            found = true;
-            CHECK_EQ(e.key.effect_id, mask.id | doc::kMaskParamBit);
-            CHECK(near(e.base, 0.1f));
-        }
-    CHECK(found);
-
-    // Square LFO route on feather: +amount*range in the first half-cycle.
-    doc::ModRoute route;
-    route.id = 1;
-    route.target = {mask.id | doc::kMaskParamBit, 0};
-    route.amount = 0.5f;
-    route.source.type = doc::ModSourceType::Lfo;
-    route.source.shape = doc::LfoShape::Square;
-    route.source.rate_hz = 1.0f;
-    d.mod_routes.push_back(route);
-    doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
-    doc::Document r15 = mod::resolve(d, 15, 30.0, nullptr);
-    CHECK(near(r0.masks[0].feather, 0.1f + 0.5f * 0.5f));   // feather max 0.5
-    CHECK(near(r15.masks[0].feather, 0.1f));
-
-    // A lane sets the base.
-    d.mod_routes.clear();
-    doc::KeyframeLane lane;
-    lane.target = {mask.id | doc::kMaskParamBit, 0};
-    lane.keys = {{0.0, 0.0f}, {10.0, 0.4f}};
-    d.lanes.push_back(lane);
-    doc::Document r5 = mod::resolve(d, 5, 30.0, nullptr);
-    CHECK(near(r5.masks[0].feather, 0.2f));
-}
-
-TEST(mod_mask_point_targets) {
-    doc::Document d;
-    doc::Mask mask;
-    mask.id = d.next_mask_id++;
-    mask.name = "blob";
-    mask.points = {0.2f, 0.2f, 0.8f, 0.2f, 0.8f, 0.8f, 0.2f, 0.8f};
-    d.masks.push_back(mask);
-
-    // Every path point coordinate is addressable (spec S8 "keyframable
-    // points"): p<i>.x / p<i>.y past kMaskPointParamBase.
-    auto table = mod::build_param_table(d);
-    bool found = false;
-    for (const auto& e : table)
-        if (e.path == "mask.blob.p1.x") {
-            found = true;
-            CHECK_EQ(e.key.effect_id, mask.id | doc::kMaskParamBit);
-            CHECK_EQ(e.key.param_index, doc::kMaskPointParamBase + 2);
-            CHECK(near(e.base, 0.8f));
-        }
-    CHECK(found);
-
-    // A lane on p1.x animates the resolved shape; unkeyed coords stay put.
-    doc::KeyframeLane lane;
-    lane.target = {mask.id | doc::kMaskParamBit,
-                   doc::kMaskPointParamBase + 2};
-    lane.keys = {{0.0, 0.2f}, {10.0, 0.6f}};
-    d.lanes.push_back(lane);
-    CHECK(near(mod::resolve(d, 0, 30.0, nullptr).masks[0].points[2], 0.2f));
-    CHECK(near(mod::resolve(d, 5, 30.0, nullptr).masks[0].points[2], 0.4f));
-    CHECK(near(mod::resolve(d, 10, 30.0, nullptr).masks[0].points[2], 0.6f));
-    CHECK(near(mod::resolve(d, 5, 30.0, nullptr).masks[0].points[3], 0.2f));
-}
-
 TEST(mod_set_lanes_command_atomic) {
     doc::Document d;
     doc::UndoStack undo;
-    const doc::ParamKey kx{7ull | doc::kMaskParamBit,
-                           doc::kMaskPointParamBase};
-    const doc::ParamKey ky{7ull | doc::kMaskParamBit,
-                           doc::kMaskPointParamBase + 1};
+    const doc::ParamKey kx{7ull, 0};
+    const doc::ParamKey ky{7ull, 1};
 
     undo.execute(d, doc::set_lanes_command({{kx, {{0.0, 0.1f}}},
                                             {ky, {{0.0, 0.9f}}}}), true);
@@ -572,38 +544,4 @@ TEST(mod_set_lanes_command_atomic) {
     undo.redo(d);
     CHECK_EQ(d.lanes.size(), size_t{2});
     CHECK(near(d.lanes[0].keys[0].value, 0.2f));
-}
-
-TEST(mod_remove_mask_point_shifts_lanes) {
-    doc::Document d;
-    doc::Mask mask;
-    mask.id = d.next_mask_id++;
-    mask.points = {0.2f, 0.2f, 0.8f, 0.2f, 0.5f, 0.8f};
-    d.masks.push_back(mask);
-    const uint64_t key_id = mask.id | doc::kMaskParamBit;
-
-    // Lanes on p0.x, p1.y, p2.x — plus a non-point lane that must not move.
-    d.lanes.push_back({{key_id, 0}, {{0.0, 0.1f}}});
-    d.lanes.push_back({{key_id, doc::kMaskPointParamBase}, {{0.0, 0.25f}}});
-    d.lanes.push_back(
-        {{key_id, doc::kMaskPointParamBase + 3}, {{0.0, 0.5f}}});
-    d.lanes.push_back(
-        {{key_id, doc::kMaskPointParamBase + 4}, {{0.0, 0.75f}}});
-
-    doc::UndoStack undo;
-    undo.execute(d, doc::remove_mask_point_command(mask.id, 1));
-    CHECK_EQ(d.masks[0].points.size(), size_t{4});
-    CHECK(near(d.masks[0].points[2], 0.5f));   // p2 slid into slot 1
-    // p1.y lane died; p2.x retargeted to p1.x; the rest untouched.
-    CHECK_EQ(d.lanes.size(), size_t{3});
-    CHECK_EQ(d.lanes[0].target.param_index, 0);
-    CHECK_EQ(d.lanes[1].target.param_index, doc::kMaskPointParamBase);
-    CHECK_EQ(d.lanes[2].target.param_index, doc::kMaskPointParamBase + 2);
-
-    undo.undo(d);
-    CHECK_EQ(d.masks[0].points.size(), size_t{6});
-    CHECK_EQ(d.lanes.size(), size_t{4});
-    CHECK_EQ(d.lanes[2].target.param_index, doc::kMaskPointParamBase + 3);
-    CHECK(near(d.lanes[2].keys[0].value, 0.5f));
-    CHECK_EQ(d.lanes[3].target.param_index, doc::kMaskPointParamBase + 4);
 }

@@ -1,4 +1,4 @@
-// Lens distortion (spec §6.3): Brown-Conrady radial model on the sampling
+// Lens distortion: Brown-Conrady radial model on the sampling
 // position — positive k1 barrels (edges bow out), negative pincushions.
 // Aspect-corrected so distortion stays circular on screen.
 //

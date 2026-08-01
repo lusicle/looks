@@ -1,4 +1,4 @@
-// Reaction-diffusion composite (spec §6.6): the Gray-Scott B field inks
+// Reaction-diffusion composite: the Gray-Scott B field inks
 // over the frame — dark organic growth (ink 0) or luminous coral (ink 1).
 // The sim itself runs in rd_step; this kernel just draws the state.
 //

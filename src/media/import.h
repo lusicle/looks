@@ -1,4 +1,4 @@
-// Import transcode (spec §3): MP4/MOV -> per-asset bundle on disk:
+// Import transcode: MP4/MOV -> per-asset bundle on disk:
 // <stem>.mez (intra-only mezzanine) + <stem>.pcm (s16 sidecar). The
 // .analysis pass and thumbnail strip join in the modulation milestone.
 //
@@ -16,7 +16,7 @@
 namespace looks::media {
 
 struct ImportOptions {
-    int quality = 90;          // 0 = lossless (spec §3 optional mode)
+    int quality = 90;          // 0 = lossless (optional mode)
     int encode_threads = 0;    // 0 = hardware_concurrency
     bool proxy = true;         // also write <stem>.proxy.mez at half res
     int thumb_count = 120;     // thumbnail strip entries (0 = none)
@@ -28,8 +28,8 @@ struct ImportResult {
     std::filesystem::path mez_path;
     std::filesystem::path pcm_path;       // empty if the source has no audio
     std::filesystem::path analysis_path;  // audio/video mod-source curves
-    std::filesystem::path proxy_path;     // half-res mezzanine (spec §3)
-    std::filesystem::path thumbs_path;    // thumbnail strip (spec §3)
+    std::filesystem::path proxy_path;     // half-res mezzanine
+    std::filesystem::path thumbs_path;    // thumbnail strip
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t frame_count = 0;
@@ -51,7 +51,7 @@ ImportResult import_media(const std::filesystem::path& source,
                           const ImportOptions& options = {},
                           ImportProgress* progress = nullptr);
 
-// Sidechain audio (spec §7): pull just the audio out of a WAV or MP4/MOV
+// Sidechain audio: pull just the audio out of a WAV or MP4/MOV
 // into a .pcm sidecar at dest_pcm. Fails with `error` set when the source
 // has no usable audio track.
 bool extract_audio_pcm(const std::filesystem::path& source,

@@ -1,4 +1,4 @@
-// Vignette (proof effect, spec §6.1 category 3). Radial falloff in linear
+// Vignette (proof effect, category 3). Radial falloff in linear
 // space.
 //
 // Composition (canonical): wet is interior to the blend, opacity outside:

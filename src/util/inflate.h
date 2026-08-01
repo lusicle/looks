@@ -1,4 +1,4 @@
-// Hand-rolled DEFLATE decompressor (spec §12: own inflate, no zlib). RFC
+// Hand-rolled DEFLATE decompressor (own inflate, no zlib). RFC
 // 1951 stored/fixed/dynamic blocks + the RFC 1950 zlib wrapper (adler32
 // verified). Used by the PNG reader for glyph atlases, LUT strips, and
 // dust/leak/screen textures.

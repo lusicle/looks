@@ -1,4 +1,4 @@
-// Export edge (spec §4): linear RGBA16F working space -> NV12 planes for
+// Export edge: linear RGBA16F working space -> NV12 planes for
 // the H.264 encoder MFT. OETF (sRGB encode, inverse of the import EOTF) +
 // BT.709 limited-range matrix; chroma is the 2x2 block average computed in
 // the encoded domain. One dispatch over full res: every thread writes Y,

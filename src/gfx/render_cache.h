@@ -1,8 +1,8 @@
-// Frame render cache (spec §10): CPU-side store of final rendered frames
+// Frame render cache: CPU-side store of final rendered frames
 // keyed on (frame index, upstream-graph hash) with an LRU byte budget
 // (default 2 GB). The "upstream graph" of the final frame is the whole
 // document plus everything else that shapes the output (proxy divisor,
-// mask overlay, clip identity); callers fold all of it into one context
+// preview tap, clip identity); callers fold all of it into one context
 // hash. A context change flushes the cache wholesale — an entry from an
 // edited document can never be served.
 //
@@ -58,7 +58,7 @@ private:
 
     std::unordered_map<uint32_t, Frame> frames_;
     uint64_t context_ = 0;
-    size_t budget_ = size_t{2048} << 20;   // spec §10: default 2 GB
+    size_t budget_ = size_t{2048} << 20;   // default 2 GB
     size_t total_bytes_ = 0;
     uint64_t clock_ = 0;
     uint64_t hits_ = 0;

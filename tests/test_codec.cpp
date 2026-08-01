@@ -144,7 +144,7 @@ TEST(codec_frame_roundtrip_quality) {
 }
 
 TEST(codec_lossless_roundtrip) {
-    // Lossless mode (spec §3): quality 0 must reproduce every byte of
+    // Lossless mode: quality 0 must reproduce every byte of
     // every plane, including odd dimensions.
     for (const auto [w, h] : {std::pair{128u, 96u}, std::pair{71u, 53u}}) {
         const DecodedFrame f = make_test_frame(w, h, 5);
@@ -196,7 +196,7 @@ TEST(codec_determinism) {
     std::vector<uint8_t> a, b;
     encode_frame(src.view(), 77, a);
     encode_frame(src.view(), 77, b);
-    CHECK(a == b);   // bit-exact (spec §11)
+    CHECK(a == b);   // bit-exact
 
     DecodedFrame da, db;
     CHECK(decode_frame(a.data(), a.size(), 64, 64, da));

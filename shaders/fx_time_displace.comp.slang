@@ -1,4 +1,4 @@
-// Time displacement (spec §6.1 adjacent): each pixel plays back from a
+// Time displacement (adjacent): each pixel plays back from a
 // different moment — its delay driven by the luma of a map (self, or a
 // mask's grayscale wired as the third input). The classic "bright is now,
 // dark is the past" video-synth effect. Same engine mechanism as

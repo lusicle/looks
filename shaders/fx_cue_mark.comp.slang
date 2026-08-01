@@ -1,4 +1,4 @@
-// Projector cue marks (spec §6.8): the reel-change dot — a rough circle in
+// Projector cue marks: the reel-change dot — a rough circle in
 // the top-right corner that appears for a few frames every period. The
 // second (changeover) mark follows one second after the first, like the
 // real thing. Encoded space, slightly ragged edge.

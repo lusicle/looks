@@ -1,4 +1,4 @@
-// Echo / ghost trails (spec §6.1 category 1): decay blend against the
+// Echo / ghost trails (category 1): decay blend against the
 // effect's own previous OUTPUT (persistent per-instance target fed by the
 // engine). mode 0 = lighten trails (max), 1 = crossfade smear.
 //

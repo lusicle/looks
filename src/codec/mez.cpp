@@ -38,7 +38,7 @@ uint64_t get_u64(const uint8_t* p) {
     return v;
 }
 
-// Lossless mode (spec §3): quality 0 skips the DCT entirely — per-plane
+// Lossless mode: quality 0 skips the DCT entirely — per-plane
 // left/above-predicted residuals, signed exp-Golomb. Bit-exact roundtrip,
 // ~2:1 on natural footage.
 void encode_plane_lossless(BitWriter& bw, const uint8_t* data, size_t stride,
@@ -142,7 +142,7 @@ void encode_frame(const FrameView& frame, int quality,
     bw.finish();
 }
 
-// Two-phase intra (spec §6.3). Block order MUST mirror encode_frame
+// Two-phase intra. Block order MUST mirror encode_frame
 // exactly — per MB: four luma (row-major), U, V — so intra_entropy's
 // bytes match encode_frame's at the same quality (test-enforced).
 void intra_dct(const FrameView& frame, IntraDct& out, bool parallel) {
@@ -309,7 +309,7 @@ bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
                   uint32_t height, DecodedFrame& out, bool parallel) {
     if (size < 1) return false;
     if (data[0] == 0) {
-        // Lossless (spec §3): inherently serial (row prediction), so the
+        // Lossless: inherently serial (row prediction), so the
         // parallel flag is ignored.
         const int w = static_cast<int>(width);
         const int h = static_cast<int>(height);

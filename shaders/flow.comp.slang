@@ -1,4 +1,4 @@
-// Optical flow (spec §4, src/gfx/flow consumer contract): one thread per
+// Optical flow (src/gfx/flow consumer contract): one thread per
 // 16x16 block, diamond/3-step SAD search of the PREVIOUS luma plane inside
 // the CURRENT one -> per-block motion vector in pixels, written to a
 // (w/16, h/16) RG target. Deterministic: pure function of the two planes.

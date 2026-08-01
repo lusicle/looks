@@ -1,15 +1,15 @@
-// Media Foundation MFT glue (spec §3): raw MFT path — we own the
+// Media Foundation MFT glue: raw MFT path — we own the
 // containers, so no SourceReader/SinkWriter. OS codecs are touched only at
 // import/export edges.
 //
 // Notes:
-// - H.264 ENCODE prefers the hardware path (spec §3): async MFT unlocked
+// - H.264 ENCODE prefers the hardware path: async MFT unlocked
 //   via MF_TRANSFORM_ASYNC_UNLOCK, driven by the METransformNeedInput /
 //   HaveOutput event pump, with a D3D11 IMFDXGIDeviceManager attached.
 //   Any setup failure logs its stage and falls back to the sync software
 //   encoder — import/export are offline, so fallback is only a speed loss.
 // - H.264 DECODE keeps the sync inbox MFT but attaches an
-//   IMFDXGIDeviceManager when the transform is D3D11-aware (spec §3): the
+//   IMFDXGIDeviceManager when the transform is D3D11-aware: the
 //   pixel work then runs on the GPU (DXVA) and samples come back D3D-backed
 //   with a GPU pitch, which receive() reads via IMF2DBuffer2::Lock2DSize.
 //   Any D3D setup failure silently stays on the pure software path. (There

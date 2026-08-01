@@ -1,7 +1,7 @@
-// Layer generators (spec §5): solid / gradient / value noise, rendered
+// Layer generators: solid / gradient / value noise, rendered
 // straight into the linear working space. Colors arrive sRGB-encoded from
 // the UI and are decoded here. Noise is seeded + frame-animated,
-// deterministic (spec §11).
+// deterministic.
 
 #include "fx_common.slang"
 
@@ -59,8 +59,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 4)
     {
-        // Test pattern (spec §5): 75% SMPTE-style bars over a grayscale
-        // ramp footer with a black/white pluge strip. Static (spec §11:
+        // Test pattern: 75% SMPTE-style bars over a grayscale
+        // ramp footer with a black/white pluge strip. Static (:
         // nothing here depends on wall clock).
         if (uv.y < 0.72)
         {
@@ -152,7 +152,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 7)
     {
-        // Shape node (docs/flow_canvas.md v5.2): a centered SDF matte —
+        // Shape node (docs/flow_canvas.md): a centered SDF matte —
         // circle / box / diamond via `shape` — drawn color_a on color_b
         // (white-on-black by default). `scale` sizes it, `angle` is the
         // feather width; position/aspect/rotation come from the layer

@@ -1,4 +1,4 @@
-// ColorScience (spec §6.4): film-stock color via per-preset 3x3 matrix +
+// ColorScience: film-stock color via per-preset 3x3 matrix +
 // tone shaping. Pipeline: linear -> exposure (push/pull) -> stock matrix ->
 // highlight rolloff -> encoded-domain curve (contrast punch around middle
 // gray, fade lifts blacks, saturation) -> back to linear.
@@ -61,7 +61,7 @@ static const float3x3 kMatrix[kPresets] = {
     // wb failure cool (daylight indoors)
     float3x3(0.80, 0.00, 0.10, 0.00, 0.98, 0.04, 0.08, 0.04, 1.28),
     // technicolor 3-strip: aggressive dye separation — saturated
-    // primaries, hard channel isolation (spec §6.4)
+    // primaries, hard channel isolation
     float3x3(1.35, -0.20, -0.15, -0.15, 1.25, -0.10, -0.15, -0.20, 1.35),
     // expired stock: green-cyan fog, magenta-shifted mids, weak blues
     float3x3(0.92, 0.10, -0.02, 0.06, 1.04, 0.04, 0.02, 0.14, 0.78),
@@ -110,7 +110,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     // Linear-domain: exposure, stock matrix, highlight rolloff.
     float3 lin = base.rgb * exp2(push);
     lin = max(mul(kMatrix[p], lin), 0.0);
-    // Highlight clip/rolloff (spec §6.4): positive pulls the shoulder
+    // Highlight clip/rolloff: positive pulls the shoulder
     // down into a deep filmic rolloff; negative hard-clips to a sinking
     // white point — the blown-video look. 0 keeps the stock shoulder.
     const float knee = 0.8 - saturate(highlight) * 0.45;
@@ -127,7 +127,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float l = fx_luma(enc);
     enc = saturate(lerp(float3(l, l, l), enc, kTone[p].y));
     // Fade: lifted blacks, optionally warmed. The expired and instant
-    // presets carry a baked-in base fog on top of the knob (spec §6.4).
+    // presets carry a baked-in base fog on top of the knob.
     const float lift =
         saturate(fade + (p == 13u ? 0.45 : (p == 16u ? 0.22 : 0.0))) *
         0.14;

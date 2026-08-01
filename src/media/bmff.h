@@ -1,4 +1,4 @@
-// BMFF (MP4/MOV) demuxer — hand-rolled (spec §3). Parses ftyp/moov and
+// BMFF (MP4/MOV) demuxer — hand-rolled. Parses ftyp/moov and
 // expands the sample tables (stts/ctts/stsc/stsz/stco/co64/stss) into flat
 // per-sample arrays; extracts avcC (H.264 decoder config) and the esds
 // AudioSpecificConfig for the MFT glue. No fragmented MP4 (moof) support —

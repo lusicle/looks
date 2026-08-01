@@ -37,7 +37,7 @@ TEST(graph_topo_linear_chain) {
 }
 
 TEST(graph_topo_diamond) {
-    // 0 source; 1 and 2 read 0; 3 reads both (mask-style join).
+    // 0 source; 1 and 2 read 0; 3 reads both (matte-style join).
     std::vector<GraphNode> nodes;
     nodes.push_back(node({}));
     nodes.push_back(node({0}));
@@ -102,7 +102,7 @@ TEST(graph_compile_layers) {
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(out.layer_index, 2);
-    // TRUE GRAPH (docs/flow_canvas.md v3): adjustment layers lost their
+    // TRUE GRAPH (docs/flow_canvas.md): adjustment layers lost their
     // composite-tap special case — their effects wire like any node and
     // head at the shared source when unlinked.
     for (const GraphNode& n : g.nodes)
@@ -186,135 +186,81 @@ TEST(graph_compile_chain_and_bypass) {
     CHECK_EQ(graph.order[2], 2);
 }
 
-TEST(graph_layer_mask_gates_composite) {
+TEST(graph_layer_matte_gates_composite) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
-    using looks::doc::Mask;
-    using looks::doc::MaskType;
 
-    // Two layers; the overlay carries a LAYER mask (spec §8): the compile
-    // must wrap its LayerBlend in a MaskApply whose base is the composite
-    // below.
+    // Two visible layers; a Shape layer wired into the overlay's port 1
+    // gates its whole contribution: the compile must wrap the overlay's
+    // LayerBlend in a MatteApply whose base is the composite below.
     Document doc;
-    Mask mask;
-    mask.id = doc.next_mask_id++;
-    mask.type = MaskType::Shape;
-    doc.masks.push_back(mask);
     Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.source = LayerSourceKind::Noise;
-    overlay.mask_id = mask.id;
     doc.layers.push_back(overlay);
+    Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.source = LayerSourceKind::Shape;
+    doc.layers.push_back(matte);
+    doc.links.push_back({doc.layers[0].id, 0, 0});
+    doc.links.push_back({overlay.id, 0, 0});
+    doc.links.push_back({matte.id, overlay.id, 1});
 
     RenderGraph graph = compile_graph(doc);
     CHECK(graph.valid);
-    bool saw_masked_blend = false;
+    bool saw_matted_blend = false;
     for (const GraphNode& n : graph.nodes) {
-        if (n.kind != GraphNode::Kind::MaskApply) continue;
+        if (n.kind != GraphNode::Kind::MatteApply) continue;
         CHECK_EQ(n.inputs.size(), size_t{3});
         const GraphNode& fx =
             graph.nodes[static_cast<size_t>(n.inputs[1])];
-        if (fx.kind == GraphNode::Kind::LayerBlend) saw_masked_blend = true;
+        if (fx.kind == GraphNode::Kind::LayerBlend) saw_matted_blend = true;
     }
-    CHECK(saw_masked_blend);
-    // The masked blend is the graph output.
+    CHECK(saw_matted_blend);
+    // The matted blend is the graph output.
     CHECK(graph.nodes[static_cast<size_t>(graph.output)].kind ==
-          GraphNode::Kind::MaskApply);
+          GraphNode::Kind::MatteApply);
 }
 
-TEST(graph_mask_motion_combine_morph) {
-    using looks::doc::Mask;
-    using looks::doc::MaskCombineOp;
-    using looks::doc::MaskType;
+TEST(graph_effect_matte_diamond) {
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
 
-    // Motion mask (spec §8): reads the shared flow field through an
-    // extract node; combine folds a second mask in through a MaskCombine
-    // node; grow adds the separable morph pair; combine cycles (A<->B)
-    // must terminate and stay acyclic.
+    // A port-1 wire on an effect gates it through extract + apply: the
+    // apply joins (dry, fx, matte) and the matte source feeds ONLY the
+    // gate — never the composite.
     Document doc;
     doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-
-    Mask motion;
-    motion.id = doc.next_mask_id++;
-    motion.type = MaskType::Motion;
-    motion.grow_px = 8.0f;
-    doc.masks.push_back(motion);
-
-    Mask shape;
-    shape.id = doc.next_mask_id++;
-    shape.type = MaskType::Shape;
-    doc.masks.push_back(shape);
-
-    doc.masks[0].combine_id = shape.id;
-    doc.masks[0].combine_op = MaskCombineOp::Intersect;
-    doc.masks[1].combine_id = motion.id;   // cycle back — must be ignored
-    doc.layers[0].stack[0].mask_id = motion.id;
+    const uint64_t fx_id = doc.layers[0].stack[0].id;
+    Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.source = LayerSourceKind::Shape;
+    doc.layers.push_back(matte);
+    doc.links.push_back({doc.layers[0].id, fx_id, 0});
+    doc.links.push_back({fx_id, 0, 0});
+    doc.links.push_back({matte.id, fx_id, 1});
 
     RenderGraph graph = compile_graph(doc);
     CHECK(graph.valid);
-    bool saw_flow = false, saw_combine = false;
-    int morphs = 0;
+    bool saw_extract = false, saw_apply = false;
     for (const GraphNode& n : graph.nodes) {
-        if (n.kind == GraphNode::Kind::Flow) saw_flow = true;
-        if (n.kind == GraphNode::Kind::MaskCombine) {
-            saw_combine = true;
-            CHECK_EQ(n.inputs.size(), size_t{2});
+        if (n.kind == GraphNode::Kind::MatteExtract) {
+            saw_extract = true;
+            CHECK_EQ(n.inputs.size(), size_t{1});
         }
-        if (n.kind == GraphNode::Kind::MaskMorphH ||
-            n.kind == GraphNode::Kind::MaskMorphV)
-            ++morphs;
+        if (n.kind == GraphNode::Kind::MatteApply) {
+            saw_apply = true;
+            CHECK_EQ(n.inputs.size(), size_t{3});
+        }
     }
-    CHECK(saw_flow);
-    CHECK(saw_combine);
-    CHECK_EQ(morphs, 2);
-}
-
-TEST(graph_mask_generator_and_layer_source) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
-    using looks::doc::Mask;
-    using looks::doc::MaskType;
-
-    Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    Layer noise;
-    noise.id = doc.next_effect_id++;
-    noise.source = LayerSourceKind::Noise;
-    doc.layers.push_back(noise);
-
-    // Generator-sourced mask: a Generator node owned by the mask (no
-    // layer_index).
-    Mask gen_mask;
-    gen_mask.id = doc.next_mask_id++;
-    gen_mask.type = MaskType::Luma;
-    gen_mask.source_gen = static_cast<uint32_t>(LayerSourceKind::Noise);
-    doc.masks.push_back(gen_mask);
-    doc.layers[0].stack[0].mask_id = gen_mask.id;
-
-    RenderGraph g1 = compile_graph(doc);
-    CHECK(g1.valid);
-    bool saw_mask_gen = false;
-    for (const GraphNode& n : g1.nodes)
-        if (n.kind == GraphNode::Kind::Generator && n.layer_index < 0 &&
-            n.mask_index >= 0)
-            saw_mask_gen = true;
-    CHECK(saw_mask_gen);
-
-    // Layer-sourced mask: reuses the noise layer's Generator as source.
-    doc.masks[0].source_gen = 0;
-    doc.masks[0].source_layer_id = noise.id;
-    RenderGraph g2 = compile_graph(doc);
-    CHECK(g2.valid);
-    int layer_gens = 0;
-    for (const GraphNode& n : g2.nodes)
-        if (n.kind == GraphNode::Kind::Generator && n.layer_index == 1)
-            ++layer_gens;
-    // One for the layer itself, one feeding the mask.
-    CHECK_EQ(layer_gens, 2);
+    CHECK(saw_extract);
+    CHECK(saw_apply);
+    CHECK(graph.nodes[static_cast<size_t>(graph.output)].kind ==
+          GraphNode::Kind::MatteApply);
 }
 
 TEST(graph_layer_transform_and_trim) {
-    // Transform (spec §5): a non-identity crop/flip/scale/rotate inserts a
+    // Transform: a non-identity crop/flip/scale/rotate inserts a
     // LayerTransform between the layer source and its stack; trim swaps the
     // shared playhead source for a private per-layer Source node.
     Document doc;
@@ -355,44 +301,48 @@ TEST(graph_layer_transform_and_trim) {
     CHECK_EQ(private_sources, 1);
 }
 
-TEST(graph_displace_by_mask_second_input) {
-    using looks::doc::Mask;
-    using looks::doc::MaskType;
+TEST(graph_displace_by_matte_second_input) {
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
 
     Document doc;
     doc.layers[0].stack.push_back(make_effect(doc, EffectType::Displace));
-    Mask mask;
-    mask.id = doc.next_mask_id++;
-    mask.type = MaskType::Luma;
-    doc.masks.push_back(mask);
-    doc.layers[0].stack[0].mask_id = mask.id;
+    const uint64_t fx_id = doc.layers[0].stack[0].id;
+    Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.source = LayerSourceKind::Shape;
+    doc.layers.push_back(matte);
+    doc.links.push_back({doc.layers[0].id, fx_id, 0});
+    doc.links.push_back({fx_id, 0, 0});
+    doc.links.push_back({matte.id, fx_id, 1});
 
-    // map_mode 0: the mask GATES (MaskApply join), displace has one input.
+    // map_mode 0: the matte GATES (MatteApply join), displace has one
+    // input.
     RenderGraph gated = compile_graph(doc);
     CHECK(gated.valid);
     bool saw_apply = false;
     for (const GraphNode& n : gated.nodes) {
         if (n.kind == GraphNode::Kind::Effect)
             CHECK_EQ(n.inputs.size(), size_t{1});
-        if (n.kind == GraphNode::Kind::MaskApply) saw_apply = true;
+        if (n.kind == GraphNode::Kind::MatteApply) saw_apply = true;
     }
     CHECK(saw_apply);
 
-    // map_mode 1: the mask becomes the displacement MAP — the effect node
-    // gains it as a second input and no MaskApply gate is emitted.
+    // map_mode 1: the matte becomes the displacement MAP — the effect
+    // node gains it as a second input and no MatteApply gate is emitted.
     doc.layers[0].stack[0].params[3] = 1.0f;
     RenderGraph mapped = compile_graph(doc);
     CHECK(mapped.valid);
     bool saw_two_input_fx = false;
     for (const GraphNode& n : mapped.nodes) {
-        CHECK(n.kind != GraphNode::Kind::MaskApply);
+        CHECK(n.kind != GraphNode::Kind::MatteApply);
         if (n.kind == GraphNode::Kind::Effect &&
             n.inputs.size() == 2) {
             saw_two_input_fx = true;
-            // Input 1 is the mask subgraph's output (extract node).
+            // Input 1 is the matte gate (extract node).
             const GraphNode& map_node =
                 mapped.nodes[static_cast<size_t>(n.inputs[1])];
-            CHECK(map_node.kind == GraphNode::Kind::MaskExtract);
+            CHECK(map_node.kind == GraphNode::Kind::MatteExtract);
         }
     }
     CHECK(saw_two_input_fx);

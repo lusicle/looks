@@ -1,4 +1,4 @@
-// Micro test harness — no third-party test framework (spec §1). Each test
+// Micro test harness — no third-party test framework. Each test
 // file defines TESTs and links test_main.cpp. CHECK failures report and mark
 // the run failed but keep going; the exe exits non-zero for CTest.
 
