@@ -16,9 +16,16 @@ add_executable(looks_tests
     test_cache.cpp
     test_refdump.cpp
     test_truetype.cpp
+    test_error_diffusion.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/graph.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/render_cache.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/render_cache.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/error_diffusion.cpp)
 target_include_directories(looks_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The dither equivalence tests walk hundreds of frames of CPU pixel loops;
+# same optimized-in-Debug tradeoff as looks_gfx/looks_codec.
+if(MSVC)
+    target_compile_options(looks_tests PRIVATE $<$<CONFIG:Debug>:/O2 /Ob2 /Oi>)
+endif()
 # test_serialize validates the shipped era presets in-place.
 target_compile_definitions(looks_tests PRIVATE
     LOOKS_REPO_ROOT="${CMAKE_SOURCE_DIR}")

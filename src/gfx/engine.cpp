@@ -8,8 +8,9 @@
 #include <cstring>
 #include <vector>
 
-#include "codec/core.h"   // parallel_blocks for the CPU dither passes
+#include "codec/core.h"   // parallel_blocks for the staging conversions
 #include "doc/effects.h"
+#include "gfx/error_diffusion.h"
 #include "gfx/graph.h"
 #include "gfx/vk_device.h"
 #include "util/file.h"
@@ -153,33 +154,6 @@ constexpr FxShaderDesc kFxShaders[] = {
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
 
-float half_to_float(uint16_t h) {
-    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-    uint32_t exp = (h >> 10) & 0x1F;
-    uint32_t man = h & 0x3FF;
-    uint32_t bits;
-    if (exp == 0) {
-        if (man == 0) {
-            bits = sign;
-        } else {
-            exp = 127 - 15 + 1;
-            while (!(man & 0x400)) {
-                man <<= 1;
-                --exp;
-            }
-            man &= 0x3FF;
-            bits = sign | (exp << 23) | (man << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7F800000u | (man << 13);
-    } else {
-        bits = sign | ((exp - 15 + 127) << 23) | (man << 13);
-    }
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
 // Maps a Codec-Box effect's params onto the mosh codec (same
 // box, different params = the four named effects).
 codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
@@ -226,6 +200,9 @@ std::unique_ptr<Engine> Engine::create(Device& device,
 }
 
 Engine::~Engine() {
+    // Land any deferred dither walks before their state unwinds.
+    for (auto& [id, slot] : ed_state_)
+        if (slot && slot->busy) slot->worker.join();
     device_.wait_idle();
     VkDevice dev = device_.device();
     if (linear_sampler_) vkDestroySampler(dev, linear_sampler_, nullptr);
@@ -385,6 +362,64 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     mix_desc.push_bytes = 4 * sizeof(uint32_t);
     fx_mix_ = ComputePipeline::create(device_, shader_dir, mix_desc);
     if (!to_nv12_ || !fx_mix_) return false;
+
+    // GPU mosh: the codec box stays on the GPU whenever no bitstream is
+    // rate-limited or corrupted (entropy is lossless, so the wire is just
+    // predict + DCT + quant + dequant + IDCT — all data-parallel integer
+    // math). The CPU box remains the byte-flips / bitrate path.
+    ComputePipelineDesc mpredict_desc;
+    mpredict_desc.spv_name = "mosh_predict.comp.spv";
+    mpredict_desc.sampled_inputs = 1;
+    mpredict_desc.storage_outputs = 6;
+    mpredict_desc.push_bytes = 16 * sizeof(uint32_t);
+    mosh_predict_ = ComputePipeline::create(device_, shader_dir,
+                                            mpredict_desc);
+    ComputePipelineDesc mwire_desc;
+    mwire_desc.spv_name = "mosh_wire.comp.spv";
+    mwire_desc.sampled_inputs = 2;
+    mwire_desc.storage_outputs = 6;
+    mwire_desc.push_bytes = 12 * sizeof(uint32_t);
+    mosh_wire_ = ComputePipeline::create(device_, shader_dir, mwire_desc);
+    ComputePipelineDesc mprobe_desc;
+    mprobe_desc.spv_name = "mosh_rate_probe.comp.spv";
+    mprobe_desc.sampled_inputs = 2;
+    mprobe_desc.storage_outputs = 3;
+    mprobe_desc.push_bytes = 16 * sizeof(uint32_t);
+    mosh_rate_probe_ =
+        ComputePipeline::create(device_, shader_dir, mprobe_desc);
+    ComputePipelineDesc mreduce_desc;
+    mreduce_desc.spv_name = "mosh_rate_reduce.comp.spv";
+    mreduce_desc.sampled_inputs = 0;
+    mreduce_desc.storage_outputs = 2;
+    mreduce_desc.push_bytes = 6 * sizeof(uint32_t);
+    mosh_rate_reduce_ =
+        ComputePipeline::create(device_, shader_dir, mreduce_desc);
+    ComputePipelineDesc mpick_desc;
+    mpick_desc.spv_name = "mosh_rate_pick.comp.spv";
+    mpick_desc.sampled_inputs = 0;
+    mpick_desc.storage_outputs = 2;
+    mpick_desc.push_bytes = 12 * sizeof(uint32_t);
+    mosh_rate_pick_ =
+        ComputePipeline::create(device_, shader_dir, mpick_desc);
+    if (!mosh_rate_probe_ || !mosh_rate_reduce_ || !mosh_rate_pick_)
+        return false;
+    ComputePipelineDesc edx_desc;
+    edx_desc.spv_name = "ed_expand.comp.spv";
+    edx_desc.sampled_inputs = 0;
+    edx_desc.storage_outputs = 2;
+    edx_desc.push_bytes = 24 * sizeof(uint32_t);
+    ed_expand_ = ComputePipeline::create(device_, shader_dir, edx_desc);
+    if (!ed_expand_) return false;
+    ComputePipelineDesc munorm_desc;
+    munorm_desc.spv_name = "mosh_to_unorm.comp.spv";
+    munorm_desc.sampled_inputs = 0;
+    munorm_desc.storage_outputs = 6;
+    munorm_desc.push_bytes = 4 * sizeof(uint32_t);
+    mosh_unorm_ = ComputePipeline::create(device_, shader_dir, munorm_desc);
+    if (!mosh_predict_ || !mosh_wire_ || !mosh_unorm_) return false;
+    dummy_flow_ = GpuImage::create(device_, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                   1, 1, VK_IMAGE_USAGE_SAMPLED_BIT);
+    if (!dummy_flow_) return false;
 
     // Compositing: layer generators + blend.
     ComputePipelineDesc gen_desc;
@@ -813,408 +848,390 @@ void Engine::set_scope_audio(std::vector<int16_t> mono,
     scope_rate_ = scope_audio_.empty() ? 0 : sample_rate;
 }
 
-namespace {
 
-uint16_t float_to_half(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const int32_t exp =
-        static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
-    const uint32_t man = x & 0x7FFFFFu;
-    if (exp <= 0) return static_cast<uint16_t>(sign);            // -> 0
-    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); // clamp
-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
-                                 (man >> 13));
-}
-
-float cpu_srgb_oetf(float x) {
-    return x <= 0.0031308f ? x * 12.92f
-                           : 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
-}
-
-float cpu_srgb_eotf(float x) {
-    return x <= 0.04045f ? x / 12.92f
-                         : std::pow((x + 0.055f) / 1.055f, 2.4f);
-}
-
-}  // namespace
-
-// Hilbert d -> (x, y) on a 2^order square (the standard rotate-and-
-// reflect walk). The curve visits 4^order cells; callers skip the ones
-// outside the image.
-static void hilbert_d2xy(int order, uint64_t d, uint32_t* out_x,
-                         uint32_t* out_y) {
-    uint32_t x = 0, y = 0;
-    for (int s = 0; s < order; ++s) {
-        const uint32_t rx = 1u & static_cast<uint32_t>(d >> 1);
-        const uint32_t ry = 1u & static_cast<uint32_t>(d ^ rx);
-        if (ry == 0) {
-            if (rx == 1) {
-                x = (1u << s) - 1u - x;
-                y = (1u << s) - 1u - y;
-            }
-            const uint32_t t = x;
-            x = y;
-            y = t;
-        }
-        x += rx << s;
-        y += ry << s;
-        d >>= 2;
-    }
-    *out_x = x;
-    *out_y = y;
-}
-
-// Error diffusion in LINEAR light: the error is conserved in the
-// domain the display averages in, so dithered fields keep the source
-// brightness — encoded-domain diffusion lifts every dark region (Jensen).
-// The output palette stays the encoded-uniform levels k/steps (perceptual
-// spacing); the level pick is nearest-in-encoded via exact linear
-// thresholds, no per-pixel transfer function needed. Temporal carry feeds
-// each pixel's quantization error into the next frame's starting values —
-// low = smooth, high = ghosting.
-// Kernels 0-5 are the fixed-tap serpentine rasters. Kernel 6 is
-// Ostromoukhov's variable-coefficient diffusion: three taps whose weights
-// come from a per-intensity table (indexed by the pixel's encoded input
-// level, mirrored above mid-gray). Kernel 7 is Riemersma dither: the
-// pixels are visited along a Hilbert curve and each is nudged by the
-// exponentially-decaying sum of the last 16 quantization errors, giving
-// a wormy structure no raster kernel produces (serpentine does not apply).
-void Engine::run_error_diffusion(const uint16_t* halves, uint32_t width,
-                                 uint32_t height,
-                                 const doc::EffectInstance& fx, EdSlot& slot) {
-    const size_t n = static_cast<size_t>(width) * height;
-    const float levels = std::clamp(fx.params[0], 2.0f, 16.0f);
-    const int kernel =
-        static_cast<int>(std::clamp(fx.params[1], 0.0f, 7.0f) + 0.5f);
-    const bool serp = fx.params[2] >= 0.5f;
-    const float carry_amt = std::clamp(fx.params[3], 0.0f, 1.0f);
-    const float steps = levels - 1.0f;
-
-    // Half is 16-bit, so the input clamp is exactly a table — and the
-    // working values stay in the linear domain the planes arrive in.
-    static const std::vector<float>& lin_lut = [] {
-        static std::vector<float> lut(65536);
-        for (uint32_t h16 = 0; h16 < 65536; ++h16)
-            lut[h16] = std::clamp(
-                half_to_float(static_cast<uint16_t>(h16)), 0.0f, 1.0f);
-        return lut;
-    }();
-
-    // Reused scratch (no 24 MB alloc+zero per frame); the fill and output
-    // conversions are per-pixel independent and run across threads — only
-    // the diffusion itself is inherently serial.
-    slot.work.resize(n * 3);
-    float* const v = slot.work.data();
-    codec::parallel_blocks(
-        static_cast<int>(height), true, [&](int begin, int end) {
-            for (int row = begin; row < end; ++row) {
-                const size_t base = static_cast<size_t>(row) * width;
-                for (size_t x = 0; x < width; ++x)
-                    for (size_t c = 0; c < 3; ++c)
-                        v[(base + x) * 3 + c] =
-                            lin_lut[halves[(base + x) * 4 + c]];
-            }
-        });
-    if (carry_amt > 0.0f && slot.carry.size() == n * 3)
-        for (size_t i = 0; i < n * 3; ++i) v[i] += slot.carry[i] * carry_amt;
-    std::vector<float> next_carry;
-    if (carry_amt > 0.0f) next_carry.assign(n * 3, 0.0f);
-
-    // Tap tables (order matters: float accumulation order defines the
-    // result, and the interior fast path must match the checked path).
-    struct Tap {
-        int dx, dy;
-        float wgt;
-    };
-    static constexpr Tap kFs[4] = {{1, 0, 7.0f / 16.0f},
-                                   {-1, 1, 3.0f / 16.0f},
-                                   {0, 1, 5.0f / 16.0f},
-                                   {1, 1, 1.0f / 16.0f}};
-    static constexpr Tap kAtk[6] = {{1, 0, 1.0f / 8.0f}, {2, 0, 1.0f / 8.0f},
-                                    {-1, 1, 1.0f / 8.0f}, {0, 1, 1.0f / 8.0f},
-                                    {1, 1, 1.0f / 8.0f}, {0, 2, 1.0f / 8.0f}};
-    // The classic wide kernels (family, DitherBoy-league).
-    static constexpr Tap kJarvis[12] = {
-        {1, 0, 7.0f / 48.0f},  {2, 0, 5.0f / 48.0f},  {-2, 1, 3.0f / 48.0f},
-        {-1, 1, 5.0f / 48.0f}, {0, 1, 7.0f / 48.0f},  {1, 1, 5.0f / 48.0f},
-        {2, 1, 3.0f / 48.0f},  {-2, 2, 1.0f / 48.0f}, {-1, 2, 3.0f / 48.0f},
-        {0, 2, 5.0f / 48.0f},  {1, 2, 3.0f / 48.0f},  {2, 2, 1.0f / 48.0f}};
-    static constexpr Tap kStucki[12] = {
-        {1, 0, 8.0f / 42.0f},  {2, 0, 4.0f / 42.0f},  {-2, 1, 2.0f / 42.0f},
-        {-1, 1, 4.0f / 42.0f}, {0, 1, 8.0f / 42.0f},  {1, 1, 4.0f / 42.0f},
-        {2, 1, 2.0f / 42.0f},  {-2, 2, 1.0f / 42.0f}, {-1, 2, 2.0f / 42.0f},
-        {0, 2, 4.0f / 42.0f},  {1, 2, 2.0f / 42.0f},  {2, 2, 1.0f / 42.0f}};
-    static constexpr Tap kBurkes[7] = {
-        {1, 0, 8.0f / 32.0f},  {2, 0, 4.0f / 32.0f}, {-2, 1, 2.0f / 32.0f},
-        {-1, 1, 4.0f / 32.0f}, {0, 1, 8.0f / 32.0f}, {1, 1, 4.0f / 32.0f},
-        {2, 1, 2.0f / 32.0f}};
-    static constexpr Tap kSierra[10] = {
-        {1, 0, 5.0f / 32.0f},  {2, 0, 3.0f / 32.0f}, {-2, 1, 2.0f / 32.0f},
-        {-1, 1, 4.0f / 32.0f}, {0, 1, 5.0f / 32.0f}, {1, 1, 4.0f / 32.0f},
-        {2, 1, 3.0f / 32.0f},  {-1, 2, 2.0f / 32.0f}, {0, 2, 3.0f / 32.0f},
-        {1, 2, 2.0f / 32.0f}};
-    const Tap* taps = kFs;
-    int ntaps = 4;
-    int margin = 1;
-    switch (kernel) {
-        case 1: taps = kAtk; ntaps = 6; margin = 2; break;
-        case 2: taps = kJarvis; ntaps = 12; margin = 2; break;
-        case 3: taps = kStucki; ntaps = 12; margin = 2; break;
-        case 4: taps = kBurkes; ntaps = 7; margin = 2; break;
-        case 5: taps = kSierra; ntaps = 10; margin = 2; break;
-        default: break;
-    }
-
-    // Level tables: the encoded-uniform palette in linear light, plus the
-    // encoded midpoints as linear thresholds — `count(thresh < value)` IS
-    // nearest-in-encoded, exactly, with ≤15 compares and no transfer
-    // function in the hot loop. After the pick, v[] holds the level INDEX.
-    const int nlevels_q =
-        std::min(17, static_cast<int>(std::lround(std::ceil(steps))) + 1);
-    float level_lin[17];
-    float thresh_lin[16];
-    for (int k = 0; k < nlevels_q; ++k)
-        level_lin[k] = cpu_srgb_eotf(
-            std::clamp(static_cast<float>(k) / steps, 0.0f, 1.0f));
-    for (int k = 0; k + 1 < nlevels_q; ++k)
-        thresh_lin[k] = cpu_srgb_eotf(std::clamp(
-            (static_cast<float>(k) + 0.5f) / steps, 0.0f, 1.0f));
-
-    const int iw = static_cast<int>(width);
-    const int ih = static_cast<int>(height);
-
-    if (kernel == 6) {
-        // Ostromoukhov variable-coefficient diffusion: three taps (next
-        // in the processing direction, down-behind, down) whose weights
-        // come from a per-intensity table. Rows cover [0..127] as
-        // integer triples normalized by their sum; levels above mirror
-        // (row(i) = row(255 - i)).
-        static constexpr int16_t kOstro[128][3] = {
-            {13, 0, 5},      {13, 0, 5},      {21, 0, 10},
-            {7, 0, 4},       {8, 0, 5},       {47, 3, 28},
-            {23, 3, 13},     {15, 3, 8},      {22, 6, 11},
-            {43, 15, 20},    {7, 3, 3},       {501, 224, 211},
-            {249, 116, 103}, {165, 80, 67},   {123, 62, 49},
-            {489, 256, 191}, {81, 44, 31},    {483, 272, 181},
-            {60, 35, 22},    {53, 32, 19},    {237, 148, 83},
-            {471, 304, 161}, {3, 2, 1},       {481, 314, 185},
-            {354, 226, 155}, {1389, 866, 685},{227, 138, 125},
-            {267, 158, 163}, {327, 188, 220}, {61, 34, 45},
-            {627, 338, 505}, {1227, 638, 1075},{20, 10, 19},
-            {1937, 1000, 1767},{977, 520, 855},{657, 360, 551},
-            {71, 40, 57},    {2005, 1160, 1539},{337, 200, 247},
-            {2039, 1240, 1425},{257, 160, 171},{691, 440, 437},
-            {1045, 680, 627},{301, 200, 171}, {177, 120, 95},
-            {2141, 1480, 1083},{1079, 760, 513},{725, 520, 323},
-            {137, 100, 57},  {2209, 1640, 855},{53, 40, 19},
-            {2243, 1720, 741},{565, 440, 171},{759, 600, 209},
-            {1147, 920, 285},{2311, 1880, 513},{97, 80, 19},
-            {335, 280, 57},  {1181, 1000, 171},{793, 680, 95},
-            {599, 520, 57},  {2413, 2120, 171},{405, 360, 19},
-            {2447, 2200, 57},{11, 10, 0},     {158, 151, 3},
-            {178, 179, 7},   {1030, 1091, 63},{248, 277, 21},
-            {318, 375, 35},  {458, 571, 63},  {878, 1159, 147},
-            {5, 7, 1},       {172, 181, 37},  {97, 76, 22},
-            {72, 41, 17},    {119, 47, 29},   {4, 1, 1},
-            {4, 1, 1},       {4, 1, 1},       {4, 1, 1},
-            {4, 1, 1},       {4, 1, 1},       {4, 1, 1},
-            {4, 1, 1},       {4, 1, 1},       {65, 18, 17},
-            {95, 29, 26},    {185, 62, 53},   {30, 11, 9},
-            {35, 14, 11},    {85, 37, 28},    {55, 26, 19},
-            {80, 41, 29},    {155, 86, 59},   {5, 3, 2},
-            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
-            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
-            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
-            {5, 3, 2},       {5, 3, 2},       {5, 3, 2},
-            {305, 176, 119}, {155, 86, 59},   {105, 56, 39},
-            {80, 41, 29},    {65, 32, 23},    {55, 26, 19},
-            {335, 152, 113}, {85, 37, 28},    {115, 48, 37},
-            {35, 14, 11},    {355, 136, 109}, {30, 11, 9},
-            {365, 128, 107}, {185, 62, 53},   {25, 8, 7},
-            {95, 29, 26},    {385, 112, 103}, {65, 18, 17},
-            {395, 104, 101}, {4, 1, 1},
+bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
+                          const codec::MoshParams& mp, const GpuImage* in,
+                          GpuImage* flow_img, uint32_t w, uint32_t h,
+                          uint32_t frame_index, uint32_t timeline_frame,
+                          GpuImage* dst) {
+    const uint32_t cw = w / 2;
+    const uint32_t chh = h / 2;
+    MoshGpuSlot& g = mosh_gpu_[fx.id];
+    if (g.w != w || g.h != h) {
+        device_.wait_idle();
+        const VkImageUsageFlags use = VK_IMAGE_USAGE_STORAGE_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        const auto make3 = [&](std::unique_ptr<GpuImage>* trio) {
+            trio[0] = GpuImage::create(device_, VK_FORMAT_R32_UINT, w, h, use);
+            trio[1] =
+                GpuImage::create(device_, VK_FORMAT_R32_UINT, cw, chh, use);
+            trio[2] =
+                GpuImage::create(device_, VK_FORMAT_R32_UINT, cw, chh, use);
+            return trio[0] && trio[1] && trio[2];
         };
-        float ostro_w[128][3];
-        for (int r = 0; r < 128; ++r) {
-            const float m = static_cast<float>(
-                kOstro[r][0] + kOstro[r][1] + kOstro[r][2]);
-            for (int t = 0; t < 3; ++t)
-                ostro_w[r][t] = static_cast<float>(kOstro[r][t]) / m;
-        }
-        // The table's domain is the encoded input level. Nearest encoded
-        // byte of a linear value via midpoint thresholds, folded into a
-        // 4096-bin lookup: sub-byte exact except the darkest rows, whose
-        // coefficients are near-identical anyway.
-        uint8_t row_lut[4096];
-        {
-            int b = 0;
-            for (int j = 0; j < 4096; ++j) {
-                const float vj = (static_cast<float>(j) + 0.5f) / 4096.0f;
-                while (b < 255 &&
-                       vj > cpu_srgb_eotf(
-                                (static_cast<float>(b) + 0.5f) / 255.0f))
-                    ++b;
-                row_lut[j] = static_cast<uint8_t>(b < 128 ? b : 255 - b);
-            }
-        }
-        for (int y = 0; y < ih; ++y) {
-            const bool reverse = serp && ((y & 1) != 0);
-            const int dir = reverse ? -1 : 1;
-            const bool has_down = y + 1 < ih;
-            for (int xi = 0; xi < iw; ++xi) {
-                const int x = reverse ? (iw - 1 - xi) : xi;
-                const size_t i = (static_cast<size_t>(y) * width +
-                                  static_cast<size_t>(x)) * 3;
-                const int xn = x + dir;
-                const int xb = x - dir;
-                const bool has_next = xn >= 0 && xn < iw;
-                const bool has_back = xb >= 0 && xb < iw;
-                for (size_t c = 0; c < 3; ++c) {
-                    // Weights index off the ORIGINAL input level (the
-                    // domain the table was tuned in), not the
-                    // error-shifted working value.
-                    const float orig =
-                        lin_lut[halves[(static_cast<size_t>(y) * width +
-                                        static_cast<size_t>(x)) * 4 + c]];
-                    const float* wv = ostro_w[row_lut[std::min(
-                        4095, static_cast<int>(orig * 4096.0f))]];
-                    const float clamped =
-                        std::clamp(v[i + c], 0.0f, 1.0f);
-                    int k = 0;
-                    while (k + 1 < nlevels_q && clamped > thresh_lin[k])
-                        ++k;
-                    const float err = clamped - level_lin[k];
-                    v[i + c] = static_cast<float>(k);
-                    if (has_next)
-                        v[(static_cast<size_t>(y) * width +
-                           static_cast<size_t>(xn)) * 3 + c] += err * wv[0];
-                    if (has_down) {
-                        if (has_back)
-                            v[(static_cast<size_t>(y + 1) * width +
-                               static_cast<size_t>(xb)) * 3 + c] +=
-                                err * wv[1];
-                        v[(static_cast<size_t>(y + 1) * width +
-                           static_cast<size_t>(x)) * 3 + c] += err * wv[2];
-                    }
-                    if (carry_amt > 0.0f) next_carry[i + c] = err;
-                }
-            }
-        }
-    } else if (kernel == 7) {
-        // Riemersma dither: pixels are visited along the Hilbert curve
-        // covering the next power-of-two square (off-image points are
-        // skipped); each pixel is nudged by the decaying weighted sum of
-        // the last 16 quantization errors (newest weight 1, oldest 1/16)
-        // and its own pure residual joins the list. The serpentine flag
-        // has no meaning on a space-filling path.
-        int order = 0;
-        while ((1u << order) < width || (1u << order) < height) ++order;
-        float wts[16];
-        const float decay = std::exp(std::log(16.0f) / 15.0f);
-        for (int a = 0; a < 16; ++a)
-            wts[a] = std::pow(decay, -static_cast<float>(a));
-        float ring[16][3] = {};
-        int head = 0;
-        const uint64_t total = uint64_t{1} << (2 * order);
-        for (uint64_t d = 0; d < total; ++d) {
-            uint32_t hx = 0, hy = 0;
-            hilbert_d2xy(order, d, &hx, &hy);
-            if (hx >= width || hy >= height) continue;
-            const size_t i = (static_cast<size_t>(hy) * width + hx) * 3;
-            float errs[3];
-            for (size_t c = 0; c < 3; ++c) {
-                float sum = 0.0f;
-                for (int a = 0; a < 16; ++a)
-                    sum += ring[(head + 15 - a) & 15][c] * wts[a];
-                const float clamped = std::clamp(v[i + c], 0.0f, 1.0f);
-                const float nudged = clamped + sum;
-                int k = 0;
-                while (k + 1 < nlevels_q && nudged > thresh_lin[k]) ++k;
-                errs[c] = clamped - level_lin[k];
-                v[i + c] = static_cast<float>(k);
-                if (carry_amt > 0.0f) next_carry[i + c] = errs[c];
-            }
-            for (size_t c = 0; c < 3; ++c) ring[head][c] = errs[c];
-            head = (head + 1) & 15;
-        }
-    } else {
-        for (int y = 0; y < ih; ++y) {
-            const bool reverse = serp && ((y & 1) != 0);
-            const int dir = reverse ? -1 : 1;
-            // Flat index deltas for this row direction (interior fast
-            // path — no per-tap bounds checks on ~99% of pixels).
-            ptrdiff_t delta[12];
-            for (int t = 0; t < ntaps; ++t)
-                delta[t] = (static_cast<ptrdiff_t>(taps[t].dy) * iw +
-                            taps[t].dx * dir) * 3;
-            const bool row_interior = y < ih - margin;
-            for (int xi = 0; xi < iw; ++xi) {
-                const int x = reverse ? (iw - 1 - xi) : xi;
-                const size_t i = (static_cast<size_t>(y) * width +
-                                  static_cast<size_t>(x)) * 3;
-                const bool interior =
-                    row_interior && x >= margin && x < iw - margin;
-                for (size_t c = 0; c < 3; ++c) {
-                    // Quantize and diffuse the CLAMPED-domain error only
-                    // — unclamped error cascades row over row (and
-                    // explodes through the temporal carry). Linear-light
-                    // pick: count thresholds below the value
-                    // (nearest-in-encoded, exact), error against the
-                    // level's LINEAR value.
-                    const float clamped = std::clamp(v[i + c], 0.0f, 1.0f);
-                    int k = 0;
-                    while (k + 1 < nlevels_q && clamped > thresh_lin[k])
-                        ++k;
-                    const float err = clamped - level_lin[k];
-                    v[i + c] = static_cast<float>(k);
-                    if (interior) {
-                        for (int t = 0; t < ntaps; ++t)
-                            v[static_cast<size_t>(
-                                static_cast<ptrdiff_t>(i + c) +
-                                delta[t])] += err * taps[t].wgt;
-                    } else {
-                        for (int t = 0; t < ntaps; ++t) {
-                            const int nx = x + taps[t].dx * dir;
-                            const int ny = y + taps[t].dy;
-                            if (nx < 0 || ny < 0 || nx >= iw || ny >= ih)
-                                continue;
-                            v[(static_cast<size_t>(ny) * width +
-                               static_cast<size_t>(nx)) * 3 + c] +=
-                                err * taps[t].wgt;
-                        }
-                    }
-                    if (carry_amt > 0.0f) next_carry[i + c] = err;
-                }
-            }
-        }
+        if (!make3(g.clean) || !make3(g.moshed) || !make3(g.pred_clean) ||
+            !make3(g.pred_moshed) || !make3(g.pred_tmp))
+            return false;
+        g.w = w;
+        g.h = h;
+        g.has_state = false;
+        g.last_frame = 0xFFFFFFFFu;
     }
-    if (carry_amt > 0.0f) slot.carry = std::move(next_carry);
-    else slot.carry.clear();
+    // Stateful advance happens once per timeline frame; paused re-renders
+    // reuse the resident state (same contract as the CPU box's cache).
+    const bool advance = !g.has_state || g.last_frame != timeline_frame;
 
-    // v[] holds level indices now; the outbound linear values are a small
-    // exact table shared with the pick above.
-    uint16_t out_lut[17];
-    for (int k = 0; k < nlevels_q; ++k)
-        out_lut[k] = float_to_half(level_lin[k]);
-    slot.out.resize(n * 4);
-    codec::parallel_blocks(
-        static_cast<int>(height), true, [&](int begin, int end) {
-            for (int row = begin; row < end; ++row) {
-                const size_t base = static_cast<size_t>(row) * width;
-                for (size_t x = 0; x < width; ++x) {
-                    const size_t i = base + x;
-                    for (size_t c = 0; c < 3; ++c) {
-                        const int k = std::clamp(
-                            static_cast<int>(v[i * 3 + c] + 0.5f), 0,
-                            nlevels_q - 1);
-                        slot.out[i * 4 + c] = out_lut[k];
-                    }
-                    slot.out[i * 4 + 3] = 0x3C00;   // alpha = 1
-                }
+    const auto barrier = [&] {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+                             0, nullptr, 0, nullptr);
+    };
+    const auto transition3 = [&](std::unique_ptr<GpuImage>* trio) {
+        for (int i = 0; i < 3; ++i)
+            trio[i]->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    };
+    transition3(g.clean);
+    transition3(g.moshed);
+    transition3(g.pred_clean);
+    transition3(g.pred_moshed);
+    transition3(g.pred_tmp);
+    // Also orders this frame's reads against the previous submission's
+    // state writes (GENERAL-to-GENERAL transitions above are no-ops).
+    barrier();
+
+    if (advance) {
+        // NV12 conversion: the wire's source.
+        codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+        codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+        {
+            const uint32_t nv_push[2] = {w, h};
+            const GpuImage* sampled[1] = {in};
+            GpuImage* storage[2] = {codec_io_.nv_y.get(),
+                                    codec_io_.nv_uv.get()};
+            to_nv12_->dispatch(rec, arena_, frame_index, sampled, 1, storage,
+                               2, nv_push, sizeof(nv_push), w, h,
+                               linear_sampler_);
+        }
+        codec_io_.nv_y->transition(rec,
+                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        codec_io_.nv_uv->transition(rec,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        GpuImage* flow = flow_img ? flow_img : dummy_flow_.get();
+        flow->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        const uint32_t seed_mv = static_cast<uint32_t>(
+            hash_u64(mp.seed ^ 0x33CC33CCull));
+        const uint32_t seed_frame = static_cast<uint32_t>(
+            hash_u64(hash_combine(mp.seed, timeline_frame)));
+        const int quality = std::clamp(mp.quality, 1, 100);
+        const bool gop_i =
+            mp.gop_length > 0 &&
+            timeline_frame % static_cast<uint32_t>(mp.gop_length) == 0;
+
+        struct PlaneDims {
+            uint32_t pw, ph, plane, shift;
+        };
+        const PlaneDims planes[3] = {
+            {w, h, 0, 1}, {cw, chh, 1, 0}, {cw, chh, 2, 0}};
+        codec_io_.rate_qsel->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+        const auto wire = [&](const PlaneDims& p, uint32_t mode,
+                              uint32_t qual, uint32_t wmoshed,
+                              uint32_t from_plane, uint32_t from_qsel,
+                              GpuImage* src, GpuImage* cpred,
+                              GpuImage* mpred, GpuImage* oclean,
+                              GpuImage* omoshed) {
+            struct {
+                uint32_t pw, ph, plane, mode, quality, wm, sfp, cen;
+                float cprob;
+                uint32_t sframe, shift, qsel;
+            } push = {p.pw,
+                      p.ph,
+                      p.plane,
+                      mode,
+                      qual,
+                      wmoshed,
+                      from_plane,
+                      mode == 1 && mp.residual_corrupt > 0.0f ? 1u : 0u,
+                      mp.residual_corrupt,
+                      seed_frame,
+                      p.shift,
+                      from_qsel};
+            const GpuImage* sampled2[2] = {codec_io_.nv_y.get(),
+                                           codec_io_.nv_uv.get()};
+            GpuImage* storage6[6] = {src,    cpred,   mpred,
+                                     oclean, omoshed, codec_io_.rate_qsel.get()};
+            mosh_wire_->dispatch(rec, arena_, frame_index, sampled2, 2,
+                                 storage6, 6, &push, sizeof(push),
+                                 (p.pw + 7) / 8, (p.ph + 7) / 8,
+                                 linear_sampler_);
+        };
+
+        // Rate control (Bitrate Starve): probe the exact per-rung stream
+        // sizes on the GPU (per-block AC bits + pairwise DC deltas — the
+        // DC "chain" is a sum of neighbor terms, so it reduces), pick the
+        // ladder rung in a one-thread kernel, and let the wire read the
+        // choice from qsel. Rate control never touches the CPU.
+        const bool rate_on = mp.bitrate_budget > 0;
+        uint32_t rungs[8] = {};
+        uint32_t nrungs = 0;
+        if (rate_on) {
+            int q = quality;
+            rungs[nrungs++] = static_cast<uint32_t>(q);
+            while (q > 1 && nrungs < 7) {
+                q = std::max(1, q - 15);
+                rungs[nrungs++] = static_cast<uint32_t>(q);
             }
-        });
+        }
+        const auto run_rate = [&](uint32_t mode, uint32_t header) {
+            codec_io_.rate_dc->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+            codec_io_.rate_bits->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                          1};
+            vkCmdClearColorImage(rec, codec_io_.rate_bits->image(),
+                                 VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            VkMemoryBarrier cb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            cb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            cb.dstAccessMask =
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &cb, 0, nullptr, 0, nullptr);
+            for (int p = 0; p < 3; ++p) {
+                const uint32_t bwp = (planes[p].pw + 7) / 8;
+                const uint32_t bhp = (planes[p].ph + 7) / 8;
+                struct {
+                    uint32_t pw, ph, plane, mode, rung_count, blocks_w;
+                    uint32_t pad0, pad1;
+                    uint32_t rungs[8];
+                } ppush = {planes[p].pw, planes[p].ph, planes[p].plane,
+                           mode,         nrungs,       bwp,
+                           0,            0,            {}};
+                std::memcpy(ppush.rungs, rungs, sizeof(rungs));
+                const GpuImage* sampled2[2] = {codec_io_.nv_y.get(),
+                                               codec_io_.nv_uv.get()};
+                GpuImage* pst[3] = {g.pred_clean[p].get(),
+                                    codec_io_.rate_dc.get(),
+                                    codec_io_.rate_bits.get()};
+                mosh_rate_probe_->dispatch(rec, arena_, frame_index,
+                                           sampled2, 2, pst, 3, &ppush,
+                                           sizeof(ppush), bwp, bhp,
+                                           linear_sampler_);
+                barrier();
+                struct {
+                    uint32_t pw, ph, plane, mode, rung_count, blocks_w;
+                } rpush = {planes[p].pw, planes[p].ph, planes[p].plane,
+                           mode,         nrungs,       bwp};
+                GpuImage* rst[2] = {codec_io_.rate_dc.get(),
+                                    codec_io_.rate_bits.get()};
+                mosh_rate_reduce_->dispatch(rec, arena_, frame_index,
+                                            nullptr, 0, rst, 2, &rpush,
+                                            sizeof(rpush), bwp, bhp,
+                                            linear_sampler_);
+                barrier();
+            }
+            struct {
+                uint32_t rung_count, budget, header, pad;
+                uint32_t rungs[8];
+            } kpush = {nrungs, mp.bitrate_budget, header, 0, {}};
+            std::memcpy(kpush.rungs, rungs, sizeof(rungs));
+            GpuImage* kst[2] = {codec_io_.rate_bits.get(),
+                                codec_io_.rate_qsel.get()};
+            mosh_rate_pick_->dispatch(rec, arena_, frame_index, nullptr, 0,
+                                      kst, 2, &kpush, sizeof(kpush), 1, 1,
+                                      linear_sampler_);
+            barrier();
+        };
+
+        if (!g.has_state || gop_i) {
+            // I frame into the clean chain (+ generation-loss recycles),
+            // then the moshed chain accepts it unless dropping.
+            if (rate_on) run_rate(0, 1);
+            for (int p = 0; p < 3; ++p)
+                wire(planes[p], 0, static_cast<uint32_t>(quality), 0, 0,
+                     rate_on ? 1u : 0u, g.clean[p].get(), g.clean[p].get(),
+                     g.clean[p].get(), g.clean[p].get(), g.clean[p].get());
+            for (int gi = 0; gi < std::min(mp.generations, 12); ++gi) {
+                const int gq =
+                    std::clamp(mp.quality - ((gi & 1) ? 9 : 0), 1, 100);
+                barrier();
+                for (int p = 0; p < 3; ++p)
+                    wire(planes[p], 0, static_cast<uint32_t>(gq), 0, 1, 0,
+                         g.clean[p].get(), g.clean[p].get(),
+                         g.clean[p].get(), g.clean[p].get(),
+                         g.clean[p].get());
+            }
+            if (!g.has_state || !mp.drop_iframes) {
+                // Accept: the moshed chain takes the clean picture.
+                VkMemoryBarrier to_xfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                to_xfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                to_xfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                vkCmdPipelineBarrier(rec,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                                     &to_xfer, 0, nullptr, 0, nullptr);
+                for (int p = 0; p < 3; ++p) {
+                    VkImageCopy copy{};
+                    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                           1};
+                    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                                           1};
+                    copy.extent = {g.clean[p]->width(),
+                                   g.clean[p]->height(), 1};
+                    vkCmdCopyImage(rec, g.clean[p]->image(),
+                                   VK_IMAGE_LAYOUT_GENERAL,
+                                   g.moshed[p]->image(),
+                                   VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+                }
+                VkMemoryBarrier from_xfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                from_xfer.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                from_xfer.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     1, &from_xfer, 0, nullptr, 0, nullptr);
+            }
+        } else {
+            const auto predict = [&](uint32_t mangle,
+                                     std::unique_ptr<GpuImage>* ref,
+                                     std::unique_ptr<GpuImage>* out) {
+                struct {
+                    uint32_t w, h, cw, ch, bw, bh, mangle, field;
+                    float scale, rc, rs, rnd, amt;
+                    uint32_t smv, frame, hasflow;
+                } push = {w,
+                          h,
+                          cw,
+                          chh,
+                          flow_img ? flow_img->width() : 0,
+                          flow_img ? flow_img->height() : 0,
+                          mangle,
+                          static_cast<uint32_t>(mp.mv_field),
+                          mp.mv_scale,
+                          std::cos(mp.mv_rotate),
+                          std::sin(mp.mv_rotate),
+                          mp.mv_random,
+                          mp.mv_field_amount,
+                          seed_mv,
+                          timeline_frame,
+                          flow_img ? 1u : 0u};
+                const GpuImage* sampled1[1] = {flow};
+                GpuImage* storage6[6] = {ref[0].get(), ref[1].get(),
+                                         ref[2].get(), out[0].get(),
+                                         out[1].get(), out[2].get()};
+                mosh_predict_->dispatch(rec, arena_, frame_index, sampled1,
+                                        1, storage6, 6, &push, sizeof(push),
+                                        w, h, linear_sampler_);
+            };
+            predict(0, g.clean, g.pred_clean);
+            predict(1, g.moshed, g.pred_moshed);
+            for (int r = 0; r < std::min(mp.p_repeat, 8); ++r) {
+                barrier();
+                predict(1, g.pred_moshed, g.pred_tmp);
+                for (int i = 0; i < 3; ++i)
+                    g.pred_moshed[i].swap(g.pred_tmp[i]);
+            }
+            barrier();
+            if (rate_on) run_rate(1, 0);
+            for (int p = 0; p < 3; ++p)
+                wire(planes[p], 1, static_cast<uint32_t>(quality), 0, 0,
+                     rate_on ? 1u : 0u, g.pred_clean[p].get(),
+                     g.pred_clean[p].get(), g.pred_moshed[p].get(),
+                     g.clean[p].get(), g.moshed[p].get());
+        }
+        g.has_state = true;
+        g.last_frame = timeline_frame;
+    }
+
+    // Moshed planes -> unorm upload images -> shared RGB + composite tail.
+    barrier();
+    codec_io_.up_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    codec_io_.up_u->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    codec_io_.up_v->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    {
+        const uint32_t un_push[4] = {w, h, cw, chh};
+        GpuImage* storage6[6] = {g.moshed[0].get(),     g.moshed[1].get(),
+                                 g.moshed[2].get(),     codec_io_.up_y.get(),
+                                 codec_io_.up_u.get(),  codec_io_.up_v.get()};
+        mosh_unorm_->dispatch(rec, arena_, frame_index, nullptr, 0, storage6,
+                              6, un_push, sizeof(un_push), w, h,
+                              linear_sampler_);
+    }
+    codec_io_.up_y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    codec_io_.up_u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    codec_io_.up_v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    GpuImage* temp = pool_.acquire(w, h);
+    if (!temp) return false;
+    temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    {
+        const uint32_t rgb_push[2] = {w, h};
+        const GpuImage* planes3[3] = {codec_io_.up_y.get(),
+                                      codec_io_.up_u.get(),
+                                      codec_io_.up_v.get()};
+        to_rgb_->dispatch(rec, arena_, frame_index, planes3, 3, &temp, 1,
+                          rgb_push, sizeof(rgb_push), w, h, linear_sampler_);
+    }
+    temp->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    {
+        const auto bits = [](float v) {
+            uint32_t b;
+            std::memcpy(&b, &v, sizeof(b));
+            return b;
+        };
+        const uint32_t mix_push[4] = {w, h, bits(fx.wet), bits(fx.opacity)};
+        const GpuImage* sampled2[2] = {in, temp};
+        fx_mix_->dispatch(rec, arena_, frame_index, sampled2, 2, &dst, 1,
+                          mix_push, sizeof(mix_push), w, h, linear_sampler_);
+    }
+    pool_.release(temp);
+    return true;
+}
+
+bool Engine::composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
+                          const GpuImage* in_img, const EdState& ed,
+                          uint32_t w, uint32_t h, uint32_t frame_index,
+                          GpuImage* dst) {
+    // Packed picks (3x5 bits per pixel, 4x smaller than colors) up to the
+    // GPU, palette expand, wet/opacity composite.
+    const size_t px_count = static_cast<size_t>(w) * h;
+    if (!codec_io_.staging->upload_image(rec, ed.out.data(), px_count * 4, w,
+                                         *codec_io_.up_idx))
+        return false;
+    codec_io_.up_idx->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    GpuImage* temp = pool_.acquire(w, h);
+    if (!temp) return false;
+    temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    {
+        struct {
+            uint32_t w, h, nlevels, pad;
+            float lv[17];
+            float tail_pad[3];
+        } xpush = {w, h, 0, 0, {}, {}};
+        xpush.nlevels =
+            static_cast<uint32_t>(ed_level_table(fx, xpush.lv));
+        GpuImage* xst[2] = {codec_io_.up_idx.get(), temp};
+        ed_expand_->dispatch(rec, arena_, frame_index, nullptr, 0, xst, 2,
+                             &xpush, sizeof(xpush), w, h, linear_sampler_);
+    }
+    temp->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    {
+        const auto bits = [](float v) {
+            uint32_t b;
+            std::memcpy(&b, &v, sizeof(b));
+            return b;
+        };
+        const uint32_t mix_push[4] = {w, h, bits(fx.wet), bits(fx.opacity)};
+        const GpuImage* sampled2[2] = {in_img, temp};
+        fx_mix_->dispatch(rec, arena_, frame_index, sampled2, 2, &dst, 1,
+                          mix_push, sizeof(mix_push), w, h, linear_sampler_);
+    }
+    pool_.release(temp);
+    return true;
 }
 
 bool Engine::ensure_codec_io(uint32_t width, uint32_t height) {
@@ -1222,10 +1239,14 @@ bool Engine::ensure_codec_io(uint32_t width, uint32_t height) {
         codec_io_.nv_y->height() == height)
         return true;
     device_.wait_idle();
-    const VkImageUsageFlags conv =
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    const VkImageUsageFlags up =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // SAMPLED: the GPU mosh wire reads the NV12 planes directly.
+    const VkImageUsageFlags conv = VK_IMAGE_USAGE_STORAGE_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT;
+    // STORAGE: the GPU mosh unorm pass writes the upload planes directly.
+    const VkImageUsageFlags up = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_STORAGE_BIT;
     const uint32_t cw = width / 2;
     const uint32_t chh = height / 2;
     codec_io_.nv_y =
@@ -1236,10 +1257,25 @@ bool Engine::ensure_codec_io(uint32_t width, uint32_t height) {
         GpuImage::create(device_, VK_FORMAT_R8_UNORM, width, height, up);
     codec_io_.up_u = GpuImage::create(device_, VK_FORMAT_R8_UNORM, cw, chh, up);
     codec_io_.up_v = GpuImage::create(device_, VK_FORMAT_R8_UNORM, cw, chh, up);
-    codec_io_.up_rgba = GpuImage::create(
-        device_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, up);
+    codec_io_.up_idx = GpuImage::create(
+        device_, VK_FORMAT_R32_UINT, width, height,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    // Rate control scratch: 8 rung columns of per-block DCs (sized for the
+    // luma grid, chroma reuses the left portion), the per-rung bit totals
+    // (cleared per probe), and the picked quality.
+    const uint32_t bw_luma = (width + 7) / 8;
+    const uint32_t bh_luma = (height + 7) / 8;
+    codec_io_.rate_dc =
+        GpuImage::create(device_, VK_FORMAT_R32_UINT, bw_luma * 8, bh_luma,
+                         VK_IMAGE_USAGE_STORAGE_BIT);
+    codec_io_.rate_bits = GpuImage::create(
+        device_, VK_FORMAT_R32_UINT, 8, 1,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    codec_io_.rate_qsel = GpuImage::create(device_, VK_FORMAT_R32_UINT, 1, 1,
+                                           VK_IMAGE_USAGE_STORAGE_BIT);
     if (!codec_io_.nv_y || !codec_io_.nv_uv || !codec_io_.up_y ||
-        !codec_io_.up_u || !codec_io_.up_v || !codec_io_.up_rgba)
+        !codec_io_.up_u || !codec_io_.up_v || !codec_io_.up_idx ||
+        !codec_io_.rate_dc || !codec_io_.rate_bits || !codec_io_.rate_qsel)
         return false;
 
     const size_t nv_bytes = static_cast<size_t>(width) * height * 3 / 2;
@@ -1426,6 +1462,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         return nullptr;
     }
     VkCommandBuffer rec = segmented ? codec_begin_segment() : cmd;
+    // One staging reset per render: every prior render's segments were
+    // fence-waited at its end, so retired buffers and offsets are safe to
+    // recycle here (mid-frame resets would clobber same-segment uploads).
+    if (segmented) codec_io_.staging->reset();
 
     // Preserve last frame's luma for flow/motion BEFORE the new upload.
     // Only when the timeline advanced — a paused re-render keeps the prior
@@ -1706,7 +1746,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         .stack[static_cast<size_t>(node.effect_index)];
 
                 if (doc::is_codec_box(fx.type)) {
-                    // --- Codec-Box: GPU->CPU->GPU roundtrip.
                     GpuImage* in = input_image(0);
                     GpuImage* flow_img =
                         fx.type == doc::EffectType::Datamosh &&
@@ -1714,6 +1753,21 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             ? input_image(1)
                             : nullptr;
 
+                    // GPU box whenever no real bitstream is needed: the
+                    // wire is pure data-parallel integer math then, and
+                    // the roundtrip (readback, fence, upload) vanishes.
+                    const uint64_t gpu_seed = hash_combine(
+                        hash_combine(doc.master_seed, fx.id), fx.seed);
+                    const codec::MoshParams gp = mosh_params(fx, gpu_seed);
+                    if (gp.byte_flips == 0) {
+                        if (!mosh_gpu_box(rec, fx, gp, in, flow_img, w, h,
+                                          frame_index, timeline_frame, dst))
+                            return nullptr;
+                        break;
+                    }
+
+                    // --- CPU Codec-Box: GPU->CPU->GPU roundtrip (the
+                    // byte-flips / bitrate-budget paths need real bytes).
                     // 1. NV12 conversion + readback, then flush the segment.
                     codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                     codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
@@ -1883,77 +1937,93 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 }
 
                 if (fx.type == doc::EffectType::ErrorDiffusion) {
-                    // 1. GPU->CPU: the RGBA16F input, tight-packed.
                     GpuImage* in_img = const_cast<GpuImage*>(input_image(0));
-                    in_img->transition(rec,
-                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                    // The input was written by compute this segment; the
-                    // read-only->transfer transition alone does not make
-                    // those writes visible to the copy.
-                    VkMemoryBarrier ed_pre{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                    ed_pre.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                    ed_pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                    vkCmdPipelineBarrier(
-                        rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ed_pre, 0,
-                        nullptr, 0, nullptr);
-                    VkBufferImageCopy ed_copy{};
-                    ed_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                                0, 1};
-                    ed_copy.imageExtent = {w, h, 1};
-                    vkCmdCopyImageToBuffer(
-                        rec, in_img->image(),
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        codec_io_.readback, 1, &ed_copy);
-                    in_img->transition(
-                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    VkMemoryBarrier ed_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                    ed_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    ed_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                    vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-                                         &ed_host, 0, nullptr, 0, nullptr);
-                    codec_flush_segment();
-
-                    // 2. CPU: serpentine diffusion (— inherently
-                    // serial). Paused re-renders reuse the cached output so
-                    // temporal carry does not re-stew.
-                    EdSlot& slot = ed_state_[fx.id];
+                    auto& slot_ptr = ed_state_[fx.id];
+                    if (!slot_ptr)
+                        slot_ptr = std::make_unique<EdSlotAsync>();
+                    EdSlotAsync& slot = *slot_ptr;
                     const size_t px_count = static_cast<size_t>(w) * h;
-                    if (!slot.valid || slot.last_frame != timeline_frame ||
-                        slot.out.size() != px_count * 4) {
-                        vmaInvalidateAllocation(device_.allocator(),
-                                                codec_io_.readback_alloc, 0,
-                                                VK_WHOLE_SIZE);
-                        run_error_diffusion(
-                            static_cast<const uint16_t*>(codec_io_.mapped),
-                            w, h, fx, slot);
-                        slot.last_frame = timeline_frame;
-                        slot.valid = true;
+
+                    // 0. Land the deferred walk (kicked last frame — it
+                    // had the whole frame to run off-thread).
+                    if (slot.busy) {
+                        slot.worker.join();
+                        slot.busy = false;
+                        slot.has_result = true;
                     }
 
-                    // 3. Re-upload + wet/opacity composite.
-                    rec = codec_begin_segment();
-                    codec_io_.staging->reset();
-                    if (!codec_io_.staging->upload_image(
-                            rec, slot.out.data(), px_count * 8, w,
-                            *codec_io_.up_rgba))
-                        return nullptr;
-                    codec_io_.up_rgba->transition(
-                        rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    {
-                        const uint32_t mix_push[4] = {w, h, as_bits(fx.wet),
-                                                      as_bits(fx.opacity)};
-                        const GpuImage* sampled2[2] = {
-                            in_img, codec_io_.up_rgba.get()};
+                    // 1. Composite LAST frame's dither (the one-frame
+                    // delay, same legal latency as Feedback's cycle
+                    // exemption). First frame / size change passes dry.
+                    if (slot.has_result && slot.result_w == w &&
+                        slot.result_h == h) {
+                        if (!composite_ed(rec, fx, in_img, slot.ed, w, h,
+                                          frame_index, dst))
+                            return nullptr;
+                    } else {
+                        const uint32_t mix_push[4] = {
+                            w, h, as_bits(fx.wet), as_bits(fx.opacity)};
+                        const GpuImage* sampled2[2] = {in_img, in_img};
                         fx_mix_->dispatch(rec, arena_, frame_index, sampled2,
                                           2, &dst, 1, mix_push,
                                           sizeof(mix_push), w, h,
                                           linear_sampler_);
                     }
+
+                    // 2. Capture THIS frame's input and walk it during the
+                    // rest of the frame; next frame consumes the result.
+                    // Once per timeline frame (paused re-renders reuse).
+                    if (slot.captured_frame != timeline_frame) {
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                        VkMemoryBarrier ed_pre{
+                            VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                        ed_pre.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                        ed_pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                        vkCmdPipelineBarrier(
+                            rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ed_pre, 0,
+                            nullptr, 0, nullptr);
+                        VkBufferImageCopy ed_copy{};
+                        ed_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,
+                                                    0, 0, 1};
+                        ed_copy.imageExtent = {w, h, 1};
+                        vkCmdCopyImageToBuffer(
+                            rec, in_img->image(),
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            codec_io_.readback, 1, &ed_copy);
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        VkMemoryBarrier ed_host{
+                            VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                        ed_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                        ed_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                        vkCmdPipelineBarrier(
+                            rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &ed_host, 0,
+                            nullptr, 0, nullptr);
+                        codec_flush_segment();
+                        rec = codec_begin_segment();
+                        vmaInvalidateAllocation(device_.allocator(),
+                                                codec_io_.readback_alloc, 0,
+                                                VK_WHOLE_SIZE);
+                        const uint16_t* src = static_cast<const uint16_t*>(
+                            codec_io_.mapped);
+                        slot.input.assign(src, src + px_count * 4);
+                        slot.pending_fx = fx;
+                        slot.result_w = w;
+                        slot.result_h = h;
+                        slot.captured_frame = timeline_frame;
+                        slot.busy = true;
+                        EdSlotAsync* s = &slot;
+                        const uint32_t cap_w = w, cap_h = h;
+                        slot.worker = std::thread([s, cap_w, cap_h] {
+                            run_error_diffusion(s->input.data(), cap_w,
+                                                cap_h, s->pending_fx, s->ed);
+                        });
+                    }
                     break;
                 }
-
                 // Shared push layout: uint2 size, wet, opacity, seed, frame,
                 // fps, params (seeded counter-based randomness).
                 const uint64_t seed64 = hash_combine(

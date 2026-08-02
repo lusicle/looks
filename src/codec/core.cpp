@@ -1,8 +1,11 @@
 #include "codec/core.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -83,24 +86,69 @@ struct DctTables {
 
 constexpr DctTables kDct;
 
-void transform_pass(const int32_t mat[kBlockSize][kBlockSize],
-                    const int16_t* in, int16_t* out, bool rows) {
-    // rows=true: out[u][k] = sum_x mat[u][x] * in[x][k] (column transform of
-    // row-major data when applied twice with transposes folded in).
-    for (int u = 0; u < kBlockSize; ++u) {
-        for (int k = 0; k < kBlockSize; ++k) {
-            int32_t acc = 0;
-            for (int x = 0; x < kBlockSize; ++x) {
-                const int16_t v = rows ? in[u * kBlockSize + x]
-                                       : in[x * kBlockSize + k];
-                const int32_t c = rows ? mat[k][x] : mat[u][x];
-                acc += c * v;
-            }
-            const int32_t r = (acc + 4096) >> 13;
-            out[rows ? u * kBlockSize + k : u * kBlockSize + k] =
-                static_cast<int16_t>(std::clamp(r, -32768, 32767));
-        }
+// The passes below exploit the DCT matrix's even/odd symmetry
+// (fwd[u][7-x] = +/-fwd[u][x]) to fold the 8-tap dot products into 4-tap
+// ones over sums/differences. Integer addition is exactly associative and
+// multiplication distributes exactly, so every accumulator holds the SAME
+// int32 value as the plain matrix product — bytes and pixels are
+// bit-identical to the naive walk (test-enforced), at a third of the
+// multiplies.
+
+inline int16_t round13(int32_t acc) {
+    return static_cast<int16_t>(std::clamp((acc + 4096) >> 13, -32768, 32767));
+}
+
+// One forward 1D transform of 8 values with stride: out[k] = round(sum_x
+// fwd[k][x] * v[x]). Even k rows are symmetric, odd k antisymmetric.
+inline void fwd_pass8(const int16_t* in, int in_stride, int16_t* out,
+                      int out_stride) {
+    int32_t s[4], d[4];
+    for (int j = 0; j < 4; ++j) {
+        const int32_t a = in[j * in_stride];
+        const int32_t b = in[(7 - j) * in_stride];
+        s[j] = a + b;
+        d[j] = a - b;
     }
+    out[0 * out_stride] = round13(2896 * (s[0] + s[1] + s[2] + s[3]));
+    out[4 * out_stride] = round13(2896 * ((s[0] + s[3]) - (s[1] + s[2])));
+    out[2 * out_stride] = round13(3784 * (s[0] - s[3]) + 1567 * (s[1] - s[2]));
+    out[6 * out_stride] = round13(1567 * (s[0] - s[3]) - 3784 * (s[1] - s[2]));
+    out[1 * out_stride] =
+        round13(4017 * d[0] + 3406 * d[1] + 2276 * d[2] + 799 * d[3]);
+    out[3 * out_stride] =
+        round13(3406 * d[0] - 799 * d[1] - 4017 * d[2] - 2276 * d[3]);
+    out[5 * out_stride] =
+        round13(2276 * d[0] - 4017 * d[1] + 799 * d[2] + 3406 * d[3]);
+    out[7 * out_stride] =
+        round13(799 * d[0] - 2276 * d[1] + 3406 * d[2] - 4017 * d[3]);
+}
+
+// One inverse 1D transform: out[x] = round(sum_u fwd[u][x] * v[u]).
+// Outputs pair up (x, 7-x) sharing even/odd partial sums.
+inline void inv_pass8(const int16_t* in, int in_stride, int16_t* out,
+                      int out_stride) {
+    const int32_t v0 = in[0 * in_stride], v1 = in[1 * in_stride];
+    const int32_t v2 = in[2 * in_stride], v3 = in[3 * in_stride];
+    const int32_t v4 = in[4 * in_stride], v5 = in[5 * in_stride];
+    const int32_t v6 = in[6 * in_stride], v7 = in[7 * in_stride];
+    // Even part for x = 0..3 (fwd[0][x] = 2896, fwd[4][x] = +/-2896).
+    const int32_t e0 = 2896 * (v0 + v4) + 3784 * v2 + 1567 * v6;
+    const int32_t e1 = 2896 * (v0 - v4) + 1567 * v2 - 3784 * v6;
+    const int32_t e2 = 2896 * (v0 - v4) - 1567 * v2 + 3784 * v6;
+    const int32_t e3 = 2896 * (v0 + v4) - 3784 * v2 - 1567 * v6;
+    // Odd part for x = 0..3 (columns of the odd fwd rows).
+    const int32_t o0 = 4017 * v1 + 3406 * v3 + 2276 * v5 + 799 * v7;
+    const int32_t o1 = 3406 * v1 - 799 * v3 - 4017 * v5 - 2276 * v7;
+    const int32_t o2 = 2276 * v1 - 4017 * v3 + 799 * v5 + 3406 * v7;
+    const int32_t o3 = 799 * v1 - 2276 * v3 + 3406 * v5 - 4017 * v7;
+    out[0 * out_stride] = round13(e0 + o0);
+    out[7 * out_stride] = round13(e0 - o0);
+    out[1 * out_stride] = round13(e1 + o1);
+    out[6 * out_stride] = round13(e1 - o1);
+    out[2 * out_stride] = round13(e2 + o2);
+    out[5 * out_stride] = round13(e2 - o2);
+    out[3 * out_stride] = round13(e3 + o3);
+    out[4 * out_stride] = round13(e3 - o3);
 }
 
 }  // namespace
@@ -108,15 +156,19 @@ void transform_pass(const int32_t mat[kBlockSize][kBlockSize],
 void fdct8x8(int16_t block[kBlockCoeffs]) {
     int16_t tmp[kBlockCoeffs];
     // Row pass: each row transformed by C (tmp = f · C^T).
-    transform_pass(kDct.fwd, block, tmp, true);
+    for (int u = 0; u < kBlockSize; ++u)
+        fwd_pass8(block + u * kBlockSize, 1, tmp + u * kBlockSize, 1);
     // Column pass: F = C · tmp.
-    transform_pass(kDct.fwd, tmp, block, false);
+    for (int k = 0; k < kBlockSize; ++k)
+        fwd_pass8(tmp + k, kBlockSize, block + k, kBlockSize);
 }
 
 void idct8x8(int16_t block[kBlockCoeffs]) {
     int16_t tmp[kBlockCoeffs];
-    transform_pass(kDct.inv, block, tmp, true);
-    transform_pass(kDct.inv, tmp, block, false);
+    for (int u = 0; u < kBlockSize; ++u)
+        inv_pass8(block + u * kBlockSize, 1, tmp + u * kBlockSize, 1);
+    for (int k = 0; k < kBlockSize; ++k)
+        inv_pass8(tmp + k, kBlockSize, block + k, kBlockSize);
 }
 
 // ---------------------------------------------------------------- quant
@@ -264,6 +316,105 @@ void residual_dct_block(const uint8_t* cur, size_t cur_stride,
     fdct8x8(out);
 }
 
+namespace {
+
+// Persistent fork-join pool: spawning ~15 threads per call costs about a
+// millisecond on Windows, which dwarfed the actual work for every codec
+// pass and made the Codec-Box effects insensitive to compiler
+// optimization. Workers park on a condition variable between tasks and
+// pull fixed chunks by atomic index — the chunk ranges are identical to
+// the old spawn-per-call split and writes are disjoint, so results are
+// bit-identical regardless of which worker runs which chunk.
+class BlockPool {
+public:
+    static BlockPool& instance() {
+        static BlockPool pool;
+        return pool;
+    }
+
+    void run(const std::function<void(int, int)>& fn, int count, int chunk) {
+        std::lock_guard<std::mutex> outer(run_mutex_);
+        ensure_workers();
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            fn_ = &fn;
+            count_ = count;
+            chunk_ = chunk;
+            next_.store(0, std::memory_order_relaxed);
+            active_ = static_cast<int>(workers_.size());
+            ++generation_;
+        }
+        cv_.notify_all();
+        work(fn, count, chunk);   // the caller is a worker too
+        std::unique_lock<std::mutex> lock(m_);
+        done_cv_.wait(lock, [this] { return active_ == 0; });
+        fn_ = nullptr;
+    }
+
+private:
+    ~BlockPool() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (std::thread& t : workers_) t.join();
+    }
+
+    void ensure_workers() {
+        if (!workers_.empty()) return;
+        const int n = static_cast<int>(std::min<unsigned>(
+            std::max(1u, std::thread::hardware_concurrency()), 16u));
+        for (int t = 1; t < n; ++t)
+            workers_.emplace_back([this] { worker_loop(); });
+    }
+
+    void work(const std::function<void(int, int)>& fn, int count, int chunk) {
+        for (;;) {
+            const int c = next_.fetch_add(1, std::memory_order_relaxed);
+            const int begin = c * chunk;
+            if (begin >= count) break;
+            fn(begin, std::min(count, begin + chunk));
+        }
+    }
+
+    void worker_loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(int, int)>* fn = nullptr;
+            int count = 0, chunk = 0;
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                cv_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                if (stop_) return;
+                seen = generation_;
+                fn = fn_;
+                count = count_;
+                chunk = chunk_;
+            }
+            work(*fn, count, chunk);
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                if (--active_ == 0) done_cv_.notify_all();
+            }
+        }
+    }
+
+    std::mutex run_mutex_;   // serializes concurrent run() callers
+    std::mutex m_;
+    std::condition_variable cv_, done_cv_;
+    std::vector<std::thread> workers_;
+    const std::function<void(int, int)>* fn_ = nullptr;
+    std::atomic<int> next_{0};
+    int count_ = 0;
+    int chunk_ = 0;
+    int active_ = 0;
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+};
+
+}  // namespace
+
 void parallel_blocks(int count, bool parallel,
                      const std::function<void(int, int)>& fn) {
     if (count <= 0) return;
@@ -276,16 +427,19 @@ void parallel_blocks(int count, bool parallel,
         return;
     }
     const int chunk = (count + threads - 1) / threads;
-    std::vector<std::thread> pool;
-    pool.reserve(static_cast<size_t>(threads) - 1);
-    for (int t = 1; t < threads; ++t) {
-        const int begin = t * chunk;
-        const int end = std::min(count, begin + chunk);
-        if (begin >= end) break;
-        pool.emplace_back([&fn, begin, end] { fn(begin, end); });
+    BlockPool::instance().run(fn, count, chunk);
+}
+
+void parallel_tasks(int count, const std::function<void(int)>& fn) {
+    if (count <= 0) return;
+    if (count == 1) {
+        fn(0);
+        return;
     }
-    fn(0, std::min(count, chunk));
-    for (std::thread& t : pool) t.join();
+    const std::function<void(int, int)> body = [&fn](int begin, int end) {
+        for (int t = begin; t < end; ++t) fn(t);
+    };
+    BlockPool::instance().run(body, count, 1);
 }
 
 bool decode_pixel_block(BitReader& br, uint8_t* dst, size_t stride,

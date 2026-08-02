@@ -384,14 +384,22 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
     }
 
     // Baseline first: upload + convert + readback with an empty stack.
-    for (int t = -1; t < static_cast<int>(doc::EffectType::Count); ++t) {
+    // One extra virtual row measures Error Diffusion's exact mode (the
+    // default is fast; the speculative exact path deserves its own line).
+    const int kTypes = static_cast<int>(doc::EffectType::Count);
+    for (int t = -1; t <= kTypes; ++t) {
         doc::Document doc;
         doc.master_seed = 77;
         const char* name = "(baseline: no effects)";
         if (t >= 0) {
-            doc.layers[0].stack.push_back(
-                doc::make_effect(doc, static_cast<doc::EffectType>(t)));
-            name = doc::effect_info(static_cast<doc::EffectType>(t)).label;
+            const auto type = static_cast<doc::EffectType>(
+                t == kTypes ? static_cast<int>(doc::EffectType::ErrorDiffusion)
+                            : t);
+            doc.layers[0].stack.push_back(doc::make_effect(doc, type));
+            name = t == kTypes ? "Error Diffusion (exact)"
+                               : doc::effect_info(type).label;
+            if (t == kTypes)
+                doc.layers[0].stack[0].params[4] = 0.0f;   // speed = exact
         }
         auto engine = gfx::Engine::create(device, shader_dir);
         auto readback = gfx::Nv12Readback::create(device, shader_dir);

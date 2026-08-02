@@ -376,6 +376,10 @@ constexpr ParamDesc kErrorDiffusionParams[] = {
      "riemersma"},
     {"serpentine", "serpentine", 0.0f, 1.0f, 1.0f, "%.0f", "off|on"},
     {"carry", "temporal carry", 0.0f, 1.0f, 0.0f, "%.2f"},
+    // fast = the walk runs in 16 independent horizontal bands (error is
+    // dropped at band seams like at the frame edge): different pixels
+    // from exact, still fully deterministic, several times faster.
+    {"speed_mode", "speed", 0.0f, 1.0f, 1.0f, "%.0f", "exact|fast"},
 };
 
 constexpr ParamDesc kFlickerParams[] = {
@@ -1052,7 +1056,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"voronoi", "Voronoi Shatter", kVoronoiParams, 5, FxCategory::Mosaic},
     {"reaction_diffusion", "Reaction-Diffusion", kReactionDiffusionParams, 5,
      FxCategory::Mosaic},
-    {"error_diffusion", "Error Diffusion", kErrorDiffusionParams, 4,
+    {"error_diffusion", "Error Diffusion", kErrorDiffusionParams, 5,
      FxCategory::Color},
     {"flicker", "Flicker", kFlickerParams, 3, FxCategory::Time},
     {"frame_hold", "Frame Hold", kFrameHoldParams, 2, FxCategory::Time},

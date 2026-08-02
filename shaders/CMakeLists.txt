@@ -8,6 +8,13 @@ add_slang_shaders(looks_shaders
         viewport.frag.slang
         ycbcr_to_rgb.comp.slang
         export_nv12.comp.slang
+        mosh_predict.comp.slang
+        mosh_wire.comp.slang
+        mosh_to_unorm.comp.slang
+        mosh_rate_probe.comp.slang
+        mosh_rate_reduce.comp.slang
+        mosh_rate_pick.comp.slang
+        ed_expand.comp.slang
         fx_rgb_split.comp.slang
         fx_vignette.comp.slang
         fx_pixelate.comp.slang

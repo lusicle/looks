@@ -648,9 +648,12 @@ void RenderWorker::run() {
         // it must tick even on cycles the idle check below skips.
         player.tick();
         const uint32_t mod_frame = player.current_frame_index();
-        // Idle: nothing moved, nothing changed, nothing owed — skip.
+        // Idle: nothing moved, nothing changed, nothing owed — skip. A
+        // pending dither walk counts as owed: one settle pass joins it so
+        // paused frames show the finished result without interaction.
         if (!doc_changed && !pending_render && !live_mode &&
-            last_had_frame && mod_frame == last_rendered_frame)
+            last_had_frame && mod_frame == last_rendered_frame &&
+            !engine->ed_walk_pending())
             continue;
         // A decided render stays owed until it actually publishes (a
         // busy publish ring or missing decode must retry, not stall).

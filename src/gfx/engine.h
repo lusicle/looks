@@ -8,11 +8,13 @@
 
 #include <filesystem>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 
 #include "codec/mosh/mosh.h"
 #include "doc/document.h"
 #include "gfx/compute.h"
+#include "gfx/error_diffusion.h"
 #include "gfx/render_cache.h"
 #include "gfx/texture.h"
 #include "ui/truetype.h"   // runtime TTF loader for the Text effect
@@ -160,7 +162,10 @@ private:
     struct CodecIo {
         std::unique_ptr<GpuImage> nv_y, nv_uv;        // NV12 conversion
         std::unique_ptr<GpuImage> up_y, up_u, up_v;   // I420 re-upload
-        std::unique_ptr<GpuImage> up_rgba;            // error-diffusion path
+        std::unique_ptr<GpuImage> up_idx;   // error-diffusion packed picks
+        // GPU rate control (Bitrate Starve): per-rung DC scratch, bit
+        // totals, and the picked quality the wire reads back.
+        std::unique_ptr<GpuImage> rate_dc, rate_bits, rate_qsel;
         VkBuffer readback = VK_NULL_HANDLE;
         VmaAllocation readback_alloc = nullptr;
         void* mapped = nullptr;
@@ -179,6 +184,32 @@ private:
     };
     std::unordered_map<uint64_t, MoshSlot> mosh_state_;
     std::unique_ptr<ComputePipeline> to_nv12_, fx_mix_;
+    // GPU mosh pipelines + per-instance chain state. Planes are r32ui
+    // storage images holding one byte value per texel; state lives on the
+    // GPU across timeline frames (the whole point — no readback). The CPU
+    // MoshCodec handles the byte-flips / bitrate-budget params, which are
+    // the only paths that still need real bytes.
+    std::unique_ptr<ComputePipeline> mosh_predict_, mosh_wire_, mosh_unorm_;
+    std::unique_ptr<ComputePipeline> mosh_rate_probe_, mosh_rate_reduce_,
+        mosh_rate_pick_;
+    std::unique_ptr<ComputePipeline> ed_expand_;
+    std::unique_ptr<GpuImage> dummy_flow_;   // bound when no flow is wired
+    struct MoshGpuSlot {
+        std::unique_ptr<GpuImage> clean[3], moshed[3];       // Y, U, V
+        std::unique_ptr<GpuImage> pred_clean[3], pred_moshed[3], pred_tmp[3];
+        uint32_t w = 0, h = 0;
+        uint32_t last_frame = 0xFFFFFFFFu;
+        bool has_state = false;
+    };
+    std::unordered_map<uint64_t, MoshGpuSlot> mosh_gpu_;
+    // Runs one codec-box frame fully on the GPU (no readback, no fence)
+    // and composites into dst. Only legal when the params need no real
+    // bitstream (no byte flips, no bitrate budget).
+    bool mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
+                      const codec::MoshParams& mp, const GpuImage* in,
+                      GpuImage* flow_img, uint32_t w, uint32_t h,
+                      uint32_t frame_index, uint32_t timeline_frame,
+                      GpuImage* dst);
     std::unique_ptr<ComputePipeline> generator_, layer_blend_;
 
     // Stateful feedback effects (echo/feedback): persistent per-instance
@@ -310,19 +341,38 @@ private:
     std::vector<int16_t> scope_audio_;
     uint32_t scope_rate_ = 0;
 
-    // CPU error diffusion: cached output halves + the residual
-    // error plane carried into the next frame (temporal carry).
-    struct EdSlot {
-        std::vector<uint16_t> out;    // RGBA16F halves, linear
-        std::vector<float> carry;     // per-pixel RGB quantization error
-        std::vector<float> work;      // sRGB working buffer (reused)
-        uint32_t last_frame = 0xFFFFFFFFu;
-        bool valid = false;
+    // CPU error diffusion (gfx/error_diffusion.h) runs ONE FRAME BEHIND —
+    // the same legal delay as Feedback's cycle exemption: frame N
+    // composites the walk of frame N-1's input while frame N's input is
+    // captured and walked on a worker thread during the rest of the
+    // frame. The serial walk overlaps GPU time instead of stalling it.
+    struct EdSlotAsync {
+        EdState ed;
+        std::vector<uint16_t> input;   // captured RGBA16F halves
+        doc::EffectInstance pending_fx;
+        std::thread worker;
+        bool busy = false;             // render-thread-owned
+        bool has_result = false;
+        uint32_t result_w = 0, result_h = 0;
+        uint32_t captured_frame = 0xFFFFFFFFu;
     };
-    std::unordered_map<uint64_t, EdSlot> ed_state_;
-    void run_error_diffusion(const uint16_t* halves, uint32_t width,
-                             uint32_t height, const doc::EffectInstance& fx,
-                             EdSlot& slot);
+    std::unordered_map<uint64_t, std::unique_ptr<EdSlotAsync>> ed_state_;
+    bool composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
+                      const GpuImage* in_img, const EdState& ed, uint32_t w,
+                      uint32_t h, uint32_t frame_index, GpuImage* dst);
+
+public:
+    // True while a deferred dither walk is in flight. The render worker
+    // uses this to schedule one settle pass instead of idling, so paused
+    // frames (and a freshly applied effect on a paused frame) pick up the
+    // finished walk without waiting for user interaction.
+    bool ed_walk_pending() const {
+        for (const auto& [id, slot] : ed_state_)
+            if (slot && slot->busy) return true;
+        return false;
+    }
+
+private:
 
     // Frame render cache: per-slot host-visible transfer buffer,
     // used in both directions — miss records image->buffer (harvested into

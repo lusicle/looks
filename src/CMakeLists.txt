@@ -85,6 +85,7 @@ add_library(looks_gfx STATIC
     gfx/graph.cpp
     gfx/render_cache.cpp
     gfx/engine.cpp
+    gfx/error_diffusion.cpp
     gfx/viewport_pass.cpp
     gfx/readback.cpp
     gfx/vma_impl.cpp)

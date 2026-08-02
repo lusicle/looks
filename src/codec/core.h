@@ -78,4 +78,9 @@ void residual_dct_block(const uint8_t* cur, size_t cur_stride,
 void parallel_blocks(int count, bool parallel,
                      const std::function<void(int, int)>& fn);
 
+// Coarse-task variant: always fans out on the pool, one task per index,
+// no small-count serial fallback — for a handful of long-running tasks
+// (dither channels/bands) where parallel_blocks' heuristic would inline.
+void parallel_tasks(int count, const std::function<void(int)>& fn);
+
 }  // namespace looks::codec
