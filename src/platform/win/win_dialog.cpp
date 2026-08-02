@@ -92,17 +92,4 @@ void show_fatal(const char* message) {
                 MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND);
 }
 
-ConfirmResult show_confirm(Window* parent, const std::string& title,
-                           const std::string& text, bool with_cancel) {
-    HWND owner = parent ? static_cast<HWND>(parent->native_window()) : nullptr;
-    const UINT flags =
-        (with_cancel ? MB_YESNOCANCEL : MB_YESNO) | MB_ICONWARNING;
-    switch (MessageBoxW(owner, widen(text).c_str(), widen(title).c_str(),
-                        flags)) {
-        case IDYES: return ConfirmResult::Yes;
-        case IDNO: return ConfirmResult::No;
-        default: return ConfirmResult::Cancel;
-    }
-}
-
 }  // namespace looks::platform

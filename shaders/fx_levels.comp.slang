@@ -1,7 +1,4 @@
-// Levels (docs/flow_canvas.md primitives): input black/white remap,
-// gamma, output range — the plain tone node. Display-referred core.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred core.
 
 #include "fx_common.slang"
 
@@ -15,10 +12,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float black;       // input black point
-    float white;       // input white point
-    float gamma_v;     // midtone gamma (>1 brightens)
-    float out_black;   // output range
+    float black;
+    float white;
+    float gamma_v;     // above 1 brightens
+    float out_black;
     float out_white;
 };
 

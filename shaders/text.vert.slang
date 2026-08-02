@@ -1,5 +1,5 @@
-// Text vertex shader — identical transform/color model to ui.vert; UV
-// addresses the glyph atlas directly.
+// Same transform and color model as ui.vert.slang; the two must stay in
+// sync. UV addresses the glyph atlas directly.
 
 [[vk::push_constant]]
 cbuffer Push

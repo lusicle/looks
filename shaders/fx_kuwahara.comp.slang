@@ -1,8 +1,5 @@
-// Kuwahara: classic 4-quadrant filter — each pixel takes the
-// mean of whichever surrounding quadrant has the least variance. Flattens
-// texture into paint daubs while keeping edges crisp. Encoded space.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Taking the least-variance quadrant, rather than a plain mean, is what
+// keeps edges crisp while texture flattens.
 
 #include "fx_common.slang"
 
@@ -16,7 +13,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float radius;   // px, 1..6
+    float radius;   // px, capped at 6 by the unrolled loops below
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,7 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     [unroll]
     for (int q = 0; q < 4; ++q) {
-        const int sx = (q & 1) == 0 ? -1 : 0;   // quadrant x range start
+        const int sx = (q & 1) == 0 ? -1 : 0;
         const int sy = (q & 2) == 0 ? -1 : 0;
         float3 sum = 0.0;
         float sum_l = 0.0, sum_l2 = 0.0;

@@ -1,8 +1,4 @@
-// Analog snow + ghosting: sparse white/dark RF speckle bursts
-// re-seeded every frame, plus a displaced low-contrast ghost image
-// (multipath reflection). Encoded space — snow rides on the signal.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded space: snow rides on the signal, not the scene.
 
 #include "fx_common.slang"
 
@@ -16,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;     // snow density/intensity
-    float ghost_px;   // ghost displacement
-    float ghost;      // ghost strength
+    float amount;
+    float ghost_px;
+    float ghost;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -36,17 +32,17 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 enc = fx_srgb_oetf(saturate(base.rgb));
 
-    // Ghost: a shifted, washed-out copy added on top.
     const float2 guv = clamp(uv + float2(ghost_px, 0.0) / size, 0.0, 1.0);
     const float3 ghost_enc =
         fx_srgb_oetf(saturate(input.SampleLevel(guv, 0).rgb));
     enc = lerp(enc, max(enc, ghost_enc), saturate(ghost));
 
-    // Snow: heavy-tailed hash — most pixels untouched, a few flare hard.
-    // Streak slightly horizontal (2px cells) like RF noise.
+    // Heavy-tailed by construction: the high powers below leave most
+    // pixels untouched while a few flare hard. 2px cells streak it
+    // horizontally the way RF noise does.
     const uint h = fx_hash4(seed, frame, tid.x >> 1, tid.y);
     const float u = fx_hash01(h);
-    const float spark = pow(u, 24.0);   // rare bright events
+    const float spark = pow(u, 24.0);
     const float dark = pow(fx_hash01(fx_hash(h ^ 0x9E3779B9u)), 40.0);
     enc = saturate(enc + spark * amount * 1.6 - dark * amount * 0.8);
 

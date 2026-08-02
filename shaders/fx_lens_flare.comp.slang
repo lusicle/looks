@@ -1,9 +1,5 @@
-// Lens flare: screen-space ghost train — clipped highlights re-image as a
-// row of aperture ghosts marching through the frame center, plus a halo
-// ring at fixed radius. Ghost samples come from center-mirrored, scaled
-// copies of the thresholded frame (the classic pseudo-flare construction).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Ghosts are center-mirrored, scaled copies of the thresholded frame,
+// which is what makes them track the highlights without any light search.
 
 #include "fx_common.slang"
 
@@ -21,7 +17,7 @@ cbuffer Push
     float ghosts;
     float spread;
     float halo;
-    float tint;     // chromatic spread along the ghost train
+    float tint;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -47,9 +43,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 to_center = float2(0.5, 0.5) - uv;
     float3 flare = float3(0.0, 0.0, 0.0);
     for (int i = 1; i <= n; ++i) {
-        // Ghost i lives at the source position mirrored/scaled through
-        // center: sample the thresholded frame there and let it fade and
-        // rainbow-shift down the train.
         const float s = spread * float(i) * 0.6;
         const float2 gp = uv + to_center * (1.0 + s);
         const float fade = 1.0 / (1.0 + float(i) * float(i) * 0.6);
@@ -57,7 +50,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             float3(1.0, 1.0, 1.0),
             fx_hue_to_rgb(frac(float(i) * 0.17 + 0.55)) * 1.4,
             saturate(tint));
-        // A soft small blur per ghost: 4 taps.
         float3 g = float3(0.0, 0.0, 0.0);
         [unroll]
         for (int k = 0; k < 4; ++k) {
@@ -67,7 +59,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         flare += g * 0.25 * fade * disperse;
     }
-    // Halo: the thresholded frame sampled on a ring around center.
     if (halo > 0.001) {
         const float rlen = length(to_center * float2(size.x / size.y, 1.0));
         const float ring =

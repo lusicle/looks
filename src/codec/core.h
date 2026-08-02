@@ -44,6 +44,14 @@ void encode_block(BitWriter& bw, const int16_t block[kBlockCoeffs],
                   int16_t* dc_pred);
 bool decode_block(BitReader& br, int16_t block[kBlockCoeffs], int16_t* dc_pred);
 
+// Exact code lengths of the entropy layer, with no bitstream — rate loops
+// pick quality from these counts, so they MUST track the writers bit for
+// bit. ac_bit_count covers everything after the DC delta code: the
+// (run, level) scan plus the end-of-block marker.
+uint32_t ue_bit_count(uint32_t v);
+uint32_t se_bit_count(int32_t v);
+uint32_t ac_bit_count(const int16_t block[kBlockCoeffs]);
+
 // Full pixel-block pipeline used by both wrappers: extract (with edge
 // replication), center, transform, quantize, entropy — and the reverse.
 // `src` points at the top-left of the block within a plane.

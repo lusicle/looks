@@ -1,10 +1,3 @@
-// Reeded glass: fluted bathroom-window refraction. Each flute compresses
-// its slice of the image toward the flute center (with a slight cylinder
-// bulge), softens toward the flute edges, and drops a dark seam plus a
-// faint specular line where the flutes meet.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,9 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float flutes;    // flute width, px
-    float refract;   // compression + bulge strength
-    float soften;    // edge-of-flute blur
+    float flutes;    // width, px
+    float refract;
+    float soften;
     float mode;      // 0 vertical flutes, 1 horizontal
 };
 
@@ -43,13 +36,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float fi = floor(p / fw);
     const float local = (p - (fi + 0.5) * fw) / fw;   // -0.5 .. 0.5
 
-    // Compress the slice toward the flute center + cylinder bulge.
+    // Each flute compresses its slice toward the flute center, plus a
+    // cylinder bulge.
     const float rf = saturate(refract);
     float sp = (fi + 0.5) * fw + local * fw * (1.0 - rf * 0.85);
     sp += sin(local * 3.14159265) * rf * fw * 0.15;
     const float su = clamp(sp / axis_len, 0.0, 1.0);
 
-    // 3 taps along the flute axis; edges of the flute blur more.
+    // Blur grows toward the flute edges, where the glass curves hardest.
     const float blur_px =
         saturate(soften) * fw * 0.12 * (0.35 + abs(local) * 1.6);
     const float bo = blur_px / axis_len;
@@ -65,7 +59,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                  input.SampleLevel(uv1, 0).rgb * 0.25 +
                  input.SampleLevel(uv2, 0).rgb * 0.25;
 
-    // Dark seam between flutes, faint specular line off-center.
     const float seam = smoothstep(0.5, 0.42, abs(local));
     col *= lerp(0.5, 1.0, seam);
     const float spec = exp(-pow((abs(local) - 0.33) * 11.0, 2.0));

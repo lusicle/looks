@@ -1,6 +1,6 @@
-// Shared kernel helpers: all randomness is a counter-based hash
-// keyed on (seed, frame, cell) — no stateful RNG anywhere, so preview and
-// export are bit-exact. Included by effect kernels via #include.
+// Shared kernel helpers. All randomness here is counter-based hashing
+// keyed on (seed, frame, cell): no stateful RNG anywhere, which is what
+// keeps preview and export bit-exact.
 
 #ifndef FX_COMMON_SLANG
 #define FX_COMMON_SLANG
@@ -37,7 +37,7 @@ float fx_luma(float3 rgb)
     return dot(rgb, float3(0.2126, 0.7152, 0.0722));
 }
 
-// Hue (0..1) -> fully saturated RGB (the abs-ramp construction).
+// Hue (0..1) -> fully saturated RGB, abs-ramp construction.
 float3 fx_hue_to_rgb(float h)
 {
     const float r = abs(h * 6.0 - 3.0) - 1.0;
@@ -46,7 +46,6 @@ float3 fx_hue_to_rgb(float h)
     return saturate(float3(r, g, b));
 }
 
-// sRGB transfer pair (display-referred effects convert around their core).
 float3 fx_srgb_oetf(float3 lin)
 {
     const float3 hi = 1.055 * pow(max(lin, 0.0), 1.0 / 2.4) - 0.055;
@@ -61,10 +60,8 @@ float3 fx_srgb_eotf(float3 encoded)
     return lerp(hi, lo, step(encoded, 0.04045));
 }
 
-// ---- Ordered-dither pattern helpers: shared by the
-// Quantizer's dither leg and the standalone Dither node. The packed LUT
-// is 512x192 R8: rows 0..63 hold the STBN 64x64x8 atlas (slice s at
-// x = s*64), rows 64..191 the 128x128 blue noise (tools/bluenoise).
+// The packed LUT is 512x192 R8: rows 0..63 hold the STBN 64x64x8 atlas
+// with slice s at x = s*64, rows 64..191 the 128x128 blue noise.
 
 static const float kFxBayer2[4] = {0.0, 2.0, 3.0, 1.0};
 static const float kFxBayer4[16] = {
@@ -148,13 +145,12 @@ float3 fx_nes_nearest(float3 c)
     return best;
 }
 
-// Linear-light level pick: choose between the two encoded
-// levels bracketing `lin` with probability from the LINEAR interpolant,
-// so the displayed (linear) average of a dithered field reproduces the
-// input. Dithering in code values alone preserves the encoded mean, and
-// the display's convex EOTF then lifts every dithered region (Jensen) —
-// a 5% linear sky encodes near 0.25 and renders 25% white. t01 is the
-// ordered threshold in [0, 1]; returns the level index.
+// Picks between the two encoded levels bracketing lin using the LINEAR
+// interpolant as the probability, so a dithered field averages back to
+// the input on screen. Dithering in code values instead preserves the
+// encoded mean, and the display's convex EOTF then lifts every dithered
+// region: a 5% linear sky encodes near 0.25 and renders 25% white.
+// Returns the level index, not a color.
 float3 fx_dither_levels(float3 lin, float n, float t01)
 {
     lin = saturate(lin);

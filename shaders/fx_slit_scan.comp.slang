@@ -1,10 +1,5 @@
-// Slit-scan: rows (or columns) sample progressively older
-// frames from a past-frames ring buffer — the frame becomes a time
-// gradient. The engine dispatches this kernel once per age band with the
-// matching history frame bound; bands are disjoint, so the passes tile the
-// output exactly once.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// One dispatch per age band with the matching history frame bound. The
+// bands are disjoint, so the passes tile the output exactly once.
 
 #include "fx_common.slang"
 
@@ -18,10 +13,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 = rows map to time, 1 = columns
-    float depth;     // frames of history in use
-    float reverse;   // flip the time gradient
-    uint pass_age;   // this dispatch's age band (engine-provided)
+    float mode;      // 0 rows map to time, 1 columns
+    float depth;
+    float reverse;
+    uint pass_age;   // engine-appended age band for this dispatch
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

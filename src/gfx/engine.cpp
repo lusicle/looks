@@ -190,17 +190,15 @@ codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
         case doc::EffectType::Datamosh:
             mp.quality = static_cast<int>(p[0]);
             mp.gop_length = static_cast<int>(p[1]);
-            mp.drop_iframes = p[1] < 0.5f;
             mp.mv_scale = p[2];
             mp.mv_random = p[3];
             mp.residual_corrupt = p[4];
             mp.p_repeat = static_cast<int>(p[5]);
-            if (p.size() > 9) {
-                mp.mv_rotate = p[6] * 0.01745329252f;
-                mp.byte_flips = static_cast<uint32_t>(p[7]);
-                mp.mv_field = static_cast<int>(p[8] + 0.5f);
-                mp.mv_field_amount = p[9];
-            }
+            mp.mv_rotate = p[6] * 0.01745329252f;
+            mp.byte_flips = static_cast<uint32_t>(p[7]);
+            mp.mv_field = static_cast<int>(p[8] + 0.5f);
+            mp.mv_field_amount = p[9];
+            mp.drop_iframes = p[10] > 0.5f;
             break;
         case doc::EffectType::GenerationLoss:
             mp.quality = static_cast<int>(p[0]);

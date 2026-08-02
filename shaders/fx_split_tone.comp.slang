@@ -1,10 +1,3 @@
-// Split toning: independent hues pushed into shadows and highlights
-// (sepia, selenium, cyanotype, teal-orange are all settings of this).
-// Distinct from the ColorScience stock matrices — this is darkroom toning,
-// luma-banded. Encoded-domain, luma-preserving-ish.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,11 +10,11 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float sh_hue;    // shadow hue 0..1
+    float sh_hue;
     float sh_amt;
-    float hi_hue;    // highlight hue 0..1
+    float hi_hue;
     float hi_amt;
-    float balance;   // -1 favors shadows .. +1 favors highlights
+    float balance;   // -1 favors shadows, +1 favors highlights
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -42,7 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float w_hi = smoothstep(pivot - 0.35, pivot + 0.35, l);
     const float w_sh = 1.0 - w_hi;
 
-    // Signed color vectors: pure hue minus neutral gray, so adding tints
+    // Hue minus neutral gray gives a signed vector, so the tint adds
     // without lifting exposure.
     const float3 sh_vec = fx_hue_to_rgb(sh_hue) - float3(0.5, 0.5, 0.5);
     const float3 hi_vec = fx_hue_to_rgb(hi_hue) - float3(0.5, 0.5, 0.5);

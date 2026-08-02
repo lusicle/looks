@@ -1,9 +1,5 @@
-// Palette Map (docs/flow_canvas.md primitives): nearest-color snap
-// to a fixed palette — the Quantizer's palette lock without the level
-// snap or dither. Duotone ramps black -> hue A -> hue B -> white by
-// luma. Display-referred core.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The Quantizer's palette lock without the level snap or dither.
+// Display-referred core.
 
 #include "fx_common.slang"
 
@@ -49,7 +45,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (pal == 1)
     {
-        // CGA palette 1: black / cyan / magenta / white.
+        // CGA palette 1.
         result = fx_nearest_of4(c,
                                 float3(0.0, 0.0, 0.0),
                                 float3(0.333, 1.0, 1.0),
@@ -62,7 +58,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (pal == 3)
     {
-        // Teletext: each channel snaps to 0 or 1 (the 8 CEEFAX colors).
+        // The 8 saturated teletext colors: each channel snaps to 0 or 1.
         result = round(c);
     }
     else

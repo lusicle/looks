@@ -1,11 +1,5 @@
-// Blur family: directional streak, spin (arc around the
-// center), zoom (along the ray from center), gaussian (spiral disc taps),
-// tilt-shift (gaussian scaled outside a sharp band), bokeh (flat disc
-// aperture — highlights bloom into discs), and surface (bilateral,
-// edge-preserving) — taps in linear light so highlights bloom through
-// the streak like real motion blur.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Taps stay in linear light so highlights bloom through the streak the
+// way real motion blur does.
 
 #include "fx_common.slang"
 
@@ -19,11 +13,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;   // px (directional/zoom/gauss) or degrees-ish (radial)
-    float mode;     // 0 directional, 1 radial, 2 zoom, 3 gauss, 4 tilt
-    float angle;    // directional streak / tilt band angle
-    float focus;    // tilt-shift: band center (0..1 along the frame)
-    float band;     // tilt-shift: sharp half-band width
+    float amount;   // px, or degrees for radial
+    float mode;     // 0 directional, 1 radial, 2 zoom, 3 gauss, 4 tilt,
+                    // 5 bokeh, 6 surface
+    float angle;
+    float focus;    // tilt band center; doubles as surface range weight
+    float band;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -42,9 +37,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint m = uint(mode + 0.5);
     float3 blurred;
     if (m >= 3u) {
-        // Disc-tap family: gaussian, tilt-shift, bokeh, surface — 24
-        // golden-spiral taps, per-mode weights. Tilt (mode 4) scales the
-        // radius by the distance outside a sharp band along `angle`.
+        // Disc-tap family: 24 golden-spiral taps, per-mode weights.
         float radius = amount * 0.5;
         if (m == 4u) {
             const float2 axis = float2(-sin(angle), cos(angle));
@@ -58,19 +51,18 @@ void main(uint3 tid : SV_DispatchThreadID)
         [unroll]
         for (int i = 0; i < 24; ++i) {
             const float fi = (float(i) + 0.5) / 24.0;
-            const float a = float(i) * 2.39996;   // golden angle
+            const float a = float(i) * 2.39996;   // golden angle, radians
             const float r = sqrt(fi) * radius;
             const float2 suv = uv + float2(cos(a), sin(a)) * r / size;
             const float3 c = input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
             float wgt;
             if (m == 5u) {
-                // Bokeh: flat disc (hard aperture edge) + energy-weighted
-                // highlights so bright points bloom into visible discs.
+                // Energy-weighted so bright points bloom into discs.
                 const float lum = dot(c, kLuma);
                 wgt = 1.0 + lum * lum * 6.0;
             } else if (m == 6u) {
-                // Surface: bilateral — spatial falloff x range weight, so
-                // texture smooths while real edges hold.
+                // Bilateral: spatial falloff x range weight, so texture
+                // smooths while real edges hold.
                 const float3 dc = c - base.rgb;
                 const float range = max(focus * focus, 0.002);
                 wgt = (1.0 - fi * 0.7) * exp(-dot(dc, dc) / range);
@@ -86,13 +78,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 acc = 0.0;
     [unroll]
     for (int i = 0; i < kTaps; ++i) {
-        const float f = (float(i) / float(kTaps - 1)) - 0.5;   // -0.5..0.5
+        const float f = (float(i) / float(kTaps - 1)) - 0.5;
         float2 suv;
         if (m == 0u) {
             const float2 dir = float2(cos(angle), sin(angle));
             suv = uv + dir * f * amount / size;
         } else if (m == 1u) {
-            // Rotate around the center by up to ±amount/2 "degrees".
             const float a = f * amount * 0.0174533;
             const float2 d = (uv - 0.5) * float2(size.x / size.y, 1.0);
             const float ca = cos(a), sa = sin(a);

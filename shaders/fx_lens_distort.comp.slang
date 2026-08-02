@@ -1,8 +1,5 @@
-// Lens distortion: Brown-Conrady radial model on the sampling
-// position — positive k1 barrels (edges bow out), negative pincushions.
-// Aspect-corrected so distortion stays circular on screen.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Brown-Conrady radial model, aspect-corrected so the distortion stays
+// circular on screen rather than following the frame's aspect.
 
 #include "fx_common.slang"
 
@@ -16,9 +13,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float k1;      // r^2 coefficient
+    float k1;      // r^2 coefficient, positive barrels
     float k2;      // r^4 coefficient
-    float zoom;    // compensating scale
+    float zoom;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

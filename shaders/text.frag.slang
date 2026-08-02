@@ -1,15 +1,8 @@
-// Text fragment shader. Three atlas flavors, selected by the push flag:
-//  - 0 bitmap coverage (A8 sampled as R): the compiled-in debug font;
-//  - 1 MSDF (RGBA, baked by fontbake via msdf-atlas-gen): median-of-RGB is
-//    a signed distance around 0.5; the screen-space derivative keeps the
-//    edge one pixel wide at any scale;
-//  - 2 plain RGBA image (thumbnail strips etc.): sample × vertex tint.
-
 [[vk::push_constant]]
 cbuffer Push
 {
-    float4x4 ortho;       // vertex stage (offset 0..64)
-    uint mode;            // fragment stage (offset 64)
+    float4x4 ortho;       // vertex stage, offset 0..64
+    uint mode;            // fragment stage, offset 64
     float unit_range_x;   // atlas px_range / atlas width
     float unit_range_y;   // atlas px_range / atlas height
 };
@@ -32,12 +25,10 @@ float4 main(FSInput input) : SV_Target
     }
     float coverage;
     if (mode == 1) {
-        // Canonical msdfgen decode: the screen-pixel range comes from the
-        // UV derivative (linear across the quad) scaled by the atlas's
-        // distance range — NOT from fwidth of the decoded median, which
-        // is discontinuous where the channel ordering switches and reads
-        // as ragged hard edges. max(.., 1) keeps at least a one-pixel AA
-        // band under minification; +0.2 is a constant-pixel embolden.
+        // The screen-pixel range must come from the UV derivative, which
+        // is linear across the quad, NOT from fwidth of the decoded
+        // median: that is discontinuous where the channel ordering
+        // switches and reads as ragged hard edges.
         const float3 s = atlas.Sample(input.v_uv).rgb;
         const float sd =
             max(min(s.r, s.g), min(max(s.r, s.g), s.b)) - 0.5;
@@ -46,12 +37,10 @@ float4 main(FSInput input) : SV_Target
         const float px_raw =
             0.5 * (unit_range_x * screen_tex.x +
                    unit_range_y * screen_tex.y);
-        // Minified glyphs (px_raw < 1: one screen pixel spans more than
-        // the whole distance range) cannot be antialiased by widening the
-        // band — a floor of 1 let the band cover the ENTIRE field, which
-        // reads as a glow around every glyph at small zoom. Bound the
-        // band to half the field, retire the embolden as it shrinks, and
-        // melt sub-pixel text toward transparent instead.
+        // Minified glyphs, where px_raw < 1, cannot be antialiased by
+        // widening the band: a floor of 1 lets it cover the ENTIRE field
+        // and reads as a glow around every glyph. Bound the band to half
+        // the field and melt sub-pixel text toward transparent instead.
         const float px_range = max(px_raw, 2.0);
         const float embolden = 0.2 * saturate(px_raw - 0.75);
         coverage = saturate(sd * px_range + 0.5 + embolden);

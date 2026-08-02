@@ -1,10 +1,6 @@
-// Wire Terrain: the luma heightfield as a receding perspective wireframe
-// — the "3D Rutt-Etra". Image rows become terrain rows marching toward a
-// horizon; brightness lifts the wire. Hidden-line removal by walking the
-// rows near-to-far and tracking the per-column silhouette: a far row only
-// shows where it rises above everything nearer.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Hidden-line removal comes from walking rows near-to-far and tracking
+// the per-column silhouette: a far row draws only where it rises above
+// everything nearer.
 
 #include "fx_common.slang"
 
@@ -18,22 +14,21 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float rows_n;    // terrain rows
-    float amount;    // wire height
-    float pitch;     // perspective compression toward the horizon
-    float horizon;   // horizon screen position (0 = top)
-    float line_w;    // wire width, px
-    float grid;      // cross-grid tick brightness
-    float color;     // 0 synth green -> 1 source color
+    float rows_n;
+    float amount;
+    float pitch;
+    float horizon;   // screen position, 0 = top
+    float line_w;    // px
+    float grid;
+    float color;     // 0 synth green, 1 source color
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Encoded luma averaged over a small vertical band: each terrain row
-// stands for a band of the image, and the average dilutes 8-bit / codec
-// luma quantization (amplified by the wire height, a single code-value
-// step would pop a whole flat segment at once).
+// The vertical band average is load-bearing: the wire height amplifies
+// 8-bit and codec luma quantization, so without it a single code-value
+// step pops a whole flat segment at once.
 float wt_luma(Sampler2D tex, float2 suv, float band_v)
 {
     const float l0 = fx_luma(tex.SampleLevel(suv, 0).rgb);
@@ -61,18 +56,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float lw = max(line_w, 0.5);
 
     float3 col = float3(0.0, 0.0, 0.0);
-    float sil = 1e9;   // lowest screen-y (nearest silhouette) so far
+    float sil = 1e9;   // nearest silhouette so far, in screen y
 
     for (uint i = 0; i < n; ++i) {
-        const float d = (float(i) + 0.5) / float(n);   // 0 near .. 1 far
+        const float d = (float(i) + 0.5) / float(n);   // 0 near, 1 far
         const float persp = pow(d, lerp(1.0, 2.2, saturate(pitch)));
-        // Horizontal perspective: far rows compress toward center on
-        // screen, so screen x maps to a stretched source u — out of range
-        // means the receding plane has no geometry here.
+        // Screen x maps to a stretched source u, so out of range means
+        // the receding plane has no geometry at this pixel.
         const float su =
             0.5 + (uv.x - 0.5) * lerp(1.0, 2.0, d * saturate(pitch));
         if (su < 0.0 || su > 1.0) continue;
-        const float sv = 1.0 - d;   // near row = image bottom
+        const float sv = 1.0 - d;
 
         const float band_v = 0.35 / float(n);
         const float l = wt_luma(input, float2(su, sv), band_v);
@@ -86,8 +80,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
         if (y_line < sil) {
             // Slope-aware distance: cover the rows the wire sweeps
-            // through within this column so steep segments stay
-            // connected instead of beading into dashes.
+            // through in this column, or steep segments bead into dashes.
             const float dsu =
                 (1.5 / size.x) * lerp(1.0, 2.0, d * saturate(pitch));
             const float slope_px =
@@ -102,7 +95,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                 const float a = saturate(1.0 - dist / lw);
                 float3 lc = lerp(float3(0.25, 1.0, 0.45), src * 1.5,
                                  saturate(color));
-                // Cross-grid ticks at fixed source columns.
                 const float gu = frac(su * 24.0);
                 const float tick_v = min(gu, 1.0 - gu) < 0.045 ? 1.0 : 0.0;
                 lc *= 1.0 + grid * tick_v * 0.9;

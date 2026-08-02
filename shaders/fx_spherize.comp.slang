@@ -1,10 +1,5 @@
-// Ball (warp & displace): wraps the frame onto a sphere — an
-// extreme fisheye. Inside the ball the radial arcsine map magnifies the
-// center and compresses the rim (orthographic front hemisphere); outside
-// shows black or the untouched source. Rim shade darkens toward the edge
-// with the sphere's cosine falloff to sell the volume.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Orthographic front hemisphere: the radial arcsine map magnifies the
+// center and compresses the rim.
 
 #include "fx_common.slang"
 
@@ -18,12 +13,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;     // 0 = flat, 1 = full sphere wrap
-    float radius;     // ball radius, relative to half the short side
-    float center_x;   // ball center, normalized
+    float amount;     // 0 flat, 1 full sphere wrap
+    float radius;     // relative to half the short side
+    float center_x;   // normalized
     float center_y;
-    float shade;      // rim darkening 0..1
-    float backdrop;   // outside the ball: 0 = black, 1 = source
+    float shade;
+    float backdrop;   // outside the ball: 0 black, 1 source
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -43,15 +38,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float2 center = float2(center_x, center_y);
     const float half_min = 0.5 * min(size.x, size.y) * max(radius, 1.0e-3);
-    // Pixel-space offset normalized so r = 1 on the ball's rim (circular
-    // regardless of aspect).
+    // Normalized so r = 1 on the rim, keeping the ball circular at any
+    // frame aspect.
     const float2 d = (uv - center) * size / half_min;
     const float r = length(d);
 
     float4 result;
     if (r <= 1.0) {
-        // Arcsine radial map: source radius asin(r)·2/π ≤ r — center
-        // magnified, rim compressed to the sphere's silhouette.
         const float ball_r = asin(saturate(r)) * (2.0 / kPi);
         const float src_r = lerp(r, ball_r, saturate(amount));
         const float2 dir = r > 1.0e-5 ? d / r : float2(0.0, 0.0);

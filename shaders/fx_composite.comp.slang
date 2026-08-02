@@ -1,9 +1,4 @@
-// Composite video artifacts: chroma bleed/delay (color smeared
-// right of where it belongs), dot crawl (checkerboard climbing chroma
-// edges), and rainbow shimmer (cross-color on fine luma detail). Runs in
-// encoded space — these live in the signal domain, not the scene.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded space: these artifacts live in the signal, not the scene.
 
 #include "fx_common.slang"
 
@@ -43,15 +38,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float y0 = fx_luma(enc);
 
-    // Chroma delay: luma stays put, color arrives late (from the left) and
-    // slightly blurred.
+    // Luma stays put while chroma arrives late: the subtract-and-re-add
+    // below is what keeps the delay chroma-only.
     const float dx = chroma_delay / size.x;
     const float3 delayed =
         (enc_at(uv - float2(dx, 0.0)) + enc_at(uv - float2(dx * 0.5, 0.0))) *
         0.5;
     float3 col = delayed - fx_luma(delayed) + y0;
 
-    // Chroma edge strength drives dot crawl.
+    // Dot crawl rides chroma edges, hence the chroma-only difference.
     const float2 e = 1.5 / size;
     const float3 cl = enc_at(uv - float2(e.x, 0.0));
     const float3 cr = enc_at(uv + float2(e.x, 0.0));
@@ -62,8 +57,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         float((tid.x + tid.y + frame) & 1u) * 2.0 - 1.0;
     col += crawl_pattern * chroma_edge * dot_crawl * 0.12;
 
-    // Rainbow shimmer: fine horizontal luma detail beats with the (fake)
-    // subcarrier and comes back as drifting hue.
+    // Fine horizontal luma detail beats against the modelled subcarrier
+    // and returns as drifting hue.
     const float lum_l = fx_luma(enc_at(uv - float2(e.x, 0.0)));
     const float lum_r = fx_luma(enc_at(uv + float2(e.x, 0.0)));
     const float detail = saturate(abs(lum_r - lum_l) * 4.0);

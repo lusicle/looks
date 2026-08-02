@@ -1,11 +1,6 @@
-// Time displacement (adjacent): each pixel plays back from a
-// different moment — its delay driven by the luma of a map (self, or a
-// mask's grayscale wired as the third input). The classic "bright is now,
-// dark is the past" video-synth effect. Same engine mechanism as
-// slit-scan: one dispatch per age band with that band's history bound;
-// bands partition the pixels, so the passes tile the output exactly once.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// One dispatch per age band with that band's history bound. The bands
+// partition the pixels, so the passes tile the output exactly once and
+// every pixel returns early from all but one dispatch.
 
 #include "fx_common.slang"
 
@@ -19,15 +14,15 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float range;      // frames of history in use
-    float mode;       // 0 dark lags, 1 bright lags, 2 map input lags-dark
-    float band_soft;  // hash dither on the band edges
-    uint pass_age;    // this dispatch's age band (engine-provided)
+    float range;
+    float mode;
+    float band_soft;
+    uint pass_age;    // engine-appended age band for this dispatch
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D history;   // frame at age == pass_age
-[[vk::binding(2, 0)]] Sampler2D map;       // delay map (self when unwired)
+[[vk::binding(2, 0)]] Sampler2D map;       // self when unwired
 [[vk::binding(3, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]

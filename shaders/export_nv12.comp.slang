@@ -1,8 +1,7 @@
-// Export edge: linear RGBA16F working space -> NV12 planes for
-// the H.264 encoder MFT. OETF (sRGB encode, inverse of the import EOTF) +
-// BT.709 limited-range matrix; chroma is the 2x2 block average computed in
-// the encoded domain. One dispatch over full res: every thread writes Y,
-// the even/even thread of each 2x2 block writes the interleaved UV texel.
+// Working space to NV12, the inverse of the import path. One dispatch at
+// full res: every thread writes Y, and the even/even thread of each 2x2
+// block writes that block's interleaved UV texel from the encoded-domain
+// average.
 
 [[vk::push_constant]]
 cbuffer Push

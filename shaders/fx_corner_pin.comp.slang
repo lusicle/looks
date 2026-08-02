@@ -1,11 +1,5 @@
-// Corner Pin: perspective quad warp. The frame is pinned by its four
-// corners (each offset from its natural position in frame fractions) and
-// output pixels inverse-map through the square-to-quad homography, so
-// straight lines stay straight under the perspective. The uncovered
-// region takes the edge policy; black gets the half-pixel analytic AA
-// edge (same treatment as Transform).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Inverse-maps through the square-to-quad homography, which is what keeps
+// straight lines straight under the perspective.
 
 #include "fx_common.slang"
 
@@ -19,7 +13,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float tl_x;        // corner offsets, frame fractions
+    float tl_x;        // offsets from the natural corner, frame fractions
     float tl_y;
     float tr_x;
     float tr_y;
@@ -27,7 +21,7 @@ cbuffer Push
     float bl_y;
     float br_x;
     float br_y;
-    float edge_mode;   // 0 black, 1 clamp, 2 wrap, 3 mirror
+    float edge_mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -43,10 +37,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / dim;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Unit square -> pinned quad homography (projective square-to-quad
-    // construction), then the adjugate inverts it without needing the
-    // determinant. Every term is a handful of flops; nothing here is
-    // worth a CPU precompute.
+    // Unit square to pinned quad, then the adjugate inverts it without
+    // needing the determinant.
     const float2 p00 = float2(tl_x, tl_y);
     const float2 p10 = float2(1.0 + tr_x, tr_y);
     const float2 p01 = float2(bl_x, 1.0 + bl_y);
@@ -81,17 +73,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int em = int(edge_mode + 0.5);
     float coverage = 1.0;
     if (em == 0) {
-        // Black outside, with a half-pixel analytic AA edge.
+        // Half-pixel analytic AA on the uncovered edge.
         const float2 dpx = min(suv, 1.0 - suv) * dim;
         coverage = saturate(min(dpx.x, dpx.y) + 0.5);
         suv = clamp(suv, 0.0, 1.0);
     } else if (em == 2) {
         suv = frac(suv);
     } else if (em == 3) {
-        // Triangle wave: 0..1..0 over a 2-frame period.
+        // Triangle wave, 0..1..0 over a 2-frame period.
         suv = 1.0 - abs(frac(suv * 0.5) * 2.0 - 1.0);
     }
-    // em == 1: the sampler clamps.
+    // em == 1 needs no case: the sampler already clamps.
 
     float4 pinned = input.SampleLevel(suv, 0);
     pinned.rgb *= coverage;

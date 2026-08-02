@@ -1,8 +1,5 @@
-// White Balance (primitive): temperature / tint as linear-light
-// channel gains — the clean warm/cool control the roster only had as
-// fixed Film Stock presets. Gains are normalized so mid-gray holds its
-// luma (a temperature sweep re-tints, it does not re-expose).
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Linear-light channel gains, normalized so a temperature sweep re-tints
+// without re-exposing.
 
 #include "fx_common.slang"
 
@@ -16,8 +13,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float temperature;   // -1 cool .. +1 warm
-    float tint;          // -1 magenta .. +1 green
+    float temperature;   // -1 cool, +1 warm
+    float tint;          // -1 magenta, +1 green
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -32,8 +29,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Opposed r/b gains for temperature, g vs magenta for tint, then a
-    // luma renormalize so the operation stays a chromatic shift.
+    // The luma renormalize below is what keeps this a chromatic shift.
     float3 gain = float3(1.0 + 0.5 * temperature,
                          1.0 + 0.35 * tint,
                          1.0 - 0.5 * temperature);

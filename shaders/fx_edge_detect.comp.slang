@@ -1,8 +1,4 @@
-// Edge detect: Sobel magnitude OR difference-of-gaussians as
-// stylized lines — white on black, black on white, or inked over the
-// image. Encoded-space gradients (edges are perceptual).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Gradients are taken in encoded space, since edges are perceptual.
 
 #include "fx_common.slang"
 
@@ -19,7 +15,7 @@ cbuffer Push
     float threshold;
     float mode;        // 0 white-on-black, 1 black-on-white, 2 over image
     float thickness;   // sample radius, px
-    float algo;        // 0 sobel, 1 difference-of-gaussians
+    float algo;        // 0 sobel, 1 difference of gaussians
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -43,8 +39,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 e = thickness / size;
     float mag;
     if (algo >= 0.5) {
-        // Difference of gaussians: 3x3 average minus a wider ring —
-        // band-pass edges, softer than the Sobel ramp.
+        // Band-pass rather than a gradient ramp, so edges come out softer.
         float inner = 0.0, outer = 0.0;
         [unroll]
         for (int dy = -1; dy <= 1; ++dy)

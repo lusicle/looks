@@ -1,9 +1,5 @@
-// Halftone (print sim): angled dot screens with dot gain. Beyond the glyph
-// engine's grid dots — the screens rotate, and CMYK mode runs
-// four screens at classic press angles so their interference produces the
-// authentic rosette. Display-referred: dots live on the print.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred: dots live on the print, so the kernel screens in the
+// encoded domain.
 
 #include "fx_common.slang"
 
@@ -17,22 +13,20 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float dot_px;   // screen cell size
-    float angle;    // screen angle, degrees (offsets every screen)
+    float dot_px;
+    float angle;    // degrees, offsets every screen
     float mode;     // 0 ink-on-paper, 1 paper-on-ink, 2 cmyk
-    float gain;     // dot gain (radius multiplier)
-    float soft;     // dot edge softness
-    float shape;    // 0 dots, 1 line screen (engraving), 2 spiral
-    float wave;     // engrave wave: luma bows the screen coordinate
+    float gain;
+    float soft;
+    float shape;    // 0 dots, 1 lines, 2 spiral
+    float wave;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Coverage of a rotated screen at pixel `px` for tone value `v` (0 = no
-// ink, 1 = solid). Shapes: dots, parallel lines (thickness carries tone —
-// the engraving/banknote screen), or an archimedean spiral from center.
-// `wob` bows the screen coordinate (engraving wave).
+// Ink coverage of a rotated screen at px for tone v, 0 = none, 1 = solid.
+// wob bows the screen coordinate.
 float screen_cov(float2 px, float ang, float cell, float v, float g,
                  float s, uint shp, float2 center, float wob)
 {
@@ -81,20 +75,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint shp = uint(shape + 0.5);
     const float2 center =
         float2(float(width) * 0.5, float(height) * 0.5);
-    // Engraving wave: the screen coordinate bows around image features.
     const float wob = fx_luma(enc) * wave * dot_px * 1.5;
 
     float3 outc;
     if (m < 2u) {
-        // Mono: darkness drives ink on white paper (mode 1 inverts).
         const float ink = screen_cov(px, base_ang, dot_px,
                                      1.0 - fx_luma(enc), gain, soft, shp,
                                      center, wob);
         outc = lerp(float3(1.0, 1.0, 1.0), float3(0.02, 0.02, 0.02), ink);
         if (m == 1u) outc = 1.0 - outc;
     } else {
-        // CMYK: classic press angles C15 M75 Y0 K45 (relative to `angle`),
-        // GCR black, multiplicative ink laydown on white.
+        // Press angles C15 M75 Y0 K45 relative to angle; their
+        // interference is what produces the rosette. GCR black.
         const float3 cmy = 1.0 - enc;
         const float k = min(min(cmy.x, cmy.y), cmy.z);
         const float denom = max(1.0 - k, 1.0e-3);

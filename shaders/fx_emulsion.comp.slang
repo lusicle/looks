@@ -1,10 +1,3 @@
-// Emulsion damage: vinegar-syndrome decay — the base warps in slow
-// large-scale waves, dye layers mottle unevenly per channel, and mold
-// blooms eat into the image as dark-green blotches. Timeline-clocked
-// drift, fully seeded.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,16 +10,16 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float warp;     // base warp strength
-    float mottle;   // per-channel dye unevenness
-    float mold;     // blotch coverage
-    float scale;    // damage feature scale
+    float warp;
+    float mottle;
+    float mold;
+    float scale;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Bilinear 2D value noise on an integer lattice (deterministic).
+// Bilinear 2D value noise on an integer lattice.
 float vnoise2(uint s, float2 p)
 {
     const float2 i = floor(p);
@@ -55,15 +48,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 q = uv * scale * 3.0;
     const float drift = t * 0.07;
 
-    // Base warp: two offset noise fields → a slow curl-ish displacement.
+    // Two offset noise fields give a slow curl-like displacement.
     const float wx = vnoise2(seed ^ 0x11u, q + drift) - 0.5;
     const float wy = vnoise2(seed ^ 0x22u, q + 17.3 - drift) - 0.5;
     const float2 suv =
         clamp(uv + float2(wx, wy) * warp * 46.0 / size, 0.0, 1.0);
     float3 col = input.SampleLevel(suv, 0).rgb;
 
-    // Dye mottle: low-frequency uneven gain, decorrelated per channel —
-    // magenta-cyan blotching as layers fade at different rates.
+    // Decorrelated per channel, so layers fade at different rates.
     if (mottle > 0.001) {
         const float mr = vnoise2(seed ^ 0x33u, q * 1.7 + drift) - 0.5;
         const float mg = vnoise2(seed ^ 0x44u, q * 1.7 + 31.0) - 0.5;
@@ -71,8 +63,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col *= 1.0 + float3(mr, mg * 0.6, mb) * mottle * 0.7;
     }
 
-    // Mold blooms: thresholded noise blobs; dark olive centers with a
-    // bleached halo where the emulsion has lifted.
+    // Dark olive blob centers with a bleached halo at the lifted edge.
     if (mold > 0.001) {
         const float n = vnoise2(seed ^ 0x66u, q * 2.3 + drift * 0.4) * 0.65 +
                         vnoise2(seed ^ 0x77u, q * 6.1) * 0.35;

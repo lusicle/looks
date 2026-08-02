@@ -1,7 +1,5 @@
-// Layer generators: solid / gradient / value noise, rendered
-// straight into the linear working space. Colors arrive sRGB-encoded from
-// the UI and are decoded here. Noise is seeded + frame-animated,
-// deterministic.
+// Colors arrive sRGB-encoded from the UI and are decoded into the linear
+// working space here.
 
 #include "fx_common.slang"
 
@@ -10,16 +8,17 @@ cbuffer Push
 {
     uint width;
     uint height;
-    uint kind;         // 1 solid, 2 gradient, 3 noise, 4 test pattern,
-                       // 5 oscillator, 7 shape (LayerSourceKind)
+    uint kind;         // LayerSourceKind: 1 solid, 2 gradient, 3 noise,
+                       // 4 test pattern, 5 oscillator, 7 shape
     uint seed;
     uint frame;
-    float ar, ag, ab;  // color A (sRGB)
-    float br, bg, bb;  // color B (sRGB)
-    float scale;       // noise cell size / oscillator frequency
-    float angle;       // gradient / oscillator orientation, radians
+    float ar, ag, ab;  // sRGB
+    float br, bg, bb;  // sRGB
+    float scale;
+    float angle;       // radians
     uint shape;        // oscillator: 0 sine bars, 1 rings, 2 plasma,
-                       // 3 lissajous XY trace
+                       // 3 lissajous; shape node: 0 circle, 1 box,
+                       // 2 diamond
 };
 
 [[vk::binding(0, 0)]] RWTexture2D<float4> output;
@@ -43,13 +42,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 3)
     {
-        // Smooth 2D value noise, re-seeded cell lattice drifting per frame.
         const float cell = max(scale, 2.0);
         const float2 p = float2(tid.xy) / cell;
         const int2 c = int2(floor(p));
         const float2 f = frac(p);
         const float2 u = f * f * (3.0 - 2.0 * f);
-        const uint t = frame / 4;   // gentle boil
+        const uint t = frame / 4;
         const float n00 = fx_hash01(fx_hash4(seed, t, uint(c.x + 4096), uint(c.y + 4096)));
         const float n10 = fx_hash01(fx_hash4(seed, t, uint(c.x + 4097), uint(c.y + 4096)));
         const float n01 = fx_hash01(fx_hash4(seed, t, uint(c.x + 4096), uint(c.y + 4097)));
@@ -59,9 +57,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 4)
     {
-        // Test pattern: 75% SMPTE-style bars over a grayscale
-        // ramp footer with a black/white pluge strip. Static (:
-        // nothing here depends on wall clock).
+        // 75% SMPTE-style bars, grayscale ramp, pluge strip.
         if (uv.y < 0.72)
         {
             const int bar = min(int(uv.x * 7.0), 6);
@@ -87,23 +83,19 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 5)
     {
-        // Oscillator (video-synth source): a periodic pattern to feed
-        // Displace / FM / ring-mod chains. `scale` = cycles across the
-        // frame, `angle` orients it; phase creeps on the frame clock so
-        // patched displacement breathes. Deterministic (frame-clocked).
+        // scale = cycles across the frame; phase creeps on the frame
+        // clock, never wall clock.
         const float t = float(frame) * 0.02;
         const float freq = max(scale, 0.5) * 6.2831853;
         float v;
         if (shape == 1u)
         {
-            // Concentric rings from center.
             const float2 d = (uv - 0.5) *
                              float2(float(width) / float(height), 1.0);
             v = 0.5 + 0.5 * sin(length(d) * freq - t * 2.0);
         }
         else if (shape == 2u)
         {
-            // Plasma: three drifting sine fields interfering.
             const float2 d = uv * freq * 0.5;
             const float p = sin(d.x + t) + sin(d.y - t * 0.7) +
                             sin((d.x + d.y) * 0.6 + t * 1.3) +
@@ -112,17 +104,15 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         else if (shape == 3u)
         {
-            // Lissajous XY trace (scope art): distance field to the
-            // curve sin(a*s), sin(b*s) with b = a + 1, phase creeping on
-            // the frame clock. `scale` picks the ratio, `angle` the
-            // phase offset.
+            // Distance field to sin(a*s), sin(b*s) with b = a + 1;
+            // scale picks the ratio, angle the phase offset.
             const float2 asp =
                 float2(float(width) / float(height), 1.0);
             const float2 p = (uv - 0.5) * asp;
             const float fa = clamp(floor(scale * 0.5 + 0.5), 1.0, 6.0);
             const float fb = fa + 1.0;
-            // Distance to the polyline through 128 curve samples (point
-            // distance alone leaves gaps between samples).
+            // Polyline distance, not point distance: sampling the curve
+            // as points alone leaves gaps between the samples.
             float md = 1e9;
             float2 prev = 0.42 * float2(sin(t * 0.7 + angle),
                                         sin(t * 0.3));
@@ -144,7 +134,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         else
         {
-            // Sine bars along `angle`.
             const float2 dir = float2(cos(angle), sin(angle));
             v = 0.5 + 0.5 * sin(dot(uv - 0.5, dir) * freq + t);
         }
@@ -152,11 +141,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 7)
     {
-        // Shape node (docs/flow_canvas.md): a centered SDF matte —
-        // circle / box / diamond via `shape` — drawn color_a on color_b
-        // (white-on-black by default). `scale` sizes it, `angle` is the
-        // feather width; position/aspect/rotation come from the layer
-        // transform, richer edges from the effect chain it feeds.
+        // Centered SDF matte drawn color_a on color_b. angle carries the
+        // feather width here, not an orientation; position and rotation
+        // come from the layer transform instead.
         const float2 p = (uv - 0.5) *
                          float2(float(width) / float(height), 1.0);
         const float r = clamp(scale * 0.05, 0.02, 1.5);

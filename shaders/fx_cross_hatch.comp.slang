@@ -1,9 +1,4 @@
-// Cross-hatching: pen-and-ink shading — successive angled line screens
-// (45 / -45 / 0 / 90 degrees) accumulate in progressively darker luma
-// bands, with hand-wobble on the strokes. Display-referred; the drawing
-// is ink on paper.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred: the drawing is ink on paper.
 
 #include "fx_common.slang"
 
@@ -17,10 +12,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float spacing;   // line pitch, px
-    float layers;    // hatch directions in play (1..4)
-    float ink;       // stroke darkness
-    float wobble;    // hand tremor on the strokes
+    float spacing;   // px
+    float layers;    // hatch directions, 1 to 4
+    float ink;
+    float wobble;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -44,13 +39,12 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float paper = 1.0;
     for (int i = 0; i < n; ++i) {
-        // Layer i draws where the tone is darker than its band threshold —
-        // deeper shadows collect more hatch directions.
+        // Each layer only draws below its band threshold, so deeper
+        // shadows accumulate more hatch directions.
         const float thresh = 1.0 - (float(i) + 0.55) / (float(n) + 0.6);
         if (l >= thresh) continue;
         const float a = kAngles[i];
         const float ca = cos(a), sa = sin(a);
-        // Distance across the stroke direction, with hand wobble along it.
         const float along = px.x * ca + px.y * sa;
         const float across = -px.x * sa + px.y * ca;
         const float tremor =
@@ -58,14 +52,13 @@ void main(uint3 tid : SV_DispatchThreadID)
             wobble * pitch * 0.8;
         const float d =
             abs(frac((across + tremor) / pitch) - 0.5) * pitch;
-        // Strokes press harder (wider) in darker tone.
+        // Strokes widen as tone darkens, like pressing harder.
         const float press = saturate((thresh - l) / max(thresh, 1.0e-3));
         const float half_w = 0.35 + press * 0.75;
         const float stroke = 1.0 - smoothstep(half_w - 0.4, half_w + 0.4, d);
         paper = min(paper, 1.0 - stroke * ink);
     }
 
-    // Keep a whisper of the source color in the ink.
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float3 drawn =
         lerp(float3(paper, paper, paper), enc * paper, 0.15);

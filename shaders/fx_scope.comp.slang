@@ -1,10 +1,6 @@
-// Scope Monitor: broadcast test-and-measurement as aesthetic. Luma
-// waveform (columns pile their levels), RGB parade (thirds per channel),
-// or chroma vectorscope (samples splat onto the Cb/Cr plane). Each frame
-// contributes a jittered subset of taps; the trace builds up on decaying
-// phosphor like a real tube scope. Canvas = own previous output.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Each frame contributes only a jittered subset of taps, so the trace
+// accumulates over frames on the decaying canvas at binding 1, which is
+// this instance's own previous output.
 
 #include "fx_common.slang"
 
@@ -19,15 +15,15 @@ cbuffer Push
     uint frame;
     float fps;
     float mode;      // 0 waveform, 1 rgb parade, 2 vectorscope
-    float gain;      // trace gain
-    float glow;      // trace brightness
-    float persist;   // phosphor decay
-    float graticule; // reference lines
-    float color;     // 0 green phosphor -> 1 signal color
+    float gain;
+    float glow;
+    float persist;
+    float graticule;
+    float color;     // 0 green phosphor, 1 signal color
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D canvas;   // own previous output
+[[vk::binding(1, 0)]] Sampler2D canvas;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 static const float3 kPhosphor = float3(0.25, 1.0, 0.45);
@@ -50,8 +46,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float g = saturate(glow);
 
     if (m <= 1u) {
-        // Waveform / parade: sample down my column, light up where the
-        // level crosses my row. Level space is encoded (like the meter).
+        // Sample down this column, light up where the level crosses this
+        // row. Level space is encoded, matching a real meter.
         const uint third = min(uint(uv.x * 3.0), 2u);
         const float u = m == 1u ? frac(uv.x * 3.0) : uv.x;
         const float level = 1.0 - uv.y;
@@ -83,13 +79,13 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         col = max(col, trace_col * acc * 0.35 * g);
 
-        // Graticule: level lines at 0 / .25 / .5 / .75 / 1.
+        // Level lines at 0, .25, .5, .75, 1.
         const float lf = frac(level * 4.0);
         const float ld = min(lf, 1.0 - lf) * size.y * 0.25;
         col += kPhosphor * saturate(graticule) * 0.10 *
                exp(-ld * ld * 2.0);
     } else {
-        // Vectorscope: centered square, samples land at (Cb, -Cr).
+        // Samples land at (Cb, -Cr) on a centered square.
         const float2 ndc =
             (float2(tid.xy) - size * 0.5) / (0.5 * size.y);
         for (uint k = 0; k < 64; ++k) {
@@ -111,7 +107,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                 lerp(kPhosphor, rgb * 1.6, saturate(color));
             col = max(col, dot_col * a * g * 1.2);
         }
-        // Graticule: outer ring + center cross.
         const float r = length(ndc);
         const float ring =
             exp(-pow((r - 0.9) * size.y * 0.5, 2.0) * 0.5);

@@ -1,9 +1,5 @@
-// Feedback node: reads the previous frame's own
-// output (one-frame-delay rule — the only legal "cycle" in the graph),
-// transformed per pass: zoom/rotate around center + fade. The classic video
-// feedback tunnel.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Reads its own previous output at binding 1: the one-frame delay that
+// is the only legal cycle in the graph.
 
 #include "fx_common.slang"
 
@@ -17,11 +13,11 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;      // feedback blend strength
-    float zoom;        // scale per pass (1 = none)
+    float amount;
+    float zoom;        // per pass, 1 = none
     float rotate;      // radians per pass
-    float fade;        // brightness decay per pass
-    float hue_shift;   // degrees per pass (color-shift)
+    float fade;
+    float hue_shift;   // degrees per pass
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,7 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Inverse transform: where did this pixel come from last frame?
+    // Inverse transform: where this pixel came from last frame.
     const float aspect = size.x / size.y;
     float2 p = uv - 0.5;
     p.x *= aspect;
@@ -53,8 +49,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (all(prev_uv >= 0.0) && all(prev_uv <= 1.0))
         fb = prev_out.SampleLevel(prev_uv, 0).rgb * (1.0 - saturate(fade));
 
-    // Per-pass color-shift: rotate the fed-back frame's hue
-    // around the luma axis — trails cycle through the spectrum.
+    // Rodrigues rotation of the color about the luma axis.
     if (abs(hue_shift) > 0.01) {
         const float ha = hue_shift * 0.01745329252;
         const float hc = cos(ha), hs = sin(ha);

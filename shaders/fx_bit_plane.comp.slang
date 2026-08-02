@@ -1,10 +1,4 @@
-// Bit-plane glitch: quantize to 8-bit and run a bitwise op (XOR / AND /
-// OR) with a fixed pattern value on selected channels — posterized bands,
-// inverted plateaus, and hard contour rings depending on which bits the
-// pattern touches. Display-referred by definition (bits live on the
-// encoded signal).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred by definition: bits live on the encoded signal.
 
 #include "fx_common.slang"
 
@@ -19,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float op;         // 0 xor, 1 and, 2 or
-    float value;      // pattern byte 1..255
+    float value;      // pattern byte
     float channels;   // 0 rgb, 1 r, 2 g, 3 b
 };
 

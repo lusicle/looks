@@ -1,11 +1,3 @@
-// Auto Camera: one bad point-and-shoot — autofocus hunting (defocus
-// breathing with overshoot), auto-exposure pumping (gain swings that drag
-// the noise floor up with them), and auto-white-balance drifting between
-// warm and cool as the camera second-guesses the scene. All three stack in
-// one effect so a single instance IS the 2003 digicam.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -18,10 +10,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float af;     // focus-hunt depth
-    float ae;     // exposure-pump depth
-    float awb;    // white-balance drift depth
-    float rate;   // hunting rate, hz
+    float af;     // focus hunt
+    float ae;     // exposure pump
+    float awb;    // white-balance drift
+    float rate;   // hz
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -40,8 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float r = max(rate, 0.05);
 
-    // AF hunt: mostly-in-focus with periodic searching excursions — the
-    // squared noise keeps it sharp most of the time, then it lunges.
+    // Squaring the noise keeps focus sharp most of the time, then lunges.
     const float hunt = fx_value_noise1(seed, t * r * 1.3);
     const float defocus = af * 9.0 * hunt * hunt;
 
@@ -62,12 +53,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         col = acc / wsum;
     }
 
-    // AE pump: stepped gain corrections that overshoot then settle.
     const float target =
         (fx_value_noise1(seed ^ 0x0AEAu, t * r * 0.8) - 0.5) * 2.0;
     const float gain = 1.0 + target * ae * 0.55;
     col *= gain;
-    // Gain drags the noise floor with it — shadows crawl when it pumps up.
+    // Gain drags the noise floor with it, so shadows crawl on a pump up.
     const float floor_amt = ae * max(gain - 1.0, 0.0) * 0.35;
     if (floor_amt > 0.001) {
         const float n =
@@ -76,7 +66,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         col += n * floor_amt * shadow;
     }
 
-    // AWB hunt: slow warm/cool see-saw.
     const float temp =
         (fx_value_noise1(seed ^ 0xA3Bu, t * r * 0.5) - 0.5) * 2.0 * awb;
     col *= float3(1.0 + temp * 0.28, 1.0 + temp * 0.04, 1.0 - temp * 0.30);

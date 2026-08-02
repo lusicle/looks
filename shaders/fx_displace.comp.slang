@@ -1,12 +1,6 @@
-// Displacement by luma or second input. The displacement
-// field always comes from `map`: the engine binds the effect input itself
-// (self-luma) or, with map_mode = 1 and a mask reference, the mask's
-// grayscale — whose source can be another layer, an external video, or a
-// generator, each with its own mini chain. Mode 0 shifts along
-// a fixed direction scaled by (map luma - 0.5); mode 1 pushes along the
-// local map-luma gradient (relief-like bulge).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The displacement field always arrives at binding 1: the graph binds
+// either this effect's own input or a wired map there, so the kernel
+// never branches on which.
 
 #include "fx_common.slang"
 
@@ -21,9 +15,9 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;     // px at full luma swing
-    float angle;      // direction for mode 0
-    float mode;       // 0 = directional, 1 = gradient
-    float map_mode;   // 0 = self, 1 = mask (consumed by the graph compiler)
+    float angle;
+    float mode;       // 0 directional, 1 gradient
+    float map_mode;   // consumed by the graph compiler, unused here
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

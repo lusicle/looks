@@ -1,6 +1,5 @@
-// Shared body for the glow blur passes — GLOW_DIR is 0 (horizontal) or 1
-// (vertical), defined by the including file. CCD-smear mode reweights the
-// axes (short horizontal, long vertical streak).
+// Shared body for both glow blur passes. GLOW_DIR is 0 horizontal or
+// 1 vertical, defined by the including file.
 
 #include "fx_common.slang"
 
@@ -32,9 +31,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 size = float2(width, height);
     const float2 uv = (float2(tid.xy) + 0.5) / size;
 
-    // CCD smear: a sensor-readout COLUMN, not a bloom — the
-    // horizontal pass collapses to nothing and the vertical pass runs a
-    // long, flat-weighted streak the height of several radii.
+    // CCD smear is a readout COLUMN, not a bloom, so the horizontal pass
+    // collapses to nothing and the vertical one runs several radii long.
     const bool ccd = int(mode + 0.5) == 2;
     float r = max(radius, 0.5);
     if (ccd)
@@ -48,8 +46,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     for (int i = -8; i <= 8; ++i)
     {
         const float offset = float(i) / 8.0 * r;
-        // Flat-ish weights give the smear its constant-intensity column;
-        // the film modes keep the gaussian falloff.
+        // Flat weights give the smear its constant-intensity column; the
+        // film modes keep the gaussian falloff.
         const float w = (ccd && GLOW_DIR == 1)
             ? 1.0 / (1.0 + abs(offset) / max(r, 1.0) * 1.5)
             : exp(-0.5 * (offset * offset) / (sigma * sigma));

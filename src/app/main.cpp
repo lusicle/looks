@@ -1118,6 +1118,34 @@ struct Selection {
     uint64_t id = 0;   // effect / group / layer / route id by kind
 };
 
+// In-app modal confirm — replaces the native MessageBox guards (silent,
+// theme-matched, no system chrome). One dialog at a time; while open it
+// owns the keyboard and the pointer, and everything under the scrim gets
+// dead input. The guarded flow is stored as a continuation and runs on
+// resolution, so the callers are asynchronous across frames instead of
+// blocking inside the event loop.
+struct ConfirmDialog {
+    enum class Kind : uint8_t { None, SaveDiscard, YesNo };
+    // The continuation an affirmed dialog runs.
+    enum class Action : uint8_t {
+        None,
+        CloseApp,                  // exit guard
+        OpenProjectDialog,         // file picker, then open
+        OpenProjectPath,           // open `path`
+        RestoreProjectAutosave,    // yes: load `path` (autosave) as `path2`
+        RestoreUntitledAutosave,   // yes: load `path`; retires either way
+    };
+    Kind kind = Kind::None;
+    Action action = Action::None;
+    std::string title;
+    std::string text;
+    std::string primary;           // affirmative label ("save" / "restore")
+    std::string secondary;         // negative label ("discard")
+    std::filesystem::path path, path2;
+    ui::ButtonState buttons[3];    // primary / secondary / cancel
+    int hovered = -1;              // interaction pass -> draw pass
+    bool open() const { return kind != Kind::None; }
+};
 
 struct AppState {
     doc::Document document;
@@ -1172,6 +1200,17 @@ struct AppState {
     ui::ButtonState duration_btn;
     std::string clip_name;      // empty = test pattern
     std::string status;         // transient message line
+    ConfirmDialog confirm;      // in-app modal guard (unsaved / restore)
+    // Timeline audio-strip acceleration: per-frame combined amplitude plus
+    // 64-frame block maxima, rebuilt when the analysis stamp moves. The
+    // strip's per-column max scan otherwise touches every frame in the
+    // visible span each UI frame - milliseconds per frame zoomed out on
+    // long clips.
+    struct StripAccel {
+        uint64_t stamp = 0;
+        std::vector<float> amp_frame;         // max(low, mid, high) per frame
+        std::vector<float> amp, onset, cut;   // per-block maxima
+    } strip_accel;
     bool loop = true;
 
     TestPattern pattern;
@@ -1947,32 +1986,11 @@ void save_project(AppState& app, const std::filesystem::path& path) {
     }
 }
 
-void open_project(AppState& app, const std::filesystem::path& path,
-                  platform::Window* window) {
-    // Crash recovery: a newer .autosave.json beside the project
-    // holds work the last session never saved — offer it before loading.
-    std::filesystem::path load_from = path;
-    bool restored = false;
-    {
-        std::filesystem::path auto_path = path;
-        auto_path.replace_extension(".autosave.json");
-        std::error_code e1, e2;
-        if (window && std::filesystem::exists(auto_path, e1) &&
-            std::filesystem::last_write_time(auto_path, e1) >
-                std::filesystem::last_write_time(path, e2) &&
-            !e1 && !e2) {
-            if (platform::show_confirm(
-                    window, "looks",
-                    "a newer autosave of " + path.filename().string() +
-                        " exists - restore it?",
-                    false) == platform::ConfirmResult::Yes) {
-                load_from = auto_path;
-                restored = true;
-            } else {
-                std::filesystem::remove(auto_path, e1);   // declined = stale
-            }
-        }
-    }
+// The load itself, after any autosave-restore choice has been made:
+// `load_from` is the file read (project or its autosave), `path` the
+// project identity it loads as.
+void open_project_load(AppState& app, const std::filesystem::path& load_from,
+                       const std::filesystem::path& path, bool restored) {
     std::string error;
     auto loaded = doc::load_document(load_from, &error);
     if (!loaded && restored) loaded = doc::load_document(path, &error);
@@ -2027,30 +2045,273 @@ void open_project(AppState& app, const std::filesystem::path& path,
     if (app.status.empty()) app.status = std::move(note);
 }
 
+void open_project(AppState& app, const std::filesystem::path& path,
+                  platform::Window* window) {
+    // Crash recovery: a newer .autosave.json beside the project
+    // holds work the last session never saved — offer it before loading.
+    std::filesystem::path auto_path = path;
+    auto_path.replace_extension(".autosave.json");
+    std::error_code e1, e2;
+    if (window && std::filesystem::exists(auto_path, e1) &&
+        std::filesystem::last_write_time(auto_path, e1) >
+            std::filesystem::last_write_time(path, e2) &&
+        !e1 && !e2) {
+        ConfirmDialog d;
+        d.kind = ConfirmDialog::Kind::YesNo;
+        d.action = ConfirmDialog::Action::RestoreProjectAutosave;
+        d.title = "crash recovery";
+        d.text = "a newer autosave of " + path.filename().string() +
+                 " exists - restore it?";
+        d.primary = "restore";
+        d.secondary = "discard";
+        d.path = auto_path;
+        d.path2 = path;
+        app.confirm = std::move(d);
+        return;
+    }
+    open_project_load(app, path, path, false);
+}
+
+void open_project_via_dialog(AppState& app, platform::Window* window) {
+    auto picked = platform::show_open_dialog(
+        window, {{"looks project", "*.json"}, {"all files", "*.*"}});
+    if (picked) open_project(app, *picked, window);
+}
+
 // Unsaved-changes guard: called before anything that would drop the
-// document (close, open-over). True = proceed (saved or discarded), false =
-// the user cancelled. Untitled documents route through Save-As.
-bool confirm_discard_changes(AppState& app, platform::Window* window) {
+// document (close, open-over). True = clean, proceed now; false = the
+// in-app confirm opened (or already owns the frame) and `action` runs on
+// resolution instead. Untitled documents route through Save-As.
+bool guard_unsaved_changes(AppState& app, ConfirmDialog::Action action,
+                           std::filesystem::path payload = {}) {
     if (app.document.revision == app.saved_revision) return true;
+    if (app.confirm.open()) return false;
     const std::string name = app.project_path.empty()
         ? std::string("untitled")
         : app.project_path.filename().string();
-    const auto r = platform::show_confirm(
-        window, "looks", "save changes to " + name + "?", true);
-    if (r == platform::ConfirmResult::Cancel) return false;
-    if (r == platform::ConfirmResult::No) return true;
-    std::filesystem::path path = app.project_path;
-    if (path.empty()) {
-        auto picked = platform::show_save_dialog(
-            window, {{"looks project", "*.json"}},
-            app.document.name + ".json");
-        if (!picked) return false;
-        if (picked->extension() != ".json")
-            picked->replace_extension(".json");
-        path = *picked;
+    ConfirmDialog d;
+    d.kind = ConfirmDialog::Kind::SaveDiscard;
+    d.action = action;
+    d.title = "unsaved changes";
+    d.text = "save changes to " + name + "?";
+    d.primary = "save";
+    d.secondary = "discard";
+    d.path = std::move(payload);
+    app.confirm = std::move(d);
+    return false;
+}
+
+void run_confirm_action(AppState& app, const ConfirmDialog& d,
+                        platform::Window* window, bool* running) {
+    switch (d.action) {
+        case ConfirmDialog::Action::CloseApp:
+            *running = false;
+            break;
+        case ConfirmDialog::Action::OpenProjectDialog:
+            open_project_via_dialog(app, window);
+            break;
+        case ConfirmDialog::Action::OpenProjectPath:
+            open_project(app, d.path, window);
+            break;
+        default:
+            break;
     }
-    save_project(app, path);
-    return app.document.revision == app.saved_revision;  // save can fail
+}
+
+// Dialog resolution. pick: 1 = primary, 2 = secondary, 3 = cancel.
+void resolve_confirm(AppState& app, int pick, platform::Window* window,
+                     bool* running) {
+    // Take the dialog down before running anything: a continuation may
+    // open the NEXT dialog (open-over-dirty chains into autosave-restore).
+    ConfirmDialog d = std::move(app.confirm);
+    app.confirm = {};
+    if (d.kind == ConfirmDialog::Kind::SaveDiscard) {
+        if (pick == 3) return;
+        if (pick == 1) {
+            std::filesystem::path path = app.project_path;
+            if (path.empty()) {
+                auto picked = platform::show_save_dialog(
+                    window, {{"looks project", "*.json"}},
+                    app.document.name + ".json");
+                if (!picked) return;   // save-as declined = action aborted
+                if (picked->extension() != ".json")
+                    picked->replace_extension(".json");
+                path = *picked;
+            }
+            save_project(app, path);
+            if (app.document.revision != app.saved_revision)
+                return;   // save failed — never drop the document
+        }
+        run_confirm_action(app, d, window, running);
+        return;
+    }
+    std::error_code ec;
+    switch (d.action) {
+        case ConfirmDialog::Action::RestoreProjectAutosave:
+            if (pick == 1) {
+                open_project_load(app, d.path, d.path2, true);
+            } else {
+                std::filesystem::remove(d.path, ec);   // declined = stale
+                open_project_load(app, d.path2, d.path2, false);
+            }
+            break;
+        case ConfirmDialog::Action::RestoreUntitledAutosave:
+            if (pick == 1) {
+                std::string error;
+                if (auto rec = doc::load_document(d.path, &error)) {
+                    app.document = std::move(*rec);
+                    app.undo.clear();
+                    app.saved_revision = app.document.revision - 1;
+                    app.autosaved_revision = app.document.revision;
+                    if (!app.document.clip_path.empty()) {
+                        const std::filesystem::path clip =
+                            app.document.clip_path;
+                        if (std::filesystem::exists(clip, ec))
+                            open_source(app, clip);
+                    }
+                    app.status = "restored unsaved session";
+                } else {
+                    app.status = "autosave restore failed: " + error;
+                }
+            }
+            std::filesystem::remove(d.path, ec);   // retires either way
+            break;
+        default:
+            break;
+    }
+}
+
+// ---- confirm dialog modal: layout shared by the interaction pass (frame
+// start, live input) and the draw pass (frame end, above everything).
+
+struct ConfirmLayout {
+    ui::Rect panel;
+    ui::Rect button[3];
+    int count = 0;                     // 3 = save/discard/cancel, 2 = yes/no
+    const std::string* labels[3]{};
+    std::vector<std::string> lines;    // body, wrapped to the panel
+    float title_h = 0.0f, line_h = 0.0f, pad = 20.0f;
+};
+
+ConfirmLayout confirm_layout(const AppState& app, const ui::Font& font,
+                             const ui::Rect& viewport) {
+    static const std::string kCancel = "cancel";
+    const ui::Theme& th = ui::active_theme();
+    const ConfirmDialog& d = app.confirm;
+    ConfirmLayout cl;
+    cl.count = d.kind == ConfirmDialog::Kind::SaveDiscard ? 3 : 2;
+    cl.labels[0] = &d.primary;
+    cl.labels[1] = &d.secondary;
+    cl.labels[2] = &kCancel;
+    const float panel_w = std::min(400.0f, viewport.w - 48.0f);
+    const float inner_w = panel_w - cl.pad * 2.0f;
+    // Greedy word wrap against the panel width.
+    std::string line;
+    size_t pos = 0;
+    while (pos <= d.text.size()) {
+        size_t next = d.text.find(' ', pos);
+        if (next == std::string::npos) next = d.text.size();
+        const std::string word = d.text.substr(pos, next - pos);
+        const std::string cand = line.empty() ? word : line + " " + word;
+        if (!line.empty() &&
+            ui::measure_text(font, cand, th.font_size).x > inner_w) {
+            cl.lines.push_back(line);
+            line = word;
+        } else {
+            line = cand;
+        }
+        pos = next + 1;
+    }
+    if (!line.empty()) cl.lines.push_back(line);
+    cl.line_h = font.line_height() * th.font_size;
+    cl.title_h = font.line_height() * th.font_size_heading;
+    const float btn_h = 24.0f;
+    const float panel_h = cl.pad + cl.title_h + 10.0f +
+                          static_cast<float>(cl.lines.size()) * cl.line_h +
+                          16.0f + btn_h + cl.pad;
+    cl.panel = {std::round((viewport.w - panel_w) * 0.5f),
+                std::round(std::max(24.0f, viewport.h * 0.38f -
+                                               panel_h * 0.5f)),
+                panel_w, panel_h};
+    // Buttons right-aligned, primary rightmost.
+    float bx = cl.panel.right() - cl.pad;
+    const float by = cl.panel.bottom() - cl.pad - btn_h;
+    for (int i = 0; i < cl.count; ++i) {
+        const float bw = std::max(
+            64.0f,
+            ui::measure_text(font, *cl.labels[i], th.font_size).x + 24.0f);
+        bx -= bw;
+        cl.button[i] = {bx, by, bw, btn_h};
+        bx -= 8.0f;
+    }
+    return cl;
+}
+
+// Pointer/keyboard logic against the LIVE input; the caller deadens the
+// input afterwards so the frame under the scrim sees nothing. pick_key
+// carries the event loop's enter (1) / escape (2 or 3) mapping.
+void confirm_interact(AppState& app, const ui::UiInput& input,
+                      const ui::Font& font, const ui::Rect& viewport,
+                      int pick_key, platform::Window* window,
+                      bool* running) {
+    const ConfirmLayout cl = confirm_layout(app, font, viewport);
+    ConfirmDialog& d = app.confirm;
+    d.hovered = -1;
+    int pick = pick_key;
+    for (int i = 0; i < cl.count; ++i) {
+        const bool inside = cl.button[i].contains(input.mouse);
+        if (inside) d.hovered = i;
+        ui::ButtonState& bs = d.buttons[i];
+        if (inside && input.left_pressed()) bs.pressed = true;
+        if (input.left_released()) {
+            if (bs.pressed && inside && pick == 0) pick = i + 1;
+            bs.pressed = false;
+        }
+    }
+    if (pick) resolve_confirm(app, pick, window, running);
+}
+
+void draw_confirm_dialog(ui::Canvas2D& canvas, const ui::Font& font,
+                         const ui::Font* header_font,
+                         const ui::Rect& viewport, AppState& app, float dt) {
+    const ui::Theme& th = ui::active_theme();
+    const ConfirmLayout cl = confirm_layout(app, font, viewport);
+    ConfirmDialog& d = app.confirm;
+    canvas.draw_sdf_rect(viewport, 0.0f, ui::Color{0.0f, 0.0f, 0.0f, 0.45f});
+    const float radius = th.corner_radius * 2.0f;
+    canvas.draw_sdf_rect(cl.panel, radius, th.panel_bg);
+    canvas.draw_sdf_rect_outline(cl.panel, radius, th.stroke_width,
+                                 th.hairline);
+    float y = cl.panel.y + cl.pad;
+    ui::draw_text(canvas, header_font ? *header_font : font, d.title,
+                  {cl.panel.x + cl.pad, y}, th.font_size_heading, th.text);
+    y += cl.title_h + 10.0f;
+    for (const std::string& ln : cl.lines) {
+        ui::draw_text(canvas, font, ln, {cl.panel.x + cl.pad, y},
+                      th.font_size, th.text_dim);
+        y += cl.line_h;
+    }
+    for (int i = 0; i < cl.count; ++i) {
+        ui::ButtonState& bs = d.buttons[i];
+        const float target = d.hovered == i ? 1.0f : 0.0f;
+        bs.hover_t += (target - bs.hover_t) *
+                      std::min(1.0f, dt * 14.0f);
+        ui::Color bg =
+            ui::lerp(th.control_bg, th.control_bg_hover, bs.hover_t);
+        if (bs.pressed) bg = th.control_bg_active;
+        const ui::Rect& r = cl.button[i];
+        canvas.draw_sdf_rect(r, th.corner_radius, bg);
+        canvas.draw_sdf_rect_outline(
+            r, th.corner_radius, th.stroke_width,
+            i == 0 ? th.accent_dim : th.hairline);
+        const std::string& lab = *cl.labels[i];
+        const Vec2 ts = ui::measure_text(font, lab, th.font_size);
+        ui::draw_text(
+            canvas, font, lab,
+            {r.x + (r.w - ts.x) * 0.5f,
+             r.y + (r.h - font.line_height() * th.font_size) * 0.5f},
+            th.font_size, i == 0 ? th.text : th.text_dim);
+    }
 }
 
 // UI-side per-frame job post (render thread): copies only what
@@ -2776,15 +3037,24 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (u->fps > 0.0) {
         const float px_per_sec =
             static_cast<float>(u->fps / vspan) * r.w;
-        const int label_every =
+        // Ticks thin with density: under ~5 px apart the per-second lines
+        // merge into noise and the loop scales with clip length instead of
+        // strip width. Labels stay on tick multiples so they still land.
+        const int tick_every =
+            px_per_sec >= 5.0f
+                ? 1
+                : static_cast<int>(std::ceil(5.0f / px_per_sec));
+        int label_every =
             px_per_sec >= 48.0f
                 ? 1
                 : static_cast<int>(std::ceil(48.0f / px_per_sec));
+        label_every =
+            (label_every + tick_every - 1) / tick_every * tick_every;
         const int s0 = std::max(0, static_cast<int>(v0 / u->fps));
         const int s1 =
             static_cast<int>((v0 + vspan) / u->fps) + 1;
         char tick_buf[16];
-        for (int s = s0; s <= s1; ++s) {
+        for (int s = s0 - s0 % tick_every; s <= s1; s += tick_every) {
             const double f = s * u->fps;
             if (f > u->frame_count) break;
             const float x = frame_x(f);
@@ -2903,6 +3173,10 @@ struct AudioStripUser {
     double v0, v1;
 };
 
+// 64 frames per acceleration block: coarse enough that a whole-clip span
+// costs span/64 block reads, fine enough that partial edges stay cheap.
+constexpr uint32_t kStripBlock = 64;
+
 void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<AudioStripUser*>(node.user);
     const ui::Rect& r = node.rect;
@@ -2913,6 +3187,33 @@ void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const double v0 = u->v0;
     const double vspan = std::max(1.0, u->v1 - u->v0);
     const auto& c = *u->curves;
+    const AppState::StripAccel& accel = u->app->strip_accel;
+    // Max over [f0, f1): per-frame at the partial edges, per-block inside.
+    // Frames past the curve clamp to its last value (same as sample()).
+    auto span_max = [](const float* fr, size_t frn,
+                       const std::vector<float>& blocks, uint32_t f0,
+                       uint32_t f1) -> float {
+        if (!frn) return 0.0f;
+        float m = 0.0f;
+        if (f1 > frn) {
+            m = fr[frn - 1];
+            f1 = static_cast<uint32_t>(frn);
+        }
+        if (f0 >= f1) return m;
+        const uint32_t first_full =
+            (f0 + kStripBlock - 1) / kStripBlock * kStripBlock;
+        const uint32_t last_full = f1 / kStripBlock * kStripBlock;
+        if (first_full >= last_full) {
+            for (uint32_t f = f0; f < f1; ++f) m = std::max(m, fr[f]);
+            return m;
+        }
+        for (uint32_t f = f0; f < first_full; ++f) m = std::max(m, fr[f]);
+        for (uint32_t b = first_full / kStripBlock;
+             b < last_full / kStripBlock; ++b)
+            m = std::max(m, blocks[b]);
+        for (uint32_t f = last_full; f < f1; ++f) m = std::max(m, fr[f]);
+        return m;
+    };
     frame.canvas.push_clip(r);
     const float cy = r.y + r.h * 0.5f;
     const int cols = std::max(1, static_cast<int>(r.w));
@@ -2925,14 +3226,12 @@ void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const uint32_t f1 = std::min(
             u->frame_count,
             std::max(f0 + 1, static_cast<uint32_t>(std::max(0.0, fb))));
-        float amp = 0.0f, onset = 0.0f, cut = 0.0f;
-        for (uint32_t f = f0; f < f1; ++f) {
-            amp = std::max(amp, std::max({c.sample(c.low, f),
-                                          c.sample(c.mid, f),
-                                          c.sample(c.high, f)}));
-            onset = std::max(onset, c.sample(c.onset, f));
-            cut = std::max(cut, c.sample(c.cut, f));
-        }
+        const float amp = span_max(accel.amp_frame.data(),
+                                   accel.amp_frame.size(), accel.amp, f0, f1);
+        const float onset =
+            span_max(c.onset.data(), c.onset.size(), accel.onset, f0, f1);
+        const float cut =
+            span_max(c.cut.data(), c.cut.size(), accel.cut, f0, f1);
         const float x = r.x + static_cast<float>(i) + 0.5f;
         if (cut > 0.5f)
             frame.canvas.draw_line({x, r.y}, {x, r.bottom()}, 1.0f,
@@ -6847,6 +7146,31 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     // aligned to the same view range — keyframe against the material.
     if (app.has_analysis &&
         (!app.analysis.low.empty() || !app.analysis.onset.empty())) {
+        if (app.strip_accel.stamp != app.analysis_stamp) {
+            const mod::AnalysisCurves& c = app.analysis;
+            AppState::StripAccel& a = app.strip_accel;
+            const size_t n = std::max(
+                {c.low.size(), c.mid.size(), c.high.size()});
+            a.amp_frame.assign(n, 0.0f);
+            for (size_t f = 0; f < n; ++f) {
+                const uint32_t fi = static_cast<uint32_t>(f);
+                a.amp_frame[f] = std::max({c.sample(c.low, fi),
+                                           c.sample(c.mid, fi),
+                                           c.sample(c.high, fi)});
+            }
+            auto block_max = [](const std::vector<float>& fr,
+                                std::vector<float>& out) {
+                out.assign((fr.size() + kStripBlock - 1) / kStripBlock,
+                           0.0f);
+                for (size_t f = 0; f < fr.size(); ++f)
+                    out[f / kStripBlock] =
+                        std::max(out[f / kStripBlock], fr[f]);
+            };
+            block_max(a.amp_frame, a.amp);
+            block_max(c.onset, a.onset);
+            block_max(c.cut, a.cut);
+            a.stamp = app.analysis_stamp;
+        }
         auto* strip_user = arena.alloc<AudioStripUser>();
         strip_user->app = &app;
         strip_user->curves = &app.analysis;
@@ -7179,28 +7503,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             executable_dir() / "cache" / "untitled.autosave.json";
         std::error_code ec;
         if (std::filesystem::exists(unsaved, ec)) {
-            if (platform::show_confirm(
-                    window.get(), "looks",
-                    "restore unsaved work from your last session?",
-                    false) == platform::ConfirmResult::Yes) {
-                std::string error;
-                if (auto rec = doc::load_document(unsaved, &error)) {
-                    app.document = std::move(*rec);
-                    app.undo.clear();
-                    app.saved_revision = app.document.revision - 1;
-                    app.autosaved_revision = app.document.revision;
-                    if (!app.document.clip_path.empty()) {
-                        const std::filesystem::path clip =
-                            app.document.clip_path;
-                        if (std::filesystem::exists(clip, ec))
-                            open_source(app, clip);
-                    }
-                    app.status = "restored unsaved session";
-                } else {
-                    app.status = "autosave restore failed: " + error;
-                }
-            }
-            std::filesystem::remove(unsaved, ec);
+            // Offered through the in-app modal on the first frames; the
+            // resolution loads and/or retires the file.
+            ConfirmDialog d;
+            d.kind = ConfirmDialog::Kind::YesNo;
+            d.action = ConfirmDialog::Action::RestoreUntitledAutosave;
+            d.title = "crash recovery";
+            d.text = "restore unsaved work from your last session?";
+            d.primary = "restore";
+            d.secondary = "discard";
+            d.path = unsaved;
+            app.confirm = std::move(d);
         }
     }
 
@@ -7235,12 +7548,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             input.mouse.y >= app.tl_rect.y &&
             input.mouse.y < app.tl_rect.bottom();
         float key_seek = -1.0f;   // keyboard playhead move (frames)
+        int confirm_pick = 0;     // modal keyboard: 1 enter, 2/3 escape
         for (const platform::Event& e : events) {
+            // Modal confirm owns the keyboard: enter affirms, escape backs
+            // out; every other event (shortcuts, typing, drops, close)
+            // stays inert until the dialog resolves.
+            if (app.confirm.open()) {
+                if (e.type == platform::Event::Type::KeyDown) {
+                    if (e.key == platform::Key::Enter) {
+                        confirm_pick = 1;
+                    } else if (e.key == platform::Key::Escape) {
+                        confirm_pick =
+                            app.confirm.kind ==
+                                    ConfirmDialog::Kind::SaveDiscard
+                                ? 3
+                                : 2;
+                    }
+                }
+                continue;
+            }
             switch (e.type) {
                 case platform::Event::Type::CloseRequested:
                     // Unsaved-changes guard: closing never silently
                     // drops edits.
-                    if (confirm_discard_changes(app, window.get()))
+                    if (guard_unsaved_changes(
+                            app, ConfirmDialog::Action::CloseApp))
                         running = false;
                     break;
                 case platform::Event::Type::Char:
@@ -7807,6 +8139,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<float>(frame.extent.height) / scale};
 
         input.begin_frame(events, scale);
+        // Modal confirm: interacts with the live pointer NOW, then the
+        // frame under the scrim gets dead input — no hover, no clicks,
+        // no wheel, no capture churn.
+        if (app.confirm.open()) {
+            confirm_interact(app, input, font, viewport, confirm_pick,
+                             window.get(), &running);
+            input.buttons_down = 0;
+            input.buttons_pressed = 0;
+            input.buttons_released = 0;
+            input.wheel_x = input.wheel_y = 0.0f;
+            input.typed.clear();
+            input.mouse = {-4096.0f, -4096.0f};
+            input.mouse_delta = {};
+            input.consumed = true;
+        }
         // Timeline zoom/pan: pre-routed against LAST frame's region
         // rect so the lane scroll area cannot swallow the wheel first.
         app.tl_rect = app.tl_rect_accum;
@@ -11206,17 +11553,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (((frame_ui.open_project_clicked &&
               *frame_ui.open_project_clicked) ||
              do_open_project) &&
-            confirm_discard_changes(app, window.get())) {
-            auto picked = platform::show_open_dialog(
-                window.get(),
-                {{"looks project", "*.json"}, {"all files", "*.*"}});
-            if (picked) open_project(app, *picked, window.get());
+            guard_unsaved_changes(
+                app, ConfirmDialog::Action::OpenProjectDialog)) {
+            open_project_via_dialog(app, window.get());
         }
         // Recent-project opens, dirty-guarded like every open.
         for (const FrameUi::RecentRow& rrow : frame_ui.recent_rows) {
             if (!*rrow.clicked) continue;
             if (rrow.index < app.recent_projects.size() &&
-                confirm_discard_changes(app, window.get()))
+                guard_unsaved_changes(
+                    app, ConfirmDialog::Action::OpenProjectPath,
+                    app.recent_projects[rrow.index]))
                 open_project(app, app.recent_projects[rrow.index],
                              window.get());
             break;
@@ -11307,7 +11654,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     } else {
                         app.status = "preset import failed";
                     }
-                } else if (confirm_discard_changes(app, window.get())) {
+                } else if (guard_unsaved_changes(
+                               app, ConfirmDialog::Action::OpenProjectPath,
+                               p)) {
                     open_project(app, p, window.get());
                 }
             } else if (ext == ".mp4" || ext == ".mov" || ext == ".mez" ||
@@ -11648,6 +11997,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                           th.font_size_small, th.text);
             ctx.clear_tooltip();
         }
+
+        // Modal confirm: scrim + panel above everything, tooltips included.
+        if (app.confirm.open())
+            draw_confirm_dialog(canvas, font,
+                                header_font ? &*header_font : nullptr,
+                                viewport, app, dt);
 
         ui_renderer->record(frame.cmd, frame.frame_index, frame.extent, canvas);
         renderer->end_frame(frame);

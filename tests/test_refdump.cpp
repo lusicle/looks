@@ -86,6 +86,25 @@ void i420_to_rgb(const looks::codec::FrameView& v, std::vector<uint8_t>& rgb) {
 
 }  // namespace
 
+// Same dev-harness pattern for long-form footage: when
+// temp/long example.mp4 exists, import it once with the app's default
+// options (bundle cached under temp/long_example/) so timeline and player
+// behavior on long clips can be exercised through the smoke workflow.
+TEST(long_example_import) {
+    namespace fs = std::filesystem;
+    const fs::path root(LOOKS_REPO_ROOT);
+    const fs::path src = root / "temp" / "long example.mp4";
+    if (!fs::exists(src)) return;   // harness inactive on this machine
+
+    const fs::path bundle_dir = root / "temp" / "long_example";
+    std::error_code ec;
+    fs::create_directories(bundle_dir, ec);
+    if (fs::exists(bundle_dir / "long example.mez")) return;   // cached
+    const looks::media::ImportResult res =
+        looks::media::import_media(src, bundle_dir, {});
+    CHECK(res.ok);
+}
+
 TEST(ref_frames_dump) {
     namespace fs = std::filesystem;
     const fs::path root(LOOKS_REPO_ROOT);

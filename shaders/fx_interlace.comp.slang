@@ -1,10 +1,3 @@
-// Interlace / combing sim: alternate scanlines shift in
-// opposite horizontal directions, flipping with the frame parity — the
-// tearing comb of a deinterlaced field pair. Mode 1 keeps only the
-// scanline darkening (CRT line structure without motion tearing).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -18,8 +11,8 @@ cbuffer Push
     uint frame;
     float fps;
     float shift;    // comb offset, px
-    float darken;   // odd-line attenuation
-    float mode;     // 0 = comb + lines, 1 = lines only
+    float darken;
+    float mode;     // 0 comb and lines, 1 lines only
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

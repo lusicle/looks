@@ -1,10 +1,3 @@
-// RGB split/shift (proof effect, category 7). Per-channel UV
-// offsets in pixels.
-//
-// Composition (canonical): wet is interior to the blend, opacity outside:
-//   final = mix(input, blend(input, mix(input, fx(input), wet)), opacity)
-// Blend is Normal (identity) until the compositing milestone.
-
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -12,10 +5,10 @@ cbuffer Push
     uint height;
     float wet;
     float opacity;
-    uint seed;        // shared fx prelude (unused here)
+    uint seed;
     uint frame;
     float fps;
-    float shift_x;    // px, red one way / blue the other
+    float shift_x;    // px; red shifts one way, blue the other
     float shift_y;
 };
 

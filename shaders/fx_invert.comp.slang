@@ -1,8 +1,4 @@
-// Invert: plain negative, film negative (inversion seen through the C-41
-// orange print mask — the strip-of-negatives look), or luma-only
-// inversion (hues survive, tones flip). Encoded-domain.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded-domain.
 
 #include "fx_common.slang"
 
@@ -36,13 +32,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint m = uint(mode + 0.5);
     float3 flipped;
     if (m == 1u) {
-        // Film negative: invert, then multiply through the orange mask
-        // and lift the floor a touch (film base is never black).
+        // Orange print mask, and the floor lift because film base is
+        // never black.
         const float3 mask = float3(1.0, 0.62, 0.30);
         flipped = (1.0 - enc) * mask;
         flipped = flipped * 0.92 + 0.05;
     } else if (m == 2u) {
-        // Luma-only: flip tone, keep the chroma vector.
+        // Adding the luma delta flips tone while the chroma vector rides
+        // through unchanged.
         const float l = fx_luma(enc);
         flipped = saturate(enc + ((1.0 - l) - l));
     } else {

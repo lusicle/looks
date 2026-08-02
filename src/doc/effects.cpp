@@ -85,18 +85,20 @@ constexpr ParamDesc kMotionExtractParams[] = {
 
 constexpr ParamDesc kDatamoshParams[] = {
     {"quality", "quality", 1.0f, 100.0f, 50.0f, "%.0f", nullptr, true},
-    {"gop", "gop (0=hold)", 0.0f, 120.0f, 0.0f, "%.0f", nullptr, true},
+    // gop is the VIRTUAL encoder's I-frame cadence; drop_i decides whether
+    // the moshed chain accepts them. drop + motion or cuts = the melt;
+    // gop 0 = no I-frames at all, so divergence never heals either way.
+    {"gop", "gop (0=none)", 0.0f, 120.0f, 30.0f, "%.0f", nullptr, true},
     {"mv_scale", "mv scale", -4.0f, 4.0f, 1.0f, "%.2f"},
     {"mv_random", "mv random", 0.0f, 32.0f, 0.0f, "%.1f px"},
     {"corrupt", "corrupt", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"bloom", "bloom", 0.0f, 8.0f, 0.0f, "%.0f", nullptr, true},
-    // user ops, previously codec-only: MV rotate, structured
-    // byte corruption, and replace-with-custom-field (pan/zoom/swirl).
     {"mv_rotate", "mv rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
     {"byte_flips", "byte flips", 0.0f, 64.0f, 0.0f, "%.0f", nullptr, true},
     {"mv_field", "field", 0.0f, 3.0f, 0.0f, "%.0f",
      "flow|pan|zoom|swirl"},
     {"field_amt", "field amt", -32.0f, 32.0f, 8.0f, "%.0f px"},
+    {"drop_i", "i-frames", 0.0f, 1.0f, 1.0f, "%.0f", "accept|drop"},
 };
 
 constexpr ParamDesc kGenerationLossParams[] = {
@@ -1001,7 +1003,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"flow_smear", "Flow Smear", kFlowSmearParams, 2, FxCategory::Time},
     {"motion_extract", "Motion Extract", kMotionExtractParams, 2,
      FxCategory::Time},
-    {"datamosh", "Datamosh", kDatamoshParams, 10, FxCategory::Signal},
+    {"datamosh", "Datamosh", kDatamoshParams, 11, FxCategory::Signal},
     {"generation_loss", "Generation Loss", kGenerationLossParams, 2,
      FxCategory::Signal},
     {"bitrate_starve", "Bitrate Starve", kBitrateStarveParams, 2,

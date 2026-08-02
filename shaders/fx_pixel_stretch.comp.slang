@@ -1,8 +1,3 @@
-// Pixel stretch: freeze one row (or column) and smear it across
-// the rest of the frame — everything past the frozen line samples the line.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -15,7 +10,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float position;   // normalized location of the frozen row/col
+    float position;   // normalized, the frozen row or column
     float mode;       // 0 smear down, 1 up, 2 right, 3 left
 };
 

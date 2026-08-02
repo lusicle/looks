@@ -1,9 +1,5 @@
-// Pixelate/mosaic (proof effect, category 5). Block-averaged?
-// No — classic point-sample at block centers (the crunchy look).
-//
-// Composition (canonical): wet is interior to the blend, opacity outside:
-//   final = mix(input, blend(input, mix(input, fx(input), wet)), opacity)
-// Blend is Normal (identity) until the compositing milestone.
+// Point-samples block centers rather than averaging blocks, which is
+// what keeps the mosaic crunchy.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -12,10 +8,10 @@ cbuffer Push
     uint height;
     float wet;
     float opacity;
-    uint seed;        // shared fx prelude (unused here)
+    uint seed;
     uint frame;
     float fps;
-    float block_size;   // px, >= 1
+    float block_size;   // px
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

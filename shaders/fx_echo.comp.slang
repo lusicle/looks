@@ -1,8 +1,5 @@
-// Echo / ghost trails (category 1): decay blend against the
-// effect's own previous OUTPUT (persistent per-instance target fed by the
-// engine). mode 0 = lighten trails (max), 1 = crossfade smear.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Binding 1 is this instance's own previous output, under the
+// one-frame-delay rule.
 
 #include "fx_common.slang"
 
@@ -16,12 +13,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float decay;       // trail persistence per frame
+    float decay;
     float mode;        // 0 lighten, 1 crossfade
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D prev_out;   // this effect's last output
+[[vk::binding(1, 0)]] Sampler2D prev_out;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]

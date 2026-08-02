@@ -1,8 +1,5 @@
-// Sharpen (primitive): clean unsharp mask — a separable-ish 9-tap
-// gaussian estimate subtracted from the pixel, added back scaled. The
-// deliberately-degraded halo look stays in Oversharpen; this one is the
-// neutral tool. Taps stay bounded (9 fixed) regardless of radius.
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Tap count stays fixed at 9 regardless of radius; the halo look lives
+// in Oversharpen, this is the neutral tool.
 
 #include "fx_common.slang"
 
@@ -16,8 +13,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;   // 0..2 unsharp gain
-    float radius;   // 0.5..6 px blur radius
+    float amount;
+    float radius;   // px
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -33,8 +30,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) * px;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // 3x3 gaussian ring at `radius` spacing — bilinear taps make the
-    // footprint scale continuously without extra samples.
+    // Bilinear taps let the footprint scale continuously with radius
+    // without adding samples.
     const float2 r = px * max(radius, 0.01);
     float3 blur = base.rgb * 0.25;
     blur += input.SampleLevel(uv + float2(r.x, 0.0), 0).rgb * 0.125;

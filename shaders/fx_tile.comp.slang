@@ -1,7 +1,5 @@
-// Tile: grid repeat with mirror alternation (the TD Tile TOP). Mirroring
-// makes edges continuous so the grid reads kaleidoscopic rather than cut.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Mirroring alternate cells makes tile edges continuous, so the grid
+// reads kaleidoscopic rather than cut.
 
 #include "fx_common.slang"
 
@@ -17,7 +15,7 @@ cbuffer Push
     float fps;
     float cols;
     float rows_n;
-    float mirror;   // 1 = alternate-flip tiles
+    float mirror;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

@@ -66,6 +66,19 @@ void intra_dct(const FrameView& frame, IntraDct& out, bool parallel);
 void intra_entropy(const IntraDct& dct, int quality,
                    std::vector<uint8_t>& out);
 
+// Entropy-free reconstruction: quantize + dequantize + IDCT straight from
+// the DCT phase. Entropy is lossless, so pixels are bit-identical to
+// intra_entropy + decode_frame at the same quality — the wire without the
+// bytes, for consumers that never read the stream (the Codec-Box when
+// nothing rate-limits or corrupts it).
+void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
+                 bool parallel);
+
+// Exact byte count intra_entropy would produce at this quality, without
+// writing it (parallel AC scan + serial DC-delta chain). Rate loops probe
+// with this and reconstruct once.
+size_t intra_entropy_bytes(const IntraDct& dct, int quality);
+
 class MezWriter {
 public:
     ~MezWriter();

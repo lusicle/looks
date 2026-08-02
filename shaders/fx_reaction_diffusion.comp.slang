@@ -1,8 +1,5 @@
-// Reaction-diffusion composite: the Gray-Scott B field inks
-// over the frame — dark organic growth (ink 0) or luminous coral (ink 1).
-// The sim itself runs in rd_step; this kernel just draws the state.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Draws the state only. The Gray-Scott sim itself runs in rd_step, which
+// the engine steps per instance before this dispatch.
 
 #include "fx_common.slang"
 
@@ -16,11 +13,11 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float feed;     // unused here (sim params live in rd_step)
+    float feed;     // sim params, consumed by rd_step, unused here
     float kill;
     float steps;
     float inject;
-    float ink;      // 0 = dark ink, 1 = glowing growth
+    float ink;      // 0 dark ink, 1 glowing growth
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -42,11 +39,9 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 col;
     if (ink < 0.5) {
-        // Dark ink with a faint bright rim.
         col = base.rgb * (1.0 - body * 0.92);
         col += rim * base.rgb * 0.8 + rim * 0.05;
     } else {
-        // Luminous growth tinted by the underlying image.
         col = base.rgb + body * (base.rgb * 2.5 + 0.08) + rim * 0.15;
     }
 

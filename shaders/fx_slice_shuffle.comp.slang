@@ -1,10 +1,3 @@
-// Slice shuffle: the frame splits into horizontal bands; a
-// seeded per-band coin decides which bands displace sideways, re-rolled at
-// `rate` Hz on the timeline clock. Displaced bands wrap around — the
-// classic corrupted-scan look. Deterministic: (seed, step, band) hash.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,10 +10,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float slices;   // band count
+    float slices;
     float amount;   // max displacement, px
-    float rate;     // reshuffle rate, hz (0 = static)
-    float prob;     // chance a band displaces
+    float rate;     // hz, 0 = static
+    float prob;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

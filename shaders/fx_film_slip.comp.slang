@@ -1,9 +1,4 @@
-// Film slip: the projector loses the loop — the frame sits (or rolls)
-// off-register so the black frame line crosses the screen, with the
-// neighboring frame showing across the divide and an optional lagging
-// double-exposure ghost. SyncFail is the VIDEO roll; this is the FILM one.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The film counterpart to SyncFail, which is the video roll.
 
 #include "fx_common.slang"
 
@@ -17,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float slip;    // static offset (0..1 of a frame height)
-    float speed;   // continuous roll, hz (0 = parked off-register)
-    float blend;   // double-exposure ghost strength
+    float slip;    // 0..1 of a frame height
+    float speed;   // hz, 0 = parked off-register
+    float blend;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -41,15 +36,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 suv = float2(uv.x, frac(uv.y + offset));
     float3 col = input.SampleLevel(suv, 0).rgb;
 
-    // Double exposure: the gate sees a lagging half-frame ghost.
     if (blend > 0.001) {
         const float2 guv = float2(uv.x, frac(uv.y + offset + 0.5));
         col = lerp(col, col + input.SampleLevel(guv, 0).rgb * 0.6,
                    blend * 0.6);
     }
 
-    // Frame line: the black divide between frames, soft-edged, riding at
-    // the wrap seam.
+    // The black frame line rides the wrap seam.
     if (offset > 0.002 && offset < 0.998) {
         const float seam = 1.0 - offset;
         const float d = min(abs(uv.y - seam),

@@ -77,14 +77,24 @@ void GpuImage::transition(VkCommandBuffer cmd, VkImageLayout new_layout) {
 // ------------------------------------------------------------ staging
 
 StagingBuffer::~StagingBuffer() {
+    reset();
     if (buffer_)
         vmaDestroyBuffer(device_.allocator(), buffer_, allocation_);
 }
 
+void StagingBuffer::reset() {
+    for (const Retired& r : retired_)
+        vmaDestroyBuffer(device_.allocator(), r.buffer, r.allocation);
+    retired_.clear();
+    offset_ = 0;
+}
+
 bool StagingBuffer::ensure(size_t needed) {
     if (capacity_ >= needed) return true;
-    if (buffer_)
-        vmaDestroyBuffer(device_.allocator(), buffer_, allocation_);
+    // Growth retires the old buffer instead of destroying it: copies
+    // recorded earlier this frame still reference it, so it must survive
+    // until the slot's fence proves the frame executed (next reset()).
+    if (buffer_) retired_.push_back({buffer_, allocation_});
     size_t capacity = 4u << 20;
     while (capacity < needed) capacity *= 2;
 

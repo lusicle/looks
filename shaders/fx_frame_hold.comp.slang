@@ -1,9 +1,5 @@
-// Frame-rate / shutter sim: the engine refreshes the held
-// frame only when the target-fps tick advances, so 30 fps footage judders
-// like 16 mm. Shutter blend mixes the live frame back in — a cheap stand-in
-// for 180° accumulation smear.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The engine refreshes the held frame only when the target-fps tick
+// advances; this kernel just mixes held against live.
 
 #include "fx_common.slang"
 
@@ -18,7 +14,7 @@ cbuffer Push
     uint frame;
     float fps;
     float hold_fps;
-    float blend;    // 0 = pure hold (judder), 1 = live
+    float blend;    // 0 pure hold, 1 live
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

@@ -179,6 +179,41 @@ TEST(codec_two_phase_intra_matches) {
     }
 }
 
+TEST(codec_intra_recon_matches_decode) {
+    // The entropy-free wire must reproduce encode+decode EXACTLY: the mosh
+    // box's output pixels ride on this equivalence. Odd size hits flat
+    // edge blocks.
+    const DecodedFrame f = make_test_frame(70, 50, 4);
+    for (const int q : {5, 35, 90}) {
+        IntraDct dct;
+        intra_dct(f.view(), dct, /*parallel=*/true);
+        std::vector<uint8_t> encoded;
+        intra_entropy(dct, q, encoded);
+        DecodedFrame via_stream;
+        CHECK(decode_frame(encoded.data(), encoded.size(), 70, 50,
+                           via_stream, /*parallel=*/true));
+        DecodedFrame direct;
+        intra_recon(dct, q, direct, /*parallel=*/true);
+        CHECK(direct.y == via_stream.y);
+        CHECK(direct.u == via_stream.u);
+        CHECK(direct.v == via_stream.v);
+    }
+}
+
+TEST(codec_intra_entropy_bytes_exact) {
+    // The rate probe must count the writer's bytes exactly: quality
+    // selection in the starvation loop depends on it, and a one-byte drift
+    // would change which quality ships.
+    const DecodedFrame f = make_test_frame(70, 50, 8);
+    IntraDct dct;
+    intra_dct(f.view(), dct, /*parallel=*/true);
+    for (const int q : {1, 12, 37, 60, 85, 100}) {
+        std::vector<uint8_t> encoded;
+        intra_entropy(dct, q, encoded);
+        CHECK_EQ(intra_entropy_bytes(dct, q), encoded.size());
+    }
+}
+
 TEST(codec_frame_odd_dimensions) {
     // 50x34: partial macroblocks on both axes.
     const DecodedFrame src = make_test_frame(50, 34, 2);

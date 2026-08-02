@@ -1,14 +1,6 @@
-// UI fragment shader. Two paths selected per-vertex by `shape`:
-//
-//   1. Pass-through (shape.x == 0 && shape.y == 0): solid rects, gradients,
-//      triangles, lines — interpolated vertex color straight out.
-//   2. SDF rounded rect (radius > 0 || stroke > 0):
-//      shape = { radius, stroke, halfW, halfH } in physical px. Fill when
-//      stroke == 0; outline ring of width `stroke` otherwise. Edge AA via
-//      fwidth of the SDF — correct at any UI scale.
-//
-// Blend is straight alpha (src_alpha / one_minus_src_alpha), so coverage is
-// folded into the returned alpha.
+// v_shape is { radius, stroke, halfW, halfH } in physical px, and both
+// zero selects the pass-through path. Blending is straight alpha, so
+// coverage is folded into the returned alpha rather than a separate mask.
 
 struct FSInput
 {
@@ -27,7 +19,6 @@ float4 main(FSInput input) : SV_Target
         return input.v_color;
     }
 
-    // UV spans [0,1] across the quad; reconstruct the offset from center.
     const float2 half_size = input.v_shape.zw;
     const float2 local = (input.v_uv - 0.5) * (2.0 * half_size);
     const float2 q = abs(local) - half_size + radius;

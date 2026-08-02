@@ -1,7 +1,4 @@
-// Flow smear (category 1): accumulate taps backward along the
-// motion vector — moving regions streak, still regions stay sharp.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Taps run BACKWARD along the motion vector, so still regions stay sharp.
 
 #include "fx_common.slang"
 
@@ -15,12 +12,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;      // smear length multiplier
-    float falloff;     // 0 = uniform trail, 1 = fast decay
+    float amount;
+    float falloff;     // 0 uniform trail, 1 fast decay
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D flow;    // block MVs in px, (w/16, h/16)
+[[vk::binding(1, 0)]] Sampler2D flow;    // block MVs in px
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]

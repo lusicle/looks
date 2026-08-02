@@ -1,21 +1,15 @@
-// Layer compositing: blends a layer's output over the composite
-// below it in linear space, then mixes by layer opacity. Adjustment layers
-// use Normal — the adjusted composite crossfades over the original.
-//
-// When the layer has a transform (crop/flip/scale/rotate), the
-// same gate the transform pass rendered as black is recomputed here as a
-// per-pixel coverage on opacity — cropped or scaled-down layers reveal the
-// composite below instead of stamping black over it.
+// The transform gate is recomputed here as per-pixel coverage on
+// opacity, so cropped or scaled-down layers reveal the composite below
+// instead of stamping the transform pass's black over it.
 
 [[vk::push_constant]]
 cbuffer Push
 {
     uint width;
     uint height;
-    uint mode;         // BlendMode: 0 normal, 1 add, 2 multiply, 3 screen,
-                       // 4 difference
+    uint mode;         // doc::BlendMode
     float opacity;
-    uint has_xform;    // 0 = identity transform (skip the gate)
+    uint has_xform;    // 0 = identity, skip the gate
     float crop_l;
     float crop_r;
     float crop_t;

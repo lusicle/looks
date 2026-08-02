@@ -1,10 +1,5 @@
-// Solarize / wavefold: Sabattier partial inversion generalized into a
-// synth wavefolder on the encoded transfer — values past the threshold
-// reflect back down, and extra folds bounce them repeatedly like an
-// overdriven folder. knee softens the crease. Per-channel, so color
-// content shears into the classic metallic look.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Folds per channel rather than on luma, which is what shears color into
+// the metallic look.
 
 #include "fx_common.slang"
 
@@ -18,9 +13,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float threshold;   // fold point
-    float folds;       // fold iterations
-    float knee;        // crease softness
+    float threshold;
+    float folds;
+    float knee;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -28,11 +23,11 @@ cbuffer Push
 
 float fold1(float x, float t, float k)
 {
-    // Reflect x about t (soft crease of width k) and renormalize so the
-    // full input range keeps using the full output range.
+    // Reflect x about t, then renormalize so the full input range keeps
+    // using the full output range.
     const float over = x - t;
     if (k > 1.0e-3) {
-        // Smooth |over| via sqrt(x^2 + k^2) - k: rounds the crease tip.
+        // sqrt(over^2 + k^2) - k is a smooth |over|, rounding the crease.
         const float folded = t - (sqrt(over * over + k * k) - k);
         return max(folded, 0.0) / max(t, 1.0e-3) * t;
     }

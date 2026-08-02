@@ -1,10 +1,7 @@
-// Pixel sort — the glitch staple. Pixels whose luma falls inside the
-// threshold band form spans along the sort axis; each span is replaced by
-// a luma-ordered gradient between its darkest and brightest member, which
-// is what a real per-row sort converges to, computed span-parallel on the
-// GPU. Deterministic, stateless.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Each span is replaced by a gradient between its darkest and brightest
+// member, which is what a real per-row sort converges to. That framing is
+// what lets every pixel resolve its own span independently, with no
+// scatter and no cross-thread ordering.
 
 #include "fx_common.slang"
 
@@ -18,9 +15,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float threshold;   // band low edge (encoded luma)
-    float range;       // band height above the threshold
-    float length_px;   // max span length walked per side
+    float threshold;   // band low edge, encoded luma
+    float range;
+    float length_px;   // max walked per side
     float direction;   // 0 horizontal, 1 vertical
 };
 
@@ -54,8 +51,8 @@ void main(uint3 tid : SV_DispatchThreadID)
                                          : float2(1.0 / size.x, 0.0);
     const int max_walk = int(clamp(length_px, 8.0, 256.0));
 
-    // Walk both ways while the band holds: find this pixel's span, its
-    // extremes, and our position inside it.
+    // Walk both ways while the band holds, collecting the span extremes
+    // and this pixel's position within it.
     int back = 0;
     float3 dark = base.rgb, bright = base.rgb;
     float dark_l = l0, bright_l = l0;
@@ -84,7 +81,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float span = float(back + fwd);
     float3 col = base.rgb;
     if (span >= 2.0) {
-        // Sorted span: dark -> bright gradient along the axis.
         const float f = float(back) / span;
         col = lerp(dark, bright, f);
     }

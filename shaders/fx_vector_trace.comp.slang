@@ -1,10 +1,5 @@
-// Vector Trace: beam strokes crawl along image contours over decaying
-// phosphor — the image perpetually being hand-drawn in outline. Seeded
-// strokes spawn on edges (one candidate per cell); each is a two-segment
-// polyline following the isophote tangent, with a bright head sliding
-// along it on the crawl clock. Canvas = own previous output.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Strokes follow the isophote tangent, so they crawl along contours. The
+// canvas at binding 1 is this instance's own previous output.
 
 #include "fx_common.slang"
 
@@ -18,20 +13,19 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float density;   // stroke spawn probability
-    float len_px;    // stroke length
-    float rate;      // head crawl rate, hz
-    float persist;   // phosphor decay
-    float beam_w;    // stroke width, px
-    float edge;      // how strongly strokes require edges
-    float color;     // 0 mono phosphor -> 1 source color
+    float density;
+    float len_px;
+    float rate;      // hz
+    float persist;
+    float beam_w;    // px
+    float edge;
+    float color;     // 0 mono phosphor, 1 source color
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D canvas;   // own previous output
+[[vk::binding(1, 0)]] Sampler2D canvas;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
-// Luma gradient by central differences (encoded space for stable edges).
 float2 vt_grad(Sampler2D tex, float2 uv, float2 size)
 {
     const float2 e = 1.5 / size;
@@ -46,7 +40,7 @@ float2 vt_grad(Sampler2D tex, float2 uv, float2 size)
     return float2(lr - ll, ld - lu);
 }
 
-// Distance from p to segment ab, and the normalized parameter along it.
+// Returns (distance from p to segment ab, normalized parameter along it).
 float2 vt_seg(float2 p, float2 a, float2 b)
 {
     const float2 ab = b - a;
@@ -67,7 +61,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 col = canvas.SampleLevel(uv, 0).rgb * saturate(persist);
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
-    const uint epoch = uint(t * 0.25);   // strokes refresh slowly
+    const uint epoch = uint(t * 0.25);
     const float len = max(len_px, 4.0);
     const float cell = len * 1.25;
     const float bw = max(beam_w, 0.5);
@@ -88,17 +82,15 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (start.x >= size.x || start.y >= size.y) continue;
         const float2 suv = (start + 0.5) / size;
 
-        // Spawn gate: edge affinity wants gradient under the start.
         const float2 g = vt_grad(input, suv, size);
         const float gmag = length(g);
         const float prob = saturate(density) *
                            lerp(1.0, saturate(gmag * 8.0), saturate(edge));
         if (fx_hash01(fx_hash(h ^ 0x43u)) >= prob) continue;
 
-        // Two-segment polyline along the contour tangent.
         float2 tan1 = gmag > 1e-5 ? float2(-g.y, g.x) / gmag
                                   : float2(1.0, 0.0);
-        if ((h & 0x100u) != 0u) tan1 = -tan1;   // seeded direction
+        if ((h & 0x100u) != 0u) tan1 = -tan1;
         const float2 mid = start + tan1 * (len * 0.5);
         const float2 muv = clamp((mid + 0.5) / size, 0.0, 1.0);
         const float2 g2 = vt_grad(input, muv, size);
@@ -114,7 +106,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float along = d1.x <= d2.x ? d1.y * 0.5 : 0.5 + d2.y * 0.5;
 
         const float a = saturate(1.0 - dist / bw);
-        // Crawling head: bright spot sliding start -> end on the clock.
         const float headf =
             frac(t * rate + fx_hash01(fx_hash(h ^ 0x77u)));
         const float head = exp(-pow((along - headf) * 6.0, 2.0));

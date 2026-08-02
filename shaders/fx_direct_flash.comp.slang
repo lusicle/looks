@@ -1,8 +1,4 @@
-// Direct flash: on-camera flash look — a hard center-weighted
-// lift with steep radial falloff, flattened shadows, and the cold white
-// cast of a xenon tube. Linear light (it IS light).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Linear light throughout, because this is literally light.
 
 #include "fx_common.slang"
 
@@ -17,9 +13,9 @@ cbuffer Push
     uint frame;
     float fps;
     float strength;
-    float falloff;   // radial exponent — higher = harder edge
-    float cool;      // blue-white tint amount
-    float red_eye;   // red lift in dark center regions
+    float falloff;   // radial exponent, higher = harder edge
+    float cool;
+    float red_eye;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -41,15 +37,12 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float3 flash_tint =
         lerp(float3(1.0, 1.0, 1.0), float3(0.85, 0.92, 1.15), saturate(cool));
-    // Multiply-boost what the flash reaches, lift its floor slightly
-    // (bounce fill), leave the falloff to drop into underexposure.
     float3 col = base.rgb * (1.0 + lit * strength * 2.0) *
                  lerp(float3(1.0, 1.0, 1.0), flash_tint, lit);
     col += lit * strength * 0.02;              // flat fill
     col *= lerp(0.55, 1.0, lit);               // background falls off
 
-    // Red-eye: the retina bounce — dark pupil-like regions
-    // near the center pick up a red glow under the flash.
+    // Keys on darkness near the lit center, standing in for pupils.
     if (red_eye > 0.001) {
         const float l = fx_luma(base.rgb);
         const float dark = saturate(1.0 - l * 6.0);

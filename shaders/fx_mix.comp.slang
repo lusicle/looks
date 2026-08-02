@@ -1,7 +1,5 @@
-// Generic wet/opacity composite for CPU-side effects (Codec-Box): the
-// processed result comes back from the codec roundtrip, this kernel applies
-// the canonical composition against the dry input.
-//   final = mix(in, blend(in, mix(in, fx(in), wet)), opacity)
+// Applies the canonical composition for CPU-side effects, whose result
+// arrives back from a roundtrip rather than from a kernel.
 
 [[vk::push_constant]]
 cbuffer Push

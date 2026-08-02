@@ -1,9 +1,3 @@
-// Film grain (category 5): size scales like ISO, optional
-// per-channel color, midtone-weighted. Counter-based hash on
-// (seed, frame, cell) — deterministic, re-seeded every frame.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -16,9 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;      // 0..1 strength
-    float size;        // grain cell size in px
-    float color;       // 0 = mono grain, 1 = fully per-channel
+    float amount;
+    float size;        // cell size, px
+    float color;       // 0 mono, 1 fully per-channel
     float mode;        // 0 film grain, 1 CCD sensor noise
 };
 
@@ -34,7 +28,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    // CCD mode is per-pixel; film grain clumps into ISO-sized cells.
+    // CCD noise is per-pixel; film grain clumps into ISO-sized cells.
     const bool ccd = mode >= 0.5;
     const float cell_size = ccd ? 1.0 : max(size, 1.0);
     const uint2 cell = uint2(float2(tid.xy) / cell_size);
@@ -52,14 +46,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float l = fx_luma(encoded);
     float weight;
     if (ccd) {
-        // Sensor noise (CCD mode): strongest in the shadows,
-        // plus a faint per-row banding term (readout noise).
+        // Sensor noise is strongest in the shadows, plus a per-row
+        // readout banding term.
         weight = 0.25 + 0.75 * (1.0 - l);
         const float row =
             fx_hash01(fx_hash3(seed, frame, tid.y)) - 0.5;
         grain += float3(row, row, row) * 0.3;
     } else {
-        // Midtone weighting (grain lives on film density).
+        // Midtone weighted, since grain lives on film density.
         weight = 4.0 * l * (1.0 - l);
     }
 

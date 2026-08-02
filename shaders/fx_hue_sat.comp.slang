@@ -1,8 +1,4 @@
-// Hue/Sat (docs/flow_canvas.md primitives): hue rotation about the
-// gray axis (Rodrigues), saturation toward/away from luma, lightness
-// lift. Display-referred core.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred core.
 
 #include "fx_common.slang"
 
@@ -16,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float hue;    // degrees, -180..180
-    float sat;    // 0 = gray, 1 = unchanged, 2 = doubled
-    float lite;   // -1..1 lightness add
+    float hue;    // degrees
+    float sat;    // 0 gray, 1 unchanged, 2 doubled
+    float lite;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -35,7 +31,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 c = fx_srgb_oetf(saturate(base.rgb));
 
-    // Hue rotation: Rodrigues about the normalized gray axis.
+    // Rodrigues rotation about the normalized gray axis.
     const float a = hue * 0.01745329252;
     const float ca = cos(a), sa = sin(a);
     const float3 k = float3(0.57735, 0.57735, 0.57735);

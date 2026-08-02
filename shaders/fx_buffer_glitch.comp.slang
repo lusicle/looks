@@ -1,10 +1,3 @@
-// Buffer glitch: framebuffer corruption two ways — stuck columns (a column
-// latches and repeats one source column, like dead shift registers) and
-// row shear (bands of rows slide sideways progressively down the frame,
-// like a slipping row pointer). Mode picks either or both. Seeded.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -18,9 +11,9 @@ cbuffer Push
     uint frame;
     float fps;
     float mode;      // 0 stuck columns, 1 row shear, 2 both
-    float amount;    // severity
-    float density;   // how much of the frame is affected
-    float rate;      // re-roll rate, hz (0 = frozen)
+    float amount;
+    float density;
+    float rate;      // hz, 0 = frozen
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -42,26 +35,24 @@ void main(uint3 tid : SV_DispatchThreadID)
     float2 suv = uv;
 
     if (m != 1u) {
-        // Stuck columns: 4px lanes; a stuck lane snaps its x to the lane's
-        // seeded source column, duplicating it across the lane run.
+        // A stuck 4px lane snaps x to its seeded source column, so that
+        // column repeats across the run.
         const uint lane = tid.x / 4u;
         const uint lh = fx_hash4(seed ^ 0xC01u, tick, lane, 0u);
         if (fx_hash01(lh) < density * 0.5 * amount) {
             const float src_x =
                 fx_hash01(fx_hash(lh ^ 0x77u));
-            // Pull from a nearby column so content still relates.
+            // Nearby, so the repeated content still relates to the frame.
             suv.x = clamp(uv.x + (src_x - 0.5) * 0.1 * (1.0 + amount * 3.0),
                           0.0, 1.0);
             suv.x = floor(suv.x * size.x / 4.0) * 4.0 / size.x;
         }
     }
     if (m >= 1u) {
-        // Row shear: 8px bands, displacement growing down the frame like
-        // an accumulating pointer slip.
         const uint band = tid.y / 8u;
         const uint bh = fx_hash4(seed ^ 0x5EA4u, tick, band, 1u);
         if (fx_hash01(bh) < density) {
-            const float grow = uv.y;   // worsens toward the bottom
+            const float grow = uv.y;   // shear accumulates downward
             const float shift =
                 (fx_value_noise1(seed ^ tick * 3u, float(band) * 0.37) - 0.5)
                 * amount * 160.0 * grow;

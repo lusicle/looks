@@ -1,7 +1,5 @@
-// One Gray-Scott reaction-diffusion step. State is (A, B) in
-// RG16F; the frame seeds the sim by injecting B where the input has
-// midtone luma — the picture literally grows the pattern. No randomness:
-// the sim is deterministic given the sequential frame stream.
+// One Gray-Scott step. No randomness anywhere: the sim is deterministic
+// given the sequential frame stream, which is what keeps it replayable.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -10,11 +8,11 @@ cbuffer Push
     uint height;
     float feed;
     float kill;
-    float inject;   // frame-luma B injection strength
+    float inject;
 };
 
 [[vk::binding(0, 0)]] Sampler2D state;     // A = r, B = g
-[[vk::binding(1, 0)]] Sampler2D frame_in;  // linear RGB source
+[[vk::binding(1, 0)]] Sampler2D frame_in;
 [[vk::binding(2, 0)]] RWTexture2D<float4> next_state;
 
 float2 ab_at(float2 uv)
@@ -48,7 +46,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float a = c.x + (1.0 * lap.x - abb + feed * (1.0 - c.x));
     float b = c.y + (0.5 * lap.y + abb - (feed + kill) * c.y);
 
-    // Seed from the frame: midtone luma feeds B where the sim is quiet.
+    // Midtones only: injecting at the extremes floods the sim flat.
     const float3 rgb = frame_in.SampleLevel(uv, 0).rgb;
     const float l = dot(rgb, float3(0.2126, 0.7152, 0.0722));
     const float mid = smoothstep(0.05, 0.25, l) * (1.0 - smoothstep(0.5, 0.9, l));

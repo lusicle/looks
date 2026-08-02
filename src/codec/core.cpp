@@ -169,6 +169,37 @@ void encode_block(BitWriter& bw, const int16_t block[kBlockCoeffs],
     bw.put_ue(kEobRun);
 }
 
+uint32_t ue_bit_count(uint32_t v) {
+    const uint32_t x = v + 1;
+    int bits = 0;
+    while ((x >> bits) > 1) ++bits;
+    return static_cast<uint32_t>(2 * bits + 1);
+}
+
+uint32_t se_bit_count(int32_t v) {
+    return ue_bit_count(v > 0 ? static_cast<uint32_t>(v) * 2 - 1
+                              : static_cast<uint32_t>(-v) * 2);
+}
+
+uint32_t ac_bit_count(const int16_t block[kBlockCoeffs]) {
+    int last_nonzero = 0;
+    for (int i = 1; i < kBlockCoeffs; ++i)
+        if (block[kZigzag[i]] != 0) last_nonzero = i;
+    uint32_t bits = 0;
+    int run = 0;
+    for (int i = 1; i <= last_nonzero; ++i) {
+        const int16_t v = block[kZigzag[i]];
+        if (v == 0) {
+            ++run;
+            continue;
+        }
+        bits += ue_bit_count(static_cast<uint32_t>(run));
+        bits += ue_bit_count(static_cast<uint32_t>(std::abs(v)) - 1) + 1;
+        run = 0;
+    }
+    return bits + ue_bit_count(kEobRun);
+}
+
 bool decode_block(BitReader& br, int16_t block[kBlockCoeffs], int16_t* dc_pred) {
     std::memset(block, 0, sizeof(int16_t) * kBlockCoeffs);
     const int32_t dc = *dc_pred + br.get_se();

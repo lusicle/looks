@@ -1,9 +1,5 @@
-// Block shuffle: macroblock-level copy/stamp glitch, GPU-side — a chosen
-// fraction of blocks display some OTHER block's pixels, re-rolled on the
-// rate clock. The instant-gratification cousin of the Codec-Box moshes:
-// no bitstream, pure block-pointer corruption. Seeded, deterministic.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Pure block-pointer corruption with no bitstream involved, unlike the
+// Codec-Box effects.
 
 #include "fx_common.slang"
 
@@ -17,10 +13,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float block_px;   // block size
+    float block_px;
     float amount;     // fraction of blocks remapped
-    float spread;     // how far a stolen block may come from
-    float rate;       // re-roll rate, hz (0 = frozen pattern)
+    float spread;
+    float rate;       // hz, 0 = frozen
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -44,7 +40,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint h = fx_hash4(seed ^ tick * 0x51EDu, tick, block.x, block.y);
     float4 result = base;
     if (fx_hash01(h) < amount) {
-        // Steal from a block up to spread*8 blocks away (wrapped).
         const float reach = spread * 8.0 + 1.0;
         const float ox =
             (fx_hash01(fx_hash(h ^ 0x111u)) - 0.5) * 2.0 * reach;

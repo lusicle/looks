@@ -1,12 +1,5 @@
-// Rutt-Etra: the frame becomes raster scanlines displaced by
-// luma — bright areas push their line into a relief. Mode picks row or
-// column rasters; `wiggle` rides oscillator noise on every trace (the
-// unstable-deflection look), and `beam` breaks the trace into beads where
-// the signal is weak (beam-intensity modulation). For each output pixel,
-// scan the candidate source lines that could land here and light up where
-// a displaced trace passes. Black elsewhere, trace color from source.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Gather, not scatter: each output pixel scans the candidate source
+// lines whose luma-displaced trace could land on it.
 
 #include "fx_common.slang"
 
@@ -20,13 +13,13 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float spacing;   // px between scanlines
+    float spacing;   // px
     float amount;    // max displacement, px
-    float line_w;    // line half-thickness, px
-    float mode;      // 0 = rows displaced up, 1 = cols displaced left
-    float wiggle;    // oscillator noise riding the trace
-    float beam;      // dot breakup in low-signal regions
-    float scroll;    // raster crawl, px/s (frame-clocked)
+    float line_w;    // half-thickness, px
+    float mode;      // 0 rows displaced up, 1 cols displaced left
+    float wiggle;
+    float beam;
+    float scroll;    // px/s
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -44,19 +37,17 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const bool cols = mode >= 0.5;
     const float sp = max(spacing, 2.0);
-    // Perpendicular position (which the trace displaces along) and the
-    // along-line coordinate (which the wiggle and beam pattern ride).
+    // p is perpendicular to the lines (the displacement axis), along runs
+    // down them (the axis wiggle and beam ride).
     const float p = cols ? float(tid.x) + 0.5 : float(tid.y) + 0.5;
     const float along = cols ? float(tid.y) + 0.5 : float(tid.x) + 0.5;
     const float p_max = cols ? size.x : size.y;
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float wig_max = wiggle * amount * 0.4;
-    // Raster crawl: the whole line grid drifts on the timeline clock —
-    // the animated scan-render. Wrapped into one spacing so the grid is
-    // seamless; deterministic (frame-clocked, ).
+    // Wrapped into one spacing so the crawling grid stays seamless.
     const float phase = frac(t * scroll / sp) * sp;
 
-    // Lines whose displaced trace can reach p.
+    // Bounds of the lines whose displaced trace can reach p.
     const int first = int(ceil((p - wig_max - phase) / sp)) - 1;
     const int last = int(floor((p + amount + wig_max - phase) / sp)) + 1;
     float3 col = 0.0;
@@ -69,8 +60,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             : float2(uv.x, (line_p + 0.5) / size.y);
         const float3 src = input.SampleLevel(suv, 0).rgb;
         const float l = fx_luma(fx_srgb_oetf(saturate(src)));
-        // Oscillator noise on the deflection: per-line phase, drifting on
-        // the timeline clock — the trace never sits still.
         const float wig = wiggle > 0.001
             ? (fx_value_noise1(seed ^ uint(s + 4096) * 197u,
                                along * 0.035 + t * 3.0) - 0.5) *
@@ -79,8 +68,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float displaced = line_p - l * amount + wig;
         const float d = abs(p - displaced);
         if (d < line_w) {
-            // Beam-intensity dot breakup: weak signal shortens the dash
-            // duty until the trace beads apart.
+            // Weak signal shortens the dash duty until the trace beads.
             if (beam > 0.001) {
                 const float period = 3.0 + line_w * 2.0;
                 const float phase_off =

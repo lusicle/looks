@@ -1,9 +1,3 @@
-// Streak: one-direction smear. Threshold 0 drags the whole frame (wind
-// smear); above 0 only clipped highlights streak, which is a directional
-// glow / anamorphic-adjacent flare along any angle.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -16,10 +10,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float length_px;   // streak reach
-    float angle;       // drag direction
+    float length_px;
+    float angle;
     float decay;       // per-tap falloff
-    float threshold;   // 0 = smear everything, >0 = highlights only
+    float threshold;   // 0 smears everything, above 0 highlights only
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

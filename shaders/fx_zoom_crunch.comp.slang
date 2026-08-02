@@ -1,10 +1,3 @@
-// Digital-zoom crunch: crop-zoom + cheap resample — the
-// camcorder digital zoom. Crunch snaps sampling onto the pre-zoom pixel
-// grid (fat aliased blocks) and adds the oversharpen ring cameras used to
-// hide the mush.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,8 +10,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float zoom;      // crop factor about center (1 = none)
-    float crunch;    // 0 smooth resample, 1 fully blocky + ringed
+    float zoom;      // crop factor about center, 1 = none
+    float crunch;    // 0 smooth resample, 1 fully blocky and ringed
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -37,13 +30,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float z = max(zoom, 1.0);
     float2 suv = (uv - 0.5) / z + 0.5;
 
-    // Crunch: quantize onto the source pixel grid (nearest-neighbor
-    // blocks that grow with the zoom).
+    // Snapping to the SOURCE grid is what makes the blocks grow with the
+    // zoom, the way a camcorder's digital zoom does.
     const float2 snapped = (floor(suv * size) + 0.5) / size;
     suv = lerp(suv, snapped, saturate(crunch));
     float3 col = input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
 
-    // Camera-style oversharpen ring on the crunched image.
     if (crunch > 0.001) {
         const float2 e = z / size;   // one source pixel at this zoom
         float3 ring = 0.0;

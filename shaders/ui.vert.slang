@@ -1,7 +1,6 @@
-// UI vertex shader. Positions arrive in PHYSICAL pixels; the push-constant
-// projection maps framebuffer top-left to NDC (-1,-1). Vertex color bytes
-// are sRGB-encoded RGB + linear alpha (Color::to_rgba8) — decoded here once
-// so interpolation and blending stay linear. Keep in sync with text.vert.
+// Positions arrive in PHYSICAL pixels. Vertex color bytes are sRGB RGB
+// with linear alpha, decoded here once so interpolation and blending stay
+// linear. Duplicated in text.vert.slang; the two must stay in sync.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -14,8 +13,6 @@ struct VSInput
     [[vk::location(0)]] float2 a_pos   : POSITION;
     [[vk::location(1)]] float2 a_uv    : TEXCOORD0;
     [[vk::location(2)]] float4 a_color : COLOR0;
-    // shape = { radius, stroke, halfW, halfH } in physical px; all zero on
-    // pass-through primitives.
     [[vk::location(3)]] float4 a_shape : TEXCOORD1;
 };
 

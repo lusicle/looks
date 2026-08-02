@@ -1,9 +1,3 @@
-// Unified Jitter (category 1): gate weave / EIS wobble / VHS
-// tracking / rolling-shutter jello are one transform-noise effect with
-// mode presets. Deterministic value noise over the frame clock.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,7 +11,7 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;      // px of travel
-    float speed;       // wander rate in Hz
+    float speed;       // hz
     float mode;        // 0 weave, 1 EIS, 2 VHS tracking, 3 jello
 };
 
@@ -40,14 +34,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     if (m == 0)
     {
-        // Gate weave: slow smooth 2D wander.
         offset_px.x = (fx_value_noise1(seed, t * speed) - 0.5) * 2.0 * amount;
         offset_px.y = (fx_value_noise1(seed ^ 0x5555u, t * speed) - 0.5) *
                       2.0 * amount;
     }
     else if (m == 1)
     {
-        // EIS wobble: mostly steady with stepped corrective snaps.
+        // Mostly steady, with stepped corrective snaps.
         const float phase = t * speed * 2.0;
         const uint step_i = uint(int(floor(phase)) + 1000000);
         const float held_x =
@@ -61,7 +54,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (m == 2)
     {
-        // VHS tracking: per-band horizontal displacement, occasional glitch.
         const uint band = tid.y / 8;
         const float band_noise =
             fx_value_noise1(seed ^ band * 977u, t * speed * 3.0) - 0.5;
@@ -71,9 +63,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else
     {
-        // Rolling-shutter jello: each row reads the swaying camera at a
-        // slightly later time, so the frame skews like gelatin. A second
-        // low-frequency vertical ripple sells the wobble.
+        // Each row samples the sway at a slightly later time, which is
+        // what skews the frame.
         const float row_delay = uv.y * 0.6;
         const float sway =
             fx_value_noise1(seed, (t - row_delay / max(speed, 0.1)) * speed) -

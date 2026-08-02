@@ -227,6 +227,109 @@ void intra_entropy(const IntraDct& dct, int quality,
     bw.finish();
 }
 
+void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
+                 bool parallel) {
+    uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
+    build_quant_table(kQuantBaseLuma, quality, qy);
+    build_quant_table(kQuantBaseChroma, quality, qc);
+    const int w = static_cast<int>(dct.width);
+    const int h = static_cast<int>(dct.height);
+    const int cw = (w + 1) / 2;
+    const int ch = (h + 1) / 2;
+    const int mb_w = (w + 15) / 16;
+    const int mb_h = (h + 15) / 16;
+    out.width = dct.width;
+    out.height = dct.height;
+    out.y_stride = static_cast<size_t>(w);
+    out.uv_stride = static_cast<size_t>(cw);
+    out.y.resize(static_cast<size_t>(w) * h);
+    out.u.resize(static_cast<size_t>(cw) * ch);
+    out.v.resize(static_cast<size_t>(cw) * ch);
+
+    parallel_blocks(mb_w * mb_h, parallel, [&](int begin, int end) {
+        int16_t quantized[kBlockCoeffs];
+        int16_t block[kBlockCoeffs];
+        for (int mb = begin; mb < end; ++mb) {
+            const int mx = mb % mb_w;
+            const int my = mb / mb_w;
+            const size_t base = static_cast<size_t>(mb) * 6;
+            for (int b = 0; b < 6; ++b) {
+                if (dct.flat[base + b]) continue;   // edge filler
+                const bool luma = b < 4;
+                const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
+                const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
+                const int pw = luma ? w : cw;
+                const int ph = luma ? h : ch;
+                quantize(dct.coeffs.data() + (base + b) * kBlockCoeffs,
+                         luma ? qy : qc, quantized);
+                dequantize(quantized, luma ? qy : qc, block);
+                idct8x8(block);
+                uint8_t* plane = luma ? out.y.data()
+                                      : (b == 4 ? out.u.data() : out.v.data());
+                const size_t stride = luma ? out.y_stride : out.uv_stride;
+                uint8_t* dst = plane + static_cast<size_t>(py) * stride + px;
+                const int copy_w = std::min(kBlockSize, pw - px);
+                const int copy_h = std::min(kBlockSize, ph - py);
+                for (int y = 0; y < copy_h; ++y)
+                    for (int x = 0; x < copy_w; ++x) {
+                        const int val = block[y * kBlockSize + x] + 128;
+                        dst[static_cast<size_t>(y) * stride + x] =
+                            static_cast<uint8_t>(std::clamp(val, 0, 255));
+                    }
+            }
+        }
+    });
+}
+
+size_t intra_entropy_bytes(const IntraDct& dct, int quality) {
+    uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
+    build_quant_table(kQuantBaseLuma, quality, qy);
+    build_quant_table(kQuantBaseChroma, quality, qc);
+    const int mb_w = (static_cast<int>(dct.width) + 15) / 16;
+    const int mb_h = (static_cast<int>(dct.height) + 15) / 16;
+    const int mb_count = mb_w * mb_h;
+    const size_t blocks = static_cast<size_t>(mb_count) * 6;
+
+    // Parallel per-block halves; the DC delta chain is the only serial
+    // dependency and reduces to one subtraction per block.
+    std::vector<int16_t> dcv(blocks);
+    std::vector<uint32_t> acbits(blocks);
+    static const int16_t kZeroBlock[kBlockCoeffs] = {};
+    const uint32_t flat_ac = ac_bit_count(kZeroBlock);
+    parallel_blocks(mb_count, true, [&](int begin, int end) {
+        int16_t quantized[kBlockCoeffs];
+        for (int mb = begin; mb < end; ++mb) {
+            const size_t base = static_cast<size_t>(mb) * 6;
+            for (int b = 0; b < 6; ++b) {
+                if (dct.flat[base + b]) {
+                    acbits[base + b] = flat_ac;
+                    continue;   // dc repeats the predictor: delta 0
+                }
+                quantize(dct.coeffs.data() + (base + b) * kBlockCoeffs,
+                         b < 4 ? qy : qc, quantized);
+                dcv[base + b] = quantized[0];
+                acbits[base + b] = ac_bit_count(quantized);
+            }
+        }
+    });
+
+    uint64_t bits = 0;
+    int16_t dc_y = 0, dc_u = 0, dc_v = 0;
+    for (int mb = 0; mb < mb_count; ++mb) {
+        const size_t base = static_cast<size_t>(mb) * 6;
+        for (int b = 0; b < 6; ++b) {
+            int16_t* dc = b < 4 ? &dc_y : (b == 4 ? &dc_u : &dc_v);
+            if (dct.flat[base + b]) {
+                bits += se_bit_count(0) + acbits[base + b];
+                continue;
+            }
+            bits += se_bit_count(dcv[base + b] - *dc) + acbits[base + b];
+            *dc = dcv[base + b];
+        }
+    }
+    return 1 + static_cast<size_t>((bits + 7) / 8);   // quality byte + pad
+}
+
 namespace {
 
 // Parallel reconstruction: serial entropy parse into a quantized-coeff

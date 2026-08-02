@@ -1,8 +1,4 @@
-// Posterize (docs/flow_canvas.md primitives): plain level
-// quantization — the Quantizer with dither off and no palette. Tone mode
-// bands the luma only, so hue survives. Display-referred core.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred core.
 
 #include "fx_common.slang"
 
@@ -17,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float levels;
-    float mode;   // 0 rgb, 1 tone (luma-only banding)
+    float mode;   // 0 rgb, 1 luma-only banding
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -36,7 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float n = max(levels, 2.0);
     float3 c;
     if (mode >= 0.5) {
-        // Band the tone, carry the chroma vector across unchanged.
+        // Adding the luma delta carries the chroma vector across intact.
         const float l = fx_luma(enc);
         const float ql = round(l * (n - 1.0)) / (n - 1.0);
         c = saturate(enc + (ql - l));

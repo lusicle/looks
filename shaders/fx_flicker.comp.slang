@@ -1,9 +1,4 @@
-// Exposure / projector flicker: whole-frame brightness beats.
-// Projector mode superimposes two shutter-harmonic sines (the 24 Hz blade
-// beat against mains); random mode gates exposure per tick. Linear light,
-// uniform across the frame, timeline-clocked.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Linear light and uniform across the frame.
 
 #include "fx_common.slang"
 
@@ -38,6 +33,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float gain;
     float3 tint = float3(1.0, 1.0, 1.0);
     if (mode < 0.5) {
+        // Two shutter harmonics beating, as a blade does against mains.
         const float beat = 0.6 * sin(6.28318 * rate * t) +
                            0.4 * sin(6.28318 * rate * 0.37 * t + 1.3);
         gain = 1.0 - amount * 0.25 * (beat + 1.0);
@@ -46,8 +42,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float g = fx_hash01(fx_hash3(seed, tick, 5u));
         gain = 1.0 - amount * 0.6 * g * g;
     } else {
-        // Color strobe: each tick flashes a different seeded hue instead
-        // of dimming — exposure holds, chroma pulses.
+        // Exposure holds here and chroma pulses instead.
         const uint tick = uint(t * rate);
         const float hue = fx_hash01(fx_hash3(seed, tick, 11u));
         tint = lerp(float3(1.0, 1.0, 1.0), fx_hue_to_rgb(hue),

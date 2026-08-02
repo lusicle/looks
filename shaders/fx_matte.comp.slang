@@ -1,10 +1,5 @@
-// Matte maker (docs/flow_canvas.md — masks ARE images): turns any
-// image into a grayscale matte. Luma pass-through, brightness key
-// (window around a luma center), or chroma key (distance to the key
-// color), then levels + gamma + soft invert. Feed the result to a mask
-// anchor, or keep processing it — it is an ordinary image.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Emits an ordinary grayscale image, so the result can feed a matte port
+// or simply keep going through the chain.
 
 #include "fx_common.slang"
 
@@ -19,7 +14,7 @@ cbuffer Push
     uint frame;
     float fps;
     float mode;       // 0 luma, 1 brightness key, 2 chroma key
-    float key_c;      // key center (luma) / unused for chroma
+    float key_c;      // luma center, or key hue in chroma mode
     float key_range;
     float black_pt;
     float white_pt;
@@ -45,14 +40,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     float v;
     if (m == 1u)
     {
-        // Brightness key: 1 inside the luma window, feathered by range.
         const float r = max(key_range, 0.01);
         v = saturate(1.0 - abs(l - key_c) / r);
     }
     else if (m == 2u)
     {
-        // Chroma key: distance to the key hue vector (chroma only, so
-        // shading survives). Key color rides key_c as hue 0..1.
+        // Distance in chroma only, with luma removed from both sides, so
+        // shading inside the keyed color survives.
         const float3 key_rgb = fx_srgb_oetf(saturate(
             0.5 + 0.5 * cos(6.2831853 * (key_c + float3(0.0, -1.0 / 3.0,
                                                         1.0 / 3.0)))));
@@ -65,7 +59,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     {
         v = l;
     }
-    // Levels + gamma, then the soft invert lerp.
     const float span = max(white_pt - black_pt, 1e-4);
     v = saturate((v - black_pt) / span);
     v = pow(v, max(gamma_v, 0.01));

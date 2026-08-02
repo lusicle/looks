@@ -1,9 +1,3 @@
-// Twirl: rotation that falls off smoothly from the center — the classic
-// swirl warp. Angle can wind past a full turn for taffy; negative reverses
-// the spiral.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -16,8 +10,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float angle;      // max rotation at center, degrees
-    float radius;     // extent (1 ~ frame height)
+    float angle;      // degrees at center, may exceed a full turn
+    float radius;
     float center_x;
     float center_y;
 };
@@ -41,7 +35,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float r = length(d);
     float3 outc = base.rgb;
     if (r < radius) {
-        // Smooth falloff: full twist at center, zero at the rim.
         const float f = 1.0 - r / max(radius, 1.0e-3);
         const float a = angle * 0.0174533 * f * f;
         const float ca = cos(a), sa = sin(a);

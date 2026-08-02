@@ -1,9 +1,3 @@
-// Star / cross-screen filter: the etched-grating lens filter — clipped
-// highlights grow diffraction spikes. N evenly spaced spike directions,
-// energy gathered inward along each so every bright point streaks.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -16,10 +10,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float points;      // spike count
-    float length_px;   // spike reach
-    float threshold;   // highlight cut
-    float angle;       // filter rotation, degrees
+    float points;
+    float length_px;
+    float threshold;
+    float angle;       // degrees
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -48,7 +42,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float2 p = clamp(uv + dir * d / size, 0.0, 1.0);
             const float3 c = input.SampleLevel(p, 0).rgb;
             const float3 over = max(c - threshold, 0.0);
-            // Slight cool-warm split down the spike sells the grating.
             const float3 disperse =
                 lerp(float3(1.0, 0.95, 0.85), float3(0.85, 0.9, 1.0), f);
             spike += over * disperse * (1.0 - f) * (1.0 - f);

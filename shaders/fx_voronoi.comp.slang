@@ -1,10 +1,3 @@
-// Voronoi / Delaunay shatter: the frame breaks into cellular
-// shards. Seed points live on a jittered grid (seeded, slowly drifting);
-// every pixel finds its nearest seed, the whole shard displaces by a
-// per-cell offset, and shard borders darken like cracks.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,11 +10,11 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float cells;     // grid cells across the width
-    float shatter;   // per-cell displacement, px
-    float edge;      // crack darkening
-    float drift;     // seed-point wander, hz
-    float style;     // 0 voronoi cells, 1 delaunay-style triangle facets
+    float cells;     // across the width
+    float shatter;   // px
+    float edge;
+    float drift;     // hz
+    float style;     // 0 voronoi cells, 1 delaunay-style facets
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -42,8 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int2 pc = int2(floor(p));
     const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * drift;
 
-    // Three nearest jittered seeds over the 3x3 neighborhood (the third
-    // feeds the Delaunay-style facets).
+    // Three nearest seeds: the third exists only for the facet style.
     float best = 1.0e9, second = 1.0e9, third = 1.0e9;
     uint best_hash = 0u;
     float2 sp1 = 0.0, sp2 = 0.0, sp3 = 0.0;
@@ -86,7 +78,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // Shard displacement: the whole cell samples from one offset.
+    // One offset for the whole shard, so it moves as a rigid piece.
     const float2 offset =
         (float2(fx_hash01(fx_hash(best_hash ^ 0x123u)),
                 fx_hash01(fx_hash(best_hash ^ 0x456u))) - 0.5) *
@@ -94,9 +86,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float border = sqrt(second) - sqrt(best);
     float3 col;
     if (style >= 0.5) {
-        // Delaunay-style facets: flat-shade each triangle of
-        // three mutually nearest seeds from its centroid; ink the
-        // bisector edges as the wireframe.
+        // Flat-shade the triangle of the three nearest seeds from its
+        // centroid, and ink the bisector edges as the wireframe.
         const float2 centroid_p = (sp1 + sp2 + sp3) / 3.0;
         const float2 cuv = clamp(
             centroid_p * cell_px / size + offset / size, 0.0, 1.0);
@@ -106,7 +97,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     } else {
         const float2 suv = clamp(uv + offset / size, 0.0, 1.0);
         col = input.SampleLevel(suv, 0).rgb;
-        // Crack lines where the two nearest seeds are equidistant.
         const float crack = 1.0 - smoothstep(0.0, 0.12, border);
         col *= 1.0 - crack * edge;
     }

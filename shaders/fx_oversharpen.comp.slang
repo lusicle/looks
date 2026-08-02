@@ -1,7 +1,5 @@
-// Oversharpen halos: unsharp mask pushed past taste — bright
-// rims around dark edges and vice versa. Encoded space, cross-tap blur.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded space, and the hard saturate below is deliberate: the clipped
+// halo rings are the point. Sharpen is the neutral version.
 
 #include "fx_common.slang"
 
@@ -47,7 +45,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         input.SampleLevel(uv - float2(r.x, -r.y) * 0.7071, 0).rgb));
     blur /= 9.0;
 
-    // Hard saturate creates the clipped halo rings the look wants.
     const float3 sharp = saturate(enc + (enc - blur) * amount);
 
     const float4 result = float4(fx_srgb_eotf(sharp), base.a);

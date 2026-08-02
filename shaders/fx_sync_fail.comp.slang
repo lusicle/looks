@@ -1,9 +1,3 @@
-// Sync failure: vertical roll (the picture wraps around at a
-// steady rate) and a horizontal tear band that wanders the frame shearing
-// scanlines sideways. All motion is timeline-clocked — deterministic.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -16,9 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float roll;    // vertical roll speed, hz (frames of the picture per s)
-    float tear;    // horizontal tear strength
-    float band;    // tear band height (normalized)
+    float roll;    // picture heights per second
+    float tear;
+    float band;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -36,12 +30,9 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
 
-    // Roll: wrap vertically; a thin dark blanking bar marks the wrap seam.
     float sy = uv.y + t * roll;
     sy -= floor(sy);
 
-    // Tear: the band center wanders; inside it, scanlines shear by a
-    // per-line jitter on top of a base displacement.
     const float center = fx_value_noise1(seed, t * 1.7);
     const float d = abs(sy - center);
     float sx = uv.x;

@@ -1,9 +1,5 @@
-// Stutter / beat-repeat: while armed, the engine replays the
-// last N recorded frames cyclically (the ring frame arrives on binding 1);
-// unarmed it records and passes through. Route a beat trigger onto the
-// "armed" param and the picture beat-repeats with the music.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// All the ring bookkeeping happens engine-side; this kernel only chooses
+// between the live input and the ring frame at binding 1.
 
 #include "fx_common.slang"
 
@@ -17,9 +13,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float frames;   // ring length (engine-side)
-    float armed;    // >= 0.5 replays
-    float rate;     // replay speed (engine-side)
+    float frames;   // consumed engine-side, unused here
+    float armed;
+    float rate;     // consumed engine-side, unused here
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

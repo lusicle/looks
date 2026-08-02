@@ -1,9 +1,5 @@
-// VHS deck OSD: the white on-screen overlay a VCR burns over playback —
-// transport glyph (PLAY wedge / REC dot / PAUSE bars / FF wedges) top-left
-// and a 7-segment tape counter top-right. Sibling of the camcorder HUD
-// (that one is the CAMERA; this is the DECK). Encoded space.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The deck-side sibling of the camcorder HUD, which is the camera side.
+// Drawn in encoded space.
 
 #include "fx_common.slang"
 
@@ -19,12 +15,13 @@ cbuffer Push
     float fps;
     float mode;      // 0 play, 1 rec, 2 pause, 3 ff
     float size;      // px per glyph unit
-    float counter;   // 1 = show the tape counter
+    float counter;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
+// 7-segment bit masks, one per decimal digit.
 static const uint kDigit[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66,
                                 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
@@ -49,7 +46,7 @@ float seg_cov(uint mask, float2 lp)
     return on ? 1.0 : 0.0;
 }
 
-// Solid right-pointing wedge in a 0..7 x 0..7 cell.
+// Right-pointing wedge in a 0..7 x 0..7 cell.
 float wedge_cov(float2 lp)
 {
     if (lp.x < 0.5 || lp.x >= 6.5 || lp.y < 0.0 || lp.y >= 7.0) return 0.0;
@@ -73,14 +70,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     float cov = 0.0;
     float3 ink = float3(0.92, 0.92, 0.92);
 
-    // Transport glyph, top-left.
     {
         const float2 lp =
             (float2(tid.xy) + 0.5 - float2(margin, margin)) / unit;
         if (m == 0u) {
             cov = max(cov, wedge_cov(lp));
         } else if (m == 1u) {
-            // REC: blinking dot, red ink.
             const float t = fps > 0.0 ? float(frame) / fps : 0.0;
             if (frac(t) < 0.6) {
                 const float2 d = lp - float2(3.5, 3.5);
@@ -90,17 +85,15 @@ void main(uint3 tid : SV_DispatchThreadID)
                 }
             }
         } else if (m == 2u) {
-            // PAUSE: two bars.
             if (lp.y >= 0.5 && lp.y < 6.5 &&
                 ((lp.x >= 1.0 && lp.x < 2.8) || (lp.x >= 4.2 && lp.x < 6.0)))
                 cov = 1.0;
         } else {
-            // FF: two wedges.
             cov = max(wedge_cov(lp), wedge_cov(lp - float2(4.5, 0.0)));
         }
     }
 
-    // Tape counter, top-right: M:SS:FF-ish from the timeline clock.
+    // Tape counter, M:SS:FF, where slot code -2 is the colon.
     if (counter >= 0.5) {
         const uint total_s = fps > 0.0 ? uint(float(frame) / fps) : 0u;
         const uint mm = (total_s / 60u) % 10u;
@@ -135,7 +128,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
-    // Dark drop shadow behind the ink, like a real deck's character gen.
     const float3 burned = lerp(enc * (1.0 - cov * 0.35), ink, cov * 0.95);
 
     const float4 result = float4(fx_srgb_eotf(saturate(burned)), base.a);

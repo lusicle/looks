@@ -1,8 +1,5 @@
-// Light leaks: warm blobs of fogging light breathing in from
-// the frame edge — additive in LINEAR light, which is what makes leaks
-// glow instead of paint. Position/intensity drift on seeded value noise.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Additive in LINEAR light, which is what makes leaks glow rather than
+// paint over the image.
 
 #include "fx_common.slang"
 
@@ -17,9 +14,9 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;
-    float hue;      // 0 = orange-red, 1 = magenta
-    float drift;    // breathing rate, hz
-    float burn;     // film-burn reel end: 0 = off
+    float hue;
+    float drift;    // hz
+    float burn;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -37,8 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * max(drift, 1.0e-3);
 
-    // Two blobs anchored off the right edge, drifting vertically; a soft
-    // band hugging the edge itself.
+    // Blobs sit off the right edge so only their falloff enters frame.
     float leak = 0.0;
     for (uint i = 0u; i < 2u; ++i) {
         const float cy = fx_value_noise1(seed + i * 17u, t + float(i) * 3.7);
@@ -58,14 +54,10 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 result_rgb = base.rgb + tint * leak;
 
-    // Film-burn reel end: a flickering burn-through creeping
-    // in from the corners — orange fringe around a blown white core, the
-    // emulsion melting look. Fully seeded/frame-driven.
     if (burn > 0.001) {
         const float tb = fps > 0.0 ? float(frame) / fps : 0.0;
         const float flicker =
             0.55 + 0.45 * fx_value_noise1(seed ^ 0xB00Bu, tb * 13.0);
-        // Ragged radius from two corners, wobbling on value noise.
         const float2 corner = float2(1.0, 1.0);
         const float2 dc = (uv - corner) * float2(size.x / size.y, 1.0);
         const float ang = atan2(dc.y, dc.x);

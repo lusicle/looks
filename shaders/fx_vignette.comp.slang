@@ -1,10 +1,3 @@
-// Vignette (proof effect, category 3). Radial falloff in linear
-// space.
-//
-// Composition (canonical): wet is interior to the blend, opacity outside:
-//   final = mix(input, blend(input, mix(input, fx(input), wet)), opacity)
-// Blend is Normal (identity) until the compositing milestone.
-
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -12,12 +5,12 @@ cbuffer Push
     uint height;
     float wet;
     float opacity;
-    uint seed;        // shared fx prelude (unused here)
+    uint seed;
     uint frame;
     float fps;
-    float amount;      // 0..1 darkening at the corners
-    float radius;      // 0..1 where falloff starts
-    float softness;    // falloff width
+    float amount;
+    float radius;      // where falloff starts
+    float softness;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

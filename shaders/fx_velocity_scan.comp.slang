@@ -1,11 +1,6 @@
-// Velocity Scan (dwell-time rendering): draws the sweeping line fronts
-// over a decaying phosphor canvas — the effect's own previous output.
-// Bright regions accumulate stuck beam segments from every sweep; dark
-// regions flash only as a line hurries through. Brightness is rendered
-// as time-spent, not intensity — velocity-modulated scanning.
-//
-// Inputs: 0 = frame, 1 = canvas (own previous output), 2 = front field.
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Brightness is rendered as time-spent, not intensity: the beam runs at
+// constant intensity and the look comes from dwell accumulating on the
+// canvas, which is this instance's own previous output.
 
 #include "fx_common.slang"
 
@@ -19,20 +14,20 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 = vertical lines sweep +x, 1 = horizontal +y
-    float speed;     // (stepper param; unused here)
-    float stick;     // (stepper param; unused here)
-    float persist;   // canvas decay per frame
-    float rate;      // (stepper param; unused here)
-    float beam_w;    // beam half-width, px
-    float wiggle;    // (stepper param; unused here)
-    float color;     // 0 = white beam, 1 = source-colored beam
-    uint state_w;    // engine-appended: front-field width
+    float mode;      // 0 vertical lines sweep +x, 1 horizontal +y
+    float speed;     // stepper param, unused here
+    float stick;     // stepper param, unused here
+    float persist;
+    float rate;      // stepper param, unused here
+    float beam_w;    // half-width, px
+    float wiggle;    // stepper param, unused here
+    float color;     // 0 white beam, 1 source-colored
+    uint state_w;    // engine-appended front-field width
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D canvas;   // own previous output
-[[vk::binding(2, 0)]] Sampler2D front;    // sweep-front field
+[[vk::binding(1, 0)]] Sampler2D canvas;
+[[vk::binding(2, 0)]] Sampler2D front;
 [[vk::binding(3, 0)]] RWTexture2D<float4> output;
 
 static const uint kSlots = 24;
@@ -51,11 +46,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint along = rows ? tid.x : tid.y;
     const float sweep_p = rows ? float(tid.y) + 0.5 : float(tid.x) + 0.5;
 
-    // Phosphor: last frame's glow, decayed.
     float3 col = canvas.SampleLevel(uv, 0).rgb * saturate(persist);
 
-    // Splat every active front passing this pixel. The beam runs at
-    // constant intensity — the LOOK comes from dwell accumulation.
     const float3 src_col =
         lerp(float3(1.0, 1.0, 1.0), base.rgb * 1.4, saturate(color));
     for (uint s = 0u; s < kSlots; ++s) {
@@ -70,8 +62,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             col += src_col * glow * glow * 0.35;
         }
     }
-    // Phosphor saturates — dwell piles up to a ceiling instead of HDR
-    // blowout, which keeps bunched-up stuck fronts reading as material.
+    // Ceiling instead of blowout, so bunched stuck fronts stay readable.
     col = min(col, float3(1.6, 1.6, 1.6));
 
     const float4 result = float4(col, base.a);

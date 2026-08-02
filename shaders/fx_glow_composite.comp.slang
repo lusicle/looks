@@ -1,6 +1,4 @@
-// Glow pass 4: additive composite of the blurred bright field over the dry
-// input, tinted per mode (Pro-Mist neutral diffusion / halation red-orange
-// / CCD smear cold vertical bleed), then the canonical wet/opacity mix.
+// Glow pass 4: composites the blurred bright field over the dry input.
 
 #include "fx_common.slang"
 
@@ -18,7 +16,7 @@ cbuffer Push
     float radius;
     float threshold;
     float mode;        // 0 pro-mist, 1 halation, 2 ccd smear
-    float smear;       // ccd: full-height column streak strength
+    float smear;       // ccd mode only
 };
 
 [[vk::binding(0, 0)]] Sampler2D dry;
@@ -38,15 +36,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 tint = float3(1.0, 1.0, 1.0);
     const int m = int(mode + 0.5);
     if (m == 1)
-        tint = float3(1.0, 0.38, 0.16);    // halation: red-orange bleed
+        tint = float3(1.0, 0.38, 0.16);
     else if (m == 2)
-        tint = float3(0.85, 0.95, 1.1);    // ccd: slightly cold
+        tint = float3(0.85, 0.95, 1.1);
 
     float3 lit = base.rgb + bloom * tint * amount;
 
-    // True CCD smear: a clipped highlight floods its readout
-    // column — a full-height, near-constant streak, not a local bloom.
-    // Averages hard-clipped energy from the DRY input down the column.
+    // Samples the DRY input down the whole column, since a readout smear
+    // is full-height and near-constant rather than a local bloom.
     if (m == 2 && smear > 0.001) {
         const float clip_at = max(threshold, 0.55);
         float3 col_energy = float3(0.0, 0.0, 0.0);

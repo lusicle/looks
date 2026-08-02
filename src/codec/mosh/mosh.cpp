@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "codec/core.h"
 #include "util/hash.h"
@@ -38,31 +39,9 @@ void copy_block(const uint8_t* src, size_t src_stride, int src_w, int src_h,
     }
 }
 
-// Encode the residual (in - pred) of one 8x8 region into the bitstream.
-void encode_residual_block(BitWriter& bw, const uint8_t* cur, size_t cur_stride,
-                           const uint8_t* pred, size_t pred_stride, int avail_w,
-                           int avail_h, const uint16_t qtab[kBlockCoeffs],
-                           int16_t* dc_pred) {
-    int16_t block[kBlockCoeffs];
-    residual_dct_block(cur, cur_stride, pred, pred_stride, avail_w, avail_h,
-                       block);
-    int16_t quantized[kBlockCoeffs];
-    quantize(block, qtab, quantized);
-    encode_block(bw, quantized, dc_pred);
-}
-
-// Decode one residual block and add it onto the prediction in place.
-// Returns false when the bitstream desyncs (corruption) — caller keeps the
-// bare prediction from then on (no error resets: that's the aesthetic).
-bool decode_residual_block(BitReader& br, uint8_t* dst, size_t dst_stride,
-                           int avail_w, int avail_h,
-                           const uint16_t qtab[kBlockCoeffs],
-                           int16_t* dc_pred) {
-    int16_t quantized[kBlockCoeffs];
-    if (!decode_block(br, quantized, dc_pred)) return false;
-    int16_t block[kBlockCoeffs];
-    dequantize(quantized, qtab, block);
-    idct8x8(block);
+// Adds a decoded residual block onto dst in place.
+void add_residual(const int16_t block[kBlockCoeffs], uint8_t* dst,
+                  size_t dst_stride, int avail_w, int avail_h) {
     const int bw = std::min(kBlockSize, avail_w);
     const int bh = std::min(kBlockSize, avail_h);
     for (int y = 0; y < bh; ++y) {
@@ -72,7 +51,6 @@ bool decode_residual_block(BitReader& br, uint8_t* dst, size_t dst_stride,
             row[x] = static_cast<uint8_t>(std::clamp(v, 0, 255));
         }
     }
-    return true;
 }
 
 }  // namespace
@@ -83,13 +61,12 @@ void MoshCodec::reset() {
 
 void MoshCodec::encode_decode_intra(const FrameView& in, int quality,
                                     DecodedFrame& out) {
-    // Two-phase + threaded transform halves; bytes and pixels identical to
-    // encode_frame + serial decode_frame. (in may alias out — the DCT pass
-    // consumes it fully before decode writes.)
+    // Entropy-free wire: pixels identical to encode + decode at this
+    // quality, no bytes ever written. (in may alias out — the DCT pass
+    // consumes it fully before recon writes.)
     intra_dct(in, intra_scratch_, /*parallel=*/true);
-    intra_entropy(intra_scratch_, std::clamp(quality, 1, 100), bitstream_);
-    decode_frame(bitstream_.data(), bitstream_.size(), in.width, in.height,
-                 out, /*parallel=*/true);
+    intra_recon(intra_scratch_, std::clamp(quality, 1, 100), out,
+                /*parallel=*/true);
 }
 
 void MoshCodec::process(const FrameView& in, uint32_t frame_index,
@@ -100,25 +77,24 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
     if (has_state_ && (state_.width != w || state_.height != h))
         has_state_ = false;
 
-    const bool gop_i = params.gop_length <= 0
-        ? !has_state_
-        : frame_index % static_cast<uint32_t>(params.gop_length) == 0;
-    const bool intra = !has_state_ || (gop_i && !params.drop_iframes);
+    const bool gop_i = params.gop_length > 0 &&
+        frame_index % static_cast<uint32_t>(params.gop_length) == 0;
 
-    if (intra) {
+    if (!has_state_ || gop_i) {
+        // The virtual encoder emits an I frame. The clean reference always
+        // takes it; the moshed chain takes it only when not dropping —
+        // a dropped I repeats the stale frame (the freeze before the melt).
         int quality = std::clamp(params.quality, 1, 100);
-        // Two-phase (rate loop): DCT once (parallel), then only
-        // quantize+entropy per quality step; decode once at the end. The
-        // bitstream is byte-identical to the one-shot encoder's.
+        // Two-phase: DCT once (parallel), then the rate loop probes exact
+        // stream sizes per quality step without writing bits, and the
+        // reconstruction skips entropy entirely — nothing downstream reads
+        // the bytes, and entropy is lossless, so the pixels are identical.
         intra_dct(in, intra_scratch_, /*parallel=*/true);
-        intra_entropy(intra_scratch_, quality, bitstream_);
-        while (params.bitrate_budget > 0 &&
-               bitstream_.size() > params.bitrate_budget && quality > 1) {
+        while (params.bitrate_budget > 0 && quality > 1 &&
+               intra_entropy_bytes(intra_scratch_, quality) >
+                   params.bitrate_budget)
             quality = std::max(1, quality - 15);
-            intra_entropy(intra_scratch_, quality, bitstream_);
-        }
-        decode_frame(bitstream_.data(), bitstream_.size(), w, h, out,
-                     /*parallel=*/true);
+        intra_recon(intra_scratch_, quality, clean_state_, /*parallel=*/true);
         // Generation loss: run the wire again N times. The integer pipeline
         // is idempotent at a fixed quality, so alternate the quantizer a
         // notch between passes — like every real dub chain, no two
@@ -126,23 +102,28 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         for (int g = 0; g < std::min(params.generations, 12); ++g) {
             const int gq = std::clamp(
                 params.quality - ((g & 1) ? 9 : 0), 1, 100);
-            encode_decode_intra(out.view(), gq, out);
+            encode_decode_intra(clean_state_.view(), gq, clean_state_);
         }
-        state_ = out;
+        if (!has_state_ || !params.drop_iframes) state_ = clean_state_;
+        out = state_;
         has_state_ = true;
         return;
     }
 
-    // ---- P frame: motion-compensated prediction from the persistent state.
-    DecodedFrame pred;
-    predict_from_state(frame_index, params, mvs, pred);
-    // Bloom: re-apply the motion field to the state N extra times.
+    // ---- P frame, open loop: the residual is encoded against the CLEAN
+    // reference (raw flow MVs — what the virtual encoder believes the
+    // decoder holds) and applied to the MOSHED prediction (mangled MVs over
+    // the diverged state). Divergence between the chains is therefore never
+    // repaired, only repainted by new residual texture — the melt.
+    predict(clean_state_, frame_index, params, mvs, /*mangle=*/false,
+            clean_pred_);
+    predict(state_, frame_index, params, mvs, /*mangle=*/true, pred_);
+    // Bloom: re-apply the mangled motion field N extra times.
     for (int r = 0; r < std::min(params.p_repeat, 8); ++r) {
-        state_ = pred;
-        predict_from_state(frame_index, params, mvs, pred);
+        predict(pred_, frame_index, params, mvs, /*mangle=*/true, pred_tmp_);
+        std::swap(pred_, pred_tmp_);
     }
 
-    // Residual encode against the prediction.
     uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
     int quality = std::clamp(params.quality, 1, 100);
     const uint32_t cw = (w + 1) / 2;
@@ -164,98 +145,91 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
             const int mx = mb % mb_w;
             const int my = mb / mb_w;
             const size_t base = static_cast<size_t>(mb) * 6;
-            // Residual corruption: seeded per-MB, skip the residual
-            // entirely (prediction-only hole).
-            const bool corrupt =
-                params.residual_corrupt > 0.0f &&
-                hash_float01(frame_seed,
-                             static_cast<uint64_t>(my) * 4096 + mx) <
-                    params.residual_corrupt;
             for (int b = 0; b < 4; ++b) {
                 const int px = mx * 16 + (b & 1) * 8;
                 const int py = my * 16 + (b >> 1) * 8;
-                if (px >= static_cast<int>(w) || py >= static_cast<int>(h) ||
-                    corrupt) {
+                if (px >= static_cast<int>(w) || py >= static_cast<int>(h)) {
                     p_zero_[base + b] = 1;
                     continue;
                 }
                 residual_dct_block(
                     in.y.data + py * in.y.stride + px, in.y.stride,
-                    pred.y.data() + static_cast<size_t>(py) * pred.y_stride +
-                        px,
-                    pred.y_stride, static_cast<int>(w) - px,
+                    clean_pred_.y.data() +
+                        static_cast<size_t>(py) * clean_pred_.y_stride + px,
+                    clean_pred_.y_stride, static_cast<int>(w) - px,
                     static_cast<int>(h) - py,
                     p_coeffs_.data() + (base + b) * kBlockCoeffs);
             }
             const int cx = mx * 8;
             const int cy = my * 8;
-            if (cx >= static_cast<int>(cw) || cy >= static_cast<int>(ch) ||
-                corrupt) {
+            if (cx >= static_cast<int>(cw) || cy >= static_cast<int>(ch)) {
                 p_zero_[base + 4] = 1;
                 p_zero_[base + 5] = 1;
             } else {
                 residual_dct_block(
                     in.u.data + cy * in.u.stride + cx, in.u.stride,
-                    pred.u.data() + static_cast<size_t>(cy) * pred.uv_stride +
-                        cx,
-                    pred.uv_stride, static_cast<int>(cw) - cx,
+                    clean_pred_.u.data() +
+                        static_cast<size_t>(cy) * clean_pred_.uv_stride + cx,
+                    clean_pred_.uv_stride, static_cast<int>(cw) - cx,
                     static_cast<int>(ch) - cy,
                     p_coeffs_.data() + (base + 4) * kBlockCoeffs);
                 residual_dct_block(
                     in.v.data + cy * in.v.stride + cx, in.v.stride,
-                    pred.v.data() + static_cast<size_t>(cy) * pred.uv_stride +
-                        cx,
-                    pred.uv_stride, static_cast<int>(cw) - cx,
+                    clean_pred_.v.data() +
+                        static_cast<size_t>(cy) * clean_pred_.uv_stride + cx,
+                    clean_pred_.uv_stride, static_cast<int>(cw) - cx,
                     static_cast<int>(ch) - cy,
                     p_coeffs_.data() + (base + 5) * kBlockCoeffs);
             }
         }
     });
 
-    for (;;) {
-        build_quant_table(kQuantBaseLuma, quality, qy);
-        build_quant_table(kQuantBaseChroma, quality, qc);
-        bitstream_.clear();
-        BitWriter bw(bitstream_);
-        int16_t dc_y = 0, dc_u = 0, dc_v = 0;
-        int16_t quantized[kBlockCoeffs];
-        const int16_t zero[kBlockCoeffs] = {};
-        for (int mb = 0; mb < mb_count; ++mb) {
-            const size_t base = static_cast<size_t>(mb) * 6;
-            for (int b = 0; b < 6; ++b) {
-                int16_t* dc = b < 4 ? &dc_y : (b == 4 ? &dc_u : &dc_v);
-                if (p_zero_[base + b]) {
-                    encode_block(bw, zero, dc);
-                    continue;
-                }
-                quantize(p_coeffs_.data() + (base + b) * kBlockCoeffs,
-                         b < 4 ? qy : qc, quantized);
-                encode_block(bw, quantized, dc);
-            }
-        }
-        bw.finish();
-        if (params.bitrate_budget == 0 ||
-            bitstream_.size() <= params.bitrate_budget || quality <= 1)
-            break;
+    // Rate loop: probes exact stream sizes without writing a bit. The
+    // quality sequence matches the old encode-and-measure loop exactly.
+    while (params.bitrate_budget > 0 && quality > 1 &&
+           p_stream_bytes(mb_count, quality) > params.bitrate_budget)
         quality = std::max(1, quality - 15);
-    }
+    build_quant_table(kQuantBaseLuma, quality, qy);
+    build_quant_table(kQuantBaseChroma, quality, qc);
 
-    // Byte corruption: structured seeded bit flips inside the P bitstream.
-    for (uint32_t i = 0; i < params.byte_flips && !bitstream_.empty(); ++i) {
-        const uint64_t hf = hash_combine(frame_seed, 0xB17F00Du + i);
-        const size_t byte = static_cast<size_t>(
-            hf % static_cast<uint64_t>(bitstream_.size()));
-        bitstream_[byte] ^= static_cast<uint8_t>(1u << (hash_u64(hf) & 7));
-    }
-
-    // ---- decode side: prediction + residual, tolerating desync. Entropy
-    // parses serially (reusing the encode coeff buffer); reconstruction —
-    // dequant + IDCT + add onto the prediction — runs across threads.
-    // Desync mid-stream leaves every later block on bare prediction,
-    // exactly like the serial walk (that's the aesthetic, ).
-    out = pred;
-    {
-        BitReader br(bitstream_.data(), bitstream_.size());
+    // ---- moshed parse. Entropy is lossless, so with no byte flips the
+    // decoder's quantized coefficients are exactly quantize(p_coeffs_) and
+    // no bitstream exists at all. With flips the stream is written once at
+    // the final quality, corrupted, and parsed serially tolerating desync:
+    // every block after the desync point stays on bare prediction — and
+    // open loop means the scar persists.
+    int done = mb_count * 6;
+    if (params.byte_flips > 0) {
+        bitstream_.clear();
+        {
+            BitWriter bw(bitstream_);
+            int16_t dc_y = 0, dc_u = 0, dc_v = 0;
+            int16_t quantized[kBlockCoeffs];
+            const int16_t zero[kBlockCoeffs] = {};
+            for (int mb = 0; mb < mb_count; ++mb) {
+                const size_t base = static_cast<size_t>(mb) * 6;
+                for (int b = 0; b < 6; ++b) {
+                    int16_t* dc = b < 4 ? &dc_y : (b == 4 ? &dc_u : &dc_v);
+                    if (p_zero_[base + b]) {
+                        encode_block(bw, zero, dc);
+                        continue;
+                    }
+                    quantize(p_coeffs_.data() + (base + b) * kBlockCoeffs,
+                             b < 4 ? qy : qc, quantized);
+                    encode_block(bw, quantized, dc);
+                }
+            }
+            bw.finish();
+        }
+        flipped_ = bitstream_;
+        for (uint32_t i = 0; i < params.byte_flips && !flipped_.empty(); ++i) {
+            const uint64_t hf = hash_combine(frame_seed, 0xB17F00Du + i);
+            const size_t byte = static_cast<size_t>(
+                hf % static_cast<uint64_t>(flipped_.size()));
+            flipped_[byte] ^= static_cast<uint8_t>(1u << (hash_u64(hf) & 7));
+        }
+        p_parsed_.resize(p_coeffs_.size());
+        BitReader br(flipped_.data(), flipped_.size());
         int16_t dc_y = 0, dc_u = 0, dc_v = 0;
         int parsed = 0;
         for (int mb = 0; mb < mb_count && parsed == mb * 6; ++mb) {
@@ -263,64 +237,122 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
             for (int b = 0; b < 6; ++b) {
                 int16_t* dc = b < 4 ? &dc_y : (b == 4 ? &dc_u : &dc_v);
                 if (!decode_block(br,
-                                  p_coeffs_.data() + (base + b) * kBlockCoeffs,
+                                  p_parsed_.data() + (base + b) * kBlockCoeffs,
                                   dc))
                     break;
                 ++parsed;
             }
         }
-        const int done = parsed;
-        parallel_blocks(mb_count, true, [&](int begin, int end) {
-            int16_t block[kBlockCoeffs];
-            for (int mb = begin; mb < end; ++mb) {
-                const int mx = mb % mb_w;
-                const int my = mb / mb_w;
-                const size_t base = static_cast<size_t>(mb) * 6;
-                for (int b = 0; b < 6; ++b) {
-                    if (static_cast<int>(base) + b >= done) break;
-                    const bool luma = b < 4;
-                    const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
-                    const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
-                    const int pw =
-                        luma ? static_cast<int>(w) : static_cast<int>(cw);
-                    const int ph =
-                        luma ? static_cast<int>(h) : static_cast<int>(ch);
-                    if (px >= pw || py >= ph) continue;   // parsed filler
-                    dequantize(p_coeffs_.data() + (base + b) * kBlockCoeffs,
-                               luma ? qy : qc, block);
-                    idct8x8(block);
-                    uint8_t* plane = luma
-                        ? out.y.data()
-                        : (b == 4 ? out.u.data() : out.v.data());
-                    const size_t stride =
-                        luma ? out.y_stride : out.uv_stride;
-                    uint8_t* dst =
-                        plane + static_cast<size_t>(py) * stride + px;
-                    const int bw2 = std::min(kBlockSize, pw - px);
-                    const int bh2 = std::min(kBlockSize, ph - py);
-                    for (int y = 0; y < bh2; ++y) {
-                        uint8_t* row = dst + static_cast<size_t>(y) * stride;
-                        for (int x = 0; x < bw2; ++x) {
-                            const int val = static_cast<int>(row[x]) +
-                                            block[y * kBlockSize + x];
-                            row[x] = static_cast<uint8_t>(
-                                std::clamp(val, 0, 255));
-                        }
-                    }
-                }
-            }
-        });
+        done = parsed;
     }
 
-    state_ = out;
-    has_state_ = true;
+    // ---- reconstruction, both chains in parallel across MBs. The clean
+    // chain adds every residual (faithful decode). The moshed chain skips
+    // corrupt-rolled MBs, blocks past the desync point, and uses the parsed
+    // (possibly garbage) coefficients when the stream was flipped.
+    parallel_blocks(mb_count, true, [&](int begin, int end) {
+        int16_t quantized[kBlockCoeffs];
+        int16_t block[kBlockCoeffs];
+        for (int mb = begin; mb < end; ++mb) {
+            const int mx = mb % mb_w;
+            const int my = mb / mb_w;
+            const size_t base = static_cast<size_t>(mb) * 6;
+            const bool corrupt =
+                params.residual_corrupt > 0.0f &&
+                hash_float01(frame_seed,
+                             static_cast<uint64_t>(my) * 4096 + mx) <
+                    params.residual_corrupt;
+            for (int b = 0; b < 6; ++b) {
+                if (p_zero_[base + b]) continue;
+                const bool luma = b < 4;
+                const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
+                const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
+                const int pw = luma ? static_cast<int>(w)
+                                    : static_cast<int>(cw);
+                const int ph = luma ? static_cast<int>(h)
+                                    : static_cast<int>(ch);
+                const uint16_t* qtab = luma ? qy : qc;
+                quantize(p_coeffs_.data() + (base + b) * kBlockCoeffs, qtab,
+                         quantized);
+                dequantize(quantized, qtab, block);
+                idct8x8(block);
+                uint8_t* cplane = luma
+                    ? clean_pred_.y.data()
+                    : (b == 4 ? clean_pred_.u.data() : clean_pred_.v.data());
+                const size_t cstride =
+                    luma ? clean_pred_.y_stride : clean_pred_.uv_stride;
+                add_residual(block,
+                             cplane + static_cast<size_t>(py) * cstride + px,
+                             cstride, pw - px, ph - py);
+                if (corrupt || static_cast<int>(base) + b >= done) continue;
+                if (params.byte_flips > 0) {
+                    dequantize(p_parsed_.data() + (base + b) * kBlockCoeffs,
+                               qtab, block);
+                    idct8x8(block);
+                }
+                uint8_t* mplane = luma
+                    ? pred_.y.data()
+                    : (b == 4 ? pred_.u.data() : pred_.v.data());
+                const size_t mstride =
+                    luma ? pred_.y_stride : pred_.uv_stride;
+                add_residual(block,
+                             mplane + static_cast<size_t>(py) * mstride + px,
+                             mstride, pw - px, ph - py);
+            }
+        }
+    });
+
+    std::swap(clean_state_, clean_pred_);
+    std::swap(state_, pred_);
+    out = state_;
 }
 
-void MoshCodec::predict_from_state(uint32_t frame_index,
-                                   const MoshParams& params, const MvField& mvs,
-                                   DecodedFrame& out) const {
-    const uint32_t w = state_.width;
-    const uint32_t h = state_.height;
+size_t MoshCodec::p_stream_bytes(int mb_count, int quality) {
+    uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
+    build_quant_table(kQuantBaseLuma, quality, qy);
+    build_quant_table(kQuantBaseChroma, quality, qc);
+    const size_t blocks = static_cast<size_t>(mb_count) * 6;
+    p_dc_.resize(blocks);
+    p_acbits_.resize(blocks);
+    static const int16_t kZeroBlock[kBlockCoeffs] = {};
+    const uint32_t zero_ac = ac_bit_count(kZeroBlock);
+    parallel_blocks(mb_count, true, [&](int begin, int end) {
+        int16_t quantized[kBlockCoeffs];
+        for (int mb = begin; mb < end; ++mb) {
+            const size_t base = static_cast<size_t>(mb) * 6;
+            for (int b = 0; b < 6; ++b) {
+                if (p_zero_[base + b]) {
+                    // Encoded as a zero block: DC 0 resets the predictor.
+                    p_dc_[base + b] = 0;
+                    p_acbits_[base + b] = zero_ac;
+                    continue;
+                }
+                quantize(p_coeffs_.data() + (base + b) * kBlockCoeffs,
+                         b < 4 ? qy : qc, quantized);
+                p_dc_[base + b] = quantized[0];
+                p_acbits_[base + b] = ac_bit_count(quantized);
+            }
+        }
+    });
+    uint64_t bits = 0;
+    int16_t dc_y = 0, dc_u = 0, dc_v = 0;
+    for (int mb = 0; mb < mb_count; ++mb) {
+        const size_t base = static_cast<size_t>(mb) * 6;
+        for (int b = 0; b < 6; ++b) {
+            int16_t* dc = b < 4 ? &dc_y : (b == 4 ? &dc_u : &dc_v);
+            bits += se_bit_count(p_dc_[base + b] - *dc) +
+                    p_acbits_[base + b];
+            *dc = p_dc_[base + b];
+        }
+    }
+    return static_cast<size_t>((bits + 7) / 8);
+}
+
+void MoshCodec::predict(const DecodedFrame& ref, uint32_t frame_index,
+                        const MoshParams& params, const MvField& mvs,
+                        bool mangle, DecodedFrame& out) const {
+    const uint32_t w = ref.width;
+    const uint32_t h = ref.height;
     const uint32_t cw = (w + 1) / 2;
     const uint32_t ch = (h + 1) / 2;
     const int mb_w = static_cast<int>((w + 15) / 16);
@@ -331,49 +363,56 @@ void MoshCodec::predict_from_state(uint32_t frame_index,
     const float sr = std::sin(params.mv_rotate);
     const uint64_t mv_seed = hash_combine(params.seed, 0x33CC33CCu);
 
-    for (int my = 0; my < mb_h; ++my) {
-        for (int mx = 0; mx < mb_w; ++mx) {
+    // MBs are independent (disjoint output blocks, per-block seeded MVs),
+    // so the motion comp fans out across threads deterministically.
+    parallel_blocks(mb_w * mb_h, true, [&](int begin, int end) {
+        for (int mb = begin; mb < end; ++mb) {
+            const int mx = mb % mb_w;
+            const int my = mb / mb_w;
             float vx = 0.0f, vy = 0.0f;
             if (mvs.mx && mvs.my && static_cast<uint32_t>(mx) < mvs.blocks_w &&
                 static_cast<uint32_t>(my) < mvs.blocks_h) {
                 vx = mvs.mx[my * static_cast<int>(mvs.blocks_w) + mx];
                 vy = mvs.my[my * static_cast<int>(mvs.blocks_w) + mx];
             }
-            // Replace-with-custom-field: synthetic MV fields
-            // swap in for the flow-supplied vectors; the mangling ops
-            // below still apply, so rotate steers the pan and scale
-            // amplifies the whole field.
-            if (params.mv_field != 0) {
-                const float px = (mx + 0.5f) / mb_w - 0.5f;
-                const float py = (my + 0.5f) / mb_h - 0.5f;
-                const float amt = params.mv_field_amount;
-                switch (params.mv_field) {
-                    case 1:               // pan
-                        vx = amt;
-                        vy = 0.0f;
-                        break;
-                    case 2:               // zoom (radial from center)
-                        vx = px * 2.0f * amt;
-                        vy = py * 2.0f * amt;
-                        break;
-                    default:              // swirl (perpendicular)
-                        vx = -py * 2.0f * amt;
-                        vy = px * 2.0f * amt;
-                        break;
+            if (mangle) {
+                // Replace-with-custom-field: synthetic MV fields swap in for
+                // the flow-supplied vectors; the mangling ops below still
+                // apply, so rotate steers the pan and scale amplifies the
+                // whole field.
+                if (params.mv_field != 0) {
+                    const float px = (mx + 0.5f) / mb_w - 0.5f;
+                    const float py = (my + 0.5f) / mb_h - 0.5f;
+                    const float amt = params.mv_field_amount;
+                    switch (params.mv_field) {
+                        case 1:               // pan
+                            vx = amt;
+                            vy = 0.0f;
+                            break;
+                        case 2:               // zoom (radial from center)
+                            vx = px * 2.0f * amt;
+                            vy = py * 2.0f * amt;
+                            break;
+                        default:              // swirl (perpendicular)
+                            vx = -py * 2.0f * amt;
+                            vy = px * 2.0f * amt;
+                            break;
+                    }
                 }
-            }
-            // MV mangling: scale, rotate, seeded randomization.
-            const float rx = vx * cr - vy * sr;
-            const float ry = vx * sr + vy * cr;
-            vx = rx * params.mv_scale;
-            vy = ry * params.mv_scale;
-            if (params.mv_random > 0.0f) {
-                const uint64_t hb = hash_combine(
-                    hash_combine(mv_seed, frame_index),
-                    static_cast<uint64_t>(my) * 4096 + mx);
-                vx += (hash_to_float01(hb) - 0.5f) * 2.0f * params.mv_random;
-                vy += (hash_to_float01(hash_u64(hb)) - 0.5f) * 2.0f *
-                      params.mv_random;
+                // MV mangling: scale, rotate, seeded randomization.
+                const float rx = vx * cr - vy * sr;
+                const float ry = vx * sr + vy * cr;
+                vx = rx * params.mv_scale;
+                vy = ry * params.mv_scale;
+                if (params.mv_random > 0.0f) {
+                    const uint64_t hb = hash_combine(
+                        hash_combine(mv_seed, frame_index),
+                        static_cast<uint64_t>(my) * 4096 + mx);
+                    vx += (hash_to_float01(hb) - 0.5f) * 2.0f *
+                          params.mv_random;
+                    vy += (hash_to_float01(hash_u64(hb)) - 0.5f) * 2.0f *
+                          params.mv_random;
+                }
             }
             const int ivx = static_cast<int>(std::lround(vx));
             const int ivy = static_cast<int>(std::lround(vy));
@@ -384,7 +423,7 @@ void MoshCodec::predict_from_state(uint32_t frame_index,
             const int bh = std::min(16, static_cast<int>(h) - dy);
             if (bw <= 0 || bh <= 0) continue;
             // The block's content came FROM (dx - mv) in the reference.
-            copy_block(state_.y.data(), state_.y_stride, static_cast<int>(w),
+            copy_block(ref.y.data(), ref.y_stride, static_cast<int>(w),
                        static_cast<int>(h), dx - ivx, dy - ivy, out.y.data(),
                        out.y_stride, dx, dy, bw, bh);
             const int cdx = mx * 8;
@@ -392,14 +431,14 @@ void MoshCodec::predict_from_state(uint32_t frame_index,
             const int cbw = std::min(8, static_cast<int>(cw) - cdx);
             const int cbh = std::min(8, static_cast<int>(ch) - cdy);
             if (cbw <= 0 || cbh <= 0) continue;
-            copy_block(state_.u.data(), state_.uv_stride, static_cast<int>(cw),
+            copy_block(ref.u.data(), ref.uv_stride, static_cast<int>(cw),
                        static_cast<int>(ch), cdx - ivx / 2, cdy - ivy / 2,
                        out.u.data(), out.uv_stride, cdx, cdy, cbw, cbh);
-            copy_block(state_.v.data(), state_.uv_stride, static_cast<int>(cw),
+            copy_block(ref.v.data(), ref.uv_stride, static_cast<int>(cw),
                        static_cast<int>(ch), cdx - ivx / 2, cdy - ivy / 2,
                        out.v.data(), out.uv_stride, cdx, cdy, cbw, cbh);
         }
-    }
+    });
 }
 
 }  // namespace looks::codec

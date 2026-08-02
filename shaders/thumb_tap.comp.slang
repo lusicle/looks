@@ -1,7 +1,6 @@
-// Node-canvas thumbnail tap (docs/flow_canvas.md): downsample one graph
-// node's output into its 160x90 cell of the thumbnail atlas. The atlas is
-// RGBA8 holding sRGB-encoded bytes — the UI image pipeline passes them
-// through unchanged, so the OETF happens here, once.
+// Downsamples one graph node into its 160x90 atlas cell. The UI image
+// pipeline passes bytes through unchanged, so the OETF has to happen
+// here, exactly once.
 
 #include "fx_common.slang"
 

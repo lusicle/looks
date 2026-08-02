@@ -16,7 +16,7 @@ bool param_randomizable(const ParamDesc& desc) {
     // discrete identity knobs on the newer effects.
     static const char* const kFrozenExact[] = {
         "op",     "channels", "counter", "pattern", "flip",
-        "r_from", "g_from",   "b_from",  "font"};
+        "r_from", "g_from",   "b_from",  "font",    "drop_i"};
     for (const char* f : kFrozenExact)
         if (std::strcmp(desc.id, f) == 0) return false;
     return true;

@@ -1,12 +1,5 @@
-// Lidar (point-scan sampling): seeded sample dots stamp the source frame
-// onto a persisting phosphor canvas — the image exists only as an
-// accumulating point cloud that fades as it ages. Scatter mode samples
-// everywhere at once; spin sweeps a rotating beam from frame center (the
-// scanner look); sweep marches a raster column. Dots re-roll on the
-// sample-rate clock, and luma bias concentrates them on lit surfaces.
-// Canvas = own previous output (feedback machinery, one-frame delay).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The canvas at binding 1 is this instance's own previous output, so the
+// point cloud accumulates under the one-frame-delay rule.
 
 #include "fx_common.slang"
 
@@ -21,17 +14,17 @@ cbuffer Push
     uint frame;
     float fps;
     float mode;      // 0 scatter, 1 spinning beam, 2 raster sweep
-    float amount;    // sample density
-    float dot_px;    // dot radius
-    float persist;   // canvas decay per frame
-    float rate;      // sample re-roll rate, hz
-    float bias;      // dots favor bright areas
-    float spin;      // beam revolutions / sweep crossings per second
-    float color;     // 0 = white points, 1 = source-colored
+    float amount;
+    float dot_px;
+    float persist;
+    float rate;      // hz
+    float bias;
+    float spin;      // revolutions or crossings per second
+    float color;     // 0 white points, 1 source-colored
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D canvas;   // own previous output
+[[vk::binding(1, 0)]] Sampler2D canvas;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 static const float kTau = 6.28318530718;
@@ -46,13 +39,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Phosphor: last frame's cloud, decayed.
     float3 col = canvas.SampleLevel(uv, 0).rgb * saturate(persist);
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const uint tick = uint(t * max(rate, 0.01));
     const float r_dot = max(dot_px, 0.75);
-    // One candidate dot per cell; cells sized so dots can breathe.
+    // One candidate dot per cell, sized so dots can breathe. The 3x3
+    // neighbourhood below is what lets a dot overlap into this pixel.
     const float cell = max(r_dot * 3.0, 6.0);
     const uint m = uint(mode + 0.5);
     const float2 center = size * 0.5;
@@ -67,14 +60,11 @@ void main(uint3 tid : SV_DispatchThreadID)
                                 uint(c.x), uint(c.y));
         if (fx_hash01(h) >= amount) continue;
 
-        // Candidate dot position inside the cell.
         const float2 cpos =
             (float2(c) + float2(fx_hash01(fx_hash(h ^ 0x11u)),
                                 fx_hash01(fx_hash(h ^ 0x22u)))) * cell;
         if (cpos.x >= size.x || cpos.y >= size.y) continue;
 
-        // Beam gates: spin admits cells near the rotating radius, sweep
-        // admits cells near the marching column.
         if (m == 1u) {
             const float beam = frac(t * spin) * kTau;
             const float2 d = cpos - center;
@@ -86,7 +76,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             if (abs(cpos.x - beam_x) > cell * 2.0) continue;
         }
 
-        // Sample the source at the dot; luma bias rejects dark samples.
         const float2 suv = (cpos + 0.5) / size;
         const float3 src = input.SampleLevel(saturate(suv), 0).rgb;
         const float l = fx_luma(fx_srgb_oetf(saturate(src)));

@@ -1,8 +1,4 @@
-// Channels (docs/flow_canvas.md primitives): each output channel
-// picks its source — R/G/B/luma. Swaps (aerochrome false color),
-// duplicated channels, and luma-mono all fall out. Display-referred.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred.
 
 #include "fx_common.slang"
 
@@ -30,7 +26,7 @@ float pick_channel(float4 src, float sel)
     const int s = int(sel + 0.5);
     if (s == 1) return src.g;
     if (s == 2) return src.b;
-    if (s == 3) return src.a;   // luma, precomputed by the caller
+    if (s == 3) return src.a;   // luma is packed into .a by the caller
     return src.r;
 }
 

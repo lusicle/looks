@@ -1,11 +1,6 @@
-// Security Mux: the camera-wall multiplexer. A cols x rows monitor grid,
-// each tile replaying the full frame at its own seeded delay from the
-// past-frames ring — no two monitors agree on "now". Mono CCTV wash with
-// per-tile gain mismatch, borders, a blinking REC dot and a cam-index
-// dot row. The engine dispatches once per age band (like slit-scan);
-// each tile's delay picks exactly one band.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The engine dispatches this once per age band of the past-frames ring,
+// as slit-scan does. Each tile's seeded delay picks exactly one band, so
+// every other dispatch returns early for that tile.
 
 #include "fx_common.slang"
 
@@ -19,12 +14,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float cols;      // grid columns
-    float rows_n;    // grid rows
+    float cols;
+    float rows_n;
     float spread;    // how deep tile delays reach into the ring
-    float mono;      // mono CCTV wash
-    float osd;       // borders + rec dot + cam dots
-    uint pass_age;   // this dispatch's age band (engine-provided)
+    float mono;
+    float osd;
+    uint pass_age;   // engine-appended age band for this dispatch
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -48,7 +43,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint ty = min(uint(uv.y * float(nr)), nr - 1u);
     const uint tile = ty * nc + tx;
 
-    // Seeded per-tile delay — each tile lands in exactly one age band.
     const uint age = min(
         uint(fx_hash01(fx_hash3(seed, tile, 0x77u)) * saturate(spread) *
              float(kRing - 1u) + 0.5),
@@ -63,7 +57,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                               frac(uv.y * float(nr)));
     float3 col = history.SampleLevel(luv, 0).rgb;
 
-    // Mono CCTV wash + per-tile gain mismatch + fizz.
     const float l = fx_luma(col);
     const float gn =
         0.8 + 0.4 * fx_hash01(fx_hash3(seed ^ 0x2Au, tile, 0x13u));
@@ -72,7 +65,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         fx_hash01(fx_hash4(seed ^ 0xC5u, tid.x, tid.y, frame)) - 0.5;
     col += fz * saturate(mono) * 0.05;
 
-    // OSD: tile border, blinking REC dot, cam-index dot row.
     const float o = saturate(osd);
     if (o > 0.01) {
         const float2 tpx = luv * size / float2(float(nc), float(nr));
@@ -82,7 +74,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (bd < 2.0) col = lerp(col, float3(0.02, 0.02, 0.02), o);
         else if (bd < 3.0) col = lerp(col, float3(0.35, 0.35, 0.35), o);
 
-        // Blinking REC dot, phase-offset per tile.
         const float t = fps > 0.0 ? float(frame) / fps : 0.0;
         const bool blink =
             frac(t * 1.2 + float(tile) * 0.37) < 0.55;
@@ -90,7 +81,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (blink && length(tpx - dotc) < 3.5)
             col = lerp(col, float3(1.0, 0.12, 0.08), o);
 
-        // Cam index: (tile + 1) small dots along the bottom edge.
+        // Cam index: tile + 1 dots along the bottom edge.
         const float2 dpx = tpx - float2(8.0, tsz.y - 9.0);
         if (dpx.y >= 0.0 && dpx.y < 3.0 && dpx.x >= 0.0) {
             const float slot_f = dpx.x / 6.0;

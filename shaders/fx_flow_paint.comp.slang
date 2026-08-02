@@ -1,11 +1,6 @@
-// Flow paint: anisotropic Kuwahara guided by the optical-flow field —
-// brush strokes stretch along the motion direction, so moving footage
-// smears into oil-paint streaks that follow the action while still
-// regions keep painterly-but-stable structure. Three candidate sectors
-// (ahead, behind, around); the lowest-variance mean wins, which is what
-// keeps the edges crisp.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Anisotropic Kuwahara steered by the flow field. Picking the
+// lowest-variance sector of the three is what keeps edges crisp; a plain
+// mean over the whole ellipse would smear them.
 
 #include "fx_common.slang"
 
@@ -19,16 +14,16 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float radius;   // brush radius, px
-    float aniso;    // stroke elongation along the flow
-    float boost;    // flow-magnitude gain on the elongation
+    float radius;   // px
+    float aniso;
+    float boost;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D flow;    // block MVs in px
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
-// Mean + variance over 12 taps in an oriented ellipse half.
+// Mean and variance over 12 taps in an oriented ellipse half.
 void sector(float2 uv, float2 size, float2 major, float2 minor,
             float side, out float3 mean, out float variance)
 {
@@ -37,7 +32,7 @@ void sector(float2 uv, float2 size, float2 major, float2 minor,
     [unroll]
     for (int i = 0; i < 12; ++i) {
         const float fi = (float(i) + 0.5) / 12.0;
-        const float a = (fi - 0.5) * 2.6;           // fan across the half
+        const float a = (fi - 0.5) * 2.6;
         const float rr = 0.25 + 0.75 * fx_hash01(fx_hash3(19u, uint(i), 7u));
         const float2 off =
             (major * cos(a) * side + minor * sin(a)) * rr;
@@ -65,8 +60,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float speed = length(mv);
     const float2 dir = speed > 0.05 ? mv / speed : float2(1.0, 0.0);
 
-    // Stroke frame: major axis along the flow, stretched by aniso and
-    // (optionally) how fast this region moves.
+    // Major axis runs along the flow.
     const float stretch =
         1.0 + aniso * (1.0 + saturate(speed * 0.15) * boost) * 1.6;
     const float2 major = dir * radius * stretch;

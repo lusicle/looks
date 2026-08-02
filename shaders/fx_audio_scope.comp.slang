@@ -1,10 +1,6 @@
-// Audio Scope: the soundtrack's real waveform traced over the frame. The
-// engine slices the mono PCM copy into a 1-D min/max strip covering the
-// trailing `window` seconds ending at this timeline frame — deterministic
-// on the frame index, so preview and export agree bit-exactly. No audio
-// loaded = flat center line.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The engine slices the mono PCM copy into the min/max strip at binding
+// 1, keyed on the timeline frame index rather than playback position, so
+// preview and export agree bit-exactly. No audio gives a flat line.
 
 #include "fx_common.slang"
 
@@ -18,13 +14,13 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float window;    // seconds shown (consumed engine-side for the strip)
+    float window;    // consumed engine-side building the strip
     float mode;      // 0 filled, 1 mirror magnitude, 2 outline only
-    float thick;     // edge thickness, px
-    float height_f;  // trace height, fraction of frame
-    float pos_y;     // trace center, fraction of frame
-    float glow;      // brightness
-    float color;     // 0 phosphor green -> 1 source color
+    float thick;     // px
+    float height_f;  // fraction of frame
+    float pos_y;     // fraction of frame
+    float glow;
+    float color;     // 0 phosphor green, 1 source color
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -51,7 +47,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float tk = max(thick, 1.0);
     const uint m = uint(mode + 0.5);
 
-    // Trace span for this column (screen y grows downward).
+    // Screen y grows downward, hence max maps to y_top.
     float y_top, y_bot;
     if (m == 1u) {
         const float mag = max(abs(mn), abs(mx));
@@ -62,20 +58,16 @@ void main(uint3 tid : SV_DispatchThreadID)
         y_bot = y_c - mn * half_px;
     }
 
-    // Edge distance to the span boundaries; inside-fill for modes 0/1.
     const float d_edge = min(abs(py - y_top), abs(py - y_bot));
     const bool inside = py >= y_top - 0.5 && py <= y_bot + 0.5;
     float trace = 0.0;
     if (m == 2u) {
-        // Outline: light the whole min..max span thinly (the classic
-        // connected waveform column).
         if (inside) trace = 0.9;
         trace = max(trace, exp(-pow(d_edge / tk, 2.0)) * 0.4);
     } else {
         if (inside) trace = 0.28;
         trace += exp(-pow(d_edge / tk, 2.0)) * (inside ? 1.0 : 0.5);
     }
-    // Faint steady center line.
     const float d_c = abs(py - y_c);
     trace = max(trace, exp(-d_c * d_c * 0.8) * 0.15);
 

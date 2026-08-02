@@ -1,6 +1,5 @@
-// Frame fetch: I420 planes -> linear RGB f16. BT.709 limited
-// range, transfer decoded with the sRGB EOTF (close enough to BT.709 camera
-// gamma for v1; a proper transfer selector rides in with ColorScience).
+// I420 planes to linear RGB, BT.709 limited range. The transfer is
+// decoded with the sRGB EOTF, which stands in for BT.709 camera gamma.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -33,7 +32,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float cb = plane_u.SampleLevel(uv, 0).r;
     const float cr = plane_v.SampleLevel(uv, 0).r;
 
-    // Limited range -> full, then BT.709 matrix.
     const float yf = (y * 255.0 - 16.0) / 219.0;
     const float cbf = (cb * 255.0 - 128.0) / 224.0;
     const float crf = (cr * 255.0 - 128.0) / 224.0;

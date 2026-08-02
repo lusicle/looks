@@ -1,9 +1,5 @@
-// Splice bump: a tape splice going through the projector gate — the frame
-// jumps vertically, the exposure flashes, and a burst of dirt rides the
-// joint. `bump` is the whole event (0 = nothing): route the scene-cut or
-// beat trigger onto it through the mod matrix and every cut hits a splice.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// bump drives the whole event and does nothing at 0, so it is meant to
+// be mod-routed from a scene-cut or beat trigger.
 
 #include "fx_common.slang"
 
@@ -17,10 +13,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float bump;      // event amount (mod-route a trigger here)
-    float jump_px;   // vertical frame jump at full bump
-    float flash;     // exposure flash at full bump
-    float dirt;      // dirt burst at full bump
+    float bump;
+    float jump_px;
+    float flash;
+    float dirt;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -41,7 +37,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 suv = float2(uv.x, frac(uv.y + dy));
     float3 col = input.SampleLevel(suv, 0).rgb;
 
-    // The splice joint: a dark tape bar at the wrap seam.
+    // Dark tape bar at the wrap seam.
     if (dy > 0.0005) {
         const float seam = 1.0 - dy;
         const float d = abs(uv.y - seam);
@@ -49,10 +45,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         col *= 1.0 - bar * 0.85 * b;
     }
 
-    // Exposure flash (the printer light hits the joint).
     col = lerp(col, float3(1.4, 1.35, 1.2), flash * b * 0.7);
 
-    // Dirt burst: dense flecks only while the bump is live.
     if (dirt * b > 0.01) {
         const uint2 cell = uint2(tid.xy / 12u);
         const uint h = fx_hash4(seed, frame, cell.x, cell.y);

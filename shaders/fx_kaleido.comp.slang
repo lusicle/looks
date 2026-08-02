@@ -1,8 +1,5 @@
-// Kaleidoscope / mirror symmetry: fold the angle around N
-// wedges about a movable center; every wedge samples the first, mirrored
-// at the seam so edges meet cleanly.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Every wedge samples the first one, mirrored at the seam so the edges
+// meet cleanly rather than butting.
 
 #include "fx_common.slang"
 
@@ -16,9 +13,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float segments;    // wedge count, >= 2
-    float angle;       // rotation of the fold
-    float center_x;    // normalized center
+    float segments;
+    float angle;
+    float center_x;    // normalized
     float center_y;
 };
 

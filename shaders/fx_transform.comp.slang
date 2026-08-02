@@ -1,9 +1,4 @@
-// Transform (docs/flow_canvas.md primitives): mid-chain affine —
-// scale / rotate / offset / flip with an edge policy for the uncovered
-// region (black, clamp, wrap, mirror). Inverse-maps in pixel space so
-// rotation is aspect-true; offsets are frame fractions.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Inverse-maps in PIXEL space, not uv, so rotation stays aspect-true.
 
 #include "fx_common.slang"
 
@@ -18,11 +13,11 @@ cbuffer Push
     uint frame;
     float fps;
     float scale;
-    float angle;       // degrees
-    float pos_x;       // frame fractions, -1..1
+    float angle;
+    float pos_x;
     float pos_y;
-    float edge_mode;   // 0 black, 1 clamp, 2 wrap, 3 mirror
-    float flip;        // 0 none, 1 h, 2 v, 3 both
+    float edge_mode;
+    float flip;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,8 +33,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / dim;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Inverse map: undo offset, then rotation about frame center, then
-    // scale, in pixel space.
     float2 p = float2(tid.xy) + 0.5 - float2(pos_x, pos_y) * dim;
     const float2 center = dim * 0.5;
     p -= center;
@@ -57,17 +50,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int em = int(edge_mode + 0.5);
     float coverage = 1.0;
     if (em == 0) {
-        // Black outside, with a half-pixel analytic AA edge.
+        // Half-pixel analytic AA on the uncovered edge.
         const float2 d = min(suv, 1.0 - suv) * dim;
         coverage = saturate(min(d.x, d.y) + 0.5);
         suv = clamp(suv, 0.0, 1.0);
     } else if (em == 2) {
         suv = frac(suv);
     } else if (em == 3) {
-        // Triangle wave: 0..1..0 over a 2-frame period.
+        // Triangle wave, 0..1..0 over a 2-frame period.
         suv = 1.0 - abs(frac(suv * 0.5) * 2.0 - 1.0);
     }
-    // em == 1: the sampler clamps.
+    // em == 1 needs no case: the sampler already clamps.
 
     float4 moved = input.SampleLevel(suv, 0);
     moved.rgb *= coverage;

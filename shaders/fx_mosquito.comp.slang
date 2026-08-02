@@ -1,9 +1,4 @@
-// Mosquito noise: the flickering DCT ringing that swarms around hard edges
-// in over-compressed video — high-frequency hash shimmer gated by local
-// edge energy, re-rolled at the flicker rate so it crawls. Encoded space
-// (it is a codec artifact, not scene light).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded space: this is a codec artifact, not scene light.
 
 #include "fx_common.slang"
 
@@ -18,8 +13,8 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;
-    float radius;   // how far the swarm spreads from the edge
-    float rate;     // re-roll rate, hz
+    float radius;
+    float rate;     // hz
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -35,8 +30,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Edge energy within `radius`: max gradient over a small ring of
-    // probes, so the shimmer hugs both sides of every edge.
+    // Max gradient over a ring of probes, so the shimmer hugs BOTH sides
+    // of an edge rather than only the side this pixel sits on.
     const float2 px = 1.0 / size;
     float edge = 0.0;
     [unroll]
@@ -58,7 +53,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const uint tick = uint(t * max(rate, 0.01));
-    // Blocky 2px shimmer cells, like DCT basis residue.
+    // 2px cells, standing in for DCT basis residue.
     const float n = fx_hash01(fx_hash4(seed ^ tick * 0x9E37u, tick,
                                        tid.x / 2u, tid.y / 2u)) - 0.5;
 

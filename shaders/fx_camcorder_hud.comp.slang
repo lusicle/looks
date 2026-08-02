@@ -1,10 +1,5 @@
-// Camcorder HUD: blinking REC dot + label, battery gauge,
-// tape counter off the timeline clock, safe-frame corner brackets. Drawn
-// procedurally in encoded space (it is signal, not scene). Put this
-// BEFORE a Codec-Box in the stack and the HUD gets JPEG-crushed with the
-// picture — the authentic ordering.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Drawn in encoded space: the HUD is signal, not scene, so placing it
+// before a Codec-Box gets it crushed along with the picture.
 
 #include "fx_common.slang"
 
@@ -18,14 +13,15 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float size;       // px per unit
-    float blink_hz;   // REC dot blink
-    float elements;   // 0 rec, 1 +counter, 2 full (battery + brackets)
+    float size;       // px per overlay unit
+    float blink_hz;
+    float elements;   // 0 rec, 1 +counter, 2 +battery and brackets
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
+// 7-segment bit masks, one per decimal digit.
 static const uint kDigit[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66,
                                 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
@@ -50,7 +46,6 @@ float seg_coverage(uint mask, float2 lp)
     return on ? 1.0 : 0.0;
 }
 
-// Box helper in overlay units.
 float box(float2 p, float2 lo, float2 hi)
 {
     return (p.x >= lo.x && p.x < hi.x && p.y >= lo.y && p.y < hi.y) ? 1.0
@@ -74,7 +69,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float white = 0.0, red = 0.0;
 
-    // REC dot + label, top-left.
     {
         const float2 origin = float2(6.0, 5.0) * unit;
         const float2 lp = (px - origin) / unit;
@@ -84,9 +78,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float2 d = lp - float2(2.0, 3.5);
             if (dot(d, d) < 4.0) red = 1.0;
         }
-        // "REC" as chunky segments: R=digit-ish boxes keeps it honest to
-        // low-budget on-screen fonts: draw three 4x7 letter cells.
-        // R: left bar + top + mid + diagonal-ish lower right stub.
+        // "REC" as three 4x7 letter cells built from boxes.
         const float2 rp = lp - float2(6.0, 0.0);
         white = max(white, box(rp, float2(0, 0), float2(1, 7)));
         white = max(white, box(rp, float2(0.5, 0), float2(3.5, 1)));
@@ -106,7 +98,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         white = max(white, box(cp, float2(0.5, 6), float2(3.5, 7)));
     }
 
-    // Counter (mm:ss), top-right.
+    // Counter, mm:ss, where slot code -2 is the colon.
     if (el >= 1) {
         const uint total_s = uint(t);
         const uint mm = (total_s / 60u) % 100u;
@@ -132,11 +124,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // Battery (bottom-left) + safe-frame brackets.
     if (el >= 2) {
         const float2 origin = float2(6.0, size_px.y - 10.0 * unit);
         const float2 lp = (px - origin) / unit;
-        // Shell + tip + 2 of 3 bars filled.
         const float shell =
             max(box(lp, float2(0, 0), float2(12, 5)) -
                     box(lp, float2(0.7, 0.7), float2(11.3, 4.3)),
@@ -147,8 +137,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
         // Corner brackets at the 90% safe frame.
         const float2 m = size_px * 0.05;
-        const float bl = 10.0 * unit;   // arm length
-        const float bw = 1.0 * unit;    // arm width
+        const float bl = 10.0 * unit;
+        const float bw = 1.0 * unit;
         const float2 q = float2(min(px.x, size_px.x - px.x),
                                 min(px.y, size_px.y - px.y));
         if ((abs(q.x - m.x) < bw * 0.5 && q.y >= m.y && q.y < m.y + bl) ||

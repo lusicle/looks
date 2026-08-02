@@ -1,5 +1,5 @@
-// Glow pass 1 (unified Glow): soft-knee bright pass in linear
-// space. Downstream: blur H -> blur V -> composite.
+// Glow pass 1: bright pass in linear space. Downstream is blur H, blur V,
+// then composite.
 
 #include "fx_common.slang"
 
@@ -13,9 +13,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;      // composite intensity (unused here)
-    float radius;      // blur radius px (unused here)
-    float threshold;   // linear luma knee
+    float amount;      // consumed by the composite pass, unused here
+    float radius;      // consumed by the blur passes, unused here
+    float threshold;
     float mode;        // 0 pro-mist, 1 halation, 2 ccd smear
 };
 
@@ -32,7 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 rgb = input.SampleLevel(uv, 0).rgb;
 
     const float l = fx_luma(rgb);
-    // Soft knee around the threshold; pro-mist diffuses everything a bit.
+    // Pro-mist floors the gain, so it diffuses everything a little.
     const float knee = max(threshold, 1.0e-3);
     float gain = smoothstep(knee * 0.5, knee * 1.5, l);
     if (int(mode + 0.5) == 0)

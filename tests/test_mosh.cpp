@@ -80,40 +80,65 @@ TEST(mosh_p_frame_static_converges) {
     CHECK(mean_abs_diff(b.y, frame.y) < 4.0);
 }
 
-TEST(mosh_datamosh_holds_stale_reference) {
+TEST(mosh_datamosh_drop_holds_stale_reference) {
     TestFrame first(0);
     TestFrame second(3);   // very different content
     MoshParams params;
     params.quality = 80;
-    params.gop_length = 1;        // every frame wants to be an I frame...
-    params.drop_iframes = true;   // ...but the mosh drops them
+    params.gop_length = 1;        // every frame is an I frame...
+    params.drop_iframes = true;   // ...and the mosh drops them all: freeze
 
     MoshCodec codec;
     DecodedFrame a, b;
     codec.process(first.view(), 0, params, {}, a);   // first I establishes
-    codec.process(second.view(), 1, params, {}, b);  // dropped I -> P
+    codec.process(second.view(), 1, params, {}, b);  // dropped I -> hold
+    CHECK(b.y == a.y);   // pure repeat of the stale frame
 
-    // Without the drop, frame 1 would be an I frame of `second`.
+    // gop 2 across a cut: frame 2's I is dropped (hold), frame 3's P
+    // residuals were encoded against the CLEAN reference of `second`, so
+    // they repaint texture without ever repairing the stale imagery.
+    MoshParams melt = params;
+    melt.gop_length = 2;
+    MoshCodec moshed;
+    DecodedFrame m;
+    moshed.process(first.view(), 0, melt, {}, m);
+    moshed.process(first.view(), 1, melt, {}, m);
+    moshed.process(second.view(), 2, melt, {}, m);   // dropped I
+    moshed.process(second.view(), 3, melt, {}, m);   // open-loop P
+
     MoshCodec honest;
-    MoshParams clean = params;
+    MoshParams clean = melt;
     clean.drop_iframes = false;
-    DecodedFrame c, d;
-    honest.process(first.view(), 0, clean, {}, c);
-    honest.process(second.view(), 1, clean, {}, d);
+    DecodedFrame hn;
+    honest.process(first.view(), 0, clean, {}, hn);
+    honest.process(first.view(), 1, clean, {}, hn);
+    honest.process(second.view(), 2, clean, {}, hn);
+    honest.process(second.view(), 3, clean, {}, hn);
 
-    // The moshed frame differs from the honest decode of `second`
-    // (residual-only update over a stale reference at P quality).
-    CHECK(mean_abs_diff(b.y, d.y) > 0.05);
-    // And with residual corruption the stale content bleeds through hard.
-    MoshCodec bleeding;
-    MoshParams corrupt = params;
-    corrupt.residual_corrupt = 1.0f;   // no residuals at all
-    DecodedFrame e, f;
-    bleeding.process(first.view(), 0, corrupt, {}, e);
-    bleeding.process(second.view(), 1, corrupt, {}, f);
-    // Frame 1's output is (almost) exactly the frame-0 reference: pure hold.
-    CHECK(mean_abs_diff(f.y, e.y) < 0.5);
-    CHECK(mean_abs_diff(f.y, second.y) > 8.0);
+    // The honest decode tracks the cut; the mosh keeps the old imagery.
+    CHECK(mean_abs_diff(hn.y, second.y) < 4.0);
+    CHECK(mean_abs_diff(m.y, second.y) > 8.0);
+    CHECK(mean_abs_diff(m.y, first.y) < mean_abs_diff(m.y, second.y));
+}
+
+TEST(mosh_open_loop_scar_persists) {
+    // A corruption scar is never repaired by later residuals: the encoder
+    // corrects against its clean reference, not the moshed output.
+    TestFrame f0(0), f1(3);
+    MoshParams params;
+    params.quality = 90;
+    params.gop_length = 0;   // no I refresh after the first frame
+    MoshCodec codec;
+    DecodedFrame a, b, c;
+    codec.process(f0.view(), 0, params, {}, a);
+    MoshParams wound = params;
+    wound.residual_corrupt = 1.0f;   // this frame's residuals all lost
+    codec.process(f1.view(), 1, wound, {}, b);   // holds ~f0 content
+    codec.process(f1.view(), 2, params, {}, c);  // corruption off again
+    CHECK(mean_abs_diff(b.y, f1.y) > 8.0);
+    // A closed loop would repair c back toward f1; open loop keeps the scar.
+    CHECK(mean_abs_diff(c.y, f1.y) > 8.0);
+    CHECK(mean_abs_diff(c.y, b.y) < 2.0);
 }
 
 TEST(mosh_mv_field_advects) {

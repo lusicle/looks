@@ -1,8 +1,4 @@
-// Blend node (docs/flow_canvas.md): the graph merge — blends the B
-// aux input over In with a classic operator. fx(In) = op(In, B); the
-// shared composition (wet interior, opacity outside) gives the mix.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The graph merge: fx(In) = op(In, B), with B arriving at binding 1.
 
 #include "fx_common.slang"
 

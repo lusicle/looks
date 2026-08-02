@@ -1,10 +1,7 @@
-// Layer transform: crop / flip / scale / rotate, applied to the
-// layer source before its effect stack. Inverse-maps each output pixel
-// into the source: rotate and scale about the frame center (aspect-
-// corrected so rotation stays rigid), then flips, then the crop gate.
-// Outside the transformed region the layer is opaque black — the blend
-// pass recomputes the same gate analytically to reveal the composite
-// below (this compositor carries no alpha through effect chains).
+// Applied to the layer source before its effect stack. Outside the
+// transformed region the layer is opaque BLACK, not transparent: this
+// compositor carries no alpha through effect chains, so layer_blend
+// recomputes the same gate analytically to reveal what is below.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -23,9 +20,8 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D source;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Shared with layer_blend.comp.slang (keep in sync): returns the source
-// uv for an output uv plus the crop/frame coverage in [0, 1] with a
-// one-pixel anti-aliased edge.
+// Duplicated in layer_blend.comp.slang; the two must stay in sync or the
+// blend gate stops matching the black this pass renders.
 float2 xform_source_uv(float2 uv, float aspect)
 {
     float2 p = (uv - 0.5) * float2(aspect, 1.0);
@@ -40,8 +36,8 @@ float2 xform_source_uv(float2 uv, float aspect)
 
 float xform_coverage(float2 suv)
 {
-    // Distance to the crop window in source uv; rotation is rigid and
-    // scale is uniform, so one output pixel spans (1 / (dim * scale)) uv.
+    // Rotation is rigid and scale uniform, so one output pixel spans
+    // 1 / (dim * scale) in source uv, giving the one-pixel AA edge.
     const float2 lo = float2(crop_l, crop_t);
     const float2 hi = float2(1.0 - crop_r, 1.0 - crop_b);
     const float dx = min(suv.x - lo.x, hi.x - suv.x) * float(width) * scale;

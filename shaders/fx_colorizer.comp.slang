@@ -1,9 +1,5 @@
-// Colorizer / gradient map: luma through a smooth 3-stop hue ramp — the
-// video-synth colorizer, TD's Lookup, thermal/false-color, and duotone
-// print in one node. Distinct from the Quantizer's palettes: this ramp is
-// continuous. Encoded-domain mapping (the ramp reads like print).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded-domain mapping, and unlike the Quantizer's palettes this ramp
+// is continuous.
 
 #include "fx_common.slang"
 
@@ -20,7 +16,7 @@ cbuffer Push
     float sh_hue;    // stop at black
     float mid_hue;   // stop at middle gray
     float hi_hue;    // stop at white
-    float sat;       // ramp saturation (0 = grayscale ramp)
+    float sat;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -37,10 +33,9 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float l = fx_luma(fx_srgb_oetf(saturate(base.rgb)));
 
-    // Stops keep their luminance ramp (dark -> mid -> bright) so tonality
-    // survives; hue comes from the ramp, chroma from `sat`.
-    // Dark stop stays near-black so mapped footage keeps its floor (the
-    // hue reads in the low mids, not as a lifted wash).
+    // The stops keep a rising luminance ramp so tonality survives, and
+    // the dark stop stays near-black so the hue reads in the low mids
+    // rather than lifting the floor into a wash.
     const float3 c0 = fx_hue_to_rgb(sh_hue) * 0.12;
     const float3 c1 = fx_hue_to_rgb(mid_hue) * 0.6;
     const float3 c2 =

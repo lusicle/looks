@@ -1,8 +1,4 @@
-// Polar coordinates: rect→polar wraps the frame around the
-// center (x = angle, y = radius); polar→rect unwraps it into a strip.
-// swirl shears the angle by radius; the angle axis wraps, radius clamps.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The angle axis wraps and the radius clamps, in both directions.
 
 #include "fx_common.slang"
 
@@ -16,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;    // 0 = rect source read in polar, 1 = unwrap to a strip
-    float swirl;   // radians of angular shear across the radius
-    float zoom;    // radial scale
+    float mode;    // 0 wrap around center, 1 unwrap to a strip
+    float swirl;   // radians of shear across the radius
+    float zoom;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,7 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float2 suv;
     if (mode < 0.5) {
-        // Output pixel (x=angle, y=radius) reads the rect source in polar.
+        // Output x is the angle, y the radius.
         const float theta = uv.x * 2.0 * kPi + swirl * uv.y;
         const float r = uv.y * 0.5 * max(zoom, 1.0e-3);
         suv = float2(0.5, 0.5) +
@@ -46,7 +42,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                   float2(size.y / size.x, 1.0);   // circular on screen
         suv = clamp(suv, 0.0, 1.0);
     } else {
-        // Unwrap: output row = radius ring, column = angle.
         const float2 d = (uv - 0.5) * float2(size.x / size.y, 1.0);
         const float r = length(d) / (0.5 * max(zoom, 1.0e-3));
         const float theta = atan2(d.y, d.x) - swirl * r;

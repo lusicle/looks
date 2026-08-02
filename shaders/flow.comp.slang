@@ -1,24 +1,22 @@
-// Optical flow (src/gfx/flow consumer contract): one thread per
-// 16x16 block, diamond/3-step SAD search of the PREVIOUS luma plane inside
-// the CURRENT one -> per-block motion vector in pixels, written to a
-// (w/16, h/16) RG target. Deterministic: pure function of the two planes.
-// Consumers: flow smear, motion masks, motion mod source, Codec-Box MVs.
+// One thread per 16x16 block, three-step SAD search, writing a per-block
+// motion vector in pixels to a (w/16, h/16) RG target. A pure function of
+// the two luma planes, so flow never carries state across frames.
 
 [[vk::push_constant]]
 cbuffer Push
 {
     uint width;        // full-res source size
     uint height;
-    uint valid;        // 0 = discontinuity (seek): emit zero flow
+    uint valid;        // 0 = seek discontinuity, emit zero flow
 };
 
-[[vk::binding(0, 0)]] Sampler2D cur_luma;    // R8: current frame Y
-[[vk::binding(1, 0)]] Sampler2D prev_luma;   // R8: previous frame Y
+[[vk::binding(0, 0)]] Sampler2D cur_luma;
+[[vk::binding(1, 0)]] Sampler2D prev_luma;
 [[vk::binding(2, 0)]] RWTexture2D<float4> flow_out;
 
 float block_sad(float2 cur_base, float2 prev_base, float2 inv_size)
 {
-    // 8x8 taps over the 16x16 block (stride 2).
+    // 8x8 taps at stride 2 over the 16x16 block.
     float sad = 0.0;
     [unroll]
     for (int y = 0; y < 8; ++y)
@@ -54,17 +52,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 inv_size = 1.0 / float2(width, height);
     const float2 block_origin = float2(tid.xy) * 16.0;
 
-    // Three-step search: step 8, 4, 2, 1 over a diamond; motion of the
-    // block from prev -> cur means the prev block content is found at
-    // block_origin + mv in the current frame, i.e. we search where the
-    // CURRENT block came FROM in the previous frame.
+    // Sign convention: the search asks where the CURRENT block came FROM
+    // in the previous frame, hence the minus on cand below.
     float2 mv = float2(0.0, 0.0);
     float best = block_sad(block_origin, block_origin, inv_size);
     for (int step = 8; step >= 1; step >>= 1)
     {
         bool improved = true;
-        // A couple of refinement rounds per step keeps it cheap and
-        // deterministic (fixed iteration count).
+        // Fixed round count: the search must not iterate to convergence,
+        // or the result stops being deterministic across drivers.
         for (int round = 0; round < 2 && improved; ++round)
         {
             improved = false;

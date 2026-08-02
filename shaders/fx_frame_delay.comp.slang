@@ -1,9 +1,5 @@
-// Frame Delay (docs/flow_canvas.md primitives): plain N-frame delay
-// — the engine binds the right slice of the per-instance past-frames
-// ring as the second input; the kernel just presents it. Composes with
-// Blend / Motion Extract for echo and difference rigs.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The engine picks the ring slice and binds it at binding 1; the kernel
+// only presents it.
 
 #include "fx_common.slang"
 
@@ -17,7 +13,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float frames;   // delay depth (engine-side ring pick; unread here)
+    float frames;   // consumed engine-side, unused here
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

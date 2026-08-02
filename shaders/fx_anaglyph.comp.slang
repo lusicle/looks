@@ -1,8 +1,4 @@
-// Anaglyph 3D: red/cyan (or red/blue, green/magenta) stereo double image.
-// Disparity rides a luma depth proxy — bright subjects read as near and
-// pop out of the screen harder than the shadows behind them.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Disparity rides luma as a depth proxy, so bright subjects read as near.
 
 #include "fx_common.slang"
 
@@ -17,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float depth;    // base disparity, px
-    float pop;      // luma-driven extra disparity
+    float pop;
     float mode;     // 0 red/cyan, 1 red/blue, 2 green/magenta
 };
 

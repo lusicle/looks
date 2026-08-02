@@ -1,8 +1,4 @@
-// Projection screen texture: the woven screen surface (fine
-// two-axis weave modulation) plus the projector hotspot — center brighter,
-// corners falling off. Multiplicative in linear light.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Multiplicative in linear light: this is a surface, not a paint.
 
 #include "fx_common.slang"
 
@@ -16,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;     // weave visibility
+    float amount;
     float weave_px;   // thread pitch
-    float hotspot;    // center gain / corner falloff
+    float hotspot;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -34,19 +30,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Weave: two phase-offset sinusoids, static in screen space (the
-    // screen does not move with the picture).
+    // Static in screen space: the screen does not move with the picture.
     const float pitch = max(weave_px, 2.0);
     const float2 ph = float2(tid.xy) * (6.28318 / pitch);
     const float wv = 0.5 * (sin(ph.x) + sin(ph.y * 1.07 + 1.3));
-    // Slight per-cell irregularity so it reads as cloth, not a grid.
+    // Per-cell irregularity, or it reads as a grid rather than cloth.
     const uint2 cell = uint2(float2(tid.xy) / pitch);
     const float irregular =
         fx_hash01(fx_hash3(seed, cell.x, cell.y)) - 0.5;
     const float weave_mod =
         1.0 - saturate(amount) * 0.18 * (0.5 - 0.5 * wv + 0.4 * irregular);
 
-    // Hotspot: gain toward the center, rolloff toward corners.
     const float2 d = (uv - 0.5) * float2(size.x / size.y, 1.0);
     const float r2 = dot(d, d);
     const float spot = 1.0 + hotspot * (0.35 - r2 * 1.6);

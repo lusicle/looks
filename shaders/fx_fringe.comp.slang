@@ -1,10 +1,3 @@
-// Fringing: mode 0 = lateral chromatic aberration (R and B
-// sampled at radially scaled positions, growing toward the edges); mode 1 =
-// digicam purple fringe (violet bloom past a contrast threshold, weighted
-// toward blown highlights the way CCD blooming reads).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,9 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;      // px at the frame edge / edge-detect radius
-    float mode;        // 0 = lens CA, 1 = purple fringe
-    float threshold;   // purple mode: contrast gate
+    float amount;      // px at the frame edge, or edge-detect radius
+    float mode;        // 0 lens CA, 1 purple fringe
+    float threshold;   // purple mode only
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -37,8 +30,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float4 result;
     if (mode < 0.5) {
-        // Radial scale per channel: R out, B in; scales with distance so
-        // the center stays clean like a real lens.
+        // Scales with distance from center, so the center stays clean the
+        // way a real lens does.
         const float2 d = uv - 0.5;
         const float s = amount / (0.5 * min(size.x, size.y));
         const float r = input.SampleLevel(0.5 + d * (1.0 + s), 0).r;
@@ -55,7 +48,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             fx_luma(saturate(input.SampleLevel(uv - float2(0, e.y), 0).rgb));
         const float edge = length(float2(lx, ly));
         const float gate = saturate((edge - threshold * 0.5) * 4.0);
-        // Strongest just off blown highlights.
+        // Peaks just below clipping, where CCD blooming actually sits.
         const float halo = saturate(1.0 - abs(l0 - 0.55) * 2.2);
         const float3 purple = float3(0.45, 0.1, 0.6);
         result = float4(base.rgb + purple * gate * halo, base.a);

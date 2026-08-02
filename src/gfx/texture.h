@@ -62,7 +62,11 @@ public:
     // submit; offsets reset with reset().
     bool upload_image(VkCommandBuffer cmd, const void* data, size_t size,
                       size_t row_pitch, GpuImage& dst);
-    void reset() { offset_ = 0; }
+    // Resets the write offset and destroys buffers retired by growth.
+    // MUST run after the owning slot's fence wait: growth mid-frame keeps
+    // the old buffer alive (already-recorded copies reference it), and the
+    // fence is what proves those copies have executed.
+    void reset();
 
 private:
     bool ensure(size_t needed);
@@ -73,6 +77,11 @@ private:
     void* mapped_ = nullptr;
     size_t capacity_ = 0;
     size_t offset_ = 0;
+    struct Retired {
+        VkBuffer buffer;
+        VmaAllocation allocation;
+    };
+    std::vector<Retired> retired_;
 };
 
 // Pooled RGBA16F render targets: acquire per pass, release when the frame's

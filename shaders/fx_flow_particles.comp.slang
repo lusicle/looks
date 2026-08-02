@@ -1,10 +1,5 @@
-// Flow-field particles: the frame dissolves into a persistent
-// particle field advected along the optical flow. A seeded per-pixel gate
-// injects fresh pixels each frame; everything else is history pulled back
-// along the motion (with optional swirl) and decayed — moving subjects
-// shed streaming trails of themselves.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// History is gathered by sampling BACKWARD along the flow, so no scatter
+// or atomics are needed to advect the field.
 
 #include "fx_common.slang"
 
@@ -18,15 +13,15 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float advect;     // flow multiplier
+    float advect;
     float dissolve;   // fraction of pixels re-injected per frame
-    float decay;      // history energy retention
-    float swirl;      // perpendicular curl of the advection
+    float decay;
+    float swirl;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D prev;    // own previous output
-[[vk::binding(2, 0)]] Sampler2D flow;    // block MVs in px, (w/16, h/16)
+[[vk::binding(1, 0)]] Sampler2D prev;
+[[vk::binding(2, 0)]] Sampler2D flow;    // block MVs in px
 [[vk::binding(3, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
@@ -40,13 +35,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     float2 mv = flow.SampleLevel(uv, 0).rg;
-    // Swirl: bend the advection sideways, varying smoothly across the
-    // frame so trails curl instead of translating.
+    // Varies smoothly across the frame so trails curl rather than
+    // translating as a block.
     const float bend =
         swirl * (fx_value_noise1(seed, uv.x * 7.0 + uv.y * 11.0 +
                                            float(frame) * 0.01) - 0.5) * 2.0;
     mv += float2(-mv.y, mv.x) * bend;
-    // Idle drift so still footage still flows a little.
+    // Idle drift, so still footage still flows a little.
     mv += float2(0.4, -0.25);
 
     const float2 suv = clamp(uv - mv * advect / size, 0.0, 1.0);

@@ -1,10 +1,5 @@
-// Slow Scan (SSTV): a beam crawls the frame in raster order, replacing
-// the held previous image line by line — one full frame takes `period`
-// seconds. Newly written lines carry sync jitter and fizz; the beam
-// glows just ahead of itself; the not-yet-scanned region dims slightly.
-// Canvas = own previous output (feedback machinery, one-frame delay).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// A beam crawls the frame replacing the held image line by line, so the
+// canvas at binding 1 is this instance's own previous output.
 
 #include "fx_common.slang"
 
@@ -19,14 +14,14 @@ cbuffer Push
     uint frame;
     float fps;
     float period;    // seconds per full frame
-    float mode;      // 0 rows (top->bottom), 1 columns
-    float beam;      // beam glow ahead of the write line
-    float noise;     // sync jitter + luma fizz on fresh lines
-    float dim;       // darken the not-yet-scanned region
+    float mode;      // 0 rows top to bottom, 1 columns
+    float beam;
+    float noise;
+    float dim;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D canvas;   // own previous output
+[[vk::binding(1, 0)]] Sampler2D canvas;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
@@ -47,7 +42,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float s_prev = s_now - fstep;
     const uint cycle = uint(t / per);
 
-    // My position along the scan, and the scan-line index for jitter.
     const float pos = cols ? uv.x : uv.y;
     const uint line_i = cols ? tid.x : tid.y;
     const float extent = cols ? size.x : size.y;
@@ -58,7 +52,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 col;
     if (in_band) {
-        // Fresh write: sync jitter shifts the line along its length.
         const float j =
             (fx_hash01(fx_hash4(seed, line_i, cycle, 0x5Cu)) - 0.5) *
             saturate(noise) * 16.0;
@@ -66,19 +59,17 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (cols) suv.y = clamp(uv.y + j / size.y, 0.0, 1.0);
         else      suv.x = clamp(uv.x + j / size.x, 0.0, 1.0);
         col = input.SampleLevel(suv, 0).rgb;
-        // Luma fizz on the fresh line.
         const float fz =
             fx_hash01(fx_hash4(seed ^ 0xF1u, tid.x, tid.y, cycle)) - 0.5;
         col = max(col + fz * saturate(noise) * 0.25, 0.0);
     } else {
         col = canvas.SampleLevel(uv, 0).rgb;
-        // Not yet scanned this cycle: slightly stale/dim.
         if (pos > s_now)
             col *= 1.0 - saturate(dim) * 0.6;
     }
 
-    // Beam glow on the lines about to be written (they get overwritten
-    // clean when the band reaches them, so the glow never burns in).
+    // Glow only ahead of the write line: those pixels get overwritten
+    // clean when the band reaches them, so it never burns into the canvas.
     const float ahead = (pos - s_now) * extent;
     if (ahead > 0.0)
         col += saturate(beam) * 0.9 * exp(-ahead * ahead * 0.08) *

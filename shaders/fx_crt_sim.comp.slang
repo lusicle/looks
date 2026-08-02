@@ -1,11 +1,5 @@
-// CRT tube sim: the DISPLAY-side counterpart to the signal-path effects
-// (Composite/Snow simulate the cable; this simulates the glass) — barrel
-// curvature with corner darkening, scanline gaps, an aperture-grille RGB
-// triad mask, and a touch of gain to pay the mask's brightness tax.
-// Panel 1 = LCD: flat glass, rectangular RGB stripe subpixels with a row
-// gap (screen-door), no beam scanline or curvature.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The display-side counterpart to the signal-path effects: Composite and
+// Snow simulate the cable, this simulates the glass.
 
 #include "fx_common.slang"
 
@@ -19,10 +13,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float curvature;   // barrel amount
-    float scanline;    // row-gap strength
-    float mask_amt;    // aperture-grille strength
-    float triad;       // grille triad width, px
+    float curvature;
+    float scanline;
+    float mask_amt;
+    float triad;       // px
     float panel;       // 0 crt tube, 1 lcd screen-door
 };
 
@@ -40,8 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const bool lcd = panel >= 0.5;
-    // Barrel curvature: quadratic bulge about the center; outside the
-    // curved screen is tube black. LCD glass is flat.
+    // Outside the curved screen is tube black. LCD glass is flat.
     float2 c = uv * 2.0 - 1.0;
     const float k = lcd ? 0.0 : curvature * 0.22;
     c *= 1.0 + k * dot(c, c);
@@ -53,9 +46,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col = input.SampleLevel(suv, 0).rgb;
 
         if (lcd) {
-            // LCD screen-door: rectangular RGB stripe subpixels inside a
-            // dark cell border, rows separated by a thin gap. `scanline`
-            // drives the row-gap depth, `triad` the cell size.
+            // scanline drives the row-gap depth here, triad the cell size.
             const float tw = max(triad, 2.0);
             const float cx = frac(float(tid.x) / (tw * 3.0)) * 3.0;
             const uint stripe = uint(cx) % 3u;
@@ -75,14 +66,12 @@ void main(uint3 tid : SV_DispatchThreadID)
                         saturate(mask_amt));
             col *= 1.0 + saturate(mask_amt) * 0.9;
         } else {
-            // Scanline gaps ride the CURVED coordinate so they bend with
-            // the glass; sized to every other output row at 1080p-ish.
+            // Gaps ride the CURVED coordinate so they bend with the glass.
             const float row = suv.y * size.y;
             const float gap =
                 0.5 + 0.5 * cos(row * 3.14159265);
             col *= 1.0 - scanline * 0.6 * gap;
 
-            // Aperture grille: R/G/B vertical stripes, triad px each.
             const float tw = max(triad, 2.0);
             const uint stripe = uint(floor(float(tid.x) / tw)) % 3u;
             float3 grille = float3(0.35, 0.35, 0.35);
@@ -93,7 +82,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             // Gain back the light the mask ate.
             col *= 1.0 + saturate(mask_amt) * 0.5 + scanline * 0.25;
 
-            // Corner darkening on the curved radius (tube vignette).
             const float corner =
                 saturate(1.0 - dot(c, c) * 0.28 * curvature);
             col *= corner;

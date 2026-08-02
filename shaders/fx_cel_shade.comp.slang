@@ -1,7 +1,4 @@
-// Cel shade: quantize luma into flat bands (hue preserved) and
-// ink the edges dark. Encoded space for perceptually even bands.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Encoded space, so the bands land perceptually even.
 
 #include "fx_common.slang"
 
@@ -15,8 +12,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float bands;   // luma steps
-    float edge;    // ink strength
+    float bands;
+    float edge;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -40,12 +37,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float l = fx_luma(enc);
 
-    // Quantize luma, keep chroma: scale rgb to the banded luma.
+    // Scaling rgb by the luma ratio is what preserves hue through the
+    // quantization.
     const float n = clamp(round(bands), 2.0, 16.0);
     const float banded = (floor(l * n) + 0.5) / n;
     float3 col = l > 1.0e-4 ? enc * (banded / l) : float3(banded, banded, banded);
 
-    // Ink: Sobel on luma.
     const float2 e = 1.5 / size;
     const float gx = luma_at(uv + float2(e.x, 0)) - luma_at(uv - float2(e.x, 0));
     const float gy = luma_at(uv + float2(0, e.y)) - luma_at(uv - float2(0, e.y));

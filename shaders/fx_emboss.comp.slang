@@ -1,9 +1,3 @@
-// Emboss: directional relief — luma gradient along a light direction over
-// middle gray (mode 0), or the colored relief added back over the image
-// (mode 1). The oldest trick in the video toolbox, still iconic.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -17,7 +11,7 @@ cbuffer Push
     uint frame;
     float fps;
     float strength;
-    float angle;    // light direction
+    float angle;
     float mode;     // 0 gray relief, 1 colored relief
 };
 

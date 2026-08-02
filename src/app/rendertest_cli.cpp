@@ -361,6 +361,28 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
     };
     std::vector<Row> rows;
 
+    // GPU clock warmup: without sustained load first, the sweep's early
+    // rows measure idle clocks and the table sorts by enum order instead
+    // of kernel cost.
+    {
+        auto engine = gfx::Engine::create(device, shader_dir);
+        auto readback = gfx::Nv12Readback::create(device, shader_dir);
+        if (!engine || !readback) {
+            std::fprintf(stderr, "bench: engine init failed\n");
+            return 1;
+        }
+        doc::Document doc;
+        doc.master_seed = 77;
+        std::vector<uint8_t> nv12;
+        for (uint32_t f = 0; f < 60; ++f) {
+            const gfx::SourcePlanes planes = source.planes(f);
+            if (!readback->render(*engine, planes, doc, f, 30.0, nv12)) {
+                std::fprintf(stderr, "bench: warmup render failed\n");
+                return 1;
+            }
+        }
+    }
+
     // Baseline first: upload + convert + readback with an empty stack.
     for (int t = -1; t < static_cast<int>(doc::EffectType::Count); ++t) {
         doc::Document doc;
@@ -378,21 +400,27 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
             return 1;
         }
         std::vector<uint8_t> nv12;
-        double seconds = 0.0;
+        // Min of the timed frames, not the mean: strips clock-ramp and
+        // scheduler spikes, leaving the effect's steady per-frame cost.
+        double best = 1.0e9;
         for (uint32_t f = 0; f < kFrames; ++f) {
+            // Pattern generation stays OUTSIDE the timed window: it is
+            // several ms of single-threaded CPU work that would otherwise
+            // flatten every GPU effect onto one harness floor.
+            const gfx::SourcePlanes planes = source.planes(f);
             const auto t0 = std::chrono::steady_clock::now();
-            if (!readback->render(*engine, source.planes(f), doc, f, 30.0,
+            if (!readback->render(*engine, planes, doc, f, 30.0,
                                   nv12)) {
                 std::fprintf(stderr, "bench: render failed (%s)\n", name);
                 return 1;
             }
             if (f >= kWarm)
-                seconds += std::chrono::duration<double>(
-                               std::chrono::steady_clock::now() - t0)
-                               .count();
+                best = std::min(
+                    best, std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count());
         }
-        rows.push_back(
-            {seconds * 1000.0 / (kFrames - kWarm), std::string(name)});
+        rows.push_back({best * 1000.0, std::string(name)});
         std::printf("bench %-24s %8.3f ms\n", name, rows.back().ms);
     }
 
@@ -400,7 +428,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
               [](const Row& a, const Row& b) { return a.ms > b.ms; });
     FILE* out = _wfopen((temp_dir / "bench.txt").wstring().c_str(), L"w");
     if (!out) return 1;
-    std::fprintf(out, "per-effect ms/frame, 1920x1080, %u timed frames "
+    std::fprintf(out, "per-effect ms/frame (min of %u timed), 1920x1080 "
                       "(sorted, includes upload+convert+readback)\n",
                  kFrames - kWarm);
     for (const Row& r : rows)

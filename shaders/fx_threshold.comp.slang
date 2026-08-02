@@ -1,8 +1,4 @@
-// Threshold (docs/flow_canvas.md primitives): soft-knee luma
-// threshold to black & white — the matte/print primitive Photocopy and
-// Halftone bury inside their stacks. Display-referred core.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Display-referred core.
 
 #include "fx_common.slang"
 
@@ -17,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float threshold;
-    float soft;     // knee width around the threshold
+    float soft;     // knee width
     float invert;
 };
 

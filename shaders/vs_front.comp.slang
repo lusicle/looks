@@ -1,29 +1,22 @@
-// Velocity-scan front stepper: each texel is one segment of one sweeping
-// line — x = along-axis position, y = line slot. The segment's front
-// advances across the frame at a speed braked by the luma underneath
-// (velocity modulation: brightness = dwell time, the 1930s TV scheme).
-// Slots respawn from the frame edge on a staggered tick cadence and die
-// after one full cycle so stuck fronts always recycle. Deterministic:
-// frame-clocked, seeded.
-//
-// State texel: R = front position (px along the sweep axis), G = active,
-// B = spawn tick + 1 (0 = never spawned).
+// Front stepper for velocity scan: texel x = along-axis position, y =
+// line slot. State texel is R = front position in px, G = active,
+// B = spawn tick + 1, where 0 means never spawned.
 
 #include "fx_common.slang"
 
 [[vk::push_constant]]
 cbuffer Push
 {
-    uint state_w;   // along-axis texels (max frame dimension)
-    uint slots;     // concurrent sweep lines
+    uint state_w;   // along-axis texels, the max frame dimension
+    uint slots;
     uint seed;
     uint frame;
     float fps;
-    float speed;    // sweep px/s
-    float stick;    // luma braking strength
-    float rate;     // spawns per second (staggered across slots)
-    float wiggle;   // shear noise on the advance
-    uint mode;      // 0 = vertical lines sweep +x, 1 = horizontal sweep +y
+    float speed;    // px/s
+    float stick;
+    float rate;     // spawns/s, staggered across slots
+    float wiggle;
+    uint mode;      // 0 vertical lines sweep +x, 1 horizontal sweep +y
     uint frame_w;
     uint frame_h;
 };
@@ -58,7 +51,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             st = float4(0.0, 1.0, float(tick) + 1.0, 0.0);
         }
     } else {
-        // Luma under the front brakes it — brightness becomes dwell.
+        // Luma under the front brakes it: brightness becomes dwell time.
         const float2 uv = mode == 0u
             ? float2((st.r + 0.5) / float(frame_w),
                      (float(tid.x) + 0.5) / float(frame_h))
@@ -68,8 +61,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             saturate(video.SampleLevel(saturate(uv), 0).rgb)));
         const float brake =
             lerp(1.0, pow(saturate(1.0 - l), 3.0), saturate(stick));
-        // Shear: neighbors advance at slightly different rates, so the
-        // trace wavers like a hand-deflected beam.
         const float shear =
             1.0 + (fx_value_noise1(seed ^ (tid.y + 1u) * 131u,
                                    float(tid.x) * 0.03 + t * 1.7) - 0.5) *

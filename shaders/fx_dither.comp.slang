@@ -1,17 +1,5 @@
-// Dither (docs/flow_canvas.md primitives): the Quantizer's ordered-
-// pattern threshold engine, standalone. Patterns: 0-2 Bayer
-// 2/4/8, 3 white noise, 4 blue noise, 5 STBN (temporal slices on the
-// boil clock), 6 moiré, 7 spiral, 8 radial rings, 9 diamond cluster,
-// 10 clustered dot (45-degree screen), 11 line screen, 12 checker,
-// 13 interleaved gradient noise.
-// Shared pattern-transform controls: boil / scroll / rotate / scale /
-// motion lock (flow advection). Levels are encoded-uniform but the pick
-// is made in LINEAR light (fx_dither_levels) so brightness is preserved.
-//
-// Binding 1 is the packed dither LUT (see fx_common.slang); binding 2 the
-// flow field (bound as the LUT dummy unless motion lock wired it).
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The Quantizer's ordered-pattern threshold engine, standalone. Binding 2
+// is the flow field, bound as the LUT dummy unless motion lock wired it.
 
 #include "fx_common.slang"
 
@@ -25,13 +13,13 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float levels;      // quantization steps
-    float pattern_m;   // pattern mode, see header
-    float amount;      // 0..1 threshold strength
-    float boil_hz;     // pattern re-seed rate; 0 = static
-    float scroll;      // pattern drift, px/s
-    float pat_rotate;  // pattern transform: rotation, degrees
-    float pat_scale;   // pattern transform: scale
+    float levels;
+    float pattern_m;
+    float amount;
+    float boil_hz;     // 0 = static
+    float scroll;      // px/s
+    float pat_rotate;  // degrees
+    float pat_scale;
     float lock_mode;   // 0 screen-locked, 1 motion-locked
     float mode;        // 0 per-channel rgb, 1 grayscale
 };
@@ -50,14 +38,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Boil: the pattern re-seeds/offsets at boil_hz.
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const uint boil_tick = boil_hz > 0.01 ? uint(t * boil_hz) : 0u;
     const uint2 shift = uint2(fx_hash3(seed, boil_tick, 11u) & 127u,
                               fx_hash3(seed, boil_tick, 13u) & 127u);
 
-    // Pattern coordinates (shared controls — same construction
-    // as the Quantizer's dither leg).
+    // Same coordinate construction as the Quantizer's dither leg.
     float2 pf = float2(tid.xy);
     if (lock_mode >= 0.5) {
         const float2 mv = flow.SampleLevel(uv, 0).rg;
@@ -68,9 +54,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float prc = cos(pr), prs = sin(pr);
         pf = float2(pf.x * prc - pf.y * prs, pf.x * prs + pf.y * prc);
     }
-    // Scale floors at 1: one pixel is the finest possible dither
-    // feature, and sub-1 strides alias the matrix onto a near-constant
-    // threshold subset (stride 4 on bayer 8 samples only {0..3}/64).
+    // Scale floors at 1: sub-1 strides alias the matrix onto a
+    // near-constant subset, e.g. stride 4 on bayer 8 samples only
+    // {0..3}/64.
     pf /= clamp(pat_scale, 1.0, 4.0);
     pf += float2(shift);
     pf += t * scroll * float2(1.0, 0.37);
@@ -116,23 +102,19 @@ void main(uint3 tid : SV_DispatchThreadID)
     else if (dm == 10)
         pattern = fx_cluster_dot(pf);
     else if (dm == 11) {
-        // Line screen: the threshold ramps across a 4 px row period, so
-        // tone renders as variable-weight lines (pattern rotate angles
-        // them).
         pattern = (float(p.y & 3) + 0.5) * 0.25;
     }
     else if (dm == 12)
         pattern = ((p.x ^ p.y) & 1u) != 0u ? 0.75 : 0.25;
     else if (dm == 13)
         pattern = fx_ign(p);
-    // Ordered threshold in [0, 1]; amount narrows it toward the plain
-    // midpoint round.
+    // amount narrows the threshold toward a plain midpoint round.
     const float t01 =
         clamp(0.5 + (pattern - 0.5) * saturate(amount), 0.0, 1.0);
 
-    // Level pick happens in LINEAR light (fx_dither_levels, v5.6a) so
-    // the dithered field averages back to the source brightness — code-
-    // value dithering lifts every dark region on display.
+    // The level pick happens in LINEAR light so the dithered field
+    // averages back to the source brightness; code-value dithering would
+    // lift every dark region on display.
     const float n = max(levels, 2.0);
     float3 result;
     if (mode >= 0.5) {

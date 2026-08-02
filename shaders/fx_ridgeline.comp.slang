@@ -1,9 +1,5 @@
-// Ridgeline: stacked occluded luma waveforms — the Unknown Pleasures
-// joyplot. Each image row band becomes one horizontal waveform; lower
-// (nearer) ridges hide the ridges behind them. Walk bottom-to-top
-// tracking the per-column silhouette.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Occlusion comes from walking bottom-to-top while tracking the
+// per-column silhouette, so nearer ridges hide the ones behind them.
 
 #include "fx_common.slang"
 
@@ -17,18 +13,17 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float rows_n;    // ridge count
-    float amount;    // waveform height
-    float line_w;    // line width, px
-    float soften;    // horizontal waveform smoothing
-    float fill;      // how black the space between ridges goes
-    float color;     // 0 white lines -> 1 source color
+    float rows_n;
+    float amount;
+    float line_w;    // px
+    float soften;
+    float fill;
+    float color;     // 0 white lines, 1 source color
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Single-tap encoded luma (slope probes).
 float ridge_enc(Sampler2D tex, float u, float v)
 {
     const float l = fx_luma(tex.SampleLevel(
@@ -36,11 +31,9 @@ float ridge_enc(Sampler2D tex, float u, float v)
     return fx_srgb_oetf(saturate(float3(l, l, l))).x;
 }
 
-// Smoothed encoded luma along a source row, averaged over a small
-// vertical band. The band average matters: each ridge stands for a BAND
-// of the image, and it dilutes 8-bit / codec luma quantization — without
-// it a flat region crossing one code value pops the whole flat line
-// segment up a pixel at once.
+// The vertical band average is load-bearing: it dilutes 8-bit and codec
+// luma quantization, without which a flat region crossing one code value
+// pops the whole flat line segment up a pixel at once.
 float ridge_luma(Sampler2D tex, float u, float v, float blur_u,
                  float band_v)
 {
@@ -97,8 +90,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
         if (y_line < sil) {
             // Slope-aware distance: on steep segments the curve sweeps
-            // several rows within one column — cover that span instead
-            // of beading into per-column dashes.
+            // several rows within one column, and without covering that
+            // span the line beads into per-column dashes.
             const float du = 1.5 / size.x;
             const float slope_px =
                 (ridge_enc(input, uv.x + du, sv) -

@@ -1,12 +1,7 @@
-// Text (docs/flow_canvas.md): runtime-TTF text burn-in. The
-// engine rasterizes the whole string into a single-channel signed
-// distance bitmap (in-repo TrueType loader, one raster per size BUCKET
-// so keyframed size scales between cached rasters), and this kernel
-// samples it with the standard SDF decode — analytic screen-px AA band,
-// distance-based outline, crisp at any size/rotation. Proxy-safe: size
-// reads as px at 1080 frame height.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// The engine rasterizes the string to a signed distance bitmap once per
+// size BUCKET, so keyframed size scales between cached rasters rather
+// than re-rastering. Size reads as px at 1080 frame height, which keeps
+// proxies matching full res.
 
 #include "fx_common.slang"
 
@@ -20,8 +15,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float font;        // engine-side font pick; unread here
-    float size;        // px at 1080p frame height
+    float font;        // engine-side font pick, unread here
+    float size;        // px at 1080 frame height
     float pos_x;
     float pos_y;
     float angle;       // degrees
@@ -29,10 +24,10 @@ cbuffer Push
     float sat;
     float lite;
     float outline;
-    float bm_w;        // extra words (engine): SDF bitmap px dims
+    float bm_w;        // engine-appended: SDF bitmap px dims
     float bm_h;
     float spread_px;   // SDF encode range, raster px
-    float raster_px;   // the bucket's font size (raster scale)
+    float raster_px;   // the bucket's font size
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -52,13 +47,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (bm_w < 1.0)
         return;
 
-    // Screen px per raster px; size reads at 1080-reference height so
-    // the proxy divisor shrinks everything cleanly.
     const float size_px = max(size, 1.0) * (float(height) / 1080.0);
     const float rscale = size_px / max(raster_px, 1.0);
 
-    // Pixel -> raster space: undo position, rotation, scale; the string
-    // box (bitmap) is centered on the anchor.
+    // Pixel to raster space; the bitmap is centered on the anchor.
     float2 p = float2(tid.xy) + 0.5 - float2(pos_x, pos_y) * dim;
     const float a = -angle * 0.01745329252;
     const float ca = cos(a), sa = sin(a);
@@ -79,7 +71,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (cov_out <= 0.0)
         return;
 
-    // Display-referred compose: dark rim under the fill color.
+    // Dark rim laid under the fill color.
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float3 fill = lerp(float3(1.0, 1.0, 1.0),
                              fx_hue_to_rgb(hue), saturate(sat)) *

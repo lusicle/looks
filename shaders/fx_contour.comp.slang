@@ -1,9 +1,5 @@
-// Contour / topo lines: iso-lines where luma crosses N evenly
-// spaced levels — the picture becomes an elevation map. Line width from
-// the local luma gradient so lines stay uniform on steep and shallow
-// slopes alike. Encoded-space luma.
-//
-// Composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
+// Dividing by the local gradient is what keeps line width uniform across
+// steep and shallow slopes alike.
 
 #include "fx_common.slang"
 
@@ -42,14 +38,14 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float n = clamp(round(levels), 3.0, 32.0);
     const float l = luma_at(uv);
-    // Manual fwidth: gradient magnitude scaled into level space.
+    // Manual fwidth: compute shaders have no derivatives.
     const float2 e = 1.0 / size;
     const float gx = luma_at(uv + float2(e.x, 0)) - luma_at(uv - float2(e.x, 0));
     const float gy = luma_at(uv + float2(0, e.y)) - luma_at(uv - float2(0, e.y));
     const float grad = max(length(float2(gx, gy)) * 0.5 * n, 1.0e-4);
 
     const float f = frac(l * n);
-    const float dist = min(f, 1.0 - f) / grad;   // px-ish to the iso line
+    const float dist = min(f, 1.0 - f) / grad;   // approx px to the line
     const float line = 1.0 - smoothstep(thickness * 0.5, thickness, dist);
 
     const uint m = uint(mode + 0.5);
