@@ -23,13 +23,23 @@ struct ParamEntry {
     float base = 0.0f;       // current document value
 };
 
-std::vector<ParamEntry> build_param_table(const doc::Document& doc);
+// Params of one look (its own morph/speed globals plus every layer).
+std::vector<ParamEntry> build_param_table(const doc::Document& doc,
+                                          const doc::Look& look);
 
-// Effect lookup by stable id across all layers; returns null when the
+// Effect lookup by stable id across a look's layers; returns null when the
 // effect no longer exists (dangling routes/lanes are skipped at eval, kept
 // in the doc so undo can resurrect their target).
+const doc::EffectInstance* find_effect(const doc::Look& look,
+                                       uint64_t effect_id,
+                                       size_t* layer_out = nullptr,
+                                       size_t* index_out = nullptr);
+
+// Document-wide lookup: ids are unique across looks, so this also reports
+// which look owns the effect.
 const doc::EffectInstance* find_effect(const doc::Document& doc,
                                        uint64_t effect_id,
+                                       uint64_t* look_out,
                                        size_t* layer_out = nullptr,
                                        size_t* index_out = nullptr);
 

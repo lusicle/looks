@@ -51,6 +51,15 @@ struct ParamRow {
     uint8_t kind = 0;
     const char* options = nullptr;
     const char* text = nullptr;
+    // Live resolved value at the playhead (lanes + wires baked): a
+    // driven row draws an accent tick at this position so modulation
+    // visibly moves, while the slider keeps editing the stored base.
+    float live = 0.0f;
+    bool has_live = false;
+    // Helper-node operand row: accepts a value out-wire drop (rings up
+    // as a candidate during the drag) without carrying the param-row
+    // route micro.
+    bool value_input = false;
     // Row micro-hotspots; null hides each.
     bool* route_clicked = nullptr;
     bool* key_clicked = nullptr;
@@ -79,6 +88,13 @@ struct Node {
     // Live preview: an atlas cell (draw_image_quad); null = flat slot.
     const ui::UiTexture* preview = nullptr;
     float pu0 = 0.0f, pv0 = 0.0f, pu1 = 1.0f, pv1 = 1.0f;
+    // Value-node scope: the node's output sampled over a window that
+    // starts at the playhead, drawn as a strip under the title (sample
+    // 0 is NOW). lo/hi frame the plot; a bipolar window keeps its zero
+    // baseline visible.
+    const float* scope = nullptr;
+    int scope_count = 0;
+    float scope_lo = 0.0f, scope_hi = 1.0f;
     const ParamRow* rows = nullptr;
     int row_count = 0;
     // Title-bar actions, staged per frame by the app.
@@ -87,6 +103,9 @@ struct Node {
     // Text node: a title double-click edits the STRING (the same
     // inline editor groups use for renames).
     bool text_edit = false;
+    // A LOOK INSTANCE card (docs/look.md): a body double-click enters the
+    // referenced look, the way it enters a group's subgraph.
+    bool is_look = false;
 };
 
 // kind: 0 = chain (solid, In port), 1 = matte (dashed, matte port),
@@ -135,7 +154,8 @@ struct Graph {
     const char* const* ctx_items = nullptr;
     size_t ctx_count = 0;
     // Selected wires (click / marquee, texed sel.links): matched by
-    // endpoints + kind (to_row ignored). Draw accent, Delete cuts all.
+    // endpoints + kind; to_row -1 matches any row of that pair. Draw
+    // accent, Delete cuts all.
     const Wire* sel_wires = nullptr;
     size_t sel_wire_count = 0;
     // Inline frame rename in flight: that frame draws rename_text + caret
@@ -152,6 +172,9 @@ struct Graph {
     // Subgraph view (texed breadcrumbs): non-null = the canvas is scoped
     // to an open group of this name; "main" in the crumb exits.
     const char* crumb = nullptr;
+    // Empty-canvas hint, drawn centered and dim when there are no nodes
+    // (a sequence scope has no graph to show).
+    const char* hint = nullptr;
 };
 
 struct CanvasState {
@@ -253,10 +276,13 @@ struct Output {
     int route_drop_row = -1;         // row index on the target card
     // Wire click-select: a still click landing on a wire's bezier.
     // Shift toggles it in the wire selection instead of replacing.
+    // wire_to_row keeps mod wires distinct when one value node drives
+    // several rows of the same card.
     bool wire_clicked = false;
     bool wire_clicked_shift = false;
     uint64_t wire_from = 0, wire_to = 0;
     uint8_t wire_kind = 0;
+    int wire_to_row = -1;
     // Context menu: item picked this frame (index into Graph::ctx_items;
     // -1 = none — the app MUST re-init the sentinel after arena alloc),
     // with the target the menu was opened on.
@@ -276,7 +302,11 @@ struct Output {
     // Double-click on a Group card: ENTER its scoped subgraph view
     // (texed enterSubgraph).
     uint64_t group_open = 0;
-    // Breadcrumb "main" clicked: exit the open group's view.
+    // Double-click on a look-instance card: ENTER that look (the canvas
+    // and the timeline scope together — docs/look.md).
+    uint64_t look_open = 0;
+    // Breadcrumb "main" clicked: exit the open group's view, or leave the
+    // scoped look for the project.
     bool crumb_clicked = false;
     // Double-click on a row's slider: type the exact value.
     uint64_t value_edit_node = 0;

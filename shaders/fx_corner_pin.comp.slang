@@ -85,8 +85,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     // em == 1 needs no case: the sampler already clamps.
 
-    float4 pinned = input.SampleLevel(suv, 0);
-    pinned.rgb *= coverage;
+    float4 pinned = input.SampleLevel(suv, 0) * coverage;
 
     const float4 wetted = lerp(base, pinned, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

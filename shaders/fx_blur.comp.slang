@@ -35,7 +35,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const uint m = uint(mode + 0.5);
-    float3 blurred;
+    // Taps accumulate float4: coverage blurs with color, so a
+    // transparent layer's edge feathers instead of smearing black.
+    float4 blurred;
     if (m >= 3u) {
         // Disc-tap family: 24 golden-spiral taps, per-mode weights.
         float radius = amount * 0.5;
@@ -46,7 +48,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             radius *= saturate((d - band) / max(band, 1.0e-3));
         }
         const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
-        float3 acc = base.rgb;
+        float4 acc = base;
         float wsum = 1.0;
         [unroll]
         for (int i = 0; i < 24; ++i) {
@@ -54,16 +56,16 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float a = float(i) * 2.39996;   // golden angle, radians
             const float r = sqrt(fi) * radius;
             const float2 suv = uv + float2(cos(a), sin(a)) * r / size;
-            const float3 c = input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
+            const float4 c = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
             float wgt;
             if (m == 5u) {
                 // Energy-weighted so bright points bloom into discs.
-                const float lum = dot(c, kLuma);
+                const float lum = dot(c.rgb, kLuma);
                 wgt = 1.0 + lum * lum * 6.0;
             } else if (m == 6u) {
                 // Bilateral: spatial falloff x range weight, so texture
                 // smooths while real edges hold.
-                const float3 dc = c - base.rgb;
+                const float3 dc = c.rgb - base.rgb;
                 const float range = max(focus * focus, 0.002);
                 wgt = (1.0 - fi * 0.7) * exp(-dot(dc, dc) / range);
             } else {
@@ -75,7 +77,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         blurred = acc / wsum;
     } else {
     const int kTaps = 16;
-    float3 acc = 0.0;
+    float4 acc = 0.0;
     [unroll]
     for (int i = 0; i < kTaps; ++i) {
         const float f = (float(i) / float(kTaps - 1)) - 0.5;
@@ -93,11 +95,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         } else {
             suv = uv + (uv - 0.5) * f * amount * 2.0 / size.y;
         }
-        acc += input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
+        acc += input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
     }
     blurred = acc / float(kTaps);
     }
-    const float4 result = float4(blurred, base.a);
-    const float4 wetted = lerp(base, result, saturate(wet));
+    const float4 wetted = lerp(base, blurred, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

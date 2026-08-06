@@ -26,6 +26,7 @@ using ui::Rect;
 constexpr float kNodeW = 200.0f;
 constexpr float kTitleH = 24.0f;
 constexpr float kPrevH = 106.0f;   // 16:9 inside the 188 px inner width
+constexpr float kScopeH = 32.0f;   // value-node signal strip
 constexpr float kRowH = 18.0f;
 constexpr float kPadB = 8.0f;
 constexpr float kGridMinor = 24.0f;
@@ -182,7 +183,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     };
     // Top of the port strip / param rows, graph units from the card top.
     auto strip_top = [](const Node& nd) {
-        return kTitleH + (node_has_preview(nd) ? kPrevH + 6.0f : 2.0f);
+        return kTitleH + (node_has_preview(nd) ? kPrevH + 6.0f
+                          : nd.scope && nd.scope_count > 1
+                              ? kScopeH + 6.0f
+                              : 2.0f);
     };
     auto rows_top_g = [&](const Node& nd) {
         return strip_top(nd) +
@@ -244,8 +248,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.center_on = 0;
     }
 
-    // Routable row under the cursor on a card (route_clicked marks rows
-    // that accept a mod route); -1 = none.
+    // Routable row under the cursor on a card: route_clicked marks
+    // param rows, value_input marks helper operand rows; -1 = none.
     auto row_under_mouse = [&](const Node& nd) {
         const Rect cr = node_rect_s(nd);
         if (!cr.contains(mouse)) return -1;
@@ -253,7 +257,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (mouse.y < rows_top) return -1;
         const int row = static_cast<int>((mouse.y - rows_top) / (kRowH * z));
         if (row < 0 || row >= nd.row_count) return -1;
-        return nd.rows[row].route_clicked ? row : -1;
+        return nd.rows[row].route_clicked || nd.rows[row].value_input
+                   ? row
+                   : -1;
     };
     // Which node outputs may feed a given input port — one truth for the
     // reverse wire drag's candidate rings and its drop resolution.
@@ -797,6 +803,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     else
                         out.group_open = nd.id;
                     st.last_click_frame = 0;
+                } else if (nd.is_look &&
+                           fnum - st.last_click_frame < 24 && dd < 8.0f &&
+                           st.last_click_id == nd.id &&
+                           mouse.y >= cr.y + kTitleH * z) {
+                    // A look instance: enter the look it plays.
+                    out.look_open = nd.id;
+                    st.last_click_frame = 0;
                 } else if (nd.text_edit &&
                            fnum - st.last_click_frame < 24 && dd < 8.0f &&
                            st.last_click_id == nd.id &&
@@ -1128,6 +1141,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     out.wire_from = g.wires[hit].from;
                     out.wire_to = g.wires[hit].to;
                     out.wire_kind = g.wires[hit].kind;
+                    out.wire_to_row = g.wires[hit].to_row;
                     st.last_click_id = 1;   // wire marker, not empty
                 } else {
                     out.clicked_empty = true;
@@ -1146,6 +1160,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // ---- draw
     canvas.draw_rect(r, theme.window_bg);
     canvas.push_clip(r);
+
+    if (g.hint && g.node_count == 0) {
+        const float tw =
+            ui::measure_text(frame.font, g.hint, theme.font_size_small).x;
+        ui::draw_text(canvas, frame.font, g.hint,
+                      {r.x + (r.w - tw) * 0.5f, r.y + r.h * 0.5f},
+                      theme.font_size_small, theme.text_disabled);
+    }
 
     // Grid, screen-space lines derived from the graph transform.
     {
@@ -1272,7 +1294,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         for (size_t sw = 0; sw < g.sel_wire_count; ++sw)
             if (g.sel_wires[sw].from == g.wires[w].from &&
                 g.sel_wires[sw].to == g.wires[w].to &&
-                g.sel_wires[sw].kind == g.wires[w].kind)
+                g.sel_wires[sw].kind == g.wires[w].kind &&
+                (g.sel_wires[sw].to_row < 0 ||
+                 g.sel_wires[sw].to_row == g.wires[w].to_row))
                 col = theme.accent;
         if (st.drag_kind == 1 && st.drag_splice_to &&
             g.wires[w].from == st.drag_splice_from &&
@@ -1405,6 +1429,38 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                                  theme.hairline);
                 }
                 cy += (kPrevH + 6.0f) * z;
+            } else if (nd.scope && nd.scope_count > 1) {
+                // Signal strip: the node's output from NOW (left edge)
+                // across the sampled window, auto-framed by lo/hi.
+                const Rect sv{cr.x + 6.0f * z, cy + 3.0f * z,
+                              cr.w - 12.0f * z, kScopeH * z - 6.0f * z};
+                canvas.draw_sdf_rect(sv, 3.0f * z, theme.control_bg);
+                const float span =
+                    std::max(nd.scope_hi - nd.scope_lo, 1e-6f);
+                auto sy_of = [&](float v) {
+                    const float t = std::clamp(
+                        (v - nd.scope_lo) / span, 0.0f, 1.0f);
+                    return sv.y + 2.0f * z +
+                           (1.0f - t) * (sv.h - 4.0f * z);
+                };
+                if (nd.scope_lo < 0.0f && nd.scope_hi > 0.0f)
+                    canvas.draw_rect({sv.x, sy_of(0.0f), sv.w, 1.0f},
+                                     theme.hairline);
+                Vec2 pp{sv.x, sy_of(nd.scope[0])};
+                for (int si = 1; si < nd.scope_count; ++si) {
+                    const Vec2 p{
+                        sv.x + sv.w * static_cast<float>(si) /
+                                   static_cast<float>(nd.scope_count - 1),
+                        sy_of(nd.scope[si])};
+                    canvas.draw_line(pp, p, std::max(1.0f, 1.2f * z),
+                                     theme.accent_dim);
+                    pp = p;
+                }
+                const float dy = sy_of(nd.scope[0]);
+                canvas.draw_sdf_rect({sv.x - 1.0f, dy - 2.0f * z,
+                                      4.0f * z, 4.0f * z},
+                                     2.0f * z, theme.accent);
+                cy += (kScopeH + 6.0f) * z;
             } else {
                 cy += 2.0f * z;
             }
@@ -1565,6 +1621,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                          row_hot ? theme.text
                                                  : theme.text_dim);
                 }
+                // Live tick: where the driven value actually sits this
+                // frame — the handle keeps editing the stored base.
+                if (pr.has_live) {
+                    const float lt = std::clamp(
+                        (pr.live - pr.min_v) /
+                            std::max(pr.max_v - pr.min_v, 1e-6f),
+                        0.0f, 1.0f);
+                    const float lx = sx0 + (sx1 - sx0) * lt;
+                    canvas.draw_rect({lx - 1.0f, sy - 5.0f * z,
+                                      std::max(2.0f, 1.5f * z),
+                                      10.0f * z},
+                                     theme.accent);
+                }
                 // Value text — ALWAYS visible (the typed buffer replaces
                 // it only while this row is being edited).
                 const bool row_editing = g.value_edit_node == nd.id &&
@@ -1716,7 +1785,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     if (nd.id == st.wire_from) continue;
                     const int hot_row = row_under_mouse(nd);
                     for (int row = 0; row < nd.row_count; ++row) {
-                        if (!nd.rows[row].route_clicked) continue;
+                        if (!nd.rows[row].route_clicked &&
+                            !nd.rows[row].value_input)
+                            continue;
                         const Vec2 p = row_anchor(nd, row);
                         const float rr2 = 3.5f * z;
                         canvas.draw_sdf_rect_outline(
@@ -1945,8 +2016,11 @@ float node_height(int row_count, bool has_preview, int port_rows) {
 }
 
 float node_height_of(const Node& nd) {
-    return node_height(nd.row_count, node_has_preview(nd),
-                       port_row_count(nd));
+    float h = node_height(nd.row_count, node_has_preview(nd),
+                          port_row_count(nd));
+    if (!node_has_preview(nd) && nd.scope && nd.scope_count > 1)
+        h += kScopeH + 6.0f - 2.0f;   // scope strip replaces the 2px gap
+    return h;
 }
 
 ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,

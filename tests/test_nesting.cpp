@@ -1,0 +1,281 @@
+// Nesting in the compiled graph: one flat node list, one instance per
+// hop, each with its own local clock, state key, and culling. Sequences
+// place with an affine map; look sources run in lockstep; the two nest
+// each other both ways under one cycle guard.
+
+#include "gfx/graph.h"
+
+#include "doc/effects.h"
+#include "doc/layer_commands.h"
+#include "test_framework.h"
+#include "util/hash.h"
+
+using looks::doc::Document;
+using looks::doc::EffectType;
+using looks::doc::make_effect;
+using looks::hash_combine;
+using looks::gfx::compile_graph;
+using looks::gfx::GraphNode;
+using looks::gfx::RenderGraph;
+
+namespace {
+
+// A look holding one gradient generator, plus an effect so the instance
+// emits something identifiable.
+uint64_t add_inner_look(Document& d, EffectType fx_type) {
+    looks::doc::Look inner;
+    inner.id = d.next_effect_id++;
+    inner.name = "inner";
+    looks::doc::Layer gen;
+    gen.id = d.next_effect_id++;
+    gen.source = looks::doc::LayerSourceKind::Gradient;
+    gen.stack.push_back(make_effect(d, fx_type));
+    inner.layers.push_back(std::move(gen));
+    d.looks.push_back(std::move(inner));
+    return d.looks.back().id;
+}
+
+// Places `target` on the root sequence's first lane at [t_in, t_out).
+uint64_t place_block(Document& d, uint64_t target, uint32_t t_in,
+                     uint32_t t_out, float speed = 1.0f) {
+    looks::doc::Placement place;
+    place.id = d.next_effect_id++;
+    place.target = target;
+    place.t_in = t_in;
+    place.t_out = t_out;
+    place.speed = speed;
+    d.root().tracks[0].placements.push_back(place);
+    return place.id;
+}
+
+int count_effects(const RenderGraph& g) {
+    int n = 0;
+    for (const GraphNode& node : g.nodes)
+        if (node.kind == GraphNode::Kind::Effect) ++n;
+    return n;
+}
+
+}  // namespace
+
+TEST(nesting_inlines_the_placed_look) {
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    place_block(d, inner, 0, 100);
+    const RenderGraph g = compile_graph(d, d.root_sequence, 5);
+    CHECK(g.valid);
+    CHECK_EQ(count_effects(g), 1);
+    // Two instances: the root sequence and the placed look.
+    CHECK_EQ(g.instances.size(), size_t{2});
+    CHECK_EQ(g.instances[1].look, inner);
+}
+
+TEST(nesting_instances_carry_local_clocks) {
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    place_block(d, inner, 10, 100);
+    const RenderGraph g = compile_graph(d, d.root_sequence, 25);
+    CHECK_EQ(g.instances.size(), size_t{2});
+    // Block at 10: root 25 = local 15.
+    CHECK_EQ(g.instances[1].local_frame, uint32_t{15});
+}
+
+TEST(nesting_speed_scales_the_local_clock) {
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    place_block(d, inner, 10, 100, 2.0f);
+    const RenderGraph g = compile_graph(d, d.root_sequence, 25);
+    CHECK_EQ(g.instances.size(), size_t{2});
+    CHECK_EQ(g.instances[1].local_frame, uint32_t{30});
+}
+
+TEST(nesting_culls_instances_that_are_not_playing) {
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    place_block(d, inner, 10, 20);
+    CHECK_EQ(compile_graph(d, d.root_sequence, 9).instances.size(),
+             size_t{1});
+    CHECK_EQ(compile_graph(d, d.root_sequence, 10).instances.size(),
+             size_t{2});
+    CHECK_EQ(compile_graph(d, d.root_sequence, 19).instances.size(),
+             size_t{2});
+    CHECK_EQ(compile_graph(d, d.root_sequence, 20).instances.size(),
+             size_t{1});
+}
+
+TEST(nesting_two_blocks_of_one_look_share_razor_stable_keys) {
+    // Two blocks of one look on ONE lane share instance paths (a razored
+    // pair rejoins bit-identically); the same look on ANOTHER lane gets
+    // its own. Paths fold container and target ids, never placement ids.
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Feedback);
+    place_block(d, inner, 0, 10);
+    place_block(d, inner, 20, 30);
+    const uint64_t lane = d.root().tracks[0].id;
+
+    const RenderGraph a = compile_graph(d, d.root_sequence, 5);
+    const RenderGraph b = compile_graph(d, d.root_sequence, 25);
+    CHECK_EQ(a.instances.size(), size_t{2});
+    CHECK_EQ(b.instances.size(), size_t{2});
+    CHECK_EQ(a.instances[1].path, b.instances[1].path);
+    CHECK_EQ(a.instances[1].path,
+             hash_combine(hash_combine(d.root_sequence, lane), inner));
+
+    looks::doc::SeqTrack lane2;
+    lane2.id = d.next_effect_id++;
+    looks::doc::Placement other;
+    other.id = d.next_effect_id++;
+    other.target = inner;
+    other.t_in = 0;
+    other.t_out = 10;
+    lane2.placements.push_back(other);
+    d.root().tracks.push_back(std::move(lane2));
+    const RenderGraph c = compile_graph(d, d.root_sequence, 5);
+    CHECK_EQ(c.instances.size(), size_t{3});
+    CHECK(c.instances[1].path != c.instances[2].path);
+}
+
+TEST(nesting_lockstep_ref_inside_a_look) {
+    // A look nesting another look runs it 1:1 on the SAME clock - no
+    // affine hop, and the path folds the ref layer and the target.
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    looks::doc::Layer ref;
+    ref.id = d.next_effect_id++;
+    ref.source = looks::doc::LayerSourceKind::LookRef;
+    ref.target = inner;
+    d.looks[0].layers.push_back(std::move(ref));
+    const uint64_t ref_id = d.looks[0].layers.back().id;
+
+    const RenderGraph g = compile_graph(d, d.looks[0].id, 33);
+    CHECK(g.valid);
+    CHECK_EQ(g.instances.size(), size_t{2});
+    CHECK_EQ(g.instances[1].local_frame, uint32_t{33});
+    CHECK_EQ(g.instances[1].path,
+             hash_combine(hash_combine(d.looks[0].id, ref_id), inner));
+}
+
+TEST(nesting_sequence_inside_a_look_carries_its_lanes) {
+    // A SequenceRef source: the only way to put effects over an edit.
+    // The nested sequence resolves its own lanes on the look's clock.
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    looks::doc::Sequence cut;
+    cut.id = d.next_effect_id++;
+    looks::doc::SeqTrack lane;
+    lane.id = d.next_effect_id++;
+    looks::doc::Placement p;
+    p.id = d.next_effect_id++;
+    p.target = inner;
+    p.t_in = 10;
+    p.t_out = 20;
+    lane.placements.push_back(p);
+    cut.tracks.push_back(std::move(lane));
+    const uint64_t cut_id = cut.id;
+    d.sequences.push_back(std::move(cut));
+
+    looks::doc::Look grade;
+    grade.id = d.next_effect_id++;
+    looks::doc::Layer sref;
+    sref.id = d.next_effect_id++;
+    sref.source = looks::doc::LayerSourceKind::SequenceRef;
+    sref.target = cut_id;
+    sref.stack.push_back(make_effect(d, EffectType::Grain));
+    grade.layers.push_back(std::move(sref));
+    const uint64_t grade_id = grade.id;
+    d.looks.push_back(std::move(grade));
+
+    // At 15 the nested sequence's block plays: instances chain
+    // grade -> cut -> inner, and BOTH effects emit (grade's grain over
+    // the cut, inner's vignette inside it).
+    const RenderGraph g = compile_graph(d, grade_id, 15);
+    CHECK(g.valid);
+    CHECK_EQ(g.instances.size(), size_t{3});
+    CHECK_EQ(count_effects(g), 2);
+    // At 25 the inner block ended: the nested sequence resolves to
+    // nothing, so the ref chain is dormant - the inner look's instance
+    // never spawns and no effect runs on a fabricated frame.
+    const RenderGraph late = compile_graph(d, grade_id, 25);
+    CHECK_EQ(late.instances.size(), size_t{2});
+    CHECK_EQ(count_effects(late), 0);
+}
+
+TEST(nesting_stops_at_the_depth_bound) {
+    // A self-cycle cannot be BUILT through commands (nest_reaches), but a
+    // hand-edited file can hold one: the depth guard stops the walk.
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    looks::doc::Layer self_ref;
+    self_ref.id = d.next_effect_id++;
+    self_ref.source = looks::doc::LayerSourceKind::LookRef;
+    self_ref.target = inner;
+    d.look(inner).layers.push_back(std::move(self_ref));
+    place_block(d, inner, 0, 100);
+    const RenderGraph g = compile_graph(d, d.root_sequence, 5);
+    CHECK(g.valid);
+    CHECK(g.instances.size() <=
+          static_cast<size_t>(looks::doc::kMaxLookDepth) + 1);
+}
+
+TEST(nesting_dangling_reference_is_dormant) {
+    Document d;
+    place_block(d, 999999, 0, 100);
+    const RenderGraph g = compile_graph(d, d.root_sequence, 5);
+    CHECK(g.valid);
+    CHECK_EQ(g.instances.size(), size_t{1});
+    // The composite is the black display node, not a fabricated frame.
+    CHECK(g.nodes[static_cast<size_t>(g.output)].kind ==
+          GraphNode::Kind::Generator);
+}
+
+TEST(nesting_reaches_spans_both_entity_kinds) {
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    place_block(d, inner, 0, 100);
+    // root sequence -> inner look; not the other way.
+    CHECK(looks::doc::nest_reaches(d, d.root_sequence, inner));
+    CHECK(!looks::doc::nest_reaches(d, inner, d.root_sequence));
+    CHECK(looks::doc::nest_reaches(d, inner, inner));
+    // A look nesting a sequence extends the reach through it.
+    looks::doc::Sequence cut;
+    cut.id = d.next_effect_id++;
+    looks::doc::SeqTrack lane;
+    lane.id = d.next_effect_id++;
+    looks::doc::Placement p;
+    p.id = d.next_effect_id++;
+    p.target = inner;
+    lane.placements.push_back(p);
+    cut.tracks.push_back(std::move(lane));
+    const uint64_t cut_id = cut.id;
+    d.sequences.push_back(std::move(cut));
+    looks::doc::Layer sref;
+    sref.id = d.next_effect_id++;
+    sref.source = looks::doc::LayerSourceKind::SequenceRef;
+    sref.target = cut_id;
+    d.looks[0].layers.push_back(std::move(sref));
+    CHECK(looks::doc::nest_reaches(d, d.looks[0].id, cut_id));
+    CHECK(looks::doc::nest_reaches(d, d.looks[0].id, inner));
+    CHECK(!looks::doc::nest_reaches(d, inner, d.looks[0].id));
+}
+
+TEST(nesting_two_levels_compose_their_maps) {
+    // Sequence block (affine) -> look -> lockstep ref -> generator: the
+    // leaf's clock is the block's affine map passed straight through.
+    Document d;
+    const uint64_t inner = add_inner_look(d, EffectType::Vignette);
+    looks::doc::Look mid;
+    mid.id = d.next_effect_id++;
+    looks::doc::Layer ref;
+    ref.id = d.next_effect_id++;
+    ref.source = looks::doc::LayerSourceKind::LookRef;
+    ref.target = inner;
+    mid.layers.push_back(std::move(ref));
+    const uint64_t mid_id = mid.id;
+    d.looks.push_back(std::move(mid));
+    place_block(d, mid_id, 10, 100, 2.0f);
+
+    const RenderGraph g = compile_graph(d, d.root_sequence, 25);
+    CHECK(g.valid);
+    CHECK_EQ(g.instances.size(), size_t{3});
+    CHECK_EQ(g.instances[1].local_frame, uint32_t{30});
+    CHECK_EQ(g.instances[2].local_frame, uint32_t{30});
+}

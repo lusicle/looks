@@ -3,7 +3,11 @@ add_executable(looks_tests
     test_json.cpp
     test_command.cpp
     test_stack.cpp
+    test_look.cpp
     test_graph.cpp
+    test_nesting.cpp
+    test_instances.cpp
+    test_audio_mix.cpp
     test_layout.cpp
     test_ui.cpp
     test_bmff.cpp

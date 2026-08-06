@@ -1,21 +1,27 @@
-// Preview player: mezzanine-only. A decode worker keeps a ring of
-// decoded frames ahead of the playhead (CPU-side I420 — they reach the GPU
-// as plain uploads in the engine milestone). The miniaudio output callback
-// is the MASTER CLOCK: it advances the timeline sample cursor; video chases
-// it. Sources without audio fall back to a wall-clock-stepped cursor with
-// identical semantics. Instant seek; per-clip trim in/out; loop region.
+// Transport: the TIMELINE's master clock (docs/look.md phase 4).
 //
-// Threads: audio callback (clock), decode worker (owns its MezReader),
-// callers (render/UI thread) via current_frame()/seek()/transport.
+// This used to be a clip player - it owned a mezzanine reader, a decode
+// ring, and a clock driven by one clip's PCM. None of that survives the
+// look model: a look tree has many clips playing at once (decode_pool.h
+// serves their frames) and its audio is a mix over the whole instance tree
+// (audio_mix.h). What is left here is the part that was always a transport:
+// a frame-indexed position over the PROJECT's length, advanced by the audio
+// device callback, with the mix pulled through it.
+//
+// The clock no longer belongs to a clip, so a project with no audio, no
+// media, or several clips all behave the same way. When no audio device
+// opens, a wall-clock fallback steps the same cursor with identical
+// semantics - callers tick() it and cannot tell the difference.
+//
+// Threads: audio callback (clock + mix), callers (render/UI thread) via
+// the transport calls, all of which are safe to call at any time.
 
 #pragma once
 
 #include <cstdint>
-#include <filesystem>
 #include <memory>
-#include <string>
 
-#include "codec/mez.h"
+#include "media/audio_mix.h"
 
 namespace looks::media {
 
@@ -27,26 +33,30 @@ public:
     Player(const Player&) = delete;
     Player& operator=(const Player&) = delete;
 
-    // pcm_path may be empty (silent clip). The PCM sidecar is loaded into
-    // RAM (streaming lands with long-form support later).
-    bool open(const std::filesystem::path& mez_path,
-              const std::filesystem::path& pcm_path, std::string* error);
-    void close();
-    bool is_open() const;
+    // The timeline being played: its length in frames and the project
+    // frame rate. Safe to call every frame - a no-op when unchanged.
+    // frames == 0 parks the transport (nothing to play).
+    void configure(double fps, uint32_t frames);
+    bool active() const;
+
+    // Publishes the mix the monitor pulls from. The previous state is held
+    // one swap longer so the audio callback can never be the last owner of
+    // a PCM buffer (freeing megabytes in the callback is a dropout).
+    void set_mix(std::shared_ptr<const MixState> mix);
 
     void play();
     void pause();
     bool playing() const;
     void set_looping(bool loop);
 
-    // Monitor gain: 0 = mute, 1 = unity, up to 2. Never touches
-    // the clock — silence still advances the timeline.
+    // Monitor gain: 0 = mute, 1 = unity, up to 2. Never touches the
+    // clock - silence still advances the timeline.
     void set_gain(float gain);
     float gain() const;
 
-    // Advances the silent-clip fallback clock (no-op with an audio master
-    // clock). Polling threads must call this even on cycles they skip —
-    // the clock only moves when someone ticks it.
+    // Advances the wall-clock fallback (no-op with an audio device).
+    // Polling threads must call this even on cycles they skip - the clock
+    // only moves when someone ticks it.
     void tick();
 
     // Frame-index timeline (deterministic: fixed-timestep on frame index).
@@ -54,7 +64,8 @@ public:
     double fps() const;
     double duration_seconds() const;
 
-    // Trim region [in, out) in frame indices; playback and loop stay inside.
+    // Trim region [in, out) in frame indices; playback and loop stay
+    // inside. Clamped to the configured length.
     void set_trim(uint32_t in_frame, uint32_t out_frame);
     uint32_t trim_in() const;
     uint32_t trim_out() const;
@@ -70,11 +81,6 @@ public:
     void seek_seconds(double seconds);
     uint32_t current_frame_index() const;
     double position_seconds() const;
-
-    // Latest decoded frame at (or nearest below) the playhead. May briefly
-    // return the previous frame right after a seek while the worker catches
-    // up; never blocks.
-    std::shared_ptr<const codec::DecodedFrame> current_frame();
 
     uint32_t audio_channels() const;
     uint32_t audio_sample_rate() const;

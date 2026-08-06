@@ -290,6 +290,15 @@ private:
                 wchar_t path[MAX_PATH] = L"";
                 if (DragQueryFileW(drop, 0, path, MAX_PATH)) {
                     e.type = Event::Type::FileDrop;
+                    // WHERE the file landed: dropping onto the timeline
+                    // means something different from dropping anywhere
+                    // else, and the last mouse-move is stale (dragging
+                    // over another window sends us nothing). Physical
+                    // client px, like every other event carries.
+                    POINT drop_pt{};
+                    DragQueryPoint(drop, &drop_pt);
+                    e.mouse_x = static_cast<float>(drop_pt.x);
+                    e.mouse_y = static_cast<float>(drop_pt.y);
                     const int n = WideCharToMultiByte(CP_UTF8, 0, path, -1,
                                                       nullptr, 0, nullptr,
                                                       nullptr);

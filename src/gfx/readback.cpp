@@ -88,22 +88,22 @@ bool Nv12Readback::ensure_targets(uint32_t width, uint32_t height) {
     return true;
 }
 
-bool Nv12Readback::render(Engine& engine, const SourcePlanes& source,
-                          const doc::Document& doc, uint32_t timeline_frame,
-                          double fps, std::vector<uint8_t>& out,
-                          uint64_t cache_ctx,
+bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
+                          uint64_t look_id, uint32_t timeline_frame,
+                          double fps, uint32_t canvas_w, uint32_t canvas_h,
+                          std::vector<uint8_t>& out,
+                          uint64_t cache_ctx, uint32_t cache_frame,
                           const Engine::LayerSourceFrame* layer_sources,
                           size_t layer_source_count) {
     // Output dims follow the engine's divisor (export scale) with the
     // exact working-target math from Engine::render, so the NV12 planes
     // match the composite instead of resampling it back up.
     const uint32_t div = engine.preview_divisor();
-    const uint32_t w = std::max((source.width / div) & ~1u, 2u);
-    const uint32_t h = std::max((source.height / div) & ~1u, 2u);
-    if (source.width == 0 || source.height == 0 || (source.width & 1) ||
-        (source.height & 1)) {
-        log_error("readback: dimensions must be even (%ux%u)", source.width,
-                  source.height);
+    const uint32_t w = std::max((canvas_w / div) & ~1u, 2u);
+    const uint32_t h = std::max((canvas_h / div) & ~1u, 2u);
+    if (canvas_w == 0 || canvas_h == 0 || (canvas_w & 1) || (canvas_h & 1)) {
+        log_error("readback: dimensions must be even (%ux%u)", canvas_w,
+                  canvas_h);
         return false;
     }
     if (!ensure_targets(w, h)) return false;
@@ -115,8 +115,9 @@ bool Nv12Readback::render(Engine& engine, const SourcePlanes& source,
     vk_check(vkBeginCommandBuffer(cmd_, &begin), "vkBeginCommandBuffer(readback)");
 
     GpuImage* final_image =
-        engine.render(cmd_, 0, source, doc, timeline_frame, fps, cache_ctx,
-                      nullptr, layer_sources, layer_source_count);
+        engine.render(cmd_, 0, doc, look_id, timeline_frame, fps, canvas_w,
+                      canvas_h, cache_ctx, cache_frame, nullptr,
+                      layer_sources, layer_source_count);
     if (!final_image) {
         vkEndCommandBuffer(cmd_);
         return false;

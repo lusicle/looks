@@ -4,9 +4,14 @@
 // and export share one code path by construction.
 //
 //   base  = keyframe lane value at frame (else the stored param)
-//   final = clamp(base + Σ amount_i · span · curve_i(source_i), min, max)
+//   final = wired ? clamp(min + span · curve(node), min, max) : base
 //
-// Sources emit [0,1]; amount is signed and scaled by the param's range.
+// A wire REPLACES the base: the node's output maps onto the param's
+// range, and depth/offset shaping lives in the value graph (math,
+// normalise), never on the wire. Generator nodes emit [0,1]; helper
+// nodes may leave that range - the Linear curve passes values through
+// raw, shaped curves clamp to their [0,1] domain, and the param's own
+// range clamp is the final bound.
 
 #pragma once
 
@@ -64,10 +69,40 @@ float eval_source(const doc::ModSource& source, double t_seconds,
                   double key_time = -1.0,
                   const SourceFrameView* video = nullptr);
 
-float apply_curve(doc::ResponseCurve curve, float x);   // [0,1] -> [0,1]
+// Everything one value-graph evaluation needs, bundled so the recursive
+// walk stays a two-argument call.
+struct ValueEnv {
+    const doc::Look* look = nullptr;
+    double t = 0.0;
+    uint32_t frame = 0;
+    const AnalysisCurves* analysis = nullptr;
+    double fps = 30.0;
+    double audio_off = 0.0;
+    double key_time = -1.0;
+    const SourceFrameView* video = nullptr;
+};
+
+// One value node's output at the env's frame: generators via
+// eval_source, helpers recursing through their inputs (unwired inputs
+// read the node's constants). A dangling id reads 0. The graph is
+// acyclic by command guard; the depth cap only defends corrupt files.
+float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth = 0);
+
+// Response shaping. Linear passes x through RAW (helper chains go
+// bipolar); the shaped curves clamp to their [0,1] domain first.
+float apply_curve(doc::ResponseCurve curve, float x);
 
 // Lane value at `frame` (bezier segments, hold keys). Keys must be sorted.
 float eval_lane(const doc::KeyframeLane& lane, double frame);
+
+// Bakes ONE look's modulation at a LOCAL frame into `out` (a copy of
+// `look`). The per-look primitive: two instances of the same look resolve
+// it at different local frames, which is what nesting needs.
+void resolve_look(const doc::Look& look, doc::Look& out,
+                  uint32_t local_frame, double fps,
+                  const AnalysisCurves* analysis, double audio_off,
+                  double live_seconds = -1.0, double key_time = -1.0,
+                  const SourceFrameView* video = nullptr);
 
 // Bakes modulation into a document copy for one frame. live_seconds >= 0
 // switches LFO/drift onto that clock instead of frame/fps (live mode,
@@ -78,14 +113,14 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double live_seconds = -1.0, double key_time = -1.0,
                       const SourceFrameView* video = nullptr);
 
-// Playback speed at one timeline frame (speed ramp): doc.speed,
-// overridden by a lane on ParamKey {0, 1} ("global.speed"), plus routes on
-// that key. Clamped to [0, doc::kMaxSpeed].
+// Playback speed of the root timeline: the project scalar, clamped to
+// [0, doc::kMaxSpeed]. Sequences carry no keyframes or routes; ramps
+// live per-block or inside looks.
 float speed_at(const doc::Document& doc, uint32_t frame_index, double fps,
                const AnalysisCurves* analysis, double live_seconds = -1.0);
 
-// True when playback is remapped at all: non-1x base speed, a non-forward
-// mode, or any lane/route on the speed param.
+// True when playback is remapped at all: non-1x base speed or a
+// non-forward mode.
 bool time_remap_active(const doc::Document& doc);
 
 // Deterministic time remap: the source position at frame

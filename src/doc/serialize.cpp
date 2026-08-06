@@ -17,14 +17,26 @@ using json::Value;
 
 const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
-const char* const kSourceKindNames[] = {"clip",       "solid", "gradient",
-                                        "noise",      "test",  "oscillator",
-                                        "adjustment", "shape"};
+const char* const kSourceKindNames[] = {"clip",  "solid", "gradient",
+                                        "noise", "test",  "oscillator",
+                                        "shape", "look",  "sequence"};
+static_assert(sizeof(kSourceKindNames) / sizeof(kSourceKindNames[0]) ==
+                  static_cast<size_t>(LayerSourceKind::Count),
+              "source kind names track the enum");
 const char* const kModSourceNames[] = {
     "lfo",         "drift",       "audio_low",    "audio_mid",
     "audio_high",  "audio_onset", "video_motion", "video_brightness",
     "lfo_beat",    "envelope",    "video_cut",    "beat",
-    "video_sample", "video_region"};
+    "video_sample", "video_region", "math",       "normalise"};
+static_assert(sizeof(kModSourceNames) / sizeof(kModSourceNames[0]) ==
+                  static_cast<size_t>(ModSourceType::Count),
+              "mod source names track the enum");
+const char* const kValueOpNames[] = {"add", "subtract", "multiply",
+                                     "divide", "min", "max", "floor",
+                                     "absolute"};
+static_assert(sizeof(kValueOpNames) / sizeof(kValueOpNames[0]) ==
+                  static_cast<size_t>(ValueOp::Count),
+              "value op names track the enum");
 const char* const kLfoShapeNames[] = {"sine", "triangle", "square",
                                       "sample_hold"};
 const char* const kCurveNames[] = {"linear", "exp", "scurve", "inverted"};
@@ -133,30 +145,63 @@ ModSource mod_source_from_json(const Value& v) {
     return s;
 }
 
+Value value_node_to_json(const ValueNode& n) {
+    Value v = Value::make_object();
+    v.set("id", static_cast<int64_t>(n.id));
+    v.set("source", mod_source_to_json(n.source));
+    if (n.source.type == ModSourceType::Math) {
+        v.set("op", enum_name(kValueOpNames, static_cast<uint32_t>(n.op)));
+        v.set("const_a", static_cast<double>(n.const_a));
+        v.set("const_b", static_cast<double>(n.const_b));
+    }
+    if (n.source.type == ModSourceType::Normalise) {
+        v.set("const_a", static_cast<double>(n.const_a));
+        v.set("const_b", static_cast<double>(n.const_b));   // window mult
+        v.set("in_min", static_cast<double>(n.in_min));
+        v.set("in_max", static_cast<double>(n.in_max));
+    }
+    if (n.in_a) v.set("in_a", static_cast<int64_t>(n.in_a));
+    if (n.in_b) v.set("in_b", static_cast<int64_t>(n.in_b));
+    if (n.node_x != 0.0f || n.node_y != 0.0f) {
+        v.set("node_x", static_cast<double>(n.node_x));
+        v.set("node_y", static_cast<double>(n.node_y));
+    }
+    return v;
+}
+
+ValueNode value_node_from_json(const Value& v) {
+    ValueNode n;
+    n.id = static_cast<uint64_t>(v.get("id").as_int(0));
+    n.source = mod_source_from_json(v.get("source"));
+    n.op = static_cast<ValueOp>(
+        enum_index(kValueOpNames, v.get("op").as_string()));
+    n.in_a = static_cast<uint64_t>(v.get("in_a").as_int(0));
+    n.in_b = static_cast<uint64_t>(v.get("in_b").as_int(0));
+    n.const_a = num(v, "const_a", 0.0f);
+    n.const_b = num(v, "const_b", 1.0f);
+    n.in_min = num(v, "in_min", 0.0f);
+    n.in_max = num(v, "in_max", 1.0f);
+    n.node_x = num(v, "node_x", 0.0f);
+    n.node_y = num(v, "node_y", 0.0f);
+    return n;
+}
+
 Value route_to_json(const ModRoute& r) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(r.id));
-    v.set("source", mod_source_to_json(r.source));
+    v.set("node", static_cast<int64_t>(r.node));
     v.set("target", param_key_to_json(r.target));
-    v.set("amount", static_cast<double>(r.amount));
     v.set("curve", enum_name(kCurveNames, static_cast<uint32_t>(r.curve)));
-    if (r.node_x != 0.0f || r.node_y != 0.0f) {
-        v.set("node_x", static_cast<double>(r.node_x));
-        v.set("node_y", static_cast<double>(r.node_y));
-    }
     return v;
 }
 
 ModRoute route_from_json(const Value& v) {
     ModRoute r;
     r.id = static_cast<uint64_t>(v.get("id").as_int(0));
-    r.source = mod_source_from_json(v.get("source"));
+    r.node = static_cast<uint64_t>(v.get("node").as_int(0));
     r.target = param_key_from_json(v.get("target"));
-    r.amount = num(v, "amount", 0.0f);
     r.curve = static_cast<ResponseCurve>(
         enum_index(kCurveNames, v.get("curve").as_string()));
-    r.node_x = num(v, "node_x", 0.0f);
-    r.node_y = num(v, "node_y", 0.0f);
     return r;
 }
 
@@ -239,6 +284,37 @@ Snapshot snapshot_from_json(const Value& v) {
     return s;
 }
 
+// ---- placements (shared by video lanes and audio tracks)
+
+Value placement_to_json(const Placement& p) {
+    Value pl = Value::make_object();
+    pl.set("id", static_cast<int64_t>(p.id));
+    if (p.target) pl.set("target", static_cast<int64_t>(p.target));
+    pl.set("t_in", static_cast<int64_t>(p.t_in));
+    pl.set("t_out", static_cast<int64_t>(p.t_out));
+    pl.set("source_in", static_cast<int64_t>(p.source_in));
+    pl.set("speed", static_cast<double>(p.speed));
+    if (p.link) pl.set("link", static_cast<int64_t>(p.link));
+    if (p.audio_gain != 1.0f)
+        pl.set("audio_gain", static_cast<double>(p.audio_gain));
+    if (p.audio_mute) pl.set("audio_mute", true);
+    return pl;
+}
+
+Placement placement_from_json(const Value& pl) {
+    Placement p;
+    p.id = static_cast<uint64_t>(pl.get("id").as_int(0));
+    p.target = static_cast<uint64_t>(pl.get("target").as_int(0));
+    p.t_in = static_cast<uint32_t>(pl.get("t_in").as_int(0));
+    p.t_out = static_cast<uint32_t>(pl.get("t_out").as_int(0));
+    p.source_in = static_cast<uint32_t>(pl.get("source_in").as_int(0));
+    p.speed = num(pl, "speed", 1.0f);
+    p.link = static_cast<uint64_t>(pl.get("link").as_int(0));
+    p.audio_gain = num(pl, "audio_gain", 1.0f);
+    p.audio_mute = pl.get("audio_mute").as_bool(false);
+    return p;
+}
+
 // ---- layers
 
 Value layer_to_json(const Layer& l) {
@@ -247,6 +323,9 @@ Value layer_to_json(const Layer& l) {
     v.set("name", l.name);
     v.set("source",
           enum_name(kSourceKindNames, static_cast<uint32_t>(l.source)));
+    if (l.asset) v.set("asset", static_cast<int64_t>(l.asset));
+    if (l.slip) v.set("slip", static_cast<int64_t>(l.slip));
+    if (l.target) v.set("target", static_cast<int64_t>(l.target));
     v.set("color_a", f3_to_json(l.color_a));
     v.set("color_b", f3_to_json(l.color_b));
     v.set("gen_scale", static_cast<double>(l.gen_scale));
@@ -256,8 +335,8 @@ Value layer_to_json(const Layer& l) {
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
-    // Transform + trim: written only when non-default so
-    // pre-transform projects stay byte-stable.
+    // Transform: written only when non-default so
+    // untransformed projects stay byte-stable.
     if (layer_has_transform(l)) {
         Value xf = Value::make_object();
         xf.set("crop_l", static_cast<double>(l.crop_l));
@@ -270,8 +349,6 @@ Value layer_to_json(const Layer& l) {
         xf.set("rotate", static_cast<double>(l.xf_rotate));
         v.set("transform", std::move(xf));
     }
-    if (l.trim_in > 0) v.set("trim_in", static_cast<int64_t>(l.trim_in));
-    if (l.trim_out > 0) v.set("trim_out", static_cast<int64_t>(l.trim_out));
     if (l.node_x != 0.0f || l.node_y != 0.0f) {
         v.set("node_x", static_cast<double>(l.node_x));
         v.set("node_y", static_cast<double>(l.node_y));
@@ -291,6 +368,9 @@ Layer layer_from_json(const Value& v) {
     l.name = v.get("name").as_string();
     l.source = static_cast<LayerSourceKind>(
         enum_index(kSourceKindNames, v.get("source").as_string()));
+    l.asset = static_cast<uint64_t>(v.get("asset").as_int(0));
+    l.slip = static_cast<uint32_t>(v.get("slip").as_int(0));
+    l.target = static_cast<uint64_t>(v.get("target").as_int(0));
     f3_from_json(v.get("color_a"), l.color_a);
     f3_from_json(v.get("color_b"), l.color_b);
     l.gen_scale = num(v, "gen_scale", 6.0f);
@@ -310,8 +390,6 @@ Layer layer_from_json(const Value& v) {
         l.xf_scale = num(xf, "scale", 1.0f);
         l.xf_rotate = num(xf, "rotate", 0.0f);
     }
-    l.trim_in = static_cast<uint32_t>(v.get("trim_in").as_int(0));
-    l.trim_out = static_cast<uint32_t>(v.get("trim_out").as_int(0));
     l.node_x = num(v, "node_x", 0.0f);
     l.node_y = num(v, "node_y", 0.0f);
     for (const Value& fv : v.get("stack").array())
@@ -319,6 +397,297 @@ Layer layer_from_json(const Value& v) {
     for (const Value& gv : v.get("groups").array())
         l.groups.push_back(group_from_json(gv));
     return l;
+}
+
+// ---- assets
+
+Value asset_to_json(const Asset& a) {
+    Value v = Value::make_object();
+    v.set("id", static_cast<int64_t>(a.id));
+    v.set("name", a.name);
+    v.set("path", a.path);
+    if (a.frame_count)
+        v.set("frames", static_cast<int64_t>(a.frame_count));
+    if (a.fps > 0.0) v.set("fps", a.fps);
+    if (a.width && a.height) {
+        v.set("width", static_cast<int64_t>(a.width));
+        v.set("height", static_cast<int64_t>(a.height));
+    }
+    if (a.still_duration_frames)
+        v.set("still_duration",
+              static_cast<int64_t>(a.still_duration_frames));
+    return v;
+}
+
+Asset asset_from_json(const Value& v) {
+    Asset a;
+    a.id = static_cast<uint64_t>(v.get("id").as_int(0));
+    a.name = v.get("name").as_string();
+    a.path = v.get("path").as_string();
+    a.frame_count = static_cast<uint32_t>(v.get("frames").as_int(0));
+    a.fps = v.get("fps").as_number(0.0);
+    a.width = static_cast<uint32_t>(v.get("width").as_int(0));
+    a.height = static_cast<uint32_t>(v.get("height").as_int(0));
+    a.still_duration_frames =
+        static_cast<uint32_t>(v.get("still_duration").as_int(0));
+    return a;
+}
+
+// ---- looks
+
+// In ports hold ONE producer — only the Output composites fan-in (the
+// layer merge). Hand-edited files keep the LAST link per (to, port),
+// matching connect's replace-on-connect.
+void dedupe_links(std::vector<NodeLink>& links) {
+    for (size_t i = links.size(); i-- > 0;) {
+        const NodeLink& l = links[i];
+        if (l.to == 0) continue;
+        for (size_t j = i; j-- > 0;) {
+            if (links[j].to == l.to && links[j].to_port == l.to_port) {
+                links.erase(links.begin() + static_cast<ptrdiff_t>(j));
+                --i;
+            }
+        }
+    }
+}
+
+Value look_to_json(const Look& look) {
+    Value v = Value::make_object();
+    v.set("id", static_cast<int64_t>(look.id));
+    v.set("name", look.name);
+    if (look.duration)
+        v.set("duration", static_cast<int64_t>(look.duration));
+
+    Value layers = Value::make_array();
+    for (const Layer& l : look.layers) layers.push(layer_to_json(l));
+    v.set("layers", std::move(layers));
+
+    Value vnodes = Value::make_array();
+    for (const ValueNode& n : look.value_nodes)
+        vnodes.push(value_node_to_json(n));
+    v.set("value_nodes", std::move(vnodes));
+
+    Value routes = Value::make_array();
+    for (const ModRoute& r : look.mod_routes) routes.push(route_to_json(r));
+    v.set("mod_routes", std::move(routes));
+
+    Value lanes = Value::make_array();
+    for (const KeyframeLane& lane : look.lanes) {
+        if (lane.keys.empty()) continue;
+        lanes.push(lane_to_json(lane));
+    }
+    v.set("lanes", std::move(lanes));
+
+    Value snapshots = Value::make_array();
+    for (const Snapshot& s : look.snapshots)
+        snapshots.push(snapshot_to_json(s));
+    v.set("snapshots", std::move(snapshots));
+    v.set("morph_from", look.morph_from);
+    v.set("morph_to", look.morph_to);
+    v.set("morph_pos", static_cast<double>(look.morph_pos));
+
+    if (look.out_node_x != 0.0f || look.out_node_y != 0.0f) {
+        v.set("out_node_x", static_cast<double>(look.out_node_x));
+        v.set("out_node_y", static_cast<double>(look.out_node_y));
+    }
+    if (!look.links.empty()) {
+        Value links = Value::make_array();
+        for (const NodeLink& l : look.links) {
+            Value lv = Value::make_object();
+            lv.set("from", static_cast<int64_t>(l.from));
+            lv.set("to", static_cast<int64_t>(l.to));
+            lv.set("port", static_cast<int64_t>(l.to_port));
+            links.push(std::move(lv));
+        }
+        v.set("links", std::move(links));
+    }
+    if (!look.frames.empty()) {
+        Value frames = Value::make_array();
+        for (const CanvasFrame& f : look.frames) {
+            Value fv = Value::make_object();
+            fv.set("id", static_cast<int64_t>(f.id));
+            fv.set("x", static_cast<double>(f.x));
+            fv.set("y", static_cast<double>(f.y));
+            fv.set("w", static_cast<double>(f.w));
+            fv.set("h", static_cast<double>(f.h));
+            fv.set("title", f.title);
+            if (f.color) fv.set("color", static_cast<int64_t>(f.color));
+            frames.push(std::move(fv));
+        }
+        v.set("frames", std::move(frames));
+    }
+    return v;
+}
+
+Look look_from_json(const Value& v) {
+    Look look;
+    look.id = static_cast<uint64_t>(v.get("id").as_int(0));
+    look.name = v.get("name").as_string();
+    look.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
+
+    for (const Value& lv : v.get("layers").array()) {
+        if (look.layers.size() >= kMaxLayers) break;
+        look.layers.push_back(layer_from_json(lv));
+    }
+    for (const Value& nv : v.get("value_nodes").array())
+        look.value_nodes.push_back(value_node_from_json(nv));
+    for (const Value& rv : v.get("mod_routes").array())
+        look.mod_routes.push_back(route_from_json(rv));
+    for (const Value& lv : v.get("lanes").array())
+        look.lanes.push_back(lane_from_json(lv));
+    const Array& snaps = v.get("snapshots").array();
+    for (size_t i = 0; i < 3 && i < snaps.size(); ++i)
+        look.snapshots[i] = snapshot_from_json(snaps[i]);
+    look.morph_from = static_cast<int>(v.get("morph_from").as_int(0));
+    look.morph_to = static_cast<int>(v.get("morph_to").as_int(1));
+    look.morph_pos = num(v, "morph_pos", 0.0f);
+
+    look.out_node_x = num(v, "out_node_x", 0.0f);
+    look.out_node_y = num(v, "out_node_y", 0.0f);
+    // Legacy chain looks carry no links; consumers call ensure_links when
+    // they need the graph — the loader stays byte-roundtrip-stable.
+    for (const Value& lv : v.get("links").array())
+        look.links.push_back(
+            {static_cast<uint64_t>(lv.get("from").as_int(0)),
+             static_cast<uint64_t>(lv.get("to").as_int(0)),
+             static_cast<uint32_t>(lv.get("port").as_int(0))});
+    dedupe_links(look.links);
+    for (const Value& fv : v.get("frames").array()) {
+        CanvasFrame f;
+        f.id = static_cast<uint64_t>(fv.get("id").as_int(0));
+        f.x = num(fv, "x", 0.0f);
+        f.y = num(fv, "y", 0.0f);
+        f.w = num(fv, "w", 480.0f);
+        f.h = num(fv, "h", 360.0f);
+        f.title = fv.get("title").as_string();
+        f.color = static_cast<uint32_t>(fv.get("color").as_int(0));
+        look.frames.push_back(std::move(f));
+    }
+    return look;
+}
+
+// Highest id in a look, so id counters can never mint a duplicate.
+uint64_t max_node_id(const Look& look) {
+    uint64_t max_id = look.id;
+    for (const Layer& l : look.layers) {
+        max_id = std::max(max_id, l.id);
+        for (const EffectInstance& fx : l.stack)
+            max_id = std::max(max_id, fx.id);
+        for (const Group& g : l.groups) max_id = std::max(max_id, g.id);
+    }
+    for (const CanvasFrame& f : look.frames) max_id = std::max(max_id, f.id);
+    return max_id;
+}
+
+uint64_t max_sequence_id(const Sequence& seq) {
+    uint64_t max_id = seq.id;
+    for (const SeqTrack& t : seq.tracks) {
+        max_id = std::max(max_id, t.id);
+        for (const Placement& p : t.placements)
+            max_id = std::max(max_id, std::max(p.id, p.link));
+    }
+    for (const AudioTrack& t : seq.audio) {
+        max_id = std::max(max_id, t.id);
+        for (const Placement& p : t.placements)
+            max_id = std::max(max_id, std::max(p.id, p.link));
+    }
+    return max_id;
+}
+
+// ---- sequences
+
+Value sequence_to_json(const Sequence& seq) {
+    Value v = Value::make_object();
+    v.set("id", static_cast<int64_t>(seq.id));
+    v.set("name", seq.name);
+    if (seq.duration)
+        v.set("duration", static_cast<int64_t>(seq.duration));
+
+    Value tracks = Value::make_array();
+    for (const SeqTrack& t : seq.tracks) {
+        Value tv = Value::make_object();
+        tv.set("id", static_cast<int64_t>(t.id));
+        tv.set("name", t.name);
+        Value places = Value::make_array();
+        for (const Placement& p : t.placements)
+            places.push(placement_to_json(p));
+        tv.set("placements", std::move(places));
+        tracks.push(std::move(tv));
+    }
+    v.set("tracks", std::move(tracks));
+
+    if (!seq.audio.empty()) {
+        Value audio = Value::make_array();
+        for (const AudioTrack& t : seq.audio) {
+            Value tv = Value::make_object();
+            tv.set("id", static_cast<int64_t>(t.id));
+            tv.set("name", t.name);
+            if (t.gain != 1.0f)
+                tv.set("gain", static_cast<double>(t.gain));
+            if (t.mute) tv.set("mute", true);
+            Value places = Value::make_array();
+            for (const Placement& p : t.placements)
+                places.push(placement_to_json(p));
+            tv.set("placements", std::move(places));
+            audio.push(std::move(tv));
+        }
+        v.set("audio", std::move(audio));
+    }
+
+    if (seq.trim_in) v.set("trim_in", static_cast<int64_t>(seq.trim_in));
+    if (seq.trim_out) v.set("trim_out", static_cast<int64_t>(seq.trim_out));
+    if (seq.loop_out > seq.loop_in) {
+        v.set("loop_in", static_cast<int64_t>(seq.loop_in));
+        v.set("loop_out", static_cast<int64_t>(seq.loop_out));
+    }
+    if (!seq.markers.empty()) {
+        Value markers = Value::make_array();
+        for (const uint32_t m : seq.markers)
+            markers.push(Value(static_cast<int64_t>(m)));
+        v.set("markers", std::move(markers));
+    }
+    return v;
+}
+
+Sequence sequence_from_json(const Value& v) {
+    Sequence seq;
+    seq.id = static_cast<uint64_t>(v.get("id").as_int(0));
+    seq.name = v.get("name").as_string();
+    seq.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
+
+    for (const Value& tv : v.get("tracks").array()) {
+        if (seq.tracks.size() >= kMaxLayers) break;
+        SeqTrack t;
+        t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
+        t.name = tv.get("name").as_string();
+        for (const Value& pl : tv.get("placements").array()) {
+            if (t.placements.size() >= kMaxPlacementsPerTrack) break;
+            t.placements.push_back(placement_from_json(pl));
+        }
+        seq.tracks.push_back(std::move(t));
+    }
+    for (const Value& tv : v.get("audio").array()) {
+        if (seq.audio.size() >= kMaxLayers) break;
+        AudioTrack t;
+        t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
+        t.name = tv.get("name").as_string();
+        t.gain = num(tv, "gain", 1.0f);
+        t.mute = tv.get("mute").as_bool(false);
+        for (const Value& pl : tv.get("placements").array()) {
+            if (t.placements.size() >= kMaxPlacementsPerTrack) break;
+            t.placements.push_back(placement_from_json(pl));
+        }
+        seq.audio.push_back(std::move(t));
+    }
+
+    seq.trim_in = static_cast<uint32_t>(v.get("trim_in").as_int(0));
+    seq.trim_out = static_cast<uint32_t>(v.get("trim_out").as_int(0));
+    seq.loop_in = static_cast<uint32_t>(v.get("loop_in").as_int(0));
+    seq.loop_out = static_cast<uint32_t>(v.get("loop_out").as_int(0));
+    for (const Value& mv : v.get("markers").array())
+        seq.markers.push_back(static_cast<uint32_t>(mv.as_int(0)));
+    std::sort(seq.markers.begin(), seq.markers.end());
+    return seq;
 }
 
 }  // namespace
@@ -435,53 +804,33 @@ json::Value doc_to_json(const Document& doc) {
     Value v = Value::make_object();
     v.set("looks_project", kProjectVersion);
     v.set("name", doc.name);
-    v.set("clip", doc.clip_path);
     v.set("master_seed", static_cast<int64_t>(doc.master_seed));
+    if (doc.fps > 0.0) v.set("fps", doc.fps);
+    if (doc.canvas_w && doc.canvas_h) {
+        v.set("canvas_w", static_cast<int64_t>(doc.canvas_w));
+        v.set("canvas_h", static_cast<int64_t>(doc.canvas_h));
+    }
     v.set("cache_mb", static_cast<int64_t>(doc.cache_mb));
     if (doc.use_proxy) v.set("use_proxy", true);
     v.set("next_effect_id", static_cast<int64_t>(doc.next_effect_id));
     v.set("next_route_id", static_cast<int64_t>(doc.next_route_id));
 
-    Value layers = Value::make_array();
-    for (const Layer& l : doc.layers) layers.push(layer_to_json(l));
-    v.set("layers", std::move(layers));
+    Value assets = Value::make_array();
+    for (const Asset& a : doc.assets) assets.push(asset_to_json(a));
+    v.set("assets", std::move(assets));
 
-    Value routes = Value::make_array();
-    for (const ModRoute& r : doc.mod_routes) routes.push(route_to_json(r));
-    v.set("mod_routes", std::move(routes));
+    Value looks = Value::make_array();
+    for (const Look& look : doc.looks) looks.push(look_to_json(look));
+    v.set("looks", std::move(looks));
 
-    Value lanes = Value::make_array();
-    for (const KeyframeLane& lane : doc.lanes) {
-        if (lane.keys.empty()) continue;
-        lanes.push(lane_to_json(lane));
-    }
-    v.set("lanes", std::move(lanes));
+    v.set("root_sequence", static_cast<int64_t>(doc.root_sequence));
+    Value sequences = Value::make_array();
+    for (const Sequence& s : doc.sequences)
+        sequences.push(sequence_to_json(s));
+    v.set("sequences", std::move(sequences));
 
-    Value snapshots = Value::make_array();
-    for (const Snapshot& s : doc.snapshots) snapshots.push(snapshot_to_json(s));
-    v.set("snapshots", std::move(snapshots));
-    v.set("morph_from", doc.morph_from);
-    v.set("morph_to", doc.morph_to);
-    v.set("morph_pos", static_cast<double>(doc.morph_pos));
     v.set("speed", static_cast<double>(doc.speed));
     v.set("time_mode", static_cast<int64_t>(doc.time_mode));
-    if (doc.clip_trim_in)
-        v.set("clip_trim_in", static_cast<int64_t>(doc.clip_trim_in));
-    if (doc.clip_trim_out)
-        v.set("clip_trim_out", static_cast<int64_t>(doc.clip_trim_out));
-    if (doc.loop_out > doc.loop_in) {
-        v.set("loop_in", static_cast<int64_t>(doc.loop_in));
-        v.set("loop_out", static_cast<int64_t>(doc.loop_out));
-    }
-    if (doc.still_duration_frames)
-        v.set("still_duration",
-              static_cast<int64_t>(doc.still_duration_frames));
-    if (!doc.markers.empty()) {
-        Value markers = Value::make_array();
-        for (const uint32_t m : doc.markers)
-            markers.push(Value(static_cast<int64_t>(m)));
-        v.set("markers", std::move(markers));
-    }
     if (!doc.sidechain_path.empty()) {
         v.set("sidechain", doc.sidechain_path);
         v.set("sidechain_mux", doc.sidechain_mux);
@@ -495,75 +844,23 @@ json::Value doc_to_json(const Document& doc) {
         v.set("export_scale", static_cast<int64_t>(doc.export_scale));
     if (!doc.export_audio) v.set("export_audio", false);
 
-    if (doc.out_node_x != 0.0f || doc.out_node_y != 0.0f) {
-        v.set("out_node_x", static_cast<double>(doc.out_node_x));
-        v.set("out_node_y", static_cast<double>(doc.out_node_y));
-    }
-    if (!doc.links.empty()) {
-        Value links = Value::make_array();
-        for (const Document::NodeLink& l : doc.links) {
-            Value lv = Value::make_object();
-            lv.set("from", static_cast<int64_t>(l.from));
-            lv.set("to", static_cast<int64_t>(l.to));
-            lv.set("port", static_cast<int64_t>(l.to_port));
-            links.push(std::move(lv));
-        }
-        v.set("links", std::move(links));
-    }
-    if (!doc.frames.empty()) {
-        Value frames = Value::make_array();
-        for (const Document::Frame& f : doc.frames) {
-            Value fv = Value::make_object();
-            fv.set("id", static_cast<int64_t>(f.id));
-            fv.set("x", static_cast<double>(f.x));
-            fv.set("y", static_cast<double>(f.y));
-            fv.set("w", static_cast<double>(f.w));
-            fv.set("h", static_cast<double>(f.h));
-            fv.set("title", f.title);
-            if (f.color) fv.set("color", static_cast<int64_t>(f.color));
-            frames.push(std::move(fv));
-        }
-        v.set("frames", std::move(frames));
-    }
     return v;
 }
 
 Document doc_from_json(const json::Value& v) {
     Document doc;
-    doc.layers.clear();
+    doc.looks.clear();
+    doc.sequences.clear();
     doc.name = v.get("name").as_string();
     if (doc.name.empty()) doc.name = "untitled";
-    doc.clip_path = v.get("clip").as_string();
     doc.master_seed = static_cast<uint64_t>(v.get("master_seed").as_int(0));
+    doc.fps = v.get("fps").as_number(0.0);
+    doc.canvas_w = static_cast<uint32_t>(v.get("canvas_w").as_int(0));
+    doc.canvas_h = static_cast<uint32_t>(v.get("canvas_h").as_int(0));
     doc.cache_mb = static_cast<uint32_t>(v.get("cache_mb").as_int(2048));
     doc.use_proxy = v.get("use_proxy").as_bool(false);
-
-    for (const Value& lv : v.get("layers").array()) {
-        if (doc.layers.size() >= kMaxLayers) break;
-        doc.layers.push_back(layer_from_json(lv));
-    }
-    for (const Value& rv : v.get("mod_routes").array())
-        doc.mod_routes.push_back(route_from_json(rv));
-    for (const Value& lv : v.get("lanes").array())
-        doc.lanes.push_back(lane_from_json(lv));
-    const Array& snaps = v.get("snapshots").array();
-    for (size_t i = 0; i < 3 && i < snaps.size(); ++i)
-        doc.snapshots[i] = snapshot_from_json(snaps[i]);
-    doc.morph_from = static_cast<int>(v.get("morph_from").as_int(0));
-    doc.morph_to = static_cast<int>(v.get("morph_to").as_int(1));
-    doc.morph_pos = num(v, "morph_pos", 0.0f);
     doc.speed = num(v, "speed", 1.0f);
     doc.time_mode = static_cast<uint32_t>(v.get("time_mode").as_int(0));
-    doc.clip_trim_in = static_cast<uint32_t>(v.get("clip_trim_in").as_int(0));
-    doc.clip_trim_out =
-        static_cast<uint32_t>(v.get("clip_trim_out").as_int(0));
-    doc.loop_in = static_cast<uint32_t>(v.get("loop_in").as_int(0));
-    doc.loop_out = static_cast<uint32_t>(v.get("loop_out").as_int(0));
-    doc.still_duration_frames =
-        static_cast<uint32_t>(v.get("still_duration").as_int(0));
-    for (const Value& mv : v.get("markers").array())
-        doc.markers.push_back(static_cast<uint32_t>(mv.as_int(0)));
-    std::sort(doc.markers.begin(), doc.markers.end());
     doc.sidechain_path = v.get("sidechain").as_string();
     doc.sidechain_mux = v.get("sidechain_mux").as_bool(false);
     doc.audio_offset_ms = num(v, "audio_offset_ms", 0.0f);
@@ -572,70 +869,96 @@ Document doc_from_json(const json::Value& v) {
     doc.export_scale = std::clamp(
         static_cast<uint32_t>(v.get("export_scale").as_int(1)), 1u, 4u);
     doc.export_audio = v.get("export_audio").as_bool(true);
-    doc.out_node_x = num(v, "out_node_x", 0.0f);
-    doc.out_node_y = num(v, "out_node_y", 0.0f);
-    // Legacy chain documents carry no links; consumers call ensure_links
-    // when they need the graph — the loader stays byte-roundtrip-stable.
-    for (const Value& lv : v.get("links").array())
-        doc.links.push_back(
-            {static_cast<uint64_t>(lv.get("from").as_int(0)),
-             static_cast<uint64_t>(lv.get("to").as_int(0)),
-             static_cast<uint32_t>(lv.get("port").as_int(0))});
-    // In ports hold ONE producer — only the Output composites
-    // fan-in (the layer merge). Hand-edited files keep the LAST link per
-    // (to, port), matching connect's replace-on-connect.
-    for (size_t i = doc.links.size(); i-- > 0;) {
-        const Document::NodeLink& l = doc.links[i];
-        if (l.to == 0) continue;
-        for (size_t j = i; j-- > 0;) {
-            if (doc.links[j].to == l.to &&
-                doc.links[j].to_port == l.to_port) {
-                doc.links.erase(doc.links.begin() +
-                                static_cast<ptrdiff_t>(j));
-                --i;
-            }
-        }
+
+    for (const Value& av : v.get("assets").array())
+        doc.assets.push_back(asset_from_json(av));
+
+    for (const Value& lv : v.get("looks").array()) {
+        if (doc.looks.size() >= kMaxLooks) break;
+        doc.looks.push_back(look_from_json(lv));
     }
-    for (const Value& fv : v.get("frames").array()) {
-        Document::Frame f;
-        f.id = static_cast<uint64_t>(fv.get("id").as_int(0));
-        f.x = num(fv, "x", 0.0f);
-        f.y = num(fv, "y", 0.0f);
-        f.w = num(fv, "w", 480.0f);
-        f.h = num(fv, "h", 360.0f);
-        f.title = fv.get("title").as_string();
-        f.color = static_cast<uint32_t>(fv.get("color").as_int(0));
-        doc.frames.push_back(std::move(f));
+    for (const Value& sv : v.get("sequences").array()) {
+        if (doc.sequences.size() >= kMaxLooks) break;
+        doc.sequences.push_back(sequence_from_json(sv));
     }
+    doc.root_sequence =
+        static_cast<uint64_t>(v.get("root_sequence").as_int(0));
 
     // Re-derive id counters from the content: stored values are honored but
     // never allowed below (max seen id + 1), so a hand-edited file cannot
     // mint duplicate ids.
-    uint64_t max_effect_id = 0, max_route_id = 0;
-    auto see_stack = [&](const std::vector<EffectInstance>& stack) {
-        for (const EffectInstance& fx : stack)
-            max_effect_id = std::max(max_effect_id, fx.id);
-    };
-    for (const Layer& l : doc.layers) {
-        max_effect_id = std::max(max_effect_id, l.id);
-        see_stack(l.stack);
-        for (const Group& g : l.groups)
-            max_effect_id = std::max(max_effect_id, g.id);
+    uint64_t max_id = 0, max_route_id = 0;
+    for (const Look& look : doc.looks)
+        max_id = std::max(max_id, max_node_id(look));
+    for (const Sequence& seq : doc.sequences)
+        max_id = std::max(max_id, max_sequence_id(seq));
+    for (const Asset& a : doc.assets) max_id = std::max(max_id, a.id);
+    for (const Look& look : doc.looks) {
+        for (const ValueNode& n : look.value_nodes)
+            max_route_id = std::max(max_route_id, n.id);
+        for (const ModRoute& r : look.mod_routes)
+            max_route_id = std::max(max_route_id, r.id);
     }
-    for (const ModRoute& r : doc.mod_routes)
-        max_route_id = std::max(max_route_id, r.id);
     doc.next_effect_id =
         std::max(static_cast<uint64_t>(v.get("next_effect_id").as_int(1)),
-                 max_effect_id + 1);
+                 max_id + 1);
     doc.next_route_id =
         std::max(static_cast<uint64_t>(v.get("next_route_id").as_int(1)),
                  max_route_id + 1);
 
-    if (doc.layers.empty()) {
-        Layer base;
-        base.id = doc.next_effect_id++;
-        base.name = "layer 1";
-        doc.layers.push_back(std::move(base));
+    // A document always holds at least one look holding at least one
+    // layer, and at least one sequence holding at least one lane.
+    if (doc.looks.empty()) {
+        Look look;
+        look.name = "look 1";
+        doc.looks.push_back(std::move(look));
+    }
+    for (Look& look : doc.looks) {
+        if (!look.id) look.id = doc.next_effect_id++;
+        if (look.layers.empty()) {
+            Layer base;
+            base.id = doc.next_effect_id++;
+            base.name = "layer 1";
+            look.layers.push_back(std::move(base));
+        }
+    }
+    if (doc.sequences.empty()) {
+        Sequence seq;
+        seq.id = doc.next_effect_id++;
+        seq.name = "sequence 1";
+        doc.sequences.push_back(std::move(seq));
+    }
+    for (Sequence& seq : doc.sequences) {
+        if (!seq.id) seq.id = doc.next_effect_id++;
+        if (seq.tracks.empty()) {
+            SeqTrack lane;
+            lane.id = doc.next_effect_id++;
+            lane.name = "v1";
+            seq.tracks.push_back(std::move(lane));
+        }
+    }
+    if (!doc.find_sequence(doc.root_sequence))
+        doc.root_sequence = doc.sequences.front().id;
+
+    // Assets and hand-authored entries minted after the id high-water
+    // mark. An unbound placement is a deliberate state (a dormant block)
+    // and loads back exactly as written.
+    for (Asset& a : doc.assets)
+        if (!a.id) a.id = doc.next_effect_id++;
+    for (Look& look : doc.looks)
+        for (Layer& l : look.layers)
+            if (!l.id) l.id = doc.next_effect_id++;
+    for (Sequence& seq : doc.sequences) {
+        for (SeqTrack& t : seq.tracks) {
+            if (!t.id) t.id = doc.next_effect_id++;
+            for (Placement& p : t.placements)
+                if (!p.id) p.id = doc.next_effect_id++;
+        }
+        for (AudioTrack& t : seq.audio) {
+            if (!t.id) t.id = doc.next_effect_id++;
+            for (Placement& p : t.placements)
+                if (!p.id) p.id = doc.next_effect_id++;
+        }
     }
     return doc;
 }
@@ -662,6 +985,13 @@ std::optional<Document> load_document(const std::filesystem::path& path,
     if (!parsed.value->is_object() ||
         parsed.value->get("looks_project").as_int(0) < 1) {
         if (error) *error = "not a looks project file";
+        return std::nullopt;
+    }
+    // Clean break at version 5 (value graph): an older file's inline
+    // route sources would load as silence, which reads as data loss.
+    // Refuse it honestly.
+    if (parsed.value->get("looks_project").as_int(0) < kProjectVersion) {
+        if (error) *error = "project predates the value graph format";
         return std::nullopt;
     }
     return doc_from_json(*parsed.value);

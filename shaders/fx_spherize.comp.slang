@@ -53,7 +53,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float cosine = sqrt(saturate(1.0 - r * r));
         result.rgb *= lerp(1.0, cosine, saturate(shade) * saturate(amount));
     } else {
-        result = backdrop >= 0.5 ? base : float4(0.0, 0.0, 0.0, 1.0);
+        // Black backdrop keeps the layer's coverage: the effect blanks
+        // color, it never manufactures opacity.
+        result = backdrop >= 0.5 ? base : float4(0.0, 0.0, 0.0, base.a);
     }
 
     const float4 wetted = lerp(base, result, saturate(wet));

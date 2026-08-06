@@ -5,17 +5,30 @@
 
 namespace looks::mod {
 
-const doc::EffectInstance* find_effect(const doc::Document& doc,
+const doc::EffectInstance* find_effect(const doc::Look& look,
                                        uint64_t effect_id, size_t* layer_out,
                                        size_t* index_out) {
-    for (size_t l = 0; l < doc.layers.size(); ++l) {
-        const auto& stack = doc.layers[l].stack;
+    for (size_t l = 0; l < look.layers.size(); ++l) {
+        const auto& stack = look.layers[l].stack;
         for (size_t i = 0; i < stack.size(); ++i) {
             if (stack[i].id == effect_id) {
                 if (layer_out) *layer_out = l;
                 if (index_out) *index_out = i;
                 return &stack[i];
             }
+        }
+    }
+    return nullptr;
+}
+
+const doc::EffectInstance* find_effect(const doc::Document& doc,
+                                       uint64_t effect_id, uint64_t* look_out,
+                                       size_t* layer_out, size_t* index_out) {
+    for (const doc::Look& look : doc.looks) {
+        if (const doc::EffectInstance* fx =
+                find_effect(look, effect_id, layer_out, index_out)) {
+            if (look_out) *look_out = look.id;
+            return fx;
         }
     }
     return nullptr;
@@ -108,33 +121,24 @@ constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
 
 }  // namespace
 
-std::vector<ParamEntry> build_param_table(const doc::Document& doc) {
+std::vector<ParamEntry> build_param_table(const doc::Document& doc,
+                                          const doc::Look& look) {
+    (void)doc;
     std::vector<ParamEntry> table;
     {
-        // Global morph position: ParamKey {0, 0}.
+        // Look morph position: ParamKey {0, 0}.
         ParamEntry e;
         e.key = {0, 0};
         e.path = "global.morph";
         e.label = "morph position";
         e.min_value = 0.0f;
         e.max_value = 1.0f;
-        e.base = doc.morph_pos;
+        e.base = look.morph_pos;
         table.push_back(std::move(e));
     }
-    {
-        // Global playback speed: ParamKey {0, 1}.
-        ParamEntry e;
-        e.key = {0, 1};
-        e.path = "global.speed";
-        e.label = "speed";
-        e.min_value = 0.0f;
-        e.max_value = doc::kMaxSpeed;
-        e.base = doc.speed;
-        table.push_back(std::move(e));
-    }
-    for (size_t l = 0; l < doc.layers.size(); ++l)
-    for (size_t i = 0; i < doc.layers[l].stack.size(); ++i) {
-        const doc::EffectInstance& fx = doc.layers[l].stack[i];
+    for (size_t l = 0; l < look.layers.size(); ++l)
+    for (size_t i = 0; i < look.layers[l].stack.size(); ++i) {
+        const doc::EffectInstance& fx = look.layers[l].stack[i];
         const doc::EffectInfo& info = doc::effect_info(fx.type);
         const std::string prefix = "layer" + std::to_string(l) + ".fx" +
                                    std::to_string(i) + ".";
@@ -158,8 +162,8 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc) {
     }
     // Layer params: opacity, generator fields, and the transform —
     // mod targets exactly like effect params.
-    for (size_t l = 0; l < doc.layers.size(); ++l) {
-        doc::Layer probe = doc.layers[l];
+    for (size_t l = 0; l < look.layers.size(); ++l) {
+        doc::Layer probe = look.layers[l];
         const std::string lname =
             probe.name.empty() ? "layer" + std::to_string(l) : probe.name;
         for (int p = 0; p < doc::kLayerParamCount; ++p) {

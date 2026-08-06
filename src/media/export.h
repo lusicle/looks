@@ -41,10 +41,22 @@ struct ExportResult {
 using FrameProducer =
     std::function<bool(uint32_t index, std::vector<uint8_t>& nv12)>;
 
+// The export's soundtrack: the same tree mix the monitor pulls
+// (audio_mix.h), so what was heard is what is written. channels == 0 =
+// silent movie.
+struct ExportAudio {
+    uint32_t channels = 0;
+    uint32_t rate = 0;
+    // Writes `frames` interleaved samples starting at output sample
+    // `first`. `first` may be negative (the audio nudge); positions
+    // outside every source are silence.
+    std::function<void(int64_t first, int16_t* out, uint32_t frames)> fill;
+};
+
 ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
                           uint32_t fps_den, uint32_t frame_count,
                           const FrameProducer& producer,
-                          const std::filesystem::path& pcm_path,  // "" = silent
+                          const ExportAudio& audio,
                           const std::filesystem::path& out_mp4,
                           const ExportOptions& options = {},
                           ExportProgress* progress = nullptr);

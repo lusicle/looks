@@ -39,7 +39,7 @@ std::vector<Preset> scan_presets(const std::filesystem::path& dir,
                                  int* failed = nullptr);
 
 // Capture a live group as a preset.
-Preset make_preset_from_group(const Document& doc, size_t layer_index,
+Preset make_preset_from_group(const Look& look, size_t layer_index,
                               uint64_t group_id);
 
 // Mint fresh ids from doc.next_effect_id and rewrite group_id / face

@@ -8,36 +8,38 @@ namespace looks::doc {
 
 namespace {
 
-ModRoute* find_route(Document& doc, uint64_t route_id) {
-    for (ModRoute& r : doc.mod_routes)
+ModRoute* find_route(Look& look, uint64_t route_id) {
+    for (ModRoute& r : look.mod_routes)
         if (r.id == route_id) return &r;
     return nullptr;
 }
 
-class SetMorphCommand final : public Command {
+class SetMorphCommand final : public LookCommand {
 public:
-    SetMorphCommand(int from, int to, float pos)
-        : from_(from), to_(to), pos_(pos) {}
+    SetMorphCommand(uint64_t look, int from, int to, float pos)
+        : LookCommand(look), from_(from), to_(to), pos_(pos) {}
     std::string name() const override { return "Set Morph"; }
 
     void apply(Document& doc) override {
-        old_from_ = doc.morph_from;
-        old_to_ = doc.morph_to;
-        old_pos_ = doc.morph_pos;
-        doc.morph_from = from_;
-        doc.morph_to = to_;
-        doc.morph_pos = pos_;
+        Look& look = look_of(doc);
+        old_from_ = look.morph_from;
+        old_to_ = look.morph_to;
+        old_pos_ = look.morph_pos;
+        look.morph_from = from_;
+        look.morph_to = to_;
+        look.morph_pos = pos_;
     }
 
     void revert(Document& doc) override {
-        doc.morph_from = old_from_;
-        doc.morph_to = old_to_;
-        doc.morph_pos = old_pos_;
+        Look& look = look_of(doc);
+        look.morph_from = old_from_;
+        look.morph_to = old_to_;
+        look.morph_pos = old_pos_;
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetMorphCommand*>(&next);
-        if (!other) return false;
+        if (!other || !same_look(*other)) return false;
         from_ = other->from_;
         to_ = other->to_;
         pos_ = other->pos_;
@@ -51,36 +53,39 @@ private:
     float old_pos_ = 0.0f;
 };
 
-class SetTimelineRegionCommand final : public Command {
+class SetTimelineRegionCommand final : public SequenceCommand {
 public:
-    SetTimelineRegionCommand(uint32_t trim_in, uint32_t trim_out,
-                             uint32_t loop_in, uint32_t loop_out)
-        : trim_in_(trim_in), trim_out_(trim_out), loop_in_(loop_in),
-          loop_out_(loop_out) {}
+    SetTimelineRegionCommand(uint64_t sequence, uint32_t trim_in,
+                             uint32_t trim_out, uint32_t loop_in,
+                             uint32_t loop_out)
+        : SequenceCommand(sequence), trim_in_(trim_in), trim_out_(trim_out),
+          loop_in_(loop_in), loop_out_(loop_out) {}
     std::string name() const override { return "Edit Timeline Region"; }
 
     void apply(Document& doc) override {
-        old_[0] = doc.clip_trim_in;
-        old_[1] = doc.clip_trim_out;
-        old_[2] = doc.loop_in;
-        old_[3] = doc.loop_out;
-        doc.clip_trim_in = trim_in_;
-        doc.clip_trim_out = trim_out_;
-        doc.loop_in = loop_in_;
-        doc.loop_out = loop_out_;
+        Sequence& seq = sequence_of(doc);
+        old_[0] = seq.trim_in;
+        old_[1] = seq.trim_out;
+        old_[2] = seq.loop_in;
+        old_[3] = seq.loop_out;
+        seq.trim_in = trim_in_;
+        seq.trim_out = trim_out_;
+        seq.loop_in = loop_in_;
+        seq.loop_out = loop_out_;
     }
 
     void revert(Document& doc) override {
-        doc.clip_trim_in = old_[0];
-        doc.clip_trim_out = old_[1];
-        doc.loop_in = old_[2];
-        doc.loop_out = old_[3];
+        Sequence& seq = sequence_of(doc);
+        seq.trim_in = old_[0];
+        seq.trim_out = old_[1];
+        seq.loop_in = old_[2];
+        seq.loop_out = old_[3];
     }
 
     bool merge(const Command& next) override {
         const auto* other =
             dynamic_cast<const SetTimelineRegionCommand*>(&next);
-        if (!other) return false;
+        if (!other || !same_sequence(*other)) return false;
         trim_in_ = other->trim_in_;
         trim_out_ = other->trim_out_;
         loop_in_ = other->loop_in_;
@@ -93,16 +98,16 @@ private:
     uint32_t old_[4] = {};
 };
 
-class SetLaneLoopCommand final : public Command {
+class SetLaneLoopCommand final : public LookCommand {
 public:
-    SetLaneLoopCommand(ParamKey target, bool loop)
-        : target_(target), loop_(loop) {}
+    SetLaneLoopCommand(uint64_t look, ParamKey target, bool loop)
+        : LookCommand(look), target_(target), loop_(loop) {}
     std::string name() const override {
         return loop_ ? "Loop Keyframes" : "Unloop Keyframes";
     }
 
     void apply(Document& doc) override {
-        for (KeyframeLane& lane : doc.lanes) {
+        for (KeyframeLane& lane : look_of(doc).lanes) {
             if (!(lane.target == target_)) continue;
             old_ = lane.loop;
             lane.loop = loop_;
@@ -110,7 +115,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        for (KeyframeLane& lane : doc.lanes)
+        for (KeyframeLane& lane : look_of(doc).lanes)
             if (lane.target == target_) lane.loop = old_;
     }
 
@@ -120,16 +125,16 @@ private:
     bool old_ = false;
 };
 
-class SetLaneMuteCommand final : public Command {
+class SetLaneMuteCommand final : public LookCommand {
 public:
-    SetLaneMuteCommand(ParamKey target, bool muted)
-        : target_(target), muted_(muted) {}
+    SetLaneMuteCommand(uint64_t look, ParamKey target, bool muted)
+        : LookCommand(look), target_(target), muted_(muted) {}
     std::string name() const override {
         return muted_ ? "Mute Keyframes" : "Unmute Keyframes";
     }
 
     void apply(Document& doc) override {
-        for (KeyframeLane& lane : doc.lanes) {
+        for (KeyframeLane& lane : look_of(doc).lanes) {
             if (!(lane.target == target_)) continue;
             old_ = lane.muted;
             lane.muted = muted_;
@@ -137,7 +142,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        for (KeyframeLane& lane : doc.lanes)
+        for (KeyframeLane& lane : look_of(doc).lanes)
             if (lane.target == target_) lane.muted = old_;
     }
 
@@ -188,35 +193,35 @@ private:
     float old_offset_ = 0.0f;
 };
 
-class ToggleMarkerCommand final : public Command {
+class ToggleMarkerCommand final : public SequenceCommand {
 public:
-    explicit ToggleMarkerCommand(uint32_t frame) : frame_(frame) {}
+    ToggleMarkerCommand(uint64_t sequence, uint32_t frame)
+        : SequenceCommand(sequence), frame_(frame) {}
     std::string name() const override { return "Toggle Marker"; }
 
     void apply(Document& doc) override {
-        auto it = std::find(doc.markers.begin(), doc.markers.end(), frame_);
-        if (it != doc.markers.end()) {
+        std::vector<uint32_t>& markers = sequence_of(doc).markers;
+        auto it = std::find(markers.begin(), markers.end(), frame_);
+        if (it != markers.end()) {
             removed_ = true;
-            doc.markers.erase(it);
+            markers.erase(it);
         } else {
             removed_ = false;
-            doc.markers.insert(
-                std::upper_bound(doc.markers.begin(), doc.markers.end(),
-                                 frame_),
+            markers.insert(
+                std::upper_bound(markers.begin(), markers.end(), frame_),
                 frame_);
         }
     }
 
     void revert(Document& doc) override {
+        std::vector<uint32_t>& markers = sequence_of(doc).markers;
         if (removed_) {
-            doc.markers.insert(
-                std::upper_bound(doc.markers.begin(), doc.markers.end(),
-                                 frame_),
+            markers.insert(
+                std::upper_bound(markers.begin(), markers.end(), frame_),
                 frame_);
         } else {
-            auto it =
-                std::find(doc.markers.begin(), doc.markers.end(), frame_);
-            if (it != doc.markers.end()) doc.markers.erase(it);
+            auto it = std::find(markers.begin(), markers.end(), frame_);
+            if (it != markers.end()) markers.erase(it);
         }
     }
 
@@ -316,28 +321,51 @@ private:
     uint32_t old_mode_ = 0;
 };
 
-class AddRouteCommand final : public Command {
+class AddRouteCommand final : public LookCommand {
 public:
-    explicit AddRouteCommand(ModRoute route) : route_(std::move(route)) {}
-    std::string name() const override { return "Add Mod Route"; }
-    void apply(Document& doc) override { doc.mod_routes.push_back(route_); }
-    void revert(Document& doc) override { doc.mod_routes.pop_back(); }
+    AddRouteCommand(uint64_t look, ModRoute route)
+        : LookCommand(look), route_(std::move(route)) {}
+    std::string name() const override { return "Wire Param"; }
+
+    void apply(Document& doc) override {
+        // One wire per param: wiring an already-driven target replaces
+        // its wire, exactly like image links at (to, port).
+        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        replaced_.clear();
+        for (size_t i = routes.size(); i-- > 0;) {
+            if (!(routes[i].target == route_.target)) continue;
+            replaced_.push_back({i, routes[i]});
+            routes.erase(routes.begin() + i);
+        }
+        routes.push_back(route_);
+    }
+
+    void revert(Document& doc) override {
+        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        routes.pop_back();
+        for (size_t i = replaced_.size(); i-- > 0;)
+            routes.insert(routes.begin() + replaced_[i].first,
+                          replaced_[i].second);
+    }
 
 private:
     ModRoute route_;
+    std::vector<std::pair<size_t, ModRoute>> replaced_;
 };
 
-class RemoveRouteCommand final : public Command {
+class RemoveRouteCommand final : public LookCommand {
 public:
-    explicit RemoveRouteCommand(uint64_t route_id) : route_id_(route_id) {}
+    RemoveRouteCommand(uint64_t look, uint64_t route_id)
+        : LookCommand(look), route_id_(route_id) {}
     std::string name() const override { return "Remove Mod Route"; }
 
     void apply(Document& doc) override {
-        for (size_t i = 0; i < doc.mod_routes.size(); ++i) {
-            if (doc.mod_routes[i].id == route_id_) {
+        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        for (size_t i = 0; i < routes.size(); ++i) {
+            if (routes[i].id == route_id_) {
                 index_ = i;
-                removed_ = doc.mod_routes[i];
-                doc.mod_routes.erase(doc.mod_routes.begin() + i);
+                removed_ = routes[i];
+                routes.erase(routes.begin() + i);
                 return;
             }
         }
@@ -345,7 +373,8 @@ public:
     }
 
     void revert(Document& doc) override {
-        doc.mod_routes.insert(doc.mod_routes.begin() + index_, removed_);
+        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        routes.insert(routes.begin() + index_, removed_);
     }
 
 private:
@@ -354,81 +383,159 @@ private:
     ModRoute removed_;
 };
 
-class SetRouteAmountCommand final : public Command {
+class AddValueNodeCommand final : public LookCommand {
 public:
-    SetRouteAmountCommand(uint64_t route_id, float amount)
-        : route_id_(route_id), amount_(amount) {}
-    std::string name() const override { return "Set Route Amount"; }
+    AddValueNodeCommand(uint64_t look, ValueNode node)
+        : LookCommand(look), node_(node) {}
+    std::string name() const override { return "Add Value Node"; }
+    void apply(Document& doc) override {
+        look_of(doc).value_nodes.push_back(node_);
+    }
+    void revert(Document& doc) override {
+        look_of(doc).value_nodes.pop_back();
+    }
+
+private:
+    ValueNode node_;
+};
+
+class RemoveValueNodeCommand final : public LookCommand {
+public:
+    RemoveValueNodeCommand(uint64_t look, uint64_t node_id)
+        : LookCommand(look), node_id_(node_id) {}
+    std::string name() const override { return "Remove Value Node"; }
 
     void apply(Document& doc) override {
-        ModRoute* r = find_route(doc, route_id_);
-        assert(r);
-        old_amount_ = r->amount;
-        r->amount = amount_;
+        Look& look = look_of(doc);
+        routes_.clear();
+        unwired_.clear();
+        removed_ = {};
+        index_ = 0;
+        // Cascade: every wire out of this node goes with it - routes it
+        // feeds, and helper inputs reading it (captured for undo).
+        for (size_t i = look.mod_routes.size(); i-- > 0;) {
+            if (look.mod_routes[i].node != node_id_) continue;
+            routes_.push_back({i, look.mod_routes[i]});
+            look.mod_routes.erase(look.mod_routes.begin() + i);
+        }
+        for (ValueNode& n : look.value_nodes) {
+            if (n.in_a == node_id_) {
+                unwired_.push_back({n.id, 0});
+                n.in_a = 0;
+            }
+            if (n.in_b == node_id_) {
+                unwired_.push_back({n.id, 1});
+                n.in_b = 0;
+            }
+        }
+        for (size_t i = 0; i < look.value_nodes.size(); ++i) {
+            if (look.value_nodes[i].id != node_id_) continue;
+            index_ = i;
+            removed_ = look.value_nodes[i];
+            look.value_nodes.erase(look.value_nodes.begin() + i);
+            return;
+        }
+        assert(false && "value node not found");
     }
 
     void revert(Document& doc) override {
-        if (ModRoute* r = find_route(doc, route_id_)) r->amount = old_amount_;
+        Look& look = look_of(doc);
+        look.value_nodes.insert(look.value_nodes.begin() + index_, removed_);
+        for (const auto& [nid, which] : unwired_)
+            if (ValueNode* n = find_value_node(look, nid))
+                (which == 0 ? n->in_a : n->in_b) = node_id_;
+        // routes_ was captured back-to-front; reinsert front-to-back so
+        // the stored indices land exactly.
+        for (size_t i = routes_.size(); i-- > 0;)
+            look.mod_routes.insert(look.mod_routes.begin() +
+                                       routes_[i].first,
+                                   routes_[i].second);
+    }
+
+private:
+    uint64_t node_id_;
+    size_t index_ = 0;
+    ValueNode removed_;
+    std::vector<std::pair<size_t, ModRoute>> routes_;
+    std::vector<std::pair<uint64_t, int>> unwired_;
+};
+
+class SetValueNodeCommand final : public LookCommand {
+public:
+    SetValueNodeCommand(uint64_t look, ValueNode node)
+        : LookCommand(look), node_(node) {}
+    std::string name() const override { return "Edit Value Node"; }
+
+    void apply(Document& doc) override {
+        ValueNode* n = find_value_node(look_of(doc), node_.id);
+        assert(n);
+        old_ = *n;
+        *n = node_;
+    }
+
+    void revert(Document& doc) override {
+        if (ValueNode* n = find_value_node(look_of(doc), node_.id))
+            *n = old_;
     }
 
     bool merge(const Command& next) override {
-        const auto* other = dynamic_cast<const SetRouteAmountCommand*>(&next);
-        if (!other || other->route_id_ != route_id_) return false;
-        amount_ = other->amount_;
+        const auto* other = dynamic_cast<const SetValueNodeCommand*>(&next);
+        if (!other || !same_look(*other) || other->node_.id != node_.id)
+            return false;
+        node_ = other->node_;
         return true;
     }
 
 private:
-    uint64_t route_id_;
-    float amount_;
-    float old_amount_ = 0.0f;
+    ValueNode node_;
+    ValueNode old_;
 };
 
-class SetRouteSourceCommand final : public Command {
+class WireValueInputCommand final : public LookCommand {
 public:
-    SetRouteSourceCommand(uint64_t route_id, ModSource source)
-        : route_id_(route_id), source_(source) {}
-    std::string name() const override { return "Edit Mod Source"; }
+    WireValueInputCommand(uint64_t look, uint64_t node_id, int which,
+                          uint64_t from)
+        : LookCommand(look), node_id_(node_id), which_(which), from_(from) {}
+    std::string name() const override {
+        return from_ ? "Wire Value Input" : "Unwire Value Input";
+    }
 
     void apply(Document& doc) override {
-        ModRoute* r = find_route(doc, route_id_);
-        assert(r);
-        old_source_ = r->source;
-        r->source = source_;
+        ValueNode* n = find_value_node(look_of(doc), node_id_);
+        assert(n);
+        uint64_t& slot = which_ == 0 ? n->in_a : n->in_b;
+        old_ = slot;
+        slot = from_;
     }
 
     void revert(Document& doc) override {
-        if (ModRoute* r = find_route(doc, route_id_)) r->source = old_source_;
-    }
-
-    bool merge(const Command& next) override {
-        const auto* other = dynamic_cast<const SetRouteSourceCommand*>(&next);
-        if (!other || other->route_id_ != route_id_) return false;
-        source_ = other->source_;
-        return true;
+        if (ValueNode* n = find_value_node(look_of(doc), node_id_))
+            (which_ == 0 ? n->in_a : n->in_b) = old_;
     }
 
 private:
-    uint64_t route_id_;
-    ModSource source_;
-    ModSource old_source_;
+    uint64_t node_id_;
+    int which_;
+    uint64_t from_;
+    uint64_t old_ = 0;
 };
 
-class SetRouteCurveCommand final : public Command {
+class SetRouteCurveCommand final : public LookCommand {
 public:
-    SetRouteCurveCommand(uint64_t route_id, ResponseCurve curve)
-        : route_id_(route_id), curve_(curve) {}
+    SetRouteCurveCommand(uint64_t look, uint64_t route_id, ResponseCurve curve)
+        : LookCommand(look), route_id_(route_id), curve_(curve) {}
     std::string name() const override { return "Set Route Curve"; }
 
     void apply(Document& doc) override {
-        ModRoute* r = find_route(doc, route_id_);
+        ModRoute* r = find_route(look_of(doc), route_id_);
         assert(r);
         old_curve_ = r->curve;
         r->curve = curve_;
     }
 
     void revert(Document& doc) override {
-        if (ModRoute* r = find_route(doc, route_id_)) r->curve = old_curve_;
+        if (ModRoute* r = find_route(look_of(doc), route_id_))
+            r->curve = old_curve_;
     }
 
 private:
@@ -437,21 +544,22 @@ private:
     ResponseCurve old_curve_ = ResponseCurve::Linear;
 };
 
-class SetRouteTargetCommand final : public Command {
+class SetRouteTargetCommand final : public LookCommand {
 public:
-    SetRouteTargetCommand(uint64_t route_id, ParamKey target)
-        : route_id_(route_id), target_(target) {}
+    SetRouteTargetCommand(uint64_t look, uint64_t route_id, ParamKey target)
+        : LookCommand(look), route_id_(route_id), target_(target) {}
     std::string name() const override { return "Wire Route"; }
 
     void apply(Document& doc) override {
-        ModRoute* r = find_route(doc, route_id_);
+        ModRoute* r = find_route(look_of(doc), route_id_);
         assert(r);
         old_target_ = r->target;
         r->target = target_;
     }
 
     void revert(Document& doc) override {
-        if (ModRoute* r = find_route(doc, route_id_)) r->target = old_target_;
+        if (ModRoute* r = find_route(look_of(doc), route_id_))
+            r->target = old_target_;
     }
 
 private:
@@ -460,10 +568,10 @@ private:
     ParamKey old_target_;
 };
 
-class SetLaneCommand final : public Command {
+class SetLaneCommand final : public LookCommand {
 public:
-    SetLaneCommand(ParamKey target, std::vector<Keyframe> keys)
-        : target_(target), keys_(std::move(keys)) {
+    SetLaneCommand(uint64_t look, ParamKey target, std::vector<Keyframe> keys)
+        : LookCommand(look), target_(target), keys_(std::move(keys)) {
         std::sort(keys_.begin(), keys_.end(),
                   [](const Keyframe& a, const Keyframe& b) {
                       return a.frame < b.frame;
@@ -472,34 +580,37 @@ public:
     std::string name() const override { return "Edit Keyframes"; }
 
     void apply(Document& doc) override {
+        std::vector<KeyframeLane>& lanes = look_of(doc).lanes;
         old_keys_.clear();
         had_lane_ = false;
-        for (size_t i = 0; i < doc.lanes.size(); ++i) {
-            if (doc.lanes[i].target == target_) {
+        for (size_t i = 0; i < lanes.size(); ++i) {
+            if (lanes[i].target == target_) {
                 had_lane_ = true;
-                old_keys_ = doc.lanes[i].keys;
-                if (keys_.empty()) doc.lanes.erase(doc.lanes.begin() + i);
-                else doc.lanes[i].keys = keys_;
+                old_keys_ = lanes[i].keys;
+                if (keys_.empty()) lanes.erase(lanes.begin() + i);
+                else lanes[i].keys = keys_;
                 return;
             }
         }
-        if (!keys_.empty()) doc.lanes.push_back({target_, keys_});
+        if (!keys_.empty()) lanes.push_back({target_, keys_});
     }
 
     void revert(Document& doc) override {
-        for (size_t i = 0; i < doc.lanes.size(); ++i) {
-            if (doc.lanes[i].target == target_) {
-                if (had_lane_) doc.lanes[i].keys = old_keys_;
-                else doc.lanes.erase(doc.lanes.begin() + i);
+        std::vector<KeyframeLane>& lanes = look_of(doc).lanes;
+        for (size_t i = 0; i < lanes.size(); ++i) {
+            if (lanes[i].target == target_) {
+                if (had_lane_) lanes[i].keys = old_keys_;
+                else lanes.erase(lanes.begin() + i);
                 return;
             }
         }
-        if (had_lane_) doc.lanes.push_back({target_, old_keys_});
+        if (had_lane_) lanes.push_back({target_, old_keys_});
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetLaneCommand*>(&next);
-        if (!other || !(other->target_ == target_)) return false;
+        if (!other || !same_look(*other) || !(other->target_ == target_))
+            return false;
         keys_ = other->keys_;   // keep our old_keys_ — gesture start
         return true;
     }
@@ -511,10 +622,10 @@ private:
     bool had_lane_ = false;
 };
 
-class SetLanesCommand final : public Command {
+class SetLanesCommand final : public LookCommand {
 public:
-    explicit SetLanesCommand(std::vector<KeyframeLane> lanes)
-        : lanes_(std::move(lanes)) {
+    SetLanesCommand(uint64_t look, std::vector<KeyframeLane> lanes)
+        : LookCommand(look), lanes_(std::move(lanes)) {
         for (KeyframeLane& lane : lanes_)
             std::sort(lane.keys.begin(), lane.keys.end(),
                       [](const Keyframe& a, const Keyframe& b) {
@@ -524,42 +635,48 @@ public:
     std::string name() const override { return "Edit Keyframes"; }
 
     void apply(Document& doc) override {
+        std::vector<KeyframeLane>& doc_lanes = look_of(doc).lanes;
         old_.clear();
         for (const KeyframeLane& lane : lanes_) {
             Old o;
             bool found = false;
-            for (size_t i = 0; i < doc.lanes.size() && !found; ++i) {
-                if (!(doc.lanes[i].target == lane.target)) continue;
+            for (size_t i = 0; i < doc_lanes.size() && !found; ++i) {
+                if (!(doc_lanes[i].target == lane.target)) continue;
                 found = true;
                 o.had = true;
-                o.keys = doc.lanes[i].keys;
-                if (lane.keys.empty()) doc.lanes.erase(doc.lanes.begin() + i);
-                else doc.lanes[i].keys = lane.keys;
+                o.keys = doc_lanes[i].keys;
+                if (lane.keys.empty())
+                    doc_lanes.erase(doc_lanes.begin() + i);
+                else doc_lanes[i].keys = lane.keys;
             }
             if (!found && !lane.keys.empty())
-                doc.lanes.push_back({lane.target, lane.keys});
+                doc_lanes.push_back({lane.target, lane.keys});
             old_.push_back(std::move(o));
         }
     }
 
     void revert(Document& doc) override {
+        std::vector<KeyframeLane>& doc_lanes = look_of(doc).lanes;
         for (size_t n = lanes_.size(); n-- > 0;) {
             const KeyframeLane& lane = lanes_[n];
             const Old& o = old_[n];
             bool found = false;
-            for (size_t i = 0; i < doc.lanes.size() && !found; ++i) {
-                if (!(doc.lanes[i].target == lane.target)) continue;
+            for (size_t i = 0; i < doc_lanes.size() && !found; ++i) {
+                if (!(doc_lanes[i].target == lane.target)) continue;
                 found = true;
-                if (o.had) doc.lanes[i].keys = o.keys;
-                else doc.lanes.erase(doc.lanes.begin() + i);
+                if (o.had) doc_lanes[i].keys = o.keys;
+                else doc_lanes.erase(doc_lanes.begin() + i);
             }
-            if (!found && o.had) doc.lanes.push_back({lane.target, o.keys});
+            if (!found && o.had)
+                doc_lanes.push_back({lane.target, o.keys});
         }
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetLanesCommand*>(&next);
-        if (!other || other->lanes_.size() != lanes_.size()) return false;
+        if (!other || !same_look(*other) ||
+            other->lanes_.size() != lanes_.size())
+            return false;
         for (size_t i = 0; i < lanes_.size(); ++i)
             if (!(other->lanes_[i].target == lanes_[i].target)) return false;
         for (size_t i = 0; i < lanes_.size(); ++i)
@@ -576,42 +693,50 @@ private:
     std::vector<Old> old_;
 };
 
-class StoreSnapshotCommand final : public Command {
+class StoreSnapshotCommand final : public LookCommand {
 public:
-    explicit StoreSnapshotCommand(int slot) : slot_(slot) {}
+    StoreSnapshotCommand(uint64_t look, int slot)
+        : LookCommand(look), slot_(slot) {}
     std::string name() const override { return "Store Snapshot"; }
 
     void apply(Document& doc) override {
         assert(slot_ >= 0 && slot_ < 3);
-        previous_ = doc.snapshots[slot_];
-        doc.snapshots[slot_] = capture_snapshot(doc);
+        Look& look = look_of(doc);
+        previous_ = look.snapshots[slot_];
+        look.snapshots[slot_] = capture_snapshot(look);
     }
 
-    void revert(Document& doc) override { doc.snapshots[slot_] = previous_; }
+    void revert(Document& doc) override {
+        look_of(doc).snapshots[slot_] = previous_;
+    }
 
 private:
     int slot_;
     Snapshot previous_;
 };
 
-class ApplySnapshotCommand final : public Command {
+class ApplySnapshotCommand final : public LookCommand {
 public:
-    explicit ApplySnapshotCommand(int slot) : slot_(slot) {}
+    ApplySnapshotCommand(uint64_t look, int slot)
+        : LookCommand(look), slot_(slot) {}
     std::string name() const override { return "Apply Snapshot"; }
 
     void apply(Document& doc) override {
         assert(slot_ >= 0 && slot_ < 3);
-        previous_ = capture_snapshot(doc);
-        restore(doc, doc.snapshots[slot_]);
+        Look& look = look_of(doc);
+        previous_ = capture_snapshot(look);
+        restore(look, look.snapshots[slot_]);
     }
 
-    void revert(Document& doc) override { restore(doc, previous_); }
+    void revert(Document& doc) override {
+        restore(look_of(doc), previous_);
+    }
 
 private:
-    static void restore(Document& doc, const Snapshot& snapshot) {
+    static void restore(Look& look, const Snapshot& snapshot) {
         if (!snapshot.valid) return;
         for (const SnapshotEntry& entry : snapshot.entries) {
-            for (Layer& layer : doc.layers) {
+            for (Layer& layer : look.layers) {
                 for (EffectInstance& fx : layer.stack) {
                     if (fx.id != entry.effect_id) continue;
                     fx.wet = entry.wet;
@@ -631,10 +756,10 @@ private:
 
 }  // namespace
 
-Snapshot capture_snapshot(const Document& doc) {
+Snapshot capture_snapshot(const Look& look) {
     Snapshot snapshot;
     snapshot.valid = true;
-    for (const Layer& layer : doc.layers) {
+    for (const Layer& layer : look.layers) {
         for (const EffectInstance& fx : layer.stack) {
             SnapshotEntry entry;
             entry.effect_id = fx.id;
@@ -647,60 +772,78 @@ Snapshot capture_snapshot(const Document& doc) {
     return snapshot;
 }
 
-std::unique_ptr<Command> add_route_command(ModRoute route) {
-    return std::make_unique<AddRouteCommand>(std::move(route));
+std::unique_ptr<Command> add_route_command(uint64_t look, ModRoute route) {
+    return std::make_unique<AddRouteCommand>(look, std::move(route));
 }
-std::unique_ptr<Command> remove_route_command(uint64_t route_id) {
-    return std::make_unique<RemoveRouteCommand>(route_id);
+std::unique_ptr<Command> remove_route_command(uint64_t look,
+                                              uint64_t route_id) {
+    return std::make_unique<RemoveRouteCommand>(look, route_id);
 }
-std::unique_ptr<Command> set_route_amount_command(uint64_t route_id,
-                                                  float amount) {
-    return std::make_unique<SetRouteAmountCommand>(route_id, amount);
-}
-std::unique_ptr<Command> set_route_target_command(uint64_t route_id,
+std::unique_ptr<Command> set_route_target_command(uint64_t look,
+                                                  uint64_t route_id,
                                                   ParamKey target) {
-    return std::make_unique<SetRouteTargetCommand>(route_id, target);
+    return std::make_unique<SetRouteTargetCommand>(look, route_id, target);
 }
 
-std::unique_ptr<Command> set_route_source_command(uint64_t route_id,
-                                                  ModSource source) {
-    return std::make_unique<SetRouteSourceCommand>(route_id, source);
+std::unique_ptr<Command> add_value_node_command(uint64_t look,
+                                                ValueNode node) {
+    return std::make_unique<AddValueNodeCommand>(look, node);
 }
-std::unique_ptr<Command> set_route_curve_command(uint64_t route_id,
+std::unique_ptr<Command> remove_value_node_command(uint64_t look,
+                                                   uint64_t node_id) {
+    return std::make_unique<RemoveValueNodeCommand>(look, node_id);
+}
+std::unique_ptr<Command> set_value_node_command(uint64_t look,
+                                                ValueNode node) {
+    return std::make_unique<SetValueNodeCommand>(look, node);
+}
+std::unique_ptr<Command> wire_value_input_command(uint64_t look,
+                                                  uint64_t node_id,
+                                                  int which, uint64_t from) {
+    return std::make_unique<WireValueInputCommand>(look, node_id, which,
+                                                   from);
+}
+std::unique_ptr<Command> set_route_curve_command(uint64_t look,
+                                                 uint64_t route_id,
                                                  ResponseCurve curve) {
-    return std::make_unique<SetRouteCurveCommand>(route_id, curve);
+    return std::make_unique<SetRouteCurveCommand>(look, route_id, curve);
 }
-std::unique_ptr<Command> set_lane_command(ParamKey target,
+std::unique_ptr<Command> set_lane_command(uint64_t look, ParamKey target,
                                           std::vector<Keyframe> keys) {
-    return std::make_unique<SetLaneCommand>(target, std::move(keys));
+    return std::make_unique<SetLaneCommand>(look, target, std::move(keys));
 }
-std::unique_ptr<Command> set_lanes_command(std::vector<KeyframeLane> lanes) {
-    return std::make_unique<SetLanesCommand>(std::move(lanes));
+std::unique_ptr<Command> set_lanes_command(uint64_t look,
+                                           std::vector<KeyframeLane> lanes) {
+    return std::make_unique<SetLanesCommand>(look, std::move(lanes));
 }
-std::unique_ptr<Command> store_snapshot_command(int slot) {
-    return std::make_unique<StoreSnapshotCommand>(slot);
+std::unique_ptr<Command> store_snapshot_command(uint64_t look, int slot) {
+    return std::make_unique<StoreSnapshotCommand>(look, slot);
 }
-std::unique_ptr<Command> apply_snapshot_command(int slot) {
-    return std::make_unique<ApplySnapshotCommand>(slot);
+std::unique_ptr<Command> apply_snapshot_command(uint64_t look, int slot) {
+    return std::make_unique<ApplySnapshotCommand>(look, slot);
 }
-std::unique_ptr<Command> set_morph_command(int from, int to, float pos) {
-    return std::make_unique<SetMorphCommand>(from, to, pos);
+std::unique_ptr<Command> set_morph_command(uint64_t look, int from, int to,
+                                           float pos) {
+    return std::make_unique<SetMorphCommand>(look, from, to, pos);
 }
 std::unique_ptr<Command> set_time_remap_command(float speed, uint32_t mode) {
     return std::make_unique<SetTimeRemapCommand>(speed, mode);
 }
-std::unique_ptr<Command> set_timeline_region_command(uint32_t trim_in,
+std::unique_ptr<Command> set_timeline_region_command(uint64_t look,
+                                                     uint32_t trim_in,
                                                      uint32_t trim_out,
                                                      uint32_t loop_in,
                                                      uint32_t loop_out) {
-    return std::make_unique<SetTimelineRegionCommand>(trim_in, trim_out,
+    return std::make_unique<SetTimelineRegionCommand>(look, trim_in, trim_out,
                                                       loop_in, loop_out);
 }
-std::unique_ptr<Command> set_lane_loop_command(ParamKey target, bool loop) {
-    return std::make_unique<SetLaneLoopCommand>(target, loop);
+std::unique_ptr<Command> set_lane_loop_command(uint64_t look, ParamKey target,
+                                               bool loop) {
+    return std::make_unique<SetLaneLoopCommand>(look, target, loop);
 }
-std::unique_ptr<Command> set_lane_mute_command(ParamKey target, bool muted) {
-    return std::make_unique<SetLaneMuteCommand>(target, muted);
+std::unique_ptr<Command> set_lane_mute_command(uint64_t look, ParamKey target,
+                                               bool muted) {
+    return std::make_unique<SetLaneMuteCommand>(look, target, muted);
 }
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
                                                   bool sidechain_mux,
@@ -717,8 +860,8 @@ std::unique_ptr<Command> set_export_config_command(float bitrate_mbps,
                                                     audio);
 }
 
-std::unique_ptr<Command> toggle_marker_command(uint32_t frame) {
-    return std::make_unique<ToggleMarkerCommand>(frame);
+std::unique_ptr<Command> toggle_marker_command(uint64_t look, uint32_t frame) {
+    return std::make_unique<ToggleMarkerCommand>(look, frame);
 }
 std::unique_ptr<Command> set_use_proxy_command(bool use_proxy) {
     return std::make_unique<SetUseProxyCommand>(use_proxy);

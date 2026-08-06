@@ -862,6 +862,7 @@ constexpr ParamDesc kMatteParams[] = {
     {"white", "white point", 0.0f, 1.0f, 1.0f, "%.2f"},
     {"gamma", "gamma", 0.2f, 5.0f, 1.0f, "%.2f"},
     {"invert", "invert", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"output", "output", 0.0f, 1.0f, 0.0f, "%.0f", "matte|cutout"},
 };
 
 // ---- The PRIMITIVES batch (docs/flow_canvas.md): the single-job
@@ -1133,7 +1134,7 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::Signal},
     {"engraver", "Engraver", kEngraverParams, 10, FxCategory::PaintPrint},
     {"blend_node", "Blend", kBlendNodeParams, 1, FxCategory::Overlay},
-    {"matte", "Matte", kMatteParams, 7, FxCategory::Color},
+    {"matte", "Matte", kMatteParams, 8, FxCategory::Color},
     {"levels", "Levels", kLevelsParams, 5, FxCategory::Color},
     {"hue_sat", "Hue/Sat", kHueSatParams, 3, FxCategory::Color},
     {"channel_mix", "Channels", kChannelMixParams, 4, FxCategory::Color},
@@ -1232,10 +1233,16 @@ bool instance_uses_history(const EffectInstance& fx) {
 
 }  // namespace
 
-bool document_uses_history(const Document& doc) {
-    for (const Layer& layer : doc.layers)
+bool look_uses_history(const Look& look) {
+    for (const Layer& layer : look.layers)
         for (const EffectInstance& fx : layer.stack)
             if (!fx.bypass && instance_uses_history(fx)) return true;
+    return false;
+}
+
+bool document_uses_history(const Document& doc) {
+    for (const Look& look : doc.looks)
+        if (look_uses_history(look)) return true;
     return false;
 }
 

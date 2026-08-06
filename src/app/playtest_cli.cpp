@@ -1,6 +1,7 @@
-// Dev CLI: headless player verification. Opens an imported bundle, plays
-// with the audio clock running, samples the playhead, exercises seek and
-// trim, and reports pass/fail.
+// Dev CLI: headless transport + decode pool verification (docs/look.md
+// phase 4). Builds a one-clip project over an imported bundle, runs the
+// timeline clock, pulls frames through the pool, and exercises seek and
+// trim.
 //   looks_playtest <bundle.mez> [bundle.pcm]
 
 #include <windows.h>
@@ -8,20 +9,62 @@
 #include <cstdio>
 #include <string>
 
+#include "codec/mez.h"
+#include "doc/document.h"
+#include "media/audio_mix.h"
+#include "media/decode_pool.h"
 #include "media/player.h"
 
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: looks_playtest <bundle.mez> [bundle.pcm]\n");
+        std::fprintf(stderr,
+                     "usage: looks_playtest <bundle.mez> [bundle.pcm]\n");
         return 2;
     }
-    looks::media::Player player;
+    using namespace looks;
+
+    codec::MezReader probe;
     std::string error;
-    if (!player.open(argv[1], argc > 2 ? argv[2] : L"", &error)) {
+    if (!probe.open(argv[1], &error)) {
         std::fprintf(stderr, "open failed: %s\n", error.c_str());
         return 1;
     }
-    std::printf("open: %u frames @ %.3f fps, %.3fs, audio %u ch %u Hz\n",
+
+    // A project the way the app builds one: an asset, the starter look's
+    // clip node bound to it, and one block placing that look on the root
+    // sequence.
+    doc::Document doc;
+    doc::Asset asset;
+    asset.id = doc.next_effect_id++;
+    asset.name = "clip";
+    asset.frame_count = probe.frame_count();
+    asset.fps = probe.fps();
+    asset.width = probe.width();
+    asset.height = probe.height();
+    doc.assets.push_back(asset);
+    doc.looks[0].layers[0].asset = asset.id;
+    {
+        doc::Placement block;
+        block.id = doc.next_effect_id++;
+        block.target = doc.looks[0].id;
+        doc.root().tracks[0].placements.push_back(block);
+    }
+    doc.fps = asset.fps > 0.0 ? asset.fps : 30.0;
+
+    media::AssetBundle bundle;
+    bundle.asset = asset.id;
+    bundle.mez = argv[1];
+    if (argc > 2) bundle.pcm = argv[2];
+    bundle.frames = asset.frame_count;
+    bundle.width = asset.width;
+    bundle.height = asset.height;
+    bundle.fps = asset.fps;
+    const std::vector<media::AssetBundle> bundles{bundle};
+
+    const uint32_t span = doc::sequence_duration(doc, doc.root());
+    media::Player player;
+    player.configure(doc.fps, span);
+    std::printf("timeline: %u frames @ %.3f fps, %.3fs, monitor %u ch %u Hz\n",
                 player.frame_count(), player.fps(), player.duration_seconds(),
                 player.audio_channels(), player.audio_sample_rate());
 
@@ -32,15 +75,34 @@ int wmain(int argc, wchar_t** argv) {
             ++failures;
         }
     };
+    expect(span == probe.frame_count(),
+           "timeline length derives from the placement");
 
-    // Decode-ahead fills without playback.
-    Sleep(200);
-    auto frame = player.current_frame();
-    expect(frame != nullptr, "frame available while paused");
-    if (frame) expect(frame->width > 0, "decoded frame has pixels");
+    // The mix: one clip source across the whole span.
+    {
+        auto mix = std::make_shared<media::MixState>();
+        mix->fps = doc.fps;
+        mix->rate = player.audio_sample_rate();
+        mix->channels = player.audio_channels();
+        if (auto pcm = media::load_pcm(bundle.pcm)) {
+            media::MixSource src;
+            src.pcm = pcm;
+            src.t_out = span;
+            mix->sources.push_back(std::move(src));
+        }
+        player.set_mix(std::move(mix));
+    }
+
+    media::DecodePool pool;
+    pool.set_document(doc, doc.root_sequence, bundles, 1);
+    const auto& first = pool.collect(0);
+    expect(first.size() == 1, "one placement decodes at frame 0");
+    expect(!first.empty() && first[0].frame &&
+               first[0].frame->width == probe.width(),
+           "decoded frame has pixels");
     expect(player.current_frame_index() == 0, "playhead at 0 before play");
 
-    // Play ~1.1s of a looping clip; the clock must advance.
+    // Play ~1.1s of a looping timeline; the clock must advance.
     player.set_looping(true);
     player.play();
     Sleep(1100);
@@ -48,22 +110,30 @@ int wmain(int argc, wchar_t** argv) {
     const uint32_t idx = player.current_frame_index();
     std::printf("after 1.1s: pos=%.3fs frame=%u playing=%d\n", pos, idx,
                 player.playing());
-    expect(pos > 0.8 && pos < 1.6, "audio clock advanced ~1.1s");
-    expect(idx > 20, "video chased the clock");
-    frame = player.current_frame();
-    expect(frame != nullptr, "frame available during playback");
+    expect(pos > 0.8 && pos < 1.6, "clock advanced ~1.1s");
+    expect(idx > 20, "playhead chased the clock");
+    expect(!pool.collect(idx).empty(), "pool serves the playhead frame");
     player.pause();
     Sleep(60);
     const double paused_pos = player.position_seconds();
     Sleep(120);
-    expect(player.position_seconds() == paused_pos, "clock frozen while paused");
+    expect(player.position_seconds() == paused_pos,
+           "clock frozen while paused");
 
     // Instant seek.
     player.seek_frame(5);
     expect(player.current_frame_index() == 5, "seek lands on frame 5");
-    Sleep(150);
-    frame = player.current_frame();
-    expect(frame != nullptr, "frame decoded after seek");
+    const auto& sought = pool.collect(5);
+    expect(sought.size() == 1 && sought[0].frame != nullptr,
+           "frame decoded after seek");
+
+    // Prewarm: replaying a span the pool has already walked must not
+    // re-read the same frames from disk.
+    const uint64_t before = pool.misses();
+    for (uint32_t f = 5; f < 9; ++f) pool.collect(f);
+    const uint64_t walked = pool.misses() - before;
+    std::printf("prewarm: %llu disk decodes over 4 sequential frames\n",
+                static_cast<unsigned long long>(walked));
 
     // Trim + loop stays inside the region.
     player.set_trim(10, 20);

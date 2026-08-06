@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _MSC_VER
+#include <crtdbg.h>
+#endif
+
 namespace testfw {
 
 struct TestCase {
@@ -31,9 +35,21 @@ struct Registrar {
 };
 
 inline int run_all() {
+#ifdef _MSC_VER
+    // Headless: debug CRT asserts report to stderr and abort instead of
+    // opening a dialog no harness can click. The trace line below names
+    // the test that died - stderr is unbuffered, stdout is not.
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     int ran = 0;
     for (const TestCase& test : registry()) {
         current_test = test.name;
+        std::fprintf(stderr, "[run] %s\n", test.name);
+        std::fflush(stderr);
         const int failures_before = failures;
         test.fn();
         ++ran;

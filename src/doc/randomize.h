@@ -10,13 +10,14 @@
 
 namespace looks::doc {
 
-// Selectors (modes, palettes, glyph sets, corners) hold the LOOK's identity
-// and stay put; continuous params are fair game.
+// Selectors (modes, palettes, glyph sets, corners) hold the effect's
+// identity and stay put; continuous params are fair game.
 bool param_randomizable(const ParamDesc& desc);
 
-void randomize_effect(Document& doc, UndoStack& undo, size_t layer_index,
-                      size_t effect_index, float intensity, uint64_t rng_seed);
-void randomize_stack(Document& doc, UndoStack& undo, size_t layer_index,
-                     float intensity, uint64_t rng_seed);
+void randomize_effect(Document& doc, UndoStack& undo, uint64_t look,
+                      size_t layer_index, size_t effect_index,
+                      float intensity, uint64_t rng_seed);
+void randomize_stack(Document& doc, UndoStack& undo, uint64_t look,
+                     size_t layer_index, float intensity, uint64_t rng_seed);
 
 }  // namespace looks::doc

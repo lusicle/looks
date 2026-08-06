@@ -102,6 +102,7 @@ bool effect_uses_history(EffectType type);
 
 // Scans every layer stack (bypassed effects excluded: they never
 // dispatch). True disables the render cache for the document.
+bool look_uses_history(const Look& look);
 bool document_uses_history(const Document& doc);
 
 }  // namespace looks::doc

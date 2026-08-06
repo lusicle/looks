@@ -272,10 +272,50 @@ float eval_source(const doc::ModSource& source, double t_seconds,
     }
 }
 
+float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
+    if (!env.look || depth >= 64) return 0.0f;
+    const doc::ValueNode* n = doc::find_value_node(*env.look, node_id);
+    if (!n) return 0.0f;
+    auto input = [&](uint64_t id, float constant) {
+        return id ? eval_value_node(env, id, depth + 1) : constant;
+    };
+    switch (n->source.type) {
+        case doc::ModSourceType::Math: {
+            const float a = input(n->in_a, n->const_a);
+            const float b = input(n->in_b, n->const_b);
+            switch (n->op) {
+                case doc::ValueOp::Add: return a + b;
+                case doc::ValueOp::Subtract: return a - b;
+                case doc::ValueOp::Multiply: return a * b;
+                case doc::ValueOp::Divide:
+                    return std::fabs(b) < 1e-6f ? 0.0f : a / b;
+                case doc::ValueOp::Min: return std::min(a, b);
+                case doc::ValueOp::Max: return std::max(a, b);
+                case doc::ValueOp::Floor: return std::floor(a);
+                case doc::ValueOp::Absolute: return std::fabs(a);
+                default: return a;
+            }
+        }
+        case doc::ModSourceType::Normalise: {
+            const float a = input(n->in_a, n->const_a);
+            const float m = n->const_b;
+            const float span = (n->in_max - n->in_min) * m;
+            if (std::fabs(span) < 1e-6f) return 0.0f;
+            return std::clamp((a - n->in_min * m) / span, 0.0f, 1.0f);
+        }
+        default:
+            return eval_source(n->source, env.t, env.frame, env.analysis,
+                               env.fps, env.audio_off, env.key_time,
+                               env.video);
+    }
+}
+
 float apply_curve(doc::ResponseCurve curve, float x) {
+    // Linear stays raw: helper chains legitimately leave [0,1] (a
+    // centered LFO swings negative) and the param clamp is the bound.
+    if (curve == doc::ResponseCurve::Linear) return x;
     x = std::clamp(x, 0.0f, 1.0f);
     switch (curve) {
-        case doc::ResponseCurve::Linear: return x;
         case doc::ResponseCurve::Exp: return x * x;
         case doc::ResponseCurve::SCurve: return smooth01(x);
         case doc::ResponseCurve::Inverted: return 1.0f - x;
@@ -305,16 +345,19 @@ float eval_lane(const doc::KeyframeLane& lane, double frame) {
     return eval_bezier(k0, k1, frame);
 }
 
-doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
-                      double fps, const AnalysisCurves* analysis,
-                      double live_seconds, double key_time,
-                      const SourceFrameView* video) {
-    doc::Document out = doc;
+void resolve_look(const doc::Look& look, doc::Look& out,
+                  uint32_t local_frame, double fps,
+                  const AnalysisCurves* analysis, double audio_off,
+                  double live_seconds, double key_time,
+                  const SourceFrameView* video) {
+    const uint32_t frame_index = local_frame;
     const double t = live_seconds >= 0.0
                          ? live_seconds
                          : (fps > 0.0 ? frame_index / fps : 0.0);
-    const double audio_off =
-        static_cast<double>(doc.audio_offset_ms) * 0.001;
+    // Value nodes read the PRE-RESOLVE look: node params are not
+    // themselves mod targets, so the copy-in-progress never feeds back.
+    const ValueEnv env{&look, t,         frame_index, analysis,
+                       fps,   audio_off, key_time,    video};
 
     auto param_slot = [](doc::EffectInstance& fx, int param_index) -> float* {
         if (param_index == doc::kWetParam) return &fx.wet;
@@ -329,25 +372,22 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     // itself is a mod target (ParamKey {0, 0}) so routes are applied to it
     // first. Runs before lanes — morph sets base values like snapshots do.
     {
-        float pos = doc.morph_pos;
-        for (const doc::ModRoute& route : doc.mod_routes) {
+        float pos = look.morph_pos;
+        for (const doc::ModRoute& route : look.mod_routes) {
             if (route.target.effect_id != 0 || route.target.param_index != 0)
                 continue;
-            const float value =
-                apply_curve(route.curve,
-                            eval_source(route.source, t, frame_index,
-                                        analysis, fps, audio_off, key_time,
-                                        video));
-            pos += route.amount * value;
+            if (!route.node) continue;
+            // Wired = graph-driven: the wire replaces the slider.
+            pos = apply_curve(route.curve, eval_value_node(env, route.node));
         }
         pos = std::clamp(pos, 0.0f, 1.0f);
-        const bool from_ok = doc.morph_from >= 0 && doc.morph_from < 3 &&
-                             doc.snapshots[doc.morph_from].valid;
-        const bool to_ok = doc.morph_to >= 0 && doc.morph_to < 3 &&
-                           doc.snapshots[doc.morph_to].valid;
+        const bool from_ok = look.morph_from >= 0 && look.morph_from < 3 &&
+                             look.snapshots[look.morph_from].valid;
+        const bool to_ok = look.morph_to >= 0 && look.morph_to < 3 &&
+                           look.snapshots[look.morph_to].valid;
         if (from_ok && to_ok && pos > 0.0f) {
-            const doc::Snapshot& a = doc.snapshots[doc.morph_from];
-            const doc::Snapshot& b = doc.snapshots[doc.morph_to];
+            const doc::Snapshot& a = look.snapshots[look.morph_from];
+            const doc::Snapshot& b = look.snapshots[look.morph_to];
             for (const doc::SnapshotEntry& ea : a.entries) {
                 const doc::SnapshotEntry* eb = nullptr;
                 for (const doc::SnapshotEntry& e : b.entries)
@@ -382,7 +422,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     };
 
     // Keyframe lanes set the base (muted lanes keep keys, drive nothing).
-    for (const doc::KeyframeLane& lane : doc.lanes) {
+    for (const doc::KeyframeLane& lane : look.lanes) {
         if (lane.keys.empty() || lane.muted) continue;
         float min_v = 0.0f, max_v = 1.0f;
         if (float* lslot = layer_slot(lane.target, &min_v, &max_v)) {
@@ -398,9 +438,12 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
         *slot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
     }
 
-    // Routes add on top. (Group faces are DIRECT param aliases — v5.3 —
-    // they have no resolve-time behavior of their own.)
-    for (const doc::ModRoute& route : doc.mod_routes) {
+    // Wires REPLACE: a driven param maps the node's output onto its
+    // range, ignoring base and lanes. Commands keep one wire per param;
+    // in a hand-edited file the last one wins. (Group faces are DIRECT
+    // param aliases — they have no resolve-time behavior of their own.)
+    for (const doc::ModRoute& route : look.mod_routes) {
+        if (!route.node) continue;
         float min_v = 0.0f, max_v = 1.0f;
         float* slot = layer_slot(route.target, &min_v, &max_v);
         if (!slot) {
@@ -413,11 +456,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
             param_range(fx.type, route.target.param_index, &min_v, &max_v);
         }
         const float value =
-            apply_curve(route.curve,
-                        eval_source(route.source, t, frame_index, analysis,
-                                    fps, audio_off, key_time, video));
-        *slot = std::clamp(*slot + route.amount * (max_v - min_v) * value,
-                           min_v, max_v);
+            apply_curve(route.curve, eval_value_node(env, route.node));
+        *slot = std::clamp(min_v + (max_v - min_v) * value, min_v, max_v);
     }
 
     // Discrete params (selectors + flagged counts) snap to whole numbers
@@ -430,43 +470,39 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
             for (size_t p = 0; p < fx.params.size(); ++p)
                 if (param_discrete(fx.type, static_cast<int>(p)))
                     fx.params[p] = std::round(fx.params[p]);
+}
+
+doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
+                      double fps, const AnalysisCurves* analysis,
+                      double live_seconds, double key_time,
+                      const SourceFrameView* video) {
+    doc::Document out = doc;
+    const double audio_off =
+        static_cast<double>(doc.audio_offset_ms) * 0.001;
+    // Every look resolves at `frame_index`. That IS its local frame for
+    // the root and for the single-instance case; per-instance local times
+    // arrive with instance paths, which is why the per-look primitive
+    // above takes the frame explicitly.
+    for (size_t i = 0; i < out.looks.size(); ++i)
+        resolve_look(doc.looks[i], out.looks[i], frame_index, fps, analysis,
+                     audio_off, live_seconds, key_time, video);
     return out;
 }
 
 float speed_at(const doc::Document& doc, uint32_t frame_index, double fps,
                const AnalysisCurves* analysis, double live_seconds) {
-    float speed = doc.speed;
-    for (const doc::KeyframeLane& lane : doc.lanes) {
-        if (lane.target.effect_id != 0 || lane.target.param_index != 1 ||
-            lane.keys.empty() || lane.muted)
-            continue;
-        speed = eval_lane(lane, frame_index);   // lane sets the base
-    }
-    const double t = live_seconds >= 0.0
-                         ? live_seconds
-                         : (fps > 0.0 ? frame_index / fps : 0.0);
-    for (const doc::ModRoute& route : doc.mod_routes) {
-        if (route.target.effect_id != 0 || route.target.param_index != 1)
-            continue;
-        const float value = apply_curve(
-            route.curve,
-            eval_source(route.source, t, frame_index, analysis, fps,
-                        static_cast<double>(doc.audio_offset_ms) * 0.001));
-        speed += route.amount * doc::kMaxSpeed * value;
-    }
-    return std::clamp(speed, 0.0f, doc::kMaxSpeed);
+    // Playback speed belongs to the root sequence, and sequences carry
+    // no keyframes or routes - the project speed is the scalar. Ramps
+    // live per-block (Placement::speed) or inside looks.
+    (void)frame_index;
+    (void)fps;
+    (void)analysis;
+    (void)live_seconds;
+    return std::clamp(doc.speed, 0.0f, doc::kMaxSpeed);
 }
 
 bool time_remap_active(const doc::Document& doc) {
-    if (doc.time_mode != 0 || doc.speed != 1.0f) return true;
-    for (const doc::KeyframeLane& lane : doc.lanes)
-        if (lane.target.effect_id == 0 && lane.target.param_index == 1 &&
-            !lane.keys.empty() && !lane.muted)
-            return true;
-    for (const doc::ModRoute& route : doc.mod_routes)
-        if (route.target.effect_id == 0 && route.target.param_index == 1)
-            return true;
-    return false;
+    return doc.time_mode != 0 || doc.speed != 1.0f;
 }
 
 uint32_t TimeRemap::source_frame(const doc::Document& doc, uint32_t frame,

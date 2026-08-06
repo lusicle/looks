@@ -34,6 +34,47 @@ public:
     }
 };
 
+// Base for every mutation scoped to ONE look. The target look is
+// captured at construction, never read from an editing cursor: undo and
+// redo must land on the look the edit was made in, whatever the UI has
+// scoped to since.
+class LookCommand : public Command {
+public:
+    explicit LookCommand(uint64_t look) : look_(look) {}
+    uint64_t look_id() const { return look_; }
+
+protected:
+    Look& look_of(Document& doc) const { return doc.look(look_); }
+    // True when `other` edits the same look — every merge() override
+    // checks this before coalescing.
+    bool same_look(const LookCommand& other) const {
+        return other.look_ == look_;
+    }
+
+private:
+    uint64_t look_ = 0;
+};
+
+// Base for every mutation scoped to ONE sequence — same explicit-scope
+// rule as LookCommand: sequences nest, so "the current timeline" is view
+// state and undo must not chase it.
+class SequenceCommand : public Command {
+public:
+    explicit SequenceCommand(uint64_t sequence) : sequence_(sequence) {}
+    uint64_t sequence_id() const { return sequence_; }
+
+protected:
+    Sequence& sequence_of(Document& doc) const {
+        return doc.sequence(sequence_);
+    }
+    bool same_sequence(const SequenceCommand& other) const {
+        return other.sequence_ == sequence_;
+    }
+
+private:
+    uint64_t sequence_ = 0;
+};
+
 class UndoStack {
 public:
     explicit UndoStack(size_t max_depth = 1024) : max_depth_(max_depth) {}

@@ -1,11 +1,20 @@
-// Modulation data model, stored in the Document: the global mod
-// matrix (routes), per-param keyframe lanes, and snapshot slots. Evaluation
-// lives in src/mod/ — this header is pure data so the document stays
-// self-contained.
+// Modulation data model, stored in the Document: the look-local value
+// graph (value nodes + routes), per-param keyframe lanes, and snapshot
+// slots. Evaluation lives in src/mod/ — this header is pure data so the
+// document stays self-contained.
 //
 // Value model per param:
-//   final = clamp(base + Σ amount_i · curve_i(source_i))
-// Keyframe lanes drive the BASE (keyframes set base, sources wiggle on top).
+//   unwired: the stored base (slider); keyframe lanes drive it
+//   wired:   final = clamp(min + span · curve(node), min, max)
+// A wire REPLACES the base — depth and offset shaping live in the value
+// graph (math, normalise), never on the wire.
+//
+// A VALUE NODE is a shared signal: a generator (LFO, drift, audio bands,
+// video sampling) or a helper that combines upstream node outputs (math
+// ops, normalise). A ROUTE is a plain wire from one value node's output
+// onto one param — one node can drive many params, a param holds at most
+// ONE wire (adding to a wired param replaces it), and helper nodes chain
+// node-to-node. The value graph is acyclic (commands guard wiring).
 //
 // Targets address effects by STABLE ID (survives reorder/undo); display
 // paths like "layer0.fx2.shift_x" are derived from the live stack by the
@@ -55,12 +64,18 @@ enum class ModSourceType : uint32_t {
     Beat,              // deterministic pulse train from the BPM estimate
     VideoSample,       // color/luma at a point of the current source frame
     VideoRegion,       // mean color/luma over a rect of the source frame
+    Math,              // helper: op(a, b) over upstream nodes / constants
+    Normalise,         // helper: map the scaled window onto [0, 1], clamped
     Count,
 };
 
 enum class LfoShape : uint32_t { Sine = 0, Triangle, Square, SampleHold, Count };
 
 enum class ResponseCurve : uint32_t { Linear = 0, Exp, SCurve, Inverted, Count };
+
+enum class ValueOp : uint32_t {
+    Add = 0, Subtract, Multiply, Divide, Min, Max, Floor, Absolute, Count,
+};
 
 struct ModSource {
     ModSourceType type = ModSourceType::Lfo;
@@ -83,15 +98,34 @@ struct ModSource {
     uint32_t channel = 0;
 };
 
-struct ModRoute {
-    uint64_t id = 0;          // stable identity for UI/undo
+// A node of the value graph. source.type is the node kind; generator
+// kinds read the ModSource fields, helper kinds read the fields below.
+// An unwired helper input (0) reads its constant instead.
+struct ValueNode {
+    uint64_t id = 0;
     ModSource source;
-    ParamKey target;
-    float amount = 0.0f;      // in normalized param range (-1..1 of span)
-    ResponseCurve curve = ResponseCurve::Linear;
+    // Math: out = op(a, b).
+    ValueOp op = ValueOp::Add;
+    uint64_t in_a = 0, in_b = 0;    // upstream value-node ids; 0 = constant
+    float const_a = 0.0f, const_b = 1.0f;
+    // Normalise: the window [in_min, in_max] (bounds capped -1..1)
+    // scaled by the multiplier m = const_b, so wide windows come from
+    // the multiplier, not wide sliders:
+    //   out = clamp01((a - in_min*m) / ((in_max - in_min)*m))
+    float in_min = 0.0f, in_max = 1.0f;
     // Node-canvas position (docs/flow_canvas.md); (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
+};
+
+// A wire: one value node's output REPLACING one param (the node's 0..1
+// maps onto the param's range through the curve). node 0 = dangling
+// (inert, kept so undo can resurrect its source).
+struct ModRoute {
+    uint64_t id = 0;          // stable identity for UI/undo
+    uint64_t node = 0;        // source ValueNode id
+    ParamKey target;
+    ResponseCurve curve = ResponseCurve::Linear;
 };
 
 // Cubic bezier key. Handles are (dframe, dvalue) offsets from the key —

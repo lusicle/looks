@@ -74,10 +74,10 @@ std::vector<Preset> scan_presets(const std::filesystem::path& dir,
     return out;
 }
 
-Preset make_preset_from_group(const Document& doc, size_t layer_index,
+Preset make_preset_from_group(const Look& look, size_t layer_index,
                               uint64_t group_id) {
     Preset p;
-    const Layer& layer = doc.layers[layer_index];
+    const Layer& layer = look.layers[layer_index];
     for (const Group& g : layer.groups)
         if (g.id == group_id) {
             p.group = g;

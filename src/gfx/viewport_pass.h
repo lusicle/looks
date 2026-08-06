@@ -29,11 +29,13 @@ public:
     // preserved and centered; restores the full-extent scissor afterwards.
     // clip_x0/clip_x1 (fractions of the fitted rect) confine the draw
     // horizontally — the A/B before-after wipe is two draws with
-    // complementary clips.
+    // complementary clips. alpha_mode: 0 flattens the composite's
+    // alpha over black, 1 over a checkerboard.
     void draw(VkCommandBuffer cmd, DescriptorArena& arena, uint32_t frame_index,
               GpuImage& image, VkSampler sampler, VkExtent2D extent,
               float dst_x, float dst_y, float dst_w, float dst_h,
-              float clip_x0 = 0.0f, float clip_x1 = 1.0f);
+              float clip_x0 = 0.0f, float clip_x1 = 1.0f,
+              uint32_t alpha_mode = 0);
 
 private:
     explicit ViewportPass(Device& device) : device_(device) {}

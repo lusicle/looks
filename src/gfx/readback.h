@@ -23,14 +23,17 @@ public:
     Nv12Readback(const Nv12Readback&) = delete;
     Nv12Readback& operator=(const Nv12Readback&) = delete;
 
-    // Evaluates the document over `source` through `engine`, converts to
-    // NV12, and blocks on the fence. `out` receives packed NV12 (stride ==
-    // width; Y plane then interleaved UV). Dimensions must be even.
+    // Evaluates one look at one frame through `engine`, converts to NV12,
+    // and blocks on the fence. `out` receives packed NV12 (stride ==
+    // width; Y plane then interleaved UV). Canvas dimensions must be even.
+    // Clip pixels arrive through `layer_sources` (the caller's decode
+    // pool), exactly as in preview.
     // cache_ctx passes through to Engine::render (0 = bypass the frame
     // render cache — the default for export, which visits each frame once).
-    bool render(Engine& engine, const SourcePlanes& source,
-                const doc::Document& doc, uint32_t timeline_frame, double fps,
-                std::vector<uint8_t>& out, uint64_t cache_ctx = 0,
+    bool render(Engine& engine, const doc::Document& doc, uint64_t look_id,
+                uint32_t timeline_frame, double fps, uint32_t canvas_w,
+                uint32_t canvas_h, std::vector<uint8_t>& out,
+                uint64_t cache_ctx = 0, uint32_t cache_frame = 0,
                 const Engine::LayerSourceFrame* layer_sources = nullptr,
                 size_t layer_source_count = 0);
 

@@ -1,6 +1,6 @@
 // Undoable layer mutations. Layer property edits are whole-
 // object replacements minus the stack; coalesces per layer so opacity
-// drags are one undo step.
+// drags are one undo step. Every command names the look it edits.
 
 #pragma once
 
@@ -14,18 +14,38 @@ namespace looks::doc {
 // Fresh layer with a unique id and a default name for its kind.
 Layer make_layer(Document& doc, LayerSourceKind kind);
 
-std::unique_ptr<Command> add_layer_command(Layer layer, size_t insert_index);
+std::unique_ptr<Command> add_layer_command(uint64_t look, Layer layer,
+                                           size_t insert_index);
 // Refuses nothing here — the app enforces "at least one layer" and cleans
 // up mod routes/lanes targeting removed effects lazily (dangling ids are
 // skipped at eval and restored by undo).
-std::unique_ptr<Command> remove_layer_command(size_t layer_index);
+std::unique_ptr<Command> remove_layer_command(uint64_t look,
+                                              size_t layer_index);
 // Everything but the stack; matched by layer id, coalesces per layer.
-std::unique_ptr<Command> set_layer_props_command(Layer updated);
+std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated);
 // Swaps a layer with a neighbour (compositing reorder). `direction` is
 // -1 (toward the bottom of the stack) or +1; caller bounds-checks.
-std::unique_ptr<Command> move_layer_command(size_t index, int direction);
+std::unique_ptr<Command> move_layer_command(uint64_t look, size_t index,
+                                            int direction);
 // Whole-layer replacement including the stack — resets the last remaining
-// layer, since removing it outright would leave the document empty.
-std::unique_ptr<Command> replace_layer_command(size_t index, Layer fresh);
+// layer, since removing it outright would leave the look empty.
+std::unique_ptr<Command> replace_layer_command(uint64_t look, size_t index,
+                                               Layer fresh);
+// Razor: splits a placement at a LOCAL frame into two abutting
+// placements on the SAME lane. The right half is a fresh placement of
+// the same target whose source_in lands on the cut's source frame, so
+// every frame renders exactly as before the cut. Nothing else moves: no
+// clone, no wiring - sequences own no effects, so razor identity is
+// structural. Cutting never forks the target. Null when `at` does not
+// fall strictly inside a placement, and at the per-lane placement
+// bound. Takes the document to mint the right half's id at build time.
+std::unique_ptr<Command> razor_track_command(Document& doc,
+                                             uint64_t sequence,
+                                             uint64_t track_id, uint32_t at);
+// The same cut for a block on an AUDIO track (an unlinked sound edits on
+// its own; a linked one splits its whole group either way).
+std::unique_ptr<Command> razor_audio_command(Document& doc,
+                                             uint64_t sequence,
+                                             uint64_t track_id, uint32_t at);
 
 }  // namespace looks::doc

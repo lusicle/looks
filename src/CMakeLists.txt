@@ -16,7 +16,10 @@ add_library(looks_doc STATIC
     doc/stack_commands.cpp
     doc/mod_commands.cpp
     doc/layer_commands.cpp
+    doc/placement_commands.cpp
     doc/group_commands.cpp
+    doc/look_commands.cpp
+    doc/instances.cpp
     doc/serialize.cpp
     doc/preset.cpp
     doc/randomize.cpp)
@@ -64,6 +67,8 @@ add_library(looks_media STATIC
     media/import.cpp
     media/export.cpp
     media/player.cpp
+    media/audio_mix.cpp
+    media/decode_pool.cpp
     media/miniaudio_impl.cpp)
 target_include_directories(looks_media PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(looks_media SYSTEM PUBLIC

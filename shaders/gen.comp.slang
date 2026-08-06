@@ -9,7 +9,7 @@ cbuffer Push
     uint width;
     uint height;
     uint kind;         // LayerSourceKind: 1 solid, 2 gradient, 3 noise,
-                       // 4 test pattern, 5 oscillator, 7 shape
+                       // 4 test pattern, 5 oscillator, 6 shape
     uint seed;
     uint frame;
     float ar, ag, ab;  // sRGB
@@ -34,6 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 color_b = fx_srgb_eotf(saturate(float3(br, bg, bb)));
 
     float3 rgb;
+    float alpha = 1.0;
     if (kind == 2)
     {
         const float2 dir = float2(cos(angle), sin(angle));
@@ -139,7 +140,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         rgb = lerp(color_b, color_a, saturate(v));
     }
-    else if (kind == 7)
+    else if (kind == 6)
     {
         // Centered SDF matte drawn color_a on color_b. angle carries the
         // feather width here, not an orientation; position and rotation
@@ -156,11 +157,15 @@ void main(uint3 tid : SV_DispatchThreadID)
             d = length(p) - r;                        // circle
         const float feather = max(abs(angle) * 0.25, 0.002);
         const float v = saturate(0.5 - d / feather);
-        rgb = lerp(color_b, color_a, v * v * (3.0 - 2.0 * v));
+        // Premultiplied: the SDF coverage IS the alpha. color_b is dead
+        // for shapes - transparency replaced "draw on a background".
+        const float sv = v * v * (3.0 - 2.0 * v);
+        rgb = color_a * sv;
+        alpha = sv;
     }
     else
     {
         rgb = color_a;
     }
-    output[tid.xy] = float4(rgb, 1.0);
+    output[tid.xy] = float4(rgb, alpha);
 }

@@ -24,5 +24,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 a = dry.SampleLevel(uv, 0);
     const float4 b = fx.SampleLevel(uv, 0);
     const float4 wetted = lerp(a, b, saturate(wet));
-    output[tid.xy] = lerp(a, wetted, saturate(opacity));
+    const float4 mixed = lerp(a, wetted, saturate(opacity));
+    // Dry alpha survives: the codec/ED roundtrips travel through NV12,
+    // which has no alpha to bring back.
+    output[tid.xy] = float4(mixed.rgb, a.a);
 }

@@ -12,8 +12,9 @@ namespace looks::gfx {
 namespace {
 
 struct ViewportPush {
-    float scale[2];    // fitted quad size in NDC
-    float offset[2];   // fitted quad center in NDC
+    float scale[2];       // fitted quad size in NDC
+    float offset[2];      // fitted quad center in NDC
+    uint32_t alpha_mode;  // 0 flatten over black, 1 checkerboard
 };
 
 VkShaderModule load_shader(Device& device, const std::filesystem::path& path) {
@@ -66,7 +67,12 @@ bool ViewportPass::init(VkFormat color_format,
     vk_check(vkCreateDescriptorSetLayout(dev, &set_info, nullptr, &set_layout_),
              "vkCreateDescriptorSetLayout(viewport)");
 
-    VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ViewportPush)};
+    // One shared block: both stages' declared push blocks must sit
+    // inside their stage's range, so the range covers the whole struct
+    // for both.
+    VkPushConstantRange push{
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        sizeof(ViewportPush)};
     VkPipelineLayoutCreateInfo layout_info{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout_info.setLayoutCount = 1;
@@ -165,7 +171,7 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
                         uint32_t frame_index, GpuImage& image,
                         VkSampler sampler, VkExtent2D extent, float dst_x,
                         float dst_y, float dst_w, float dst_h, float clip_x0,
-                        float clip_x1) {
+                        float clip_x1, uint32_t alpha_mode) {
     if (dst_w < 1.0f || dst_h < 1.0f || extent.width == 0 ||
         extent.height == 0 || clip_x1 <= clip_x0)
         return;
@@ -189,6 +195,7 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
     push.scale[1] = fit_h / eh;
     push.offset[0] = cx * 2.0f / ew - 1.0f;
     push.offset[1] = cy * 2.0f / eh - 1.0f;
+    push.alpha_mode = alpha_mode;
 
     VkDescriptorSet set = arena.allocate(frame_index, set_layout_);
     VkDescriptorImageInfo image_info{sampler, image.view(),
@@ -221,8 +228,10 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1,
                             &set, 0, nullptr);
-    vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                       sizeof(push), &push);
+    vkCmdPushConstants(cmd, layout_,
+                       VK_SHADER_STAGE_VERTEX_BIT |
+                           VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(push), &push);
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
     VkRect2D full{{0, 0}, extent};

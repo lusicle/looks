@@ -91,15 +91,15 @@ TEST(cache_replace_same_frame_updates_bytes) {
 TEST(history_scan_gates_cache) {
     doc::Document doc;
     CHECK(!doc::document_uses_history(doc));
-    doc.layers[0].stack.push_back(
+    doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Vignette));
-    doc.layers[0].stack.push_back(
+    doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Quantize));
     CHECK(!doc::document_uses_history(doc));
-    doc.layers[0].stack.push_back(
+    doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Feedback));
     CHECK(doc::document_uses_history(doc));
-    doc.layers[0].stack.back().bypass = true;   // bypassed never dispatches
+    doc.looks[0].layers[0].stack.back().bypass = true;   // bypassed never dispatches
     CHECK(!doc::document_uses_history(doc));
 }
 
@@ -107,13 +107,13 @@ TEST(history_scan_quantize_rd_stipple) {
     // The quantizer is pure except in RD-stipple mode (dither 9), whose
     // Gray-Scott state accumulates across frames.
     doc::Document doc;
-    doc.layers[0].stack.push_back(
+    doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Quantize));
     CHECK(!doc::document_uses_history(doc));
-    doc.layers[0].stack[0].params[2] = 8.0f;   // level cycle: still pure
+    doc.looks[0].layers[0].stack[0].params[2] = 8.0f;   // level cycle: still pure
     CHECK(!doc::document_uses_history(doc));
-    doc.layers[0].stack[0].params[2] = 9.0f;   // RD stipple: stateful
+    doc.looks[0].layers[0].stack[0].params[2] = 9.0f;   // RD stipple: stateful
     CHECK(doc::document_uses_history(doc));
-    doc.layers[0].stack[0].params[2] = 13.0f;  // ordered patterns: pure
+    doc.looks[0].layers[0].stack[0].params[2] = 13.0f;  // ordered patterns: pure
     CHECK(!doc::document_uses_history(doc));
 }

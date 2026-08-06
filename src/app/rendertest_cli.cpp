@@ -23,9 +23,11 @@
 #include "gfx/engine.h"
 #include "gfx/readback.h"
 #include "gfx/vk_device.h"
+#include "media/audio_mix.h"
 #include "media/bmff.h"
 #include "media/export.h"
 #include "util/file.h"
+#include "util/hash.h"
 
 namespace {
 
@@ -33,6 +35,20 @@ using namespace looks;
 
 constexpr uint32_t kWidth = 320;
 constexpr uint32_t kHeight = 240;
+
+// The harness stands in for the decode pool: one clip source, fed under
+// the instance key compile_graph stamps on its Source node (docs/look.md).
+gfx::Engine::LayerSourceFrame clip_frame(const doc::Document& doc,
+                                         const gfx::SourcePlanes& planes) {
+    gfx::Engine::LayerSourceFrame lf;
+    // Rendering the look directly: path = look id, and the clip node's
+    // asset folds into the Source key.
+    lf.key = hash_combine(
+        hash_combine(doc.looks[0].id, doc.looks[0].layers[0].id),
+        doc.looks[0].layers[0].asset);
+    lf.planes = planes;
+    return lf;
+}
 
 // Deterministic animated I420 source (gradient + moving bar + chroma sweep).
 struct SyntheticSource {
@@ -89,67 +105,70 @@ uint64_t fnv1a(const uint8_t* data, size_t size) {
 doc::Document make_document() {
     doc::Document doc;
     doc.master_seed = 1234;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.layers[0].stack[1].params[0] = 9.0f;      // block size
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Jitter));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
-    doc.layers[0].stack[6].params[0] = 4.5f;      // shift x
-    doc.layers[0].stack[6].params[1] = 1.5f;      // shift y
-    doc.layers[0].stack[6].wet = 0.8f;
-    doc.layers[0].stack[6].opacity = 0.9f;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
+    // The clip node binds a synthetic asset id (no Asset entry: unknown
+    // length = always on); the harness feeds its planes under the key.
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
+    doc.looks[0].layers[0].stack[1].params[0] = 9.0f;      // block size
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Jitter));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
+    doc.looks[0].layers[0].stack[6].params[0] = 4.5f;      // shift x
+    doc.looks[0].layers[0].stack[6].params[1] = 1.5f;      // shift y
+    doc.looks[0].layers[0].stack[6].wet = 0.8f;
+    doc.looks[0].layers[0].stack[6].opacity = 0.9f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
     // Codec-Box: exercises the segmented GPU->CPU->GPU roundtrip with
     // persistent decoder state, flow-fed MVs, and seeded corruption.
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Datamosh));
-    doc.layers[0].stack[8].params[1] = 8.0f;      // gop 8
-    doc.layers[0].stack[8].params[3] = 4.0f;      // mv random
-    doc.layers[0].stack[8].params[4] = 0.15f;     // corrupt
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Datamosh));
+    doc.looks[0].layers[0].stack[8].params[1] = 8.0f;      // gop 8
+    doc.looks[0].layers[0].stack[8].params[3] = 4.0f;      // mv random
+    doc.looks[0].layers[0].stack[8].params[4] = 0.15f;     // corrupt
     // Stateful one-frame-delay effects (persistent GPU targets).
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Echo));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Feedback));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FilmStock));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Echo));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Feedback));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FilmStock));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
     // Wave 2: seeded slice shuffle, time-quantized curl-noise warp, and a
     // pure-geometry fold.
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SliceShuffle));
-    doc.layers[0].stack.back().params[3] = 0.7f;   // probability
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Turbulence));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
-    doc.layers[0].stack.back().wet = 0.6f;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Snow));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Composite));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Timestamp));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SliceShuffle));
+    doc.looks[0].layers[0].stack.back().params[3] = 0.7f;   // probability
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Turbulence));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
+    doc.looks[0].layers[0].stack.back().wet = 0.6f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Snow));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Composite));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Timestamp));
     // Dither-engine wave: STBN mode reads the build-time LUT; slit-scan
     // exercises the past-frames ring across sequential evaluation.
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.layers[0].stack.back().params[0] = 5.0f;   // levels
-    doc.layers[0].stack.back().params[2] = 6.0f;   // STBN
-    doc.layers[0].stack.back().wet = 0.5f;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SlitScan));
-    doc.layers[0].stack.back().params[1] = 8.0f;   // depth
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].layers[0].stack.back().params[0] = 5.0f;   // levels
+    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;   // STBN
+    doc.looks[0].layers[0].stack.back().wet = 0.5f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SlitScan));
+    doc.looks[0].layers[0].stack.back().params[1] = 8.0f;   // depth
     // RD-stipple dither (mode 9): the quantizer's own Gray-Scott
     // state must evolve bit-exact across evaluations.
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.layers[0].stack.back().params[2] = 9.0f;
-    doc.layers[0].stack.back().params[3] = 0.8f;
-    doc.layers[0].stack.back().wet = 0.5f;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Voronoi));
-    doc.layers[0].stack.back().wet = 0.6f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].layers[0].stack.back().params[2] = 9.0f;
+    doc.looks[0].layers[0].stack.back().params[3] = 0.8f;
+    doc.looks[0].layers[0].stack.back().wet = 0.5f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Voronoi));
+    doc.looks[0].layers[0].stack.back().wet = 0.6f;
     // Stateful sim: N Gray-Scott steps per frame, seeded by the picture.
-    doc.layers[0].stack.push_back(
+    doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::ReactionDiffusion));
-    doc.layers[0].stack.back().params[2] = 6.0f;   // steps
-    doc.layers[0].stack.back().wet = 0.7f;
+    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;   // steps
+    doc.looks[0].layers[0].stack.back().wet = 0.7f;
     // CPU serpentine dither with temporal carry (second CPU roundtrip).
-    doc.layers[0].stack.push_back(
+    doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::ErrorDiffusion));
-    doc.layers[0].stack.back().params[0] = 3.0f;   // levels
-    doc.layers[0].stack.back().params[3] = 0.4f;   // carry
-    doc.layers[0].stack.back().wet = 0.6f;
+    doc.looks[0].layers[0].stack.back().params[0] = 3.0f;   // levels
+    doc.looks[0].layers[0].stack.back().params[3] = 0.4f;   // carry
+    doc.looks[0].layers[0].stack.back().wet = 0.6f;
     // Compositing: a noise generator layer multiplied over the base, with
     // its own mini stack.
     doc::Layer overlay;
@@ -160,7 +179,7 @@ doc::Document make_document() {
     overlay.opacity = 0.6f;
     overlay.gen_scale = 24.0f;
     overlay.stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.layers.push_back(std::move(overlay));
+    doc.looks[0].layers.push_back(std::move(overlay));
     // Port-1 matte on the pixelate (masks ARE images): a Shape layer wired
     // into the matte port gates the effect through extract + apply. The
     // layer feeds ONLY the gate — no link to the composite.
@@ -170,18 +189,18 @@ doc::Document make_document() {
     matte.source = doc::LayerSourceKind::Shape;
     matte.gen_scale = 8.0f;
     matte.gen_angle = 0.35f;
-    doc.layers.push_back(std::move(matte));
-    for (const doc::Layer& l : doc.layers) {
+    doc.looks[0].layers.push_back(std::move(matte));
+    for (const doc::Layer& l : doc.looks[0].layers) {
         if (l.source == doc::LayerSourceKind::Shape) continue;
         uint64_t prev = l.id;
         for (const doc::EffectInstance& fx : l.stack) {
-            doc.links.push_back({prev, fx.id, 0});
+            doc.looks[0].links.push_back({prev, fx.id, 0});
             prev = fx.id;
         }
-        doc.links.push_back({prev, 0, 0});
+        doc.looks[0].links.push_back({prev, 0, 0});
     }
-    doc.links.push_back(
-        {doc.layers.back().id, doc.layers[0].stack[1].id, 1});
+    doc.looks[0].links.push_back(
+        {doc.looks[0].layers.back().id, doc.looks[0].layers[0].stack[1].id, 1});
     return doc;
 }
 
@@ -190,16 +209,16 @@ doc::Document make_document() {
 doc::Document make_cacheable_document() {
     doc::Document doc;
     doc.master_seed = 555;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
     // Level cycling (mode 8) is time-based but pure — must stay cacheable.
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.layers[0].stack.back().params[2] = 8.0f;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
-    doc.layers[0].stack.back().wet = 0.5f;
-    doc.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].layers[0].stack.back().params[2] = 8.0f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
+    doc.looks[0].layers[0].stack.back().wet = 0.5f;
+    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
     // Port-1 matte on the pixelate — the wire path must stay cacheable.
     doc::Layer matte;
     matte.id = doc.next_effect_id++;
@@ -207,15 +226,15 @@ doc::Document make_cacheable_document() {
     matte.source = doc::LayerSourceKind::Shape;
     matte.gen_scale = 8.0f;
     matte.gen_angle = 0.35f;
-    doc.layers.push_back(std::move(matte));
-    uint64_t prev = doc.layers[0].id;
-    for (const doc::EffectInstance& fx : doc.layers[0].stack) {
-        doc.links.push_back({prev, fx.id, 0});
+    doc.looks[0].layers.push_back(std::move(matte));
+    uint64_t prev = doc.looks[0].layers[0].id;
+    for (const doc::EffectInstance& fx : doc.looks[0].layers[0].stack) {
+        doc.looks[0].links.push_back({prev, fx.id, 0});
         prev = fx.id;
     }
-    doc.links.push_back({prev, 0, 0});
-    doc.links.push_back(
-        {doc.layers.back().id, doc.layers[0].stack[1].id, 1});
+    doc.looks[0].links.push_back({prev, 0, 0});
+    doc.looks[0].links.push_back(
+        {doc.looks[0].layers.back().id, doc.looks[0].layers[0].stack[1].id, 1});
     return doc;
 }
 
@@ -240,14 +259,16 @@ bool cache_coherence_check(gfx::Device& device,
     std::vector<uint8_t> nv12;
     std::vector<uint64_t> miss_hashes, hit_hashes;
     for (uint32_t f = 0; f < frames; ++f) {
-        if (!readback->render(*engine, source.planes(f), doc, f, 30.0, nv12,
-                              ctx))
+        const auto lf = clip_frame(doc, source.planes(f));
+        if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0, kWidth,
+                              kHeight, nv12, ctx, f, &lf, 1))
             return false;
         miss_hashes.push_back(fnv1a(nv12.data(), nv12.size()));
     }
     for (uint32_t f = 0; f < frames; ++f) {
-        if (!readback->render(*engine, source.planes(f), doc, f, 30.0, nv12,
-                              ctx))
+        const auto lf = clip_frame(doc, source.planes(f));
+        if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0, kWidth,
+                              kHeight, nv12, ctx, f, &lf, 1))
             return false;
         hit_hashes.push_back(fnv1a(nv12.data(), nv12.size()));
     }
@@ -291,7 +312,9 @@ bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
     std::vector<uint8_t> nv12;
     hashes.clear();
     for (uint32_t f = 0; f < frames; ++f) {
-        if (!readback->render(*engine, source.planes(f), doc, f, 30.0, nv12)) {
+        const auto lf = clip_frame(doc, source.planes(f));
+        if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0, kWidth,
+                              kHeight, nv12, 0, f, &lf, 1)) {
             std::fprintf(stderr, "render failed at frame %u\n", f);
             return false;
         }
@@ -373,10 +396,13 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
         }
         doc::Document doc;
         doc.master_seed = 77;
+        doc.canvas_w = source.w;
+        doc.canvas_h = source.h;
         std::vector<uint8_t> nv12;
         for (uint32_t f = 0; f < 60; ++f) {
-            const gfx::SourcePlanes planes = source.planes(f);
-            if (!readback->render(*engine, planes, doc, f, 30.0, nv12)) {
+            const auto lf = clip_frame(doc, source.planes(f));
+            if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
+                                  source.w, source.h, nv12, 0, f, &lf, 1)) {
                 std::fprintf(stderr, "bench: warmup render failed\n");
                 return 1;
             }
@@ -390,16 +416,18 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
     for (int t = -1; t <= kTypes; ++t) {
         doc::Document doc;
         doc.master_seed = 77;
+        doc.canvas_w = source.w;
+        doc.canvas_h = source.h;
         const char* name = "(baseline: no effects)";
         if (t >= 0) {
             const auto type = static_cast<doc::EffectType>(
                 t == kTypes ? static_cast<int>(doc::EffectType::ErrorDiffusion)
                             : t);
-            doc.layers[0].stack.push_back(doc::make_effect(doc, type));
+            doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, type));
             name = t == kTypes ? "Error Diffusion (exact)"
                                : doc::effect_info(type).label;
             if (t == kTypes)
-                doc.layers[0].stack[0].params[4] = 0.0f;   // speed = exact
+                doc.looks[0].layers[0].stack[0].params[4] = 0.0f;   // speed = exact
         }
         auto engine = gfx::Engine::create(device, shader_dir);
         auto readback = gfx::Nv12Readback::create(device, shader_dir);
@@ -415,10 +443,10 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
             // Pattern generation stays OUTSIDE the timed window: it is
             // several ms of single-threaded CPU work that would otherwise
             // flatten every GPU effect onto one harness floor.
-            const gfx::SourcePlanes planes = source.planes(f);
+            const auto lf = clip_frame(doc, source.planes(f));
             const auto t0 = std::chrono::steady_clock::now();
-            if (!readback->render(*engine, planes, doc, f, 30.0,
-                                  nv12)) {
+            if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
+                                  source.w, source.h, nv12, 0, f, &lf, 1)) {
                 std::fprintf(stderr, "bench: render failed (%s)\n", name);
                 return 1;
             }
@@ -512,11 +540,33 @@ int wmain(int argc, wchar_t** argv) {
         if (!engine || !readback) return 1;
         SyntheticSource source;
         auto producer = [&](uint32_t f, std::vector<uint8_t>& nv12) {
-            return readback->render(*engine, source.planes(f), doc, f, 30.0,
-                                    nv12);
+            const auto lf = clip_frame(doc, source.planes(f));
+            return readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
+                                    kWidth, kHeight, nv12, 0, f, &lf, 1);
         };
+        // The soundtrack goes through the same tree mix the app uses: one
+        // source, full span, unity gain.
+        media::MixState mix;
+        std::vector<float> scratch;
+        media::ExportAudio audio;
+        if (!pcm_path.empty()) {
+            if (auto pcm = media::load_pcm(pcm_path)) {
+                mix.fps = 30.0;
+                mix.rate = pcm->rate;
+                mix.channels = pcm->channels;
+                media::MixSource src;
+                src.pcm = pcm;
+                src.t_out = frames;
+                mix.sources.push_back(std::move(src));
+                audio.channels = mix.channels;
+                audio.rate = mix.rate;
+                audio.fill = [&](int64_t first, int16_t* out, uint32_t n) {
+                    media::render_mix(mix, first, out, n, scratch);
+                };
+            }
+        }
         media::ExportResult result = media::export_movie(
-            kWidth, kHeight, 30, 1, frames, producer, pcm_path, export_path);
+            kWidth, kHeight, 30, 1, frames, producer, audio, export_path);
         if (!result.ok) {
             std::fprintf(stderr, "export failed: %s\n", result.error.c_str());
             return 1;

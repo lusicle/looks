@@ -16,7 +16,8 @@ bool param_randomizable(const ParamDesc& desc) {
     // discrete identity knobs on the newer effects.
     static const char* const kFrozenExact[] = {
         "op",     "channels", "counter", "pattern", "flip",
-        "r_from", "g_from",   "b_from",  "font",    "drop_i"};
+        "r_from", "g_from",   "b_from",  "font",    "drop_i",
+        "output"};
     for (const char* f : kFrozenExact)
         if (std::strcmp(desc.id, f) == 0) return false;
     return true;
@@ -24,9 +25,11 @@ bool param_randomizable(const ParamDesc& desc) {
 
 namespace {
 
-void randomize_one(Document& doc, UndoStack& undo, size_t layer_index,
-                   size_t effect_index, float intensity, uint64_t rng_seed) {
-    const EffectInstance& fx = doc.layers[layer_index].stack[effect_index];
+void randomize_one(Document& doc, UndoStack& undo, uint64_t look,
+                   size_t layer_index, size_t effect_index, float intensity,
+                   uint64_t rng_seed) {
+    const EffectInstance& fx =
+        doc.look(look).layers[layer_index].stack[effect_index];
     const EffectInfo& info = effect_info(fx.type);
     for (uint32_t p = 0; p < info.param_count; ++p) {
         const ParamDesc& desc = info.params[p];
@@ -37,27 +40,28 @@ void randomize_one(Document& doc, UndoStack& undo, size_t layer_index,
         const float cur = fx.params[p];
         const float next = cur + (target - cur) * intensity;
         if (next == cur) continue;
-        undo.execute(doc, set_param_command(layer_index, effect_index,
+        undo.execute(doc, set_param_command(look, layer_index, effect_index,
                                             static_cast<int>(p), next));
     }
 }
 
 }  // namespace
 
-void randomize_effect(Document& doc, UndoStack& undo, size_t layer_index,
-                      size_t effect_index, float intensity,
-                      uint64_t rng_seed) {
+void randomize_effect(Document& doc, UndoStack& undo, uint64_t look,
+                      size_t layer_index, size_t effect_index,
+                      float intensity, uint64_t rng_seed) {
     undo.begin_group("Randomize Effect");
-    randomize_one(doc, undo, layer_index, effect_index, intensity, rng_seed);
+    randomize_one(doc, undo, look, layer_index, effect_index, intensity,
+                  rng_seed);
     undo.end_group();
 }
 
-void randomize_stack(Document& doc, UndoStack& undo, size_t layer_index,
-                     float intensity, uint64_t rng_seed) {
+void randomize_stack(Document& doc, UndoStack& undo, uint64_t look,
+                     size_t layer_index, float intensity, uint64_t rng_seed) {
     undo.begin_group("Randomize Stack");
-    const size_t n = doc.layers[layer_index].stack.size();
+    const size_t n = doc.look(look).layers[layer_index].stack.size();
     for (size_t i = 0; i < n; ++i)
-        randomize_one(doc, undo, layer_index, i, intensity, rng_seed);
+        randomize_one(doc, undo, look, layer_index, i, intensity, rng_seed);
     undo.end_group();
 }
 

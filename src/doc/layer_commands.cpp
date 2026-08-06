@@ -7,25 +7,28 @@ namespace looks::doc {
 
 namespace {
 
-Layer* find_layer(Document& doc, uint64_t layer_id) {
-    for (Layer& l : doc.layers)
+Layer* find_layer(Look& look, uint64_t layer_id) {
+    for (Layer& l : look.layers)
         if (l.id == layer_id) return &l;
     return nullptr;
 }
 
-class AddLayerCommand final : public Command {
+class AddLayerCommand final : public LookCommand {
 public:
-    AddLayerCommand(Layer layer, size_t insert_index)
-        : layer_(std::move(layer)), insert_index_(insert_index) {}
+    AddLayerCommand(uint64_t look, Layer layer, size_t insert_index)
+        : LookCommand(look), layer_(std::move(layer)),
+          insert_index_(insert_index) {}
     std::string name() const override { return "Add Layer"; }
 
     void apply(Document& doc) override {
-        assert(insert_index_ <= doc.layers.size());
-        doc.layers.insert(doc.layers.begin() + insert_index_, layer_);
+        Look& look = look_of(doc);
+        assert(insert_index_ <= look.layers.size());
+        look.layers.insert(look.layers.begin() + insert_index_, layer_);
     }
 
     void revert(Document& doc) override {
-        doc.layers.erase(doc.layers.begin() + insert_index_);
+        Look& look = look_of(doc);
+        look.layers.erase(look.layers.begin() + insert_index_);
     }
 
 private:
@@ -33,20 +36,22 @@ private:
     size_t insert_index_;
 };
 
-class RemoveLayerCommand final : public Command {
+class RemoveLayerCommand final : public LookCommand {
 public:
-    explicit RemoveLayerCommand(size_t layer_index)
-        : layer_index_(layer_index) {}
+    RemoveLayerCommand(uint64_t look, size_t layer_index)
+        : LookCommand(look), layer_index_(layer_index) {}
     std::string name() const override { return "Remove Layer"; }
 
     void apply(Document& doc) override {
-        assert(layer_index_ < doc.layers.size());
-        removed_ = doc.layers[layer_index_];
-        doc.layers.erase(doc.layers.begin() + layer_index_);
+        Look& look = look_of(doc);
+        assert(layer_index_ < look.layers.size());
+        removed_ = look.layers[layer_index_];
+        look.layers.erase(look.layers.begin() + layer_index_);
     }
 
     void revert(Document& doc) override {
-        doc.layers.insert(doc.layers.begin() + layer_index_, removed_);
+        Look& look = look_of(doc);
+        look.layers.insert(look.layers.begin() + layer_index_, removed_);
     }
 
 private:
@@ -54,26 +59,27 @@ private:
     Layer removed_;
 };
 
-class SetLayerPropsCommand final : public Command {
+class SetLayerPropsCommand final : public LookCommand {
 public:
-    explicit SetLayerPropsCommand(Layer updated)
-        : updated_(std::move(updated)) {}
+    SetLayerPropsCommand(uint64_t look, Layer updated)
+        : LookCommand(look), updated_(std::move(updated)) {}
     std::string name() const override { return "Edit Layer"; }
 
     void apply(Document& doc) override {
-        Layer* l = find_layer(doc, updated_.id);
+        Layer* l = find_layer(look_of(doc), updated_.id);
         assert(l);
         old_ = *l;
         assign(*l, updated_);
     }
 
     void revert(Document& doc) override {
-        if (Layer* l = find_layer(doc, updated_.id)) assign(*l, old_);
+        if (Layer* l = find_layer(look_of(doc), updated_.id)) assign(*l, old_);
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetLayerPropsCommand*>(&next);
-        if (!other || other->updated_.id != updated_.id) return false;
+        if (!other || !same_look(*other) || other->updated_.id != updated_.id)
+            return false;
         updated_ = other->updated_;
         return true;
     }
@@ -89,10 +95,10 @@ private:
     Layer old_;
 };
 
-class MoveLayerCommand final : public Command {
+class MoveLayerCommand final : public LookCommand {
 public:
-    MoveLayerCommand(size_t index, int direction)
-        : index_(index), direction_(direction) {}
+    MoveLayerCommand(uint64_t look, size_t index, int direction)
+        : LookCommand(look), index_(index), direction_(direction) {}
     std::string name() const override { return "Move Layer"; }
 
     void apply(Document& doc) override { swap(doc); }
@@ -100,28 +106,32 @@ public:
 
 private:
     void swap(Document& doc) {
+        Look& look = look_of(doc);
         const size_t other = index_ + static_cast<size_t>(direction_);
-        assert(index_ < doc.layers.size() && other < doc.layers.size());
-        std::swap(doc.layers[index_], doc.layers[other]);
+        assert(index_ < look.layers.size() && other < look.layers.size());
+        std::swap(look.layers[index_], look.layers[other]);
     }
 
     size_t index_;
     int direction_;
 };
 
-class ReplaceLayerCommand final : public Command {
+class ReplaceLayerCommand final : public LookCommand {
 public:
-    ReplaceLayerCommand(size_t index, Layer fresh)
-        : index_(index), fresh_(std::move(fresh)) {}
+    ReplaceLayerCommand(uint64_t look, size_t index, Layer fresh)
+        : LookCommand(look), index_(index), fresh_(std::move(fresh)) {}
     std::string name() const override { return "Reset Layer"; }
 
     void apply(Document& doc) override {
-        assert(index_ < doc.layers.size());
-        old_ = doc.layers[index_];
-        doc.layers[index_] = fresh_;
+        Look& look = look_of(doc);
+        assert(index_ < look.layers.size());
+        old_ = look.layers[index_];
+        look.layers[index_] = fresh_;
     }
 
-    void revert(Document& doc) override { doc.layers[index_] = old_; }
+    void revert(Document& doc) override {
+        look_of(doc).layers[index_] = old_;
+    }
 
 private:
     size_t index_;
@@ -129,19 +139,188 @@ private:
     Layer old_;
 };
 
+// The placement list holding an id, wherever it lives - a video lane or
+// an audio track - plus the index inside it.
+std::vector<Placement>* placement_container(Sequence& seq,
+                                            uint64_t placement_id,
+                                            size_t* index) {
+    for (SeqTrack& t : seq.tracks)
+        for (size_t i = 0; i < t.placements.size(); ++i)
+            if (t.placements[i].id == placement_id) {
+                *index = i;
+                return &t.placements;
+            }
+    for (AudioTrack& t : seq.audio)
+        for (size_t i = 0; i < t.placements.size(); ++i)
+            if (t.placements[i].id == placement_id) {
+                *index = i;
+                return &t.placements;
+            }
+    return nullptr;
+}
+
+// One half of a razor: the placement being shortened and the fresh right
+// half that resumes at the cut's source frame.
+struct PlacementSplit {
+    uint64_t left_id = 0;
+    Placement right;
+};
+
+// RAZOR: a cut is two abutting placements on ONE lane. Nothing is
+// cloned and no wiring moves - sequences own no effects, so the cut
+// cannot touch state anywhere and razor identity is structural. The
+// cut applies to the WHOLE LINK GROUP: a linked audio partner splits at
+// the same frame and the right halves link to each other, so picture
+// and sound stay lockstep through the edit.
+class RazorPlacementCommand final : public SequenceCommand {
+public:
+    RazorPlacementCommand(uint64_t sequence, uint32_t at,
+                          std::vector<PlacementSplit> splits)
+        : SequenceCommand(sequence), at_(at), splits_(std::move(splits)) {}
+    std::string name() const override { return "Razor"; }
+
+    void apply(Document& doc) override {
+        Sequence& seq = sequence_of(doc);
+        old_outs_.clear();
+        for (const PlacementSplit& s : splits_) {
+            size_t i = 0;
+            std::vector<Placement>* c =
+                placement_container(seq, s.left_id, &i);
+            if (!c) continue;
+            old_outs_.emplace_back(s.left_id, (*c)[i].t_out);
+            (*c)[i].t_out = at_;
+            c->insert(c->begin() + static_cast<ptrdiff_t>(i + 1), s.right);
+        }
+    }
+
+    void revert(Document& doc) override {
+        Sequence& seq = sequence_of(doc);
+        for (const PlacementSplit& s : splits_) {
+            size_t i = 0;
+            if (std::vector<Placement>* c =
+                    placement_container(seq, s.right.id, &i))
+                c->erase(c->begin() + static_cast<ptrdiff_t>(i));
+        }
+        for (const auto& [id, out] : old_outs_)
+            if (Placement* p = find_placement(seq, id)) p->t_out = out;
+    }
+
+private:
+    uint32_t at_;
+    std::vector<PlacementSplit> splits_;
+    std::vector<std::pair<uint64_t, uint32_t>> old_outs_;
+};
+
 }  // namespace
+
+namespace {
+
+// The latest-starting placement strictly containing `at` - the one the
+// track shows there.
+const Placement* placement_under(const Document& doc,
+                                 const std::vector<Placement>& placements,
+                                 uint32_t at) {
+    const Placement* place = nullptr;
+    for (const Placement& p : placements) {
+        const uint32_t len = source_length(doc, p);
+        const uint32_t end = placement_end(p, len);
+        if (at <= p.t_in || (end && at >= end)) continue;
+        if (!place || p.t_in >= place->t_in) place = &p;
+    }
+    return place;
+}
+
+// The split for one placement: same target, fresh id, resuming at the
+// cut's source frame so the halves are continuous.
+PlacementSplit split_of(Document& doc, const Placement& place, uint32_t at) {
+    PlacementSplit s;
+    s.left_id = place.id;
+    s.right = place;
+    s.right.id = doc.next_effect_id++;
+    s.right.t_in = at;
+    s.right.t_out = place.t_out;   // 0 stays "to the source end"
+    const double cut_src =
+        placement_source_frame(place, static_cast<double>(at));
+    s.right.source_in =
+        cut_src <= 0.0 ? 0u : static_cast<uint32_t>(cut_src);
+    return s;
+}
+
+// The whole group's splits: the named placement plus every link partner
+// the cut lands strictly inside. Right halves link to each other.
+std::unique_ptr<Command> razor_group(Document& doc, uint64_t seq_id,
+                                     const Placement& primary, uint32_t at) {
+    std::vector<PlacementSplit> splits;
+    splits.push_back(split_of(doc, primary, at));
+    if (primary.link) {
+        const Sequence& seq = doc.sequence(seq_id);
+        auto try_partner = [&](const Placement& p) {
+            if (p.link != primary.link || p.id == primary.id) return;
+            const uint32_t len = source_length(doc, p);
+            const uint32_t end = placement_end(p, len);
+            if (at <= p.t_in || (end && at >= end)) return;
+            splits.push_back(split_of(doc, p, at));
+        };
+        for (const SeqTrack& t : seq.tracks)
+            for (const Placement& p : t.placements) try_partner(p);
+        for (const AudioTrack& t : seq.audio)
+            for (const Placement& p : t.placements) try_partner(p);
+    }
+    if (splits.size() >= 2) {
+        const uint64_t fresh_link = doc.next_effect_id++;
+        for (PlacementSplit& s : splits) s.right.link = fresh_link;
+    } else {
+        splits[0].right.link = 0;
+    }
+    return std::make_unique<RazorPlacementCommand>(seq_id, at,
+                                                   std::move(splits));
+}
+
+}  // namespace
+
+std::unique_ptr<Command> razor_track_command(Document& doc, uint64_t seq_id,
+                                             uint64_t track_id, uint32_t at) {
+    const Sequence& seq = doc.sequence(seq_id);
+    const SeqTrack* src = nullptr;
+    for (const SeqTrack& t : seq.tracks)
+        if (t.id == track_id) src = &t;
+    if (!src) return nullptr;
+    if (src->placements.size() >= kMaxPlacementsPerTrack) return nullptr;
+    const Placement* place = placement_under(doc, src->placements, at);
+    if (!place) return nullptr;
+    return razor_group(doc, seq_id, *place, at);
+}
+
+std::unique_ptr<Command> razor_audio_command(Document& doc, uint64_t seq_id,
+                                             uint64_t track_id, uint32_t at) {
+    const Sequence& seq = doc.sequence(seq_id);
+    const AudioTrack* track = nullptr;
+    for (const AudioTrack& t : seq.audio)
+        if (t.id == track_id) track = &t;
+    if (!track) return nullptr;
+    if (track->placements.size() >= kMaxPlacementsPerTrack) return nullptr;
+    const Placement* place = placement_under(doc, track->placements, at);
+    if (!place) return nullptr;
+    return razor_group(doc, seq_id, *place, at);
+}
 
 Layer make_layer(Document& doc, LayerSourceKind kind) {
     Layer layer;
     layer.id = doc.next_effect_id++;
     layer.source = kind;
-    static const char* kNames[] = {"clip",    "solid", "gradient", "noise",
-                                   "pattern", "osc",   "adjust",   "shape"};
+    static const char* kNames[] = {"clip",  "solid", "gradient",
+                                   "noise", "pattern", "osc",
+                                   "shape", "look",  "sequence"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                       static_cast<size_t>(LayerSourceKind::Count),
                   "layer names track the enum");
     layer.name = std::string(kNames[static_cast<size_t>(kind)]) + " " +
                  std::to_string(layer.id);
+    // A clip node binds to the project's first asset by default; the
+    // browser retargets it. Nested refs bind when the caller names the
+    // entity (and checks nest_reaches first).
+    if (kind == LayerSourceKind::Clip && !doc.assets.empty())
+        layer.asset = doc.assets.front().id;
     // Generators default to half opacity so adding one doesn't blank the
     // composite.
     if (kind == LayerSourceKind::Solid || kind == LayerSourceKind::Gradient ||
@@ -156,8 +335,9 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
     }
     if (kind == LayerSourceKind::Shape) {
-        // A matte maker: white on black, a visible size, a soft edge
-        // (gen_scale = size, gen_angle = feather — see gen.comp.slang).
+        // A matte maker: opaque coverage on transparent, a visible size,
+        // a soft edge (gen_scale = size, gen_angle = feather — see
+        // gen.comp.slang).
         layer.gen_scale = 6.0f;
         layer.gen_angle = 0.35f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
@@ -166,24 +346,29 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     return layer;
 }
 
-std::unique_ptr<Command> add_layer_command(Layer layer, size_t insert_index) {
-    return std::make_unique<AddLayerCommand>(std::move(layer), insert_index);
+std::unique_ptr<Command> add_layer_command(uint64_t look, Layer layer,
+                                           size_t insert_index) {
+    return std::make_unique<AddLayerCommand>(look, std::move(layer),
+                                             insert_index);
 }
 
-std::unique_ptr<Command> remove_layer_command(size_t layer_index) {
-    return std::make_unique<RemoveLayerCommand>(layer_index);
+std::unique_ptr<Command> remove_layer_command(uint64_t look,
+                                              size_t layer_index) {
+    return std::make_unique<RemoveLayerCommand>(look, layer_index);
 }
 
-std::unique_ptr<Command> set_layer_props_command(Layer updated) {
-    return std::make_unique<SetLayerPropsCommand>(std::move(updated));
+std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated) {
+    return std::make_unique<SetLayerPropsCommand>(look, std::move(updated));
 }
 
-std::unique_ptr<Command> move_layer_command(size_t index, int direction) {
-    return std::make_unique<MoveLayerCommand>(index, direction);
+std::unique_ptr<Command> move_layer_command(uint64_t look, size_t index,
+                                            int direction) {
+    return std::make_unique<MoveLayerCommand>(look, index, direction);
 }
 
-std::unique_ptr<Command> replace_layer_command(size_t index, Layer fresh) {
-    return std::make_unique<ReplaceLayerCommand>(index, std::move(fresh));
+std::unique_ptr<Command> replace_layer_command(uint64_t look, size_t index,
+                                               Layer fresh) {
+    return std::make_unique<ReplaceLayerCommand>(look, index, std::move(fresh));
 }
 
 }  // namespace looks::doc

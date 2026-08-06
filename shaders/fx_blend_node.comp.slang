@@ -28,8 +28,12 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
+    const float4 b4 = input_b.SampleLevel(uv, 0);
     const float3 a = base.rgb;
-    const float3 b = input_b.SampleLevel(uv, 0).rgb;
+    // Blend math runs on unpremultiplied B, applied at B's coverage, so
+    // a transparent B region leaves In untouched instead of stamping
+    // the operator's identity-with-black.
+    const float3 b = b4.rgb / max(b4.a, 1.0e-6);
 
     const int op = int(mode + 0.5);
     float3 fx = b;                                    // normal
@@ -46,6 +50,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         fx = lerp(lo, hi, step(0.5, a));
     }
 
-    const float3 wetted = lerp(a, fx, saturate(wet));
-    output[tid.xy] = float4(lerp(a, wetted, saturate(opacity)), base.a);
+    const float3 gated = lerp(a, fx, b4.a);
+    const float fx_a = base.a + b4.a * (1.0 - base.a);
+    const float3 wetted = lerp(a, gated, saturate(wet));
+    const float wet_a = lerp(base.a, fx_a, saturate(wet));
+    const float op_amt = saturate(opacity);
+    output[tid.xy] = float4(lerp(a, wetted, op_amt),
+                            lerp(base.a, wet_a, op_amt));
 }

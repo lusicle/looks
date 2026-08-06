@@ -1,8 +1,12 @@
 #include "gfx/graph.h"
 
+#include <algorithm>
+
 #include "doc/effects.h"
+#include "doc/layer_commands.h"
 #include "test_framework.h"
 
+using looks::doc::Asset;
 using looks::doc::Document;
 using looks::doc::EffectType;
 using looks::doc::make_effect;
@@ -64,32 +68,46 @@ TEST(graph_topo_detects_cycle) {
 }
 
 TEST(graph_compile_empty_stack) {
+    // A fresh look holds one UNBOUND clip node: dormant, so the
+    // composite is the black display generator - never a fabricated
+    // source. Binding an asset (even one the document does not know:
+    // unknown length = always on) emits the Source head.
     Document doc;
-    RenderGraph graph = compile_graph(doc);
+    RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
     CHECK_EQ(graph.nodes.size(), size_t{1});
-    CHECK_EQ(graph.output, 0);
-    CHECK(graph.nodes[0].kind == GraphNode::Kind::Source);
+    CHECK(graph.nodes[0].kind == GraphNode::Kind::Generator);
+    CHECK_EQ(graph.nodes[0].layer_index, -1);
+
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    RenderGraph bound = compile_graph(doc, doc.looks[0].id, 0);
+    CHECK(bound.valid);
+    CHECK(bound.nodes[static_cast<size_t>(bound.output)].kind ==
+          GraphNode::Kind::Source);
 }
 
 TEST(graph_compile_layers) {
     Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     // A noise generator layer with its own effect, screened over the base.
     looks::doc::Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.source = looks::doc::LayerSourceKind::Noise;
     overlay.blend = looks::doc::BlendMode::Screen;
     overlay.stack.push_back(make_effect(doc, EffectType::Pixelate));
-    doc.layers.push_back(overlay);
-    // An adjustment layer on top applying grain to the composite.
+    doc.looks[0].layers.push_back(overlay);
+    // A second clip tap on top applying grain to the composite (the
+    // adjustment kind died with the flat graph - a clip tap merged back
+    // IS an adjustment).
     looks::doc::Layer adjust;
     adjust.id = doc.next_effect_id++;
-    adjust.source = looks::doc::LayerSourceKind::Adjustment;
+    adjust.source = looks::doc::LayerSourceKind::Clip;
+    adjust.asset = doc.next_effect_id++;
     adjust.stack.push_back(make_effect(doc, EffectType::Grain));
-    doc.layers.push_back(adjust);
+    doc.looks[0].layers.push_back(adjust);
 
-    RenderGraph g = compile_graph(doc);
+    RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g.valid);
     int generators = 0, blends = 0;
     for (const GraphNode& n : g.nodes) {
@@ -102,16 +120,15 @@ TEST(graph_compile_layers) {
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(out.layer_index, 2);
-    // TRUE GRAPH (docs/flow_canvas.md): adjustment layers lost their
-    // composite-tap special case — their effects wire like any node and
-    // head at the shared source when unlinked.
+    // TRUE GRAPH (docs/flow_canvas.md): a clip tap's effects wire like
+    // any node and head at its own source when unlinked.
     for (const GraphNode& n : g.nodes)
         if (n.kind == GraphNode::Kind::Effect && n.layer_index == 2)
             CHECK(g.nodes[static_cast<size_t>(n.inputs[0])].kind ==
                   GraphNode::Kind::Source);
     // Invisible layers compile out entirely.
-    doc.layers[1].visible = false;
-    RenderGraph g2 = compile_graph(doc);
+    doc.looks[0].layers[1].visible = false;
+    RenderGraph g2 = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g2.valid);
     int generators2 = 0;
     for (const GraphNode& n : g2.nodes)
@@ -124,13 +141,14 @@ TEST(graph_compile_dormant_unwired) {
     // fabricated in its place — and an unwired Output composites nothing
     // (black display node, which no effect may consume as input).
     Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    const uint64_t fx_id = doc.layers[0].stack[0].id;
-    const uint64_t layer_id = doc.layers[0].id;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
+    const uint64_t layer_id = doc.looks[0].layers[0].id;
     // Explicit links: source -> output. The effect is NOT wired anywhere.
-    doc.links.push_back({layer_id, 0, 0});
+    doc.looks[0].links.push_back({layer_id, 0, 0});
 
-    RenderGraph g = compile_graph(doc);
+    RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g.valid);
     int effects = 0;
     for (const GraphNode& n : g.nodes)
@@ -141,10 +159,10 @@ TEST(graph_compile_dormant_unwired) {
           GraphNode::Kind::Source);
 
     // Wire the effect in: it emits and carries the composite.
-    doc.links.clear();
-    doc.links.push_back({layer_id, fx_id, 0});
-    doc.links.push_back({fx_id, 0, 0});
-    RenderGraph g2 = compile_graph(doc);
+    doc.looks[0].links.clear();
+    doc.looks[0].links.push_back({layer_id, fx_id, 0});
+    doc.looks[0].links.push_back({fx_id, 0, 0});
+    RenderGraph g2 = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g2.valid);
     int effects2 = 0;
     for (const GraphNode& n : g2.nodes)
@@ -153,23 +171,86 @@ TEST(graph_compile_dormant_unwired) {
 
     // Nothing wired to Output at all: the composite is the empty-display
     // generator — never the raw source.
-    doc.links.clear();
-    doc.links.push_back({layer_id, fx_id, 0});   // effect fed, not shown
-    RenderGraph g3 = compile_graph(doc);
+    doc.looks[0].links.clear();
+    doc.looks[0].links.push_back({layer_id, fx_id, 0});   // effect fed, not shown
+    RenderGraph g3 = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g3.valid);
     CHECK(g3.nodes[static_cast<size_t>(g3.output)].kind ==
           GraphNode::Kind::Generator);
     CHECK_EQ(g3.nodes[static_cast<size_t>(g3.output)].layer_index, -1);
 }
 
+TEST(graph_preview_layer_taps_the_chain_end) {
+    // The LAYER tap publishes a layer's whole contribution - the end of
+    // the chain leaving it, pre-blend - where the NODE tap on the same
+    // layer id stays the bare source head. A node tap outranks it.
+    Document doc;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Grain));
+    const uint64_t base_id = doc.looks[0].layers[0].id;
+    const uint64_t last_fx = doc.looks[0].layers[0].stack[1].id;
+    looks::doc::Layer solid;
+    solid.id = doc.next_effect_id++;
+    solid.source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].layers.push_back(solid);
+    const uint64_t solid_id = solid.id;
+
+    // Synthesized wiring: the base chain ends at its last stack effect.
+    RenderGraph by_node = compile_graph(doc, doc.looks[0].id, 0, last_fx);
+    RenderGraph by_layer = compile_graph(doc, doc.looks[0].id, 0, 0, base_id);
+    CHECK(by_node.valid);
+    CHECK(by_node.preview >= 0);
+    CHECK_EQ(by_layer.preview, by_node.preview);
+    // A bare layer's contribution IS its head: both taps agree there.
+    RenderGraph solid_node = compile_graph(doc, doc.looks[0].id, 0, solid_id);
+    RenderGraph solid_layer =
+        compile_graph(doc, doc.looks[0].id, 0, 0, solid_id);
+    CHECK(solid_node.preview >= 0);
+    CHECK_EQ(solid_layer.preview, solid_node.preview);
+    // The node tap outranks the layer tap when both are set.
+    RenderGraph both =
+        compile_graph(doc, doc.looks[0].id, 0, solid_id, base_id);
+    CHECK_EQ(both.preview, solid_node.preview);
+    // An id naming no layer resolves to nothing: the composite stays.
+    RenderGraph none = compile_graph(doc, doc.looks[0].id, 0, 0, 99999);
+    CHECK_EQ(none.preview, -1);
+}
+
+TEST(graph_preview_layer_resolves_a_mask_only_feed) {
+    // A layer wired only as another chain's matte never feeds the
+    // Output, but it still has an output of its own: the tap resolves
+    // the link leaving the layer, Output or not.
+    Document doc;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t base_id = doc.looks[0].layers[0].id;
+    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
+    looks::doc::Layer solid;
+    solid.id = doc.next_effect_id++;
+    solid.source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].layers.push_back(solid);
+    const uint64_t mask_id = solid.id;
+    doc.looks[0].links.push_back({base_id, fx_id, 0});
+    doc.looks[0].links.push_back({fx_id, 0, 0});
+    doc.looks[0].links.push_back({mask_id, fx_id, 1});   // matte feed only
+
+    RenderGraph by_layer = compile_graph(doc, doc.looks[0].id, 0, 0, mask_id);
+    RenderGraph by_node = compile_graph(doc, doc.looks[0].id, 0, mask_id);
+    CHECK(by_layer.valid);
+    CHECK(by_layer.preview >= 0);
+    CHECK_EQ(by_layer.preview, by_node.preview);
+}
+
 TEST(graph_compile_chain_and_bypass) {
     Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::RgbSplit));
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Pixelate));
-    doc.layers[0].stack[1].bypass = true;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::RgbSplit));
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Pixelate));
+    doc.looks[0].layers[0].stack[1].bypass = true;
 
-    RenderGraph graph = compile_graph(doc);
+    RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
     // Source + 2 live effects; the bypassed vignette is compiled out.
     CHECK_EQ(graph.nodes.size(), size_t{3});
@@ -194,19 +275,20 @@ TEST(graph_layer_matte_gates_composite) {
     // gates its whole contribution: the compile must wrap the overlay's
     // LayerBlend in a MatteApply whose base is the composite below.
     Document doc;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
     Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.source = LayerSourceKind::Noise;
-    doc.layers.push_back(overlay);
+    doc.looks[0].layers.push_back(overlay);
     Layer matte;
     matte.id = doc.next_effect_id++;
     matte.source = LayerSourceKind::Shape;
-    doc.layers.push_back(matte);
-    doc.links.push_back({doc.layers[0].id, 0, 0});
-    doc.links.push_back({overlay.id, 0, 0});
-    doc.links.push_back({matte.id, overlay.id, 1});
+    doc.looks[0].layers.push_back(matte);
+    doc.looks[0].links.push_back({doc.looks[0].layers[0].id, 0, 0});
+    doc.looks[0].links.push_back({overlay.id, 0, 0});
+    doc.looks[0].links.push_back({matte.id, overlay.id, 1});
 
-    RenderGraph graph = compile_graph(doc);
+    RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
     bool saw_matted_blend = false;
     for (const GraphNode& n : graph.nodes) {
@@ -230,17 +312,18 @@ TEST(graph_effect_matte_diamond) {
     // apply joins (dry, fx, matte) and the matte source feeds ONLY the
     // gate — never the composite.
     Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    const uint64_t fx_id = doc.layers[0].stack[0].id;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
     Layer matte;
     matte.id = doc.next_effect_id++;
     matte.source = LayerSourceKind::Shape;
-    doc.layers.push_back(matte);
-    doc.links.push_back({doc.layers[0].id, fx_id, 0});
-    doc.links.push_back({fx_id, 0, 0});
-    doc.links.push_back({matte.id, fx_id, 1});
+    doc.looks[0].layers.push_back(matte);
+    doc.looks[0].links.push_back({doc.looks[0].layers[0].id, fx_id, 0});
+    doc.looks[0].links.push_back({fx_id, 0, 0});
+    doc.looks[0].links.push_back({matte.id, fx_id, 1});
 
-    RenderGraph graph = compile_graph(doc);
+    RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
     bool saw_extract = false, saw_apply = false;
     for (const GraphNode& n : graph.nodes) {
@@ -259,46 +342,253 @@ TEST(graph_effect_matte_diamond) {
           GraphNode::Kind::MatteApply);
 }
 
-TEST(graph_layer_transform_and_trim) {
+TEST(graph_layer_transform_and_source_keys) {
     // Transform: a non-identity crop/flip/scale/rotate inserts a
-    // LayerTransform between the layer source and its stack; trim swaps the
-    // shared playhead source for a private per-layer Source node.
+    // LayerTransform between the layer source and its stack. Every clip
+    // source is private and keyed per instance (docs/look.md phase 4) —
+    // there is no shared playhead source to fall back to.
     Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
 
-    RenderGraph plain = compile_graph(doc);
+    RenderGraph plain = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(plain.valid);
     for (const GraphNode& n : plain.nodes)
         CHECK(n.kind != GraphNode::Kind::LayerTransform);
+    int sources = 0;
+    for (const GraphNode& n : plain.nodes)
+        if (n.kind == GraphNode::Kind::Source) {
+            ++sources;
+            CHECK_EQ(n.layer_index, 0);
+            CHECK(n.key != 0);
+        }
+    CHECK_EQ(sources, 1);
+    CHECK(plain.source >= 0);
+    CHECK(plain.nodes[static_cast<size_t>(plain.source)].kind ==
+          GraphNode::Kind::Source);
 
-    doc.layers[0].xf_rotate = 15.0f;
-    RenderGraph xf = compile_graph(doc);
+    doc.looks[0].layers[0].xf_rotate = 15.0f;
+    RenderGraph xf = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(xf.valid);
     int transforms = 0;
+    int source_node = -1;
+    for (size_t i = 0; i < xf.nodes.size(); ++i)
+        if (xf.nodes[i].kind == GraphNode::Kind::Source)
+            source_node = static_cast<int>(i);
     for (const GraphNode& n : xf.nodes) {
         if (n.kind != GraphNode::Kind::LayerTransform) continue;
         ++transforms;
         CHECK_EQ(n.layer_index, 0);
         CHECK_EQ(n.inputs.size(), size_t{1});
-        CHECK_EQ(n.inputs[0], 0);   // reads the shared source
+        CHECK_EQ(n.inputs[0], source_node);   // reads its own source
     }
     CHECK_EQ(transforms, 1);
-    // The stack effect reads the transformed source, not node 0.
+    // The stack effect reads the transformed source, not the raw one.
     for (const GraphNode& n : xf.nodes)
         if (n.kind == GraphNode::Kind::Effect)
-            CHECK(n.inputs[0] != 0);
+            CHECK(n.inputs[0] != source_node);
+}
 
-    doc.layers[0].xf_rotate = 0.0f;
-    doc.layers[0].trim_in = 12;
-    RenderGraph trimmed = compile_graph(doc);
-    CHECK(trimmed.valid);
-    // Node 0 stays (shared playhead source); the layer gets a private one.
-    int private_sources = 0;
-    for (size_t i = 1; i < trimmed.nodes.size(); ++i)
-        if (trimmed.nodes[i].kind == GraphNode::Kind::Source &&
-            trimmed.nodes[i].layer_index == 0)
-            ++private_sources;
-    CHECK_EQ(private_sources, 1);
+TEST(graph_time_culled_matte_reads_as_closed_gate) {
+    // Masking across time: while the mask's media plays, the masked
+    // layer is gated by it; when it ENDS (an explicit duration on the
+    // nested look), the gate closes (black) instead of the wire reading
+    // as unwired — the masked contribution disappears, it does not pop
+    // to full. A mask IS a nested look, playing lockstep.
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
+
+    Document doc;
+    Asset asset;
+    asset.id = doc.next_effect_id++;
+    asset.frame_count = 100;
+    doc.assets.push_back(asset);
+    doc.looks[0].layers[0].asset = asset.id;
+
+    looks::doc::Look mask_look;
+    mask_look.id = doc.next_effect_id++;
+    mask_look.duration = 10;   // the mask ends at local 10
+    Layer shape;
+    shape.id = doc.next_effect_id++;
+    shape.source = LayerSourceKind::Shape;
+    mask_look.layers.push_back(std::move(shape));
+    const uint64_t mask_look_id = mask_look.id;
+    doc.looks.push_back(std::move(mask_look));
+
+    Layer mask;
+    mask.id = doc.next_effect_id++;
+    mask.source = LayerSourceKind::LookRef;
+    mask.target = mask_look_id;
+    doc.looks[0].layers.push_back(mask);
+    const uint64_t mask_id = doc.looks[0].layers.back().id;
+    const uint64_t base_id = doc.looks[0].layers[0].id;
+    doc.looks[0].links.push_back({base_id, 0, 0});
+    doc.looks[0].links.push_back({mask_id, base_id, 1});   // layer matte
+
+    auto gate_feed = [&](uint32_t frame) -> int {
+        // -2 no gate; else the layer_index of the generator feeding the
+        // extract (-1 = the black stand-in).
+        const RenderGraph g = compile_graph(doc, doc.looks[0].id, frame);
+        for (const GraphNode& n : g.nodes) {
+            if (n.kind != GraphNode::Kind::MatteExtract) continue;
+            const GraphNode& feed =
+                g.nodes[static_cast<size_t>(n.inputs[0])];
+            return feed.layer_index;
+        }
+        return -2;
+    };
+    // Mask playing: the gate reads the nested look's shape (its layer 0).
+    CHECK_EQ(gate_feed(5), 0);
+    // Mask's duration over: the gate reads BLACK (closed), not unwired.
+    CHECK_EQ(gate_feed(20), -1);
+}
+
+TEST(graph_generator_has_no_when_but_a_placed_look_does) {
+    // Generators are always on - the SEQUENCE holds what has a when, the
+    // graph holds the rest. A span comes from wrapping the generator in
+    // a look and placing that as a block.
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
+
+    Document doc;
+    doc.looks[0].layers[0].source = LayerSourceKind::Solid;
+
+    auto gen_count = [&](uint64_t root, uint32_t frame) {
+        const RenderGraph g = compile_graph(doc, root, frame);
+        int n = 0;
+        for (const GraphNode& node : g.nodes)
+            if (node.kind == GraphNode::Kind::Generator &&
+                node.layer_index >= 0)
+                ++n;
+        return n;
+    };
+    CHECK_EQ(gen_count(doc.looks[0].id, 3), 1);
+    CHECK_EQ(gen_count(doc.looks[0].id, 100000), 1);
+
+    // The same solid look placed at [4, 8) on the root sequence culls
+    // outside the block.
+    looks::doc::Placement wp;
+    wp.id = doc.next_effect_id++;
+    wp.target = doc.looks[0].id;
+    wp.t_in = 4;
+    wp.t_out = 8;
+    doc.root().tracks[0].placements.push_back(wp);
+    CHECK_EQ(gen_count(doc.root_sequence, 3), 0);
+    CHECK_EQ(gen_count(doc.root_sequence, 4), 1);
+    CHECK_EQ(gen_count(doc.root_sequence, 7), 1);
+    CHECK_EQ(gen_count(doc.root_sequence, 8), 0);
+}
+
+TEST(graph_clip_source_culled_past_its_media) {
+    // A clip node plays its media in lockstep from local 0: past the
+    // media (through slip) the layer is a closed gate. On the sequence,
+    // a block's own window culls the whole look outside it.
+    Document doc;
+    Asset asset;
+    asset.id = doc.next_effect_id++;
+    asset.frame_count = 10;
+    doc.assets.push_back(asset);
+    doc.looks[0].layers[0].asset = asset.id;
+
+    auto source_count = [&](uint64_t root, uint32_t frame) {
+        const RenderGraph g = compile_graph(doc, root, frame);
+        int n = 0;
+        for (const GraphNode& node : g.nodes)
+            if (node.kind == GraphNode::Kind::Source) ++n;
+        return n;
+    };
+    CHECK_EQ(source_count(doc.looks[0].id, 0), 1);
+    CHECK_EQ(source_count(doc.looks[0].id, 9), 1);
+    CHECK_EQ(source_count(doc.looks[0].id, 10), 0);
+    // Slip shortens what remains of the media.
+    doc.looks[0].layers[0].slip = 4;
+    CHECK_EQ(source_count(doc.looks[0].id, 5), 1);
+    CHECK_EQ(source_count(doc.looks[0].id, 6), 0);
+    doc.looks[0].layers[0].slip = 0;
+
+    // Placed at [4, 8): the sequence window culls outside the block.
+    looks::doc::Placement wp;
+    wp.id = doc.next_effect_id++;
+    wp.target = doc.looks[0].id;
+    wp.t_in = 4;
+    wp.t_out = 8;
+    doc.root().tracks[0].placements.push_back(wp);
+    CHECK_EQ(source_count(doc.root_sequence, 3), 0);
+    CHECK_EQ(source_count(doc.root_sequence, 4), 1);
+    CHECK_EQ(source_count(doc.root_sequence, 7), 1);
+    CHECK_EQ(source_count(doc.root_sequence, 8), 0);
+}
+
+TEST(graph_sequence_lanes_stack_alpha_over) {
+    // Lanes composite bottom-up with plain alpha-over: LayerBlend nodes
+    // with layer_index -1 (no look supplies a mode). One lane = no blend
+    // at all. Overlap within a lane shows the LATEST-STARTING block.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Look second;
+    second.id = doc.next_effect_id++;
+    looks::doc::Layer noise;
+    noise.id = doc.next_effect_id++;
+    noise.source = looks::doc::LayerSourceKind::Noise;
+    second.layers.push_back(std::move(noise));
+    const uint64_t second_id = second.id;
+    doc.looks.push_back(std::move(second));
+
+    looks::doc::Sequence& seq = doc.root();
+    looks::doc::Placement a;
+    a.id = doc.next_effect_id++;
+    a.target = doc.looks[0].id;
+    seq.tracks[0].placements.push_back(a);
+    RenderGraph one = compile_graph(doc, doc.root_sequence, 0);
+    CHECK(one.valid);
+    for (const GraphNode& n : one.nodes)
+        CHECK(n.kind != GraphNode::Kind::LayerBlend);
+
+    looks::doc::SeqTrack lane2;
+    lane2.id = doc.next_effect_id++;
+    lane2.name = "v2";
+    looks::doc::Placement b;
+    b.id = doc.next_effect_id++;
+    b.target = second_id;
+    lane2.placements.push_back(b);
+    seq.tracks.push_back(std::move(lane2));
+    RenderGraph two = compile_graph(doc, doc.root_sequence, 0);
+    CHECK(two.valid);
+    int overs = 0;
+    for (const GraphNode& n : two.nodes)
+        if (n.kind == GraphNode::Kind::LayerBlend) {
+            ++overs;
+            CHECK_EQ(n.layer_index, -1);
+        }
+    CHECK_EQ(overs, 1);
+
+    // Overlap on ONE lane: the later-starting block wins the frame.
+    seq.tracks.pop_back();
+    looks::doc::Placement late;
+    late.id = doc.next_effect_id++;
+    late.target = second_id;
+    late.t_in = 5;
+    seq.tracks[0].placements.push_back(late);
+    auto kinds_at = [&](uint32_t frame) {
+        const RenderGraph g = compile_graph(doc, doc.root_sequence, frame);
+        int solids = 0, noises = 0;
+        for (const GraphNode& n : g.nodes) {
+            if (n.kind != GraphNode::Kind::Generator || n.layer_index < 0)
+                continue;
+            const looks::doc::Look& l = doc.look(
+                g.instances[static_cast<size_t>(n.instance)].look);
+            if (l.layers[static_cast<size_t>(n.layer_index)].source ==
+                looks::doc::LayerSourceKind::Solid)
+                ++solids;
+            else
+                ++noises;
+        }
+        return std::make_pair(solids, noises);
+    };
+    CHECK_EQ(kinds_at(3).first, 1);
+    CHECK_EQ(kinds_at(3).second, 0);
+    CHECK_EQ(kinds_at(6).first, 0);
+    CHECK_EQ(kinds_at(6).second, 1);
 }
 
 TEST(graph_displace_by_matte_second_input) {
@@ -306,19 +596,20 @@ TEST(graph_displace_by_matte_second_input) {
     using looks::doc::LayerSourceKind;
 
     Document doc;
-    doc.layers[0].stack.push_back(make_effect(doc, EffectType::Displace));
-    const uint64_t fx_id = doc.layers[0].stack[0].id;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Displace));
+    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
     Layer matte;
     matte.id = doc.next_effect_id++;
     matte.source = LayerSourceKind::Shape;
-    doc.layers.push_back(matte);
-    doc.links.push_back({doc.layers[0].id, fx_id, 0});
-    doc.links.push_back({fx_id, 0, 0});
-    doc.links.push_back({matte.id, fx_id, 1});
+    doc.looks[0].layers.push_back(matte);
+    doc.looks[0].links.push_back({doc.looks[0].layers[0].id, fx_id, 0});
+    doc.looks[0].links.push_back({fx_id, 0, 0});
+    doc.looks[0].links.push_back({matte.id, fx_id, 1});
 
     // map_mode 0: the matte GATES (MatteApply join), displace has one
     // input.
-    RenderGraph gated = compile_graph(doc);
+    RenderGraph gated = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(gated.valid);
     bool saw_apply = false;
     for (const GraphNode& n : gated.nodes) {
@@ -330,8 +621,8 @@ TEST(graph_displace_by_matte_second_input) {
 
     // map_mode 1: the matte becomes the displacement MAP — the effect
     // node gains it as a second input and no MatteApply gate is emitted.
-    doc.layers[0].stack[0].params[3] = 1.0f;
-    RenderGraph mapped = compile_graph(doc);
+    doc.looks[0].layers[0].stack[0].params[3] = 1.0f;
+    RenderGraph mapped = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(mapped.valid);
     bool saw_two_input_fx = false;
     for (const GraphNode& n : mapped.nodes) {
@@ -346,4 +637,72 @@ TEST(graph_displace_by_matte_second_input) {
         }
     }
     CHECK(saw_two_input_fx);
+}
+
+namespace {
+
+// Every key the compile emits for Source and Effect nodes, sorted - the
+// compile-level fingerprint the engine keys its state on.
+std::vector<uint64_t> state_fingerprint(const Document& doc, uint64_t root,
+                                        uint32_t frame) {
+    const RenderGraph g = compile_graph(doc, root, frame);
+    std::vector<uint64_t> out;
+    for (const GraphNode& n : g.nodes)
+        if (n.kind == GraphNode::Kind::Source ||
+            n.kind == GraphNode::Kind::Effect)
+            out.push_back(n.key);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+}  // namespace
+
+TEST(graph_razor_identity_is_structural) {
+    // RAZOR IDENTITY: cutting a block and butting the halves back
+    // together renders bit-identically - the state keys the engine hangs
+    // history on are UNCHANGED by the cut, and with zero effects at
+    // sequence level there is nothing a cut could reset. A cut is a
+    // window onto the target; the target cannot see it.
+    Document doc;
+    Asset asset;
+    asset.id = doc.next_effect_id++;
+    asset.frame_count = 200;
+    doc.assets.push_back(asset);
+    doc.looks[0].layers[0].asset = asset.id;
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Feedback));
+
+    looks::doc::Sequence& seq = doc.root();
+    looks::doc::Placement block;
+    block.id = doc.next_effect_id++;
+    block.target = doc.looks[0].id;
+    seq.tracks[0].placements.push_back(block);
+    const uint64_t lane_id = seq.tracks[0].id;
+
+    std::vector<std::vector<uint64_t>> uncut;
+    for (uint32_t f = 39; f <= 41; ++f)
+        uncut.push_back(state_fingerprint(doc, doc.root_sequence, f));
+
+    looks::doc::UndoStack undo;
+    undo.execute(doc, looks::doc::razor_track_command(
+                          doc, doc.root_sequence, lane_id, 40));
+    CHECK_EQ(doc.root().tracks[0].placements.size(), size_t{2});
+    for (uint32_t f = 39; f <= 41; ++f) {
+        const auto cut = state_fingerprint(doc, doc.root_sequence, f);
+        const auto& before = uncut[f - 39];
+        CHECK_EQ(cut.size(), before.size());
+        for (size_t i = 0; i < cut.size() && i < before.size(); ++i)
+            CHECK_EQ(cut[i], before[i]);
+    }
+    // Duplicating the look on ANOTHER lane gets its OWN keys: instances
+    // stay distinct while razored halves share.
+    looks::doc::SeqTrack lane2;
+    lane2.id = doc.next_effect_id++;
+    looks::doc::Placement dup;
+    dup.id = doc.next_effect_id++;
+    dup.target = doc.looks[0].id;
+    lane2.placements.push_back(dup);
+    doc.root().tracks.push_back(std::move(lane2));
+    const auto stacked = state_fingerprint(doc, doc.root_sequence, 39);
+    CHECK_EQ(stacked.size(), uncut[0].size() * 2);
 }

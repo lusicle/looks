@@ -1,7 +1,7 @@
-// Applied to the layer source before its effect stack. Outside the
-// transformed region the layer is opaque BLACK, not transparent: this
-// compositor carries no alpha through effect chains, so layer_blend
-// recomputes the same gate analytically to reveal what is below.
+// Applied to the layer source before its effect stack. Coverage is
+// written as premultiplied alpha, so the chain carries the transformed
+// region's shape through every effect and layer_blend composites what
+// actually survived the stack.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -20,8 +20,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D source;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Duplicated in layer_blend.comp.slang; the two must stay in sync or the
-// blend gate stops matching the black this pass renders.
 float2 xform_source_uv(float2 uv, float aspect)
 {
     float2 p = (uv - 0.5) * float2(aspect, 1.0);
@@ -55,6 +53,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float aspect = float(width) / float(height);
     const float2 suv = xform_source_uv(uv, aspect);
     const float cov = xform_coverage(suv);
-    const float3 rgb = source.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
-    output[tid.xy] = float4(rgb * cov, 1.0);
+    const float4 src = source.SampleLevel(clamp(suv, 0.0, 1.0), 0);
+    output[tid.xy] = src * cov;
 }

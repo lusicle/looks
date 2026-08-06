@@ -62,8 +62,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     // em == 1 needs no case: the sampler already clamps.
 
-    float4 moved = input.SampleLevel(suv, 0);
-    moved.rgb *= coverage;
+    float4 moved = input.SampleLevel(suv, 0) * coverage;
 
     const float4 wetted = lerp(base, moved, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

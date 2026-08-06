@@ -28,7 +28,7 @@ struct AudioPacket {
 ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
                           uint32_t fps_den, uint32_t frame_count,
                           const FrameProducer& producer,
-                          const std::filesystem::path& pcm_path,
+                          const ExportAudio& audio,
                           const std::filesystem::path& out_mp4,
                           const ExportOptions& options,
                           ExportProgress* progress) {
@@ -100,20 +100,14 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
         return result;
     }
 
-    // ---- audio: PCM sidecar -> AAC packets.
+    // ---- audio: the project mix -> AAC packets.
     std::vector<AudioPacket> audio_packets;
     std::vector<uint8_t> audio_asc;
     uint32_t audio_channels = 0;
     uint32_t audio_rate = 0;
-    if (!pcm_path.empty()) {
-        PcmReader pcm;
-        std::string pcm_error;
-        if (!pcm.open(pcm_path, &pcm_error)) {
-            result.error = "pcm open failed: " + pcm_error;
-            return result;
-        }
-        audio_channels = pcm.channels();
-        audio_rate = pcm.sample_rate();
+    if (audio.channels > 0 && audio.rate > 0 && audio.fill) {
+        audio_channels = audio.channels;
+        audio_rate = audio.rate;
 
         platform::AacEncoder audio_encoder;
         if (!audio_encoder.create(audio_channels, audio_rate,
@@ -126,15 +120,14 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
                 audio_packets.push_back({packet.data, packet.pts_100ns});
         };
         // Export exactly the video's duration of audio. The offset maps
-        // output sample s to source sample s + skip; anything outside the
-        // sidecar is silence (trim past the end, negative nudge, etc.).
+        // output sample s to mix position s + skip; anything outside every
+        // source is silence (a gap, a negative nudge, trim past the end).
         const uint64_t total_frames =
             static_cast<uint64_t>(audio_rate) * frame_count * fps_den /
             fps_num;
         const int64_t skip = static_cast<int64_t>(
             options.audio_offset_seconds * audio_rate +
             (options.audio_offset_seconds >= 0.0 ? 0.5 : -0.5));
-        const int64_t pcm_total = static_cast<int64_t>(pcm.frame_count());
         std::vector<int16_t> chunk(static_cast<size_t>(1024) * audio_channels);
         for (uint64_t s = 0; s < total_frames; s += 1024) {
             if (progress && progress->cancel.load()) {
@@ -143,18 +136,8 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
             }
             const size_t n = static_cast<size_t>(
                 std::min<uint64_t>(1024, total_frames - s));
-            std::fill(chunk.begin(),
-                      chunk.begin() +
-                          static_cast<ptrdiff_t>(n * audio_channels),
-                      int16_t{0});
-            const int64_t src = static_cast<int64_t>(s) + skip;
-            const int64_t lo = std::max<int64_t>(src, 0);
-            const int64_t hi =
-                std::min<int64_t>(src + static_cast<int64_t>(n), pcm_total);
-            if (hi > lo)
-                pcm.read(static_cast<uint64_t>(lo),
-                         chunk.data() + (lo - src) * audio_channels,
-                         static_cast<size_t>(hi - lo));
+            audio.fill(static_cast<int64_t>(s) + skip, chunk.data(),
+                       static_cast<uint32_t>(n));
             const int64_t pts =
                 static_cast<int64_t>(s) * 10'000'000ll / audio_rate;
             if (!audio_encoder.feed(chunk.data(), n * audio_channels, pts)) {

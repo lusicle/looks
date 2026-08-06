@@ -15,8 +15,8 @@ namespace {
 
 doc::Document make_doc() {
     doc::Document d;
-    d.layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::Vignette));
-    d.layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::RgbSplit));
+    d.looks[0].layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::Vignette));
+    d.looks[0].layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::RgbSplit));
     return d;
 }
 
@@ -24,33 +24,48 @@ bool near(float a, float b, float eps = 1.0e-4f) {
     return std::fabs(a - b) <= eps;
 }
 
+// A generator node wired onto one param: the wire REPLACES the param's
+// base with the node's output mapped onto its range.
+uint64_t add_valued_route(doc::Document& d, doc::ModSource source,
+                          doc::ParamKey target) {
+    doc::ValueNode node;
+    node.id = d.next_route_id++;
+    node.source = source;
+    d.looks[0].value_nodes.push_back(node);
+    doc::ModRoute route;
+    route.id = d.next_route_id++;
+    route.node = node.id;
+    route.target = target;
+    d.looks[0].mod_routes.push_back(route);
+    return node.id;
+}
+
 }  // namespace
 
 TEST(mod_param_table_paths) {
     doc::Document d = make_doc();
-    auto table = mod::build_param_table(d);
-    // global.morph + global.speed + vignette (wet, opacity, amount,
-    // radius, softness = 5) + rgb split (4) + layer params (v5.7:
-    // opacity, colors, gen, transform = kLayerParamCount).
-    CHECK_EQ(table.size(), size_t{11 + doc::kLayerParamCount});
+    auto table = mod::build_param_table(d, d.looks[0]);
+    // global.morph + vignette (wet, opacity, amount, radius,
+    // softness = 5) + rgb split (4) + layer params (opacity, colors,
+    // gen, transform = kLayerParamCount). Project speed is a scalar,
+    // not a mod target.
+    CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount});
     CHECK_EQ(table[0].path, "global.morph");
     CHECK_EQ(table[0].key.effect_id, uint64_t{0});
-    CHECK_EQ(table[1].path, "global.speed");
-    CHECK_EQ(table[1].key.param_index, 1);
-    CHECK_EQ(table[2].path, "layer0.fx0.wet");
-    CHECK_EQ(table[4].path, "layer0.fx0.amount");
-    CHECK_EQ(table[7].path, "layer0.fx1.wet");
-    CHECK_EQ(table[9].path, "layer0.fx1.shift_x");
-    CHECK_EQ(table[9].key.effect_id, d.layers[0].stack[1].id);
-    CHECK_EQ(table[9].min_value, -64.0f);
-    CHECK_EQ(table[9].max_value, 64.0f);
+    CHECK_EQ(table[1].path, "layer0.fx0.wet");
+    CHECK_EQ(table[3].path, "layer0.fx0.amount");
+    CHECK_EQ(table[6].path, "layer0.fx1.wet");
+    CHECK_EQ(table[8].path, "layer0.fx1.shift_x");
+    CHECK_EQ(table[8].key.effect_id, d.looks[0].layers[0].stack[1].id);
+    CHECK_EQ(table[8].min_value, -64.0f);
+    CHECK_EQ(table[8].max_value, 64.0f);
     // Layer entries carry kLayerParamBit + the layer id.
-    CHECK_EQ(table[11].path, "layer0.opacity");
-    CHECK_EQ(table[11].key.effect_id,
-             d.layers[0].id | doc::kLayerParamBit);
-    CHECK_EQ(table[11].key.param_index, 0);
-    CHECK_EQ(table[25].path, "layer0.xf_rotate");
-    CHECK_EQ(table[25].min_value, -180.0f);
+    CHECK_EQ(table[10].path, "layer0.opacity");
+    CHECK_EQ(table[10].key.effect_id,
+             d.looks[0].layers[0].id | doc::kLayerParamBit);
+    CHECK_EQ(table[10].key.param_index, 0);
+    CHECK_EQ(table[24].path, "layer0.xf_rotate");
+    CHECK_EQ(table[24].min_value, -180.0f);
 }
 
 TEST(mod_resolve_snaps_discrete_params) {
@@ -58,25 +73,25 @@ TEST(mod_resolve_snaps_discrete_params) {
     // after lanes/routes/morph — fractional level counts alias the
     // kernel math (a dither `levels` of 2.2 cuts a band into the frame).
     doc::Document d;
-    d.layers[0].stack.push_back(
+    d.looks[0].layers[0].stack.push_back(
         doc::make_effect(d, doc::EffectType::Dither));
     doc::KeyframeLane lane;
-    lane.target = {d.layers[0].stack[0].id, 0};   // levels, integer count
+    lane.target = {d.looks[0].layers[0].stack[0].id, 0};   // levels, integer count
     lane.keys.push_back({0.0, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     lane.keys.push_back({10.0, 7.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
-    d.lanes.push_back(lane);
+    d.looks[0].lanes.push_back(lane);
     // A continuous param lane stays fractional: dither amount (index 2).
     doc::KeyframeLane amt;
-    amt.target = {d.layers[0].stack[0].id, 2};
+    amt.target = {d.looks[0].layers[0].stack[0].id, 2};
     amt.keys.push_back({0.0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     amt.keys.push_back({10.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
-    d.lanes.push_back(amt);
+    d.looks[0].lanes.push_back(amt);
 
     const doc::Document r = mod::resolve(d, 3, 30.0, nullptr);
-    const float levels = r.layers[0].stack[0].params[0];
+    const float levels = r.looks[0].layers[0].stack[0].params[0];
     CHECK_EQ(levels, std::round(levels));
     CHECK(levels >= 2.0f && levels <= 7.0f);
-    const float amount = r.layers[0].stack[0].params[2];
+    const float amount = r.looks[0].layers[0].stack[0].params[2];
     CHECK(amount > 0.05f && amount < 0.95f);
     CHECK(amount != std::round(amount));
 }
@@ -86,14 +101,14 @@ TEST(mod_resolve_layer_params) {
     // gradient angle drives the resolved layer field.
     doc::Document d;
     doc::KeyframeLane lane;
-    lane.target = {d.layers[0].id | doc::kLayerParamBit, 8};   // gen_angle
+    lane.target = {d.looks[0].layers[0].id | doc::kLayerParamBit, 8};   // gen_angle
     lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     lane.keys.push_back({10.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
-    d.lanes.push_back(lane);
+    d.looks[0].lanes.push_back(lane);
     const doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
     const doc::Document r10 = mod::resolve(d, 10, 30.0, nullptr);
-    CHECK(near(r0.layers[0].gen_angle, -1.0f));
-    CHECK(near(r10.layers[0].gen_angle, 1.0f));
+    CHECK(near(r0.looks[0].layers[0].gen_angle, -1.0f));
+    CHECK(near(r10.looks[0].layers[0].gen_angle, 1.0f));
 }
 
 TEST(mod_lfo_shapes_deterministic) {
@@ -169,19 +184,17 @@ TEST(mod_video_sampling_sources) {
     CHECK_EQ(mean,
              mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view));
 
-    // A route on a video source resolves through the same view.
+    // A route on a video source resolves through the same view: the
+    // wire replaces wet with the region mean; without a view the source
+    // reads 0 and drives wet to the range floor.
     doc::Document d = make_doc();
-    doc::ModRoute route;
-    route.id = 1;
-    route.source = s;
-    route.target = {d.layers[0].stack[0].id, doc::kWetParam};
-    route.amount = -1.0f;
-    d.mod_routes.push_back(route);
+    add_valued_route(d, s,
+                     {d.looks[0].layers[0].stack[0].id, doc::kWetParam});
     const doc::Document lit =
         mod::resolve(d, 0, 30.0, nullptr, -1.0, -1.0, &view);
-    CHECK(lit.layers[0].stack[0].wet < 1.0f);
+    CHECK(near(lit.looks[0].layers[0].stack[0].wet, mean));
     const doc::Document dark = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK_EQ(dark.layers[0].stack[0].wet, 1.0f);
+    CHECK_EQ(dark.looks[0].layers[0].stack[0].wet, 0.0f);
 }
 
 TEST(mod_lane_eval) {
@@ -212,115 +225,305 @@ TEST(mod_lane_eval) {
 
 TEST(mod_resolve_lane_and_route) {
     doc::Document d = make_doc();
-    const uint64_t vignette_id = d.layers[0].stack[0].id;
+    const uint64_t vignette_id = d.looks[0].layers[0].stack[0].id;
 
     // Lane drives vignette amount from 0 to 1 over 10 frames.
     doc::KeyframeLane lane;
     lane.target = {vignette_id, 0};   // amount
     lane.keys.push_back({0.0, 0.0f});
     lane.keys.push_back({10.0, 1.0f});
-    d.lanes.push_back(lane);
+    d.looks[0].lanes.push_back(lane);
 
     doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
     doc::Document r5 = mod::resolve(d, 5, 30.0, nullptr);
-    CHECK(near(r0.layers[0].stack[0].params[0], 0.0f));
-    CHECK(near(r5.layers[0].stack[0].params[0], 0.5f));
+    CHECK(near(r0.looks[0].layers[0].stack[0].params[0], 0.0f));
+    CHECK(near(r5.looks[0].layers[0].stack[0].params[0], 0.5f));
     // Source doc untouched.
-    CHECK(near(d.layers[0].stack[0].params[0], 0.6f));
+    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.6f));
 
-    // Route: square LFO at 1 Hz on wet, amount 0.5 → +0.5 in first half.
-    doc::ModRoute route;
-    route.id = 1;
-    route.target = {vignette_id, doc::kWetParam};
-    route.amount = -0.5f;
-    route.source.type = doc::ModSourceType::Lfo;
-    route.source.shape = doc::LfoShape::Square;
-    route.source.rate_hz = 1.0f;
-    d.mod_routes.push_back(route);
+    // Route: square LFO at 1 Hz REPLACES wet. Frame 0: square=1 →
+    // wet 1. Frame 15 (t=0.5s): square=0 → wet 0 (the stored base 1 is
+    // ignored while wired).
+    doc::ModSource lfo;
+    lfo.type = doc::ModSourceType::Lfo;
+    lfo.shape = doc::LfoShape::Square;
+    lfo.rate_hz = 1.0f;
+    add_valued_route(d, lfo, {vignette_id, doc::kWetParam});
 
-    // Frame 0: square=1 → wet = 1 + (-0.5)*1 = 0.5. Frame 15 (t=0.5s):
-    // square=0 → wet stays 1.
     doc::Document ra = mod::resolve(d, 0, 30.0, nullptr);
     doc::Document rb = mod::resolve(d, 15, 30.0, nullptr);
-    CHECK(near(ra.layers[0].stack[0].wet, 0.5f));
-    CHECK(near(rb.layers[0].stack[0].wet, 1.0f));
+    CHECK(near(ra.looks[0].layers[0].stack[0].wet, 1.0f));
+    CHECK(near(rb.looks[0].layers[0].stack[0].wet, 0.0f));
 
-    // Clamped at range edges.
-    d.mod_routes[0].amount = -2.0f;
-    doc::Document rc = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK(near(rc.layers[0].stack[0].wet, 0.0f));
+    // A chain past the range clamps at the param's edge: constant 2
+    // through a math node still lands wet on 1.
+    doc::ValueNode big;
+    big.id = d.next_route_id++;
+    big.source.type = doc::ModSourceType::Math;
+    big.op = doc::ValueOp::Add;
+    big.const_a = 2.0f;
+    big.const_b = 0.0f;
+    d.looks[0].value_nodes.push_back(big);
+    d.looks[0].mod_routes[0].node = big.id;
+    doc::Document rc = mod::resolve(d, 15, 30.0, nullptr);
+    CHECK(near(rc.looks[0].layers[0].stack[0].wet, 1.0f));
 }
 
 TEST(mod_resolve_analysis_sources) {
     doc::Document d = make_doc();
-    doc::ModRoute route;
-    route.id = 1;
-    route.target = {d.layers[0].stack[1].id, 0};   // rgb shift_x, range -64..64
-    route.amount = 0.25f;
-    route.source.type = doc::ModSourceType::AudioLow;
-    d.mod_routes.push_back(route);
+    doc::ModSource low;
+    low.type = doc::ModSourceType::AudioLow;
+    // rgb shift_x, range -64..64: the wire maps low onto the full span.
+    add_valued_route(d, low, {d.looks[0].layers[0].stack[1].id, 0});
 
     mod::AnalysisCurves curves;
     curves.low = {0.0f, 1.0f, 0.5f};
-    // base 6 + 0.25*128*low
+    // shift = -64 + 128*low
     doc::Document r0 = mod::resolve(d, 0, 30.0, &curves);
     doc::Document r1 = mod::resolve(d, 1, 30.0, &curves);
     doc::Document r9 = mod::resolve(d, 9, 30.0, &curves);   // clamps to last
-    CHECK(near(r0.layers[0].stack[1].params[0], 6.0f));
-    CHECK(near(r1.layers[0].stack[1].params[0], 38.0f));
-    CHECK(near(r9.layers[0].stack[1].params[0], 22.0f));
+    CHECK(near(r0.looks[0].layers[0].stack[1].params[0], -64.0f));
+    CHECK(near(r1.looks[0].layers[0].stack[1].params[0], 64.0f));
+    CHECK(near(r9.looks[0].layers[0].stack[1].params[0], 0.0f));
 }
 
 TEST(mod_route_commands_undo) {
     doc::Document d = make_doc();
     doc::UndoStack undo;
 
+    doc::ValueNode node;
+    node.id = d.next_route_id++;
+    undo.execute(d, doc::add_value_node_command(d.looks[0].id, node));
+    CHECK_EQ(d.looks[0].value_nodes.size(), size_t{1});
+
     doc::ModRoute route;
     route.id = d.next_route_id++;
-    route.target = {d.layers[0].stack[0].id, doc::kWetParam};
-    route.amount = 0.3f;
-    undo.execute(d, doc::add_route_command(route));
-    CHECK_EQ(d.mod_routes.size(), size_t{1});
+    route.node = node.id;
+    route.target = {d.looks[0].layers[0].stack[0].id, doc::kWetParam};
+    undo.execute(d, doc::add_route_command(d.looks[0].id,route));
+    CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
 
-    undo.execute(d, doc::set_route_amount_command(route.id, 0.5f), true);
-    undo.execute(d, doc::set_route_amount_command(route.id, 0.7f), true);
-    CHECK(near(d.mod_routes[0].amount, 0.7f));
-    undo.undo(d);   // one step back through the coalesced drag
-    CHECK(near(d.mod_routes[0].amount, 0.3f));
-    undo.redo(d);
-    CHECK(near(d.mod_routes[0].amount, 0.7f));
-
-    undo.execute(d, doc::remove_route_command(route.id));
-    CHECK(d.mod_routes.empty());
+    // One wire per param: wiring another node onto the same target
+    // REPLACES the wire; undo brings the first one back.
+    doc::ValueNode node2;
+    node2.id = d.next_route_id++;
+    undo.execute(d, doc::add_value_node_command(d.looks[0].id, node2));
+    doc::ModRoute rival;
+    rival.id = d.next_route_id++;
+    rival.node = node2.id;
+    rival.target = route.target;
+    undo.execute(d, doc::add_route_command(d.looks[0].id, rival));
+    CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
+    CHECK_EQ(d.looks[0].mod_routes[0].node, node2.id);
     undo.undo(d);
-    CHECK_EQ(d.mod_routes.size(), size_t{1});
-    CHECK(near(d.mod_routes[0].amount, 0.7f));
+    CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
+    CHECK_EQ(d.looks[0].mod_routes[0].node, node.id);
+    undo.redo(d);
+    CHECK_EQ(d.looks[0].mod_routes[0].node, node2.id);
+
+    // Node edits: whole-struct replace, coalescing per id.
+    doc::ValueNode edit = d.looks[0].value_nodes[0];
+    edit.source.rate_hz = 3.0f;
+    undo.execute(d, doc::set_value_node_command(d.looks[0].id, edit), true);
+    CHECK(near(d.looks[0].value_nodes[0].source.rate_hz, 3.0f));
+    undo.undo(d);
+    CHECK(near(d.looks[0].value_nodes[0].source.rate_hz, 1.0f));
+    undo.redo(d);
+
+    undo.execute(d, doc::remove_route_command(d.looks[0].id,rival.id));
+    CHECK(d.looks[0].mod_routes.empty());
+    undo.undo(d);
+    CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
+    CHECK_EQ(d.looks[0].mod_routes[0].node, node2.id);
+}
+
+TEST(mod_value_math_and_normalise) {
+    doc::Document d;
+    doc::Look& look = d.looks[0];
+    // Constants through every math op: a = 0.6, b = 0.25.
+    doc::ValueNode m;
+    m.id = 1;
+    m.source.type = doc::ModSourceType::Math;
+    m.const_a = 0.6f;
+    m.const_b = 0.25f;
+    look.value_nodes.push_back(m);
+    mod::ValueEnv env;
+    env.look = &look;
+    auto with_op = [&](doc::ValueOp op) {
+        look.value_nodes[0].op = op;
+        return mod::eval_value_node(env, 1);
+    };
+    CHECK(near(with_op(doc::ValueOp::Add), 0.85f));
+    CHECK(near(with_op(doc::ValueOp::Subtract), 0.35f));
+    CHECK(near(with_op(doc::ValueOp::Multiply), 0.15f));
+    CHECK(near(with_op(doc::ValueOp::Divide), 2.4f));
+    CHECK(near(with_op(doc::ValueOp::Min), 0.25f));
+    CHECK(near(with_op(doc::ValueOp::Max), 0.6f));
+    CHECK(near(with_op(doc::ValueOp::Floor), 0.0f));
+    look.value_nodes[0].const_a = -0.6f;
+    CHECK(near(with_op(doc::ValueOp::Absolute), 0.6f));
+    // Divide by zero reads 0, not inf.
+    look.value_nodes[0].const_b = 0.0f;
+    CHECK_EQ(with_op(doc::ValueOp::Divide), 0.0f);
+
+    // Normalise maps its window onto [0,1], clamped.
+    doc::ValueNode norm;
+    norm.id = 2;
+    norm.source.type = doc::ModSourceType::Normalise;
+    norm.in_min = 0.2f;
+    norm.in_max = 0.7f;
+    norm.const_a = 0.45f;
+    look.value_nodes.push_back(norm);
+    CHECK(near(mod::eval_value_node(env, 2), 0.5f));
+    look.value_nodes[1].const_a = 0.9f;
+    CHECK(near(mod::eval_value_node(env, 2), 1.0f));
+    look.value_nodes[1].const_a = -1.0f;
+    CHECK(near(mod::eval_value_node(env, 2), 0.0f));
+    // Degenerate window reads 0.
+    look.value_nodes[1].in_max = look.value_nodes[1].in_min;
+    CHECK_EQ(mod::eval_value_node(env, 2), 0.0f);
+
+    // The multiplier scales the window: bounds stay -1..1, magnitude
+    // rides const_b. [-0.02, 1] x50 = an effective [-1, 50] window.
+    look.value_nodes[1].in_min = -0.02f;
+    look.value_nodes[1].in_max = 1.0f;
+    look.value_nodes[1].const_b = 50.0f;
+    look.value_nodes[1].const_a = 24.5f;   // window midpoint
+    CHECK(near(mod::eval_value_node(env, 2), 0.5f));
+    look.value_nodes[1].const_a = 50.0f;
+    CHECK(near(mod::eval_value_node(env, 2), 1.0f));
+    look.value_nodes[1].const_a = -1.0f;
+    CHECK(near(mod::eval_value_node(env, 2), 0.0f));
+
+    // Dangling id reads 0.
+    CHECK_EQ(mod::eval_value_node(env, 99), 0.0f);
+}
+
+TEST(mod_value_chain_and_fanout) {
+    doc::Document d = make_doc();
+    const uint64_t vignette_id = d.looks[0].layers[0].stack[0].id;
+    const uint64_t rgb_id = d.looks[0].layers[0].stack[1].id;
+
+    // Square LFO (0/1) -> math (multiply by 0.5) -> two wires: one on
+    // vignette wet, one on rgb wet. Fan-out from one shared chain.
+    doc::ValueNode lfo;
+    lfo.id = d.next_route_id++;
+    lfo.source.type = doc::ModSourceType::Lfo;
+    lfo.source.shape = doc::LfoShape::Square;
+    lfo.source.rate_hz = 1.0f;
+    d.looks[0].value_nodes.push_back(lfo);
+
+    doc::ValueNode half;
+    half.id = d.next_route_id++;
+    half.source.type = doc::ModSourceType::Math;
+    half.op = doc::ValueOp::Multiply;
+    half.in_a = lfo.id;
+    half.const_b = 0.5f;
+    d.looks[0].value_nodes.push_back(half);
+
+    for (const uint64_t fx : {vignette_id, rgb_id}) {
+        doc::ModRoute r;
+        r.id = d.next_route_id++;
+        r.node = half.id;
+        r.target = {fx, doc::kWetParam};
+        d.looks[0].mod_routes.push_back(r);
+    }
+
+    // Frame 0: square = 1 -> chain = 0.5 -> wet REPLACED to 0.5 on
+    // BOTH. Frame 15 (t = 0.5 s): square = 0 -> wet 0 on both.
+    doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
+    CHECK(near(r0.looks[0].layers[0].stack[0].wet, 0.5f));
+    CHECK(near(r0.looks[0].layers[0].stack[1].wet, 0.5f));
+    doc::Document r15 = mod::resolve(d, 15, 30.0, nullptr);
+    CHECK(near(r15.looks[0].layers[0].stack[0].wet, 0.0f));
+    CHECK(near(r15.looks[0].layers[0].stack[1].wet, 0.0f));
+}
+
+TEST(mod_value_cycle_guard) {
+    doc::Document d;
+    doc::Look& look = d.looks[0];
+    doc::ValueNode a, b;
+    a.id = 1;
+    a.source.type = doc::ModSourceType::Math;
+    b.id = 2;
+    b.source.type = doc::ModSourceType::Math;
+    look.value_nodes.push_back(a);
+    look.value_nodes.push_back(b);
+    look.value_nodes[0].in_a = 2;
+    // Wiring b.in_a = 1 would close the loop: the guard sees it.
+    CHECK(doc::value_reaches(look, 1, 2));
+    CHECK(!doc::value_reaches(look, 2, 1));
+    CHECK(doc::value_reaches(look, 1, 1));
+    // A corrupt file's cycle still terminates at the eval depth cap.
+    look.value_nodes[1].in_a = 1;
+    mod::ValueEnv env;
+    env.look = &look;
+    (void)mod::eval_value_node(env, 1);
+}
+
+TEST(mod_remove_value_node_cascades) {
+    doc::Document d = make_doc();
+    doc::UndoStack undo;
+    doc::Look& look = d.looks[0];
+    const uint64_t vignette_id = look.layers[0].stack[0].id;
+
+    doc::ValueNode lfo;
+    lfo.id = d.next_route_id++;
+    look.value_nodes.push_back(lfo);
+    doc::ValueNode math;
+    math.id = d.next_route_id++;
+    math.source.type = doc::ModSourceType::Math;
+    math.in_a = lfo.id;
+    look.value_nodes.push_back(math);
+    doc::ModRoute r;
+    r.id = d.next_route_id++;
+    r.node = lfo.id;
+    r.target = {vignette_id, doc::kWetParam};
+    look.mod_routes.push_back(r);
+
+    // Removing the LFO takes its route and unwires the math input.
+    undo.execute(d, doc::remove_value_node_command(look.id, lfo.id));
+    CHECK_EQ(d.looks[0].value_nodes.size(), size_t{1});
+    CHECK(d.looks[0].mod_routes.empty());
+    CHECK_EQ(d.looks[0].value_nodes[0].in_a, uint64_t{0});
+    // One undo restores the node, the wire, and the input.
+    undo.undo(d);
+    CHECK_EQ(d.looks[0].value_nodes.size(), size_t{2});
+    CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
+    CHECK_EQ(d.looks[0].value_nodes[1].in_a, lfo.id);
+
+    // wire_value_input swaps helper inputs undoably.
+    undo.execute(d, doc::wire_value_input_command(look.id,
+                     d.looks[0].value_nodes[1].id, 1, lfo.id));
+    CHECK_EQ(d.looks[0].value_nodes[1].in_b, lfo.id);
+    undo.undo(d);
+    CHECK_EQ(d.looks[0].value_nodes[1].in_b, uint64_t{0});
 }
 
 TEST(mod_lane_command_and_snapshots) {
     doc::Document d = make_doc();
     doc::UndoStack undo;
-    const doc::ParamKey key{d.layers[0].stack[0].id, 0};
+    const doc::ParamKey key{d.looks[0].layers[0].stack[0].id, 0};
 
-    undo.execute(d, doc::set_lane_command(key, {{0.0, 0.1f}, {5.0, 0.9f}}));
-    CHECK_EQ(d.lanes.size(), size_t{1});
-    CHECK_EQ(d.lanes[0].keys.size(), size_t{2});
+    undo.execute(d, doc::set_lane_command(d.looks[0].id,key, {{0.0, 0.1f}, {5.0, 0.9f}}));
+    CHECK_EQ(d.looks[0].lanes.size(), size_t{1});
+    CHECK_EQ(d.looks[0].lanes[0].keys.size(), size_t{2});
 
     // Empty keys removes the lane; undo restores it.
-    undo.execute(d, doc::set_lane_command(key, {}));
-    CHECK(d.lanes.empty());
+    undo.execute(d, doc::set_lane_command(d.looks[0].id,key, {}));
+    CHECK(d.looks[0].lanes.empty());
     undo.undo(d);
-    CHECK_EQ(d.lanes.size(), size_t{1});
+    CHECK_EQ(d.looks[0].lanes.size(), size_t{1});
 
     // Snapshots: store A, mutate, apply A restores params.
-    undo.execute(d, doc::store_snapshot_command(0));
-    CHECK(d.snapshots[0].valid);
-    undo.execute(d, doc::set_param_command(0, 0, 0, 0.11f));
-    CHECK(near(d.layers[0].stack[0].params[0], 0.11f));
-    undo.execute(d, doc::apply_snapshot_command(0));
-    CHECK(near(d.layers[0].stack[0].params[0], 0.6f));
+    undo.execute(d, doc::store_snapshot_command(d.looks[0].id,0));
+    CHECK(d.looks[0].snapshots[0].valid);
+    undo.execute(d, doc::set_param_command(d.looks[0].id,0, 0, 0, 0.11f));
+    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.11f));
+    undo.execute(d, doc::apply_snapshot_command(d.looks[0].id,0));
+    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.6f));
     undo.undo(d);   // un-apply
-    CHECK(near(d.layers[0].stack[0].params[0], 0.11f));
+    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.11f));
 }
 
 TEST(mod_fft_sine_bin) {
@@ -424,13 +627,12 @@ TEST(mod_time_remap_identity_and_modes) {
 }
 
 TEST(mod_time_remap_seek_matches_sequential) {
-    // A ramped speed lane: the prefix sum after a cold seek must equal the
-    // incrementally-accumulated one (determinism, spec S11).
+    // A non-unit project speed: the prefix sum after a cold seek must
+    // equal the incrementally-accumulated one (determinism). Sequences
+    // carry no keyframes, so the project speed is the scalar - ramps
+    // live per-block or inside looks.
     doc::Document d;
-    doc::KeyframeLane lane;
-    lane.target = {0, 1};   // global.speed
-    lane.keys = {{0.0, 0.5f}, {30.0, 3.0f}};
-    d.lanes.push_back(lane);
+    d.speed = 1.7f;
     CHECK(mod::time_remap_active(d));
 
     mod::TimeRemap sequential, seek;
@@ -448,20 +650,15 @@ TEST(mod_time_remap_seek_matches_sequential) {
     CHECK_EQ(seek.source_frame(d, 13, 30.0, nullptr, 90), expect[13]);
 }
 
-TEST(mod_speed_at_lane_and_route) {
+TEST(mod_speed_at_is_the_project_scalar) {
     doc::Document d;
     CHECK(near(mod::speed_at(d, 0, 30.0, nullptr), 1.0f));
+    CHECK(!mod::time_remap_active(d));
     d.speed = 2.5f;
     CHECK(near(mod::speed_at(d, 5, 30.0, nullptr), 2.5f));
-    // A lane on {0, 1} overrides the base...
-    doc::KeyframeLane lane;
-    lane.target = {0, 1};
-    lane.keys = {{0.0, 1.0f}, {10.0, 2.0f}};
-    d.lanes.push_back(lane);
-    CHECK(near(mod::speed_at(d, 0, 30.0, nullptr), 1.0f));
-    CHECK(near(mod::speed_at(d, 5, 30.0, nullptr), 1.5f));
-    // ...and clamping holds at the range edge.
-    d.lanes[0].keys = {{0.0, 100.0f}};
+    CHECK(mod::time_remap_active(d));
+    // Clamping holds at the range edge.
+    d.speed = 100.0f;
     CHECK(near(mod::speed_at(d, 0, 30.0, nullptr), doc::kMaxSpeed));
 }
 
@@ -529,19 +726,19 @@ TEST(mod_set_lanes_command_atomic) {
     const doc::ParamKey kx{7ull, 0};
     const doc::ParamKey ky{7ull, 1};
 
-    undo.execute(d, doc::set_lanes_command({{kx, {{0.0, 0.1f}}},
+    undo.execute(d, doc::set_lanes_command(d.looks[0].id,{{kx, {{0.0, 0.1f}}},
                                             {ky, {{0.0, 0.9f}}}}), true);
-    CHECK_EQ(d.lanes.size(), size_t{2});
-    undo.execute(d, doc::set_lanes_command({{kx, {{0.0, 0.2f}}},
+    CHECK_EQ(d.looks[0].lanes.size(), size_t{2});
+    undo.execute(d, doc::set_lanes_command(d.looks[0].id,{{kx, {{0.0, 0.2f}}},
                                             {ky, {{0.0, 0.8f}}}}), true);
-    CHECK_EQ(d.lanes.size(), size_t{2});
-    CHECK(near(d.lanes[0].keys[0].value, 0.2f));
-    CHECK(near(d.lanes[1].keys[0].value, 0.8f));
+    CHECK_EQ(d.looks[0].lanes.size(), size_t{2});
+    CHECK(near(d.looks[0].lanes[0].keys[0].value, 0.2f));
+    CHECK(near(d.looks[0].lanes[1].keys[0].value, 0.8f));
 
     // The coalesced drag is one undo step; both lanes revert atomically.
     undo.undo(d);
-    CHECK(d.lanes.empty());
+    CHECK(d.looks[0].lanes.empty());
     undo.redo(d);
-    CHECK_EQ(d.lanes.size(), size_t{2});
-    CHECK(near(d.lanes[0].keys[0].value, 0.2f));
+    CHECK_EQ(d.looks[0].lanes.size(), size_t{2});
+    CHECK(near(d.looks[0].lanes[0].keys[0].value, 0.2f));
 }

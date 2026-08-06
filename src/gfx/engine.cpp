@@ -433,7 +433,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     blend_desc.spv_name = "layer_blend.comp.spv";
     blend_desc.sampled_inputs = 2;
     blend_desc.storage_outputs = 1;
-    blend_desc.push_bytes = 12 * sizeof(uint32_t);
+    blend_desc.push_bytes = 4 * sizeof(uint32_t);
     layer_blend_ = ComputePipeline::create(device_, shader_dir, blend_desc);
 
     ComputePipelineDesc xf_desc;
@@ -759,27 +759,16 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     return matte_extract_ && matte_apply_;
 }
 
-bool Engine::ensure_planes(uint32_t width, uint32_t height) {
-    if (plane_y_ && plane_y_->width() == width && plane_y_->height() == height)
+bool Engine::ensure_prev_ref(uint32_t width, uint32_t height) {
+    if (prev_y_ && prev_y_->width() == width && prev_y_->height() == height)
         return true;
-
-    // Source size changed (clip switch): the old planes/targets may be in
+    // The reference source changed format: the old copy may still be in
     // flight — rare enough that a full sync is the simple correct answer.
     device_.wait_idle();
-    pool_.clear();
-    have_last_frame_ = false;
-
-    const uint32_t cw = (width + 1) / 2;
-    const uint32_t ch = (height + 1) / 2;
-    const VkImageUsageFlags usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    plane_y_ = GpuImage::create(device_, VK_FORMAT_R8_UNORM, width, height,
-                                usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    plane_u_ = GpuImage::create(device_, VK_FORMAT_R8_UNORM, cw, ch, usage);
-    plane_v_ = GpuImage::create(device_, VK_FORMAT_R8_UNORM, cw, ch, usage);
     prev_y_ = GpuImage::create(device_, VK_FORMAT_R8_UNORM, width, height,
-                               usage);
-    return plane_y_ && plane_u_ && plane_v_ && prev_y_;
+                               VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    return prev_y_ != nullptr;
 }
 
 bool Engine::upload_gray_oneshot(GpuImage& dst, const uint8_t* gray,
@@ -850,13 +839,14 @@ void Engine::set_scope_audio(std::vector<int16_t> mono,
 
 
 bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
+                          uint64_t state_key,
                           const codec::MoshParams& mp, const GpuImage* in,
                           GpuImage* flow_img, uint32_t w, uint32_t h,
                           uint32_t frame_index, uint32_t timeline_frame,
                           GpuImage* dst) {
     const uint32_t cw = w / 2;
     const uint32_t chh = h / 2;
-    MoshGpuSlot& g = mosh_gpu_[fx.id];
+    MoshGpuSlot& g = mosh_gpu_[state_key];
     if (g.w != w || g.h != h) {
         device_.wait_idle();
         const VkImageUsageFlags use = VK_IMAGE_USAGE_STORAGE_BIT |
@@ -1358,33 +1348,33 @@ void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
 }
 
 GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
-                         const SourcePlanes& source, const doc::Document& doc,
-                         uint32_t timeline_frame, double fps,
-                         uint64_t cache_ctx,
+                         const doc::Document& doc,
+                         uint64_t root_id, uint32_t root_frame, double fps,
+                         uint32_t canvas_w, uint32_t canvas_h,
+                         uint64_t cache_ctx, uint32_t cache_frame,
                          GpuImage** out_source,
                          const LayerSourceFrame* layer_sources,
                          size_t layer_source_count,
-                         uint64_t preview_node) {
+                         uint64_t preview_node, uint64_t preview_layer) {
+    // The entity being rendered (a sequence or a scoped look) and the
+    // frame it plays at. Nodes belonging to NESTED instances read their
+    // own look and their own local frame instead (both are shadowed
+    // inside the dispatch loop) — only the root's clock drives caching
+    // and prev-frame tracking.
     if (out_source) *out_source = nullptr;
-    if (!source.y || !source.u || !source.v || source.width == 0 ||
-        source.height == 0)
-        return nullptr;
-    if (!ensure_planes(source.width, source.height)) return nullptr;
+    if (canvas_w == 0 || canvas_h == 0) return nullptr;
 
     arena_.reset(frame_index);
     pool_.release_all();
     StagingBuffer& staging = *staging_[frame_index % kFramesInFlight];
     staging.reset();
 
-    // Upload dimensions (full-res planes) vs working dimensions (preview
-    // proxy, ). Kernels sample the planes by uv, so the working
-    // targets shrink cleanly; even dims keep the codec paths happy.
-    const uint32_t src_h = source.height;
-    const uint32_t ch = (src_h + 1) / 2;
-    const uint32_t w =
-        std::max((source.width / preview_divisor_) & ~1u, 2u);
-    const uint32_t h =
-        std::max((source.height / preview_divisor_) & ~1u, 2u);
+    // The CANVAS is the project's, never the clip's (docs/look.md phase
+    // 4): a cut between two source sizes must not resize the graph.
+    // Working dimensions shrink under the preview proxy — kernels sample
+    // by uv, so everything scales; even dims keep the codec paths happy.
+    const uint32_t w = std::max((canvas_w / preview_divisor_) & ~1u, 2u);
+    const uint32_t h = std::max((canvas_h / preview_divisor_) & ~1u, 2u);
 
     // ---- frame render cache. First harvest the readback this
     // slot recorded kFramesInFlight renders ago — the caller has waited the
@@ -1407,7 +1397,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     bool arm_readback = false;
     if (cache_ctx != 0) {
         cache_.set_context(cache_ctx);
-        const RenderCache::Frame* hit = cache_.find(timeline_frame);
+        const RenderCache::Frame* hit = cache_.find(cache_frame);
         if (hit && hit->width == w && hit->height == h) {
             const size_t bytes = static_cast<size_t>(w) * h * 8;
             GpuImage* dst = nullptr;
@@ -1436,11 +1426,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         arm_readback = true;
     }
 
-    const RenderGraph graph = compile_graph(doc, preview_node);
+    const RenderGraph graph =
+        compile_graph(doc, root_id, root_frame, preview_node, preview_layer);
     if (!graph.valid) {
         log_error("engine: render graph invalid (cycle?)");
         return nullptr;
     }
+    // A node's subject lives in ITS instance's look.
+    auto node_look = [&](const GraphNode& n) -> const doc::Look& {
+        return doc.look(
+            graph.instances[static_cast<size_t>(n.instance)].look);
+    };
 
     // Codec-Box nodes need the frame on the CPU mid-graph: evaluate in
     // fenced segments on an internal command buffer instead of `cmd`
@@ -1449,7 +1445,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     for (const GraphNode& n : graph.nodes) {
         if (n.kind != GraphNode::Kind::Effect) continue;
         const doc::EffectInstance& fx =
-            doc.layers[static_cast<size_t>(n.layer_index)]
+            node_look(n).layers[static_cast<size_t>(n.layer_index)]
                 .stack[static_cast<size_t>(n.effect_index)];
         if (doc::is_codec_box(fx.type) ||
             fx.type == doc::EffectType::ErrorDiffusion) {
@@ -1467,49 +1463,72 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // recycle here (mid-frame resets would clobber same-segment uploads).
     if (segmented) codec_io_.staging->reset();
 
-    // Preserve last frame's luma for flow/motion BEFORE the new upload.
-    // Only when the timeline advanced — a paused re-render keeps the prior
-    // prev frame and validity; a seek gap invalidates for one frame.
-    if (have_last_frame_ && timeline_frame != last_timeline_frame_) {
-        prev_frame_valid_ = timeline_frame == last_timeline_frame_ + 1;
-        plane_y_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    // The REFERENCE SOURCE: the first clip source playing in the root
+    // instance. A multi-clip look has no single "the source", so the graph
+    // names one — the A/B wipe compares against it and the shared motion
+    // field is measured on it.
+    const uint64_t ref_key =
+        graph.source >= 0
+            ? graph.nodes[static_cast<size_t>(graph.source)].key
+            : 0;
+
+    // Preserve the reference luma for flow/motion BEFORE the new upload
+    // overwrites its planes. Only when the timeline advanced (a paused
+    // re-render keeps the prior prev frame) and the reference is still the
+    // same source — a cut has no motion across it, by construction.
+    const auto ref_it = ref_key ? layer_planes_.find(ref_key)
+                                : layer_planes_.end();
+    const LayerPlanes* ref_last =
+        ref_it != layer_planes_.end() ? &ref_it->second : nullptr;
+    // A reference that changes size this render has its planes recreated
+    // below, so the copy would read a freed image — and there is no motion
+    // between two different formats anyway.
+    if (ref_last) {
+        for (size_t i = 0; i < layer_source_count; ++i)
+            if (layer_sources[i].key == ref_key &&
+                (layer_sources[i].planes.width != ref_last->width ||
+                 layer_sources[i].planes.height != ref_last->height))
+                ref_last = nullptr;
+    }
+    if (have_last_frame_ && root_frame != last_timeline_frame_ &&
+        ref_key != 0 && ref_key == last_ref_key_ && ref_last && ref_last->y &&
+        ensure_prev_ref(ref_last->width, ref_last->height)) {
+        prev_frame_valid_ = root_frame == last_timeline_frame_ + 1;
+        ref_last->y->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         prev_y_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageCopy copy{};
         copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.extent = {source.width, src_h, 1};
-        vkCmdCopyImage(rec, plane_y_->image(),
+        copy.extent = {ref_last->width, ref_last->height, 1};
+        vkCmdCopyImage(rec, ref_last->y->image(),
                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, prev_y_->image(),
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         prev_y_->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    } else if (!have_last_frame_) {
+    } else {
         prev_frame_valid_ = false;
     }
-    last_timeline_frame_ = timeline_frame;
+    last_timeline_frame_ = root_frame;
+    last_ref_key_ = ref_key;
     have_last_frame_ = true;
 
-    if (!staging.upload_image(rec, source.y, source.y_stride * src_h,
-                              source.y_stride, *plane_y_) ||
-        !staging.upload_image(rec, source.u, source.u_stride * ch,
-                              source.u_stride, *plane_u_) ||
-        !staging.upload_image(rec, source.v, source.v_stride * ch,
-                              source.v_stride, *plane_v_))
-        return nullptr;
-    // Per-layer trim sources: per-layer I420 uploads.
+    // Clip sources: one I420 upload per PLACEMENT, keyed per instance.
     for (size_t i = 0; i < layer_source_count; ++i) {
         const LayerSourceFrame& lf = layer_sources[i];
         if (!lf.planes.y || !lf.planes.u || !lf.planes.v ||
-            lf.planes.width == 0 || lf.layer_index < 0)
+            lf.planes.width == 0 || lf.key == 0)
             continue;
-        LayerPlanes& lp = layer_planes_[lf.layer_index];
+        LayerPlanes& lp = layer_planes_[lf.key];
         if (lp.width != lf.planes.width || lp.height != lf.planes.height) {
             device_.wait_idle();
             const VkImageUsageFlags lu =
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             const uint32_t lcw = (lf.planes.width + 1) / 2;
             const uint32_t lch = (lf.planes.height + 1) / 2;
+            // Y also feeds the prev-luma copy when this source is the
+            // graph's reference.
             lp.y = GpuImage::create(device_, VK_FORMAT_R8_UNORM,
-                                    lf.planes.width, lf.planes.height, lu);
+                                    lf.planes.width, lf.planes.height,
+                                    lu | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
             lp.u = GpuImage::create(device_, VK_FORMAT_R8_UNORM, lcw, lch, lu);
             lp.v = GpuImage::create(device_, VK_FORMAT_R8_UNORM, lcw, lch, lu);
             if (!lp.y || !lp.u || !lp.v) return nullptr;
@@ -1532,11 +1551,36 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
-    plane_y_->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    plane_u_->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    plane_v_->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // Seek gap / first frame: neutral prev = current (zero difference).
-    GpuImage* prev_plane = prev_frame_valid_ ? prev_y_.get() : plane_y_.get();
+    // The motion pair the shared Flow field and MotionExtract read. With
+    // no clip source in the look there is nothing moving to measure: a
+    // cleared 1x1 plane reads as flat black, so motion comes out zero
+    // instead of undefined.
+    GpuImage* ref_plane = nullptr;
+    if (ref_key) {
+        if (auto it = layer_planes_.find(ref_key);
+            it != layer_planes_.end() && it->second.y)
+            ref_plane = it->second.y.get();
+    }
+    if (!ref_plane) {
+        if (!dummy_y_) {
+            dummy_y_ = GpuImage::create(
+                device_, VK_FORMAT_R8_UNORM, 1, 1,
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            if (!dummy_y_) return nullptr;
+        }
+        dummy_y_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                            1};
+        vkCmdClearColorImage(rec, dummy_y_->image(),
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
+                             &range);
+        ref_plane = dummy_y_.get();
+        prev_frame_valid_ = false;
+    }
+    ref_plane->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Seek gap / first frame / cut: neutral prev = current (zero motion).
+    GpuImage* prev_plane = prev_frame_valid_ ? prev_y_.get() : ref_plane;
 
     // Audio Scope strips: one 1-D min/max waveform texture per active
     // instance, sliced from the mono PCM copy for the trailing window
@@ -1559,7 +1603,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     ? 0.5f
                     : std::clamp(fx.params[0], 0.05f, 2.0f);
             if (scope_rate_ > 0 && !scope_audio_.empty() && fps > 0.0) {
-                const double t1 = timeline_frame / fps;
+                const double t1 = root_frame / fps;
                 const double t0 = t1 - window;
                 const int64_t total =
                     static_cast<int64_t>(scope_audio_.size());
@@ -1592,7 +1636,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             tex->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             return true;
         };
-        for (const doc::Layer& layer : doc.layers)
+        // Every instance that actually renders, so a scope in a nested
+        // look still gets its waveform.
+        for (const LookInstance& li : graph.instances)
+        for (const doc::Layer& layer : doc.look(li.look).layers)
             for (const doc::EffectInstance& fx : layer.stack)
                 if (!upload_strip(fx)) return nullptr;
     }
@@ -1620,8 +1667,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     remaining_uses[static_cast<size_t>(graph.output)]++;
     if (graph.preview >= 0)
         remaining_uses[static_cast<size_t>(graph.preview)]++;
-    // A/B wipe: keep the converted source alive to the end too.
-    if (out_source) remaining_uses[0]++;
+    // A/B wipe: keep the converted reference source alive to the end too.
+    if (out_source && graph.source >= 0)
+        remaining_uses[static_cast<size_t>(graph.source)]++;
 
     auto as_bits = [](float v) {
         uint32_t bits;
@@ -1631,6 +1679,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
     for (int index : graph.order) {
         const GraphNode& node = graph.nodes[static_cast<size_t>(index)];
+        // Per-instance view (docs/look.md): `look` is the look this node
+        // came from and `timeline_frame` its LOCAL clock, both shadowing
+        // the root's. Everything below addresses its own placement, so a
+        // look nested twice runs twice on two different frames. `skey`
+        // is the instance-scoped state key — history slots and private
+        // source planes hang off it, never off the bare effect id.
+        const LookInstance& linst =
+            graph.instances[static_cast<size_t>(node.instance)];
+        const doc::Look& look = doc.look(linst.look);
+        const uint32_t timeline_frame = linst.local_frame;
+        const uint64_t skey = node.key;
         for (int input : node.inputs)
             results[static_cast<size_t>(input)]->transition(
                 rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1648,19 +1707,24 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
         switch (node.kind) {
             case GraphNode::Kind::Source: {
-                // layer_index >= 0: a private per-layer source (trim).
-                // Falls back to the playhead planes when the caller
-                // supplied no frame for that layer.
-                const GpuImage* planes[3] = {plane_y_.get(), plane_u_.get(),
-                                             plane_v_.get()};
-                if (node.layer_index >= 0) {
-                    if (auto it = layer_planes_.find(node.layer_index);
-                        it != layer_planes_.end() && it->second.y) {
-                        planes[0] = it->second.y.get();
-                        planes[1] = it->second.u.get();
-                        planes[2] = it->second.v.get();
-                    }
+                // The decode pool feeds every clip source under this
+                // node's key. A key with no frame (decode failed, or an
+                // unbound asset) reads flat black rather than another
+                // layer's pixels.
+                auto it = layer_planes_.find(skey);
+                if (it == layer_planes_.end() || !it->second.y) {
+                    dst->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    const VkClearColorValue clear{};
+                    const VkImageSubresourceRange range{
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdClearColorImage(rec, dst->image(),
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                         &clear, 1, &range);
+                    break;
                 }
+                const GpuImage* planes[3] = {it->second.y.get(),
+                                             it->second.u.get(),
+                                             it->second.v.get()};
                 const uint32_t push[2] = {w, h};
                 to_rgb_->dispatch(rec, arena_, frame_index, planes, 3, &dst, 1,
                                   push, sizeof(push), w, h, linear_sampler_);
@@ -1668,7 +1732,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             }
             case GraphNode::Kind::LayerTransform: {
                 const doc::Layer& layer =
-                    doc.layers[static_cast<size_t>(node.layer_index)];
+                    look.layers[static_cast<size_t>(node.layer_index)];
                 uint32_t push[9] = {};
                 push[0] = w;
                 push[1] = h;
@@ -1691,7 +1755,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 push[1] = h;
                 if (node.layer_index >= 0) {
                     const doc::Layer& layer =
-                        doc.layers[static_cast<size_t>(node.layer_index)];
+                        look.layers[static_cast<size_t>(node.layer_index)];
                     push[2] = static_cast<uint32_t>(layer.source);
                     push[3] = static_cast<uint32_t>(
                         hash_combine(doc.master_seed, layer.id));
@@ -1717,23 +1781,23 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::LayerBlend: {
-                const doc::Layer& layer =
-                    doc.layers[static_cast<size_t>(node.layer_index)];
-                uint32_t push[12] = {};
+                // layer_index -1 is a SEQUENCE lane stack: plain
+                // alpha-over, full opacity - the timeline owns no blend
+                // modes. Otherwise the owning look layer's mode applies;
+                // its premultiplied alpha is the gate either way.
+                doc::BlendMode mode = doc::BlendMode::Normal;
+                float opacity = 1.0f;
+                if (node.layer_index >= 0) {
+                    const doc::Layer& layer =
+                        look.layers[static_cast<size_t>(node.layer_index)];
+                    mode = layer.blend;
+                    opacity = layer.opacity;
+                }
+                uint32_t push[4] = {};
                 push[0] = w;
                 push[1] = h;
-                push[2] = static_cast<uint32_t>(layer.blend);
-                push[3] = as_bits(layer.opacity);
-                // Transform gate: cropped / scaled-down regions
-                // reveal the composite below instead of stamping black.
-                push[4] = doc::layer_has_transform(layer) ? 1u : 0u;
-                push[5] = as_bits(layer.crop_l);
-                push[6] = as_bits(layer.crop_r);
-                push[7] = as_bits(layer.crop_t);
-                push[8] = as_bits(layer.crop_b);
-                push[9] = (layer.flip_h ? 1u : 0u) | (layer.flip_v ? 2u : 0u);
-                push[10] = as_bits(layer.xf_scale);
-                push[11] = as_bits(layer.xf_rotate * 0.01745329252f);
+                push[2] = static_cast<uint32_t>(mode);
+                push[3] = as_bits(opacity);
                 const GpuImage* sampled[2] = {input_image(0), input_image(1)};
                 layer_blend_->dispatch(rec, arena_, frame_index, sampled, 2,
                                        &dst, 1, push, sizeof(push), w, h,
@@ -1742,7 +1806,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             }
             case GraphNode::Kind::Effect: {
                 const doc::EffectInstance& fx =
-                    doc.layers[static_cast<size_t>(node.layer_index)]
+                    look.layers[static_cast<size_t>(node.layer_index)]
                         .stack[static_cast<size_t>(node.effect_index)];
 
                 if (doc::is_codec_box(fx.type)) {
@@ -1760,8 +1824,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         hash_combine(doc.master_seed, fx.id), fx.seed);
                     const codec::MoshParams gp = mosh_params(fx, gpu_seed);
                     if (gp.byte_flips == 0) {
-                        if (!mosh_gpu_box(rec, fx, gp, in, flow_img, w, h,
-                                          frame_index, timeline_frame, dst))
+                        if (!mosh_gpu_box(rec, fx, skey, gp, in, flow_img, w,
+                                          h, frame_index, timeline_frame,
+                                          dst))
                             return nullptr;
                         break;
                     }
@@ -1835,7 +1900,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     // 2. CPU: mosh with persistent per-instance state. A
                     // paused re-render reuses the cached output so the
                     // decoder does not keep stewing (vs export).
-                    MoshSlot& slot = mosh_state_[fx.id];
+                    MoshSlot& slot = mosh_state_[skey];
                     if (!slot.valid || slot.last_frame != timeline_frame) {
                         vmaInvalidateAllocation(device_.allocator(),
                                                 codec_io_.readback_alloc, 0,
@@ -1938,7 +2003,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
                 if (fx.type == doc::EffectType::ErrorDiffusion) {
                     GpuImage* in_img = const_cast<GpuImage*>(input_image(0));
-                    auto& slot_ptr = ed_state_[fx.id];
+                    auto& slot_ptr = ed_state_[skey];
                     if (!slot_ptr)
                         slot_ptr = std::make_unique<EdSlotAsync>();
                     EdSlotAsync& slot = *slot_ptr;
@@ -2065,7 +2130,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::MotionExtract) {
                     const GpuImage* sampled[3] = {input_image(0), prev_plane,
-                                                  plane_y_.get()};
+                                                  ref_plane};
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 3, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
@@ -2102,7 +2167,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         : 0;
                     const GpuImage* stipple = noise_lut_.get();
                     if (dm == 9) {
-                        RdSlot& slot = rd_state_[fx.id];
+                        RdSlot& slot = rd_state_[skey];
                         if (slot.state[0] &&
                             (slot.state[0]->width() != w ||
                              slot.state[0]->height() != h)) {
@@ -2191,7 +2256,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 } else if (fx.type == doc::EffectType::FrameDelay) {
                     // Plain N-frame delay: the slit-scan ring
                     // machinery, one slice bound as the second input.
-                    SlitSlot& slot = slit_state_[fx.id];
+                    SlitSlot& slot = slit_state_[skey];
                     if (slot.ring[0] &&
                         (slot.ring[0]->width() != w ||
                          slot.ring[0]->height() != h)) {
@@ -2362,7 +2427,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 } else if (fx.type == doc::EffectType::SlitScan) {
                     // Ring of past inputs; one masked dispatch per age band
                     // (bands are disjoint pixels, so no barriers between).
-                    SlitSlot& slot = slit_state_[fx.id];
+                    SlitSlot& slot = slit_state_[skey];
                     if (slot.ring[0] &&
                         (slot.ring[0]->width() != w ||
                          slot.ring[0]->height() != h)) {
@@ -2428,7 +2493,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     // Same ring mechanism as SlitScan: one dispatch per
                     // age band; the shader masks pixels to its band from
                     // the delay map (self-luma, or a wired map input).
-                    SlitSlot& slot = slit_state_[fx.id];
+                    SlitSlot& slot = slit_state_[skey];
                     if (slot.ring[0] &&
                         (slot.ring[0]->width() != w ||
                          slot.ring[0]->height() != h)) {
@@ -2494,7 +2559,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.last_frame = timeline_frame;
                     }
                 } else if (fx.type == doc::EffectType::FrameHold) {
-                    HoldSlot& slot = hold_state_[fx.id];
+                    HoldSlot& slot = hold_state_[skey];
                     if (slot.held && (slot.held->width() != w ||
                                       slot.held->height() != h)) {
                         slot.held.reset();
@@ -2543,7 +2608,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::Stutter) {
-                    SlitSlot& slot = slit_state_[fx.id];
+                    SlitSlot& slot = slit_state_[skey];
                     if (slot.ring[0] &&
                         (slot.ring[0]->width() != w ||
                          slot.ring[0]->height() != h)) {
@@ -2607,7 +2672,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.last_frame = timeline_frame;
                     }
                 } else if (fx.type == doc::EffectType::ReactionDiffusion) {
-                    RdSlot& slot = rd_state_[fx.id];
+                    RdSlot& slot = rd_state_[skey];
                     if (slot.state[0] &&
                         (slot.state[0]->width() != w ||
                          slot.state[0]->height() != h)) {
@@ -2675,7 +2740,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     // state, stepped once per timeline frame); the render
                     // splats the beams over the phosphor canvas — the
                     // effect's own previous output via the feedback slot.
-                    VsSlot& vs = vs_state_[fx.id];
+                    VsSlot& vs = vs_state_[skey];
                     const uint32_t state_w = std::max(w, h);
                     if (vs.state[0] && vs.state[0]->width() != state_w) {
                         vs.state[0].reset();
@@ -2739,7 +2804,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     front->transition(
                         rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-                    FeedbackSlot& slot = feedback_state_[fx.id];
+                    FeedbackSlot& slot = feedback_state_[skey];
                     if (!slot.prev || slot.prev->width() != w ||
                         slot.prev->height() != h) {
                         slot.prev = GpuImage::create(
@@ -2792,7 +2857,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 } else if (fx.type == doc::EffectType::FlowParticles) {
                     // Feedback-style persistent field advected by flow:
                     // inputs = {frame, own previous output, flow}.
-                    FeedbackSlot& slot = feedback_state_[fx.id];
+                    FeedbackSlot& slot = feedback_state_[skey];
                     if (!slot.prev || slot.prev->width() != w ||
                         slot.prev->height() != h) {
                         slot.prev = GpuImage::create(
@@ -2845,7 +2910,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     // masked dispatch per age band; each tile's seeded
                     // delay picks exactly one band, so the passes tile
                     // the output exactly once.
-                    SlitSlot& slot = slit_state_[fx.id];
+                    SlitSlot& slot = slit_state_[skey];
                     if (slot.ring[0] &&
                         (slot.ring[0]->width() != w ||
                          slot.ring[0]->height() != h)) {
@@ -2976,7 +3041,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (doc::is_stateful_feedback(fx.type)) {
-                    FeedbackSlot& slot = feedback_state_[fx.id];
+                    FeedbackSlot& slot = feedback_state_[skey];
                     if (!slot.prev || slot.prev->width() != w ||
                         slot.prev->height() != h) {
                         slot.prev = GpuImage::create(
@@ -3037,7 +3102,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             case GraphNode::Kind::Flow: {
                 const uint32_t push[3] = {w, h,
                                           prev_frame_valid_ ? 1u : 0u};
-                const GpuImage* sampled[2] = {plane_y_.get(), prev_plane};
+                const GpuImage* sampled[2] = {ref_plane, prev_plane};
                 flow_->dispatch(rec, arena_, frame_index, sampled, 2, &dst, 1,
                                 push, sizeof(push), dst->width(),
                                 dst->height(), linear_sampler_);
@@ -3072,28 +3137,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         if (node.kind == GraphNode::Kind::Effect &&
             node.effect_index >= 0 && node.layer_index >= 0) {
             const doc::EffectInstance& tfx =
-                doc.layers[static_cast<size_t>(node.layer_index)]
+                look.layers[static_cast<size_t>(node.layer_index)]
                     .stack[static_cast<size_t>(node.effect_index)];
             record_thumb_tap(rec, frame_index, dst, tfx.id);
         } else if (node.kind == GraphNode::Kind::Source ||
                    node.kind == GraphNode::Kind::Generator ||
                    node.kind == GraphNode::Kind::LayerTransform) {
-            if (node.layer_index >= 0) {
+            if (node.layer_index >= 0)
                 record_thumb_tap(
                     rec, frame_index, dst,
-                    doc.layers[static_cast<size_t>(node.layer_index)].id |
+                    look.layers[static_cast<size_t>(node.layer_index)].id |
                         kThumbSourceBit);
-            } else if (index == 0) {
-                // The shared playhead source backs every untrimmed clip
-                // layer's card.
-                for (const doc::Layer& tl : doc.layers)
-                    if (tl.visible &&
-                        tl.source == doc::LayerSourceKind::Clip &&
-                        !doc::layer_has_trim(tl) &&
-                        !doc::layer_has_transform(tl))
-                        record_thumb_tap(rec, frame_index, dst,
-                                         tl.id | kThumbSourceBit);
-            }
         }
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
@@ -3108,9 +3162,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     record_thumb_tap(rec, frame_index,
                      results[static_cast<size_t>(graph.output)], 0);
     out->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (out_source && results[0]) {
-        results[0]->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        *out_source = results[0];
+    if (out_source && graph.source >= 0 &&
+        results[static_cast<size_t>(graph.source)]) {
+        GpuImage* ref = results[static_cast<size_t>(graph.source)];
+        ref->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        *out_source = ref;
     }
     // Segmented (Codec-Box) evaluation ran on internal command buffers; the
     // caller's cmd records nothing — flush the tail segment so the result
@@ -3141,7 +3197,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                  0, nullptr, 0, nullptr);
             cio.pending = true;
             cio.pending_ctx = cache_ctx;
-            cio.pending_frame = timeline_frame;
+            cio.pending_frame = cache_frame;
             cio.pending_w = w;
             cio.pending_h = h;
         }

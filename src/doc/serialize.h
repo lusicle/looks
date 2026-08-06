@@ -6,6 +6,12 @@
 // (json::Value typed reads never throw), unknown effect types are skipped,
 // and id counters are re-derived from the highest id seen so a hand-edited
 // file can never mint duplicate ids.
+//
+// Version 4: two entities. Looks are timeless graphs (clip nodes with a
+// slip, generators, nested look/sequence refs - no placements, no audio
+// of their own); sequences arrange placements on video lanes and audio
+// tracks and carry the timeline region. Older files do not load - no
+// userbase, no migration path.
 
 #pragma once
 
@@ -18,7 +24,7 @@
 
 namespace looks::doc {
 
-inline constexpr int kProjectVersion = 1;
+inline constexpr int kProjectVersion = 5;
 
 json::Value doc_to_json(const Document& doc);
 Document doc_from_json(const json::Value& v);

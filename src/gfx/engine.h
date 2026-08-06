@@ -50,15 +50,22 @@ public:
     // timeline_frame/fps feed the deterministic per-frame randomness and
     // clocked effects (fixed timestep on frame index).
 
-    // Per-layer trim: a layer whose trim selects a different clip
-    // frame than the playhead gets its own decoded planes for this render.
-    // Callers decode (trim_in + remapped frame, clamped to the segment) and
-    // keep the planes alive through render().
+    // Clip sources: EVERY placement decodes its own frame (docs/look.md
+    // phase 4 — there is no shared playhead frame). The caller's decode
+    // pool maps each placement to its source frame and keeps the planes
+    // alive through render(); a key with no entry renders black.
     struct LayerSourceFrame {
-        int layer_index = -1;
+        // The instance-scoped key of the placement these planes belong
+        // to: hash(instance path, layer id), matching GraphNode::key.
+        uint64_t key = 0;
         SourcePlanes planes;
     };
 
+    // cache_frame is what the cache keys on: the PLAYHEAD frame, not
+    // timeline_frame. Under a speed ramp several playhead frames land on
+    // one timeline position with different modulation, so the playhead is
+    // the only index that identifies an output frame. Ignored when
+    // cache_ctx is 0.
     // cache_ctx != 0 enables the frame render cache for this
     // render: a hit skips the whole graph and re-uploads the stored frame;
     // a miss arms a deferred readback harvested kFramesInFlight renders
@@ -67,20 +74,29 @@ public:
     // (doc::document_uses_history) or determinism is not frame-indexed
     // (live mode) — the engine does not re-check.
     // out_source (A/B wipe / bypass-all): when non-null, receives
-    // the converted linear-RGB source frame (kept alive alongside the
-    // final target, SHADER_READ_ONLY) — or nullptr when unavailable (cache
-    // hit). Callers comparing A/B should pass cache_ctx 0.
+    // the converted linear-RGB REFERENCE source — the first clip source
+    // playing in the rendered look (kept alive alongside the final target,
+    // SHADER_READ_ONLY) — or nullptr when unavailable (cache hit, or a
+    // look with no clip playing). Callers comparing A/B pass cache_ctx 0.
     // preview_node: publish the named node's output instead of
-    // the composite (selection-follows preview). Callers hashing the
-    // render-cache context must include it; export passes 0.
+    // the composite (selection-follows preview). preview_layer: publish
+    // the named LAYER's whole contribution (chain end, pre-blend);
+    // preview_node outranks it. Callers hashing the render-cache context
+    // must include both; export passes 0.
+    // root_id names which entity renders: the scoped sequence or look in
+    // preview, the exported sequence in export.
+    // canvas_w/canvas_h are the PROJECT's working resolution
+    // (doc::canvas_size) — the clip under the playhead never decides it.
     GpuImage* render(VkCommandBuffer cmd, uint32_t frame_index,
-                     const SourcePlanes& source, const doc::Document& doc,
-                     uint32_t timeline_frame, double fps,
-                     uint64_t cache_ctx = 0,
+                     const doc::Document& doc,
+                     uint64_t root_id, uint32_t timeline_frame, double fps,
+                     uint32_t canvas_w, uint32_t canvas_h,
+                     uint64_t cache_ctx = 0, uint32_t cache_frame = 0,
                      GpuImage** out_source = nullptr,
                      const LayerSourceFrame* layer_sources = nullptr,
                      size_t layer_source_count = 0,
-                     uint64_t preview_node = 0);
+                     uint64_t preview_node = 0,
+                     uint64_t preview_layer = 0);
 
     RenderCache& cache() { return cache_; }
 
@@ -131,7 +147,7 @@ private:
         : device_(device), arena_(device), pool_(device) {}
 
     bool init(const std::filesystem::path& shader_dir);
-    bool ensure_planes(uint32_t width, uint32_t height);
+    bool ensure_prev_ref(uint32_t width, uint32_t height);
     bool ensure_codec_io(uint32_t width, uint32_t height);
     VkCommandBuffer codec_begin_segment();
     void codec_flush_segment();
@@ -140,11 +156,14 @@ private:
     DescriptorArena arena_;
     TargetPool pool_;
     std::unique_ptr<StagingBuffer> staging_[kFramesInFlight];
-    std::unique_ptr<GpuImage> plane_y_, plane_u_, plane_v_;   // R8 uploads
-    // Previous frame's luma for flow/motion. Valid only when this
-    // render's timeline frame directly follows the last one (sequential
-    // playback/export); a seek yields zero flow for one frame.
+    // Previous frame's REFERENCE luma for flow/motion. Valid only when
+    // this render's timeline frame directly follows the last one AND the
+    // reference is still the same source (sequential playback/export); a
+    // seek or a cut yields zero flow for one frame.
     std::unique_ptr<GpuImage> prev_y_;
+    // Flat-black stand-in when the look holds no clip source at all.
+    std::unique_ptr<GpuImage> dummy_y_;
+    uint64_t last_ref_key_ = 0;
     uint32_t last_timeline_frame_ = 0;
     bool have_last_frame_ = false;
     bool prev_frame_valid_ = false;
@@ -205,7 +224,9 @@ private:
     // Runs one codec-box frame fully on the GPU (no readback, no fence)
     // and composites into dst. Only legal when the params need no real
     // bitstream (no byte flips, no bitrate budget).
+    // state_key is the instance-scoped slot id (GraphNode::key).
     bool mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
+                      uint64_t state_key,
                       const codec::MoshParams& mp, const GpuImage* in,
                       GpuImage* flow_img, uint32_t w, uint32_t h,
                       uint32_t frame_index, uint32_t timeline_frame,
@@ -285,13 +306,15 @@ private:
     std::unordered_map<uint64_t, HoldSlot> hold_state_;
     uint32_t preview_divisor_ = 1;
 
-    // Per-layer private source planes (trim), uploaded fresh each
-    // render that provides frames for that layer.
+    // Private source planes for placed layers, uploaded fresh each render
+    // that provides frames for them. Keyed by the INSTANCE-scoped node key
+    // (docs/look.md), not a layer index: two placements of one look each
+    // want their own decoded frame.
     struct LayerPlanes {
         std::unique_ptr<GpuImage> y, u, v;
         uint32_t width = 0, height = 0;
     };
-    std::unordered_map<int, LayerPlanes> layer_planes_;
+    std::unordered_map<uint64_t, LayerPlanes> layer_planes_;
     std::unique_ptr<ComputePipeline> layer_transform_;
 
     // Reaction-diffusion: persistent Gray-Scott (A, B) state,

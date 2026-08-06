@@ -1,5 +1,6 @@
 // Emits an ordinary grayscale image, so the result can feed a matte port
-// or simply keep going through the chain.
+// or simply keep going through the chain. Output mode cutout instead
+// carves the key into premultiplied alpha - the input survives, gated.
 
 #include "fx_common.slang"
 
@@ -20,6 +21,7 @@ cbuffer Push
     float white_pt;
     float gamma_v;
     float invert_amt;
+    float out_mode;   // 0 grayscale matte image, 1 premultiplied cutout
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -64,7 +66,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     v = pow(v, max(gamma_v, 0.01));
     v = lerp(v, 1.0 - v, saturate(invert_amt));
 
-    const float4 result = float4(fx_srgb_eotf(float3(v, v, v)), base.a);
+    const float4 result =
+        int(out_mode + 0.5) == 1
+            ? base * v
+            : float4(fx_srgb_eotf(float3(v, v, v)), base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }
