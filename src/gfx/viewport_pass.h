@@ -30,12 +30,16 @@ public:
     // clip_x0/clip_x1 (fractions of the fitted rect) confine the draw
     // horizontally — the A/B before-after wipe is two draws with
     // complementary clips. alpha_mode: 0 flattens the composite's
-    // alpha over black, 1 over a checkerboard.
+    // alpha over black, 1 over a checkerboard. bound_* (physical px,
+    // bound_w <= 0 = none) further clamps the scissor — the monitor
+    // zoom scales dst past its panel and must not paint outside it.
     void draw(VkCommandBuffer cmd, DescriptorArena& arena, uint32_t frame_index,
               GpuImage& image, VkSampler sampler, VkExtent2D extent,
               float dst_x, float dst_y, float dst_w, float dst_h,
               float clip_x0 = 0.0f, float clip_x1 = 1.0f,
-              uint32_t alpha_mode = 0);
+              uint32_t alpha_mode = 0, float bound_x = 0.0f,
+              float bound_y = 0.0f, float bound_w = -1.0f,
+              float bound_h = -1.0f);
 
 private:
     explicit ViewportPass(Device& device) : device_(device) {}

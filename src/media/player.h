@@ -1,4 +1,4 @@
-// Transport: the TIMELINE's master clock (docs/look.md phase 4).
+// Transport: the TIMELINE's master clock.
 //
 // This used to be a clip player - it owned a mezzanine reader, a decode
 // ring, and a clock driven by one clip's PCM. None of that survives the

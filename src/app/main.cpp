@@ -1,6 +1,6 @@
 // looks — the app shell.
 //
-// The timeline is the clock (docs/look.md phase 4): the transport runs the
+// The timeline is the clock: the transport runs the
 // scoped look's local time, the decode pool decodes one frame per clip
 // PLACEMENT in the instance tree, and the engine composites them into the
 // project canvas → letterboxed viewport blit, with the UI on top.
@@ -21,6 +21,7 @@
 #include <memory>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -191,10 +192,10 @@ std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
 struct AppState;
 void open_source(AppState& app, const std::filesystem::path& picked);
 
-// ---- look scope + the project's clip (docs/look.md)
+// ---- look scope + the project's clip
 
-// The clip a single-asset project plays: assets[0] until the decode pool
-// lands (phase 4). Empty when nothing is bound.
+// The project's first asset's path - the fallback clip for helpers that
+// need one representative media file. Empty when nothing is imported.
 inline std::string primary_clip_path(const doc::Document& doc) {
     const doc::Asset* a = doc.primary_asset();
     return a ? a->path : std::string();
@@ -361,8 +362,23 @@ inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
 // around player open/close, where MezReader ownership moves.
 struct RenderWorker {
     struct Job {
-        doc::Document doc;
+        // Immutable snapshot, shared by pointer: the UI builds it once
+        // per revision OUTSIDE the lock and the worker just retains it -
+        // per-gesture-frame document copies (and the mutex hold while
+        // copying) are what made drags stutter.
+        std::shared_ptr<const doc::Document> doc;
         uint64_t doc_revision = ~0ull;
+        // A coalescing gesture is mutating the doc every frame: skip
+        // render-cache hashing/readback (never reusable mid-drag).
+        bool interactive = false;
+        // Gesture overlay: a lone coalesced placement edit rides as an
+        // O(1) payload the worker applies onto its own copy - during a
+        // drag NO document snapshot is built or copied anywhere, which
+        // is what keeps gesture cadence at render speed on any project
+        // size. Release pushes a full snapshot (link groups heal there).
+        uint64_t gesture_revision = 0;
+        uint64_t gesture_seq = 0;
+        doc::Placement gesture_place{};
         mod::AnalysisCurves analysis;
         bool has_analysis = false;
         uint64_t analysis_stamp = ~0ull;
@@ -370,13 +386,16 @@ struct RenderWorker {
         // pool resolves placements through this, not through the document.
         std::vector<media::AssetBundle> bundles;
         uint64_t bundle_stamp = ~0ull;
-        // The look being previewed (docs/look.md): the editing scope.
+        // The look being previewed: the editing scope.
         uint64_t look_id = 0;
         // Selection-follows preview: node whose output the big
         // preview publishes; 0 = the composite. preview_layer taps a
         // LAYER's whole contribution instead (node outranks layer).
         uint64_t preview_node = 0;
         uint64_t preview_layer = 0;
+        // Sequence-scope selected block: the render measures its
+        // pre-Motion alpha bounds for the monitor's content box.
+        uint64_t sel_placement = 0;
         uint32_t preview_div = 1;
         bool live_mode = false;
         double app_seconds = 0.0;
@@ -401,10 +420,17 @@ struct RenderWorker {
     struct View {
         gfx::GpuImage* final_img = nullptr;    // SHADER_READ_ONLY or null
         gfx::GpuImage* source_img = nullptr;   // when want_source was set
-        // Node-canvas thumbnails (docs/flow_canvas.md): the published
+        // Node-canvas thumbnails: the published
         // atlas + cell map snapshot consistent with it.
         gfx::GpuImage* thumb_img = nullptr;
         std::unordered_map<uint64_t, uint32_t> thumb_cells;
+        // Which document this frame rendered (gesture-glued overlays)
+        // and the measured alpha bounds of the selected block, canvas
+        // fractions - valid only for bounds_placement.
+        uint64_t doc_revision = 0;
+        float bounds[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        bool bounds_valid = false;
+        uint64_t bounds_placement = 0;
     };
 
     RenderWorker(gfx::Device& dev, media::Player& p,
@@ -490,11 +516,35 @@ struct RenderWorker {
         v.source_img = p.has_source ? p.source_img.get() : nullptr;
         v.thumb_img = p.has_thumbs ? p.thumb_img.get() : nullptr;
         if (p.has_thumbs) v.thumb_cells = p.thumb_cells;
+        v.doc_revision = p.doc_revision;
+        for (int i = 0; i < 4; ++i) v.bounds[i] = p.bounds[i];
+        v.bounds_valid = p.bounds_valid;
+        v.bounds_placement = p.bounds_placement;
         return v;
     }
 
     void set_completed_ui_frame(uint64_t f) {
         completed_ui_frame_.store(f, std::memory_order_relaxed);
+    }
+
+    // Distinct TIMELINE frames published so far: the UI's playback-rate
+    // counter samples this - re-renders of one frame do not count, so a
+    // heavy stack that drops below realtime reads honestly.
+    uint64_t frames_advanced() const {
+        return frames_advanced_.load(std::memory_order_relaxed);
+    }
+
+    // Render-cycle wall time (render decision -> successful publish,
+    // retries included), smoothed. The menu bar's "rt" readout - gesture
+    // stutter reads directly as this number. The phases split it:
+    // d decode wait, r modulation resolve, c command recording (codec
+    // segments included), g the GPU fence wait.
+    double cycle_ms() const {
+        return cycle_ms_x100_.load(std::memory_order_relaxed) / 100.0;
+    }
+    double phase_ms(int i) const {
+        return phase_ms_x100_[i & 3].load(std::memory_order_relaxed) /
+               100.0;
     }
 
     void post_glyph_atlas(std::vector<uint8_t> data, uint32_t w, uint32_t h,
@@ -548,6 +598,10 @@ private:
         bool has_thumbs = false;   // atlas copy recorded at least once
         bool ready = false;
         uint64_t last_ui_frame = 0;
+        uint64_t doc_revision = 0;
+        float bounds[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        bool bounds_valid = false;
+        uint64_t bounds_placement = 0;
     };
 
     void run();
@@ -560,6 +614,9 @@ private:
     std::vector<Published> published_;
     int latest_ = -1;
     std::atomic<uint64_t> completed_ui_frame_{0};
+    std::atomic<uint64_t> frames_advanced_{0};
+    std::atomic<uint32_t> cycle_ms_x100_{0};
+    std::atomic<uint32_t> phase_ms_x100_[4] = {};
     // Old-size images wait here until the UI frames that sampled them have
     // retired.
     std::vector<std::pair<uint64_t, std::unique_ptr<gfx::GpuImage>>>
@@ -617,7 +674,14 @@ void RenderWorker::run() {
     media::DecodePool pool;
     mod::TimeRemap remap;
 
-    doc::Document doc;
+    std::shared_ptr<const doc::Document> doc_snap;
+    // Gesture overlays mutate a lazily-made local copy (one copy at
+    // gesture start, O(1) per frame after); outside gestures the shared
+    // snapshot is read directly. doc_revision is the EFFECTIVE revision
+    // (base or overlay) - it feeds the decode pool and the cache hash.
+    doc::Document doc_local;
+    bool local_valid = false;
+    uint64_t base_revision = ~0ull;
     uint64_t doc_revision = ~0ull;
     mod::AnalysisCurves analysis;
     bool has_analysis = false;
@@ -632,14 +696,16 @@ void RenderWorker::run() {
     bool last_had_frame = false;
     bool pending_render = false;
     uint32_t slot = 0;
+    std::chrono::steady_clock::time_point cycle_start{};
 
     for (;;) {
         // Small-field snapshot; doc/analysis copied only on change.
-        uint64_t preview_node, preview_layer, look_id;
+        uint64_t preview_node, preview_layer, look_id, sel_placement;
         uint32_t preview_div;
-        bool live_mode, want_source, proxy_active;
+        bool live_mode, want_source, proxy_active, interactive;
         double app_seconds, env_key_time;
         bool doc_changed = false;
+        bool fields_changed = false;
         {
             std::unique_lock<std::mutex> lock(m_);
             idle_ = true;
@@ -651,10 +717,28 @@ void RenderWorker::run() {
             if (quit_) return;
             if (pause_count_ > 0) continue;
             idle_ = false;
+            // The serial bumps only on REAL job-field changes (selection,
+            // scope, proxy...) - a paused preview re-renders on those too.
+            fields_changed = job_serial_ != last_serial;
             last_serial = job_serial_;
-            if (job_.doc_revision != doc_revision) {
-                doc = job_.doc;
-                doc_revision = job_.doc_revision;
+            if (job_.doc_revision != base_revision && job_.doc) {
+                doc_snap = job_.doc;   // pointer retain, no copy
+                base_revision = job_.doc_revision;
+                doc_revision = base_revision;
+                local_valid = false;
+                doc_changed = true;
+            }
+            if (job_.gesture_revision > doc_revision && doc_snap) {
+                if (!local_valid) {
+                    doc_local = *doc_snap;   // once per gesture start
+                    local_valid = true;
+                }
+                if (doc::Sequence* gs =
+                        doc_local.find_sequence(job_.gesture_seq))
+                    if (doc::Placement* gp = doc::find_placement(
+                            *gs, job_.gesture_place.id))
+                        *gp = job_.gesture_place;
+                doc_revision = job_.gesture_revision;
                 doc_changed = true;
             }
             if (job_.analysis_stamp != analysis_stamp) {
@@ -696,6 +780,7 @@ void RenderWorker::run() {
             }
             preview_node = job_.preview_node;
             preview_layer = job_.preview_layer;
+            sel_placement = job_.sel_placement;
             look_id = job_.look_id;
             preview_div = job_.preview_div;
             live_mode = job_.live_mode;
@@ -703,7 +788,10 @@ void RenderWorker::run() {
             env_key_time = job_.env_key_time;
             want_source = job_.want_source;
             proxy_active = job_.proxy_active;
+            interactive = job_.interactive;
         }
+        if (!doc_snap) continue;   // nothing pushed yet
+        const doc::Document& doc = local_valid ? doc_local : *doc_snap;
 
         // The transport runs whether or not any media is loaded — a look
         // of generators is a perfectly good thing to render. Without an
@@ -714,12 +802,14 @@ void RenderWorker::run() {
         // Idle: nothing moved, nothing changed, nothing owed — skip. A
         // pending dither walk counts as owed: one settle pass joins it so
         // paused frames show the finished result without interaction.
-        if (!doc_changed && !pending_render && !live_mode &&
-            last_had_frame && mod_frame == last_rendered_frame &&
-            !engine->ed_walk_pending())
+        if (!doc_changed && !fields_changed && !pending_render &&
+            !live_mode && last_had_frame &&
+            mod_frame == last_rendered_frame && !engine->ed_walk_pending())
             continue;
         // A decided render stays owed until it actually publishes (a
         // busy publish ring must retry, not stall).
+        if (!pending_render)
+            cycle_start = std::chrono::steady_clock::now();
         pending_render = true;
 
         const double mod_fps = player.fps() > 0.0 ? player.fps() : 30.0;
@@ -741,12 +831,14 @@ void RenderWorker::run() {
 
         // Clip pixels: one decoded frame per PLACEMENT in the instance
         // tree, keyed exactly as the compiler keys its Source nodes.
+        const auto tp0 = std::chrono::steady_clock::now();
         pool.set_document(doc, look_id, bundles, doc_revision);
         const std::vector<media::SourceFrame>& decoded =
             pool.collect(play_frame);
+        const auto tp1 = std::chrono::steady_clock::now();
         const auto lsrc = to_layer_sources(decoded);
 
-        // Video-sampling sources (docs/flow_canvas.md) read the exact
+        // Video-sampling sources read the exact
         // frame this pass renders: the reference source, which is what
         // the A/B wipe and the motion field read too.
         mod::SourceFrameView sfv;
@@ -766,13 +858,17 @@ void RenderWorker::run() {
             doc, mod_frame, mod_fps, has_analysis ? &analysis : nullptr,
             live_mode ? app_seconds : -1.0, live_mode ? env_key_time : -1.0,
             &sfv);
+        const auto tp2 = std::chrono::steady_clock::now();
         engine->set_preview_divisor(preview_div);
         engine->cache().set_budget(static_cast<size_t>(doc.cache_mb) << 20);
 
         // Frame render cache context — the doc-hash leg is
-        // recomputed only when the document changed.
+        // recomputed only when the document changed. During a coalescing
+        // gesture the whole leg is skipped: the doc re-hashes (a full
+        // JSON serialize) and the cache re-arms a full-frame readback
+        // EVERY frame for entries the next frame invalidates.
         uint64_t cache_ctx = 0;
-        if (!live_mode && !want_source && doc.cache_mb > 0) {
+        if (!live_mode && !want_source && !interactive && doc.cache_mb > 0) {
             if (cache_hash_revision != doc_revision) {
                 cache_hash_revision = doc_revision;
                 const std::string doc_json =
@@ -837,7 +933,7 @@ void RenderWorker::run() {
             canvas_h, cache_ctx, mod_frame,
             want_source ? &source_image : nullptr,
             lsrc.empty() ? nullptr : lsrc.data(), lsrc.size(),
-            preview_node, preview_layer);
+            preview_node, preview_layer, sel_placement);
         slot = (slot + 1) % gfx::kFramesInFlight;
 
         bool published_ok = false;
@@ -888,6 +984,7 @@ void RenderWorker::run() {
             published_ok = true;
         }
         vkEndCommandBuffer(cmd_);
+        const auto tp3 = std::chrono::steady_clock::now();
 
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
@@ -899,14 +996,57 @@ void RenderWorker::run() {
                 continue;
         }
         vkWaitForFences(device.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+        {
+            const auto tp4 = std::chrono::steady_clock::now();
+            auto ema_ms = [&](std::atomic<uint32_t>& cell, auto a, auto b) {
+                const double ms =
+                    std::chrono::duration<double, std::milli>(b - a)
+                        .count();
+                const double prev =
+                    cell.load(std::memory_order_relaxed) / 100.0;
+                const double ema =
+                    prev <= 0.0 ? ms : prev * 0.7 + ms * 0.3;
+                cell.store(
+                    static_cast<uint32_t>(std::min(ema * 100.0, 4.0e9)),
+                    std::memory_order_relaxed);
+            };
+            ema_ms(phase_ms_x100_[0], tp0, tp1);   // decode wait
+            ema_ms(phase_ms_x100_[1], tp1, tp2);   // modulation resolve
+            ema_ms(phase_ms_x100_[2], tp2, tp3);   // record + segments
+            ema_ms(phase_ms_x100_[3], tp3, tp4);   // gpu fence
+        }
 
         if (published_ok) {
-            std::lock_guard<std::mutex> lock(m_);
-            pub.ready = true;
-            latest_ = target;
+            // Post-fence: the alpha-bounds copy has landed.
+            float mb[4];
+            const bool mb_ok = engine->read_measure_bounds(mb);
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                pub.doc_revision = doc_revision;
+                pub.bounds_valid = mb_ok;
+                pub.bounds_placement = mb_ok ? sel_placement : 0;
+                if (mb_ok)
+                    for (int i = 0; i < 4; ++i) pub.bounds[i] = mb[i];
+                pub.ready = true;
+                latest_ = target;
+            }
+            if (!last_had_frame || mod_frame != last_rendered_frame)
+                frames_advanced_.fetch_add(1, std::memory_order_relaxed);
         }
         last_rendered_frame = mod_frame;
         last_had_frame = true;
+        {
+            const double ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cycle_start)
+                    .count();
+            const double prev =
+                cycle_ms_x100_.load(std::memory_order_relaxed) / 100.0;
+            const double ema = prev <= 0.0 ? ms : prev * 0.7 + ms * 0.3;
+            cycle_ms_x100_.store(
+                static_cast<uint32_t>(std::min(ema * 100.0, 4.0e9)),
+                std::memory_order_relaxed);
+        }
         pending_render = false;
     }
 }
@@ -951,7 +1091,7 @@ std::vector<int16_t> load_scope_audio(const std::filesystem::path& pcm_path,
 // Offline export worker: private MezReader + Engine + readback on a copied
 // document — the preview loop keeps running; queue submits are serialized
 // by the device mutex. export_look_id names what renders (the project's
-// root look, or one look on its own — docs/look.md).
+// root look, or one look on its own).
 std::unique_ptr<ExportJob> start_export(
     gfx::Device& device, const std::filesystem::path& shader_dir,
     const std::vector<media::AssetBundle>& bundles, const PcmCache& pcm,
@@ -1176,7 +1316,7 @@ struct RulerState {
     double loop_anchor = 0.0;   // frame where the loop drag started
 };
 
-// Flow-canvas selection (docs/flow_canvas.md): the inspector shows exactly
+// Flow-canvas selection: the inspector shows exactly
 // one selected thing. View state — never document state, no undo.
 enum class SelKind : uint8_t {
     None, Effect, Group, LayerSource, ModSource, Output,
@@ -1345,7 +1485,7 @@ struct AppState {
     // working the graph is working inside the layer.
     bool layer_sel = false;
 
-    // Node canvas (docs/flow_canvas.md): selection drives the rail;
+    // Node canvas: selection drives the rail;
     // insert_before anchors splicing (a flow node id; 0 = chain end).
     Selection sel;
     // Multi-selection (canvas node ids): outlines, group move, group
@@ -1410,7 +1550,7 @@ struct AppState {
     // Inspector tabs: 0 = node (selection context), 1 = project (clip +
     // project — the old left rail), 2 = presets (the browser).
     int inspector_tab = 0;
-    ui::ButtonState tab_buttons[3];
+    ui::ButtonState tab_buttons[4];
     // Menu bar (file / edit / view over the dropdown popup machinery).
     ui::DropdownState menu_states[3];
 
@@ -1446,7 +1586,7 @@ struct AppState {
 
     // UI preferences — app-level view state persisted in ui.json next to
     // the exe (deliberately not project state): active theme + sidebar
-    // section folds (layers, stack, presets, mod matrix).
+    // section folds (layers, stack, presets, wires).
     int theme_index = 0;
     bool sec_open[5] = {true, true, true, true, true};
     ui::ButtonState sec_buttons[5];
@@ -1464,7 +1604,7 @@ struct AppState {
     // one-frame-stale copy.
     ui::Rect tl_rect{}, tl_rect_accum{};
     float tl_strip_x = 0.0f, tl_strip_w = 0.0f;   // ruler column x span
-    // Block lanes (docs/look.md phase 5): one drag at a time. Mode 0
+    // Block lanes: one drag at a time. Mode 0
     // idle, 1 move, 2 trim-in, 3 trim-out; anchor is the frame under the
     // press. Widget-id anchors per lane row (stable addresses).
     // The picked BLOCK (view state, 0 = none): Delete removes it with
@@ -1534,7 +1674,7 @@ struct AppState {
     bool fx_cat_open[static_cast<size_t>(doc::FxCategory::Count)] = {};
     ui::ButtonState add_fx_button,
         fx_cat_buttons[static_cast<size_t>(doc::FxCategory::Count)];
-    // Add-node search (docs/flow_canvas.md): same capture-the-keyboard
+    // Add-node search: same capture-the-keyboard
     // field pattern as the preset search; non-empty = flat filtered list.
     std::string fx_filter;
     bool fx_search_focus = false;
@@ -1570,7 +1710,7 @@ struct AppState {
 
     // Widget state
     std::unordered_map<uint64_t, LayerUiState> layer_ui;
-    // Audio lane label controls (docs/look.md): per-track gain + mute -
+    // Audio lane label controls: per-track gain + mute -
     // the per-track half of the mixer.
     struct AudioLaneUi {
         ui::SliderState gain;
@@ -1582,7 +1722,17 @@ struct AppState {
         ui::ButtonState open, place;
     };
     std::unordered_map<uint64_t, BrowserRowUi> browser_ui;
-    ui::ButtonState new_seq_button;
+    ui::ButtonState new_seq_button, browser_new_look_button, new_bin_button;
+    // Browser tree view state: closed bins (absent = open), the row
+    // being renamed inline, and the drag-into-bin gesture.
+    std::unordered_set<uint64_t> bin_closed;
+    uint64_t browser_rename_id = 0;
+    std::string browser_rename_buf;
+    bool browser_rename_commit = false;
+    uint64_t browser_drag_id = 0;
+    bool browser_drag_is_bin = false;
+    bool browser_drag_live = false;
+    Vec2 browser_drag_from{};
     std::unordered_map<uint64_t, GroupUiState> group_ui;
     std::map<std::string, ui::ButtonState> preset_buttons;
     ui::DropdownState tag_dd;
@@ -1635,10 +1785,87 @@ struct AppState {
     ui::ScrubberState scrubber;
     ui::ButtonState loop_check;
     ui::ScrollState sidebar_scroll, right_scroll, preset_scroll;
+    ui::ScrollState browser_scroll;
+    // Browser view state: selected row, double-click clock, search.
+    uint64_t browser_sel = 0;
+    uint64_t browser_click_id = 0;
+    uint64_t browser_click_frame = 0;
+    std::string browser_filter;
+    bool browser_search_focus = false;
+    ui::ButtonState browser_search_btn;
+    // Playback-rate readout: sampled from the worker's advance counter
+    // (the UI loop runs detached, so its own rate says nothing).
+    double play_fps = 0.0;
+    uint64_t play_fps_count = 0;
+    double play_fps_time = 0.0;
+    ui::DropdownState project_fps_dd, project_res_dd;
+    // Program-monitor direct manipulation (sequence scope): the selected
+    // block's move/scale/rotate drag in flight.
+    ui::ButtonState monitor_ws;
+    int mon_mode = 0;   // 0 idle, 1 move, 2 scale, 3 rotate
+    Vec2 mon_anchor{};
+    doc::Placement mon_orig{};
+    ui::SliderState block_xf_sliders[5];
+    // The displayed frame's provenance: which doc revision it rendered
+    // and the measured content box of the selected block (canvas
+    // fractions). The overlay draws GLUED to the displayed frame -
+    // during a gesture the box follows the image, not the mouse, so the
+    // two never visibly separate. xf_history maps revisions staged by
+    // recent gestures to their placement values.
+    uint64_t view_doc_revision = 0;
+    float view_bounds[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    bool view_bounds_valid = false;
+    uint64_t view_bounds_placement = 0;
+    std::deque<std::pair<uint64_t, doc::Placement>> xf_history;
+    // Last document revision handed to the render worker (snapshots are
+    // built outside its lock, so the job compare lives app-side).
+    uint64_t pushed_doc_revision = ~0ull;
+    // Latest coalesced placement edit: revisions that are exactly this
+    // one gesture ride to the worker as an O(1) overlay payload - no
+    // document snapshot is built while a drag is in flight.
+    uint64_t gesture_revision = 0;
+    uint64_t gesture_seq = 0;
+    doc::Placement gesture_place{};
+    // The content box FROZEN at gesture start (source-uv offsets): the
+    // scale/rotate pivot and re-anchor math use this, never the live
+    // measured box - on animated content the live box moves every frame
+    // and a pivot chasing it reads as drift.
+    float mon_box[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
+    // Program monitor zoom/pan: 1 = aspect-fit; wheel over the preview
+    // scales about the cursor, middle-drag pans (the canvas gesture).
+    // View state, both scopes.
+    float mon_zoom = 1.0f;
+    Vec2 mon_pan{};
+    bool mon_panning = false;
+    Vec2 mon_pan_anchor{};
+    Vec2 mon_pan_orig{};
+    // Displayed image aspect (published dims, else canvas): the overlay,
+    // the blit and click-uv mapping must share one fit.
+    float mon_canvas_aspect = 16.0f / 9.0f;
     RulerState ruler;
+
+    // App-wide context menu (right-click on any non-canvas surface): one
+    // open menu drawn through the shared popup overlay. kind names the
+    // surface; a/b/key/at_frame mean what the kind says they mean. acts
+    // parallels labels row for row.
+    struct CtxMenu {
+        int kind = 0;
+        Vec2 anchor{};
+        uint64_t a = 0, b = 0;
+        doc::ParamKey key{};
+        float at_frame = 0.0f;
+        float value = 0.0f;
+        float def_v = 0.0f;
+        std::vector<const char*> labels;
+        std::vector<int> acts;
+        int pick = -1;
+    };
+    CtxMenu ctx_menu;
+    ui::DropdownState ctx_menu_dd;
+    ui::Rect win_rect{};   // this frame's viewport (menu clamping)
 };
 
-// ---- flow-canvas selection helpers (docs/flow_canvas.md)
+// ---- flow-canvas selection helpers
 
 bool find_effect_by_id(const doc::Look& look, uint64_t id,
                        size_t* layer_index, size_t* fx_index) {
@@ -1866,6 +2093,7 @@ void sync_sidechain(AppState& app) {
 void save_ui_prefs(const AppState& app) {
     json::Value v = json::Value::make_object();
     v.set("theme", ui::theme_name(app.theme_index));
+    v.set("tab", static_cast<int64_t>(app.inspector_tab));
     json::Value secs = json::Value::make_array();
     for (int i = 0; i < 5; ++i) secs.push(app.sec_open[i]);
     v.set("sections", std::move(secs));
@@ -1895,6 +2123,8 @@ void load_ui_prefs(AppState& app) {
     for (int i = 0; i < ui::theme_count(); ++i)
         if (parsed.value->get("theme").as_string() == ui::theme_name(i))
             app.theme_index = i;
+    app.inspector_tab = std::clamp(
+        static_cast<int>(parsed.value->get("tab").as_int(0)), 0, 3);
     const json::Array& secs = parsed.value->get("sections").array();
     for (size_t i = 0; i < secs.size() && i < 5; ++i)
         app.sec_open[i] = secs[i].as_bool(true);
@@ -2061,7 +2291,7 @@ uint64_t find_wrapper_look(const doc::Document& doc, uint64_t asset_id) {
 // twice. Returns false when the media has no usable bundle yet (the
 // caller imports first); everything it does lands in ONE undo step.
 bool place_clip_block(AppState& app, const std::filesystem::path& picked,
-                      uint32_t at_frame) {
+                      uint32_t at_frame, uint64_t track_id) {
     const BundlePaths paths = resolve_bundle(picked);
     if (!paths.ready) return false;
 
@@ -2107,12 +2337,17 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
     }
 
     doc::Sequence& seq = app.sequence();
-    if (seq.tracks.empty() ||
-        seq.tracks.front().placements.size() >=
-            doc::kMaxPlacementsPerTrack) {
+    // track_id 0 = the front lane (the drop path names a real one).
+    const doc::SeqTrack* lane = nullptr;
+    for (const doc::SeqTrack& t : seq.tracks)
+        if (t.id == track_id) lane = &t;
+    if (!lane && !seq.tracks.empty()) lane = &seq.tracks.front();
+    if (!lane ||
+        lane->placements.size() >= doc::kMaxPlacementsPerTrack) {
         app.status = "lane is full";
         return true;
     }
+    const uint64_t lane_id = lane->id;
     app.undo.begin_group("Add Clip");
     if (!asset_id) {
         doc::Asset asset = doc::make_asset(app.document,
@@ -2141,8 +2376,7 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
     block.t_out = 0;   // runs as long as the media does
     const uint64_t video_place_id = block.id;
     app.undo.execute(app.document,
-                     doc::add_placement_command(
-                         seq.id, seq.tracks.front().id, block));
+                     doc::add_placement_command(seq.id, lane_id, block));
     // A clip WITH sound lays a linked audio placement beside the video
     // one: audio presence is a placement that exists, never an inference
     // from the asset. Silent media lays none.
@@ -2157,6 +2391,15 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
                          doc::add_audio_placement_command(
                              app.document, seq.id, audio_track, ap,
                              video_place_id));
+    }
+    // The landed block OVERWRITES whatever its span covers on the lane.
+    if (const doc::Placement* landed =
+            doc::find_placement(app.sequence(), video_place_id)) {
+        const uint32_t end = doc::placement_end(
+            *landed, doc::source_length(app.document, *landed));
+        doc::overwrite_lane_span(app.document, app.undo, seq.id, lane_id,
+                                 video_place_id, landed->link, at_frame,
+                                 end);
     }
     app.undo.end_group();
 
@@ -2176,7 +2419,8 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
 // `at_frame` - the browser's "+". At look scope it lands as a lockstep
 // ref NODE instead. Lays the linked audio placement when the target has
 // any sound under it; one undo step; cycle-guarded both ways.
-bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame) {
+bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame,
+                      uint64_t track_id) {
     const doc::Look* tl = app.document.find_look(target_id);
     const doc::Sequence* ts =
         tl ? nullptr : app.document.find_sequence(target_id);
@@ -2220,9 +2464,13 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame) {
         app.status = "that would loop - it cannot reach itself";
         return false;
     }
-    if (seq.tracks.empty() ||
-        seq.tracks.front().placements.size() >=
-            doc::kMaxPlacementsPerTrack) {
+    // track_id 0 = the front lane (the drop path names a real one).
+    const doc::SeqTrack* lane = nullptr;
+    for (const doc::SeqTrack& t : seq.tracks)
+        if (t.id == track_id) lane = &t;
+    if (!lane && !seq.tracks.empty()) lane = &seq.tracks.front();
+    if (!lane ||
+        lane->placements.size() >= doc::kMaxPlacementsPerTrack) {
         app.status = "lane is full";
         return false;
     }
@@ -2233,8 +2481,7 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame) {
     block.t_in = at_frame;
     const uint64_t video_place_id = block.id;
     app.undo.execute(app.document,
-                     doc::add_placement_command(
-                         seq.id, seq.tracks.front().id, block));
+                     doc::add_placement_command(seq.id, lane->id, block));
     // The pair rule: a target WITH sound arrives with its submix linked;
     // a silent one lays no audio placement at all.
     if (!doc::flatten_audio_sources(app.document, target_id).empty()) {
@@ -2247,6 +2494,15 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame) {
                          doc::add_audio_placement_command(
                              app.document, seq.id, audio_track, ap,
                              video_place_id));
+    }
+    // The landed block OVERWRITES whatever its span covers on the lane.
+    if (const doc::Placement* landed =
+            doc::find_placement(app.sequence(), video_place_id)) {
+        const uint32_t end = doc::placement_end(
+            *landed, doc::source_length(app.document, *landed));
+        doc::overwrite_lane_span(app.document, app.undo, seq.id, lane->id,
+                                 video_place_id, landed->link, at_frame,
+                                 end);
     }
     app.undo.end_group();
     // Arranging picks nothing - no node, no layer: the monitor keeps
@@ -2280,7 +2536,7 @@ void ensure_clip_placed(AppState& app,
                         if (p.target == wrapper) return;
         }
     }
-    place_clip_block(app, picked, app.player.current_frame_index());
+    place_clip_block(app, picked, app.player.current_frame_index(), 0);
 }
 
 // Generic IMPORT: the asset joins the browser and NOTHING is placed or
@@ -2900,12 +3156,32 @@ void draw_confirm_dialog(ui::Canvas2D& canvas, const ui::Font& font,
 // bumps the serial so the worker wakes when a re-render is due.
 void push_render_job(RenderWorker& w, AppState& app) {
     bool changed = false;
+    // One document copy per revision, built OUTSIDE the lock; the worker
+    // retains the pointer without copying. A revision that IS the
+    // in-flight gesture's placement edit skips the snapshot entirely and
+    // rides as the overlay payload instead - drags cost O(1) per frame
+    // no matter the project size. Release breaks coalescing, so the
+    // next frame snapshots and heals everything (link groups included).
+    std::shared_ptr<const doc::Document> snap;
+    const bool gesture_fresh =
+        app.undo.coalescing_active() &&
+        app.gesture_revision == app.document.revision &&
+        app.document.revision != app.pushed_doc_revision;
+    if (app.pushed_doc_revision != app.document.revision && !gesture_fresh)
+        snap = std::make_shared<const doc::Document>(app.document);
     {
         std::lock_guard<std::mutex> lock(w.m_);
         RenderWorker::Job& j = w.job_;
-        if (j.doc_revision != app.document.revision) {
-            j.doc = app.document;
+        if (snap) {
+            j.doc = std::move(snap);
             j.doc_revision = app.document.revision;
+            app.pushed_doc_revision = app.document.revision;
+            changed = true;
+        } else if (gesture_fresh &&
+                   j.gesture_revision != app.gesture_revision) {
+            j.gesture_revision = app.gesture_revision;
+            j.gesture_seq = app.gesture_seq;
+            j.gesture_place = app.gesture_place;
             changed = true;
         }
         if (j.analysis_stamp != app.analysis_stamp) {
@@ -2948,6 +3224,12 @@ void push_render_job(RenderWorker& w, AppState& app) {
             preview_layer_key = app.look().layers[app.selected_layer].id;
         set(j.preview_node, preview_key);
         set(j.preview_layer, preview_layer_key);
+        // The monitor's content box: measure the selected video block's
+        // alpha bounds (sequence scope only).
+        set(j.sel_placement,
+            app.scope_is_look() ? uint64_t{0} : app.sel_placement);
+        // Gesture in flight: the worker drops cache hash/readback work.
+        set(j.interactive, app.undo.coalescing_active());
         // The scoped ENTITY renders: the sequence's arrangement or the
         // look's graph - never a fallback.
         set(j.look_id, app.scope_look);
@@ -3152,7 +3434,7 @@ struct FrameUi {
         bool* released;
     };
     std::vector<LayerStage> layer_stages;
-    // Timeline blocks (docs/look.md phase 6): a block IS a placement on a
+    // Timeline blocks: a block IS a placement on a
     // track lane; a drag stages the whole placement, named by its id.
     struct BlockStage {
         uint64_t layer_id;
@@ -3191,18 +3473,44 @@ struct FrameUi {
     };
     std::vector<ClipRowBind> clip_row_binds;
     bool* import_media_clicked = nullptr;
-    // BROWSER (docs/look.md phase 6): the project tab lists what the user
+    // BROWSER: the project tab lists what the user
     // deliberately made - sequences and assets - never the internal graph
     // every clip carries. Open sets the editing scope; place lays a block
     // at the playhead.
     struct BrowserAction {
         uint64_t id;
-        bool* open = nullptr;    // sequences only
-        bool* place = nullptr;
+        bool* open = nullptr;    // double-click: scope into the entity
+        bool* place = nullptr;   // ctx "place at playhead"
+        bool* ctx = nullptr;     // right-click: the row's context menu
+        bool* select = nullptr;  // single click: browser selection
     };
     std::vector<BrowserAction> browser_looks;
     std::vector<BrowserAction> browser_assets;
     bool* new_sequence_clicked = nullptr;
+    bool* browser_new_look_clicked = nullptr;   // placed nowhere
+    bool* new_bin_clicked = nullptr;
+    bool* browser_search_clicked = nullptr;
+    struct BinRow {
+        uint64_t id;
+        bool* toggled;   // click folds/unfolds + selects (view state)
+        bool* ctx;
+    };
+    std::vector<BinRow> bin_rows;
+    // Every tree row's laid-out node, for drag-into-bin and hit checks.
+    struct BrowserNode {
+        uint64_t id;
+        bool is_bin;
+        ui::LayoutNode* node;
+    };
+    std::vector<BrowserNode> browser_nodes;
+    ui::LayoutNode* browser_panel = nullptr;   // background menu + drops
+    // Timeline lane widgets, for drag-from-browser drops.
+    struct LaneNode {
+        uint64_t track_id;
+        bool audio;
+        ui::LayoutNode* node;
+    };
+    std::vector<LaneNode> lane_nodes;
 
     // Audio track label controls: gain slider + mute chip per lane.
     struct AudioTrackStage {
@@ -3289,6 +3597,8 @@ struct FrameUi {
     float* speed_staged = nullptr;
     bool* speed_changed = nullptr;
     int* time_mode_selected = nullptr;   // dropdown pick; -1 = untouched
+    int* project_fps_selected = nullptr;
+    int* project_res_selected = nullptr;
     // Sidechain + audio nudge.
     int* sc_selected = nullptr;          // [clip, <file>, pick]; -1 untouched
     bool* sc_mux_changed = nullptr;
@@ -3335,7 +3645,255 @@ struct FrameUi {
         bool* clicked;
     };
     std::vector<TextEditOpen> text_edit_opens;
+
+    // Right-click context requests: each surface stages its target during
+    // the draw pass; the post-frame opener turns one into the app menu.
+    struct BlockCtx {
+        uint64_t track_id;      // owning video lane / audio track
+        uint64_t placement_id;
+        bool audio;
+        bool* clicked;
+        float* at_frame;        // sequence-local frame under the cursor
+    };
+    std::vector<BlockCtx> block_ctxs;
+    struct LaneCtx {
+        uint64_t track_id;
+        bool audio;
+        bool* clicked;
+    };
+    std::vector<LaneCtx> lane_ctxs;
+    bool* ruler_ctx = nullptr;
+    float* ruler_ctx_frame = nullptr;
+    struct ParamCtx {
+        doc::ParamKey key;
+        float value;
+        float def_v;
+        bool has_def;           // false = no meaningful reset target
+        bool* clicked;
+    };
+    std::vector<ParamCtx> param_ctxs;
+
+    // Placement transform edits (the monitor's handles and the block
+    // panel's sliders both stage whole placements; timing is untouched
+    // so nothing propagates to link groups but the named block).
+    struct PlacementXf {
+        uint64_t id;
+        doc::Placement* staged;
+        bool* changed;
+        bool* released;
+    };
+    std::vector<PlacementXf> placement_xfs;
 };
+
+// ---- app context menu (right-click surfaces outside the node canvas)
+
+enum CtxSurface : int {
+    kCtxNone = 0,
+    kCtxBlockVideo,     // a=track id, b=placement id, at_frame=cursor
+    kCtxBlockAudio,     // a=audio track id, b=placement id
+    kCtxLaneVideo,      // a=track id (empty lane space)
+    kCtxLaneAudio,      // a=audio track id (empty lane space)
+    kCtxRuler,          // at_frame=cursor
+    kCtxParam,          // key/value/def_v from the row
+    kCtxBrowserEntity,  // a=look or sequence id
+    kCtxBrowserAsset,   // a=asset id
+    kCtxBin,            // a=bin id
+    kCtxBrowserBg,      // browser panel background (root creations)
+    kCtxPreview,        // value/def_v = uv of the click inside the image
+};
+
+enum CtxItemAct : int {
+    kActOpenTarget,
+    kActRazorHere,
+    kActUnlinkGroup,
+    kActMakeUnique,
+    kActDuplicateBlock,
+    kActRemoveBlock,
+    kActMuteBlock,
+    kActResetBlockGain,
+    kActMarkerHere,
+    kActLoopInHere,
+    kActLoopOutHere,
+    kActClearLoop,
+    kActTrimInHere,
+    kActTrimOutHere,
+    kActKeyHere,
+    kActClearLane,
+    kActLaneLoop,
+    kActLaneMute,
+    kActWireLfo,
+    kActRemoveWire,
+    kActResetParam,
+    kActPlaceAtPlayhead,
+    kActRemoveEntity,
+    kActNewLookFromAsset,
+    kActStoreSnap0,     // 0/1/2 contiguous; apply follows the same order
+    kActStoreSnap1,
+    kActStoreSnap2,
+    kActApplySnap0,
+    kActApplySnap1,
+    kActApplySnap2,
+    kActToggleAb,
+    kActMonZoomFit,
+    kActSampleHere,
+    kActAddLaneAbove,
+    kActAddLaneBelow,
+    kActAddAudioTrack,
+    kActRemoveLane,
+    kActNewLook,
+    kActNewSequence,
+    kActImportMedia,
+    kActNewBinInside,
+    kActRemoveBin,
+    kActRename,
+    kActMoveToRoot,
+};
+
+// Project format presets (index 0 = derive from the first asset). The
+// dropdown builder and the pick handler share these one-to-one.
+inline constexpr double kProjectFpsValues[] = {0.0,  24.0, 25.0, 30.0,
+                                               48.0, 50.0, 60.0};
+inline constexpr uint32_t kProjectResW[] = {0, 1280, 1920, 1080, 2560,
+                                            3840};
+inline constexpr uint32_t kProjectResH[] = {0, 720, 1080, 1920, 1440,
+                                            2160};
+
+// Reset target for a layer-param row; false = the default depends on the
+// source kind (colors, generator scale), so the menu offers no reset.
+bool layer_field_reset(FrameUi::LayerField f, float* def) {
+    using LF = FrameUi::LayerField;
+    switch (f) {
+        case LF::Opacity:
+        case LF::XfScale:
+            *def = 1.0f;
+            return true;
+        case LF::Rotate:
+        case LF::Slip:
+        case LF::CropL:
+        case LF::CropR:
+        case LF::CropT:
+        case LF::CropB:
+            *def = 0.0f;
+            return true;
+        default:
+            return false;
+    }
+}
+
+// ---- browser tree row: one custom leaf per project item, project-panel
+// style. Alternating stripes carry the rows; a type chip colors the
+// kind (bin amber, sequence teal, look violet, asset steel); bins twirl
+// with stroke chevrons; selection wears the accent bar. Single click
+// selects (bins also fold), double-click opens, right-click stages the
+// row's context menu. Drag is app-side, keyed off the row rects.
+struct BrowseRowUser {
+    AppState* app;
+    uint64_t id;
+    int kind;        // 0 bin, 1 sequence, 2 look, 3 asset
+    const char* name;
+    int depth;
+    bool stripe;
+    bool open_bin;
+    bool scoped;
+    bool* clicked;
+    bool* opened;
+    bool* ctx;
+};
+
+Vec2 measure_browser_row(ui::LayoutNode&, const ui::Constraints& c,
+                         const ui::LayoutFrame&) {
+    return {c.bounded_w() ? c.max_w : 220.0f, 22.0f};
+}
+
+void hit_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<BrowseRowUser*>(node.user);
+    ui::Rect r = node.rect;
+    if (!node.clip.empty()) r = r.intersect(node.clip);
+    frame.ctx.add_hit(
+        r, frame.ctx.acquire_widget_id(&u->app->browser_ui[u->id].open));
+}
+
+void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<BrowseRowUser*>(node.user);
+    const ui::Theme& th = frame.theme;
+    const ui::Rect& r = node.rect;
+    if (u->stripe)
+        frame.canvas.draw_rect(r, th.control_bg.with_alpha(0.45f));
+    const ui::WidgetId id =
+        frame.ctx.acquire_widget_id(&u->app->browser_ui[u->id].open);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    const bool hover = owns && r.contains(frame.input.mouse);
+    if (u->app->browser_sel == u->id) {
+        frame.canvas.draw_rect(r, th.control_bg_active.with_alpha(0.55f));
+        frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
+    } else if (hover) {
+        frame.canvas.draw_rect(r, th.control_bg_hover.with_alpha(0.6f));
+    }
+    float tx = r.x + 8.0f + static_cast<float>(u->depth) * 14.0f;
+    if (u->kind == 0) {
+        // Chevron strokes: v open, > closed (the section-header idiom).
+        const float cx = tx + 3.0f;
+        const float cy = r.y + r.h * 0.5f;
+        const ui::Color cc = th.text_dim;
+        if (u->open_bin) {
+            frame.canvas.draw_line({cx - 3.0f, cy - 1.5f}, {cx, cy + 1.5f},
+                                   1.5f, cc);
+            frame.canvas.draw_line({cx, cy + 1.5f}, {cx + 3.0f, cy - 1.5f},
+                                   1.5f, cc);
+        } else {
+            frame.canvas.draw_line({cx - 1.5f, cy - 3.0f}, {cx + 1.5f, cy},
+                                   1.5f, cc);
+            frame.canvas.draw_line({cx + 1.5f, cy}, {cx - 1.5f, cy + 3.0f},
+                                   1.5f, cc);
+        }
+        tx += 12.0f;
+    }
+    static const uint32_t kChipHex[4] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
+                                         0x5B84B1};
+    frame.canvas.draw_sdf_rect(
+        {tx, r.y + (r.h - 8.0f) * 0.5f, 8.0f, 8.0f}, 2.0f,
+        ui::Color::hex(kChipHex[u->kind],
+                       u->kind == 0 && !u->open_bin ? 0.7f : 1.0f));
+    tx += 14.0f;
+    frame.canvas.push_clip(r);
+    ui::draw_text(frame.canvas, frame.font, u->name,
+                  {tx, r.y + (r.h - frame.font.line_height() *
+                                        th.font_size) *
+                                   0.5f},
+                  th.font_size,
+                  u->scoped ? th.accent
+                            : (hover || u->app->browser_sel == u->id
+                                   ? th.text
+                                   : th.text_dim));
+    frame.canvas.pop_clip();
+    if (frame.input.left_pressed() && owns && hover) {
+        *u->clicked = true;
+        const uint64_t f = frame.ctx.frame();
+        if (u->app->browser_click_id == u->id &&
+            f - u->app->browser_click_frame < 24 && u->opened)
+            *u->opened = true;
+        u->app->browser_click_id = u->id;
+        u->app->browser_click_frame = f;
+    }
+    if (frame.input.right_pressed() && owns && hover && u->ctx)
+        *u->ctx = true;
+}
+
+ui::Rect app_ctx_menu_rect(const AppState& app, const ui::Font& font) {
+    float widest = 130.0f;
+    for (const char* it : app.ctx_menu.labels)
+        widest = std::max(
+            widest,
+            ui::measure_text(font, it, ui::active_theme().font_size).x +
+                24.0f);
+    const float h =
+        static_cast<float>(app.ctx_menu.labels.size()) * 20.0f + 8.0f;
+    const ui::Rect& vp = app.win_rect;
+    Vec2 a = app.ctx_menu.anchor;
+    if (a.x + widest > vp.right()) a.x = std::max(vp.x, vp.right() - widest);
+    if (a.y + h > vp.bottom()) a.y = std::max(vp.y, a.y - h);
+    return {a.x, a.y, widest, h};
+}
 
 // Dynamic-count sibling list (the stack panel) — mirrors make_stack.
 ui::LayoutNode* VStackDyn(ui::LayoutArena& arena, const ui::StackOpts& opts,
@@ -3353,8 +3911,463 @@ ui::LayoutNode* VStackDyn(ui::LayoutArena& arena, const ui::StackOpts& opts,
     return n;
 }
 
-void draw_preview_frame(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+// The selected placement when it sits on a VIDEO lane (audio blocks
+// carry no canvas geometry).
+const doc::Placement* video_placement_of(const doc::Sequence& seq,
+                                         uint64_t id) {
+    for (const doc::SeqTrack& t : seq.tracks)
+        for (const doc::Placement& p : t.placements)
+            if (p.id == id) return &p;
+    return nullptr;
+}
+
+// The monitor's CONTENT rect: the canvas letterboxed into the leaf,
+// scaled by the zoom about the leaf center, shifted by the pan. The
+// viewport blit, the overlay handles and click-uv mapping all go
+// through this ONE mapping - any divergence puts the box off the
+// pixels.
+ui::Rect monitor_content_rect(const AppState& app, ui::Rect r) {
+    float fw = r.w, fh = fw / app.mon_canvas_aspect;
+    if (fh > r.h) {
+        fh = r.h;
+        fw = fh * app.mon_canvas_aspect;
+    }
+    fw *= app.mon_zoom;
+    fh *= app.mon_zoom;
+    return {r.x + (r.w - fw) * 0.5f + app.mon_pan.x,
+            r.y + (r.h - fh) * 0.5f + app.mon_pan.y, fw, fh};
+}
+
+// CLICK-SELECT on the frame itself: the topmost lane whose SHOWN block
+// (the compiler's winner: active, latest t_in) contains the click picks
+// it, transform-aware; empty canvas deselects. The monitor speaks the
+// timeline's selection verbs.
+void monitor_click_pick(AppState& app, const ui::Rect& r, Vec2 m) {
+    const float aspect = r.w / std::max(r.h, 1.0f);
+    const doc::Sequence& sq = app.sequence();
+    const double f =
+        static_cast<double>(app.player.current_frame_index());
+    uint64_t hit = 0;
+    size_t hit_lane = 0;
+    for (size_t ti = sq.tracks.size(); ti-- > 0;) {
+        const doc::Placement* best = nullptr;
+        for (const doc::Placement& p : sq.tracks[ti].placements) {
+            if (f < static_cast<double>(p.t_in)) continue;
+            const uint32_t end = doc::placement_end(
+                p, doc::source_length(app.document, p));
+            if (end != 0 && f >= static_cast<double>(end)) continue;
+            if (!best || p.t_in >= best->t_in) best = &p;
+        }
+        if (!best) continue;
+        // Inverse of the composite affine: is the click inside this
+        // block's frame?
+        const float rad = best->rotate * 0.01745329252f;
+        const float cs = std::cos(rad), sn = std::sin(rad);
+        const float cxf = (m.x - r.x) / r.w - 0.5f - best->pos_x;
+        const float cyf = (m.y - r.y) / r.h - 0.5f - best->pos_y;
+        const float qx = cxf * aspect, qy = cyf;
+        const float rx = qx * cs + qy * sn;
+        const float ry = -qx * sn + qy * cs;
+        const float s = std::max(best->scale, 1e-4f);
+        if (std::fabs(rx / s / aspect) <= 0.5f &&
+            std::fabs(ry / s) <= 0.5f) {
+            hit = best->id;
+            hit_lane = ti;
+            break;
+        }
+    }
+    if (hit && hit != app.sel_placement) {
+        app.sel_placement = hit;
+        app.selected_layer = hit_lane;
+        app.layer_sel = true;
+        app.sel = {};
+        app.multi_sel.clear();
+    } else if (!hit) {
+        app.sel_placement = 0;
+        app.layer_sel = false;
+    }
+}
+
+// ---- program monitor: the preview leaf. At look scope it is a plain
+// frame; at SEQUENCE scope it is the program monitor and the selected
+// block manipulates directly on it - body moves, corners scale, the
+// stub above the top edge rotates. Edits stage a whole placement like
+// every other gesture.
+struct MonitorUser {
+    AppState* app;
+    doc::Placement* staged = nullptr;   // selected video block, this frame
+    bool* changed = nullptr;
+    bool* released = nullptr;
+};
+
+void hit_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<MonitorUser*>(node.user);
+    AppState& a = *u->app;
+    // The app context menu's popup-layer hit rides this always-present
+    // leaf (hits reset inside run_frame, so it must register here).
+    if (a.ctx_menu.kind && a.ctx_menu_dd.open)
+        frame.ctx.add_hit(app_ctx_menu_rect(a, frame.font),
+                          frame.ctx.acquire_widget_id(&a.ctx_menu_dd),
+                          ui::HitLayer::Popup);
+    if (!a.scope_is_look()) {
+        ui::Rect r = node.rect;
+        if (!node.clip.empty()) r = r.intersect(node.clip);
+        frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(&a.monitor_ws));
+    }
+}
+
+void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<MonitorUser*>(node.user);
+    AppState& app = *u->app;
     frame.canvas.draw_rect_outline(node.rect, 1.0f, frame.theme.hairline);
+    // Latch the displayed frame at DRAW time, not frame start - the
+    // worker may have published since the build began, and every UI
+    // frame of glue latency reads as gesture float.
+    if (app.render_worker) {
+        const RenderWorker::View mv =
+            app.render_worker->acquire(app.ui_frame_counter);
+        if (mv.final_img) {
+            app.view_doc_revision = mv.doc_revision;
+            if (mv.bounds_valid) {
+                app.view_bounds_valid = true;
+                app.view_bounds_placement = mv.bounds_placement;
+                for (int i = 0; i < 4; ++i)
+                    app.view_bounds[i] = mv.bounds[i];
+            }
+            app.mon_canvas_aspect =
+                static_cast<float>(mv.final_img->width()) /
+                std::max(1.0f,
+                         static_cast<float>(mv.final_img->height()));
+        }
+    }
+    // Staged gesture entries older than the displayed frame have served
+    // their purpose; keep the one the frame rendered with.
+    while (app.xf_history.size() > 1 &&
+           app.xf_history[1].first <= app.view_doc_revision)
+        app.xf_history.pop_front();
+    if (app.xf_history.size() == 1 && app.mon_mode == 0 &&
+        app.xf_history.front().first <= app.view_doc_revision)
+        app.xf_history.clear();
+    const Vec2 mpos = frame.input.mouse;
+    // Wheel over the preview zooms about the CURSOR (both scopes) - the
+    // way to reach handles past the canvas edge or step back from it.
+    // Snaps back to exact fit near 1 so a casual scroll recovers.
+    if (node.rect.contains(mpos) && frame.input.wheel_y != 0.0f) {
+        const float z0 = app.mon_zoom;
+        float z1 = std::clamp(z0 * std::pow(1.12f, frame.input.wheel_y),
+                              0.1f, 8.0f);
+        if (std::fabs(z1 - 1.0f) < 0.06f) z1 = 1.0f;
+        const ui::Rect ri = node.rect.inset(1.0f);
+        const Vec2 lc{ri.x + ri.w * 0.5f, ri.y + ri.h * 0.5f};
+        // Keep the point under the cursor fixed: the content center
+        // moves toward/away from it with the zoom ratio.
+        const float k = z1 / std::max(z0, 1e-4f);
+        app.mon_pan.x = mpos.x + (lc.x + app.mon_pan.x - mpos.x) * k - lc.x;
+        app.mon_pan.y = mpos.y + (lc.y + app.mon_pan.y - mpos.y) * k - lc.y;
+        app.mon_zoom = z1;
+        if (z1 == 1.0f && std::fabs(app.mon_pan.x) < 8.0f &&
+            std::fabs(app.mon_pan.y) < 8.0f)
+            app.mon_pan = {};
+    }
+    // Middle-drag pans (the node-canvas gesture); pan stays bounded so
+    // the picture can never be lost off the panel.
+    if ((frame.input.buttons_pressed & ui::kMouseMiddle) &&
+        node.rect.contains(mpos)) {
+        app.mon_panning = true;
+        app.mon_pan_anchor = mpos;
+        app.mon_pan_orig = app.mon_pan;
+    }
+    if (app.mon_panning) {
+        if (!(frame.input.buttons_down & ui::kMouseMiddle)) {
+            app.mon_panning = false;
+        } else {
+            app.mon_pan.x =
+                std::clamp(app.mon_pan_orig.x + mpos.x - app.mon_pan_anchor.x,
+                           -node.rect.w, node.rect.w);
+            app.mon_pan.y =
+                std::clamp(app.mon_pan_orig.y + mpos.y - app.mon_pan_anchor.y,
+                           -node.rect.h, node.rect.h);
+        }
+    }
+    // "fit to view" chip whenever the view is off the plain fit; a
+    // click resets zoom and pan (also on the right-click menu).
+    bool fit_clicked = false;
+    if (app.mon_zoom != 1.0f || app.mon_pan.x != 0.0f ||
+        app.mon_pan.y != 0.0f) {
+        char zl[40];
+        std::snprintf(zl, sizeof(zl), "zoom %d%% - fit",
+                      static_cast<int>(app.mon_zoom * 100.0f + 0.5f));
+        const Vec2 tp{node.rect.x + 8.0f, node.rect.bottom() - 20.0f};
+        const Vec2 ts =
+            ui::measure_text(frame.font, zl, frame.theme.font_size_small);
+        const float zh =
+            frame.font.line_height() * frame.theme.font_size_small;
+        const ui::Rect zr{tp.x - 4.0f, tp.y - 3.0f, ts.x + 8.0f,
+                          zh + 6.0f};
+        const bool hov = zr.contains(mpos);
+        ui::draw_text(frame.canvas, frame.font, zl, tp,
+                      frame.theme.font_size_small,
+                      hov ? frame.theme.text : frame.theme.text_dim);
+        if (hov && frame.input.left_pressed()) {
+            app.mon_zoom = 1.0f;
+            app.mon_pan = {};
+            fit_clicked = true;
+        }
+    }
+    if (app.scope_is_look()) return;
+    ui::Rect r = node.rect.inset(1.0f);
+    if (r.w < 8.0f || r.h < 8.0f) return;
+    // The image sits letterboxed+zoomed+panned inside the leaf; the
+    // overlay maps through the SAME content rect as the blit or the box
+    // drifts off the pixels.
+    r = monitor_content_rect(app, r);
+    if (!u->staged) {
+        // Nothing selected: a click on the frame picks the block under
+        // the cursor (or keeps nothing).
+        if (frame.input.left_pressed() && !fit_clicked &&
+            frame.ctx.widget_owns_mouse(
+                frame.ctx.acquire_widget_id(&app.monitor_ws)))
+            monitor_click_pick(app, r, mpos);
+        return;
+    }
+    doc::Placement& st = *u->staged;
+    // The box draws from the DISPLAYED frame's placement state, glued to
+    // the pixels; gesture math writes the live staged one.
+    const doc::Placement* shown =
+        !app.xf_history.empty() &&
+                app.xf_history.front().second.id == st.id
+            ? &app.xf_history.front().second
+            : nullptr;
+    const doc::Placement& bx = shown ? *shown : st;
+    const float aspect = r.w / std::max(r.h, 1.0f);
+    // Content box in source-uv offsets (canvas-center-relative): the
+    // measured alpha bounds when the frame carries them (masks act as
+    // crops), the full frame until the first measurement lands.
+    float b0 = -0.5f, b1 = -0.5f, b2 = 0.5f, b3 = 0.5f;
+    if (app.view_bounds_valid && app.view_bounds_placement == st.id) {
+        b0 = app.view_bounds[0] - 0.5f;
+        b1 = app.view_bounds[1] - 0.5f;
+        b2 = app.view_bounds[0] + app.view_bounds[2] - 0.5f;
+        b3 = app.view_bounds[1] + app.view_bounds[3] - 0.5f;
+    }
+    const float bcx = (b0 + b2) * 0.5f, bcy = (b1 + b3) * 0.5f;
+    // Forward map, the inverse of the transform kernel's sampling math:
+    // source-uv offsets -> canvas fractions -> monitor pixels.
+    auto xf_frac = [&](const doc::Placement& p, float sx, float sy) -> Vec2 {
+        const float rad = p.rotate * 0.01745329252f;
+        const float cs = std::cos(rad), sn = std::sin(rad);
+        const float qx = sx * aspect, qy = sy;
+        const float rx = qx * cs - qy * sn;
+        const float ry = qx * sn + qy * cs;
+        return {rx * p.scale / aspect + p.pos_x, ry * p.scale + p.pos_y};
+    };
+    auto fwd = [&](const doc::Placement& p, float sx, float sy) -> Vec2 {
+        const Vec2 f = xf_frac(p, sx, sy);
+        return {r.x + (0.5f + f.x) * r.w, r.y + (0.5f + f.y) * r.h};
+    };
+    auto inv = [&](Vec2 m, float* ox, float* oy) {
+        const float rad = st.rotate * 0.01745329252f;
+        const float cs = std::cos(rad), sn = std::sin(rad);
+        const float cxf = (m.x - r.x) / r.w - 0.5f - st.pos_x;
+        const float cyf = (m.y - r.y) / r.h - 0.5f - st.pos_y;
+        const float qx = cxf * aspect, qy = cyf;
+        const float rx = qx * cs + qy * sn;
+        const float ry = -qx * sn + qy * cs;
+        const float s = std::max(st.scale, 1e-4f);
+        *ox = rx / s / aspect;
+        *oy = ry / s;
+    };
+    const Vec2 c00 = fwd(bx, b0, b1), c10 = fwd(bx, b2, b1);
+    const Vec2 c11 = fwd(bx, b2, b3), c01 = fwd(bx, b0, b3);
+    const ui::Color ac = frame.theme.accent;
+    frame.canvas.push_clip(node.rect);
+    frame.canvas.draw_line(c00, c10, 1.5f, ac);
+    frame.canvas.draw_line(c10, c11, 1.5f, ac);
+    frame.canvas.draw_line(c11, c01, 1.5f, ac);
+    frame.canvas.draw_line(c01, c00, 1.5f, ac);
+    const Vec2 corners[4] = {c00, c10, c11, c01};
+    for (const Vec2& c : corners)
+        frame.canvas.draw_sdf_rect({c.x - 4.0f, c.y - 4.0f, 8.0f, 8.0f},
+                                   2.0f, ac);
+    const Vec2 tm{(c00.x + c10.x) * 0.5f, (c00.y + c10.y) * 0.5f};
+    const Vec2 ctr = fwd(bx, bcx, bcy);
+    Vec2 dir{tm.x - ctr.x, tm.y - ctr.y};
+    const float dl = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+    if (dl > 1.0f) {
+        dir.x /= dl;
+        dir.y /= dl;
+    }
+    const Vec2 rot{tm.x + dir.x * 18.0f, tm.y + dir.y * 18.0f};
+    frame.canvas.draw_line(tm, rot, 1.5f, ac);
+    frame.canvas.draw_sdf_rect({rot.x - 4.0f, rot.y - 4.0f, 8.0f, 8.0f},
+                               4.0f, ac);
+    frame.canvas.pop_clip();
+
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    const Vec2 mouse = frame.input.mouse;
+    auto near_pt = [&](Vec2 p2) {
+        return std::fabs(mouse.x - p2.x) <= 6.0f &&
+               std::fabs(mouse.y - p2.y) <= 6.0f;
+    };
+    if (frame.input.left_pressed() && owns && app.mon_mode == 0 &&
+        !fit_clicked) {
+        float sx = 0.0f, sy = 0.0f;
+        inv(mouse, &sx, &sy);
+        int mode = 0;
+        if (near_pt(rot)) mode = 3;
+        else if (near_pt(c00) || near_pt(c10) || near_pt(c11) ||
+                 near_pt(c01))
+            mode = 2;
+        else if (sx >= b0 && sx <= b2 && sy >= b1 && sy <= b3)
+            mode = 1;
+        if (mode) {
+            app.mon_mode = mode;
+            app.mon_anchor = mouse;
+            app.mon_orig = st;
+            app.mon_box[0] = b0;
+            app.mon_box[1] = b1;
+            app.mon_box[2] = b2;
+            app.mon_box[3] = b3;
+            frame.ctx.set_capture(id);
+        } else {
+            // The press missed the box and every handle: same click
+            // verbs as the timeline - pick what is under the cursor,
+            // or deselect on empty canvas.
+            monitor_click_pick(app, r, mouse);
+        }
+    }
+    if (app.mon_mode != 0 && !frame.input.left_down()) {
+        app.mon_mode = 0;
+        if (u->released) *u->released = true;
+        frame.ctx.clear_capture();
+    }
+    if (app.mon_mode != 0 && u->changed) {
+        const doc::Placement& o = app.mon_orig;
+        // Scale/rotate pivot on the CONTENT box center (mask crops move
+        // it off canvas center) as FROZEN at the press - a live measured
+        // box moves with animated content and a pivot chasing it drifts.
+        // Transform about it, then re-anchor pos so the pivot holds
+        // still. All absolute from the gesture origin.
+        const float fcx = (app.mon_box[0] + app.mon_box[2]) * 0.5f;
+        const float fcy = (app.mon_box[1] + app.mon_box[3]) * 0.5f;
+        const Vec2 pvt = fwd(o, fcx, fcy);
+        if (app.mon_mode == 1) {
+            st.pos_x = o.pos_x + (mouse.x - app.mon_anchor.x) / r.w;
+            st.pos_y = o.pos_y + (mouse.y - app.mon_anchor.y) / r.h;
+        } else {
+            if (app.mon_mode == 2) {
+                const float d0 = std::hypot(app.mon_anchor.x - pvt.x,
+                                            app.mon_anchor.y - pvt.y);
+                const float d1 =
+                    std::hypot(mouse.x - pvt.x, mouse.y - pvt.y);
+                st.scale = std::clamp(
+                    o.scale * (d0 > 1.0f ? d1 / d0 : 1.0f), 0.02f, 16.0f);
+                st.rotate = o.rotate;
+            } else {
+                const float a0 = std::atan2(app.mon_anchor.y - pvt.y,
+                                            app.mon_anchor.x - pvt.x);
+                const float a1 =
+                    std::atan2(mouse.y - pvt.y, mouse.x - pvt.x);
+                st.rotate = o.rotate + (a1 - a0) * 57.29578f;
+                st.scale = o.scale;
+            }
+            st.pos_x = o.pos_x;
+            st.pos_y = o.pos_y;
+            const Vec2 c_o = xf_frac(o, fcx, fcy);
+            const Vec2 c_n = xf_frac(st, fcx, fcy);
+            st.pos_x = o.pos_x + (c_o.x - c_n.x);
+            st.pos_y = o.pos_y + (c_o.y - c_n.y);
+        }
+        *u->changed = true;
+    }
+}
+
+// The block ATTRIBUTES panel: the old preview slot at sequence scope.
+// Transform + opacity of the selected video block; the monitor is the
+// direct-manipulation twin of these sliders.
+ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
+                                  FrameUi& out) {
+    using namespace ui;
+    LabelOpts dim;
+    dim.color = active_theme().text_dim;
+    StackOpts col;
+    col.gap = 6.0f;
+    col.cross_align = AlignMode::Stretch;
+    col.padding = Edges::all(12);
+    col.width = SizeSpec::fill();
+    col.height = SizeSpec::fill();
+    std::vector<LayoutNode*> rows;
+    rows.push_back(Heading(arena, "block"));
+    const doc::Placement* p =
+        app.sel_placement
+            ? video_placement_of(app.sequence(), app.sel_placement)
+            : nullptr;
+    if (!p) {
+        rows.push_back(
+            Label(arena, "select a block on a video lane", dim));
+        rows.push_back(
+            Label(arena, "then move / scale / rotate it here or", dim));
+        rows.push_back(Label(arena, "directly on the monitor", dim));
+        return Panel(arena, VStackDyn(arena, col, rows),
+                     PanelOpts{Edges::all(0), -1.0f});
+    }
+    const doc::Look* tl = app.document.find_look(p->target);
+    const doc::Sequence* ts =
+        tl ? nullptr : app.document.find_sequence(p->target);
+    const std::string tname =
+        tl ? tl->name : (ts ? ts->name : std::string("block"));
+    rows.push_back(
+        Label(arena, arena.dup(tname.c_str(), tname.size()), dim));
+    FrameUi::PlacementXf px{};
+    px.id = p->id;
+    px.staged = arena.alloc<doc::Placement>();
+    *px.staged = *p;
+    px.changed = arena.alloc<bool>();
+    px.released = arena.alloc<bool>();
+    out.placement_xfs.push_back(px);
+    int si = 0;
+    auto row = [&](const char* label, float* value, float min_v,
+                   float max_v, const char* format, float dscale = 1.0f,
+                   float doffset = 0.0f) {
+        SliderOpts so;
+        so.format = format;
+        so.out_changed = px.changed;
+        so.out_released = px.released;
+        so.display_scale = dscale;
+        so.display_offset = doffset;
+        LabelOpts ldim;
+        ldim.color = active_theme().text_dim;
+        StackOpts hs;
+        hs.gap = 6.0f;
+        hs.cross_align = AlignMode::Center;
+        hs.width = SizeSpec::fill();
+        rows.push_back(HStack(
+            arena, hs,
+            {SizedBox(arena, SizeSpec::fixed(64),
+                      SizeSpec::fixed(active_theme().control_height),
+                      Label(arena, label, ldim)),
+             SliderF(arena, value, min_v, max_v,
+                     &app.block_xf_sliders[si++], so)}));
+    };
+    // Readouts in real units, storage untouched: x/y show the block
+    // CENTER's canvas position in px from the top-left corner (fractions
+    // stay the doc unit); scale/opacity read as percent.
+    uint32_t cw = 0, chh = 0;
+    doc::canvas_size(app.document, &cw, &chh);
+    row("x", &px.staged->pos_x, -1.0f, 1.0f, "%.0f px",
+        static_cast<float>(cw), static_cast<float>(cw) * 0.5f);
+    row("y", &px.staged->pos_y, -1.0f, 1.0f, "%.0f px",
+        static_cast<float>(chh), static_cast<float>(chh) * 0.5f);
+    row("scale", &px.staged->scale, 0.02f, 8.0f, "%.0f%%", 100.0f);
+    row("rotation", &px.staged->rotate, -360.0f, 360.0f, "%.0f deg");
+    row("opacity", &px.staged->opacity, 0.0f, 1.0f, "%.0f%%", 100.0f);
+    rows.push_back(Label(arena,
+                         "drag the block on the monitor: body moves, "
+                         "corners scale, the stub rotates",
+                         dim));
+    return Panel(arena, VStackDyn(arena, col, rows),
+                 PanelOpts{Edges::all(0), -1.0f});
 }
 
 // ---- menu-bar button (user sketch): a Dropdown variant whose closed
@@ -3797,6 +4810,13 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         frame.ctx.set_capture(id);
     }
+    // Right-click: the region menu (markers, loop, trim). Sequence
+    // structure only - a scoped look's local ruler carries none of it.
+    if (frame.input.right_pressed() && frame.ctx.widget_owns_mouse(id) &&
+        !u->app->scope_is_look() && u->out->ruler_ctx) {
+        *u->out->ruler_ctx = true;
+        *u->out->ruler_ctx_frame = static_cast<float>(mouse_frame());
+    }
     if (state.drag_mode != 0) {
         const double mf = mouse_frame();
         switch (state.drag_mode) {
@@ -3924,13 +4944,11 @@ void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     frame.canvas.pop_clip();
 }
 
-// ---- timeline block lanes (docs/look.md phase 5)
+// ---- timeline block lanes
 //
-// The scoped look's placements as BLOCKS: each layer is one block on its
-// look's local timeline; a lane is a display row packing non-overlapping
-// blocks (a razored pair abuts on one lane). Tracks carry no semantics —
-// composite order is layer order, the lane is where the block happens to
-// sit.
+// The scoped SEQUENCE's placements as BLOCKS, one display row per video
+// lane (topmost lane composites last) plus one per audio track. A scoped
+// look is timeless and shows no block lanes at all.
 
 // One audio contributor inside a block: samples the per-asset amp array
 // through the block's (possibly nested) time map. `outer` is the block
@@ -3977,6 +4995,8 @@ struct TlBlock {
     bool* changed = nullptr;
     bool* released = nullptr;
     bool* pressed = nullptr;
+    bool* ctx = nullptr;                // right-click: context menu request
+    float* ctx_at = nullptr;            // cursor's sequence-local frame
 };
 
 struct BlockLaneUser {
@@ -3990,6 +5010,7 @@ struct BlockLaneUser {
     uint32_t play_end = 0;   // content ends here; past it is buffer
     uint32_t playhead = 0;
     double v0 = 0.0, v1 = 0.0;
+    bool* lane_ctx = nullptr;   // right-click on empty lane space
 };
 
 void hit_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
@@ -4152,6 +5173,27 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (!on_block && u->out->tl_deselect &&
             !(frame.input.mods & platform::kModShift))
             *u->out->tl_deselect = true;
+    }
+    // Right-click: a block stages its context menu; empty lane space
+    // stages the lane's own (add/remove lanes). The post-frame opener
+    // anchors either at the cursor.
+    if (frame.input.right_pressed() && frame.ctx.widget_owns_mouse(id)) {
+        const float mx = frame.input.mouse.x;
+        bool on_block = false;
+        for (size_t i = 0; i < u->count; ++i) {
+            const TlBlock& b = u->blocks[i];
+            const float x0 = frame_x(b.t0);
+            const float x1 = std::max(frame_x(b.t1), x0 + 3.0f);
+            if (mx < x0 || mx > x1) continue;
+            on_block = true;
+            if (b.ctx) {
+                *b.ctx = true;
+                if (b.ctx_at)
+                    *b.ctx_at = static_cast<float>(mouse_frame());
+            }
+            break;
+        }
+        if (!on_block && u->lane_ctx) *u->lane_ctx = true;
     }
     if (app.blk_drag_mode != 0) {
         for (size_t i = 0; i < u->count; ++i) {
@@ -5333,13 +6375,13 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
                  PanelOpts{Edges::all(6), -1.0f, /*outline=*/true});
 }
 
-// Popup source entries (docs/flow_canvas.md/v4): sources are just
+// Popup source entries: sources are just
 // nodes you add like anything else. "source: clip" is THE input — a tap
 // off the project clip (the adjustment type is gone; a clip tap merged
 // back through a Blend IS an adjustment). Order here MUST match the pick
 // handler's walk.
 // "source: look" mints a NEW empty look and places an instance of it —
-// the one way to nest from the canvas (docs/look.md); double-click the
+// the one way to nest from the canvas; double-click the
 // card to go edit it.
 static const char* kSrcAddLabels[] = {
     "source: clip",  "source: solid", "source: gradient",
@@ -5357,7 +6399,7 @@ static const bool kSrcAddIsLook[] = {false, false, false, false,
 constexpr int kSrcAddCount =
     static_cast<int>(sizeof(kSrcAddLabels) / sizeof(kSrcAddLabels[0]));
 
-// Popup value-node entries (docs/flow_canvas.md): each spawns an
+// Popup value-node entries: each spawns an
 // unconnected value node at the click point — wiring happens by dragging
 // its out port onto a param row (or a helper node's input row). Order
 // here MUST match the pick handler's walk.
@@ -5427,7 +6469,7 @@ static int value_row_of_input(const doc::ValueNode& vn, int which) {
     return -1;
 }
 
-// Node-canvas graph (docs/flow_canvas.md): the document translated
+// Node-canvas graph: the document translated
 // into cards + wires each frame. Positions come from the document; nodes
 // never dragged flow through a derived auto-layout (chains left→right per
 // layer, aux row below) and only commit a position when moved. Param rows
@@ -5797,8 +6839,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             } else {
                 src.x = auto_x;
                 src.y = auto_y;
-                // Materialize the derived slot (docs/flow_canvas.md
-                // "auto-layout once"): committed the first frame it
+                // Materialize the derived slot ("auto-layout once"):
+                // committed the first frame it
                 // appears so later deletions never re-slot survivors.
                 // Positions are pure UI state the renderer never reads —
                 // command-exempt (undo would splice layout writes into
@@ -6768,7 +7810,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
 void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                        float fps, ui::LayoutNode** left_out,
                        ui::LayoutNode** right_out,
-                       ui::LayoutNode** preset_out) {
+                       ui::LayoutNode** preset_out,
+                       ui::LayoutNode** browser_out) {
     using namespace ui;
     LabelOpts dim;
     dim.color = active_theme().text_dim;
@@ -6809,67 +7852,185 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(Label(arena, app.clip_name.c_str(), small_dim));
     }
 
-    // ---- BROWSER: sequences and looks - the things deliberately made
-    // and named. Open moves the editing scope; "+" lays a block at the
-    // playhead (or a ref node when a look is scoped).
+    // ---- BROWSER: the project panel, its own inspector tab. One mixed
+    // tree of bins and items drawn by the custom row widget (stripes,
+    // type chips, stroke chevrons, selection accent); search filters
+    // flat; the strip below creates. Single click selects (bins also
+    // fold), double-click opens, drag files rows into bins or lays them
+    // on the timeline.
+    std::vector<LayoutNode*> browser_rows;
     {
-        auto entity_row = [&](uint64_t id, const std::string& name,
-                              const char* fallback, const char* open_tip) {
-            auto& bui = app.browser_ui[id];
-            FrameUi::BrowserAction act{};
-            act.id = id;
-            act.open = arena.alloc<bool>();
-            act.place = arena.alloc<bool>();
-            ButtonOpts name_opts;
-            name_opts.width = SizeSpec::fill();
-            name_opts.flat = true;
-            name_opts.align_left = true;
-            name_opts.tooltip = open_tip;
-            ButtonOpts place_opts;
-            place_opts.width = SizeSpec::fixed(24);
-            place_opts.tooltip = "place at the playhead";
-            const bool scoped = id == app.scope_look;
-            std::string nm = scoped ? "> " : "";
-            nm += name.empty() ? fallback : name;
-            rows.push_back(HStack(
-                arena, {4.0f},
-                {Button(arena, arena.dup(nm.c_str(), nm.size()),
-                        &bui.open, act.open, name_opts),
-                 Button(arena, "+", &bui.place, act.place, place_opts)}));
-            out.browser_looks.push_back(act);
-        };
-        rows.push_back(Label(arena, "sequences", small_dim));
-        for (const doc::Sequence& sq : app.document.sequences)
-            entity_row(sq.id, sq.name, "sequence", "open this sequence");
-        rows.push_back(Label(arena, "looks", small_dim));
-        for (const doc::Look& lk : app.document.looks)
-            entity_row(lk.id, lk.name, "look", "open this look's graph");
-        out.new_sequence_clicked = arena.alloc<bool>();
-        ButtonOpts seq_opts;
-        seq_opts.width = SizeSpec::fill();
-        seq_opts.tooltip = "a fresh sequence, placed nowhere";
-        rows.push_back(Button(arena, "new sequence", &app.new_seq_button,
-                              out.new_sequence_clicked, seq_opts));
-        if (!app.document.assets.empty())
-            rows.push_back(Label(arena, "assets", small_dim));
-        for (const doc::Asset& a : app.document.assets) {
-            auto& bui = app.browser_ui[a.id];
-            FrameUi::BrowserAction act{};
-            act.id = a.id;
-            act.place = arena.alloc<bool>();
-            ButtonOpts place_opts;
-            place_opts.width = SizeSpec::fixed(24);
-            place_opts.tooltip = "place at the playhead";
-            const std::string an = a.name.empty() ? "clip" : a.name;
-            LayoutNode* alabel =
-                Label(arena, arena.dup(an.c_str(), an.size()), small_dim);
-            alabel->width = SizeSpec::fill();
-            rows.push_back(HStack(
-                arena, {4.0f},
-                {alabel,
-                 Button(arena, "+", &bui.place, act.place, place_opts)}));
-            out.browser_assets.push_back(act);
+        out.browser_search_clicked = arena.alloc<bool>();
+        {
+            std::string label = app.browser_filter;
+            if (app.browser_search_focus) label += "_";
+            else if (label.empty()) label = "search...";
+            ButtonOpts so;
+            so.width = SizeSpec::fill();
+            so.flat = true;
+            so.align_left = true;
+            so.tooltip = "type to filter the project";
+            browser_rows.push_back(
+                Button(arena, arena.dup(label.c_str(), label.size()),
+                       &app.browser_search_btn,
+                       out.browser_search_clicked, so));
         }
+        int stripe = 0;
+        auto rename_row = [&](uint64_t id, int depth) {
+            // The row being renamed draws the edit buffer in place;
+            // Enter commits, Escape cancels (keys captured app-wide).
+            std::string shown(static_cast<size_t>(depth) * 2 + 2, ' ');
+            shown += app.browser_rename_buf + "_";
+            ButtonOpts bo;
+            bo.flat = true;
+            bo.align_left = true;
+            bo.width = SizeSpec::fill();
+            browser_rows.push_back(
+                Button(arena, arena.dup(shown.c_str(), shown.size()),
+                       &app.browser_ui[id].open, arena.alloc<bool>(), bo));
+            ++stripe;
+        };
+        auto tree_row = [&](uint64_t id, int kind, const std::string& name,
+                            const char* fallback, int depth,
+                            bool open_bin) {
+            if (id == app.browser_rename_id) {
+                rename_row(id, depth);
+                return;
+            }
+            auto* u = arena.alloc<BrowseRowUser>();
+            u->app = &app;
+            u->id = id;
+            u->kind = kind;
+            const std::string shown =
+                name.empty() ? std::string(fallback) : name;
+            u->name = arena.dup(shown.c_str(), shown.size());
+            u->depth = depth;
+            u->stripe = (stripe++ & 1) != 0;
+            u->open_bin = open_bin;
+            u->scoped = id == app.scope_look;
+            u->clicked = arena.alloc<bool>();
+            u->opened = arena.alloc<bool>();
+            u->ctx = arena.alloc<bool>();
+            LayoutNode* n = make_node(arena, NodeKind::Leaf);
+            n->user = u;
+            n->width = SizeSpec::fill();
+            n->height = SizeSpec::fixed(22.0f);
+            n->measure_fn = measure_browser_row;
+            n->draw_fn = draw_browser_row;
+            n->hit_fn = hit_browser_row;
+            n->debug_name = "browser_row";
+            out.browser_nodes.push_back({id, kind == 0, n});
+            browser_rows.push_back(n);
+            if (kind == 0) {
+                out.bin_rows.push_back({id, u->clicked, u->ctx});
+            } else {
+                FrameUi::BrowserAction act{};
+                act.id = id;
+                act.open = u->opened;
+                act.place = arena.alloc<bool>();
+                act.ctx = u->ctx;
+                act.select = u->clicked;
+                (kind == 3 ? out.browser_assets : out.browser_looks)
+                    .push_back(act);
+            }
+        };
+        auto matches = [&](const std::string& nm) {
+            if (app.browser_filter.empty()) return true;
+            auto low = [](std::string s) {
+                for (char& c : s)
+                    if (c >= 'A' && c <= 'Z')
+                        c = static_cast<char>(c + 32);
+                return s;
+            };
+            return low(nm).find(low(app.browser_filter)) !=
+                   std::string::npos;
+        };
+        if (!app.browser_filter.empty()) {
+            // Filtering flattens: matching items only, bins skipped.
+            for (const doc::Sequence& sq : app.document.sequences)
+                if (matches(sq.name))
+                    tree_row(sq.id, 1, sq.name, "sequence", 0, false);
+            for (const doc::Look& lk : app.document.looks)
+                if (matches(lk.name))
+                    tree_row(lk.id, 2, lk.name, "look", 0, false);
+            for (const doc::Asset& a : app.document.assets)
+                if (matches(a.name))
+                    tree_row(a.id, 3, a.name, "clip", 0, false);
+        } else {
+            auto walk = [&](auto&& self, uint64_t parent,
+                            int depth) -> void {
+                if (depth > 16) return;
+                for (const doc::Bin& b : app.document.bins) {
+                    if (b.parent != parent) continue;
+                    const bool open = !app.bin_closed.count(b.id);
+                    tree_row(b.id, 0, b.name, "bin", depth, open);
+                    if (open) self(self, b.id, depth + 1);
+                }
+                for (const doc::Sequence& sq : app.document.sequences)
+                    if (sq.bin == parent)
+                        tree_row(sq.id, 1, sq.name, "sequence", depth,
+                                 false);
+                for (const doc::Look& lk : app.document.looks)
+                    if (lk.bin == parent)
+                        tree_row(lk.id, 2, lk.name, "look", depth, false);
+                for (const doc::Asset& a : app.document.assets)
+                    if (a.bin == parent)
+                        tree_row(a.id, 3, a.name, "clip", depth, false);
+            };
+            walk(walk, 0, 0);
+        }
+        // Creation strip: the background right-click's button twins.
+        out.new_sequence_clicked = arena.alloc<bool>();
+        out.browser_new_look_clicked = arena.alloc<bool>();
+        out.new_bin_clicked = arena.alloc<bool>();
+        ButtonOpts third;
+        third.width = SizeSpec::fill();
+        StackOpts strip;
+        strip.gap = 4.0f;
+        strip.width = SizeSpec::fill();
+        browser_rows.push_back(HStack(
+            arena, strip,
+            {Button(arena, "+ seq", &app.new_seq_button,
+                    out.new_sequence_clicked, third),
+             Button(arena, "+ look", &app.browser_new_look_button,
+                    out.browser_new_look_clicked, third),
+             Button(arena, "+ bin", &app.new_bin_button,
+                    out.new_bin_clicked, third)}));
+    }
+
+    // Project FORMAT: frame rate + canvas size, document parameters (one
+    // clock and one canvas for every entity; auto = the first asset
+    // decides). Editable before any media exists - a generator-only
+    // project still needs its rate and size.
+    {
+        static const char* kFpsItems[] = {"auto", "24", "25", "30",
+                                          "48",   "50", "60"};
+        int fps_cur = 0;
+        for (int i = 1; i < 7; ++i)
+            if (std::abs(app.document.fps - kProjectFpsValues[i]) < 0.01)
+                fps_cur = i;
+        out.project_fps_selected = arena.alloc<int>();
+        *out.project_fps_selected = -1;
+        rows.push_back(value_row(
+            arena, "fps",
+            Dropdown(arena, kFpsItems, 7, fps_cur, &app.project_fps_dd,
+                     out.project_fps_selected, SizeSpec::fill(),
+                     "timeline frame rate (auto = first asset)")));
+        static const char* kResItems[] = {"auto",        "1280 x 720",
+                                          "1920 x 1080", "1080 x 1920",
+                                          "2560 x 1440", "3840 x 2160"};
+        int res_cur = 0;
+        for (int i = 1; i < 6; ++i)
+            if (app.document.canvas_w == kProjectResW[i] &&
+                app.document.canvas_h == kProjectResH[i])
+                res_cur = i;
+        out.project_res_selected = arena.alloc<int>();
+        *out.project_res_selected = -1;
+        rows.push_back(value_row(
+            arena, "canvas",
+            Dropdown(arena, kResItems, 6, res_cur, &app.project_res_dd,
+                     out.project_res_selected, SizeSpec::fill(),
+                     "canvas size (auto = first asset)")));
     }
 
     if (has_clip) {
@@ -7086,7 +8247,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     }
     rows.push_back(Separator(arena));
 
-    // ---- layer inspector (docs/flow_canvas.md): the selected layer's
+    // ---- layer inspector: the selected layer's
     // props (canvas source node) or the add-layer source picker. Lives on
     // the right panel; the canvas lanes replaced the layer list.
     static const char* kBlendNames[] = {"normal", "add", "mult", "screen",
@@ -7245,6 +8406,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             out.add_routes.push_back(add_route);
             FrameUi::KeyToggle ktog{lkey, value, arena.alloc<bool>()};
             out.key_toggles.push_back(ktog);
+            FrameUi::ParamCtx pctx{lkey, value, 0.0f, false,
+                                   arena.alloc<bool>()};
+            pctx.has_def = layer_field_reset(field, &pctx.def_v);
+            out.param_ctxs.push_back(pctx);
+            opts.out_ctx = pctx.clicked;
             // Rail type-in, same contract as effect rows.
             bool editing = app.rail_edit_key == lkey;
             if (editing && app.rail_edit_commit) {
@@ -7423,6 +8589,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 out.add_routes.push_back(add_route);
                 FrameUi::KeyToggle ktog{lkey, value, arena.alloc<bool>()};
                 out.key_toggles.push_back(ktog);
+                FrameUi::ParamCtx pctx{lkey, value, 0.0f, false,
+                                       arena.alloc<bool>()};
+                pctx.has_def = layer_field_reset(field, &pctx.def_v);
+                out.param_ctxs.push_back(pctx);
+                opts.out_ctx = pctx.clicked;
                 LayoutNode* xcontrol =
                     format && std::strstr(format, "deg")
                         ? DialF(arena, stage.staged, min_v, max_v,
@@ -7519,7 +8690,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     // layer.
     {
     std::vector<LayoutNode*>& rows = right_rows;   // right panel from here
-    // Inspector title (docs/flow_canvas.md): the selection names the
+    // Inspector title: the selection names the
     // content; the flow canvas below is the selector.
     const bool stack_sel = app.sel.kind == SelKind::Effect ||
                            app.sel.kind == SelKind::Group ||
@@ -7862,20 +9033,20 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(astack);
         rows.push_back(Separator(arena));
     }
-    const bool show_matrix = app.sel.kind == SelKind::Effect ||
+    const bool show_wires = app.sel.kind == SelKind::Effect ||
                              app.sel.kind == SelKind::ModSource ||
                              app.sel.kind == SelKind::Output;
     if (app.sel.kind == SelKind::Output)
         rows.push_back(Heading(arena, "project & output"));
     else if (app.sel.kind == SelKind::ModSource)
         rows.push_back(Heading(arena, "value node"));
-    else if (show_matrix)
+    else if (show_wires)
         rows.push_back(Label(arena, "modulation", small_dim));
     size_t routes_shown = 0;
-    if (show_matrix) {
-    // Per-WIRE rows: which node drives which param, how hard, through
-    // which curve. Node params (rate, shape, operands) edit on the
-    // node's canvas card - the wire owns only amount + curve.
+    if (show_wires) {
+    // Per-WIRE rows: which node drives which param, through which
+    // curve. Node params (rate, shape, operands) edit on the node's
+    // canvas card - the wire owns only the curve.
     const auto table = mod::build_param_table(app.document, app.look());
     auto path_of = [&](const doc::ParamKey& key) -> std::string {
         for (const auto& e : table)
@@ -7893,7 +9064,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                   "route-panel source names track the enum");
     static const char* kCurveNames[] = {"lin", "exp", "s", "inv"};
     for (const doc::ModRoute& route : app.look().mod_routes) {
-        // Selection filter (docs/flow_canvas.md): an effect shows the
+        // Selection filter: an effect shows the
         // wires driving it, a value node the wires it feeds.
         const bool match =
             app.sel.kind == SelKind::Output ? true
@@ -7955,9 +9126,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 : "press ~ next to a param",
             small_dim));
     rows.push_back(Separator(arena));
-    }   // end show_matrix
+    }   // end show_wires
 
-    // ---- snapshots + morph: the Output inspector (docs/flow_canvas.md)
+    // ---- snapshots + morph: the Output inspector
     if (app.sel.kind == SelKind::Output) {
         ButtonOpts slot;
         slot.width = SizeSpec::fixed(36);
@@ -8157,6 +9328,17 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         ScrollAreaV(arena, &app.preset_scroll,
                     VStackDyn(arena, column, preset_rows)),
         PanelOpts{panel_pad, -1.0f});
+    // The browser packs rows edge to edge so the stripes read as one
+    // surface; only the search field and creation strip breathe.
+    StackOpts bcol;
+    bcol.gap = 2.0f;
+    bcol.cross_align = AlignMode::Stretch;
+    *browser_out = Panel(
+        arena,
+        ScrollAreaV(arena, &app.browser_scroll,
+                    VStackDyn(arena, bcol, browser_rows)),
+        PanelOpts{panel_pad, -1.0f});
+    out.browser_panel = *browser_out;
 }
 
 // Bottom timeline: ruler + one row per keyframe lane. Lanes are
@@ -8434,6 +9616,8 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
 
     std::vector<LayoutNode*> rows;
     out.tl_deselect = arena.alloc<bool>();
+    out.ruler_ctx = arena.alloc<bool>();
+    out.ruler_ctx_frame = arena.alloc<float>();
 
     auto* ruler_user = arena.alloc<RulerUser>();
     ruler_user->app = &app;
@@ -8508,6 +9692,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         struct LaneBuild {
             std::vector<TlBlock> blocks;
             size_t layer_index = SIZE_MAX;
+            uint64_t track_id = 0;
         };
         std::vector<LaneBuild> lanes;
         const uint64_t primary =
@@ -8527,6 +9712,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             lanes.push_back({});
             LaneBuild& lane = lanes.back();
             lane.layer_index = li;
+            lane.track_id = track.id;
             for (const doc::Placement& place : track.placements) {
                 TlBlock b;
                 b.layer_index = li;
@@ -8587,10 +9773,14 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.changed = arena.alloc<bool>();
                 b.released = arena.alloc<bool>();
                 b.pressed = arena.alloc<bool>();
+                b.ctx = arena.alloc<bool>();
+                b.ctx_at = arena.alloc<float>();
                 out.block_stages.push_back(
                     {track.id, place.id, b.staged, b.changed, b.released});
                 out.block_picks.push_back(
                     {li, track.id, place.id, b.pressed});
+                out.block_ctxs.push_back(
+                    {track.id, place.id, false, b.ctx, b.ctx_at});
                 lane.blocks.push_back(b);
             }
         }
@@ -8611,12 +9801,17 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             user->playhead = playhead;
             user->v0 = v0;
             user->v1 = v1;
+            user->lane_ctx = arena.alloc<bool>();
+            out.lane_ctxs.push_back(
+                {lanes[lane].track_id, false, user->lane_ctx});
             LayoutNode* widget = make_node(arena, NodeKind::Leaf);
             widget->width = SizeSpec::fill();
             widget->height = SizeSpec::fixed(lane_h);
             widget->user = user;
             widget->draw_fn = draw_block_lane;
             widget->hit_fn = hit_block_lane;
+            out.lane_nodes.push_back(
+                {lanes[lane].track_id, false, widget});
             char lane_name[16];
             std::snprintf(lane_name, sizeof(lane_name), "v%zu", lane + 1);
             rows.push_back(HStack(
@@ -8704,10 +9899,14 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.changed = arena.alloc<bool>();
                 b.released = arena.alloc<bool>();
                 b.pressed = arena.alloc<bool>();
+                b.ctx = arena.alloc<bool>();
+                b.ctx_at = arena.alloc<float>();
                 out.block_stages.push_back(
                     {0, place.id, b.staged, b.changed, b.released});
                 out.block_picks.push_back(
                     {SIZE_MAX, 0, place.id, b.pressed});
+                out.block_ctxs.push_back(
+                    {track.id, place.id, true, b.ctx, b.ctx_at});
                 ablocks.push_back(b);
             }
 
@@ -8725,12 +9924,15 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             user->playhead = playhead;
             user->v0 = v0;
             user->v1 = v1;
+            user->lane_ctx = arena.alloc<bool>();
+            out.lane_ctxs.push_back({track.id, true, user->lane_ctx});
             LayoutNode* widget = make_node(arena, NodeKind::Leaf);
             widget->width = SizeSpec::fill();
             widget->height = SizeSpec::fixed(lane_h);
             widget->user = user;
             widget->draw_fn = draw_block_lane;
             widget->hit_fn = hit_block_lane;
+            out.lane_nodes.push_back({track.id, true, widget});
 
             // The lane label carries the per-track mixer: gain + mute.
             auto& aui = app.audio_ui[track.id];
@@ -9263,18 +10465,53 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<char>(e.codepoint));
                         break;
                     }
+                    // Browser inline rename: printable ASCII only.
+                    if (app.browser_rename_id && e.codepoint >= 32 &&
+                        e.codepoint < 127)
+                        app.browser_rename_buf.push_back(
+                            static_cast<char>(e.codepoint));
+                    // Browser search typing: printable ASCII only.
+                    if (app.browser_search_focus && e.codepoint >= 32 &&
+                        e.codepoint < 127)
+                        app.browser_filter.push_back(
+                            static_cast<char>(e.codepoint));
                     // Preset search typing: printable ASCII only.
                     if (app.preset_search_focus && e.codepoint >= 32 &&
                         e.codepoint < 127)
                         app.preset_filter.push_back(
                             static_cast<char>(e.codepoint));
-                    // Add-node search (docs/flow_canvas.md).
+                    // Add-node search.
                     if (app.fx_search_focus && e.codepoint >= 32 &&
                         e.codepoint < 127)
                         app.fx_filter.push_back(
                             static_cast<char>(e.codepoint));
                     break;
                 case platform::Event::Type::KeyDown:
+                    if (app.browser_rename_id) {
+                        // Same swallow-the-keyboard contract as the other
+                        // inline fields: backspace edits, Enter commits,
+                        // Escape abandons.
+                        if (e.key == platform::Key::Backspace &&
+                            !app.browser_rename_buf.empty())
+                            app.browser_rename_buf.pop_back();
+                        else if (e.key == platform::Key::Enter)
+                            app.browser_rename_commit = true;
+                        else if (e.key == platform::Key::Escape)
+                            app.browser_rename_id = 0;
+                        break;
+                    }
+                    if (app.browser_search_focus) {
+                        if (e.key == platform::Key::Backspace &&
+                            !app.browser_filter.empty())
+                            app.browser_filter.pop_back();
+                        else if (e.key == platform::Key::Enter)
+                            app.browser_search_focus = false;
+                        else if (e.key == platform::Key::Escape) {
+                            app.browser_search_focus = false;
+                            app.browser_filter.clear();
+                        }
+                        break;
+                    }
                     if (app.duration_focus) {
                         // Same swallow-the-keyboard contract as the preset
                         // search: backspace edits, Enter commits, Escape
@@ -9437,10 +10674,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                         break;
                     }
-                    // Escape deselects first (docs/flow_canvas.md); a bare
+                    // Escape deselects first; a bare
                     // Escape with nothing selected keeps the old quit.
                     if (e.key == platform::Key::Escape) {
-                        if (app.canvas_state.dd_open) {
+                        if (app.ctx_menu.kind) {
+                            app.ctx_menu = {};
+                            app.ctx_menu_dd.open = false;
+                        } else if (app.canvas_state.dd_open) {
                             app.canvas_state.dd_open = false;
                         } else if (app.canvas_state.ctx_open) {
                             app.canvas_state.ctx_open = false;
@@ -9611,9 +10851,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                (e.mods & platform::kModCtrl)) {
                         do_select_all = true;   // texed Ctrl+A
                     } else if (e.key == platform::Key::F && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
+                               (e.mods & platform::kModCtrl) &&
+                               app.scope_is_look()) {
                         // texed Ctrl+F: find / jump-to-node popup (the
-                        // cursor add menu in find mode).
+                        // cursor add menu in find mode). Sequence scope
+                        // has no nodes to find - the popup stays shut.
                         app.find_mode = true;
                         app.fx_filter.clear();
                         app.fx_search_focus = true;
@@ -9967,7 +11209,38 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         ui::LayoutNode* preview = ui::make_node(arena, ui::NodeKind::Leaf);
         preview->width = ui::SizeSpec::fill();
         preview->height = ui::SizeSpec::fill();
-        preview->draw_fn = draw_preview_frame;
+        // The monitor leaf: plain preview frame at look scope, program
+        // monitor with block handles at sequence scope. Also hosts the
+        // app context menu's popup hit (hits reset inside run_frame, so
+        // the rect must register from a node's hit pass).
+        auto* mon = arena.alloc<MonitorUser>();
+        mon->app = &app;
+        // The displayed-frame latch (revision, bounds, aspect) happens
+        // inside draw_monitor at DRAW time; here only the no-frame
+        // fallback keeps the aspect sane before the first publish.
+        {
+            uint32_t cw = 0, ch = 0;
+            doc::canvas_size(app.document, &cw, &ch);
+            const float fallback =
+                static_cast<float>(cw) /
+                std::max(1.0f, static_cast<float>(ch));
+            if (app.mon_canvas_aspect <= 0.0f)
+                app.mon_canvas_aspect = fallback;
+        }
+        if (!app.scope_is_look() && app.sel_placement) {
+            if (const doc::Placement* selp = video_placement_of(
+                    app.sequence(), app.sel_placement)) {
+                mon->staged = arena.alloc<doc::Placement>();
+                *mon->staged = *selp;
+                mon->changed = arena.alloc<bool>();
+                mon->released = arena.alloc<bool>();
+                frame_ui.placement_xfs.push_back(
+                    {selp->id, mon->staged, mon->changed, mon->released});
+            }
+        }
+        preview->user = mon;
+        preview->draw_fn = draw_monitor;
+        preview->hit_fn = hit_monitor;
         frame_ui.preview = preview;
 
         // A stale scope (undo removed the entity, a new project) repairs
@@ -10012,7 +11285,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                           .first;
             thumb_tex = reg->second;
         }
-        // Node canvas (docs/flow_canvas.md): graph + events built before
+        // Node canvas: graph + events built before
         // the panels so the rail and the canvas share one selection.
         FlowBuild flow_ui = build_flow(arena, app, frame_ui, thumb_tex,
                                        thumb_view.thumb_img
@@ -10028,8 +11301,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         ui::LayoutNode* left_panel = nullptr;
         ui::LayoutNode* right_panel = nullptr;
         ui::LayoutNode* preset_panel = nullptr;
+        ui::LayoutNode* browser_panel = nullptr;
         build_side_panels(arena, app, frame_ui, 1.0f / smoothed_dt,
-                          &left_panel, &right_panel, &preset_panel);
+                          &left_panel, &right_panel, &preset_panel,
+                          &browser_panel);
 
         // Menu bar: every file/edit/view action stays reachable without
         // the old rail buttons; picks dispatch after RunPopup below.
@@ -10048,9 +11323,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             "bypass fx  (b)",   "alpha checker"};
         int* menu_picks = arena.alloc<int>(3);
         for (int m = 0; m < 3; ++m) menu_picks[m] = -1;
-        char fps_buf[32];
-        std::snprintf(fps_buf, sizeof(fps_buf), "%.0f fps",
-                      1.0f / std::max(smoothed_dt, 1e-4f));
+        // Playback rate = distinct timeline frames the worker published
+        // per second; the UI loop runs detached, so its rate is shown
+        // beside it, never instead of it.
+        {
+            const uint64_t adv = render_worker.frames_advanced();
+            const double now_s = app.app_seconds;
+            if (app.play_fps_time <= 0.0) {
+                app.play_fps_time = now_s;
+                app.play_fps_count = adv;
+            } else if (now_s - app.play_fps_time >= 0.5) {
+                app.play_fps =
+                    static_cast<double>(adv - app.play_fps_count) /
+                    std::max(1e-3, now_s - app.play_fps_time);
+                app.play_fps_count = adv;
+                app.play_fps_time = now_s;
+            }
+        }
+        char fps_buf[96];
+        std::snprintf(fps_buf, sizeof(fps_buf),
+                      "play %.0f / ui %.0f fps / rt %.1f ms "
+                      "(d%.0f r%.0f c%.0f g%.0f)",
+                      app.play_fps, 1.0f / std::max(smoothed_dt, 1e-4f),
+                      render_worker.cycle_ms(), render_worker.phase_ms(0),
+                      render_worker.phase_ms(1), render_worker.phase_ms(2),
+                      render_worker.phase_ms(3));
         ui::LabelOpts bar_dim;
         bar_dim.color = ui::active_theme().text_dim;
         ui::StackOpts bar;
@@ -10071,12 +11368,58 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                           ui::SizeSpec::fixed(1.0f), nullptr),
              ui::Label(arena, fps_buf, bar_dim)});
 
-        // LEFT column: the node canvas over the timeline (timeline
-        // collapses in Live mode / with nothing open).
+        // LEFT column over the timeline: the node canvas at look scope;
+        // at SEQUENCE scope the PROGRAM MONITOR takes this slot (the
+        // graph area is a hint screen there) and the selected block
+        // manipulates directly on the picture.
+        const bool seq_monitor = !app.scope_is_look();
         ui::LayoutNode* canvas_band = flow::FlowCanvas(
             arena, flow_ui.graph, &app.canvas_state, flow_ui.events);
         frame_ui.canvas_node = canvas_band;
-        ui::LayoutNode* left_col = canvas_band;
+        const bool blank_start = app.document.assets.empty() &&
+                                 app.document.revision == 0 && !app.import;
+        // Built ONCE; it rides directly under whichever slot holds the
+        // picture - the transport belongs to the monitor, not a column.
+        ui::LayoutNode* transport = build_transport(arena, app, frame_ui);
+        ui::LayoutNode* left_top = canvas_band;
+        if (seq_monitor) {
+            ui::StackOpts mc;
+            mc.gap = 6.0f;
+            mc.cross_align = ui::AlignMode::Stretch;
+            mc.width = ui::SizeSpec::fill();
+            mc.height = ui::SizeSpec::fill();
+            left_top = ui::VStack(arena, mc, {preview, transport});
+        }
+        if (blank_start && seq_monitor) {
+            ui::LabelOpts hint;
+            hint.color = ui::active_theme().text_dim;
+            hint.size = ui::active_theme().font_size + 2.0f;
+            ui::ButtonOpts big;
+            big.width = ui::SizeSpec::fixed(150);
+            ui::StackOpts center;
+            center.justify = ui::Justify::Center;
+            center.cross_align = ui::AlignMode::Center;
+            center.width = ui::SizeSpec::fill();
+            center.height = ui::SizeSpec::fill();
+            center.gap = 10.0f;
+            // The blank start offers both doors: a look FROM a clip, or
+            // an empty one to build in. Either way you land in a look's
+            // editing view - that is home.
+            frame_ui.new_look_clicked = arena.alloc<bool>();
+            ui::LayoutNode* empty_ui = ui::VStack(
+                arena, center,
+                {ui::Label(arena, "drag a clip here", hint),
+                 ui::Button(arena, "look from clip...",
+                            &app.open_big_button, frame_ui.open_clicked,
+                            big),
+                 ui::Button(arena, "new look", &app.new_look_button,
+                            frame_ui.new_look_clicked, big)});
+            ui::LayoutNode* z = ui::ZStack(arena, {left_top, empty_ui});
+            z->width = ui::SizeSpec::fill();
+            z->height = ui::SizeSpec::fill();
+            left_top = z;
+        }
+        ui::LayoutNode* left_col = left_top;
         if (app.has_timeline() && !app.live_mode) {
             const float tl_h = std::clamp(
                 app.split_timeline * viewport.h, 96.0f,
@@ -10092,57 +11435,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             lc.height = ui::SizeSpec::fill();
             left_col = ui::VStack(
                 arena, lc,
-                {canvas_band,
+                {left_top,
                  SplitterBar(arena, app, &app.split_timeline,
                              &app.split_drag[1], viewport.h, 1, -1.0f,
                              0.1f, 0.6f),
                  tl_box});
         }
 
-        // RIGHT column: preview (+ transport / empty state) over the
-        // tabbed inspector. The transport is always there — the timeline
-        // is the clock now, and an empty look still has one. The
-        // blank-start prompt (docs/look.md phase 5) rides over the preview
-        // only while the project is untouched.
-        ui::LayoutNode* preview_cell = preview;
-        const bool blank_start = app.document.assets.empty() &&
-                                 app.document.revision == 0 && !app.import;
-        {
+        // RIGHT column top slot: at look scope the preview with the
+        // transport under it; at sequence scope the block ATTRIBUTES
+        // panel alone - the picture AND its transport moved into the
+        // left slot as the program monitor.
+        ui::LayoutNode* preview_cell;
+        if (seq_monitor) {
+            preview_cell = build_block_panel(arena, app, frame_ui);
+        } else {
             ui::StackOpts rc;
             rc.gap = 6.0f;
             rc.cross_align = ui::AlignMode::Stretch;
             rc.width = ui::SizeSpec::fill();
             rc.height = ui::SizeSpec::fill();
-            preview_cell = ui::VStack(
-                arena, rc, {preview, build_transport(arena, app, frame_ui)});
-        }
-        if (blank_start) {
-            ui::LabelOpts hint;
-            hint.color = ui::active_theme().text_dim;
-            hint.size = ui::active_theme().font_size + 2.0f;
-            ui::ButtonOpts big;
-            big.width = ui::SizeSpec::fixed(150);
-            ui::StackOpts center;
-            center.justify = ui::Justify::Center;
-            center.cross_align = ui::AlignMode::Center;
-            center.width = ui::SizeSpec::fill();
-            center.height = ui::SizeSpec::fill();
-            center.gap = 10.0f;
-            // The blank start offers both doors (docs/look.md): a look
-            // FROM a clip, or an empty one to build in. Either way you
-            // land in a look's editing view - that is home.
-            frame_ui.new_look_clicked = arena.alloc<bool>();
-            ui::LayoutNode* empty_ui = ui::VStack(
-                arena, center,
-                {ui::Label(arena, "drag a clip here", hint),
-                 ui::Button(arena, "look from clip...", &app.open_big_button,
-                            frame_ui.open_clicked, big),
-                 ui::Button(arena, "new look", &app.new_look_button,
-                            frame_ui.new_look_clicked, big)});
-            ui::LayoutNode* z = ui::ZStack(arena, {preview_cell, empty_ui});
-            z->width = ui::SizeSpec::fill();
-            z->height = ui::SizeSpec::fill();
-            preview_cell = z;
+            preview_cell = ui::VStack(arena, rc, {preview, transport});
         }
         const float pv_h = std::clamp(app.split_preview * viewport.h,
                                       140.0f, viewport.h * 0.7f);
@@ -10150,6 +11463,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             ui::SizedBox(arena, ui::SizeSpec::fill(),
                          ui::SizeSpec::fixed(pv_h), preview_cell);
         bool* tab_node = arena.alloc<bool>();
+        bool* tab_browser = arena.alloc<bool>();
         bool* tab_project = arena.alloc<bool>();
         bool* tab_presets = arena.alloc<bool>();
         ui::StackOpts tabs_row;
@@ -10161,12 +11475,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             {ui::Chip(arena, "node", app.inspector_tab == 0,
                       &app.tab_buttons[0], tab_node,
                       "selection inspector"),
+             ui::Chip(arena, "browser", app.inspector_tab == 3,
+                      &app.tab_buttons[3], tab_browser,
+                      "project browser: bins, looks, sequences, media"),
              ui::Chip(arena, "project", app.inspector_tab == 1,
                       &app.tab_buttons[1], tab_project,
                       "clip & project settings"),
              ui::Chip(arena, "presets", app.inspector_tab == 2,
                       &app.tab_buttons[2], tab_presets,
                       "preset browser")});
+        ui::LayoutNode* tab_panel = right_panel;
+        if (app.inspector_tab == 1) tab_panel = left_panel;
+        else if (app.inspector_tab == 2) tab_panel = preset_panel;
+        else if (app.inspector_tab == 3) tab_panel = browser_panel;
         ui::StackOpts insp_col;
         insp_col.gap = 4.0f;
         insp_col.cross_align = ui::AlignMode::Stretch;
@@ -10176,11 +11497,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             arena, insp_col,
             {tabs,
              ui::SizedBox(arena, ui::SizeSpec::fill(),
-                          ui::SizeSpec::fill(),
-                          app.inspector_tab == 2
-                              ? preset_panel
-                              : (app.inspector_tab == 1 ? left_panel
-                                                        : right_panel))});
+                          ui::SizeSpec::fill(), tab_panel)});
         const float right_w = std::clamp(app.split_right * viewport.w,
                                          280.0f, 560.0f);
         ui::StackOpts rc2;
@@ -10219,11 +11536,862 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         ui::LayoutFrame layout_frame{canvas, input, ctx, font,
                                      ui::active_theme(), dt,
                                      header_font ? &*header_font : nullptr};
+        app.win_rect = viewport;
         ui::run_frame(root, viewport, layout_frame);
+
+        // ---- app context menu: close on an outside press, then turn the
+        // surfaces' staged right-click requests into an open menu. The
+        // popup itself rides the shared overlay (RunPopup below draws it
+        // and lands the pick this same frame).
+        if (app.ctx_menu.kind && app.ctx_menu_dd.open &&
+            (input.left_pressed() || input.right_pressed()) &&
+            !app_ctx_menu_rect(app, font).contains(input.mouse)) {
+            app.ctx_menu = {};
+            app.ctx_menu_dd.open = false;
+        }
+        const bool ctx_was_open = app.ctx_menu.kind != 0;
+        auto ctx_open = [&](int kind) -> AppState::CtxMenu& {
+            app.ctx_menu = {};
+            app.ctx_menu.kind = kind;
+            app.ctx_menu.anchor = input.mouse;
+            app.ctx_menu_dd.open = true;
+            ctx.set_popup_owner(&app.ctx_menu_dd);
+            return app.ctx_menu;
+        };
+        auto ctx_item = [&](const char* label, int act) {
+            app.ctx_menu.labels.push_back(label);
+            app.ctx_menu.acts.push_back(act);
+        };
+        if (!ctx_was_open) {
+            for (const FrameUi::BlockCtx& bc : frame_ui.block_ctxs) {
+                if (!*bc.clicked || app.scope_is_look()) continue;
+                const doc::Placement* p =
+                    doc::find_placement(app.sequence(), bc.placement_id);
+                if (!p) break;
+                auto& m =
+                    ctx_open(bc.audio ? kCtxBlockAudio : kCtxBlockVideo);
+                m.a = bc.track_id;
+                m.b = bc.placement_id;
+                m.at_frame = *bc.at_frame;
+                const bool live_target =
+                    app.document.find_look(p->target) ||
+                    app.document.find_sequence(p->target);
+                if (!bc.audio && live_target)
+                    ctx_item("open (double-click)", kActOpenTarget);
+                ctx_item("razor here", kActRazorHere);
+                if (p->link)
+                    ctx_item(bc.audio ? "unlink from video" : "unlink audio",
+                             kActUnlinkGroup);
+                if (!bc.audio && live_target) {
+                    ctx_item("make unique", kActMakeUnique);
+                    ctx_item("duplicate after", kActDuplicateBlock);
+                }
+                if (bc.audio) {
+                    ctx_item(p->audio_mute ? "unmute" : "mute",
+                             kActMuteBlock);
+                    if (p->audio_gain != 1.0f)
+                        ctx_item("reset gain", kActResetBlockGain);
+                }
+                ctx_item("remove (del)", kActRemoveBlock);
+                break;
+            }
+            for (const FrameUi::LaneCtx& lc : frame_ui.lane_ctxs) {
+                if (!*lc.clicked || app.scope_is_look()) continue;
+                auto& m = ctx_open(lc.audio ? kCtxLaneAudio : kCtxLaneVideo);
+                m.a = lc.track_id;
+                if (!lc.audio) {
+                    ctx_item("add lane above", kActAddLaneAbove);
+                    ctx_item("add lane below", kActAddLaneBelow);
+                    ctx_item("add audio track", kActAddAudioTrack);
+                    if (app.sequence().tracks.size() > 1)
+                        ctx_item("remove this lane", kActRemoveLane);
+                } else {
+                    ctx_item("add audio track", kActAddAudioTrack);
+                    ctx_item("remove this track", kActRemoveLane);
+                }
+                break;
+            }
+            if (frame_ui.ruler_ctx && *frame_ui.ruler_ctx &&
+                !app.scope_is_look()) {
+                auto& m = ctx_open(kCtxRuler);
+                m.at_frame = *frame_ui.ruler_ctx_frame;
+                const doc::Sequence& sq = app.sequence();
+                ctx_item("marker here (m)", kActMarkerHere);
+                ctx_item("loop start here", kActLoopInHere);
+                ctx_item("loop end here", kActLoopOutHere);
+                if (sq.loop_out > sq.loop_in)
+                    ctx_item("clear loop", kActClearLoop);
+                ctx_item("trim in here", kActTrimInHere);
+                ctx_item("trim out here", kActTrimOutHere);
+            }
+            for (const FrameUi::ParamCtx& pc : frame_ui.param_ctxs) {
+                if (!*pc.clicked || !app.scope_is_look()) continue;
+                auto& m = ctx_open(kCtxParam);
+                m.key = pc.key;
+                m.value = pc.value;
+                m.def_v = pc.def_v;
+                bool lane = false, lane_loop = false, lane_mute = false;
+                for (const doc::KeyframeLane& l : app.look().lanes)
+                    if (l.target == pc.key) {
+                        lane = !l.keys.empty();
+                        lane_loop = l.loop;
+                        lane_mute = l.muted;
+                    }
+                bool wired = false;
+                for (const doc::ModRoute& r : app.look().mod_routes)
+                    if (r.target == pc.key) wired = true;
+                ctx_item("key here (k)", kActKeyHere);
+                if (lane) {
+                    ctx_item(lane_loop ? "lane loop off" : "lane loop",
+                             kActLaneLoop);
+                    ctx_item(lane_mute ? "unmute lane" : "mute lane",
+                             kActLaneMute);
+                    ctx_item("clear lane", kActClearLane);
+                }
+                ctx_item(wired ? "rewire ~ (replaces)" : "wire an lfo (~)",
+                         kActWireLfo);
+                if (wired) ctx_item("remove wire", kActRemoveWire);
+                if (pc.has_def && pc.value != pc.def_v)
+                    ctx_item("reset", kActResetParam);
+                break;
+            }
+            for (const FrameUi::BrowserAction& ba : frame_ui.browser_looks) {
+                if (!ba.ctx || !*ba.ctx) continue;
+                auto& m = ctx_open(kCtxBrowserEntity);
+                m.a = ba.id;
+                const bool is_seq =
+                    app.document.find_sequence(ba.id) != nullptr;
+                ctx_item(is_seq ? "open" : "open graph", kActOpenTarget);
+                ctx_item("place at playhead", kActPlaceAtPlayhead);
+                ctx_item("rename", kActRename);
+                uint64_t cur_bin = 0;
+                if (const doc::Look* l = app.document.find_look(ba.id))
+                    cur_bin = l->bin;
+                else if (const doc::Sequence* s =
+                             app.document.find_sequence(ba.id))
+                    cur_bin = s->bin;
+                if (cur_bin) ctx_item("move to root", kActMoveToRoot);
+                if (!is_seq || ba.id != app.document.root_sequence)
+                    ctx_item("remove from project", kActRemoveEntity);
+                break;
+            }
+            for (const FrameUi::BrowserAction& ba :
+                 frame_ui.browser_assets) {
+                if (!ba.ctx || !*ba.ctx) continue;
+                auto& m = ctx_open(kCtxBrowserAsset);
+                m.a = ba.id;
+                ctx_item("new look from this", kActNewLookFromAsset);
+                ctx_item("place at playhead", kActPlaceAtPlayhead);
+                ctx_item("rename", kActRename);
+                for (const doc::Asset& a2 : app.document.assets)
+                    if (a2.id == ba.id && a2.bin) {
+                        ctx_item("move to root", kActMoveToRoot);
+                        break;
+                    }
+                break;
+            }
+            for (const FrameUi::BinRow& br : frame_ui.bin_rows) {
+                if (!br.ctx || !*br.ctx) continue;
+                auto& m = ctx_open(kCtxBin);
+                m.a = br.id;
+                m.b = br.id;   // creations inside land in this bin
+                ctx_item("new bin inside", kActNewBinInside);
+                ctx_item("new look inside", kActNewLook);
+                ctx_item("new sequence inside", kActNewSequence);
+                ctx_item("rename", kActRename);
+                const doc::Bin* b = app.document.find_bin(br.id);
+                if (b && b->parent)
+                    ctx_item("move to root", kActMoveToRoot);
+                ctx_item("delete bin (keeps contents)", kActRemoveBin);
+                break;
+            }
+            // Browser background (no row under the cursor): creation.
+            if (!app.ctx_menu.kind && input.right_pressed() &&
+                frame_ui.browser_panel &&
+                frame_ui.browser_panel->rect.contains(input.mouse)) {
+                bool on_row = false;
+                for (const FrameUi::BrowserNode& bn :
+                     frame_ui.browser_nodes)
+                    if (bn.node->rect.contains(input.mouse)) on_row = true;
+                if (!on_row) {
+                    ctx_open(kCtxBrowserBg);
+                    ctx_item("new look", kActNewLook);
+                    ctx_item("new sequence", kActNewSequence);
+                    ctx_item("new bin", kActNewBinInside);
+                    ctx_item("import media...", kActImportMedia);
+                }
+            }
+            if (!app.ctx_menu.kind && input.right_pressed() &&
+                frame_ui.preview &&
+                frame_ui.preview->rect.contains(input.mouse)) {
+                // Click uv maps through the SAME content rect the blit
+                // uses, or sample-here lands off the pixels.
+                const ui::Rect pr = monitor_content_rect(
+                    app, frame_ui.preview->rect.inset(1.0f));
+                auto& m = ctx_open(kCtxPreview);
+                m.value = std::clamp((input.mouse.x - pr.x) /
+                                         std::max(pr.w, 1.0f),
+                                     0.0f, 1.0f);
+                m.def_v = std::clamp((input.mouse.y - pr.y) /
+                                         std::max(pr.h, 1.0f),
+                                     0.0f, 1.0f);
+                if (app.scope_is_look()) {
+                    if (app.sel.kind == SelKind::ModSource) {
+                        const doc::ValueNode* vn =
+                            doc::find_value_node(app.look(), app.sel.id);
+                        if (vn &&
+                            (vn->source.type ==
+                                 doc::ModSourceType::VideoSample ||
+                             vn->source.type ==
+                                 doc::ModSourceType::VideoRegion))
+                            ctx_item("sample here (selected node)",
+                                     kActSampleHere);
+                    }
+                    ctx_item("store snapshot a", kActStoreSnap0);
+                    ctx_item("store snapshot b", kActStoreSnap1);
+                    ctx_item("store snapshot c", kActStoreSnap2);
+                    if (app.look().snapshots[0].valid)
+                        ctx_item("apply snapshot a", kActApplySnap0);
+                    if (app.look().snapshots[1].valid)
+                        ctx_item("apply snapshot b", kActApplySnap1);
+                    if (app.look().snapshots[2].valid)
+                        ctx_item("apply snapshot c", kActApplySnap2);
+                }
+                ctx_item(app.ab_wipe ? "a/b wipe off" : "a/b wipe",
+                         kActToggleAb);
+                if (app.mon_zoom != 1.0f || app.mon_pan.x != 0.0f ||
+                    app.mon_pan.y != 0.0f)
+                    ctx_item("fit to view", kActMonZoomFit);
+                if (!app.scope_is_look()) {
+                    // The program monitor doubles as the sequence's
+                    // creation surface (the canvas hint screen it
+                    // replaced owned these).
+                    ctx_item("new look", kActNewLook);
+                    ctx_item("new sequence", kActNewSequence);
+                    ctx_item("import media...", kActImportMedia);
+                }
+            }
+            if (app.ctx_menu.kind && app.ctx_menu.labels.empty()) {
+                app.ctx_menu = {};
+                app.ctx_menu_dd.open = false;
+            }
+        }
+        if (app.ctx_menu.kind && app.ctx_menu_dd.open) {
+            ui::Context::PopupRequest req;
+            req.rect = app_ctx_menu_rect(app, font);
+            req.anchor = req.rect;
+            req.items = app.ctx_menu.labels.data();
+            req.count = static_cast<int>(app.ctx_menu.labels.size());
+            req.selected = -1;
+            req.state = &app.ctx_menu_dd;
+            req.out_selected = &app.ctx_menu.pick;
+            ctx.set_popup(req);
+        }
+
+        // ---- browser drag-into-bin: press a tree row, cross the
+        // threshold, release over a bin row. A clean click never crosses
+        // the threshold, so open/fold behavior is untouched. Bins
+        // reparent through the same gesture (cycle-guarded).
+        if (!input.left_down()) {
+            if (app.browser_drag_live) {
+                bool dropped = false;
+                for (const FrameUi::BrowserNode& bn :
+                     frame_ui.browser_nodes) {
+                    if (!bn.is_bin || bn.id == app.browser_drag_id)
+                        continue;
+                    if (!bn.node->rect.contains(input.mouse)) continue;
+                    if (app.browser_drag_is_bin) {
+                        if (!doc::bin_reaches(app.document, bn.id,
+                                              app.browser_drag_id)) {
+                            if (const doc::Bin* b = app.document.find_bin(
+                                    app.browser_drag_id))
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_bin_props_command(
+                                        b->id, b->name, bn.id));
+                        }
+                    } else {
+                        app.undo.execute(app.document,
+                                         doc::set_entity_bin_command(
+                                             app.browser_drag_id, bn.id));
+                    }
+                    app.bin_closed.erase(bn.id);   // reveal the drop
+                    dropped = true;
+                    break;
+                }
+                // Timeline lanes take entity drops: a block at the drop
+                // frame on that very lane. Audio lanes lay sound only.
+                if (!dropped && !app.browser_drag_is_bin &&
+                    !app.scope_is_look()) {
+                    for (const FrameUi::LaneNode& ln :
+                         frame_ui.lane_nodes) {
+                        if (!ln.node->rect.contains(input.mouse))
+                            continue;
+                        const ui::Rect& lr = ln.node->rect;
+                        const double vspan =
+                            std::max(1.0, app.tl_v1 - app.tl_v0);
+                        const double f =
+                            app.tl_v0 + (input.mouse.x - lr.x) /
+                                            std::max(lr.w, 1.0f) * vspan;
+                        const uint32_t at = f <= 0.0
+                            ? 0u
+                            : static_cast<uint32_t>(std::llround(f));
+                        const uint64_t did = app.browser_drag_id;
+                        if (const doc::Asset* as =
+                                app.document.find_asset(did)) {
+                            if (!ln.audio) {
+                                if (!as->path.empty())
+                                    place_clip_block(
+                                        app,
+                                        std::filesystem::path(as->path),
+                                        at, ln.track_id);
+                            } else {
+                                app.status = "drop media on a video lane";
+                            }
+                        } else if (!ln.audio) {
+                            place_look_block(app, did, at, ln.track_id);
+                        } else if (app.document.find_look(did) ||
+                                   app.document.find_sequence(did)) {
+                            doc::Placement ap;
+                            ap.target = did;
+                            ap.t_in = at;
+                            app.undo.execute(
+                                app.document,
+                                doc::add_audio_placement_command(
+                                    app.document, app.sequence().id,
+                                    ln.track_id, ap, 0));
+                        }
+                        dropped = true;
+                        break;
+                    }
+                }
+                // The browser background is "file at root".
+                if (!dropped && frame_ui.browser_panel &&
+                    frame_ui.browser_panel->rect.contains(input.mouse)) {
+                    if (app.browser_drag_is_bin) {
+                        if (const doc::Bin* b = app.document.find_bin(
+                                app.browser_drag_id)) {
+                            if (b->parent)
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_bin_props_command(
+                                        b->id, b->name, 0));
+                        }
+                    } else {
+                        uint64_t cur = 0;
+                        if (const doc::Look* l =
+                                app.document.find_look(app.browser_drag_id))
+                            cur = l->bin;
+                        else if (const doc::Sequence* s =
+                                     app.document.find_sequence(
+                                         app.browser_drag_id))
+                            cur = s->bin;
+                        else if (const doc::Asset* a2 =
+                                     app.document.find_asset(
+                                         app.browser_drag_id))
+                            cur = a2->bin;
+                        if (cur)
+                            app.undo.execute(
+                                app.document,
+                                doc::set_entity_bin_command(
+                                    app.browser_drag_id, 0));
+                    }
+                }
+            }
+            app.browser_drag_id = 0;
+            app.browser_drag_live = false;
+        } else if (app.browser_drag_id && !app.browser_drag_live) {
+            const float moved =
+                std::fabs(input.mouse.x - app.browser_drag_from.x) +
+                std::fabs(input.mouse.y - app.browser_drag_from.y);
+            if (moved > 6.0f) app.browser_drag_live = true;
+        }
+        if (input.left_pressed() && !app.browser_drag_id &&
+            !(app.ctx_menu.kind && app.ctx_menu_dd.open)) {
+            for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes)
+                if (bn.node->rect.contains(input.mouse)) {
+                    app.browser_drag_id = bn.id;
+                    app.browser_drag_is_bin = bn.is_bin;
+                    app.browser_drag_from = input.mouse;
+                    break;
+                }
+        }
+        if (app.browser_drag_live) {
+            // Valid target under the cursor wears the accent; the cursor
+            // trails a small chip so the gesture reads as a carry.
+            for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes) {
+                if (!bn.is_bin || bn.id == app.browser_drag_id) continue;
+                if (!bn.node->rect.contains(input.mouse)) continue;
+                const bool ok =
+                    !app.browser_drag_is_bin ||
+                    !doc::bin_reaches(app.document, bn.id,
+                                      app.browser_drag_id);
+                if (ok)
+                    canvas.draw_sdf_rect_outline(
+                        bn.node->rect, 3.0f, 1.5f,
+                        ui::active_theme().accent);
+                break;
+            }
+            if (!app.browser_drag_is_bin && !app.scope_is_look())
+                for (const FrameUi::LaneNode& ln : frame_ui.lane_nodes) {
+                    if (!ln.node->rect.contains(input.mouse)) continue;
+                    const ui::Rect& lr = ln.node->rect;
+                    canvas.draw_sdf_rect_outline(
+                        lr, 3.0f, 1.5f, ui::active_theme().accent);
+                    canvas.draw_line({input.mouse.x, lr.y},
+                                     {input.mouse.x, lr.bottom()}, 1.5f,
+                                     ui::active_theme().accent);
+                    break;
+                }
+            canvas.draw_sdf_rect(
+                {input.mouse.x + 10.0f, input.mouse.y + 6.0f, 8.0f, 8.0f},
+                2.0f, ui::active_theme().accent_dim);
+        }
         // Dropdown overlay: interacts NOW — before the edit handlers below
         // — so a selection made this frame is applied this frame. Drawn
         // here it also overlays every widget (recorded after them).
         ui::RunPopup(canvas, font, ui::active_theme(), ctx, input);
+
+        // App-menu picks: forward through the SAME flag the surface's
+        // buttons use where one exists this frame; everything else
+        // executes its command directly.
+        if (app.ctx_menu.kind && app.ctx_menu.pick >= 0 &&
+            app.ctx_menu.pick <
+                static_cast<int>(app.ctx_menu.acts.size())) {
+            const AppState::CtxMenu m = app.ctx_menu;
+            const int act = m.acts[static_cast<size_t>(m.pick)];
+            app.ctx_menu = {};
+            app.ctx_menu_dd.open = false;
+            auto scope_into = [&](uint64_t target) {
+                const doc::Look* tl = app.document.find_look(target);
+                if (!tl && !app.document.find_sequence(target)) return;
+                app.scope_look = target;
+                app.open_group = 0;
+                app.sel = {};
+                app.selected_layer = 0;
+                app.layer_sel = false;
+                app.sel_placement = 0;
+                app.multi_sel.clear();
+                app.sel_wires.clear();
+                app.canvas_state.view_inited = false;
+                app.saved_view_valid = false;
+                app.tl_v0 = app.tl_v1 = 0.0;
+                app.undo.break_coalescing();
+                app.status =
+                    "editing " +
+                    (tl ? tl->name : app.document.sequence(target).name);
+            };
+            switch (act) {
+                case kActOpenTarget: {
+                    if (m.kind == kCtxBlockVideo) {
+                        if (const doc::Placement* p = doc::find_placement(
+                                app.sequence(), m.b))
+                            scope_into(p->target);
+                    } else {
+                        for (const FrameUi::BrowserAction& ba :
+                             frame_ui.browser_looks)
+                            if (ba.id == m.a && ba.open) *ba.open = true;
+                    }
+                    break;
+                }
+                case kActRazorHere: {
+                    const uint32_t at =
+                        static_cast<uint32_t>(std::llround(m.at_frame));
+                    auto cmd = m.kind == kCtxBlockAudio
+                        ? doc::razor_audio_command(app.document,
+                                                   app.sequence().id, m.a,
+                                                   at)
+                        : doc::razor_track_command(app.document,
+                                                   app.sequence().id, m.a,
+                                                   at);
+                    if (cmd)
+                        app.undo.execute(app.document, std::move(cmd));
+                    else
+                        app.status = "razor needs a frame inside the block";
+                    break;
+                }
+                case kActUnlinkGroup:
+                    app.undo.execute(app.document,
+                                     doc::unlink_placement_command(
+                                         app.sequence().id, m.b));
+                    break;
+                case kActMakeUnique: {
+                    if (auto cmd = doc::make_unique_command(
+                            app.document, app.sequence().id, m.b)) {
+                        app.undo.execute(app.document, std::move(cmd));
+                        app.status = "made unique";
+                    } else {
+                        app.status = "cannot make unique";
+                    }
+                    break;
+                }
+                case kActDuplicateBlock: {
+                    const doc::Placement* p =
+                        doc::find_placement(app.sequence(), m.b);
+                    if (!p) break;
+                    const doc::Placement orig = *p;
+                    const uint32_t len =
+                        doc::source_length(app.document, orig);
+                    const uint32_t end = doc::placement_end(orig, len);
+                    const uint32_t span =
+                        end > orig.t_in ? end - orig.t_in : 60u;
+                    // Collect the linked audio partners BEFORE executing:
+                    // the adds grow the very vectors being scanned.
+                    struct APair {
+                        uint64_t track;
+                        doc::Placement place;
+                    };
+                    std::vector<APair> partners;
+                    if (orig.link)
+                        for (const doc::AudioTrack& tr :
+                             app.sequence().audio)
+                            for (const doc::Placement& ap0 : tr.placements)
+                                if (ap0.link == orig.link) {
+                                    doc::Placement ap = ap0;
+                                    ap.id = 0;
+                                    ap.link = 0;
+                                    ap.t_in = ap0.t_in + span;
+                                    ap.t_out =
+                                        ap0.t_out ? ap0.t_out + span : 0;
+                                    partners.push_back({tr.id, ap});
+                                }
+                    doc::Placement np = orig;
+                    np.id = app.document.next_effect_id++;
+                    np.link = 0;
+                    np.t_in = orig.t_in + span;
+                    np.t_out = orig.t_out ? orig.t_out + span : 0;
+                    app.undo.begin_group("Duplicate Block");
+                    app.undo.execute(app.document,
+                                     doc::add_placement_command(
+                                         app.sequence().id, m.a, np));
+                    for (const APair& pr : partners)
+                        app.undo.execute(
+                            app.document,
+                            doc::add_audio_placement_command(
+                                app.document, app.sequence().id, pr.track,
+                                pr.place, np.id));
+                    if (const doc::Placement* landed = doc::find_placement(
+                            app.sequence(), np.id)) {
+                        const uint32_t nend = doc::placement_end(
+                            *landed,
+                            doc::source_length(app.document, *landed));
+                        doc::overwrite_lane_span(
+                            app.document, app.undo, app.sequence().id, m.a,
+                            np.id, landed->link, landed->t_in, nend);
+                    }
+                    app.undo.end_group();
+                    break;
+                }
+                case kActRemoveBlock:
+                    app.undo.execute(app.document,
+                                     doc::remove_placement_command(
+                                         app.sequence().id, m.b));
+                    break;
+                case kActMuteBlock:
+                case kActResetBlockGain: {
+                    const doc::Placement* p =
+                        doc::find_placement(app.sequence(), m.b);
+                    if (!p) break;
+                    doc::Placement up = *p;
+                    if (act == kActMuteBlock)
+                        up.audio_mute = !up.audio_mute;
+                    else
+                        up.audio_gain = 1.0f;
+                    app.undo.execute(app.document,
+                                     doc::set_placement_command(
+                                         app.sequence().id, up));
+                    break;
+                }
+                case kActMarkerHere:
+                    app.undo.execute(
+                        app.document,
+                        doc::toggle_marker_command(
+                            app.sequence().id,
+                            static_cast<uint32_t>(
+                                std::llround(m.at_frame))));
+                    break;
+                case kActLoopInHere:
+                case kActLoopOutHere:
+                case kActClearLoop:
+                case kActTrimInHere:
+                case kActTrimOutHere: {
+                    const doc::Sequence& sq = app.sequence();
+                    const uint32_t fc = app.player.frame_count();
+                    uint32_t ti = sq.trim_in;
+                    uint32_t to = sq.trim_out ? sq.trim_out : fc;
+                    uint32_t li = sq.loop_in, lo = sq.loop_out;
+                    const uint32_t f =
+                        static_cast<uint32_t>(std::llround(m.at_frame));
+                    if (act == kActLoopInHere) {
+                        li = f;
+                        if (lo <= li) lo = to;
+                    } else if (act == kActLoopOutHere) {
+                        lo = f;
+                        if (li >= lo) li = ti;
+                    } else if (act == kActClearLoop) {
+                        li = lo = 0;
+                    } else if (act == kActTrimInHere) {
+                        ti = std::min(f, to > 0 ? to - 1 : 0);
+                    } else {
+                        to = std::max(f, ti + 1);
+                    }
+                    app.undo.execute(app.document,
+                                     doc::set_timeline_region_command(
+                                         sq.id, ti, to, li, lo));
+                    break;
+                }
+                case kActKeyHere:
+                    for (const FrameUi::KeyToggle& kt :
+                         frame_ui.key_toggles)
+                        if (kt.key == m.key && kt.clicked) {
+                            *kt.clicked = true;
+                            break;
+                        }
+                    break;
+                case kActClearLane:
+                    app.undo.execute(
+                        app.document,
+                        doc::set_lane_command(app.scope_look, m.key, {}));
+                    break;
+                case kActLaneLoop:
+                case kActLaneMute: {
+                    bool cur_loop = false, cur_mute = false;
+                    for (const doc::KeyframeLane& l : app.look().lanes)
+                        if (l.target == m.key) {
+                            cur_loop = l.loop;
+                            cur_mute = l.muted;
+                        }
+                    if (act == kActLaneLoop)
+                        app.undo.execute(app.document,
+                                         doc::set_lane_loop_command(
+                                             app.scope_look, m.key,
+                                             !cur_loop));
+                    else
+                        app.undo.execute(app.document,
+                                         doc::set_lane_mute_command(
+                                             app.scope_look, m.key,
+                                             !cur_mute));
+                    break;
+                }
+                case kActWireLfo:
+                    for (const FrameUi::AddRoute& ar : frame_ui.add_routes)
+                        if (ar.key == m.key && ar.clicked) {
+                            *ar.clicked = true;
+                            break;
+                        }
+                    break;
+                case kActRemoveWire:
+                    for (const doc::ModRoute& r : app.look().mod_routes)
+                        if (r.target == m.key) {
+                            app.undo.execute(
+                                app.document,
+                                doc::remove_route_command(app.scope_look,
+                                                          r.id));
+                            break;
+                        }
+                    break;
+                case kActResetParam:
+                    for (const FrameUi::LayerStage& lst :
+                         frame_ui.layer_stages) {
+                        const doc::ParamKey lk{
+                            lst.layer_id | doc::kLayerParamBit,
+                            static_cast<int>(lst.field)};
+                        if (!(lk == m.key)) continue;
+                        *lst.staged = m.def_v;
+                        *lst.changed = true;
+                        *lst.released = true;
+                        break;
+                    }
+                    break;
+                case kActPlaceAtPlayhead: {
+                    auto fwd =
+                        [&](const std::vector<FrameUi::BrowserAction>& v) {
+                            for (const FrameUi::BrowserAction& ba : v)
+                                if (ba.id == m.a && ba.place) {
+                                    *ba.place = true;
+                                    return true;
+                                }
+                            return false;
+                        };
+                    if (!fwd(frame_ui.browser_looks))
+                        fwd(frame_ui.browser_assets);
+                    break;
+                }
+                case kActRemoveEntity:
+                    if (app.document.find_sequence(m.a)) {
+                        if (m.a != app.document.root_sequence)
+                            app.undo.execute(
+                                app.document,
+                                doc::remove_sequence_command(m.a));
+                    } else if (app.document.find_look(m.a)) {
+                        app.undo.execute(app.document,
+                                         doc::remove_look_command(m.a));
+                    }
+                    break;
+                case kActNewLookFromAsset: {
+                    const doc::Asset* a = nullptr;
+                    for (const doc::Asset& it : app.document.assets)
+                        if (it.id == m.a) a = &it;
+                    if (!a) break;
+                    const std::string nm =
+                        a->name.empty() ? "look" : a->name;
+                    doc::Look look = doc::make_look(app.document, nm);
+                    doc::Layer clip = doc::make_layer(
+                        app.document, doc::LayerSourceKind::Clip);
+                    clip.name = nm;
+                    clip.asset = a->id;
+                    look.layers.push_back(std::move(clip));
+                    const uint64_t nid = look.id;
+                    app.undo.execute(
+                        app.document,
+                        doc::add_look_command(std::move(look)));
+                    scope_into(nid);
+                    break;
+                }
+                case kActStoreSnap0:
+                case kActStoreSnap1:
+                case kActStoreSnap2:
+                    app.undo.execute(app.document,
+                                     doc::store_snapshot_command(
+                                         app.scope_look,
+                                         act - kActStoreSnap0));
+                    break;
+                case kActApplySnap0:
+                case kActApplySnap1:
+                case kActApplySnap2:
+                    app.undo.execute(app.document,
+                                     doc::apply_snapshot_command(
+                                         app.scope_look,
+                                         act - kActApplySnap0));
+                    break;
+                case kActToggleAb:
+                    if (frame_ui.ab_clicked) *frame_ui.ab_clicked = true;
+                    else app.ab_wipe = !app.ab_wipe;
+                    break;
+                case kActMonZoomFit:
+                    app.mon_zoom = 1.0f;
+                    app.mon_pan = {};
+                    break;
+                case kActSampleHere: {
+                    if (app.sel.kind != SelKind::ModSource) break;
+                    const doc::ValueNode* vn =
+                        doc::find_value_node(app.look(), app.sel.id);
+                    if (!vn) break;
+                    doc::ValueNode n = *vn;
+                    n.source.px = m.value;
+                    n.source.py = m.def_v;
+                    app.undo.execute(app.document,
+                                     doc::set_value_node_command(
+                                         app.scope_look, n));
+                    break;
+                }
+                case kActAddLaneAbove:
+                case kActAddLaneBelow: {
+                    const doc::Sequence& sq = app.sequence();
+                    size_t idx = 0;
+                    for (size_t i = 0; i < sq.tracks.size(); ++i)
+                        if (sq.tracks[i].id == m.a) idx = i;
+                    // Higher index composites later = stacks above.
+                    const size_t at =
+                        act == kActAddLaneAbove ? idx + 1 : idx;
+                    app.undo.execute(
+                        app.document,
+                        doc::add_track_command(
+                            sq.id, doc::make_track(app.document, sq), at));
+                    break;
+                }
+                case kActAddAudioTrack: {
+                    const doc::Sequence& sq = app.sequence();
+                    app.undo.execute(
+                        app.document,
+                        doc::add_audio_track_command(
+                            sq.id,
+                            doc::make_audio_track(app.document, sq)));
+                    break;
+                }
+                case kActRemoveLane:
+                    if (m.kind == kCtxLaneAudio) {
+                        app.undo.execute(app.document,
+                                         doc::remove_audio_track_command(
+                                             app.sequence().id, m.a));
+                    } else if (auto cmd = doc::remove_track_command(
+                                   app.document, app.sequence().id, m.a)) {
+                        app.undo.execute(app.document, std::move(cmd));
+                    }
+                    break;
+                case kActNewLook: {
+                    doc::Look nl = doc::make_look(app.document, "");
+                    nl.bin = m.b;
+                    const uint64_t nid = nl.id;
+                    app.undo.execute(app.document,
+                                     doc::add_look_command(std::move(nl)));
+                    scope_into(nid);
+                    break;
+                }
+                case kActNewSequence: {
+                    doc::Sequence ns =
+                        doc::make_sequence(app.document, "");
+                    ns.bin = m.b;
+                    const uint64_t sid = ns.id;
+                    app.undo.execute(
+                        app.document,
+                        doc::add_sequence_command(std::move(ns)));
+                    scope_into(sid);
+                    break;
+                }
+                case kActImportMedia:
+                    if (frame_ui.import_media_clicked)
+                        *frame_ui.import_media_clicked = true;
+                    break;
+                case kActNewBinInside: {
+                    doc::Bin nb = doc::make_bin(app.document, "");
+                    nb.parent = m.a;
+                    app.undo.execute(app.document,
+                                     doc::add_bin_command(std::move(nb)));
+                    app.bin_closed.erase(m.a);
+                    break;
+                }
+                case kActRemoveBin:
+                    app.undo.execute(app.document,
+                                     doc::remove_bin_command(m.a));
+                    break;
+                case kActRename: {
+                    std::string cur;
+                    if (const doc::Bin* b = app.document.find_bin(m.a))
+                        cur = b->name;
+                    else if (const doc::Look* l =
+                                 app.document.find_look(m.a))
+                        cur = l->name;
+                    else if (const doc::Sequence* s =
+                                 app.document.find_sequence(m.a))
+                        cur = s->name;
+                    else
+                        for (const doc::Asset& a2 : app.document.assets)
+                            if (a2.id == m.a) cur = a2.name;
+                    app.browser_rename_id = m.a;
+                    app.browser_rename_buf = cur;
+                    app.browser_rename_commit = false;
+                    // The rename field owns the keyboard; no other
+                    // capture field may stay live under it.
+                    app.fx_search_focus = false;
+                    app.preset_search_focus = false;
+                    app.duration_focus = false;
+                    break;
+                }
+                case kActMoveToRoot:
+                    if (const doc::Bin* b = app.document.find_bin(m.a))
+                        app.undo.execute(app.document,
+                                         doc::set_bin_props_command(
+                                             m.a, b->name, 0));
+                    else
+                        app.undo.execute(
+                            app.document,
+                            doc::set_entity_bin_command(m.a, 0));
+                    break;
+                default:
+                    break;
+            }
+        }
 
         // Menu-bar picks: each item routes through the SAME flag or frame
         // local its button/hotkey twin uses — one code path per action.
@@ -10287,6 +12455,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (*tab_node) app.inspector_tab = 0;
         if (*tab_project) app.inspector_tab = 1;
         if (*tab_presets) app.inspector_tab = 2;
+        if (*tab_browser) app.inspector_tab = 3;
 
         // ---- apply staged UI edits as commands (before rendering, so the
         // frame reflects this frame's slider positions). Stack edits target
@@ -10443,7 +12612,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 structure_done = true;
             }
         }
-        // ---- node canvas events (docs/flow_canvas.md): selection is view
+        // ---- node canvas events: selection is view
         // state; moves stream through one coalesced command per gesture.
         {
             const flow::Output& fe = *flow_ui.events;
@@ -12111,7 +14280,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                              "first";
                 do_group = false;
             }
-            // NEST (docs/look.md): Ctrl+G over selected SOURCES is the
+            // NEST: Ctrl+G over selected SOURCES is the
             // one-level-up sibling of grouping effects — the blocks leave
             // this look and become one, with a single instance in their
             // place. Effects group; blocks nest.
@@ -12656,7 +14825,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 structure_done = true;
             }
             // Delete removes the selected effect (layer removal stays
-            // behind its inspector button — docs/flow_canvas.md).
+            // behind its inspector button).
             if (do_delete_sel && !structure_done) {
                 if (app.sel.kind == SelKind::Effect) {
                     size_t li = 0, fi = 0;
@@ -12726,7 +14895,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (frame_ui.add_clicked[t] && *frame_ui.add_clicked[t]) {
                 auto fx = doc::make_effect(app.document,
                                            static_cast<doc::EffectType>(t));
-                // Splice where the canvas asked (docs/flow_canvas.md):
+                // Splice where the canvas asked:
                 // insert_before anchors a slot, else the chain end; a
                 // double-click add spawns the card at the click.
                 const auto& stack = app.look().layers[ui_layer].stack;
@@ -12791,6 +14960,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 doc::set_time_remap_command(
                     app.document.speed,
                     static_cast<uint32_t>(*frame_ui.time_mode_selected)));
+        }
+        if (frame_ui.project_fps_selected &&
+            *frame_ui.project_fps_selected >= 0 &&
+            *frame_ui.project_fps_selected < 7 &&
+            app.document.fps !=
+                kProjectFpsValues[*frame_ui.project_fps_selected]) {
+            app.undo.execute(
+                app.document,
+                doc::set_project_format_command(
+                    kProjectFpsValues[*frame_ui.project_fps_selected],
+                    app.document.canvas_w, app.document.canvas_h));
+        }
+        if (frame_ui.project_res_selected &&
+            *frame_ui.project_res_selected >= 0 &&
+            *frame_ui.project_res_selected < 6) {
+            const int s = *frame_ui.project_res_selected;
+            if (app.document.canvas_w != kProjectResW[s] ||
+                app.document.canvas_h != kProjectResH[s])
+                app.undo.execute(app.document,
+                                 doc::set_project_format_command(
+                                     app.document.fps, kProjectResW[s],
+                                     kProjectResH[s]));
         }
 
         // ---- sidechain + audio nudge
@@ -13145,7 +15336,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
 
         // ---- modulation edits. Value-node cards edit the node; wire
-        // rows edit amount/curve; "~" mints an LFO wired onto the param.
+        // rows edit the curve; "~" mints an LFO wired onto the param.
         for (const FrameUi::NodeRow& row : frame_ui.node_rows) {
             using MST = doc::ModSourceType;
             const doc::ValueNode* vn =
@@ -13290,7 +15481,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             app.undo.execute(app.document,
                              doc::set_lane_command(app.scope_look,toggle.key, std::move(keys)));
-            // Jump-to-lane (docs/flow_canvas.md): k on a card also
+            // Jump-to-lane: k on a card also
             // scrolls the timeline so the param's lane editor is in view
             // (rows are 42 px + 4 gap).
             for (size_t i = 0; i < app.look().lanes.size(); ++i)
@@ -13571,8 +15762,52 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.document,
                     doc::set_placement_command(app.scope_look, *bs.staged),
                     /*coalesce=*/true);
+                app.gesture_revision = app.document.revision;
+                app.gesture_seq = app.scope_look;
+                app.gesture_place = *bs.staged;
             }
-            if (*bs.released) app.undo.break_coalescing();
+            if (*bs.released) {
+                app.undo.break_coalescing();
+                // The drag has landed: the block OVERWRITES whatever its
+                // final span covers on its video lane (audio sums).
+                if (!app.scope_is_look()) {
+                    const doc::Sequence& sq = app.sequence();
+                    for (const doc::SeqTrack& t : sq.tracks) {
+                        const doc::Placement* p = nullptr;
+                        for (const doc::Placement& q : t.placements)
+                            if (q.id == bs.placement_id) p = &q;
+                        if (!p) continue;
+                        const doc::Placement moved = *p;
+                        const uint32_t end = doc::placement_end(
+                            moved,
+                            doc::source_length(app.document, moved));
+                        app.undo.begin_group("Overwrite");
+                        doc::overwrite_lane_span(
+                            app.document, app.undo, sq.id, t.id, moved.id,
+                            moved.link, moved.t_in, end);
+                        app.undo.end_group();
+                        break;
+                    }
+                }
+            }
+        }
+        for (const FrameUi::PlacementXf& px : frame_ui.placement_xfs) {
+            if (*px.changed) {
+                app.undo.execute(
+                    app.document,
+                    doc::set_placement_command(app.scope_look, *px.staged),
+                    /*coalesce=*/true);
+                app.gesture_revision = app.document.revision;
+                app.gesture_seq = app.scope_look;
+                app.gesture_place = *px.staged;
+                // Revision -> staged value, so the monitor overlay can
+                // draw the state the DISPLAYED frame rendered with.
+                app.xf_history.emplace_back(app.document.revision,
+                                            *px.staged);
+                if (app.xf_history.size() > 240)
+                    app.xf_history.pop_front();
+            }
+            if (*px.released) app.undo.break_coalescing();
         }
         for (const FrameUi::AudioTrackStage& as : frame_ui.audio_tracks) {
             const doc::AudioTrack* track = nullptr;
@@ -13858,7 +16093,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         // BROWSER actions: open moves the editing scope (a sequence's
         // timeline or a look's graph), "+" places at the playhead.
+        for (const FrameUi::BrowserAction& ba : frame_ui.browser_assets)
+            if (ba.select && *ba.select) app.browser_sel = ba.id;
         for (const FrameUi::BrowserAction& ba : frame_ui.browser_looks) {
+            if (ba.select && *ba.select) app.browser_sel = ba.id;
             const doc::Look* bl = app.document.find_look(ba.id);
             const doc::Sequence* bs2 =
                 bl ? nullptr : app.document.find_sequence(ba.id);
@@ -13881,14 +16119,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             if (ba.place && *ba.place)
                 place_look_block(app, ba.id,
-                                 app.player.current_frame_index());
+                                 app.player.current_frame_index(), 0);
         }
         for (const FrameUi::BrowserAction& ba : frame_ui.browser_assets) {
             if (!ba.place || !*ba.place) continue;
             const doc::Asset* asset = app.document.find_asset(ba.id);
             if (!asset || asset->path.empty()) continue;
             if (!place_clip_block(app, std::filesystem::path(asset->path),
-                                  app.player.current_frame_index()))
+                                  app.player.current_frame_index(), 0))
                 app.status = "no bundle yet - import the clip first";
         }
         if (frame_ui.new_sequence_clicked &&
@@ -13911,6 +16149,89 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.break_coalescing();
             app.status =
                 "editing " + app.document.sequence(seq_id).name;
+        }
+        for (const FrameUi::BinRow& br : frame_ui.bin_rows) {
+            if (!br.toggled || !*br.toggled) continue;
+            app.browser_sel = br.id;
+            if (app.bin_closed.count(br.id))
+                app.bin_closed.erase(br.id);
+            else
+                app.bin_closed.insert(br.id);
+        }
+        // Click-away drops the browser keyboard captures FIRST: an
+        // invisible rename or search field must never keep swallowing
+        // Delete and friends after the user moved on (the field's own
+        // click below re-arms it in the same frame).
+        if (input.left_pressed()) {
+            if (app.browser_rename_id && !app.browser_rename_commit)
+                app.browser_rename_id = 0;
+            app.browser_search_focus = false;
+        }
+        if (frame_ui.browser_search_clicked &&
+            *frame_ui.browser_search_clicked) {
+            app.browser_search_focus = true;
+            app.browser_rename_id = 0;
+            app.fx_search_focus = false;
+            app.preset_search_focus = false;
+            app.duration_focus = false;
+        }
+        if (frame_ui.new_bin_clicked && *frame_ui.new_bin_clicked)
+            app.undo.execute(
+                app.document,
+                doc::add_bin_command(doc::make_bin(app.document, "")));
+        if (app.browser_rename_commit) {
+            const uint64_t rid = app.browser_rename_id;
+            const std::string nm = app.browser_rename_buf;
+            if (rid && !nm.empty()) {
+                if (const doc::Bin* b = app.document.find_bin(rid)) {
+                    app.undo.execute(app.document,
+                                     doc::set_bin_props_command(
+                                         rid, nm, b->parent));
+                } else if (const doc::Look* l =
+                               app.document.find_look(rid)) {
+                    app.undo.execute(app.document,
+                                     doc::set_look_props_command(
+                                         rid, nm, l->duration));
+                } else if (const doc::Sequence* s =
+                               app.document.find_sequence(rid)) {
+                    app.undo.execute(app.document,
+                                     doc::set_sequence_props_command(
+                                         rid, nm, s->duration));
+                } else {
+                    for (const doc::Asset& a2 : app.document.assets)
+                        if (a2.id == rid) {
+                            doc::Asset up = a2;
+                            up.name = nm;
+                            app.undo.execute(
+                                app.document,
+                                doc::set_asset_command(std::move(up)));
+                            break;
+                        }
+                }
+            }
+            app.browser_rename_id = 0;
+            app.browser_rename_commit = false;
+            app.browser_rename_buf.clear();
+        }
+        if (frame_ui.browser_new_look_clicked &&
+            *frame_ui.browser_new_look_clicked) {
+            doc::Look fresh = doc::make_look(app.document, "");
+            const uint64_t look_id = fresh.id;
+            app.undo.execute(app.document,
+                             doc::add_look_command(std::move(fresh)));
+            app.scope_look = look_id;
+            app.open_group = 0;
+            app.sel = {};
+            app.selected_layer = 0;
+            app.layer_sel = false;
+            app.sel_placement = 0;
+            app.multi_sel.clear();
+            app.sel_wires.clear();
+            app.canvas_state.view_inited = false;
+            app.saved_view_valid = false;
+            app.tl_v0 = app.tl_v1 = 0.0;
+            app.undo.break_coalescing();
+            app.status = "editing " + app.document.look(look_id).name;
         }
         // Drag-and-drop: video files open like the dialog would; preset
         // files import into the browser; other .json loads as a project;
@@ -13959,8 +16280,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (app.tl_rect.w > 0.0f && at.x >= app.tl_rect.x &&
                     at.x < app.tl_rect.right() && at.y >= app.tl_rect.y &&
                     at.y < app.tl_rect.bottom())
-                    placed = place_clip_block(app, p, timeline_frame_at(app,
-                                                                        at.x));
+                    placed = place_clip_block(
+                        app, p, timeline_frame_at(app, at.x), 0);
                 if (!placed) open_source(app, p);
             } else if (ext == ".png") {
                 // A PNG with a sibling .json grid descriptor ({"tile": 8,
@@ -14278,31 +16599,43 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (final_image) {
             ui_view_arena.reset(frame.frame_index);
             const ui::Rect r = frame_ui.preview->rect.inset(1.0f);
-            const float px = r.x * scale, py = r.y * scale;
-            const float pw = r.w * scale, ph = r.h * scale;
+            const float bx = r.x * scale, by = r.y * scale;
+            const float bw = r.w * scale, bh = r.h * scale;
+            // Monitor zoom/pan transform the dst about its center; the
+            // internal aspect fit commutes with that, and the leaf rect
+            // bounds the scissor so a zoom-in never paints outside the
+            // panel. Pan is in logical px like the mouse.
+            const float z = app.mon_zoom;
+            const float px =
+                bx + bw * 0.5f * (1.0f - z) + app.mon_pan.x * scale;
+            const float py =
+                by + bh * 0.5f * (1.0f - z) + app.mon_pan.y * scale;
+            const float pw = bw * z, ph = bh * z;
             const uint32_t amode = app.alpha_checker ? 1u : 0u;
             if (app.bypass_all && source_image) {
                 viewport_pass->draw(frame.cmd, ui_view_arena,
                                     frame.frame_index, *source_image,
                                     ui_view_sampler, frame.extent,
-                                    px, py, pw, ph, 0.0f, 1.0f, amode);
+                                    px, py, pw, ph, 0.0f, 1.0f, amode,
+                                    bx, by, bw, bh);
             } else if (app.ab_wipe && source_image) {
                 // Before left of the split, after right of it.
                 viewport_pass->draw(frame.cmd, ui_view_arena,
                                     frame.frame_index, *source_image,
                                     ui_view_sampler, frame.extent,
                                     px, py, pw, ph, 0.0f, app.wipe_pos,
-                                    amode);
+                                    amode, bx, by, bw, bh);
                 viewport_pass->draw(frame.cmd, ui_view_arena,
                                     frame.frame_index, *final_image,
                                     ui_view_sampler, frame.extent,
                                     px, py, pw, ph, app.wipe_pos, 1.0f,
-                                    amode);
+                                    amode, bx, by, bw, bh);
             } else {
                 viewport_pass->draw(frame.cmd, ui_view_arena,
                                     frame.frame_index, *final_image,
                                     ui_view_sampler, frame.extent,
-                                    px, py, pw, ph, 0.0f, 1.0f, amode);
+                                    px, py, pw, ph, 0.0f, 1.0f, amode,
+                                    bx, by, bw, bh);
             }
         }
 

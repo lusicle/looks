@@ -99,7 +99,16 @@ public:
 
     // Ends a coalescing run: the next execute(..., coalesce=true) will not
     // merge into the current top. Call on gesture end (mouse up).
-    void break_coalescing() { coalesce_barrier_ = true; }
+    void break_coalescing() {
+        coalesce_barrier_ = true;
+        coalescing_active_ = false;
+    }
+
+    // True between a coalesced execute and its break_coalescing: a drag
+    // is mutating the document every frame. The render side skips cache
+    // hashing/readback while this holds - those entries can never be
+    // reused and their cost is what makes gestures lag.
+    bool coalescing_active() const { return coalescing_active_; }
 
     void clear();
     size_t undo_depth() const { return undo_.size(); }
@@ -118,6 +127,7 @@ private:
     size_t max_depth_;
     int group_depth_ = 0;
     bool coalesce_barrier_ = false;
+    bool coalescing_active_ = false;
 };
 
 }  // namespace looks::doc

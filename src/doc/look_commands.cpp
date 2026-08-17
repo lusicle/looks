@@ -119,6 +119,148 @@ Sequence clone_sequence_for_unique(Document& doc, const Sequence& src) {
     return out;
 }
 
+class AddBinCommand final : public Command {
+public:
+    explicit AddBinCommand(Bin bin) : bin_(std::move(bin)) {}
+    std::string name() const override { return "Add Bin"; }
+
+    void apply(Document& doc) override { doc.bins.push_back(bin_); }
+
+    void revert(Document& doc) override {
+        for (auto it = doc.bins.begin(); it != doc.bins.end(); ++it)
+            if (it->id == bin_.id) {
+                doc.bins.erase(it);
+                break;
+            }
+    }
+
+private:
+    Bin bin_;
+};
+
+class RemoveBinCommand final : public Command {
+public:
+    explicit RemoveBinCommand(uint64_t bin_id) : bin_id_(bin_id) {}
+    std::string name() const override { return "Remove Bin"; }
+
+    void apply(Document& doc) override {
+        had_ = false;
+        moved_.clear();
+        reparented_.clear();
+        for (size_t i = 0; i < doc.bins.size(); ++i)
+            if (doc.bins[i].id == bin_id_) {
+                index_ = i;
+                removed_ = doc.bins[i];
+                had_ = true;
+                doc.bins.erase(doc.bins.begin() +
+                               static_cast<ptrdiff_t>(i));
+                break;
+            }
+        if (!had_) return;
+        // Contents climb to the deleted bin's parent - organisation is
+        // never data, so removing a folder must not remove work.
+        auto climb = [&](uint64_t id, uint64_t* slot) {
+            if (*slot != bin_id_) return;
+            moved_.push_back(id);
+            *slot = removed_.parent;
+        };
+        for (Look& l : doc.looks) climb(l.id, &l.bin);
+        for (Sequence& s : doc.sequences) climb(s.id, &s.bin);
+        for (Asset& a : doc.assets) climb(a.id, &a.bin);
+        for (Bin& b : doc.bins)
+            if (b.parent == bin_id_) {
+                reparented_.push_back(b.id);
+                b.parent = removed_.parent;
+            }
+    }
+
+    void revert(Document& doc) override {
+        if (!had_) return;
+        doc.bins.insert(doc.bins.begin() + static_cast<ptrdiff_t>(
+                            std::min(index_, doc.bins.size())),
+                        removed_);
+        auto restore = [&](uint64_t id, uint64_t* slot, uint64_t moved) {
+            if (id == moved) *slot = bin_id_;
+        };
+        for (const uint64_t id : moved_) {
+            for (Look& l : doc.looks) restore(l.id, &l.bin, id);
+            for (Sequence& s : doc.sequences) restore(s.id, &s.bin, id);
+            for (Asset& a : doc.assets) restore(a.id, &a.bin, id);
+        }
+        for (const uint64_t id : reparented_)
+            if (Bin* b = doc.find_bin(id)) b->parent = bin_id_;
+    }
+
+private:
+    uint64_t bin_id_;
+    Bin removed_;
+    size_t index_ = 0;
+    bool had_ = false;
+    std::vector<uint64_t> moved_;
+    std::vector<uint64_t> reparented_;
+};
+
+class SetBinPropsCommand final : public Command {
+public:
+    SetBinPropsCommand(uint64_t bin, std::string name, uint64_t parent)
+        : bin_id_(bin), name_(std::move(name)), parent_(parent) {}
+    std::string name() const override { return "Edit Bin"; }
+
+    void apply(Document& doc) override {
+        if (Bin* b = doc.find_bin(bin_id_)) {
+            old_name_ = b->name;
+            old_parent_ = b->parent;
+            b->name = name_;
+            b->parent = parent_;
+        }
+    }
+
+    void revert(Document& doc) override {
+        if (Bin* b = doc.find_bin(bin_id_)) {
+            b->name = old_name_;
+            b->parent = old_parent_;
+        }
+    }
+
+private:
+    uint64_t bin_id_;
+    std::string name_;
+    uint64_t parent_;
+    std::string old_name_;
+    uint64_t old_parent_ = 0;
+};
+
+class SetEntityBinCommand final : public Command {
+public:
+    SetEntityBinCommand(uint64_t entity_id, uint64_t bin)
+        : entity_id_(entity_id), bin_(bin) {}
+    std::string name() const override { return "Move To Bin"; }
+
+    uint64_t* slot_of(Document& doc) const {
+        if (Look* l = doc.find_look(entity_id_)) return &l->bin;
+        if (Sequence* s = doc.find_sequence(entity_id_)) return &s->bin;
+        for (Asset& a : doc.assets)
+            if (a.id == entity_id_) return &a.bin;
+        return nullptr;
+    }
+
+    void apply(Document& doc) override {
+        if (uint64_t* slot = slot_of(doc)) {
+            old_bin_ = *slot;
+            *slot = bin_;
+        }
+    }
+
+    void revert(Document& doc) override {
+        if (uint64_t* slot = slot_of(doc)) *slot = old_bin_;
+    }
+
+private:
+    uint64_t entity_id_;
+    uint64_t bin_;
+    uint64_t old_bin_ = 0;
+};
+
 class AddLookCommand final : public Command {
 public:
     explicit AddLookCommand(Look look) : look_(std::move(look)) {}
@@ -635,6 +777,35 @@ Asset make_asset(Document& doc, std::string name, std::string path) {
     asset.name = std::move(name);
     asset.path = std::move(path);
     return asset;
+}
+
+Bin make_bin(Document& doc, std::string name) {
+    Bin bin;
+    bin.id = doc.next_effect_id++;
+    bin.name = name.empty()
+        ? ("bin " + std::to_string(doc.bins.size() + 1))
+        : std::move(name);
+    return bin;
+}
+
+std::unique_ptr<Command> add_bin_command(Bin bin) {
+    return std::make_unique<AddBinCommand>(std::move(bin));
+}
+
+std::unique_ptr<Command> remove_bin_command(uint64_t bin_id) {
+    return std::make_unique<RemoveBinCommand>(bin_id);
+}
+
+std::unique_ptr<Command> set_bin_props_command(uint64_t bin,
+                                               std::string name,
+                                               uint64_t parent) {
+    return std::make_unique<SetBinPropsCommand>(bin, std::move(name),
+                                                parent);
+}
+
+std::unique_ptr<Command> set_entity_bin_command(uint64_t entity_id,
+                                                uint64_t bin) {
+    return std::make_unique<SetEntityBinCommand>(entity_id, bin);
 }
 
 std::unique_ptr<Command> add_look_command(Look look) {

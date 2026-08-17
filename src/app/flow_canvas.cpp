@@ -1,4 +1,4 @@
-// Node canvas implementation (docs/flow_canvas.md). Everything draws
+// Node canvas implementation. Everything draws
 // in graph space through one screen transform; interaction resolves
 // geometrically against the same transform. One WidgetId owns the whole
 // surface; drags hold ctx capture with the element remembered in
@@ -479,6 +479,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return best;
     };
     auto open_add_menu = [&]() {
+        // Nothing to add (sequence scope): no menu - an empty popup is
+        // worse than none.
+        if (!g.add_count) return;
         st.add_open = true;
         st.add_anchor = mouse;
         st.add_gx = gmouse.x;

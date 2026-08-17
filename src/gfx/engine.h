@@ -50,8 +50,8 @@ public:
     // timeline_frame/fps feed the deterministic per-frame randomness and
     // clocked effects (fixed timestep on frame index).
 
-    // Clip sources: EVERY placement decodes its own frame (docs/look.md
-    // phase 4 — there is no shared playhead frame). The caller's decode
+    // Clip sources: EVERY placement decodes its own frame - there is no
+    // shared playhead frame. The caller's decode
     // pool maps each placement to its source frame and keeps the planes
     // alive through render(); a key with no entry renders black.
     struct LayerSourceFrame {
@@ -87,6 +87,10 @@ public:
     // preview, the exported sequence in export.
     // canvas_w/canvas_h are the PROJECT's working resolution
     // (doc::canvas_size) — the clip under the playhead never decides it.
+    // measure_placement: root-sequence block whose pre-Motion lane image
+    // gets the alpha-bounds reduction (read_measure_bounds after the
+    // fence). Preview-only - it bypasses the render cache LOOKUP so the
+    // measurement actually runs; export always passes 0.
     GpuImage* render(VkCommandBuffer cmd, uint32_t frame_index,
                      const doc::Document& doc,
                      uint64_t root_id, uint32_t timeline_frame, double fps,
@@ -96,7 +100,13 @@ public:
                      const LayerSourceFrame* layer_sources = nullptr,
                      size_t layer_source_count = 0,
                      uint64_t preview_node = 0,
-                     uint64_t preview_layer = 0);
+                     uint64_t preview_layer = 0,
+                     uint64_t measure_placement = 0);
+
+    // Alpha bounds of the last render's measure tap, as a canvas-fraction
+    // rect {x, y, w, h}. Valid only after the submission that recorded it
+    // has fenced. False: nothing measured, or fully transparent content.
+    bool read_measure_bounds(float rect[4]) const;
 
     RenderCache& cache() { return cache_; }
 
@@ -131,7 +141,7 @@ public:
     }
     uint32_t preview_divisor() const { return preview_divisor_; }
 
-    // Node-canvas thumbnails (docs/flow_canvas.md): a fixed 8x8 grid of
+    // Node-canvas thumbnails: a fixed 8x8 grid of
     // 160x90 cells, RGBA8 sRGB-encoded, tapped after each layer-chain
     // effect plus the final composite (cell key 0). The cell map reflects
     // the last EVALUATED graph — stale-but-valid across render-cache hits.
@@ -169,6 +179,22 @@ private:
     bool prev_frame_valid_ = false;
     VkSampler linear_sampler_ = VK_NULL_HANDLE;
     std::unique_ptr<ComputePipeline> to_rgb_;
+    // Alpha-bounds measurement: 4x1 r32ui atomic min/max target + a
+    // persistently-mapped readback the UI harvests after the worker's
+    // per-cycle fence. Never touched by export.
+    std::unique_ptr<ComputePipeline> alpha_bounds_;
+    std::unique_ptr<GpuImage> bounds_img_;
+    VkBuffer bounds_buf_ = VK_NULL_HANDLE;
+    VmaAllocation bounds_alloc_ = nullptr;
+    void* bounds_mapped_ = nullptr;
+    bool bounds_recorded_ = false;
+    uint32_t bounds_w_ = 0, bounds_h_ = 0;
+    // The placement the last recorded measurement belongs to: the cache
+    // LOOKUP is bypassed only until the current selection has been
+    // measured once - cached frames then serve normally and the UI keeps
+    // the last measured box (edits miss the cache anyway, so fresh
+    // content re-measures itself).
+    uint64_t measured_placement_ = 0;
     std::unique_ptr<ComputePipeline> fx_[static_cast<size_t>(doc::EffectType::Count)];
     std::unique_ptr<ComputePipeline> matte_extract_, matte_apply_;
     std::unique_ptr<ComputePipeline> glow_pass_[4];   // bright, H, V, comp
@@ -262,7 +288,7 @@ private:
     // when present, else a procedural grunge fallback — always non-null.
     std::unique_ptr<GpuImage> dust_tex_;
 
-    // Text overlay (docs/flow_canvas.md): runtime TTFs from
+    // Text overlay: runtime TTFs from
     // assets/fonts/*.ttf, sorted by filename — the `font` param indexes
     // the list, no bake step. Per-instance string SDFs (truetype.h) are
     // cached per SIZE BUCKET, so a keyframed/modulated size walks a
@@ -307,9 +333,9 @@ private:
     uint32_t preview_divisor_ = 1;
 
     // Private source planes for placed layers, uploaded fresh each render
-    // that provides frames for them. Keyed by the INSTANCE-scoped node key
-    // (docs/look.md), not a layer index: two placements of one look each
-    // want their own decoded frame.
+    // that provides frames for them. Keyed by the INSTANCE-scoped node
+    // key, not a layer index: two placements of one look each want their
+    // own decoded frame.
     struct LayerPlanes {
         std::unique_ptr<GpuImage> y, u, v;
         uint32_t width = 0, height = 0;

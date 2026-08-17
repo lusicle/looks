@@ -39,7 +39,7 @@ struct AnalysisCurves {
 };
 
 // CPU view of the decoded source frame (I420) for the video-sampling
-// sources (docs/flow_canvas.md: sample-at-point / region-average).
+// sources (sample-at-point / region-average).
 // Callers pass the SAME frame they are about to render, so preview and
 // export sample identical decoded pixels and determinism holds.
 // A null view (or null planes) reads as 0.

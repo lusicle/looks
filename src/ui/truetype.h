@@ -1,5 +1,5 @@
-// Hand-rolled TrueType loader + string SDF rasterizer (docs/
-// flow_canvas.md v5.5b): parses glyf-flavored TTFs (cmap formats 4/12,
+// Hand-rolled TrueType loader + string SDF rasterizer: parses
+// glyf-flavored TTFs (cmap formats 4/12,
 // simple + composite glyphs, hmtx advances, kern format 0) and renders
 // whole strings into single-channel signed-distance bitmaps — the Text
 // effect's runtime font path, no bake step, any dropped .ttf. Output is

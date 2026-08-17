@@ -1,7 +1,10 @@
 #include "doc/placement_commands.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
+
+#include "doc/layer_commands.h"
 
 namespace looks::doc {
 
@@ -304,6 +307,113 @@ private:
     bool old_mute_ = false;
 };
 
+class AddTrackCommand final : public SequenceCommand {
+public:
+    AddTrackCommand(uint64_t sequence, SeqTrack track, size_t at_index)
+        : SequenceCommand(sequence), track_(std::move(track)),
+          at_index_(at_index) {}
+    std::string name() const override { return "Add Lane"; }
+
+    void apply(Document& doc) override {
+        auto& tracks = sequence_of(doc).tracks;
+        tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(
+                          std::min(at_index_, tracks.size())),
+                      track_);
+    }
+
+    void revert(Document& doc) override {
+        auto& tracks = sequence_of(doc).tracks;
+        for (size_t i = tracks.size(); i-- > 0;)
+            if (tracks[i].id == track_.id)
+                tracks.erase(tracks.begin() + static_cast<ptrdiff_t>(i));
+    }
+
+private:
+    SeqTrack track_;
+    size_t at_index_;
+};
+
+class RemoveTrackCommand final : public SequenceCommand {
+public:
+    RemoveTrackCommand(uint64_t sequence, uint64_t track_id)
+        : SequenceCommand(sequence), track_id_(track_id) {}
+    std::string name() const override { return "Remove Lane"; }
+
+    void apply(Document& doc) override {
+        auto& tracks = sequence_of(doc).tracks;
+        for (size_t i = 0; i < tracks.size(); ++i)
+            if (tracks[i].id == track_id_) {
+                index_ = i;
+                removed_ = std::move(tracks[i]);
+                tracks.erase(tracks.begin() + static_cast<ptrdiff_t>(i));
+                return;
+            }
+    }
+
+    void revert(Document& doc) override {
+        auto& tracks = sequence_of(doc).tracks;
+        tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(
+                          std::min(index_, tracks.size())),
+                      removed_);
+    }
+
+private:
+    uint64_t track_id_;
+    SeqTrack removed_;
+    size_t index_ = 0;
+};
+
+class AddAudioTrackCommand final : public SequenceCommand {
+public:
+    AddAudioTrackCommand(uint64_t sequence, AudioTrack track)
+        : SequenceCommand(sequence), track_(std::move(track)) {}
+    std::string name() const override { return "Add Audio Track"; }
+
+    void apply(Document& doc) override {
+        sequence_of(doc).audio.push_back(track_);
+    }
+
+    void revert(Document& doc) override {
+        auto& audio = sequence_of(doc).audio;
+        for (size_t i = audio.size(); i-- > 0;)
+            if (audio[i].id == track_.id)
+                audio.erase(audio.begin() + static_cast<ptrdiff_t>(i));
+    }
+
+private:
+    AudioTrack track_;
+};
+
+class RemoveAudioTrackCommand final : public SequenceCommand {
+public:
+    RemoveAudioTrackCommand(uint64_t sequence, uint64_t track_id)
+        : SequenceCommand(sequence), track_id_(track_id) {}
+    std::string name() const override { return "Remove Audio Track"; }
+
+    void apply(Document& doc) override {
+        auto& audio = sequence_of(doc).audio;
+        for (size_t i = 0; i < audio.size(); ++i)
+            if (audio[i].id == track_id_) {
+                index_ = i;
+                removed_ = std::move(audio[i]);
+                audio.erase(audio.begin() + static_cast<ptrdiff_t>(i));
+                return;
+            }
+    }
+
+    void revert(Document& doc) override {
+        auto& audio = sequence_of(doc).audio;
+        audio.insert(audio.begin() + static_cast<ptrdiff_t>(
+                         std::min(index_, audio.size())),
+                     removed_);
+    }
+
+private:
+    uint64_t track_id_;
+    AudioTrack removed_;
+    size_t index_ = 0;
+};
+
 }  // namespace
 
 std::unique_ptr<Command> add_placement_command(uint64_t sequence,
@@ -352,6 +462,125 @@ std::unique_ptr<Command> set_audio_track_props_command(uint64_t sequence,
                                                        bool mute) {
     return std::make_unique<SetAudioTrackPropsCommand>(
         sequence, track_id, std::move(name), gain, mute);
+}
+
+SeqTrack make_track(Document& doc, const Sequence& seq) {
+    SeqTrack lane;
+    lane.id = doc.next_effect_id++;
+    lane.name = "v" + std::to_string(seq.tracks.size() + 1);
+    return lane;
+}
+
+AudioTrack make_audio_track(Document& doc, const Sequence& seq) {
+    AudioTrack track;
+    track.id = doc.next_effect_id++;
+    track.name = "a" + std::to_string(seq.audio.size() + 1);
+    return track;
+}
+
+std::unique_ptr<Command> add_track_command(uint64_t sequence, SeqTrack track,
+                                           size_t at_index) {
+    return std::make_unique<AddTrackCommand>(sequence, std::move(track),
+                                             at_index);
+}
+
+std::unique_ptr<Command> remove_track_command(const Document& doc,
+                                              uint64_t sequence,
+                                              uint64_t track_id) {
+    const Sequence* seq = doc.find_sequence(sequence);
+    if (!seq || seq->tracks.size() <= 1) return nullptr;
+    bool found = false;
+    for (const SeqTrack& t : seq->tracks)
+        if (t.id == track_id) found = true;
+    if (!found) return nullptr;
+    return std::make_unique<RemoveTrackCommand>(sequence, track_id);
+}
+
+std::unique_ptr<Command> add_audio_track_command(uint64_t sequence,
+                                                 AudioTrack track) {
+    return std::make_unique<AddAudioTrackCommand>(sequence,
+                                                  std::move(track));
+}
+
+std::unique_ptr<Command> remove_audio_track_command(uint64_t sequence,
+                                                    uint64_t track_id) {
+    return std::make_unique<RemoveAudioTrackCommand>(sequence, track_id);
+}
+
+void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
+                         uint64_t track_id, uint64_t keep_id,
+                         uint64_t keep_link, uint32_t t0, uint32_t t1) {
+    const uint64_t e1 = t1 ? t1 : UINT64_MAX;
+    // Snapshot the victims first: every edit below reshapes the lane
+    // under the loop.
+    struct Victim {
+        uint64_t id;
+        uint32_t t_in;
+        uint64_t end;   // UINT64_MAX = unbounded
+    };
+    std::vector<Victim> victims;
+    {
+        const Sequence* seq = doc.find_sequence(sequence);
+        if (!seq) return;
+        const SeqTrack* lane = nullptr;
+        for (const SeqTrack& t : seq->tracks)
+            if (t.id == track_id) lane = &t;
+        if (!lane) return;
+        for (const Placement& p : lane->placements) {
+            if (p.id == keep_id) continue;
+            if (keep_link && p.link == keep_link) continue;
+            const uint32_t pe32 = placement_end(p, source_length(doc, p));
+            const uint64_t pe = pe32 ? pe32 : UINT64_MAX;
+            if (p.t_in >= e1 || pe <= t0) continue;
+            victims.push_back({p.id, p.t_in, pe});
+        }
+    }
+    for (const Victim& v : victims) {
+        if (v.t_in >= t0 && v.end <= e1) {
+            undo.execute(doc, remove_placement_command(sequence, v.id));
+            continue;
+        }
+        if (v.t_in < t0 && v.end > e1) {
+            // The newcomer sits strictly inside: razor at its head, then
+            // slide the right half's start past its tail.
+            if (auto cut =
+                    razor_track_command(doc, sequence, track_id, t0))
+                undo.execute(doc, std::move(cut));
+            else
+                continue;   // at the lane bound: leave the overlap
+            const Sequence* seq = doc.find_sequence(sequence);
+            const SeqTrack* lane = nullptr;
+            for (const SeqTrack& t : seq->tracks)
+                if (t.id == track_id) lane = &t;
+            const Placement* right = nullptr;
+            if (lane)
+                for (const Placement& p : lane->placements)
+                    if (p.t_in == t0 && p.id != keep_id &&
+                        !(keep_link && p.link == keep_link))
+                        right = &p;
+            if (!right) continue;
+            Placement np = *right;
+            np.source_in += static_cast<uint32_t>(std::llround(
+                (static_cast<double>(t1) - np.t_in) * np.speed));
+            np.t_in = t1;
+            undo.execute(doc, set_placement_command(sequence, np));
+            continue;
+        }
+        const Sequence* seq = doc.find_sequence(sequence);
+        const Placement* p = seq ? find_placement(*seq, v.id) : nullptr;
+        if (!p) continue;
+        Placement np = *p;
+        if (v.t_in < t0) {
+            np.t_out = t0;   // its tail sits under the newcomer: cut it
+        } else {
+            // Its head sits under: slide the start past the newcomer,
+            // source_in follows so the surviving content holds still.
+            np.source_in += static_cast<uint32_t>(std::llround(
+                (static_cast<double>(t1) - np.t_in) * np.speed));
+            np.t_in = t1;
+        }
+        undo.execute(doc, set_placement_command(sequence, np));
+    }
 }
 
 }  // namespace looks::doc

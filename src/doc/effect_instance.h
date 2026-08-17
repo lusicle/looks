@@ -112,7 +112,7 @@ enum class EffectType : uint32_t {
     BlendNode,         // graph merge: blends the B input over In
     Matte,             // matte maker: luma/key extract + levels (—
                        // masks ARE images; feeds any mask anchor)
-    // The PRIMITIVES batch (docs/flow_canvas.md): single-job nodes
+    // The PRIMITIVES batch: single-job nodes
     // for operations previously buried inside compound effects.
     Levels,            // in/out black-white points + gamma (tone primitive)
     HueSat,            // hue rotate / saturation / lightness
@@ -194,7 +194,7 @@ struct EffectInstance {
     // The one string param: only Text reads it. Serialized when
     // non-empty; edited through set_effect_text_command.
     std::string text;
-    // Node-canvas position (docs/flow_canvas.md), graph units. Pure UI
+    // Node-canvas position, graph units. Pure UI
     // placement — never read by the renderer. (0,0) = unplaced; the
     // canvas auto-lays-out unplaced nodes once and commits positions.
     float node_x = 0.0f;

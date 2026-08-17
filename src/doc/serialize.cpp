@@ -298,6 +298,12 @@ Value placement_to_json(const Placement& p) {
     if (p.audio_gain != 1.0f)
         pl.set("audio_gain", static_cast<double>(p.audio_gain));
     if (p.audio_mute) pl.set("audio_mute", true);
+    if (p.pos_x != 0.0f) pl.set("x", static_cast<double>(p.pos_x));
+    if (p.pos_y != 0.0f) pl.set("y", static_cast<double>(p.pos_y));
+    if (p.scale != 1.0f) pl.set("scale", static_cast<double>(p.scale));
+    if (p.rotate != 0.0f) pl.set("rotate", static_cast<double>(p.rotate));
+    if (p.opacity != 1.0f)
+        pl.set("opacity", static_cast<double>(p.opacity));
     return pl;
 }
 
@@ -312,6 +318,11 @@ Placement placement_from_json(const Value& pl) {
     p.link = static_cast<uint64_t>(pl.get("link").as_int(0));
     p.audio_gain = num(pl, "audio_gain", 1.0f);
     p.audio_mute = pl.get("audio_mute").as_bool(false);
+    p.pos_x = num(pl, "x", 0.0f);
+    p.pos_y = num(pl, "y", 0.0f);
+    p.scale = num(pl, "scale", 1.0f);
+    p.rotate = num(pl, "rotate", 0.0f);
+    p.opacity = num(pl, "opacity", 1.0f);
     return p;
 }
 
@@ -416,6 +427,7 @@ Value asset_to_json(const Asset& a) {
     if (a.still_duration_frames)
         v.set("still_duration",
               static_cast<int64_t>(a.still_duration_frames));
+    if (a.bin) v.set("bin", static_cast<int64_t>(a.bin));
     return v;
 }
 
@@ -430,6 +442,7 @@ Asset asset_from_json(const Value& v) {
     a.height = static_cast<uint32_t>(v.get("height").as_int(0));
     a.still_duration_frames =
         static_cast<uint32_t>(v.get("still_duration").as_int(0));
+    a.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
     return a;
 }
 
@@ -457,6 +470,7 @@ Value look_to_json(const Look& look) {
     v.set("name", look.name);
     if (look.duration)
         v.set("duration", static_cast<int64_t>(look.duration));
+    if (look.bin) v.set("bin", static_cast<int64_t>(look.bin));
 
     Value layers = Value::make_array();
     for (const Layer& l : look.layers) layers.push(layer_to_json(l));
@@ -524,6 +538,7 @@ Look look_from_json(const Value& v) {
     look.id = static_cast<uint64_t>(v.get("id").as_int(0));
     look.name = v.get("name").as_string();
     look.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
+    look.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
 
     for (const Value& lv : v.get("layers").array()) {
         if (look.layers.size() >= kMaxLayers) break;
@@ -544,8 +559,9 @@ Look look_from_json(const Value& v) {
 
     look.out_node_x = num(v, "out_node_x", 0.0f);
     look.out_node_y = num(v, "out_node_y", 0.0f);
-    // Legacy chain looks carry no links; consumers call ensure_links when
-    // they need the graph — the loader stays byte-roundtrip-stable.
+    // An absent link table means implicit chain wiring; consumers call
+    // ensure_links when they need the graph — the loader stays
+    // byte-roundtrip-stable.
     for (const Value& lv : v.get("links").array())
         look.links.push_back(
             {static_cast<uint64_t>(lv.get("from").as_int(0)),
@@ -602,6 +618,7 @@ Value sequence_to_json(const Sequence& seq) {
     v.set("name", seq.name);
     if (seq.duration)
         v.set("duration", static_cast<int64_t>(seq.duration));
+    if (seq.bin) v.set("bin", static_cast<int64_t>(seq.bin));
 
     Value tracks = Value::make_array();
     for (const SeqTrack& t : seq.tracks) {
@@ -654,6 +671,7 @@ Sequence sequence_from_json(const Value& v) {
     seq.id = static_cast<uint64_t>(v.get("id").as_int(0));
     seq.name = v.get("name").as_string();
     seq.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
+    seq.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
 
     for (const Value& tv : v.get("tracks").array()) {
         if (seq.tracks.size() >= kMaxLayers) break;
@@ -829,6 +847,19 @@ json::Value doc_to_json(const Document& doc) {
         sequences.push(sequence_to_json(s));
     v.set("sequences", std::move(sequences));
 
+    if (!doc.bins.empty()) {
+        Value bins = Value::make_array();
+        for (const Bin& b : doc.bins) {
+            Value bv = Value::make_object();
+            bv.set("id", static_cast<int64_t>(b.id));
+            bv.set("name", b.name);
+            if (b.parent)
+                bv.set("parent", static_cast<int64_t>(b.parent));
+            bins.push(std::move(bv));
+        }
+        v.set("bins", std::move(bins));
+    }
+
     v.set("speed", static_cast<double>(doc.speed));
     v.set("time_mode", static_cast<int64_t>(doc.time_mode));
     if (!doc.sidechain_path.empty()) {
@@ -884,6 +915,26 @@ Document doc_from_json(const json::Value& v) {
     doc.root_sequence =
         static_cast<uint64_t>(v.get("root_sequence").as_int(0));
 
+    for (const Value& bv : v.get("bins").array()) {
+        Bin b;
+        b.id = static_cast<uint64_t>(bv.get("id").as_int(0));
+        b.name = bv.get("name").as_string();
+        b.parent = static_cast<uint64_t>(bv.get("parent").as_int(0));
+        if (b.id) doc.bins.push_back(std::move(b));
+    }
+    // Bin refs heal to the root: a dangling parent or membership, or a
+    // parent loop, must not orphan rows out of the browser.
+    for (Bin& b : doc.bins)
+        if (b.parent &&
+            (!doc.find_bin(b.parent) || bin_reaches(doc, b.parent, b.id)))
+            b.parent = 0;
+    auto heal_bin = [&](uint64_t* slot) {
+        if (*slot && !doc.find_bin(*slot)) *slot = 0;
+    };
+    for (Look& look : doc.looks) heal_bin(&look.bin);
+    for (Sequence& seq : doc.sequences) heal_bin(&seq.bin);
+    for (Asset& a : doc.assets) heal_bin(&a.bin);
+
     // Re-derive id counters from the content: stored values are honored but
     // never allowed below (max seen id + 1), so a hand-edited file cannot
     // mint duplicate ids.
@@ -893,6 +944,7 @@ Document doc_from_json(const json::Value& v) {
     for (const Sequence& seq : doc.sequences)
         max_id = std::max(max_id, max_sequence_id(seq));
     for (const Asset& a : doc.assets) max_id = std::max(max_id, a.id);
+    for (const Bin& b : doc.bins) max_id = std::max(max_id, b.id);
     for (const Look& look : doc.looks) {
         for (const ValueNode& n : look.value_nodes)
             max_route_id = std::max(max_route_id, n.id);

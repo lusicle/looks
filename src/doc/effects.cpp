@@ -558,8 +558,8 @@ constexpr ParamDesc kCrossHatchParams[] = {
 };
 
 constexpr ParamDesc kSpliceBumpParams[] = {
-    // Route the scene-cut (or beat) trigger onto `bump` in the mod matrix
-    // and every cut becomes a splice event.
+    // Wire the scene-cut (or beat) trigger onto `bump` and every cut
+    // becomes a splice event.
     {"bump", "bump (route a trigger)", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"jump_px", "frame jump", 0.0f, 128.0f, 48.0f, "%.0f px"},
     {"flash", "flash", 0.0f, 1.0f, 0.6f, "%.2f"},
@@ -844,7 +844,7 @@ constexpr ParamDesc kRidgelineParams[] = {
 };
 
 constexpr ParamDesc kBlendNodeParams[] = {
-    // Graph merge node (docs/flow_canvas.md): blends the B aux input
+    // Graph merge node: blends the B aux input
     // over In. Wet/opacity give the mix amount; the mode is the operator.
     {"mode", "mode", 0.0f, 8.0f, 0.0f, "%.0f",
      "normal|add|multiply|screen|difference|subtract|darken|lighten|"
@@ -865,7 +865,7 @@ constexpr ParamDesc kMatteParams[] = {
     {"output", "output", 0.0f, 1.0f, 0.0f, "%.0f", "matte|cutout"},
 };
 
-// ---- The PRIMITIVES batch (docs/flow_canvas.md): the single-job
+// ---- The PRIMITIVES batch: the single-job
 // nodes previously buried inside compound effects.
 
 constexpr ParamDesc kLevelsParams[] = {

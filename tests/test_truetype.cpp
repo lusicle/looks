@@ -1,5 +1,5 @@
-// In-repo TrueType loader + string SDF rasterizer (docs/flow_canvas.md
-// v5.5b): parse the shipped fonts, rasterize strings, verify the
+// In-repo TrueType loader + string SDF rasterizer: parse the shipped
+// fonts, rasterize strings, verify the
 // distance encoding and that output is a pure function of its inputs.
 
 #include <filesystem>

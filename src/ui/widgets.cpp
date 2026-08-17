@@ -167,6 +167,7 @@ struct ButtonUser {
     bool flat;
     bool align_left;
     const char* tooltip;
+    bool* out_ctx;
 };
 
 Vec2 measure_button(LayoutNode& node, const Constraints&,
@@ -196,6 +197,9 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
         const WidgetId id = frame.ctx.acquire_widget_id(u->state);
         if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
             *u->out_clicked = true;
+        if (u->out_ctx && frame.input.right_pressed() &&
+            frame.ctx.widget_owns_mouse(id) && r.contains(frame.input.mouse))
+            *u->out_ctx = true;
         maybe_tooltip(*u->state, u->tooltip, frame);
         bg = lerp(bg, theme.control_bg_hover, u->state->hover_t);
         bg = lerp(bg, theme.control_bg_active, u->state->press_t);
@@ -682,7 +686,9 @@ struct SliderUser {
     bool* out_released;
     bool* out_value_clicked;
     float display_scale;
+    float display_offset;
     const char* tooltip;
+    bool* out_ctx;
 };
 
 Vec2 measure_slider(LayoutNode&, const Constraints& c, const LayoutFrame& frame) {
@@ -708,13 +714,15 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     float text_w = 0.0f;
     if (u->format) {
         std::snprintf(buf, sizeof(buf), u->format,
-                      *u->value * u->display_scale);
+                      *u->value * u->display_scale + u->display_offset);
         text_w = measure_text(frame.font, buf, theme.font_size_small).x;
     }
     const float value_zone_x = r.right() - text_w - 10.0f;
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
     const bool owns = frame.ctx.widget_owns_mouse(id);
+    if (u->out_ctx && frame.input.right_pressed() && owns && !s.dragging)
+        *u->out_ctx = true;
     if (frame.input.left_pressed() && owns && !s.dragging) {
         if (u->out_value_clicked && u->format &&
             frame.input.mouse.x >= value_zone_x) {
@@ -802,7 +810,9 @@ struct DialUser {
     bool* out_released;
     bool* out_value_clicked;
     float display_scale;
+    float display_offset;
     const char* tooltip;
+    bool* out_ctx;
 };
 
 constexpr float kDialRadius = 8.0f;
@@ -839,7 +849,7 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
     float text_w = 0.0f;
     if (u->format) {
         std::snprintf(buf, sizeof(buf), u->format,
-                      *u->value * u->display_scale);
+                      *u->value * u->display_scale + u->display_offset);
         text_w = measure_text(frame.font, buf, theme.font_size_small).x;
     }
     const float value_zone_x = r.right() - text_w - 10.0f;
@@ -847,6 +857,8 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
     const bool owns = frame.ctx.widget_owns_mouse(id);
+    if (u->out_ctx && frame.input.right_pressed() && owns && !s.dragging)
+        *u->out_ctx = true;
     if (frame.input.left_pressed() && owns && !s.dragging) {
         if (u->out_value_clicked && u->format &&
             frame.input.mouse.x >= value_zone_x) {
@@ -1243,6 +1255,7 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
     u->flat = opts.flat;
     u->align_left = opts.align_left;
     u->tooltip = opts.tooltip;
+    u->out_ctx = opts.out_ctx;
     n->user = u;
     n->width = opts.width;
     n->measure_fn = measure_button;
@@ -1394,7 +1407,9 @@ LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
     u->out_released = opts.out_released;
     u->out_value_clicked = opts.out_value_clicked;
     u->display_scale = opts.display_scale;
+    u->display_offset = opts.display_offset;
     u->tooltip = opts.tooltip;
+    u->out_ctx = opts.out_ctx;
     n->user = u;
     n->width = SizeSpec::fill();
     n->measure_fn = measure_slider;
@@ -1418,7 +1433,9 @@ LayoutNode* DialF(LayoutArena& arena, float* value, float min_value,
     u->out_released = opts.out_released;
     u->out_value_clicked = opts.out_value_clicked;
     u->display_scale = opts.display_scale;
+    u->display_offset = opts.display_offset;
     u->tooltip = opts.tooltip;
+    u->out_ctx = opts.out_ctx;
     n->user = u;
     n->width = SizeSpec::fill();
     n->measure_fn = measure_dial;

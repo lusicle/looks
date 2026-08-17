@@ -171,7 +171,8 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
                         uint32_t frame_index, GpuImage& image,
                         VkSampler sampler, VkExtent2D extent, float dst_x,
                         float dst_y, float dst_w, float dst_h, float clip_x0,
-                        float clip_x1, uint32_t alpha_mode) {
+                        float clip_x1, uint32_t alpha_mode, float bound_x,
+                        float bound_y, float bound_w, float bound_h) {
     if (dst_w < 1.0f || dst_h < 1.0f || extent.width == 0 ||
         extent.height == 0 || clip_x1 <= clip_x0)
         return;
@@ -209,16 +210,24 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
     vkUpdateDescriptorSets(device_.device(), 1, &write, 0, nullptr);
 
     // The cover triangle overshoots the fitted rect — scissor confines it
-    // (further narrowed by the wipe clip fractions).
+    // (further narrowed by the wipe clip fractions and the bound rect).
     const float fit_left = cx - fit_w * 0.5f;
-    const int32_t sx = std::max(
+    int32_t sx = std::max(
         0, static_cast<int32_t>(std::floor(fit_left + fit_w * clip_x0)));
-    const int32_t sy = std::max(0, static_cast<int32_t>(std::floor(cy - fit_h * 0.5f)));
-    const int32_t sr = std::min(
+    int32_t sy = std::max(0, static_cast<int32_t>(std::floor(cy - fit_h * 0.5f)));
+    int32_t sr = std::min(
         static_cast<int32_t>(extent.width),
         static_cast<int32_t>(std::ceil(fit_left + fit_w * clip_x1)));
-    const int32_t sb = std::min(static_cast<int32_t>(extent.height),
-                                static_cast<int32_t>(std::ceil(cy + fit_h * 0.5f)));
+    int32_t sb = std::min(static_cast<int32_t>(extent.height),
+                          static_cast<int32_t>(std::ceil(cy + fit_h * 0.5f)));
+    if (bound_w > 0.0f && bound_h > 0.0f) {
+        sx = std::max(sx, static_cast<int32_t>(std::floor(bound_x)));
+        sy = std::max(sy, static_cast<int32_t>(std::floor(bound_y)));
+        sr = std::min(sr,
+                      static_cast<int32_t>(std::ceil(bound_x + bound_w)));
+        sb = std::min(sb,
+                      static_cast<int32_t>(std::ceil(bound_y + bound_h)));
+    }
     if (sr <= sx || sb <= sy) return;
     VkRect2D scissor{{sx, sy},
                      {static_cast<uint32_t>(sr - sx),

@@ -237,7 +237,7 @@ private:
     size_t to_;
 };
 
-// Node-canvas placement (docs/flow_canvas.md). Resolves the target by
+// Node-canvas placement. Resolves the target by
 // document id on every apply/revert — indices may shift under undo, ids
 // never do. A missing target is a silent no-op (node deleted mid-history).
 class SetNodePosCommand final : public LookCommand {
@@ -325,7 +325,7 @@ private:
     float old_x_ = 0.0f, old_y_ = 0.0f;
 };
 
-// Freezes the synthesized legacy wiring into the link table:
+// Freezes the implicit stack-order wiring into the link table:
 // every node-creation path runs this FIRST so newborns spawn UNWIRED —
 // with the table empty, stack-order synthesis would chain them straight
 // into the composite. Wiring is a wire gesture, never a side effect of
@@ -351,7 +351,7 @@ private:
     bool materialized_ = false;
 };
 
-// TRUE GRAPH link edits (docs/flow_canvas.md). apply/revert address
+// TRUE GRAPH link edits. apply/revert address
 // links by value — ids are stable, indices are not. First edit
 // materializes the synthesized legacy table (reverted symmetrically).
 class ConnectCommand final : public LookCommand {
@@ -451,7 +451,7 @@ private:
     bool materialized_ = false;
 };
 
-// Canvas frames (docs/flow_canvas.md): pure annotations, but still
+// Canvas frames: pure annotations, but still
 // undoable like every mutation.
 class AddFrameCommand final : public LookCommand {
 public:

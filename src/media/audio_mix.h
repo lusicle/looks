@@ -1,4 +1,4 @@
-// Tree audio mix (docs/look.md phase 4).
+// Tree audio mix.
 //
 // A look's audio out is the sum of its active clip sources' PCM through
 // their time maps. There is no audio node graph, no audio effects and no

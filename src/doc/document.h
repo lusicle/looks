@@ -50,6 +50,19 @@ struct Asset {
     // scratch cache is regenerable, so the one user decision baked into it
     // lives here and is re-applied whenever the asset opens.
     uint32_t still_duration_frames = 0;
+    // Browser bin this asset files under; 0 = the project root.
+    uint64_t bin = 0;
+};
+
+// Browser BIN: pure project organisation, like an NLE's project-panel
+// folders. Bins nest by parent (0 = root) and hold nothing themselves -
+// membership is the `bin` field on looks, sequences and assets, so
+// deleting a bin never deletes content. Nothing outside the browser
+// reads them.
+struct Bin {
+    uint64_t id = 0;
+    std::string name;
+    uint64_t parent = 0;
 };
 
 // Where a block sits on a sequence's timeline, and WHAT plays there: a
@@ -75,7 +88,22 @@ struct Placement {
     // target. Meaningful on AUDIO placements.
     float audio_gain = 1.0f;   // 0..2, linear
     bool audio_mute = false;
+    // Canvas composition (Motion, per block, VIDEO lanes): offset in
+    // canvas fractions (+x right, +y down; 0 = centered), uniform scale
+    // about center, rotation in degrees, opacity into the lane stack.
+    // Pure stateless geometry - razored halves inherit it bit-identically
+    // and sequences still own no effects.
+    float pos_x = 0.0f;
+    float pos_y = 0.0f;
+    float scale = 1.0f;
+    float rotate = 0.0f;
+    float opacity = 1.0f;
 };
+
+inline bool placement_has_transform(const Placement& p) {
+    return p.pos_x != 0.0f || p.pos_y != 0.0f || p.scale != 1.0f ||
+           p.rotate != 0.0f;
+}
 
 // A sequence VIDEO LANE: placements in local time, topmost lane
 // composites last. Pure arrangement - it owns no effects, no state.
@@ -109,7 +137,7 @@ enum class LayerSourceKind : uint32_t {
     Noise,
     TestPattern,   // 75% color bars + grayscale ramp
     Oscillator,    // video-synth periodic source: bars / rings / plasma
-    // The SHAPE NODE (docs/flow_canvas.md): a centered SDF matte
+    // The SHAPE NODE: a centered SDF matte
     // (circle/box/diamond via osc_shape) drawn as premultiplied coverage
     // - an ordinary image source meant to run through effects and feed
     // mask anchors. gen_scale = size, gen_angle = feather.
@@ -135,7 +163,7 @@ struct NodeLink {
     uint32_t to_port = 0;
 };
 
-// Canvas frames (docs/flow_canvas.md): titled visual grouping boxes,
+// Canvas frames: titled visual grouping boxes,
 // texed-style. Pure annotation - nothing reads them but the canvas.
 struct CanvasFrame {
     uint64_t id = 0;
@@ -166,8 +194,7 @@ struct Group {
     // never rewrite the internal picture. 0 = first/last member.
     uint64_t face_in = 0;
     uint64_t face_out = 0;
-    // Node-canvas position of the FOLDED group's card (docs/flow_canvas.md
-    // v4 subgraphs); (0,0) = unplaced.
+    // Node-canvas position of the FOLDED group's card; (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
     // Scoped-view positions of the In/Out boundary nodes (they
@@ -211,8 +238,7 @@ struct Layer {
     bool flip_h = false, flip_v = false;
     float xf_scale = 1.0f;                // about frame center, 0.25..4
     float xf_rotate = 0.0f;               // degrees, -180..180
-    // Node-canvas position of the layer's SOURCE node (docs/
-    // flow_canvas.md); (0,0) = unplaced.
+    // Node-canvas position of the layer's SOURCE node; (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
     std::vector<EffectInstance> stack;
@@ -237,7 +263,7 @@ inline bool layer_is_nested(const Layer& l) {
            l.source == LayerSourceKind::SequenceRef;
 }
 
-// TRUE GRAPH (docs/flow_canvas.md): layers are storage bags + source
+// TRUE GRAPH: layers are storage bags + source
 // nodes, not a composite hierarchy - branches merge through Blend nodes.
 // These bound runaway documents only. kMaxLayers bounds GRAPH NODES, not
 // edit length - a sequence lane holds up to kMaxPlacementsPerTrack cuts.
@@ -254,6 +280,8 @@ struct Look {
     // Local length in frames; 0 = derived from the longest source
     // (look_duration). Generator-only looks derive 0 = unbounded.
     uint32_t duration = 0;
+    // Browser bin; 0 = the project root.
+    uint64_t bin = 0;
 
     std::vector<Layer> layers;
     std::vector<NodeLink> links;
@@ -287,6 +315,8 @@ struct Sequence {
     std::string name;
     // Local length in frames; 0 = derived from the furthest block end.
     uint32_t duration = 0;
+    // Browser bin; 0 = the project root.
+    uint64_t bin = 0;
 
     std::vector<SeqTrack> tracks;
     std::vector<AudioTrack> audio;
@@ -311,6 +341,8 @@ struct Document {
     std::vector<Look> looks;
     std::vector<Sequence> sequences;
     uint64_t root_sequence = 0;
+    // Browser organisation only; nothing renders or plays from these.
+    std::vector<Bin> bins;
 
     uint64_t master_seed = 0;
     // Project frame rate: one clock for every entity, so nested local
@@ -404,6 +436,16 @@ struct Document {
     const Sequence* find_sequence(uint64_t id) const {
         for (const Sequence& s : sequences)
             if (s.id == id) return &s;
+        return nullptr;
+    }
+    Bin* find_bin(uint64_t id) {
+        for (Bin& b : bins)
+            if (b.id == id) return &b;
+        return nullptr;
+    }
+    const Bin* find_bin(uint64_t id) const {
+        for (const Bin& b : bins)
+            if (b.id == id) return &b;
         return nullptr;
     }
     // For callers holding an id they know is live (commands capture the
@@ -579,6 +621,17 @@ inline double placement_source_frame(const Placement& p, double local) {
     return (local - static_cast<double>(p.t_in)) *
                static_cast<double>(p.speed) +
            static_cast<double>(p.source_in);
+}
+
+// True when browser bin `from` reaches bin `to` walking parents - the
+// no-cycle rule for nesting bins (reparent guard). Depth cap defends
+// corrupt files only.
+inline bool bin_reaches(const Document& doc, uint64_t from, uint64_t to,
+                        int depth = 0) {
+    if (!from || depth >= 64) return false;
+    if (from == to) return true;
+    const Bin* b = doc.find_bin(from);
+    return b && bin_reaches(doc, b->parent, to, depth + 1);
 }
 
 // True when entity `from` (a look or sequence) already reaches entity

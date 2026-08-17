@@ -288,6 +288,36 @@ private:
     bool old_ = false;
 };
 
+class SetProjectFormatCommand final : public Command {
+public:
+    SetProjectFormatCommand(double fps, uint32_t w, uint32_t h)
+        : fps_(fps), w_(w), h_(h) {}
+    std::string name() const override { return "Project Format"; }
+
+    void apply(Document& doc) override {
+        old_fps_ = doc.fps;
+        old_w_ = doc.canvas_w;
+        old_h_ = doc.canvas_h;
+        doc.fps = fps_;
+        doc.canvas_w = w_;
+        doc.canvas_h = h_;
+    }
+
+    void revert(Document& doc) override {
+        doc.fps = old_fps_;
+        doc.canvas_w = old_w_;
+        doc.canvas_h = old_h_;
+    }
+
+private:
+    double fps_;
+    uint32_t w_;
+    uint32_t h_;
+    double old_fps_ = 0.0;
+    uint32_t old_w_ = 0;
+    uint32_t old_h_ = 0;
+};
+
 class SetTimeRemapCommand final : public Command {
 public:
     SetTimeRemapCommand(float speed, uint32_t mode)
@@ -544,30 +574,6 @@ private:
     ResponseCurve old_curve_ = ResponseCurve::Linear;
 };
 
-class SetRouteTargetCommand final : public LookCommand {
-public:
-    SetRouteTargetCommand(uint64_t look, uint64_t route_id, ParamKey target)
-        : LookCommand(look), route_id_(route_id), target_(target) {}
-    std::string name() const override { return "Wire Route"; }
-
-    void apply(Document& doc) override {
-        ModRoute* r = find_route(look_of(doc), route_id_);
-        assert(r);
-        old_target_ = r->target;
-        r->target = target_;
-    }
-
-    void revert(Document& doc) override {
-        if (ModRoute* r = find_route(look_of(doc), route_id_))
-            r->target = old_target_;
-    }
-
-private:
-    uint64_t route_id_;
-    ParamKey target_;
-    ParamKey old_target_;
-};
-
 class SetLaneCommand final : public LookCommand {
 public:
     SetLaneCommand(uint64_t look, ParamKey target, std::vector<Keyframe> keys)
@@ -779,12 +785,6 @@ std::unique_ptr<Command> remove_route_command(uint64_t look,
                                               uint64_t route_id) {
     return std::make_unique<RemoveRouteCommand>(look, route_id);
 }
-std::unique_ptr<Command> set_route_target_command(uint64_t look,
-                                                  uint64_t route_id,
-                                                  ParamKey target) {
-    return std::make_unique<SetRouteTargetCommand>(look, route_id, target);
-}
-
 std::unique_ptr<Command> add_value_node_command(uint64_t look,
                                                 ValueNode node) {
     return std::make_unique<AddValueNodeCommand>(look, node);
@@ -828,6 +828,10 @@ std::unique_ptr<Command> set_morph_command(uint64_t look, int from, int to,
 }
 std::unique_ptr<Command> set_time_remap_command(float speed, uint32_t mode) {
     return std::make_unique<SetTimeRemapCommand>(speed, mode);
+}
+std::unique_ptr<Command> set_project_format_command(double fps, uint32_t w,
+                                                    uint32_t h) {
+    return std::make_unique<SetProjectFormatCommand>(fps, w, h);
 }
 std::unique_ptr<Command> set_timeline_region_command(uint64_t look,
                                                      uint32_t trim_in,

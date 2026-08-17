@@ -32,6 +32,8 @@ struct UiInput {
     bool left_down() const { return buttons_down & kMouseLeft; }
     bool left_pressed() const { return buttons_pressed & kMouseLeft; }
     bool left_released() const { return buttons_released & kMouseLeft; }
+    bool right_down() const { return buttons_down & kMouseRight; }
+    bool right_pressed() const { return buttons_pressed & kMouseRight; }
 
     // Folds the platform events into the snapshot. `to_logical` divides
     // physical event coordinates by the window's DPI scale.

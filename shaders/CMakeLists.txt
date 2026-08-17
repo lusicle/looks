@@ -7,6 +7,7 @@ add_slang_shaders(looks_shaders
         viewport.vert.slang
         viewport.frag.slang
         ycbcr_to_rgb.comp.slang
+        alpha_bounds.comp.slang
         export_nv12.comp.slang
         mosh_predict.comp.slang
         mosh_wire.comp.slang

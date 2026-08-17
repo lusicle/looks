@@ -35,6 +35,7 @@ void UndoStack::execute(Document& doc, std::unique_ptr<Command> cmd, bool coales
     assert(cmd);
     cmd->apply(doc);
     ++doc.revision;
+    coalescing_active_ = coalesce;
     push_entry(std::move(cmd), coalesce);
 }
 

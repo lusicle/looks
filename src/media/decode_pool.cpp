@@ -66,12 +66,36 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
     if (revision == revision_ && look_id == look_ &&
         same_bundles(bundles, bundles_))
         return;
+    // A revision that left the CLIP TABLE identical (param drags, block
+    // Motion, effect edits) must not stall the decode workers - draining
+    // per gesture frame is what made dragging hitch during playback.
+    std::vector<doc::ClipInstance> next =
+        doc::flatten_clip_sources(doc, look_id);
+    if (look_id == look_ && same_bundles(bundles, bundles_) &&
+        next.size() == clips_.size()) {
+        bool same = true;
+        for (size_t i = 0; i < next.size(); ++i) {
+            const doc::ClipInstance& a = next[i];
+            const doc::ClipInstance& b = clips_[i];
+            if (a.key != b.key || a.owner != b.owner || a.layer != b.layer ||
+                a.asset != b.asset || a.t_in != b.t_in ||
+                a.t_out != b.t_out || a.source_in != b.source_in ||
+                a.speed != b.speed || a.gain != b.gain) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            revision_ = revision;
+            return;
+        }
+    }
     // No worker may be inside a stream while the table is rebuilt.
     drain();
     revision_ = revision;
     look_ = look_id;
     bundles_ = bundles;
-    clips_ = doc::flatten_clip_sources(doc, look_id);
+    clips_ = std::move(next);
 
     std::lock_guard<std::mutex> lock(map_m_);
     for (auto it = streams_.begin(); it != streams_.end();) {
@@ -139,10 +163,21 @@ DecodePool::Stream* DecodePool::stream_for(const Request& req) {
 
 std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
     Stream& s, uint32_t frame, bool* was_miss) {
-    std::lock_guard<std::mutex> lock(s.m);
-    for (const auto& e : s.ring)
-        if (e.first == frame) return e.second;
+    {
+        std::lock_guard<std::mutex> lock(s.m);
+        for (const auto& e : s.ring)
+            if (e.first == frame) return e.second;
+    }
     if (was_miss) *was_miss = true;
+    // The reader is stateful, so decodes serialize per stream - but on
+    // decode_m, never on the ring lock: a probe returns immediately and
+    // a miss waits at most the ONE decode in flight.
+    std::lock_guard<std::mutex> dlock(s.decode_m);
+    {
+        std::lock_guard<std::mutex> lock(s.m);
+        for (const auto& e : s.ring)
+            if (e.first == frame) return e.second;   // landed while waiting
+    }
     if (!s.opened) {
         s.opened = true;
         std::string error;
@@ -158,6 +193,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
     }
     auto shared =
         std::make_shared<const codec::DecodedFrame>(std::move(decoded));
+    std::lock_guard<std::mutex> lock(s.m);
     s.ring.emplace_back(frame, shared);
     // Evict what the playhead has left furthest behind (or never reaches).
     const size_t depth = std::max<size_t>(ring_depth_, 1);
@@ -201,9 +237,17 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
     // PREWARM. What plays later is a closed form, so the frames a cut or a
     // nested look's in-point will need are known now: queue them nearest
     // first. Streams that only prewarm are capped, so a pathological
-    // arrangement cannot open unbounded files.
+    // arrangement cannot open unbounded files. The span never exceeds
+    // what the ring can HOLD next to the current frame - prewarming past
+    // it decodes frames that evict themselves, then re-queues them every
+    // cycle: permanent decode churn whose stream-lock traffic stalled
+    // collect() by the whole backlog. Frames already ringed (or already
+    // queued - slowed clips repeat source frames) never re-queue, so a
+    // settled steady state queues NOTHING.
     std::vector<Job> queued;
-    for (uint32_t n = 0; n < kDecodeAhead; ++n) {
+    const uint32_t span = std::min(
+        kDecodeAhead, ring_depth_ > 1 ? ring_depth_ - 1 : 1u);
+    for (uint32_t n = 0; n < span; ++n) {
         for (size_t i = 0; i < clips_.size(); ++i) {
             const doc::ClipInstance& c = clips_[i];
             const double first =
@@ -221,13 +265,31 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
             req.clip = i;
             req.frame = static_cast<uint32_t>(std::clamp(
                 src, 0.0, static_cast<double>(b->frames - 1)));
+            bool dup = false;
+            for (const Job& q : queued)
+                if (q.key == req.key && q.frame == req.frame) {
+                    dup = true;
+                    break;
+                }
+            if (dup) continue;
             {
                 std::lock_guard<std::mutex> lock(map_m_);
                 if (streams_.find(req.key) == streams_.end() &&
                     streams_.size() >= kMaxStreams)
                     continue;
             }
-            if (!stream_for(req)) continue;
+            Stream* ps = stream_for(req);
+            if (!ps) continue;
+            {
+                std::lock_guard<std::mutex> lock(ps->m);
+                bool ringed = false;
+                for (const auto& e : ps->ring)
+                    if (e.first == req.frame) {
+                        ringed = true;
+                        break;
+                    }
+                if (ringed) continue;
+            }
             queued.push_back({req.key, req.frame, 0});
         }
     }

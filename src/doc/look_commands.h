@@ -46,6 +46,22 @@ std::unique_ptr<Command> add_asset_command(Asset asset);
 // back what opening the bundle probed (frame count, fps, still length).
 std::unique_ptr<Command> set_asset_command(Asset updated);
 
+// Browser bins: project-panel folders. Membership is the `bin` field on
+// looks, sequences and assets; bins nest by parent.
+Bin make_bin(Document& doc, std::string name);
+std::unique_ptr<Command> add_bin_command(Bin bin);
+// Deleting a bin keeps its contents: members and child bins move up to
+// the bin's parent; undo restores every membership and the bin itself.
+std::unique_ptr<Command> remove_bin_command(uint64_t bin_id);
+// Rename + reparent in one. Callers guard cycles with bin_reaches FIRST
+// (a bin must not land inside its own subtree).
+std::unique_ptr<Command> set_bin_props_command(uint64_t bin,
+                                               std::string name,
+                                               uint64_t parent);
+// Files a look, sequence or asset under `bin` (0 = project root).
+std::unique_ptr<Command> set_entity_bin_command(uint64_t entity_id,
+                                                uint64_t bin);
+
 // NEST: moves `layer_ids` out of `look` into a brand new look and puts a
 // LookRef source node in their place; Ctrl+G one level up. Everything
 // plays in lockstep, so nothing is rebased - the nested look renders

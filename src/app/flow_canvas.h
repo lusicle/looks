@@ -1,5 +1,5 @@
-// Node canvas (docs/flow_canvas.md) — the full node editor. Document-
-// agnostic: the app translates the document into a flow::Graph each frame
+// Node canvas - the full node editor. Document-agnostic: the app
+// translates the document into a flow::Graph each frame
 // (positions from the document, derived auto-layout for unplaced nodes)
 // and turns flow::Output events + staged param edits into commands. The
 // widget owns pan/zoom, card chrome, inline sliders, ports, and wires —
@@ -103,7 +103,7 @@ struct Node {
     // Text node: a title double-click edits the STRING (the same
     // inline editor groups use for renames).
     bool text_edit = false;
-    // A LOOK INSTANCE card (docs/look.md): a body double-click enters the
+    // A LOOK INSTANCE card: a body double-click enters the
     // referenced look, the way it enters a group's subgraph.
     bool is_look = false;
 };
@@ -114,8 +114,8 @@ struct Wire {
     uint64_t from = 0;   // leaves from's Out port
     uint64_t to = 0;
     uint8_t kind = 0;
-    // Mod wires land on the driven PARAM's row (docs/flow_canvas.md)
-    // instead of the card edge; -1 = no row (card-edge fallback).
+    // Mod wires land on the driven PARAM's row instead of the card
+    // edge; -1 = no row (card-edge fallback).
     int to_row = -1;
 };
 
@@ -303,7 +303,7 @@ struct Output {
     // (texed enterSubgraph).
     uint64_t group_open = 0;
     // Double-click on a look-instance card: ENTER that look (the canvas
-    // and the timeline scope together — docs/look.md).
+    // and the timeline scope together).
     uint64_t look_open = 0;
     // Breadcrumb "main" clicked: exit the open group's view, or leave the
     // scoped look for the project.

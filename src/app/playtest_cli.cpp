@@ -1,5 +1,5 @@
-// Dev CLI: headless transport + decode pool verification (docs/look.md
-// phase 4). Builds a one-clip project over an imported bundle, runs the
+// Dev CLI: headless transport + decode pool verification. Builds a
+// one-clip project over an imported bundle, runs the
 // timeline clock, pulls frames through the pool, and exercises seek and
 // trim.
 //   looks_playtest <bundle.mez> [bundle.pcm]

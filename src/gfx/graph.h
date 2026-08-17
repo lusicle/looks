@@ -52,6 +52,16 @@ struct GraphNode {
     // paths fold container and target ids, never placement ids - with no
     // effects at sequence level there is nothing a cut could reset.
     uint64_t key = 0;
+    // Placement composition (sequence lanes only): the lane's LayerBlend
+    // (layer_index -1) samples its lane image through this affine WHILE
+    // compositing and applies p_opacity. Canvas Motion is an attribute
+    // of the composite - sequences never own effect passes, so no
+    // transform node ever appears in a sequence graph.
+    float p_shift_x = 0.0f;
+    float p_shift_y = 0.0f;
+    float p_scale = 1.0f;
+    float p_rotate = 0.0f;   // radians, pre-converted at compile
+    float p_opacity = 1.0f;
 };
 
 // One instance of an entity (look or sequence) inside the compiled
@@ -89,6 +99,16 @@ struct RenderGraph {
     // out_source) ever reads it. Resolved in the root instance only —
     // you preview the look you are editing.
     int preview = -1;
+    // Measure tap: the selected block's lane image BEFORE its placement
+    // Motion, root sequence only. The engine runs the alpha-bounds
+    // reduction on it for the monitor's content box. UI-only - export
+    // compiles without it and pixels never depend on the measurement.
+    int measure = -1;
+    // The A/B "before": the SAME composition with every effect stack
+    // stripped - arrangement, Motion, opacity and layer attributes are
+    // composition state, not effects, so the wipe and fx bypass keep
+    // them. -1 unless compiled with_before.
+    int before = -1;
     bool valid = false;        // false: cycle or empty
 };
 
@@ -110,8 +130,38 @@ bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order);
 // LANE's output (its winning block, pre-over) — the id names a layer or
 // a lane track. preview_node outranks it. Preview-only: export passes 0
 // for both.
+// measure_placement names a root-sequence block whose pre-Motion lane
+// image gets the alpha-bounds tap (RenderGraph::measure); 0 disables.
+// with_before additionally emits the effect-stripped composite
+// (RenderGraph::before) the A/B wipe and fx bypass publish.
 RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
                           uint32_t frame, uint64_t preview_node = 0,
-                          uint64_t preview_layer = 0);
+                          uint64_t preview_layer = 0,
+                          uint64_t measure_placement = 0,
+                          bool with_before = false);
+
+// Aspect-preserving source fit: the largest centered rect of the
+// source's aspect inside the working target, as {x, y, w, h} in output
+// pixels. Sources never stretch - the remainder is transparent black.
+// Matching aspects return exactly the full target, so same-shape media
+// keeps its 1:1 normalized sampling. Unknown source dims fill.
+inline void source_fit_rect(uint32_t src_w, uint32_t src_h,
+                            uint32_t out_w, uint32_t out_h, float rect[4]) {
+    float fw = static_cast<float>(out_w);
+    float fh = static_cast<float>(out_h);
+    if (src_w && src_h && out_w && out_h) {
+        const float sa =
+            static_cast<float>(src_w) / static_cast<float>(src_h);
+        const float oa = fw / fh;
+        if (sa > oa)
+            fh = fw / sa;
+        else if (sa < oa)
+            fw = fh * sa;
+    }
+    rect[0] = (static_cast<float>(out_w) - fw) * 0.5f;
+    rect[1] = (static_cast<float>(out_h) - fh) * 0.5f;
+    rect[2] = fw;
+    rect[3] = fh;
+}
 
 }  // namespace looks::gfx

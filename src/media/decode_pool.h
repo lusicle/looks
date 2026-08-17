@@ -1,4 +1,4 @@
-// Decode pool (docs/look.md phase 4): one decoded frame per PLACEMENT.
+// Decode pool: one decoded frame per PLACEMENT.
 //
 // The single Player owned one reader and one playhead, which is exactly as
 // many clips as a rack could show. A look tree can have several playing at
@@ -80,10 +80,16 @@ private:
     struct Stream {
         std::filesystem::path path;
         uint32_t frames = 0;
+        // Two locks by design: `m` guards the ring/want and is only ever
+        // held briefly; `decode_m` serializes the stateful reader. A ring
+        // PROBE must never wait behind a decode in flight - the render
+        // thread queuing behind prewarm decodes was a per-frame stall the
+        // length of the whole prewarm backlog.
         std::mutex m;
+        std::mutex decode_m;
         codec::MezReader reader;
-        bool opened = false;
-        bool ok = false;
+        bool opened = false;   // guarded by decode_m
+        bool ok = false;       // guarded by decode_m
         // Decoded frames by index, newest last. Bounded by ring_depth_.
         std::deque<std::pair<uint32_t, std::shared_ptr<const codec::DecodedFrame>>>
             ring;
@@ -97,7 +103,8 @@ private:
     };
 
     Stream* stream_for(const Request& req);
-    // Returns the decoded frame, decoding under `s.m` when the ring misses.
+    // Returns the decoded frame; a ring miss decodes under `decode_m`
+    // (waiting at most one in-flight decode, never the prewarm backlog).
     std::shared_ptr<const codec::DecodedFrame> fetch(Stream& s, uint32_t frame,
                                                      bool* was_miss);
     void worker_main();

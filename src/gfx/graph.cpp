@@ -25,6 +25,10 @@ struct Compiler {
     RenderGraph& graph;
     uint64_t preview_node = 0;
     uint64_t preview_layer = 0;
+    uint64_t measure_placement = 0;
+    // The "before" pass: every effect compiles as bypassed while the
+    // composition (sources, layer attributes, lane Motion) stays whole.
+    bool strip_effects = false;
     FlowSlot flow;
     int black_node = -1;
 
@@ -170,13 +174,33 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
         // stacks into the film.
         if (is_root && preview_layer == track.id && graph.preview < 0)
             graph.preview = out;
-        if (below < 0) {
+        // Measure tap: the selected block's content pre-Motion - the
+        // monitor's box math applies the placement transform itself.
+        if (is_root && measure_placement && place->id == measure_placement)
+            graph.measure = out;
+        // Placement composition: stateless canvas geometry and opacity
+        // are attributes OF the lane's over-composite - the blend
+        // samples the lane image through the placement affine while
+        // compositing. No transform node exists at sequence level
+        // (sequences never own effects). A bottom lane with Motion or
+        // reduced opacity blends over transparent black so both are
+        // honored there too.
+        const float popa = std::clamp(place->opacity, 0.0f, 1.0f);
+        const bool moved = doc::placement_has_transform(*place);
+        if (below < 0 && popa >= 1.0f && !moved) {
             below = out;
         } else {
             GraphNode blend;
             blend.kind = GraphNode::Kind::LayerBlend;
             blend.layer_index = -1;   // plain alpha-over
-            blend.inputs = {below, out};
+            blend.p_opacity = popa;
+            if (moved) {
+                blend.p_shift_x = place->pos_x;
+                blend.p_shift_y = place->pos_y;
+                blend.p_scale = place->scale;
+                blend.p_rotate = place->rotate * 0.01745329252f;
+            }
+            blend.inputs = {below < 0 ? black() : below, out};
             below = add(std::move(blend), inst);
         }
     }
@@ -189,9 +213,9 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     const uint64_t path = graph.instances[static_cast<size_t>(inst)].path;
     auto subject_key = [&](uint64_t id) { return hash_combine(path, id); };
 
-    // TRUE GRAPH (docs/flow_canvas.md): effect wiring and the final
-    // composite come from the link table; legacy chain documents compile
-    // through the synthesized equivalent.
+    // TRUE GRAPH: effect wiring and the final composite come from the
+    // link table; an empty table compiles through the synthesized
+    // stack-order chain.
     const std::vector<doc::NodeLink> links =
         look.links.empty() ? doc::synthesize_links(look) : look.links;
     auto link_into = [&](uint64_t to, uint32_t port) -> uint64_t {
@@ -217,6 +241,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         return false;
     };
     auto effect_active = [&](uint64_t id) {
+        if (strip_effects) return false;
         const auto ito = owner.find(id);
         if (ito == owner.end()) return false;
         const size_t li = ito->second;
@@ -507,8 +532,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         const doc::Layer& layer = look.layers[li];
 
         // Every contribution resolves through the links — the adjustment
-        // special case is gone (docs/flow_canvas.md: source in, output
-        // out, everything between wires freely; merges are Blend nodes).
+        // special case is gone (source in, output out, everything
+        // between wires freely; merges are Blend nodes).
         // A dormant chain contributes NOTHING.
         int cur = resolve(l.from);
         if (cur < 0) continue;
@@ -644,7 +669,8 @@ bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order) {
 
 RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
                           uint32_t frame, uint64_t preview_node,
-                          uint64_t preview_layer) {
+                          uint64_t preview_layer,
+                          uint64_t measure_placement, bool with_before) {
     RenderGraph graph;
 
     // The compiled entity is instance 0: its path is its own id, its
@@ -656,7 +682,8 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
     root.local_frame = frame;
     graph.instances.push_back(root);
 
-    Compiler c{doc, graph, preview_node, preview_layer, {}, -1};
+    Compiler c{doc, graph, preview_node, preview_layer, measure_placement,
+               {}, -1};
     const int below = c.emit_entity(root_id, 0, /*is_root=*/true);
 
     // Unwired Output (flat graph): nothing feeds the composite, so
@@ -664,6 +691,16 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
     // through, which is chain residue, not a node graph.
     graph.output = below >= 0 ? below : c.black();
     if (graph.preview == graph.output) graph.preview = -1;
+
+    // The A/B "before": the SAME entity re-emitted with effects
+    // stripped. Composition attributes (arrangement, Motion, opacity,
+    // layer transforms) are not effects and must survive the wipe;
+    // Source keys match the main tree, so decoded planes are shared.
+    if (with_before) {
+        c.strip_effects = true;
+        const int before = c.emit_entity(root_id, 0, /*is_root=*/false);
+        graph.before = before >= 0 ? before : c.black();
+    }
 
     graph.valid = topo_sort(graph.nodes, graph.order);
     return graph;

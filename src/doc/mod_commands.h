@@ -43,11 +43,6 @@ std::unique_ptr<Command> remove_route_command(uint64_t look,
 std::unique_ptr<Command> set_route_curve_command(uint64_t look,
                                                  uint64_t route_id,
                                                  ResponseCurve curve);
-// Rewires which param the route drives (docs/flow_canvas.md: dropping
-// a value node's out wire onto a param row). {0, -1} = unwired (inert).
-std::unique_ptr<Command> set_route_target_command(uint64_t look,
-                                                  uint64_t route_id,
-                                                  ParamKey target);
 
 // Replaces (or creates, or removes when `keys` is empty) the lane for
 // `target`. Coalesces per target.
@@ -96,6 +91,11 @@ std::unique_ptr<Command> set_lane_mute_command(uint64_t look, ParamKey target,
 
 // Time remap: base speed + playback mode on the root timeline. Coalesces.
 std::unique_ptr<Command> set_time_remap_command(float speed, uint32_t mode);
+
+// Project format: frame rate + canvas size (0 = derive from the first
+// asset). One clock and one canvas for every entity.
+std::unique_ptr<Command> set_project_format_command(double fps, uint32_t w,
+                                                    uint32_t h);
 
 // Sidechain + audio nudge. Coalesces (offset drags).
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,

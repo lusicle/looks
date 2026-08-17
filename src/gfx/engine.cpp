@@ -211,6 +211,8 @@ Engine::~Engine() {
     if (codec_io_.readback)
         vmaDestroyBuffer(device_.allocator(), codec_io_.readback,
                          codec_io_.readback_alloc);
+    if (bounds_buf_)
+        vmaDestroyBuffer(device_.allocator(), bounds_buf_, bounds_alloc_);
     for (CacheIo& io : cache_io_)
         if (io.buf) vmaDestroyBuffer(device_.allocator(), io.buf, io.alloc);
 }
@@ -264,9 +266,39 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     to_rgb_desc.spv_name = "ycbcr_to_rgb.comp.spv";
     to_rgb_desc.sampled_inputs = 3;
     to_rgb_desc.storage_outputs = 1;
-    to_rgb_desc.push_bytes = 2 * sizeof(uint32_t);
+    to_rgb_desc.push_bytes = 6 * sizeof(uint32_t);
     to_rgb_ = ComputePipeline::create(device_, shader_dir, to_rgb_desc);
     if (!to_rgb_) return false;
+
+    ComputePipelineDesc bounds_desc;
+    bounds_desc.spv_name = "alpha_bounds.comp.spv";
+    bounds_desc.sampled_inputs = 1;
+    bounds_desc.storage_outputs = 1;
+    bounds_desc.push_bytes = 2 * sizeof(uint32_t);
+    alpha_bounds_ = ComputePipeline::create(device_, shader_dir, bounds_desc);
+    if (!alpha_bounds_) return false;
+    bounds_img_ = GpuImage::create(
+        device_, VK_FORMAT_R32_UINT, 4, 1,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!bounds_img_) return false;
+    {
+        VkBufferCreateInfo binfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        binfo.size = 4 * sizeof(uint32_t);
+        binfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo alloc_info{};
+        alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VmaAllocationInfo mapped{};
+        if (vmaCreateBuffer(device_.allocator(), &binfo, &alloc_info,
+                            &bounds_buf_, &bounds_alloc_,
+                            &mapped) != VK_SUCCESS) {
+            bounds_buf_ = VK_NULL_HANDLE;
+            return false;
+        }
+        bounds_mapped_ = mapped.pMappedData;
+    }
 
     for (size_t i = 0; i < static_cast<size_t>(doc::EffectType::Count); ++i) {
         if (!kFxShaders[i].spv_name) continue;   // multi-pass, below
@@ -328,7 +360,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     mod_integrate_ = ComputePipeline::create(device_, shader_dir, mi_desc);
     if (!mod_integrate_) return false;
 
-    // Node-canvas thumbnail tap (docs/flow_canvas.md): one small
+    // Node-canvas thumbnail tap: one small
     // downsample dispatch per evaluated graph node into a fixed atlas.
     ComputePipelineDesc tt_desc;
     tt_desc.spv_name = "thumb_tap.comp.spv";
@@ -433,7 +465,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     blend_desc.spv_name = "layer_blend.comp.spv";
     blend_desc.sampled_inputs = 2;
     blend_desc.storage_outputs = 1;
-    blend_desc.push_bytes = 4 * sizeof(uint32_t);
+    blend_desc.push_bytes = 9 * sizeof(uint32_t);
     layer_blend_ = ComputePipeline::create(device_, shader_dir, blend_desc);
 
     ComputePipelineDesc xf_desc;
@@ -681,7 +713,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Text-overlay fonts (docs/flow_canvas.md): every .ttf under
+    // Text-overlay fonts: every .ttf under
     // assets/fonts, parsed by the in-repo TrueType loader — drop a font
     // next to the shipped ones and it's index N, no bake step. Sorted by
     // lowercased filename so the `font` param stays deterministic;
@@ -1159,12 +1191,19 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     if (!temp) return false;
     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
     {
-        const uint32_t rgb_push[2] = {w, h};
+        // Moshed planes are already working-size: identity fit.
+        struct {
+            uint32_t w, h;
+            float rx, ry, iw, ih;
+        } rgb_push = {w,    h,
+                      0.0f, 0.0f,
+                      1.0f / static_cast<float>(w),
+                      1.0f / static_cast<float>(h)};
         const GpuImage* planes3[3] = {codec_io_.up_y.get(),
                                       codec_io_.up_u.get(),
                                       codec_io_.up_v.get()};
         to_rgb_->dispatch(rec, arena_, frame_index, planes3, 3, &temp, 1,
-                          rgb_push, sizeof(rgb_push), w, h, linear_sampler_);
+                          &rgb_push, sizeof(rgb_push), w, h, linear_sampler_);
     }
     temp->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     {
@@ -1328,7 +1367,7 @@ void Engine::codec_flush_segment() {
              "vkResetFences(codecbox)");
 }
 
-// Node-canvas thumbnail tap (docs/flow_canvas.md): downsample `src` into
+// Node-canvas thumbnail tap: downsample `src` into
 // the next free atlas cell, keyed for the UI's cell map. Silently drops
 // taps past the fixed grid — 64 previews bound the cost.
 void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
@@ -1347,6 +1386,28 @@ void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                          linear_sampler_);
 }
 
+bool Engine::read_measure_bounds(float rect[4]) const {
+    if (!bounds_recorded_ || !bounds_mapped_ || !bounds_w_ || !bounds_h_)
+        return false;
+    vmaInvalidateAllocation(device_.allocator(), bounds_alloc_, 0,
+                            VK_WHOLE_SIZE);
+    uint32_t v[4];
+    std::memcpy(v, bounds_mapped_, sizeof(v));
+    // Max cells store the complement (one atomic min serves all four);
+    // an untouched clear means fully transparent content.
+    if (v[0] == 0xFFFFFFFFu || v[2] == 0xFFFFFFFFu) return false;
+    const uint32_t max_x = 0xFFFFFFFFu - v[2];
+    const uint32_t max_y = 0xFFFFFFFFu - v[3];
+    if (max_x < v[0] || max_y < v[1]) return false;
+    const float fw = static_cast<float>(bounds_w_);
+    const float fh = static_cast<float>(bounds_h_);
+    rect[0] = static_cast<float>(v[0]) / fw;
+    rect[1] = static_cast<float>(v[1]) / fh;
+    rect[2] = static_cast<float>(max_x + 1 - v[0]) / fw;
+    rect[3] = static_cast<float>(max_y + 1 - v[1]) / fh;
+    return true;
+}
+
 GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          const doc::Document& doc,
                          uint64_t root_id, uint32_t root_frame, double fps,
@@ -1355,7 +1416,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          GpuImage** out_source,
                          const LayerSourceFrame* layer_sources,
                          size_t layer_source_count,
-                         uint64_t preview_node, uint64_t preview_layer) {
+                         uint64_t preview_node, uint64_t preview_layer,
+                         uint64_t measure_placement) {
+    bounds_recorded_ = false;
     // The entity being rendered (a sequence or a scoped look) and the
     // frame it plays at. Nodes belonging to NESTED instances read their
     // own look and their own local frame instead (both are shadowed
@@ -1369,8 +1432,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     StagingBuffer& staging = *staging_[frame_index % kFramesInFlight];
     staging.reset();
 
-    // The CANVAS is the project's, never the clip's (docs/look.md phase
-    // 4): a cut between two source sizes must not resize the graph.
+    // The CANVAS is the project's, never the clip's: a cut between two
+    // source sizes must not resize the graph.
     // Working dimensions shrink under the preview proxy — kernels sample
     // by uv, so everything scales; even dims keep the codec paths happy.
     const uint32_t w = std::max((canvas_w / preview_divisor_) & ~1u, 2u);
@@ -1395,9 +1458,16 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
     }
     bool arm_readback = false;
+    if (measure_placement == 0) measured_placement_ = 0;
     if (cache_ctx != 0) {
         cache_.set_context(cache_ctx);
-        const RenderCache::Frame* hit = cache_.find(cache_frame);
+        // A newly-selected block needs ONE evaluated graph to measure
+        // its bounds; after that, cached frames serve as usual and the
+        // last measured box stands (edits miss the cache anyway).
+        const bool need_measure =
+            measure_placement && measure_placement != measured_placement_;
+        const RenderCache::Frame* hit =
+            need_measure ? nullptr : cache_.find(cache_frame);
         if (hit && hit->width == w && hit->height == h) {
             const size_t bytes = static_cast<size_t>(w) * h * 8;
             GpuImage* dst = nullptr;
@@ -1427,7 +1497,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     }
 
     const RenderGraph graph =
-        compile_graph(doc, root_id, root_frame, preview_node, preview_layer);
+        compile_graph(doc, root_id, root_frame, preview_node, preview_layer,
+                      measure_placement, out_source != nullptr);
     if (!graph.valid) {
         log_error("engine: render graph invalid (cycle?)");
         return nullptr;
@@ -1667,9 +1738,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     remaining_uses[static_cast<size_t>(graph.output)]++;
     if (graph.preview >= 0)
         remaining_uses[static_cast<size_t>(graph.preview)]++;
-    // A/B wipe: keep the converted reference source alive to the end too.
-    if (out_source && graph.source >= 0)
-        remaining_uses[static_cast<size_t>(graph.source)]++;
+    // A/B wipe: keep the effect-stripped BEFORE composite alive to the
+    // end (composition attributes intact - only effects differ).
+    if (out_source && graph.before >= 0)
+        remaining_uses[static_cast<size_t>(graph.before)]++;
+    // The measure tap survives to the tail's alpha-bounds reduction.
+    if (graph.measure >= 0)
+        remaining_uses[static_cast<size_t>(graph.measure)]++;
 
     auto as_bits = [](float v) {
         uint32_t bits;
@@ -1679,7 +1754,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
     for (int index : graph.order) {
         const GraphNode& node = graph.nodes[static_cast<size_t>(index)];
-        // Per-instance view (docs/look.md): `look` is the look this node
+        // Per-instance view: `look` is the look this node
         // came from and `timeline_frame` its LOCAL clock, both shadowing
         // the root's. Everything below addresses its own placement, so a
         // look nested twice runs twice on two different frames. `skey`
@@ -1725,12 +1800,25 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 const GpuImage* planes[3] = {it->second.y.get(),
                                              it->second.u.get(),
                                              it->second.v.get()};
-                const uint32_t push[2] = {w, h};
+                // Aspect-preserving fit: the clip lands centered at its
+                // own shape, transparent outside - never stretched.
+                float fit[4];
+                source_fit_rect(it->second.y->width(),
+                                it->second.y->height(), w, h, fit);
+                struct {
+                    uint32_t w, h;
+                    float rx, ry, iw, ih;
+                } push = {w,      h,
+                          fit[0], fit[1],
+                          1.0f / std::max(fit[2], 1.0f),
+                          1.0f / std::max(fit[3], 1.0f)};
                 to_rgb_->dispatch(rec, arena_, frame_index, planes, 3, &dst, 1,
-                                  push, sizeof(push), w, h, linear_sampler_);
+                                  &push, sizeof(push), w, h, linear_sampler_);
                 break;
             }
             case GraphNode::Kind::LayerTransform: {
+                // Look layers only - sequence Motion composites through
+                // the lane blend, never through a transform pass.
                 const doc::Layer& layer =
                     look.layers[static_cast<size_t>(node.layer_index)];
                 uint32_t push[9] = {};
@@ -1740,7 +1828,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 push[3] = as_bits(layer.crop_r);
                 push[4] = as_bits(layer.crop_t);
                 push[5] = as_bits(layer.crop_b);
-                push[6] = (layer.flip_h ? 1u : 0u) | (layer.flip_v ? 2u : 0u);
+                push[6] = (layer.flip_h ? 1u : 0u) |
+                          (layer.flip_v ? 2u : 0u);
                 push[7] = as_bits(layer.xf_scale);
                 push[8] = as_bits(layer.xf_rotate * 0.01745329252f);
                 const GpuImage* sampled[1] = {input_image(0)};
@@ -1782,22 +1871,35 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             }
             case GraphNode::Kind::LayerBlend: {
                 // layer_index -1 is a SEQUENCE lane stack: plain
-                // alpha-over, full opacity - the timeline owns no blend
-                // modes. Otherwise the owning look layer's mode applies;
-                // its premultiplied alpha is the gate either way.
+                // alpha-over at the PLACEMENT's opacity, sampling the
+                // lane through its canvas affine IN the composite -
+                // Motion is an attribute of the arrangement, never an
+                // effect pass, and the timeline owns no blend modes.
+                // Otherwise the owning look layer's mode applies;
+                // premultiplied alpha is the gate either way.
                 doc::BlendMode mode = doc::BlendMode::Normal;
-                float opacity = 1.0f;
+                float opacity = node.p_opacity;
+                bool moved = false;
                 if (node.layer_index >= 0) {
                     const doc::Layer& layer =
                         look.layers[static_cast<size_t>(node.layer_index)];
                     mode = layer.blend;
                     opacity = layer.opacity;
+                } else {
+                    moved = node.p_scale != 1.0f || node.p_rotate != 0.0f ||
+                            node.p_shift_x != 0.0f ||
+                            node.p_shift_y != 0.0f;
                 }
-                uint32_t push[4] = {};
+                uint32_t push[9] = {};
                 push[0] = w;
                 push[1] = h;
                 push[2] = static_cast<uint32_t>(mode);
                 push[3] = as_bits(opacity);
+                push[4] = moved ? 1u : 0u;
+                push[5] = as_bits(node.p_scale);
+                push[6] = as_bits(node.p_rotate);
+                push[7] = as_bits(node.p_shift_x);
+                push[8] = as_bits(node.p_shift_y);
                 const GpuImage* sampled[2] = {input_image(0), input_image(1)};
                 layer_blend_->dispatch(rec, arena_, frame_index, sampled, 2,
                                        &dst, 1, push, sizeof(push), w, h,
@@ -1977,12 +2079,20 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     if (!temp) return nullptr;
                     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                     {
-                        const uint32_t rgb_push[2] = {w, h};
+                        // Codec round-trip planes are working-size:
+                        // identity fit.
+                        struct {
+                            uint32_t w, h;
+                            float rx, ry, iw, ih;
+                        } rgb_push = {w,    h,
+                                      0.0f, 0.0f,
+                                      1.0f / static_cast<float>(w),
+                                      1.0f / static_cast<float>(h)};
                         const GpuImage* planes3[3] = {codec_io_.up_y.get(),
                                                       codec_io_.up_u.get(),
                                                       codec_io_.up_v.get()};
                         to_rgb_->dispatch(rec, arena_, frame_index, planes3,
-                                          3, &temp, 1, rgb_push,
+                                          3, &temp, 1, &rgb_push,
                                           sizeof(rgb_push), w, h,
                                           linear_sampler_);
                     }
@@ -3130,7 +3240,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
 
         results[static_cast<size_t>(index)] = dst;
-        // Node-canvas thumbnail taps (docs/flow_canvas.md): effects key on
+        // Node-canvas thumbnail taps: effects key on
         // their id, layer sources on layer.id | bit 62 (id spaces
         // overlap).
         constexpr uint64_t kThumbSourceBit = 1ull << 62;
@@ -3154,6 +3264,41 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 pool_.release(results[static_cast<size_t>(input)]);
     }
 
+    // Alpha-bounds reduction on the measure tap: cleared bounds cells,
+    // atomic min/max sweep, 16-byte copy-out. Harvested by
+    // read_measure_bounds after the caller's fence.
+    if (graph.measure >= 0 && results[static_cast<size_t>(graph.measure)]) {
+        GpuImage* mimg = results[static_cast<size_t>(graph.measure)];
+        mimg->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        bounds_img_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue cv{};
+        for (int i = 0; i < 4; ++i) cv.uint32[i] = 0xFFFFFFFFu;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+                                            0, 1};
+        vkCmdClearColorImage(rec, bounds_img_->image(),
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1,
+                             &range);
+        bounds_img_->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+        const uint32_t bpush[2] = {mimg->width(), mimg->height()};
+        const GpuImage* msampled[1] = {mimg};
+        GpuImage* mstorage[1] = {bounds_img_.get()};
+        alpha_bounds_->dispatch(rec, arena_, frame_index, msampled, 1,
+                                mstorage, 1, bpush, sizeof(bpush),
+                                mimg->width(), mimg->height(),
+                                linear_sampler_);
+        bounds_img_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy bcopy{};
+        bcopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        bcopy.imageExtent = {4, 1, 1};
+        vkCmdCopyImageToBuffer(rec, bounds_img_->image(),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               bounds_buf_, 1, &bcopy);
+        bounds_w_ = mimg->width();
+        bounds_h_ = mimg->height();
+        bounds_recorded_ = true;
+        measured_placement_ = measure_placement;
+    }
+
     // The published image: the preview tap when set, the OUTPUT
     // otherwise. The output itself always feeds the Output card's
     // thumbnail (cell key 0) — the preview never touches it.
@@ -3162,9 +3307,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     record_thumb_tap(rec, frame_index,
                      results[static_cast<size_t>(graph.output)], 0);
     out->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (out_source && graph.source >= 0 &&
-        results[static_cast<size_t>(graph.source)]) {
-        GpuImage* ref = results[static_cast<size_t>(graph.source)];
+    if (out_source && graph.before >= 0 &&
+        results[static_cast<size_t>(graph.before)]) {
+        GpuImage* ref = results[static_cast<size_t>(graph.before)];
         ref->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         *out_source = ref;
     }

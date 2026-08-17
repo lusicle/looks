@@ -89,7 +89,7 @@ struct ModSource {
     float attack = 0.02f;     // seconds to peak
     float decay = 0.4f;       // exponential decay constant, seconds
     uint32_t trigger = 0;     // 0 onset, 1 scene cut, 2 beat, 3 keypress
-    // Video sampling (docs/flow_canvas.md): point / centered region on
+    // Video sampling: point / centered region on
     // the CURRENT decoded source frame, uv 0..1. VideoSample ignores the
     // extent (it averages a small fixed box so 8-bit code-value steps
     // don't pop). channel: 0 luma, 1 R, 2 G, 3 B.
@@ -113,7 +113,7 @@ struct ValueNode {
     // the multiplier, not wide sliders:
     //   out = clamp01((a - in_min*m) / ((in_max - in_min)*m))
     float in_min = 0.0f, in_max = 1.0f;
-    // Node-canvas position (docs/flow_canvas.md); (0,0) = unplaced.
+    // Node-canvas position; (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
 };

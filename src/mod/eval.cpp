@@ -104,11 +104,11 @@ float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
     return 0.0f;
 }
 
-// Video sampling (docs/flow_canvas.md). Averages the channel over a
-// decimated tap grid: the point variant uses a small fixed box and the
-// region variant caps its grid, so cost stays bounded and single 8-bit
-// code-value steps get band-averaged instead of popping when a large
-// amount scales them (the CLAUDE.md luma rule).
+// Video sampling. Averages the channel over a decimated tap grid: the
+// point variant uses a small fixed box and the region variant caps its
+// grid, so cost stays bounded and single 8-bit code-value steps get
+// band-averaged instead of popping when downstream shaping magnifies
+// them.
 float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
     if (!video || !video->y || video->width <= 0 || video->height <= 0)
         return 0.0f;

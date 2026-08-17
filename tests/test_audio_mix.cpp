@@ -1,4 +1,4 @@
-// Tree audio mix (docs/look.md phase 4): a look's audio is the sum of its
+// Tree audio mix: a look's audio is the sum of its
 // active clip sources' PCM through their time maps.
 //
 // render_mix is a PURE function of (mix, sample range) - the monitor

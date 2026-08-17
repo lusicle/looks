@@ -73,6 +73,8 @@ struct ButtonOpts {
     bool active = false;
     SizeSpec width;             // default: hug label (min 64; flat: hug+8)
     const char* tooltip = nullptr;   // shown after a hover delay
+    // Right-click report: the app opens its context menu for this row.
+    bool* out_ctx = nullptr;
 };
 
 LayoutNode* Button(LayoutArena& arena, std::string_view label,
@@ -135,7 +137,13 @@ struct SliderOpts {
     // Readout multiplier (display only): degree readouts over radian
     // values. Type-in callers must divide by it on commit.
     float display_scale = 1.0f;
+    // Readout offset, added after the multiplier (display only):
+    // corner-origin pixel readouts over centered-fraction values.
+    // Type-in callers must subtract it before the divide.
+    float display_offset = 0.0f;
     const char* tooltip = nullptr;   // sustained-hover tip (range/default)
+    // Right-click report: the app opens its context menu for this row.
+    bool* out_ctx = nullptr;
 };
 
 LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,

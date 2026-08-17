@@ -75,6 +75,147 @@ TEST(sequence_add_remove_undo) {
     CHECK_EQ(d.sequences.size(), size_t{2});
 }
 
+TEST(sequence_track_commands_undo) {
+    Document d;
+    doc::UndoStack undo;
+    const uint64_t sid = d.sequences[0].id;
+    CHECK_EQ(d.sequence(sid).tracks.size(), size_t{1});
+    const uint64_t v1 = d.sequence(sid).tracks[0].id;
+
+    // Lanes insert at an index (higher composites later) and undo out.
+    doc::SeqTrack lane = doc::make_track(d, d.sequence(sid));
+    const uint64_t v2 = lane.id;
+    undo.execute(d, doc::add_track_command(sid, std::move(lane), 1));
+    CHECK_EQ(d.sequence(sid).tracks.size(), size_t{2});
+    CHECK_EQ(d.sequence(sid).tracks[1].id, v2);
+
+    // A removed lane takes its placements; undo restores both in place.
+    doc::Placement p;
+    p.id = d.next_effect_id++;
+    p.target = d.looks[0].id;
+    p.t_in = 0;
+    p.t_out = 10;
+    undo.execute(d, doc::add_placement_command(sid, v2, p));
+    undo.execute(d, doc::remove_track_command(d, sid, v2));
+    CHECK_EQ(d.sequence(sid).tracks.size(), size_t{1});
+    CHECK_EQ(d.sequence(sid).tracks[0].id, v1);
+    undo.undo(d);
+    CHECK_EQ(d.sequence(sid).tracks.size(), size_t{2});
+    CHECK_EQ(d.sequence(sid).tracks[1].placements.size(), size_t{1});
+
+    // The last video lane refuses removal.
+    undo.execute(d, doc::remove_track_command(d, sid, v2));
+    CHECK(doc::remove_track_command(d, sid, v1) == nullptr);
+
+    // Audio tracks add bare and remove with their placements.
+    CHECK_EQ(d.sequence(sid).audio.size(), size_t{0});
+    doc::AudioTrack at = doc::make_audio_track(d, d.sequence(sid));
+    const uint64_t a1 = at.id;
+    undo.execute(d, doc::add_audio_track_command(sid, std::move(at)));
+    CHECK_EQ(d.sequence(sid).audio.size(), size_t{1});
+    doc::Placement ap;
+    ap.target = d.looks[0].id;
+    ap.t_in = 0;
+    ap.t_out = 10;
+    undo.execute(d, doc::add_audio_placement_command(d, sid, a1, ap, 0));
+    CHECK_EQ(d.sequence(sid).audio[0].placements.size(), size_t{1});
+    undo.execute(d, doc::remove_audio_track_command(sid, a1));
+    CHECK_EQ(d.sequence(sid).audio.size(), size_t{0});
+    undo.undo(d);
+    CHECK_EQ(d.sequence(sid).audio.size(), size_t{1});
+    CHECK_EQ(d.sequence(sid).audio[0].placements.size(), size_t{1});
+}
+
+TEST(sequence_overwrite_claims_span) {
+    Document d;
+    doc::UndoStack undo;
+    const uint64_t sid = d.sequences[0].id;
+    const uint64_t lane = d.sequence(sid).tracks[0].id;
+    const uint64_t target = d.looks[0].id;
+    auto lay = [&](uint32_t t_in, uint32_t t_out) {
+        doc::Placement p;
+        p.id = d.next_effect_id++;
+        p.target = target;
+        p.t_in = t_in;
+        p.t_out = t_out;
+        undo.execute(d, doc::add_placement_command(sid, lane, p));
+        return p.id;
+    };
+
+    // Tail under the newcomer: cut to its start.
+    const uint64_t a = lay(0, 100);
+    const uint64_t b = lay(60, 160);
+    doc::overwrite_lane_span(d, undo, sid, lane, b, 0, 60, 160);
+    CHECK_EQ(doc::find_placement(d.sequence(sid), a)->t_out, uint32_t{60});
+
+    // Newcomer strictly inside: split (razor + head-trim), content holds
+    // still through source_in.
+    const uint64_t c = lay(20, 50);
+    doc::overwrite_lane_span(d, undo, sid, lane, c, 0, 20, 50);
+    CHECK_EQ(doc::find_placement(d.sequence(sid), a)->t_out, uint32_t{20});
+    uint64_t right = 0;
+    for (const doc::Placement& p : d.sequence(sid).tracks[0].placements)
+        if (p.t_in == 50 && p.t_out == 60) right = p.id;
+    CHECK(right != 0);
+    CHECK_EQ(doc::find_placement(d.sequence(sid), right)->source_in,
+             uint32_t{50});
+
+    // One landing that tail-trims, removes whole, and head-trims at once;
+    // a single undo of the group restores all three.
+    const uint64_t e = lay(45, 70);
+    undo.begin_group("Overwrite");
+    doc::overwrite_lane_span(d, undo, sid, lane, e, 0, 45, 70);
+    undo.end_group();
+    CHECK_EQ(doc::find_placement(d.sequence(sid), c)->t_out, uint32_t{45});
+    CHECK(doc::find_placement(d.sequence(sid), right) == nullptr);
+    CHECK_EQ(doc::find_placement(d.sequence(sid), b)->t_in, uint32_t{70});
+    CHECK_EQ(doc::find_placement(d.sequence(sid), b)->source_in,
+             uint32_t{10});
+    undo.undo(d);
+    CHECK(doc::find_placement(d.sequence(sid), right) != nullptr);
+    CHECK_EQ(doc::find_placement(d.sequence(sid), b)->t_in, uint32_t{60});
+    CHECK_EQ(doc::find_placement(d.sequence(sid), c)->t_out, uint32_t{50});
+}
+
+TEST(bin_commands_organise_the_browser) {
+    Document d;
+    doc::UndoStack undo;
+    doc::Bin top = doc::make_bin(d, "top");
+    const uint64_t top_id = top.id;
+    undo.execute(d, doc::add_bin_command(std::move(top)));
+    doc::Bin inner = doc::make_bin(d, "inner");
+    inner.parent = top_id;
+    const uint64_t inner_id = inner.id;
+    undo.execute(d, doc::add_bin_command(std::move(inner)));
+    CHECK_EQ(d.bins.size(), size_t{2});
+
+    // Membership: file the first look inside the inner bin.
+    const uint64_t look_id = d.looks[0].id;
+    undo.execute(d, doc::set_entity_bin_command(look_id, inner_id));
+    CHECK_EQ(d.looks[0].bin, inner_id);
+
+    // The reparent guard walks parents: inner sits under top, never the
+    // other way.
+    CHECK(doc::bin_reaches(d, inner_id, top_id));
+    CHECK(!doc::bin_reaches(d, top_id, inner_id));
+
+    // Deleting a bin lifts its contents to its parent; undo restores.
+    undo.execute(d, doc::remove_bin_command(inner_id));
+    CHECK_EQ(d.bins.size(), size_t{1});
+    CHECK_EQ(d.looks[0].bin, top_id);
+    undo.undo(d);
+    CHECK_EQ(d.bins.size(), size_t{2});
+    CHECK_EQ(d.looks[0].bin, inner_id);
+    undo.redo(d);
+    CHECK_EQ(d.looks[0].bin, top_id);
+
+    // Rename + reparent ride one command; undo restores both.
+    undo.execute(d, doc::set_bin_props_command(top_id, "renamed", 0));
+    CHECK_EQ(d.find_bin(top_id)->name, "renamed");
+    undo.undo(d);
+    CHECK_EQ(d.find_bin(top_id)->name, "top");
+}
+
 TEST(look_commands_stay_on_their_own_look) {
     // A command captures the look it edits: undo must land there no
     // matter what the editing scope moved to afterwards.

@@ -6,6 +6,7 @@
 
 #include "doc/effects.h"
 #include "doc/group_commands.h"
+#include "doc/look_commands.h"
 #include "doc/mod_commands.h"
 #include "doc/preset.h"
 #include "doc/stack_commands.h"
@@ -148,6 +149,65 @@ Document make_rich_doc() {
 }
 
 }  // namespace
+
+TEST(serialize_placement_transform_roundtrip) {
+    Document d;
+    doc::Placement p;
+    p.id = d.next_effect_id++;
+    p.target = d.looks[0].id;
+    p.t_out = 50;
+    p.pos_x = 0.25f;
+    p.pos_y = -0.1f;
+    p.scale = 0.5f;
+    p.rotate = 45.0f;
+    p.opacity = 0.7f;
+    d.sequences[0].tracks[0].placements.push_back(p);
+    json::Value a = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(a);
+    CHECK(doc::doc_to_json(d2) == a);
+    const doc::Placement* q = doc::find_placement(d2.sequences[0], p.id);
+    CHECK(q != nullptr);
+    CHECK_EQ(q->pos_x, 0.25f);
+    CHECK_EQ(q->pos_y, -0.1f);
+    CHECK_EQ(q->scale, 0.5f);
+    CHECK_EQ(q->rotate, 45.0f);
+    CHECK_EQ(q->opacity, 0.7f);
+}
+
+TEST(serialize_bins_roundtrip_and_heal) {
+    Document d;
+    doc::Bin media = doc::make_bin(d, "media");
+    doc::Bin cuts = doc::make_bin(d, "cuts");
+    cuts.parent = media.id;
+    d.bins.push_back(media);
+    d.bins.push_back(cuts);
+    d.looks[0].bin = cuts.id;
+    d.sequences[0].bin = media.id;
+    json::Value a = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(a);
+    json::Value b = doc::doc_to_json(d2);
+    CHECK(a == b);
+    CHECK_EQ(d2.bins.size(), size_t{2});
+    CHECK_EQ(d2.bins[1].parent, media.id);
+    CHECK_EQ(d2.looks[0].bin, cuts.id);
+    CHECK_EQ(d2.sequences[0].bin, media.id);
+
+    // Heals: a dangling membership and a parent loop both fall to root.
+    Document h;
+    doc::Bin a1 = doc::make_bin(h, "a");
+    doc::Bin b1 = doc::make_bin(h, "b");
+    a1.parent = b1.id;
+    b1.parent = a1.id;
+    h.bins.push_back(a1);
+    h.bins.push_back(b1);
+    h.looks[0].bin = 424242;
+    Document h2 = doc::doc_from_json(doc::doc_to_json(h));
+    CHECK_EQ(h2.looks[0].bin, uint64_t{0});
+    bool any_root = false;
+    for (const doc::Bin& bb : h2.bins)
+        if (bb.parent == 0) any_root = true;
+    CHECK(any_root);
+}
 
 TEST(serialize_roundtrip_stable) {
     Document d = make_rich_doc();

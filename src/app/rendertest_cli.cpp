@@ -37,7 +37,7 @@ constexpr uint32_t kWidth = 320;
 constexpr uint32_t kHeight = 240;
 
 // The harness stands in for the decode pool: one clip source, fed under
-// the instance key compile_graph stamps on its Source node (docs/look.md).
+// the instance key compile_graph stamps on its Source node.
 gfx::Engine::LayerSourceFrame clip_frame(const doc::Document& doc,
                                          const gfx::SourcePlanes& planes) {
     gfx::Engine::LayerSourceFrame lf;

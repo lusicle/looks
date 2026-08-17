@@ -120,7 +120,7 @@ TEST(graph_compile_layers) {
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(out.layer_index, 2);
-    // TRUE GRAPH (docs/flow_canvas.md): a clip tap's effects wire like
+    // TRUE GRAPH: a clip tap's effects wire like
     // any node and head at its own source when unlinked.
     for (const GraphNode& n : g.nodes)
         if (n.kind == GraphNode::Kind::Effect && n.layer_index == 2)
@@ -137,7 +137,7 @@ TEST(graph_compile_layers) {
 }
 
 TEST(graph_compile_dormant_unwired) {
-    // v4: an effect with NO in-wire is DORMANT — never emitted, nothing
+    // An effect with NO in-wire is DORMANT — never emitted, nothing
     // fabricated in its place — and an unwired Output composites nothing
     // (black display node, which no effect may consume as input).
     Document doc;
@@ -345,8 +345,8 @@ TEST(graph_effect_matte_diamond) {
 TEST(graph_layer_transform_and_source_keys) {
     // Transform: a non-identity crop/flip/scale/rotate inserts a
     // LayerTransform between the layer source and its stack. Every clip
-    // source is private and keyed per instance (docs/look.md phase 4) —
-    // there is no shared playhead source to fall back to.
+    // source is private and keyed per instance - there is no shared
+    // playhead source to fall back to.
     Document doc;
     doc.looks[0].layers[0].asset = doc.next_effect_id++;
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
@@ -517,6 +517,165 @@ TEST(graph_clip_source_culled_past_its_media) {
     CHECK_EQ(source_count(doc.root_sequence, 4), 1);
     CHECK_EQ(source_count(doc.root_sequence, 7), 1);
     CHECK_EQ(source_count(doc.root_sequence, 8), 0);
+}
+
+TEST(graph_placement_transform_and_opacity) {
+    // Placement Motion is a COMPOSITION attribute: the lane's over-blend
+    // carries the affine and opacity and samples through it while
+    // compositing. No transform node ever appears in a sequence graph -
+    // sequences own no effect passes. A bottom lane with Motion or
+    // reduced opacity blends over transparent black so both are real.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Sequence& seq = doc.root();
+    looks::doc::Placement a;
+    a.id = doc.next_effect_id++;
+    a.target = doc.looks[0].id;
+    a.pos_x = 0.25f;
+    a.scale = 0.5f;
+    a.rotate = 90.0f;
+    a.opacity = 0.6f;
+    seq.tracks[0].placements.push_back(a);
+
+    RenderGraph g = compile_graph(doc, doc.root_sequence, 0);
+    CHECK(g.valid);
+    int blends = 0;
+    for (const GraphNode& n : g.nodes) {
+        CHECK(n.kind != GraphNode::Kind::LayerTransform);
+        if (n.kind == GraphNode::Kind::LayerBlend) {
+            ++blends;
+            CHECK_EQ(n.layer_index, -1);
+            CHECK_EQ(n.p_shift_x, 0.25f);
+            CHECK_EQ(n.p_scale, 0.5f);
+            CHECK(std::fabs(n.p_rotate - 1.5707963f) < 1e-3f);
+            CHECK_EQ(n.p_opacity, 0.6f);
+        }
+    }
+    CHECK_EQ(blends, 1);
+
+    // Identity transform at full opacity compiles to no blend at all.
+    seq.tracks[0].placements[0] = [] {
+        looks::doc::Placement p;
+        return p;
+    }();
+    seq.tracks[0].placements[0].id = doc.next_effect_id++;
+    seq.tracks[0].placements[0].target = doc.looks[0].id;
+    RenderGraph plain = compile_graph(doc, doc.root_sequence, 0);
+    CHECK(plain.valid);
+    for (const GraphNode& n : plain.nodes) {
+        CHECK(n.kind != GraphNode::Kind::LayerTransform);
+        CHECK(n.kind != GraphNode::Kind::LayerBlend);
+    }
+}
+
+TEST(graph_measure_taps_selected_block_pre_motion) {
+    // The measure tap names the selected block's lane image BEFORE its
+    // placement Motion: the monitor's box applies the transform itself,
+    // so the measured bounds must be the untransformed content.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Sequence& seq = doc.root();
+    looks::doc::Placement a;
+    a.id = doc.next_effect_id++;
+    a.target = doc.looks[0].id;
+    a.pos_x = 0.25f;
+    a.scale = 0.5f;
+    seq.tracks[0].placements.push_back(a);
+
+    RenderGraph g = compile_graph(doc, doc.root_sequence, 0, 0, 0, a.id);
+    CHECK(g.valid);
+    CHECK(g.measure >= 0);
+    // Pre-Motion: the tap is not the transform node (which IS the
+    // output here - one lane, full opacity).
+    CHECK(g.nodes[static_cast<size_t>(g.measure)].kind !=
+          GraphNode::Kind::LayerTransform);
+    CHECK(g.measure != g.output);
+
+    // No selection, no tap; an unknown id, no tap.
+    RenderGraph off = compile_graph(doc, doc.root_sequence, 0);
+    CHECK_EQ(off.measure, -1);
+    RenderGraph miss =
+        compile_graph(doc, doc.root_sequence, 0, 0, 0, 0xDEADull);
+    CHECK_EQ(miss.measure, -1);
+}
+
+TEST(graph_before_strips_effects_keeps_composition) {
+    // The A/B "before" is the same composition minus effect stacks:
+    // arrangement, Motion and opacity are composition attributes and
+    // survive the wipe; effects do not.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Posterize));
+    looks::doc::Sequence& seq = doc.root();
+    looks::doc::Placement a;
+    a.id = doc.next_effect_id++;
+    a.target = doc.looks[0].id;
+    a.pos_x = 0.25f;
+    a.scale = 0.5f;
+    seq.tracks[0].placements.push_back(a);
+
+    RenderGraph g =
+        compile_graph(doc, doc.root_sequence, 0, 0, 0, 0, true);
+    CHECK(g.valid);
+    CHECK(g.before >= 0);
+    auto reach = [&](int root, auto&& visit) {
+        std::vector<int> work = {root};
+        std::vector<char> seen(g.nodes.size(), 0);
+        while (!work.empty()) {
+            const int idx = work.back();
+            work.pop_back();
+            if (seen[static_cast<size_t>(idx)]) continue;
+            seen[static_cast<size_t>(idx)] = 1;
+            visit(g.nodes[static_cast<size_t>(idx)]);
+            for (int in : g.nodes[static_cast<size_t>(idx)].inputs)
+                work.push_back(in);
+        }
+    };
+    bool motion = false;
+    reach(g.before, [&](const GraphNode& n) {
+        CHECK(n.kind != GraphNode::Kind::Effect);
+        if (n.kind == GraphNode::Kind::LayerBlend &&
+            n.layer_index == -1 && n.p_scale == 0.5f)
+            motion = true;
+    });
+    CHECK(motion);
+    bool fx = false;
+    reach(g.output, [&](const GraphNode& n) {
+        if (n.kind == GraphNode::Kind::Effect) fx = true;
+    });
+    CHECK(fx);
+    // Default compile carries no before tree.
+    RenderGraph off = compile_graph(doc, doc.root_sequence, 0);
+    CHECK_EQ(off.before, -1);
+}
+
+TEST(graph_source_fit_rect_preserves_aspect) {
+    // Sources never stretch: matching aspects fill exactly (1:1 with
+    // the old normalized sampling), mismatches letterbox/pillarbox
+    // centered, unknown dims fill.
+    float r[4];
+    looks::gfx::source_fit_rect(1920, 1080, 1920, 1080, r);
+    CHECK_EQ(r[0], 0.0f);
+    CHECK_EQ(r[1], 0.0f);
+    CHECK_EQ(r[2], 1920.0f);
+    CHECK_EQ(r[3], 1080.0f);
+
+    looks::gfx::source_fit_rect(1920, 1080, 1080, 1080, r);   // wide in square
+    CHECK_EQ(r[0], 0.0f);
+    CHECK(std::fabs(r[2] - 1080.0f) < 1e-3f);
+    CHECK(std::fabs(r[3] - 607.5f) < 1e-3f);
+    CHECK(std::fabs(r[1] - (1080.0f - 607.5f) * 0.5f) < 1e-3f);
+
+    looks::gfx::source_fit_rect(1080, 1920, 1920, 1080, r);   // tall in wide
+    CHECK_EQ(r[1], 0.0f);
+    CHECK(std::fabs(r[3] - 1080.0f) < 1e-3f);
+    CHECK(std::fabs(r[2] - 1080.0f * 1080.0f / 1920.0f) < 1e-3f);
+    CHECK(std::fabs(r[0] - (1920.0f - r[2]) * 0.5f) < 1e-3f);
+
+    looks::gfx::source_fit_rect(0, 0, 640, 480, r);           // unknown dims
+    CHECK_EQ(r[2], 640.0f);
+    CHECK_EQ(r[3], 480.0f);
 }
 
 TEST(graph_sequence_lanes_stack_alpha_over) {

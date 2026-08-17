@@ -1,11 +1,18 @@
 // I420 planes to linear RGB, BT.709 limited range. The transfer is
 // decoded with the sRGB EOTF, which stands in for BT.709 camera gamma.
+// The source lands in its aspect-preserving fit rect (rect origin +
+// reciprocal size, output pixels); outside it the target is transparent
+// black - sources never stretch to the canvas.
 
 [[vk::push_constant]]
 cbuffer Push
 {
     uint width;
     uint height;
+    float rect_x;
+    float rect_y;
+    float inv_fit_w;
+    float inv_fit_h;
 };
 
 [[vk::binding(0, 0)]] Sampler2D plane_y;
@@ -26,7 +33,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= width || tid.y >= height)
         return;
-    const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
+    const float2 uv = (float2(tid.xy) + 0.5 - float2(rect_x, rect_y))
+                    * float2(inv_fit_w, inv_fit_h);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+    {
+        output[tid.xy] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
 
     const float y = plane_y.SampleLevel(uv, 0).r;
     const float cb = plane_u.SampleLevel(uv, 0).r;

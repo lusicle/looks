@@ -45,8 +45,8 @@ std::unique_ptr<Command> move_effect_command(uint64_t look, size_t layer_index,
                                              size_t from_index,
                                              size_t to_index);
 
-// Node-canvas placement (docs/flow_canvas.md): one command moves any node
-// kind, addressed by document id. Consecutive moves of the same node
+// Node-canvas placement: one command moves any node kind, addressed by
+// document id. Consecutive moves of the same node
 // coalesce so a whole drag is one undo step. Positions are pure UI state
 // on the document — the renderer never reads them.
 enum class NodeRef : uint32_t {
@@ -56,15 +56,16 @@ enum class NodeRef : uint32_t {
 std::unique_ptr<Command> set_node_pos_command(uint64_t look, NodeRef kind,
                                               uint64_t id, float x, float y);
 
-// TRUE GRAPH link edits (docs/flow_canvas.md). Both materialize the
-// synthesized legacy links on first edit, so the table becomes the single
-// topology truth from then on. connect replaces any existing link at
+// TRUE GRAPH link edits. An empty link table means implicit stack-order
+// chain wiring; both materialize that synthesis on first edit, so the
+// table becomes the single topology truth. connect replaces any existing
+// link at
 // (to, port) — except the Output node (to 0), which accepts any number of
 // composite inputs. Callers validate with link_would_cycle FIRST; the
 // commands themselves apply unconditionally.
 std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link);
 std::unique_ptr<Command> disconnect_command(uint64_t look, NodeLink link);
-// Freeze the synthesized legacy wiring: run before ANY node add so
+// Freeze the implicit stack-order wiring: run before ANY node add so
 // the newborn spawns unwired instead of being chained in by stack-order
 // synthesis. No-op when links are already materialized (or no layers).
 std::unique_ptr<Command> materialize_links_command(uint64_t look);
@@ -73,7 +74,7 @@ std::unique_ptr<Command> materialize_links_command(uint64_t look);
 // through the (effective) link table. The texed reachability guard.
 bool link_would_cycle(const Look& look, uint64_t from, uint64_t to);
 
-// Canvas frames (docs/flow_canvas.md): titled grouping boxes.
+// Canvas frames: titled grouping boxes.
 std::unique_ptr<Command> add_frame_command(uint64_t look, CanvasFrame frame);
 std::unique_ptr<Command> remove_frame_command(uint64_t look,
                                               uint64_t frame_id);
