@@ -16,6 +16,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "doc/document.h"
@@ -38,6 +40,20 @@ struct AnalysisCurves {
     }
 };
 
+// Runtime analysis for audio-driven nodes (ValueNode.audio_src): curves
+// computed from the wired chain's PROCESSED audio, media-frame indexed;
+// slip + offset (Offset shims on the chain) map the look clock onto the
+// curve. Keyed by value-node id (ids are globally unique). The input is
+// REQUIRED: an unwired node or a wire with no entry reads 0 - never the
+// global curves. Beat/LfoBeat clocks anchor on the same media position,
+// so cuts of one media beat-match by construction.
+struct NodeAudio {
+    std::shared_ptr<const AnalysisCurves> curves;
+    uint32_t slip = 0;
+    int64_t offset = 0;
+};
+using NodeAudioMap = std::unordered_map<uint64_t, NodeAudio>;
+
 // CPU view of the decoded source frame (I420) for the video-sampling
 // sources (sample-at-point / region-average).
 // Callers pass the SAME frame they are about to render, so preview and
@@ -57,8 +73,8 @@ struct SourceFrameView {
 // fps feeds the envelope's frame->seconds conversion and the BPM-synced
 // LFO's fallback clock; sources that don't need it ignore it.
 // audio_offset_seconds (nudge): shifts every audio-derived source
-// (bands, onsets, beat, BPM clocks) against video — positive = audio
-// later. key_time: seconds of the last live keypress trigger (-1 = none;
+// (beat/BPM clocks, envelope onset triggers, wired analysis nodes)
+// against video — positive = audio later. key_time: seconds of the last live keypress trigger (-1 = none;
 // live mode only, exempts it). video: the current source frame
 // for VideoSample/VideoRegion; those sources read 0 without it — notably
 // on the speed target, where the sampled frame would itself depend on
@@ -80,6 +96,7 @@ struct ValueEnv {
     double audio_off = 0.0;
     double key_time = -1.0;
     const SourceFrameView* video = nullptr;
+    const NodeAudioMap* node_audio = nullptr;
 };
 
 // One value node's output at the env's frame: generators via
@@ -102,7 +119,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                   uint32_t local_frame, double fps,
                   const AnalysisCurves* analysis, double audio_off,
                   double live_seconds = -1.0, double key_time = -1.0,
-                  const SourceFrameView* video = nullptr);
+                  const SourceFrameView* video = nullptr,
+                  const NodeAudioMap* node_audio = nullptr);
 
 // Bakes modulation into a document copy for one frame. live_seconds >= 0
 // switches LFO/drift onto that clock instead of frame/fps (live mode,
@@ -111,7 +129,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
 doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
                       double live_seconds = -1.0, double key_time = -1.0,
-                      const SourceFrameView* video = nullptr);
+                      const SourceFrameView* video = nullptr,
+                      const NodeAudioMap* node_audio = nullptr);
 
 // Playback speed of the root timeline: the project scalar, clamped to
 // [0, doc::kMaxSpeed]. Sequences carry no keyframes or routes; ramps
@@ -127,8 +146,8 @@ bool time_remap_active(const doc::Document& doc);
 // t is the prefix sum of speed over frames [0, t) — fixed timestep on the
 // frame index, identical in preview and export. Incremental during
 // sequential playback; a backward seek recomputes the prefix from zero.
-// Forward wraps around the clip, reverse runs from the end, ping-pong
-// folds over the clip; a 1x forward document is the identity mapping.
+// Forward wraps around the media, reverse runs from the end, ping-pong
+// folds over the media; a 1x forward document is the identity mapping.
 struct TimeRemap {
     double position = 0.0;
     uint32_t next_frame = 0;   // frame the accumulated position belongs to

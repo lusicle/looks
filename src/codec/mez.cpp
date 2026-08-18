@@ -497,8 +497,16 @@ bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
 // ------------------------------------------------------------ MezWriter
 
 MezWriter::~MezWriter() {
-    if (file_ && !finished_) finish();
+    // An unfinished writer is an ABORTED import (cancel, error,
+    // teardown). Never seal it: a partial mez with a patched header
+    // reads as a valid SHORTER clip and poisons the bundle cache -
+    // close and remove the file so nothing can trust it.
+    const bool partial = file_ && !finished_;
     if (file_) std::fclose(static_cast<FILE*>(file_));
+    if (partial) {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
 }
 
 bool MezWriter::open(const std::filesystem::path& path, uint32_t width,
@@ -507,6 +515,7 @@ bool MezWriter::open(const std::filesystem::path& path, uint32_t width,
     FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) return false;
     file_ = f;
+    path_ = path;
     width_ = width;
     height_ = height;
     quality_ = quality;
@@ -566,6 +575,22 @@ bool MezWriter::finish() {
     if (std::fwrite(patch, 1, 8, f) != 8) return false;
     std::fflush(f);
     finished_ = true;
+    return true;
+}
+
+bool mez_probe(const std::filesystem::path& path, uint32_t* frames,
+               double* fps) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    uint8_t header[kHeaderSize];
+    const bool ok = std::fread(header, 1, kHeaderSize, f) == kHeaderSize &&
+                    get_u32(header + 0) == kMagic;
+    std::fclose(f);
+    if (!ok) return false;
+    const uint32_t fd = get_u32(header + 24);
+    if (frames) *frames = get_u32(header + 16);
+    if (fps)
+        *fps = fd ? static_cast<double>(get_u32(header + 20)) / fd : 0.0;
     return true;
 }
 

@@ -91,7 +91,7 @@ public:
     // Appends a pre-encoded frame payload (parallel import encodes on
     // worker threads and serializes through this).
     bool add_encoded_frame(const std::vector<uint8_t>& payload);
-    // Still-image clips: appends `count` index entries pointing at the
+    // Still-image media: appends `count` index entries pointing at the
     // LAST written frame's payload — N timeline frames for one frame of
     // storage. The reader can't tell the difference.
     bool add_hold_frames(size_t count);
@@ -102,6 +102,7 @@ public:
 
 private:
     void* file_ = nullptr;
+    std::filesystem::path path_;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     int quality_ = 90;
@@ -110,9 +111,15 @@ private:
     bool finished_ = false;
 };
 
-// Rewrites the frame index in place so the clip runs `count` frames:
+// Header-only probe: frame count and fps without touching the index
+// (44 bytes read). The bundle completeness gate keys on this. False =
+// unreadable or not a mez.
+bool mez_probe(const std::filesystem::path& path, uint32_t* frames,
+               double* fps);
+
+// Rewrites the frame index in place so the media runs `count` frames:
 // entries past the old count repeat the last surviving frame's payload
-// (the add_hold_frames trick, applied after the fact). Still-image clips
+// (the add_hold_frames trick, applied after the fact). Still-image media
 // use this to change their timeline duration without re-encoding. The
 // file must not be open in a writer; readers holding the old index keep
 // working (decode bounds-checks) but see the old length until reopened.

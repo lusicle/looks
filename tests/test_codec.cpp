@@ -275,6 +275,35 @@ TEST(codec_mez_file_roundtrip) {
     std::filesystem::remove(path);
 }
 
+TEST(codec_mez_partial_writer_removes_its_file) {
+    // An unfinished writer is an aborted import: the destructor must
+    // DELETE the partial, never seal it - a sealed partial reads as a
+    // valid shorter clip and poisons the bundle cache.
+    const auto path =
+        std::filesystem::temp_directory_path() / "looks_partial.mez";
+    {
+        MezWriter writer;
+        CHECK(writer.open(path, 96, 64, 30000, 1001, 88));
+        CHECK(writer.add_frame(make_test_frame(96, 64, 3).view()));
+        // No finish(): simulated cancel/error path.
+    }
+    CHECK(!std::filesystem::exists(path));
+
+    // mez_probe reads the header without touching the index.
+    {
+        MezWriter writer;
+        CHECK(writer.open(path, 96, 64, 30000, 1001, 88));
+        CHECK(writer.add_frame(make_test_frame(96, 64, 3).view()));
+        CHECK(writer.finish());
+    }
+    uint32_t frames = 0;
+    double fps = 0.0;
+    CHECK(mez_probe(path, &frames, &fps));
+    CHECK_EQ(frames, 1u);
+    CHECK(fps > 29.0 && fps < 30.5);
+    std::filesystem::remove(path);
+}
+
 TEST(codec_mez_set_frame_count) {
     const auto path =
         std::filesystem::temp_directory_path() / "looks_test_dur.mez";

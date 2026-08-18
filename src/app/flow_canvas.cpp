@@ -289,9 +289,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (!a || !b) return false;
         *p0 = port_out(*a);
         const bool row_end =
-            w.kind == 2 && w.to_row >= 0 && w.to_row < b->row_count;
-        *p3 = w.kind == 1 ? port_matte(*b)
-            : w.kind == 3 ? port_aux(*b)
+            w.data && w.to_row >= 0 && w.to_row < b->row_count;
+        *p3 = !w.data && w.to_port == 1 ? port_matte(*b)
+            : !w.data && w.to_port == 2 ? port_aux(*b)
             : row_end     ? row_anchor(*b, w.to_row)
                           : port_in(*b);
         return true;
@@ -493,18 +493,18 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         // Wire under the cursor → the added node splices into it.
         float best = 10.0f * 10.0f;
         for (size_t w = 0; w < g.wire_count; ++w) {
-            if (g.wires[w].kind != 0 && g.wires[w].kind != 3) continue;
+            if (g.wires[w].data || g.wires[w].to_port == 1) continue;
             const Node* a = find_node(g.wires[w].from);
             const Node* b = find_node(g.wires[w].to);
             if (!a || !b) continue;
-            const Vec2 p3 = g.wires[w].kind == 3 ? port_aux(*b)
+            const Vec2 p3 = g.wires[w].to_port == 2 ? port_aux(*b)
                                                  : port_in(*b);
             const float d = wire_near(port_out(*a), p3);
             if (d < best) {
                 best = d;
                 st.splice_from = g.wires[w].from;
                 st.splice_to = g.wires[w].to;
-                st.splice_port = g.wires[w].kind == 3 ? 2 : 0;
+                st.splice_port = g.wires[w].to_port;
             }
         }
         out.add_menu_opened = true;
@@ -694,11 +694,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             // Input ports: a FED port picks its wire up (rewire, texed
             // pick-up-from-source); an EMPTY one extends a new wire whose
             // fixed end is the input, seeking an Out port (kind 8).
-            auto grab_input = [&](Vec2 p, uint8_t wire_kind,
+            auto grab_input = [&](Vec2 p,
                                   uint32_t port) {
                 if (!near2(p, 81.0f)) return;
                 for (size_t w = 0; w < g.wire_count; ++w)
-                    if (g.wires[w].kind == wire_kind &&
+                    if (!g.wires[w].data &&
+                        g.wires[w].to_port == port &&
                         g.wires[w].to == nd.id) {
                         st.drag_kind = 5;
                         st.wire_from = g.wires[w].from;
@@ -715,11 +716,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 frame.ctx.set_capture(wid);
                 port_handled = true;
             };
-            if (!port_handled && nd.has_in) grab_input(port_in(nd), 0, 0);
+            if (!port_handled && nd.has_in) grab_input(port_in(nd), 0);
             if (!port_handled && nd.has_matte_port)
-                grab_input(port_matte(nd), 1, 1);
+                grab_input(port_matte(nd), 1);
             if (!port_handled && nd.has_aux_port)
-                grab_input(port_aux(nd), 3, 2);
+                grab_input(port_aux(nd), 2);
         }
         if (!port_handled && hover_i >= 0) {
             const Node& nd = g.nodes[static_cast<size_t>(hover_i)];
@@ -928,14 +929,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 g.multi_count <= 1) {
                 bool fed = false;
                 for (size_t w = 0; w < g.wire_count; ++w)
-                    fed = fed || ((g.wires[w].kind == 0 ||
-                                   g.wires[w].kind == 3) &&
+                    fed = fed || ((!g.wires[w].data && (g.wires[w].to_port == 0 ||
+                                   g.wires[w].to_port == 2)) &&
                                   g.wires[w].to == dn->id);
                 if (!fed) {
                     float best = 12.0f * 12.0f;
                     for (size_t w = 0; w < g.wire_count; ++w) {
                         const Wire& wr = g.wires[w];
-                        if (wr.kind != 0 && wr.kind != 3) continue;
+                        if (wr.data || wr.to_port == 1) continue;
                         if (wr.from == dn->id || wr.to == dn->id)
                             continue;
                         Vec2 p0, p3;
@@ -946,7 +947,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                             st.drag_splice_from = wr.from;
                             st.drag_splice_to = wr.to;
                             st.drag_splice_port =
-                                wr.kind == 3 ? 2u : 0u;
+                                wr.to_port;
                         }
                     }
                 }
@@ -1143,7 +1144,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         (frame.input.mods & platform::kModShift) != 0;
                     out.wire_from = g.wires[hit].from;
                     out.wire_to = g.wires[hit].to;
-                    out.wire_kind = g.wires[hit].kind;
+                    out.wire_to_port = g.wires[hit].to_port;
+                    out.wire_data = g.wires[hit].data;
                     out.wire_to_row = g.wires[hit].to_row;
                     st.last_click_id = 1;   // wire marker, not empty
                 } else {
@@ -1270,26 +1272,25 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const Node* b = find_node(g.wires[w].to);
         if (!a || !b) continue;
         const Vec2 p0 = port_out(*a);
-        const bool row_end = g.wires[w].kind == 2 &&
+        const bool row_end = g.wires[w].data &&
                              g.wires[w].to_row >= 0 &&
                              g.wires[w].to_row < b->row_count;
-        const Vec2 p3 = g.wires[w].kind == 1
+        const Vec2 p3 = !g.wires[w].data && g.wires[w].to_port == 1
             ? port_matte(*b)
-            : (g.wires[w].kind == 3
+            : (!g.wires[w].data && g.wires[w].to_port == 2
                    ? port_aux(*b)
                    : (row_end ? row_anchor(*b, g.wires[w].to_row)
                               : port_in(*b)));
         const bool hot = st.hover == a->id || st.hover == b->id ||
                          g.selected == a->id || g.selected == b->id;
+        // TWO families only: MEDIA (chain/matte/aux/audio - one generic
+        // solid style, whatever the port) and DATA (the value graph,
+        // dashed dim). Selection alone wears the accent.
         Color col = theme.text_disabled.with_alpha(0.7f);
         bool dashed = false;
-        if (g.wires[w].kind == 1) {
-            col = hot ? theme.accent_dim
-                      : theme.accent_dim.with_alpha(0.45f);
-            dashed = true;
-        } else if (g.wires[w].kind == 2) {
-            col = hot ? theme.accent_dim
-                      : theme.accent_dim.with_alpha(0.28f);
+        if (g.wires[w].data) {
+            col = hot ? theme.text_dim
+                      : theme.text_disabled.with_alpha(0.4f);
             dashed = true;
         } else if (hot) {
             col = theme.text_dim;
@@ -1297,14 +1298,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         for (size_t sw = 0; sw < g.sel_wire_count; ++sw)
             if (g.sel_wires[sw].from == g.wires[w].from &&
                 g.sel_wires[sw].to == g.wires[w].to &&
-                g.sel_wires[sw].kind == g.wires[w].kind &&
+                g.sel_wires[sw].data == g.wires[w].data &&
+                g.sel_wires[sw].to_port == g.wires[w].to_port &&
                 (g.sel_wires[sw].to_row < 0 ||
                  g.sel_wires[sw].to_row == g.wires[w].to_row))
                 col = theme.accent;
-        if (st.drag_kind == 1 && st.drag_splice_to &&
+        // Armed splice target under the drag: exactly the ONE wire the
+        // drop will cut - same endpoints AND same port (image and audio
+        // wires share endpoints on the Output), never a data wire.
+        if (st.drag_kind == 1 && st.drag_splice_to && !g.wires[w].data &&
             g.wires[w].from == st.drag_splice_from &&
-            g.wires[w].to == st.drag_splice_to)
-            col = theme.accent;   // armed splice target under the drag
+            g.wires[w].to == st.drag_splice_to &&
+            g.wires[w].to_port == st.drag_splice_port)
+            col = theme.accent;
         draw_wire(canvas, p0, p3, std::max(2.0f, 2.0f * z), col, dashed);
         if (row_end) {
             const float dr = 2.6f * z;
@@ -1690,9 +1696,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 const Wire& wr = g.wires[w];
                 if (wr.from == nd.id) out_fed = true;
                 if (wr.to != nd.id) continue;
-                if (wr.kind == 0) in_fed = true;
-                else if (wr.kind == 1) matte_fed = true;
-                else if (wr.kind == 3) aux_fed = true;
+                if (wr.data) continue;
+                if (wr.to_port == 0) in_fed = true;
+                else if (wr.to_port == 1) matte_fed = true;
+                else if (wr.to_port == 2) aux_fed = true;
             }
             auto draw_port = [&](Vec2 c, Color col, bool fed) {
                 const Color pc = near2(c, 100.0f) ? theme.accent : col;
@@ -1711,7 +1718,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                       out_fed);
             if (nd.has_matte_port) {
                 draw_port(port_matte(nd), theme.accent_dim, matte_fed);
-                ui::draw_text(canvas, frame.font, "matte",
+                ui::draw_text(canvas, frame.font,
+                              nd.matte_label ? nd.matte_label : "matte",
                               {cr.x + 8.0f * z,
                                port_matte(nd).y - rs * 0.5f},
                               rs * 0.9f, theme.text_disabled);

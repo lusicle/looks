@@ -68,7 +68,7 @@ TEST(graph_topo_detects_cycle) {
 }
 
 TEST(graph_compile_empty_stack) {
-    // A fresh look holds one UNBOUND clip node: dormant, so the
+    // A fresh look holds one UNBOUND media node: dormant, so the
     // composite is the black display generator - never a fabricated
     // source. Binding an asset (even one the document does not know:
     // unknown length = always on) emits the Source head.
@@ -86,6 +86,28 @@ TEST(graph_compile_empty_stack) {
           GraphNode::Kind::Source);
 }
 
+TEST(graph_audio_effects_compile_out_of_the_image_graph) {
+    // Audio modifiers are image-identity: the compiler routes the image
+    // graph around them like bypassed nodes, so the video effect behind
+    // one heads straight at the source.
+    Document doc;
+    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::AudioDelay));
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Posterize));
+    RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
+    CHECK(g.valid);
+    int effects = 0;
+    for (const GraphNode& n : g.nodes)
+        if (n.kind == GraphNode::Kind::Effect) {
+            ++effects;
+            CHECK(g.nodes[static_cast<size_t>(n.inputs[0])].kind ==
+                  GraphNode::Kind::Source);
+        }
+    CHECK_EQ(effects, 1);   // posterize only - the delay never dispatches
+}
+
 TEST(graph_compile_layers) {
     Document doc;
     doc.looks[0].layers[0].asset = doc.next_effect_id++;
@@ -97,12 +119,12 @@ TEST(graph_compile_layers) {
     overlay.blend = looks::doc::BlendMode::Screen;
     overlay.stack.push_back(make_effect(doc, EffectType::Pixelate));
     doc.looks[0].layers.push_back(overlay);
-    // A second clip tap on top applying grain to the composite (the
-    // adjustment kind died with the flat graph - a clip tap merged back
+    // A second media tap on top applying grain to the composite (the
+    // adjustment kind died with the flat graph - a media tap merged back
     // IS an adjustment).
     looks::doc::Layer adjust;
     adjust.id = doc.next_effect_id++;
-    adjust.source = looks::doc::LayerSourceKind::Clip;
+    adjust.source = looks::doc::LayerSourceKind::Media;
     adjust.asset = doc.next_effect_id++;
     adjust.stack.push_back(make_effect(doc, EffectType::Grain));
     doc.looks[0].layers.push_back(adjust);
@@ -120,7 +142,7 @@ TEST(graph_compile_layers) {
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(out.layer_index, 2);
-    // TRUE GRAPH: a clip tap's effects wire like
+    // TRUE GRAPH: a media tap's effects wire like
     // any node and head at its own source when unlinked.
     for (const GraphNode& n : g.nodes)
         if (n.kind == GraphNode::Kind::Effect && n.layer_index == 2)
@@ -344,7 +366,7 @@ TEST(graph_effect_matte_diamond) {
 
 TEST(graph_layer_transform_and_source_keys) {
     // Transform: a non-identity crop/flip/scale/rotate inserts a
-    // LayerTransform between the layer source and its stack. Every clip
+    // LayerTransform between the layer source and its stack. Every media
     // source is private and keyed per instance - there is no shared
     // playhead source to fall back to.
     Document doc;
@@ -479,8 +501,8 @@ TEST(graph_generator_has_no_when_but_a_placed_look_does) {
     CHECK_EQ(gen_count(doc.root_sequence, 8), 0);
 }
 
-TEST(graph_clip_source_culled_past_its_media) {
-    // A clip node plays its media in lockstep from local 0: past the
+TEST(graph_media_source_culled_past_its_media) {
+    // A media node plays its media in lockstep from local 0: past the
     // media (through slip) the layer is a closed gate. On the sequence,
     // a block's own window culls the whole look outside it.
     Document doc;

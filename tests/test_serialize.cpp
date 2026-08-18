@@ -24,14 +24,14 @@ namespace {
 Document make_rich_doc() {
     Document d;
     d.name = "rich";
-    doc::Asset clip;
-    clip.id = d.next_effect_id++;
-    clip.name = "test.mp4";
-    clip.path = "C:/clips/test.mp4";
-    clip.still_duration_frames = 900;
-    clip.frame_count = 1200;
-    d.assets.push_back(clip);
-    d.looks[0].layers[0].asset = clip.id;
+    doc::Asset media;
+    media.id = d.next_effect_id++;
+    media.name = "test.mp4";
+    media.path = "C:/clips/test.mp4";
+    media.still_duration_frames = 900;
+    media.frame_count = 1200;
+    d.assets.push_back(media);
+    d.looks[0].layers[0].asset = media.id;
     d.looks[0].layers[0].slip = 12;
     d.master_seed = 1234;
     d.cache_mb = 512;
@@ -207,6 +207,54 @@ TEST(serialize_bins_roundtrip_and_heal) {
     for (const doc::Bin& bb : h2.bins)
         if (bb.parent == 0) any_root = true;
     CHECK(any_root);
+}
+
+TEST(serialize_audio_voice_roundtrip) {
+    // The Output routing flag, audio-modifier effects, the Offset shim
+    // and the media node's timeline lock survive the trip; defaults
+    // stay absent from the JSON.
+    Document d;
+    d.looks[0].audio_split = true;
+    d.looks[0].layers[0].asset = d.next_effect_id++;
+    d.looks[0].layers[0].timeline_lock = true;
+    d.looks[0].layers[0].stack.push_back(
+        make_effect(d, EffectType::AudioFilter));
+    d.looks[0].layers[0].stack[0].params[0] = 0.25f;
+    d.looks[0].layers[0].stack.push_back(
+        make_effect(d, EffectType::Offset));
+    d.looks[0].layers[0].stack[1].params[0] = -24.0f;
+    d.looks[0].layers[0].stack[1].params[1] = 1.0f;
+    d.looks[0].links.push_back({d.looks[0].layers[0].id, 0, 1});
+    doc::ValueNode vn;
+    vn.id = d.next_route_id++;
+    vn.source.type = doc::ModSourceType::AudioHigh;
+    vn.audio_src = d.looks[0].layers[0].id;
+    d.looks[0].value_nodes.push_back(vn);
+
+    json::Value a = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(a);
+    json::Value b = doc::doc_to_json(d2);
+    CHECK(a == b);
+    CHECK(d2.looks[0].audio_split);
+    CHECK(d2.looks[0].layers[0].timeline_lock);
+    CHECK(d2.looks[0].layers[0].stack[0].type == EffectType::AudioFilter);
+    CHECK_EQ(d2.looks[0].layers[0].stack[0].params[0], 0.25f);
+    CHECK(d2.looks[0].layers[0].stack[1].type == EffectType::Offset);
+    CHECK_EQ(doc::offset_frames(d2.looks[0].layers[0].stack[1]),
+             int64_t{-24});
+    CHECK(doc::offset_targets_audio(d2.looks[0].layers[0].stack[1]));
+    CHECK(!doc::offset_targets_video(d2.looks[0].layers[0].stack[1]));
+    CHECK_EQ(d2.looks[0].links.back().to, uint64_t{0});
+    CHECK_EQ(d2.looks[0].links.back().to_port, uint32_t{1});
+    CHECK_EQ(d2.looks[0].value_nodes[0].audio_src,
+             d2.looks[0].layers[0].id);
+
+    Document plain;
+    CHECK(!doc::doc_from_json(doc::doc_to_json(plain)).looks[0].audio_split);
+    CHECK(!doc::doc_from_json(doc::doc_to_json(plain))
+               .looks[0]
+               .layers[0]
+               .timeline_lock);
 }
 
 TEST(serialize_roundtrip_stable) {

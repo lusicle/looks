@@ -50,7 +50,7 @@ public:
     // timeline_frame/fps feed the deterministic per-frame randomness and
     // clocked effects (fixed timestep on frame index).
 
-    // Clip sources: EVERY placement decodes its own frame - there is no
+    // Media sources: EVERY placement decodes its own frame - there is no
     // shared playhead frame. The caller's decode
     // pool maps each placement to its source frame and keeps the planes
     // alive through render(); a key with no entry renders black.
@@ -74,10 +74,10 @@ public:
     // (doc::document_uses_history) or determinism is not frame-indexed
     // (live mode) — the engine does not re-check.
     // out_source (A/B wipe / bypass-all): when non-null, receives
-    // the converted linear-RGB REFERENCE source — the first clip source
+    // the converted linear-RGB REFERENCE source — the first media source
     // playing in the rendered look (kept alive alongside the final target,
     // SHADER_READ_ONLY) — or nullptr when unavailable (cache hit, or a
-    // look with no clip playing). Callers comparing A/B pass cache_ctx 0.
+    // look with no media playing). Callers comparing A/B pass cache_ctx 0.
     // preview_node: publish the named node's output instead of
     // the composite (selection-follows preview). preview_layer: publish
     // the named LAYER's whole contribution (chain end, pre-blend);
@@ -86,7 +86,7 @@ public:
     // root_id names which entity renders: the scoped sequence or look in
     // preview, the exported sequence in export.
     // canvas_w/canvas_h are the PROJECT's working resolution
-    // (doc::canvas_size) — the clip under the playhead never decides it.
+    // (doc::canvas_size) — the media under the playhead never decides it.
     // measure_placement: root-sequence block whose pre-Motion lane image
     // gets the alpha-bounds reduction (read_measure_bounds after the
     // fence). Preview-only - it bypasses the render cache LOOKUP so the
@@ -171,7 +171,7 @@ private:
     // reference is still the same source (sequential playback/export); a
     // seek or a cut yields zero flow for one frame.
     std::unique_ptr<GpuImage> prev_y_;
-    // Flat-black stand-in when the look holds no clip source at all.
+    // Flat-black stand-in when the look holds no media source at all.
     std::unique_ptr<GpuImage> dummy_y_;
     uint64_t last_ref_key_ = 0;
     uint32_t last_timeline_frame_ = 0;

@@ -1,5 +1,5 @@
 // Determinism harness: same project + seeds => identical frames.
-// Renders a deterministic synthetic clip through the full GPU path (upload
+// Renders a deterministic synthetic media through the full GPU path (upload
 // -> YCbCr->linear -> effect chain -> NV12 readback) TWICE with independent
 // Engine/readback instances and compares per-frame FNV-1a hashes. With
 // --export it additionally drives the offline export pipeline (encoder MFT
@@ -36,12 +36,12 @@ using namespace looks;
 constexpr uint32_t kWidth = 320;
 constexpr uint32_t kHeight = 240;
 
-// The harness stands in for the decode pool: one clip source, fed under
+// The harness stands in for the decode pool: one media source, fed under
 // the instance key compile_graph stamps on its Source node.
-gfx::Engine::LayerSourceFrame clip_frame(const doc::Document& doc,
+gfx::Engine::LayerSourceFrame media_frame(const doc::Document& doc,
                                          const gfx::SourcePlanes& planes) {
     gfx::Engine::LayerSourceFrame lf;
-    // Rendering the look directly: path = look id, and the clip node's
+    // Rendering the look directly: path = look id, and the media node's
     // asset folds into the Source key.
     lf.key = hash_combine(
         hash_combine(doc.looks[0].id, doc.looks[0].layers[0].id),
@@ -105,7 +105,7 @@ uint64_t fnv1a(const uint8_t* data, size_t size) {
 doc::Document make_document() {
     doc::Document doc;
     doc.master_seed = 1234;
-    // The clip node binds a synthetic asset id (no Asset entry: unknown
+    // The media node binds a synthetic asset id (no Asset entry: unknown
     // length = always on); the harness feeds its planes under the key.
     doc.looks[0].layers[0].asset = doc.next_effect_id++;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
@@ -259,14 +259,14 @@ bool cache_coherence_check(gfx::Device& device,
     std::vector<uint8_t> nv12;
     std::vector<uint64_t> miss_hashes, hit_hashes;
     for (uint32_t f = 0; f < frames; ++f) {
-        const auto lf = clip_frame(doc, source.planes(f));
+        const auto lf = media_frame(doc, source.planes(f));
         if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0, kWidth,
                               kHeight, nv12, ctx, f, &lf, 1))
             return false;
         miss_hashes.push_back(fnv1a(nv12.data(), nv12.size()));
     }
     for (uint32_t f = 0; f < frames; ++f) {
-        const auto lf = clip_frame(doc, source.planes(f));
+        const auto lf = media_frame(doc, source.planes(f));
         if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0, kWidth,
                               kHeight, nv12, ctx, f, &lf, 1))
             return false;
@@ -312,7 +312,7 @@ bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
     std::vector<uint8_t> nv12;
     hashes.clear();
     for (uint32_t f = 0; f < frames; ++f) {
-        const auto lf = clip_frame(doc, source.planes(f));
+        const auto lf = media_frame(doc, source.planes(f));
         if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0, kWidth,
                               kHeight, nv12, 0, f, &lf, 1)) {
             std::fprintf(stderr, "render failed at frame %u\n", f);
@@ -400,7 +400,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
         doc.canvas_h = source.h;
         std::vector<uint8_t> nv12;
         for (uint32_t f = 0; f < 60; ++f) {
-            const auto lf = clip_frame(doc, source.planes(f));
+            const auto lf = media_frame(doc, source.planes(f));
             if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
                                   source.w, source.h, nv12, 0, f, &lf, 1)) {
                 std::fprintf(stderr, "bench: warmup render failed\n");
@@ -443,7 +443,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
             // Pattern generation stays OUTSIDE the timed window: it is
             // several ms of single-threaded CPU work that would otherwise
             // flatten every GPU effect onto one harness floor.
-            const auto lf = clip_frame(doc, source.planes(f));
+            const auto lf = media_frame(doc, source.planes(f));
             const auto t0 = std::chrono::steady_clock::now();
             if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
                                   source.w, source.h, nv12, 0, f, &lf, 1)) {
@@ -540,7 +540,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!engine || !readback) return 1;
         SyntheticSource source;
         auto producer = [&](uint32_t f, std::vector<uint8_t>& nv12) {
-            const auto lf = clip_frame(doc, source.planes(f));
+            const auto lf = media_frame(doc, source.planes(f));
             return readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
                                     kWidth, kHeight, nv12, 0, f, &lf, 1);
         };

@@ -1,19 +1,26 @@
 #include "media/import.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 #include "codec/mez.h"
 #include "media/bmff.h"
+#include "media/mp3.h"
 #include "media/pcm.h"
 #include "media/wav.h"
 #include "mod/analysis.h"
 #include "util/image.h"
 #include "platform/win/mf_codec.h"
+#include "platform/win/wic_image.h"
 #include "util/log.h"
 
 namespace looks::media {
@@ -157,55 +164,142 @@ struct StageClock {
     }
 };
 
-// Encodes a batch of frames in parallel, then appends in order.
-class BatchEncoder {
+// The import pixel pipeline: double-buffered batches. The decode thread
+// pushes raw NV12 frames (ownership moves) and never touches pixels;
+// when a batch fills, a background thread fans it out over the worker
+// count (convert, proxy downsample, both encodes per frame - the
+// atomic-cursor loop) and then appends IN ORDER (main mez, proxy mez,
+// thumbs) while the decode thread fills the next batch. The batch is
+// sized so cooking a full batch is FASTER than decoding the next one -
+// the submit join then never waits and the pixel work hides entirely
+// behind the decode. Deliberately batch-synchronous: a persistent
+// work-queue variant convoyed on its queue lock and deadlocked; this
+// shape is dumb, measured, and correct. Peak transient = two batches
+// of raw NV12 (~600 MB at 4K).
+class ImportPipeline {
 public:
-    BatchEncoder(codec::MezWriter& writer, int quality, int threads)
-        : writer_(writer), quality_(quality),
-          threads_(threads > 0 ? threads
-                               : std::max(1u, std::thread::hardware_concurrency())) {}
-
-    void push(I420Frame frame) {
-        batch_.push_back(std::move(frame));
-        if (batch_.size() >= static_cast<size_t>(threads_) * 2) flush();
+    ImportPipeline(codec::MezWriter& writer, codec::MezWriter* proxy,
+                   ThumbStrip* strip, size_t thumb_every, int quality,
+                   int threads)
+        : writer_(writer), proxy_(proxy), strip_(strip),
+          thumb_every_(thumb_every), quality_(quality) {
+        // Leave the MF decoder's internal threads a few cores of
+        // headroom - starving the pump just moves the wall.
+        const unsigned hw =
+            std::max(1u, std::thread::hardware_concurrency());
+        threads_ = threads > 0
+                       ? threads
+                       : static_cast<int>(
+                             std::max(2u, hw > 4 ? hw - 4 : hw));
     }
 
-    bool flush() {
-        if (batch_.empty()) return ok_;
-        clock_.begin();
-        std::vector<std::vector<uint8_t>> encoded(batch_.size());
-        std::atomic<size_t> next{0};
-        auto worker = [&] {
-            for (;;) {
-                const size_t i = next.fetch_add(1);
-                if (i >= batch_.size()) break;
-                codec::encode_frame(batch_[i].view(), quality_, encoded[i]);
-            }
-        };
-        std::vector<std::thread> pool;
-        const int n = std::min<int>(threads_, static_cast<int>(batch_.size()));
-        pool.reserve(static_cast<size_t>(n) - 1);
-        for (int i = 1; i < n; ++i) pool.emplace_back(worker);
-        worker();
-        for (std::thread& t : pool) t.join();
+    ~ImportPipeline() { join(); }
 
-        for (const auto& payload : encoded)
-            ok_ = ok_ && writer_.add_encoded_frame(payload);
-        batch_.clear();
-        clock_.end();
+    void push(platform::VideoFrameNV12 frame) {
+        batch_.push_back({std::move(frame), frame_index_++});
+        const size_t cap =
+            std::min<size_t>(static_cast<size_t>(threads_), 24);
+        if (batch_.size() >= cap) submit();
+    }
+
+    // Flushes everything and joins; the writers are fully caught up on
+    // return. False when any main-mez append failed.
+    bool finish() {
+        submit();
+        join();
         return ok_;
     }
 
     bool ok() const { return ok_; }
-    double encode_seconds() const { return clock_.seconds; }
+    bool proxy_ok() const { return proxy_ok_; }
+    int worker_count() const { return threads_; }
+    double pixels_seconds() const { return t_pixels_.seconds; }
+    double append_seconds() const { return t_append_.seconds; }
 
 private:
+    struct Raw {
+        platform::VideoFrameNV12 nv12;
+        uint64_t index = 0;
+    };
+    struct Cooked {
+        std::vector<uint8_t> main_payload;
+        std::vector<uint8_t> proxy_payload;
+        I420Frame thumb_frame;
+        bool thumb = false;
+    };
+
+    void submit() {
+        if (batch_.empty()) return;
+        join();   // instant when the batch outpaced the decode fill
+        bg_batch_ = std::move(batch_);
+        batch_.clear();
+        bg_ = std::thread([this] { run_batch(); });
+    }
+
+    void join() {
+        if (bg_.joinable()) bg_.join();
+    }
+
+    void run_batch() {
+        std::vector<Cooked> cooked(bg_batch_.size());
+        t_pixels_.begin();
+        std::atomic<size_t> next{0};
+        auto worker = [&] {
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= bg_batch_.size()) break;
+                Cooked& c = cooked[i];
+                I420Frame f;
+                nv12_to_i420(bg_batch_[i].nv12, f);
+                bg_batch_[i].nv12 = {};   // 12 MB freed early
+                codec::encode_frame(f.view(), quality_, c.main_payload);
+                if (proxy_) {
+                    I420Frame half;
+                    downsample_half(f, half);
+                    codec::encode_frame(half.view(), quality_,
+                                        c.proxy_payload);
+                }
+                if (thumb_every_ &&
+                    bg_batch_[i].index % thumb_every_ == 0) {
+                    c.thumb = true;
+                    c.thumb_frame = std::move(f);
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        const int n =
+            std::min<int>(threads_, static_cast<int>(bg_batch_.size()));
+        pool.reserve(static_cast<size_t>(n) - 1);
+        for (int i = 1; i < n; ++i) pool.emplace_back(worker);
+        worker();
+        for (std::thread& t : pool) t.join();
+        t_pixels_.end();
+
+        t_append_.begin();
+        for (Cooked& c : cooked) {
+            ok_ = ok_ && writer_.add_encoded_frame(c.main_payload);
+            if (proxy_ && proxy_ok_)
+                proxy_ok_ = proxy_->add_encoded_frame(c.proxy_payload);
+            if (c.thumb && strip_) strip_->add(c.thumb_frame);
+        }
+        t_append_.end();
+        bg_batch_.clear();
+    }
+
     codec::MezWriter& writer_;
+    codec::MezWriter* proxy_;
+    ThumbStrip* strip_;
+    size_t thumb_every_;
+    uint64_t frame_index_ = 0;
     int quality_;
-    int threads_;
-    std::vector<I420Frame> batch_;
-    bool ok_ = true;
-    StageClock clock_;
+    int threads_ = 1;
+    std::vector<Raw> batch_;
+    std::vector<Raw> bg_batch_;   // owned by bg_ while it runs
+    std::thread bg_;
+    bool ok_ = true;         // bg-thread written, read after join only
+    bool proxy_ok_ = true;
+    StageClock t_pixels_;    // parallel convert+downsample+encode wall
+    StageClock t_append_;    // ordered writes + thumb adds
 };
 
 bool import_video(BmffFile& file, const TrackInfo& track,
@@ -238,8 +332,6 @@ bool import_video(BmffFile& file, const TrackInfo& track,
     if (progress)
         progress->frames_total.store(static_cast<uint32_t>(track.samples.size()));
 
-    BatchEncoder encoder(writer, options.quality, options.encode_threads);
-
     // Half-res proxy: second mezzanine, same timeline.
     codec::MezWriter proxy_writer;
     const std::filesystem::path proxy_path = [&] {
@@ -253,8 +345,6 @@ bool import_video(BmffFile& file, const TrackInfo& track,
         options.proxy && proxy_writer.open(proxy_path, proxy_w, proxy_h,
                                            track.timescale, frame_duration,
                                            options.quality);
-    BatchEncoder proxy_encoder(proxy_writer, options.quality,
-                               options.encode_threads);
 
     // Thumbnail strip: every Nth frame, budgeted count.
     ThumbStrip strip;
@@ -264,10 +354,14 @@ bool import_video(BmffFile& file, const TrackInfo& track,
                                       static_cast<size_t>(options.thumb_count))
             : 0;
 
+    ImportPipeline pipeline(writer, proxy_on ? &proxy_writer : nullptr,
+                            thumb_every ? &strip : nullptr, thumb_every,
+                            options.quality, options.encode_threads);
+
     std::vector<uint8_t> sample_bytes;
     platform::VideoFrameNV12 nv12;
     uint32_t decoded = 0;
-    StageClock t_decode, t_convert, t_analyze;
+    StageClock t_decode, t_analyze;
     const auto t_start = std::chrono::steady_clock::now();
 
     auto pump_decoder = [&]() {
@@ -276,23 +370,17 @@ bool import_video(BmffFile& file, const TrackInfo& track,
             const bool got = decoder.receive(nv12);
             t_decode.end();
             if (!got) break;
-            I420Frame i420;
-            t_convert.begin();
-            nv12_to_i420(nv12, i420);
-            t_convert.end();
+            // The analyzer reads the luma plane straight off the NV12
+            // (identical bytes to the converted Y, so the curves stay
+            // bit-identical) - the decode thread hands the frame to the
+            // pipeline untouched and pixels never run serially here.
             if (analyzer) {
                 t_analyze.begin();
-                analyzer->push_frame(i420.y.data(), i420.width, i420.width,
-                                     i420.height);
+                analyzer->push_frame(nv12.data.data(), nv12.width,
+                                     nv12.width, nv12.height);
                 t_analyze.end();
             }
-            if (thumb_every && decoded % thumb_every == 0) strip.add(i420);
-            if (proxy_on) {
-                I420Frame half;
-                downsample_half(i420, half);
-                proxy_encoder.push(std::move(half));
-            }
-            encoder.push(std::move(i420));
+            pipeline.push(std::move(nv12));
             ++decoded;
             if (progress) progress->frames_done.store(decoded);
         }
@@ -325,19 +413,24 @@ bool import_video(BmffFile& file, const TrackInfo& track,
     }
     decoder.drain();
     pump_decoder();
+    const bool pipeline_ok = pipeline.finish();
 
-    // Stage split for the speed target (import ≥ 2× realtime).
+    // Stage split for the speed target (import ≥ 2× realtime). Decode
+    // and pixels overlap by design, so the stages sum past the total
+    // once the overlap is winning.
     const double t_total =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       t_start)
             .count();
-    log_info("import: video stages %.2fs total — decode %.2fs, nv12->i420 "
-             "%.2fs, analyze %.2fs, mez encode %.2fs (%u frames, %.1f fps)",
-             t_total, t_decode.seconds, t_convert.seconds, t_analyze.seconds,
-             encoder.encode_seconds(), decoded,
+    log_info("import: video stages %.2fs total — decode %.2fs, analyze "
+             "%.2fs, pixels %.2fs / %d workers, append %.2fs "
+             "(%u frames, %.1f fps)",
+             t_total, t_decode.seconds, t_analyze.seconds,
+             pipeline.pixels_seconds(), pipeline.worker_count(),
+             pipeline.append_seconds(), decoded,
              t_total > 0.0 ? decoded / t_total : 0.0);
 
-    if (!encoder.flush() || !encoder.ok()) {
+    if (!pipeline_ok) {
         result->error = "mezzanine encode/write failed";
         return false;
     }
@@ -346,8 +439,7 @@ bool import_video(BmffFile& file, const TrackInfo& track,
         return false;
     }
     if (proxy_on) {
-        if (proxy_encoder.flush() && proxy_encoder.ok() &&
-            proxy_writer.finish())
+        if (pipeline.proxy_ok() && proxy_writer.finish())
             result->proxy_path = proxy_path;
         else
             log_warn("import: proxy encode failed — full-res only");
@@ -433,27 +525,19 @@ bool import_audio(BmffFile& file, const TrackInfo& track,
 
 // Still-image import (PNG/TGA through the in-repo decoders, ):
 // the image is encoded ONCE and every timeline frame's index entry points
-// at that payload — a 10-second clip for one frame of storage. Downstream
+// at that payload — a 10-second stream for one frame of storage. Downstream
 // the bundle is indistinguishable from footage, so the whole rack (mattes,
 // modulation, trim, export) works on stills untouched.
 constexpr uint32_t kStillFps = 30;
 constexpr uint32_t kStillFrames = 300;   // 10 s at 30 fps
 
-bool import_still(const std::filesystem::path& source,
-                  const std::filesystem::path& dest_dir,
-                  const ImportOptions& options, ImportProgress* progress,
-                  ImportResult* result) {
-    ImageRgba img;
-    std::string error;
-    if (!load_image(source, &img, &error)) {
-        result->error = "image: " + error;
-        return false;
-    }
-    if (progress) {
-        progress->frames_total.store(1);
-        progress->frames_done.store(0);
-    }
-
+// Writes a one-image bundle: the frame encoded once, every index entry
+// pointing at that payload, plus proxy/thumb/analysis sidecars. Shared
+// by still imports and audio cover art (held for the audio's length).
+bool write_still_bundle(const ImageRgba& img,
+                        const std::filesystem::path& mez_path,
+                        const ImportOptions& options, uint32_t hold_frames,
+                        ImportResult* result) {
     // sRGB RGB -> BT.709 limited-range I420: the exact inverse of the
     // engine's frame-fetch matrix (ycbcr_to_rgb), so a still round-trips
     // through preview/export with no color shift. Even dims for the codec
@@ -512,8 +596,6 @@ bool import_still(const std::filesystem::path& source,
         }
     }
 
-    const std::wstring stem = source.stem().wstring();
-    const std::filesystem::path mez_path = dest_dir / (stem + L".mez");
     codec::MezWriter writer;
     if (!writer.open(mez_path, frame.width, frame.height, kStillFps * 1000,
                      1000, options.quality)) {
@@ -521,7 +603,7 @@ bool import_still(const std::filesystem::path& source,
         return false;
     }
     if (!writer.add_frame(frame.view()) ||
-        !writer.add_hold_frames(kStillFrames - 1) || !writer.finish()) {
+        !writer.add_hold_frames(hold_frames - 1) || !writer.finish()) {
         result->error = "mezzanine write failed";
         return false;
     }
@@ -536,7 +618,7 @@ bool import_still(const std::filesystem::path& source,
         if (proxy.open(proxy_path, half.width, half.height, kStillFps * 1000,
                        1000, options.quality) &&
             proxy.add_frame(half.view()) &&
-            proxy.add_hold_frames(kStillFrames - 1) && proxy.finish())
+            proxy.add_hold_frames(hold_frames - 1) && proxy.finish())
             result->proxy_path = proxy_path;
     }
 
@@ -549,36 +631,256 @@ bool import_still(const std::filesystem::path& source,
         if (strip.write(tpath)) result->thumbs_path = tpath;
     }
 
-    // Analysis: constant brightness, zero motion/cuts, no audio curves —
-    // deterministic and honest for a static source.
+    // Analysis: constant brightness, zero motion/cuts — deterministic
+    // and honest for a static image.
     {
         mod::AnalysisData data;
         data.fps = kStillFps;
-        data.frame_count = kStillFrames;
+        data.frame_count = hold_frames;
         const float mean = static_cast<float>(
             luma_sum / (static_cast<double>(frame.width) * frame.height));
-        data.brightness.assign(kStillFrames, mean);
-        data.motion.assign(kStillFrames, 0.0f);
-        data.cut.assign(kStillFrames, 0.0f);
+        data.brightness.assign(hold_frames, mean);
+        data.motion.assign(hold_frames, 0.0f);
+        data.cut.assign(hold_frames, 0.0f);
         std::filesystem::path apath = mez_path;
         apath.replace_extension(".analysis");
         if (mod::write_analysis(apath, data))
             result->analysis_path = apath;
     }
 
-    if (progress) progress->frames_done.store(1);
     result->ok = true;
     result->mez_path = mez_path;
     result->width = frame.width;
     result->height = frame.height;
-    result->frame_count = kStillFrames;
+    result->frame_count = hold_frames;
     result->fps = kStillFps;
     log_info("import: still %ux%u -> %u held frames", frame.width,
-             frame.height, kStillFrames);
+             frame.height, hold_frames);
+    return true;
+}
+
+bool import_still(const std::filesystem::path& source,
+                  const std::filesystem::path& dest_dir,
+                  const ImportOptions& options, ImportProgress* progress,
+                  ImportResult* result) {
+    ImageRgba img;
+    std::string error;
+    if (!load_image(source, &img, &error)) {
+        result->error = "image: " + error;
+        return false;
+    }
+    if (progress) {
+        progress->frames_total.store(1);
+        progress->frames_done.store(0);
+    }
+    const bool ok = write_still_bundle(
+        img, dest_dir / (source.stem().wstring() + L".mez"), options,
+        kStillFrames, result);
+    if (ok && progress) progress->frames_done.store(1);
+    return ok;
+}
+
+// Audio import (WAV via the in-repo reader, MP3 via the in-repo frame
+// walker over the inbox MFT): PCM sidecar always; embedded cover art
+// additionally becomes the VIDEO side - a one-image mezzanine held for
+// the audio's length, so the media node shows the art and plays the
+// sound. Without art there is no mez: the node is image-dormant and
+// asset frame_count stays 0 = unbounded, like a generator.
+bool import_audio_file(const std::filesystem::path& source,
+                       const std::filesystem::path& dest_dir,
+                       const ImportOptions& options,
+                       ImportProgress* progress, ImportResult* result) {
+    std::wstring ext = source.extension().native();
+    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+
+    uint32_t channels = 0, rate = 0;
+    std::vector<int16_t> samples;
+    std::vector<uint8_t> art;
+    std::string error;
+    if (ext == L".wav") {
+        WavData wav;
+        if (!read_wav(source, &wav, &error)) {
+            result->error = "wav: " + error;
+            return false;
+        }
+        channels = wav.channels;
+        rate = wav.sample_rate;
+        samples = std::move(wav.samples);
+    } else {
+        FILE* f = _wfopen(source.c_str(), L"rb");
+        if (!f) {
+            result->error = "cannot open " + source.string();
+            return false;
+        }
+        std::fseek(f, 0, SEEK_END);
+        const long len = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        std::vector<uint8_t> bytes(len > 0 ? static_cast<size_t>(len) : 0);
+        const size_t got =
+            bytes.empty() ? 0 : std::fread(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+        if (got != bytes.size() || bytes.empty()) {
+            result->error = "short read";
+            return false;
+        }
+        Mp3Data mp3;
+        if (!decode_mp3(bytes.data(), bytes.size(), &mp3, &error)) {
+            result->error = "mp3: " + error;
+            return false;
+        }
+        channels = mp3.channels;
+        rate = mp3.sample_rate;
+        samples = std::move(mp3.samples);
+        mp3_cover_art(bytes.data(), bytes.size(), &art);
+    }
+    if (progress) {
+        progress->frames_total.store(1);
+        progress->frames_done.store(0);
+    }
+
+    const std::filesystem::path pcm_path =
+        dest_dir / (source.stem().wstring() + L".pcm");
+    PcmWriter writer;
+    if (!writer.open(pcm_path, channels, rate)) {
+        result->error = "cannot create " + pcm_path.string();
+        return false;
+    }
+    if (!writer.append(samples.data(), samples.size())) {
+        result->error = "pcm write failed";
+        return false;
+    }
+    writer.finish();
+    result->pcm_path = pcm_path;
+    result->audio_channels = channels;
+    result->audio_sample_rate = rate;
+    result->audio_frames =
+        channels ? samples.size() / channels : 0;
+
+    if (!art.empty()) {
+        ImageRgba img;
+        std::string wic_error;
+        if (platform::decode_image_rgba(art.data(), art.size(), &img.width,
+                                        &img.height, &img.pixels,
+                                        &wic_error)) {
+            // Hold the art for the audio's length on the still grid.
+            const double secs =
+                rate ? static_cast<double>(result->audio_frames) / rate : 0.0;
+            const uint32_t hold = std::max<uint32_t>(
+                1, static_cast<uint32_t>(secs * kStillFps) + 1);
+            ImportResult art_result;
+            if (write_still_bundle(
+                    img, dest_dir / (source.stem().wstring() + L".mez"),
+                    options, hold, &art_result)) {
+                result->mez_path = art_result.mez_path;
+                result->proxy_path = art_result.proxy_path;
+                result->thumbs_path = art_result.thumbs_path;
+                result->analysis_path = art_result.analysis_path;
+                result->width = art_result.width;
+                result->height = art_result.height;
+                result->frame_count = art_result.frame_count;
+                result->fps = art_result.fps;
+            }
+        } else {
+            log_warn("import: cover art undecodable (%s) — audio only",
+                     wic_error.c_str());
+        }
+    }
+
+    if (progress) progress->frames_done.store(1);
+    result->ok = true;
+    log_info("import: audio %u ch @%u Hz, %llu frames%s", channels, rate,
+             static_cast<unsigned long long>(result->audio_frames),
+             result->mez_path.empty() ? "" : " + cover art");
     return true;
 }
 
 }  // namespace
+
+double probe_video_duration_seconds(const std::filesystem::path& source) {
+    FILE* f = _wfopen(source.c_str(), L"rb");
+    if (!f) return 0.0;
+    _fseeki64(f, 0, SEEK_END);
+    const int64_t file_end = _ftelli64(f);
+    auto be32 = [](const uint8_t* p) {
+        return (static_cast<uint32_t>(p[0]) << 24) |
+               (static_cast<uint32_t>(p[1]) << 16) |
+               (static_cast<uint32_t>(p[2]) << 8) | p[3];
+    };
+    auto be64 = [&](const uint8_t* p) {
+        return (static_cast<uint64_t>(be32(p)) << 32) | be32(p + 4);
+    };
+    // Finds a child box inside [begin, end); returns payload begin/end.
+    auto find_box = [&](int64_t begin, int64_t end, const char* fourcc,
+                        int64_t* pb, int64_t* pe) {
+        int64_t at = begin;
+        uint8_t hdr[16];
+        for (int guard = 0; guard < 4096 && at + 8 <= end; ++guard) {
+            _fseeki64(f, at, SEEK_SET);
+            if (std::fread(hdr, 1, 8, f) != 8) return false;
+            uint64_t size = be32(hdr);
+            int64_t payload = at + 8;
+            if (size == 1) {
+                if (std::fread(hdr + 8, 1, 8, f) != 8) return false;
+                size = be64(hdr + 8);
+                payload = at + 16;
+            } else if (size == 0) {
+                size = static_cast<uint64_t>(end - at);
+            }
+            if (size < 8) return false;
+            if (!std::memcmp(hdr + 4, fourcc, 4)) {
+                *pb = payload;
+                *pe = at + static_cast<int64_t>(size);
+                return true;
+            }
+            at += static_cast<int64_t>(size);
+        }
+        return false;
+    };
+    double secs = 0.0;
+    int64_t moov_b = 0, moov_e = 0;
+    if (find_box(0, file_end, "moov", &moov_b, &moov_e)) {
+        // Walk every trak; the VIDEO handler's mdhd is the duration the
+        // mezzanine must cover (mvhd would count a longer audio tail
+        // and force a re-import loop).
+        int64_t at = moov_b;
+        int64_t trak_b = 0, trak_e = 0;
+        while (find_box(at, moov_e, "trak", &trak_b, &trak_e)) {
+            int64_t mdia_b = 0, mdia_e = 0;
+            if (find_box(trak_b, trak_e, "mdia", &mdia_b, &mdia_e)) {
+                int64_t hb = 0, he = 0;
+                uint8_t buf[36];
+                bool is_video = false;
+                if (find_box(mdia_b, mdia_e, "hdlr", &hb, &he)) {
+                    _fseeki64(f, hb, SEEK_SET);
+                    if (std::fread(buf, 1, 12, f) == 12)
+                        is_video = !std::memcmp(buf + 8, "vide", 4);
+                }
+                if (is_video &&
+                    find_box(mdia_b, mdia_e, "mdhd", &hb, &he)) {
+                    _fseeki64(f, hb, SEEK_SET);
+                    if (std::fread(buf, 1, 32, f) == 32) {
+                        uint32_t ts = 0;
+                        uint64_t dur = 0;
+                        if (buf[0] == 1) {
+                            ts = be32(buf + 20);
+                            dur = be64(buf + 24);
+                        } else {
+                            ts = be32(buf + 12);
+                            dur = be32(buf + 16);
+                        }
+                        if (ts) {
+                            secs = static_cast<double>(dur) / ts;
+                            break;
+                        }
+                    }
+                }
+            }
+            at = trak_e;
+        }
+    }
+    std::fclose(f);
+    return secs;
+}
 
 bool extract_audio_pcm(const std::filesystem::path& source,
                        const std::filesystem::path& dest_pcm,
@@ -599,6 +901,19 @@ bool extract_audio_pcm(const std::filesystem::path& source,
         if (!writer.open(dest_pcm, wav.channels, wav.sample_rate))
             return fail("cannot create " + dest_pcm.string());
         if (!writer.append(wav.samples.data(), wav.samples.size()))
+            return fail("pcm write failed");
+        writer.finish();
+        return true;
+    }
+    if (ext == L".mp3") {
+        Mp3Data mp3;
+        std::string mp3_error;
+        if (!read_mp3(source, &mp3, &mp3_error))
+            return fail("mp3: " + mp3_error);
+        PcmWriter writer;
+        if (!writer.open(dest_pcm, mp3.channels, mp3.sample_rate))
+            return fail("cannot create " + dest_pcm.string());
+        if (!writer.append(mp3.samples.data(), mp3.samples.size()))
             return fail("pcm write failed");
         writer.finish();
         return true;
@@ -633,6 +948,12 @@ ImportResult import_media(const std::filesystem::path& source,
     for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
     if (ext == L".png" || ext == L".tga") {
         import_still(source, dest_dir, options, progress, &result);
+        return result;
+    }
+    if (ext == L".wav" || ext == L".mp3") {
+        std::error_code wec;
+        std::filesystem::create_directories(dest_dir, wec);
+        import_audio_file(source, dest_dir, options, progress, &result);
         return result;
     }
 

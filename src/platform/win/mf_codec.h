@@ -102,6 +102,24 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// MP3 (Layer III) decode through the inbox MFT, fed whole frames by the
+// in-repo frame walker (media/mp3.cpp owns the container exactly as the
+// BMFF demuxer does for AAC).
+class Mp3Decoder {
+public:
+    Mp3Decoder();
+    ~Mp3Decoder();
+
+    bool create(uint32_t channels, uint32_t sample_rate, std::string* error);
+    bool feed(const uint8_t* data, size_t size, int64_t pts_100ns);
+    bool receive(AudioChunk& out);
+    void drain();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // ---- encoders (export edge; also used by the test-fixture generator)
 
 struct EncodedPacket {

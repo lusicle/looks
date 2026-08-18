@@ -1,6 +1,6 @@
 // Undoable mutations of the project's looks, sequences and assets.
 // A look is a timeless node graph; a sequence is arrangement; an asset is
-// imported media that clip nodes bind to by id.
+// imported media that media nodes bind to by id.
 
 #pragma once
 
@@ -30,6 +30,10 @@ std::unique_ptr<Command> remove_look_command(uint64_t look_id);
 std::unique_ptr<Command> set_look_props_command(uint64_t look,
                                                 std::string name,
                                                 uint32_t duration);
+// Output audio routing: combined (false) = the voice rides the In wire's
+// chain; split (true) = the dedicated audio-in (port 1), silent unwired.
+std::unique_ptr<Command> set_look_audio_split_command(uint64_t look,
+                                                      bool split);
 
 std::unique_ptr<Command> add_sequence_command(Sequence seq);
 // Blocks and sources referencing a removed sequence go dormant; undo

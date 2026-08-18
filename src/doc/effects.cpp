@@ -997,6 +997,44 @@ constexpr ParamDesc kCornerPinParams[] = {
      "black|clamp|wrap|mirror"},
 };
 
+// ---- audio modifiers. Params snapshot into the flatten's DSP op lists
+// (doc/instances.h AudioOp carries at most 4); time-domain params are in
+// SOURCE samples/ms, so placement speed scales them with the pitch.
+constexpr ParamDesc kAudioGainParams[] = {
+    {"gain", "gain", 0.0f, 4.0f, 1.0f, "%.2fx"},
+};
+
+constexpr ParamDesc kAudioBitcrushParams[] = {
+    {"bits", "bits", 1.0f, 16.0f, 8.0f, "%.0f", nullptr, true},
+};
+
+constexpr ParamDesc kAudioDownsampleParams[] = {
+    // Hold length in source samples: 4 at 48 kHz is a 12 kHz crunch.
+    {"hold", "hold (samples)", 1.0f, 64.0f, 4.0f, "%.0f", nullptr, true},
+};
+
+constexpr ParamDesc kAudioDistortionParams[] = {
+    {"drive", "drive", 0.0f, 1.0f, 0.35f, "%.2f"},
+};
+
+constexpr ParamDesc kAudioDelayParams[] = {
+    {"time", "time", 1.0f, 1000.0f, 250.0f, "%.0f ms"},
+    {"feedback", "feedback", 0.0f, 0.95f, 0.4f, "%.2f"},
+};
+
+constexpr ParamDesc kAudioFilterParams[] = {
+    {"cutoff", "cutoff", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "lowpass|highpass"},
+};
+
+// ---- offset: the time shim. Applies only wired directly onto a source
+// node; the shift is static (not a mod target - it rekeys decode
+// streams, so the flatten snapshots it like audio params).
+constexpr ParamDesc kOffsetParams[] = {
+    {"offset", "offset", -600.0f, 600.0f, 0.0f, "%.0f fr"},
+    {"target", "target", 0.0f, 2.0f, 2.0f, "%.0f", "video|audio|both"},
+};
+
 constexpr EffectInfo kEffectInfos[] = {
     {"rgb_split", "RGB Split", kRgbSplitParams, 2, FxCategory::Signal},
     {"vignette", "Vignette", kVignetteParams, 3, FxCategory::Optics},
@@ -1149,6 +1187,16 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::Color},
     {"sharpen", "Sharpen", kSharpenParams, 2, FxCategory::Texture},
     {"corner_pin", "Corner Pin", kCornerPinParams, 9, FxCategory::Warp},
+    {"audio_gain", "Gain", kAudioGainParams, 1, FxCategory::Audio},
+    {"audio_bitcrush", "Bitcrush", kAudioBitcrushParams, 1,
+     FxCategory::Audio},
+    {"audio_downsample", "Downsample", kAudioDownsampleParams, 1,
+     FxCategory::Audio},
+    {"audio_distortion", "Distortion", kAudioDistortionParams, 1,
+     FxCategory::Audio},
+    {"audio_delay", "Delay", kAudioDelayParams, 2, FxCategory::Audio},
+    {"audio_filter", "Filter", kAudioFilterParams, 2, FxCategory::Audio},
+    {"offset", "Offset", kOffsetParams, 2, FxCategory::Time},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));
@@ -1159,7 +1207,8 @@ const char* fx_category_label(FxCategory category) {
     static const char* kLabels[] = {
         "time & motion",  "warp & displace",  "optics & light",
         "color & tone",   "texture & detail", "structure & scan",
-        "paint & print",  "signal & codec",   "frame & overlay"};
+        "paint & print",  "signal & codec",   "frame & overlay",
+        "audio & dsp"};
     static_assert(sizeof(kLabels) / sizeof(kLabels[0]) ==
                   static_cast<size_t>(FxCategory::Count));
     const auto i = static_cast<size_t>(category);

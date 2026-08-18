@@ -4,9 +4,9 @@
 //
 // Two entities, each pure:
 // - A LOOK is a TIMELESS node graph with one linear local clock. Its
-//   sources (clips, generators, nested looks, nested sequences) play in
-//   LOCKSTEP with that clock, 1:1 - no scheduling inside looks. A clip
-//   node carries one static SLIP (media in-point) so two clips can hold
+//   sources (media, generators, nested looks, nested sequences) play in
+//   LOCKSTEP with that clock, 1:1 - no scheduling inside looks. A media
+//   node carries one static SLIP (media in-point) so two media nodes can hold
 //   a fixed sync offset; that is a parameter, not a schedule. Effects
 //   exist ONLY in look graphs. Keyframe lanes are look-local, keyed on
 //   the local clock, so motion travels with the look.
@@ -16,7 +16,7 @@
 //   line that keeps razor identity universal (nothing at sequence level
 //   has state, so cutting a block and butting the halves is always
 //   bit-identical). Placements target looks or sequences; raw media
-//   never sits on a timeline - importing wraps the clip in a look.
+//   never sits on a timeline - importing wraps the media in a look.
 // Both entities are TEMPLATES shared by reference: params live on the
 // entity, per-instance state (effect history) keys on the instance path
 // in the engine, MAKE UNIQUE is the explicit fork.
@@ -125,11 +125,13 @@ struct AudioTrack {
     bool mute = false;
 };
 
-// Layer source: what a look-graph source node IS. Clip reads media in
+// Layer source: what a look-graph source node IS. Media reads an imported asset in
 // lockstep (plus slip); generators have no media; LookRef/SequenceRef
 // nest an entity as a lockstep source - a mask IS a nested look.
 enum class LayerSourceKind : uint32_t {
-    Clip = 0,
+    // MEDIA, not "clip": the layer reads an imported asset - video,
+    // still, or audio-bearing - in lockstep with the look's clock.
+    Media = 0,
     // Generator numeric values are baked into gen.comp.slang's kind
     // switch - renumbering means editing the shader in the same change.
     Solid,
@@ -154,9 +156,10 @@ enum class LayerSourceKind : uint32_t {
 // Graph wiring: an output feeding a named input port. Node ids are
 // effect / layer ids; 0 as `to` = the look's Output node. to_port 0 = In,
 // 1 = the matte port (the wired image gates the consumer through luma
-// extract), 2+ = per-effect aux inputs (Warp/Displace/B...). While a
-// look's links are empty the loader and engine synthesize them from stack
-// order.
+// extract), 2+ = per-effect aux inputs (Warp/Displace/B...). On the
+// OUTPUT node port 1 is the split-mode audio-in instead (Look
+// .audio_split) - the Output has no matte. While a look's links are
+// empty the loader and engine synthesize them from stack order.
 struct NodeLink {
     uint64_t from = 0;
     uint64_t to = 0;
@@ -207,13 +210,21 @@ struct Group {
 struct Layer {
     uint64_t id = 0;
     std::string name;
-    LayerSourceKind source = LayerSourceKind::Clip;
-    // Clip: the media this node reads, in lockstep with the look's
+    LayerSourceKind source = LayerSourceKind::Media;
+    // Media: the asset this node reads, in lockstep with the look's
     // clock. slip is the one timing nuance a look allows: a static media
-    // in-point (local frame 0 reads media frame `slip`) so two clips can
-    // hold a fixed sync offset. A parameter, not a schedule.
+    // in-point (local frame 0 reads media frame `slip`) so two sources
+    // can hold a fixed sync offset. A parameter, not a schedule.
     uint64_t asset = 0;
     uint32_t slip = 0;
+    // TIMELINE LOCK (media only): the node reads the asset at the ROOT
+    // timeline frame instead of the look clock, so every placement of
+    // the look reads identical media positions - offset blocks stay in
+    // sync (and their reactive signals with them). Closed-form and
+    // razor-invariant; placement speed/source_in stop applying to this
+    // node; slip stays the manual nudge. At look scope root = local, so
+    // the toggle degrades to lockstep.
+    bool timeline_lock = false;
     // LookRef/SequenceRef: the nested entity, playing 1:1.
     uint64_t target = 0;
     // Generator params: color_a (solid / gradient start), color_b
@@ -251,8 +262,8 @@ inline bool layer_has_transform(const Layer& l) {
            l.xf_scale != 1.0f || l.xf_rotate != 0.0f;
 }
 
-inline bool layer_is_clip(const Layer& l) {
-    return l.source == LayerSourceKind::Clip;
+inline bool layer_is_media(const Layer& l) {
+    return l.source == LayerSourceKind::Media;
 }
 inline bool layer_is_generator(const Layer& l) {
     return l.source >= LayerSourceKind::Solid &&
@@ -282,6 +293,13 @@ struct Look {
     uint32_t duration = 0;
     // Browser bin; 0 = the project root.
     uint64_t bin = 0;
+    // Output audio routing. COMBINED (false, default): image and audio
+    // arrive on the one In wire - the voice is the port-0 chain's audio,
+    // so looks wire exactly as always and the bottom chain wins the
+    // fan-in. SPLIT (true): the Output grows a dedicated audio-in
+    // (to=0, to_port=1) for a voice that differs from the picture's
+    // chain; unwired = silent, not fallback.
+    bool audio_split = false;
 
     std::vector<Layer> layers;
     std::vector<NodeLink> links;
@@ -333,7 +351,7 @@ struct Sequence {
 
 struct Document {
     std::string name = "untitled";
-    // Imported media. Clip layers bind to these by id.
+    // Imported media. Media layers bind to these by id.
     std::vector<Asset> assets;
     // Every look and sequence in the project; root_sequence is the
     // project timeline - the one export renders by default. It is only
@@ -349,7 +367,7 @@ struct Document {
     // times stay commensurable. 0 = derive from the first asset.
     double fps = 0.0;
     // Project canvas: what everything renders into. 0/0 = derive from the
-    // first bound asset. The timeline owns the format - the clip under the
+    // first bound asset. The timeline owns the format - the media under the
     // playhead must not decide the working resolution, or a cut between
     // two sizes would resize the whole graph mid-playback.
     uint32_t canvas_w = 0, canvas_h = 0;
@@ -379,9 +397,9 @@ struct Document {
     uint32_t time_mode = 0;   // 0 forward, 1 reverse, 2 ping-pong
 
     // Sidechain: analyze an external WAV or another MP4's audio
-    // instead of the clip's own; the audio-derived mod curves come from it
-    // while video curves stay with the clip. sidechain_mux muxes its audio
-    // into the export instead of the clip's. audio_offset_ms nudges audio
+    // instead of the media's own; the audio-derived mod curves come from it
+    // while video curves stay with the media. sidechain_mux muxes its audio
+    // into the export instead of the media's. audio_offset_ms nudges audio
     // against video everywhere (curve sampling, monitoring, export).
     std::string sidechain_path;
     bool sidechain_mux = false;
@@ -395,7 +413,7 @@ struct Document {
     bool export_audio = true;
 
     // A fresh project holds one empty sequence (one video lane) and one
-    // starter look with a single clip node - the timeline to cut on and
+    // starter look with a single media node - the timeline to cut on and
     // a look to build in.
     Document() {
         Sequence seq;
@@ -481,7 +499,7 @@ struct Document {
             if (a.id == id) return &a;
         return nullptr;
     }
-    // The clip the single-asset paths still key on (player, analysis,
+    // The media file the single-asset paths still key on (player, analysis,
     // export mux) until every consumer walks the flatten.
     const Asset* primary_asset() const {
         return assets.empty() ? nullptr : &assets.front();
@@ -517,12 +535,12 @@ inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
                                   int depth);
 
 // Frame count a look-graph source can play from local 0: the media past
-// its slip for clips, the nested entity's duration for refs, 0 for
+// its slip for media, the nested entity's duration for refs, 0 for
 // generators and unbound sources (no when / unbounded).
 inline uint32_t layer_source_length(const Document& doc, const Layer& l,
                                     int depth = 0) {
     if (depth >= kMaxLookDepth) return 0;
-    if (layer_is_clip(l)) {
+    if (layer_is_media(l)) {
         const Asset* a = doc.find_asset(l.asset);
         if (!a || !a->frame_count) return 0;
         return a->frame_count > l.slip ? a->frame_count - l.slip : 0;
@@ -720,6 +738,24 @@ inline std::vector<NodeLink> synthesize_links(const Look& look) {
 // canvas display). Idempotent when links already exist.
 inline void ensure_links(Look& look) {
     if (look.links.empty()) look.links = synthesize_links(look);
+}
+
+// The EMPTY table means synthesized wiring, so deleting a look's last
+// real wire must not fall back into it (the chain would resurrect).
+// A dead self-link keeps the table explicit; a real connect prunes it.
+inline bool link_is_tombstone(const NodeLink& l) {
+    return l.from == 0 && l.to == 0 && l.to_port == 9999;
+}
+inline void seal_links(Look& look) {
+    if (look.links.empty()) look.links.push_back({0, 0, 9999});
+}
+inline bool prune_tombstone(Look& look) {
+    for (auto it = look.links.begin(); it != look.links.end(); ++it)
+        if (link_is_tombstone(*it)) {
+            look.links.erase(it);
+            return true;
+        }
+    return false;
 }
 
 }  // namespace looks::doc

@@ -1,7 +1,7 @@
 // Decode pool: one decoded frame per PLACEMENT.
 //
 // The single Player owned one reader and one playhead, which is exactly as
-// many clips as a rack could show. A look tree can have several playing at
+// many sources as a rack could show. A look tree can have several playing at
 // once - at different source frames, at different speeds, nested - so the
 // pool keeps a stream per active placement, keyed by the same instance key
 // compile_graph stamps on the matching Source node.
@@ -60,7 +60,7 @@ public:
 
     struct Request {
         uint64_t key = 0;
-        size_t clip = 0;      // index into sources()
+        size_t source = 0;      // index into sources()
         uint32_t frame = 0;   // asset frame, clamped into the media
     };
     // Every placement playing at a root frame. Pure - no decode, no state.
@@ -70,7 +70,7 @@ public:
     // for the frames after it. Frames stay alive until the next collect().
     const std::vector<SourceFrame>& collect(uint32_t root_frame);
 
-    const std::vector<doc::ClipInstance>& sources() const { return clips_; }
+    const std::vector<doc::MediaInstance>& sources() const { return sources_; }
 
     // Frames decoded from disk since the last reset - a decode this frame
     // that prewarm did not already have. Playback smoothness, measurable.
@@ -80,16 +80,23 @@ private:
     struct Stream {
         std::filesystem::path path;
         uint32_t frames = 0;
-        // Two locks by design: `m` guards the ring/want and is only ever
-        // held briefly; `decode_m` serializes the stateful reader. A ring
-        // PROBE must never wait behind a decode in flight - the render
-        // thread queuing behind prewarm decodes was a per-frame stall the
-        // length of the whole prewarm backlog.
+        // `m` guards the ring/want and is only ever held briefly - a
+        // ring PROBE must never wait behind a decode in flight.
         std::mutex m;
-        std::mutex decode_m;
-        codec::MezReader reader;
-        bool opened = false;   // guarded by decode_m
-        bool ok = false;       // guarded by decode_m
+        // Reader BANK: the mezzanine is intra-only, so frames decode
+        // independently - each slot owns its own FILE* + scratch and
+        // several frames of one stream decode concurrently. One
+        // stateful reader capped a 4K stream at ~20 fps, under the
+        // media's own rate; the bank multiplies that by the slots a
+        // worker can grab.
+        struct Slot {
+            std::mutex m;
+            codec::MezReader reader;
+            bool opened = false;   // guarded by the slot mutex
+            bool ok = false;
+        };
+        static constexpr size_t kSlots = 4;
+        Slot slots[kSlots];
         // Decoded frames by index, newest last. Bounded by ring_depth_.
         std::deque<std::pair<uint32_t, std::shared_ptr<const codec::DecodedFrame>>>
             ring;
@@ -110,7 +117,7 @@ private:
     void worker_main();
     void drain();
 
-    std::vector<doc::ClipInstance> clips_;
+    std::vector<doc::MediaInstance> sources_;
     std::vector<AssetBundle> bundles_;
     uint64_t revision_ = ~0ull;
     uint64_t look_ = 0;

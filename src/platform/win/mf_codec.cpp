@@ -595,6 +595,115 @@ void AacDecoder::drain() {
     }
 }
 
+// ------------------------------------------------------------ Mp3Decoder
+
+struct Mp3Decoder::Impl {
+    Com<IMFTransform> mft;
+    uint32_t out_channels = 0;
+    uint32_t out_rate = 0;
+
+    bool negotiate_output(std::string* error) {
+        for (DWORD i = 0;; ++i) {
+            Com<IMFMediaType> type;
+            HRESULT hr = mft->GetOutputAvailableType(0, i, type.put());
+            if (FAILED(hr)) return set_error(error, "no PCM output type", hr);
+            GUID subtype{};
+            type->GetGUID(MF_MT_SUBTYPE, &subtype);
+            UINT32 bits = 0;
+            type->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
+            if (subtype == MFAudioFormat_PCM && bits == 16) {
+                hr = mft->SetOutputType(0, type.get(), 0);
+                if (FAILED(hr))
+                    return set_error(error, "SetOutputType(PCM)", hr);
+                type->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &out_channels);
+                type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &out_rate);
+                return true;
+            }
+        }
+    }
+};
+
+Mp3Decoder::Mp3Decoder() : impl_(new Impl) {}
+Mp3Decoder::~Mp3Decoder() = default;
+
+bool Mp3Decoder::create(uint32_t channels, uint32_t sample_rate,
+                        std::string* error) {
+    Impl& d = *impl_;
+    HRESULT hr = create_sync_mft(MFT_CATEGORY_AUDIO_DECODER, MFAudioFormat_MP3,
+                                 MFMediaType_Audio, d.mft.put());
+    if (FAILED(hr)) return set_error(error, "MP3 decoder MFT not found", hr);
+
+    Com<IMFMediaType> input;
+    MFCreateMediaType(input.put());
+    input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    input->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_MP3);
+    input->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+    input->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
+    hr = d.mft->SetInputType(0, input.get(), 0);
+    if (FAILED(hr)) return set_error(error, "SetInputType(MP3)", hr);
+
+    if (!d.negotiate_output(error)) return false;
+
+    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    return true;
+}
+
+bool Mp3Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns) {
+    Impl& d = *impl_;
+    if (!d.mft) return false;
+    Com<IMFSample> sample;
+    if (FAILED(make_sample(data, size, pts_100ns, 0, sample.put())))
+        return false;
+    const HRESULT hr = d.mft->ProcessInput(0, sample.get(), 0);
+    if (hr == MF_E_NOTACCEPTING) {
+        log_warn("mf: MP3 ProcessInput not accepting — receive() first");
+        return false;
+    }
+    return SUCCEEDED(hr);
+}
+
+bool Mp3Decoder::receive(AudioChunk& out) {
+    Impl& d = *impl_;
+    if (!d.mft) return false;
+
+    for (;;) {
+        Com<IMFSample> sample;
+        bool stream_changed = false;
+        const HRESULT hr = pump_output(d.mft.get(), sample, &stream_changed);
+        if (stream_changed) {
+            std::string err;
+            if (!d.negotiate_output(&err)) return false;
+            continue;
+        }
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
+        if (FAILED(hr) || !sample) return false;
+
+        LONGLONG pts = 0;
+        sample->GetSampleTime(&pts);
+        Com<IMFMediaBuffer> buffer;
+        if (FAILED(sample->ConvertToContiguousBuffer(buffer.put())))
+            return false;
+        BYTE* src = nullptr;
+        DWORD len = 0;
+        if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
+        out.channels = d.out_channels;
+        out.sample_rate = d.out_rate;
+        out.pts_100ns = pts;
+        out.samples.resize(len / 2);
+        std::memcpy(out.samples.data(), src, out.samples.size() * 2);
+        buffer->Unlock();
+        return true;
+    }
+}
+
+void Mp3Decoder::drain() {
+    if (impl_->mft) {
+        impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
+}
+
 // ----------------------------------------------------------- H264Encoder
 
 struct H264Encoder::Impl {

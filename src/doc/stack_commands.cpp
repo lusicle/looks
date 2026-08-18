@@ -364,8 +364,11 @@ public:
         Look& look = look_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
+        pruned_ = prune_tombstone(look);   // a real wire replaces it
         had_replaced_ = false;
-        if (link_.to != 0) {
+        if (link_.to != 0 || link_.to_port != 0) {
+            // One feed per (to, port) - the Output's audio-in included:
+            // wiring it must never touch the image feed on port 0.
             for (auto it = look.links.begin(); it != look.links.end(); ++it)
                 if (it->to == link_.to && it->to_port == link_.to_port) {
                     replaced_ = *it;
@@ -409,6 +412,7 @@ public:
                 break;
             }
         if (had_replaced_) look.links.push_back(replaced_);
+        if (pruned_) seal_links(look);
         if (materialized_) look.links.clear();
     }
 
@@ -417,6 +421,7 @@ private:
     NodeLink replaced_{};
     bool had_replaced_ = false;
     bool materialized_ = false;
+    bool pruned_ = false;
 };
 
 class DisconnectCommand final : public LookCommand {
@@ -437,10 +442,16 @@ public:
                 removed_ = true;
                 break;
             }
+        sealed_ = false;
+        if (removed_ && look.links.empty()) {
+            seal_links(look);
+            sealed_ = true;
+        }
     }
 
     void revert(Document& doc) override {
         Look& look = look_of(doc);
+        if (sealed_) prune_tombstone(look);
         if (removed_) look.links.push_back(link_);
         if (materialized_) look.links.clear();
     }
@@ -449,6 +460,7 @@ private:
     NodeLink link_;
     bool removed_ = false;
     bool materialized_ = false;
+    bool sealed_ = false;
 };
 
 // Canvas frames: pure annotations, but still

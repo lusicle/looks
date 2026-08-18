@@ -22,7 +22,7 @@ namespace looks::gfx {
 struct GraphNode {
     enum class Kind : uint8_t {
         Source,        // decoded frame -> linear RGB working target. Every
-                       // clip source has its own, fed by the decode pool
+                       // media source has its own, fed by the decode pool
                        // under this node's key - there is no shared
                        // playhead frame.
         Generator,     // solid/gradient/noise layer source (-1 = black)
@@ -48,7 +48,7 @@ struct GraphNode {
     // path, layer or effect id) - and for Source nodes the asset folds
     // in too, so a lane cutting between two looks never serves one
     // file's pixels under the other's key. Per-effect engine history and
-    // per-clip decoded planes key on this. Razor-stable by construction:
+    // per-source decoded planes key on this. Razor-stable by construction:
     // paths fold container and target ids, never placement ids - with no
     // effects at sequence level there is nothing a cut could reset.
     uint64_t key = 0;
@@ -89,10 +89,11 @@ struct RenderGraph {
     // placements, parents always before children.
     std::vector<LookInstance> instances;
     int output = -1;           // the REAL output — the composite, always
-    // REFERENCE SOURCE: the first clip source playing in the root
-    // instance, or -1. The A/B wipe compares against it and the shared
-    // motion field is measured on it — a multi-clip look has no single
-    // "the source", so the first one is named as the reference.
+    // REFERENCE SOURCE: the first media source playing in the root
+    // instance, or -1. The shared motion field and prev-luma are
+    // measured on it — a multi-source entity has no single "the source",
+    // so the first one is named as the reference. The A/B wipe no
+    // longer reads it (it compares against `before`).
     int source = -1;
     // Viewport tap: the node the big preview publishes instead (selection
     // preview). -1 = show the output. Nothing else (thumbs, export,

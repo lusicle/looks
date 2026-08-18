@@ -2,7 +2,7 @@
 // keyed on (frame index, upstream-graph hash) with an LRU byte budget
 // (default 2 GB). The "upstream graph" of the final frame is the whole
 // document plus everything else that shapes the output (proxy divisor,
-// preview tap, clip identity); callers fold all of it into one context
+// preview tap, media identity); callers fold all of it into one context
 // hash. A context change flushes the cache wholesale — an entry from an
 // edited document can never be served.
 //

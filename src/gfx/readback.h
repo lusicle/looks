@@ -26,7 +26,7 @@ public:
     // Evaluates one look at one frame through `engine`, converts to NV12,
     // and blocks on the fence. `out` receives packed NV12 (stride ==
     // width; Y plane then interleaved UV). Canvas dimensions must be even.
-    // Clip pixels arrive through `layer_sources` (the caller's decode
+    // Media pixels arrive through `layer_sources` (the caller's decode
     // pool), exactly as in preview.
     // cache_ctx passes through to Engine::render (0 = bypass the frame
     // render cache — the default for export, which visits each frame once).

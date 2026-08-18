@@ -150,6 +150,17 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_white_balance.comp.spv", 1},
     {"fx_sharpen.comp.spv", 1},
     {"fx_corner_pin.comp.spv", 1},
+    // Audio modifiers: no kernel - the compiler routes the image graph
+    // around them (is_audio_effect), so they never dispatch.
+    {nullptr, 0},
+    {nullptr, 0},
+    {nullptr, 0},
+    {nullptr, 0},
+    {nullptr, 0},
+    {nullptr, 0},
+    // Offset: a time shim - the compiler replaces it with a shifted
+    // source read (or routes through it); it never dispatches.
+    {nullptr, 0},
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -312,7 +323,9 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         // word (the history-pass index), velocity-scan one (front-state
         // width); glyph appends four (atlas grid cols/rows + tile px +
         // color flag, custom glyph sets); text appends four
-        // (glyph count + MSDF px range + string width + atlas em px).
+        // (glyph count + MSDF px range + string width + atlas em px);
+        // motion-extract appends four (the reference source's fit rect -
+        // its luma planes are native while the frame is the canvas).
         const auto type_i = static_cast<doc::EffectType>(i);
         const uint32_t extra =
             (type_i == doc::EffectType::SlitScan ||
@@ -321,7 +334,8 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
              type_i == doc::EffectType::VelocityScan)
                 ? 1u
                 : (type_i == doc::EffectType::Glyph ||
-                           type_i == doc::EffectType::Text
+                           type_i == doc::EffectType::Text ||
+                           type_i == doc::EffectType::MotionExtract
                        ? 4u
                        : 0u);
         desc.push_bytes = static_cast<uint32_t>(
@@ -334,7 +348,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     flow_desc.spv_name = "flow.comp.spv";
     flow_desc.sampled_inputs = 2;
     flow_desc.storage_outputs = 1;
-    flow_desc.push_bytes = 3 * sizeof(uint32_t);
+    flow_desc.push_bytes = 7 * sizeof(uint32_t);
     flow_ = ComputePipeline::create(device_, shader_dir, flow_desc);
     if (!flow_) return false;
 
@@ -1432,7 +1446,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     StagingBuffer& staging = *staging_[frame_index % kFramesInFlight];
     staging.reset();
 
-    // The CANVAS is the project's, never the clip's: a cut between two
+    // The CANVAS is the project's, never the media's: a cut between two
     // source sizes must not resize the graph.
     // Working dimensions shrink under the preview proxy — kernels sample
     // by uv, so everything scales; even dims keep the codec paths happy.
@@ -1534,10 +1548,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // recycle here (mid-frame resets would clobber same-segment uploads).
     if (segmented) codec_io_.staging->reset();
 
-    // The REFERENCE SOURCE: the first clip source playing in the root
-    // instance. A multi-clip look has no single "the source", so the graph
-    // names one — the A/B wipe compares against it and the shared motion
-    // field is measured on it.
+    // The REFERENCE SOURCE: the first media source playing in the root
+    // instance. A multi-source entity has no single "the source", so the
+    // graph names one — the shared motion field and prev-luma are
+    // measured on it (the A/B wipe compares against `before` instead).
     const uint64_t ref_key =
         graph.source >= 0
             ? graph.nodes[static_cast<size_t>(graph.source)].key
@@ -1582,7 +1596,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     last_ref_key_ = ref_key;
     have_last_frame_ = true;
 
-    // Clip sources: one I420 upload per PLACEMENT, keyed per instance.
+    // Media sources: one I420 upload per PLACEMENT, keyed per instance.
     for (size_t i = 0; i < layer_source_count; ++i) {
         const LayerSourceFrame& lf = layer_sources[i];
         if (!lf.planes.y || !lf.planes.u || !lf.planes.v ||
@@ -1623,7 +1637,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     }
 
     // The motion pair the shared Flow field and MotionExtract read. With
-    // no clip source in the look there is nothing moving to measure: a
+    // no media source in the look there is nothing moving to measure: a
     // cleared 1x1 plane reads as flat black, so motion comes out zero
     // instead of undefined.
     GpuImage* ref_plane = nullptr;
@@ -1782,7 +1796,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
         switch (node.kind) {
             case GraphNode::Kind::Source: {
-                // The decode pool feeds every clip source under this
+                // The decode pool feeds every media source under this
                 // node's key. A key with no frame (decode failed, or an
                 // unbound asset) reads flat black rather than another
                 // layer's pixels.
@@ -1800,7 +1814,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 const GpuImage* planes[3] = {it->second.y.get(),
                                              it->second.u.get(),
                                              it->second.v.get()};
-                // Aspect-preserving fit: the clip lands centered at its
+                // Aspect-preserving fit: the media lands centered at its
                 // own shape, transparent outside - never stretched.
                 float fit[4];
                 source_fit_rect(it->second.y->width(),
@@ -2239,11 +2253,24 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::MotionExtract) {
+                    // Native luma planes vs canvas frame: the mask
+                    // samples through the reference source's fit rect.
+                    float fit[4];
+                    source_fit_rect(ref_plane->width(),
+                                    ref_plane->height(), w, h, fit);
+                    push[kFxPreludeWords + param_count] = as_bits(fit[0]);
+                    push[kFxPreludeWords + param_count + 1] =
+                        as_bits(fit[1]);
+                    push[kFxPreludeWords + param_count + 2] =
+                        as_bits(1.0f / std::max(fit[2], 1.0f));
+                    push[kFxPreludeWords + param_count + 3] =
+                        as_bits(1.0f / std::max(fit[3], 1.0f));
                     const GpuImage* sampled[3] = {input_image(0), prev_plane,
                                                   ref_plane};
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 3, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                        push_bytes + 4 * sizeof(uint32_t), w, h,
+                        linear_sampler_);
                 } else if (fx.type == doc::EffectType::Glyph) {
                     // set: 0 halftone, 1 ascii, 2 custom (user-
                     // droppable tilesets), 3 braille, 4 teletext; missing
@@ -3210,11 +3237,25 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::Flow: {
-                const uint32_t push[3] = {w, h,
-                                          prev_frame_valid_ ? 1u : 0u};
+                // Native planes vs canvas block grid: sample through the
+                // reference source's fit rect so the field registers
+                // with the composited content.
+                float fit[4];
+                source_fit_rect(ref_plane->width(), ref_plane->height(),
+                                w, h, fit);
+                struct {
+                    uint32_t w, h, valid;
+                    float rx, ry, iw, ih;
+                } fpush = {w,
+                           h,
+                           prev_frame_valid_ ? 1u : 0u,
+                           fit[0],
+                           fit[1],
+                           1.0f / std::max(fit[2], 1.0f),
+                           1.0f / std::max(fit[3], 1.0f)};
                 const GpuImage* sampled[2] = {ref_plane, prev_plane};
                 flow_->dispatch(rec, arena_, frame_index, sampled, 2, &dst, 1,
-                                push, sizeof(push), dst->width(),
+                                &fpush, sizeof(fpush), dst->width(),
                                 dst->height(), linear_sampler_);
                 break;
             }

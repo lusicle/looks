@@ -1,14 +1,20 @@
-// Tree audio mix: a look's audio is the sum of its
-// active clip sources' PCM through their time maps.
+// Tree audio mix: a look's audio is its VOICE - PCM plus an ordered DSP
+// op list per instance - summed through the time maps.
 //
 // render_mix is a PURE function of (mix, sample range) - the monitor
 // callback and the export encoder share it, so any position dependence
-// would desync what you hear from what you get.
+// would desync what you hear from what you get. DSP ops must keep that
+// contract: they are functions of absolute source position, no carried
+// state.
 
 #include "media/audio_mix.h"
 
+#include <cstring>
+
 #include "test_framework.h"
 
+using looks::media::MixOp;
+using looks::media::MixOpKind;
 using looks::media::MixSource;
 using looks::media::MixState;
 using looks::media::PcmBuffer;
@@ -152,4 +158,109 @@ TEST(mix_ramps_the_edges) {
     std::vector<int16_t> middle(4, 0);
     render_mix(mix, 4000, middle.data(), 4, scratch);
     for (int16_t v : middle) CHECK_EQ(v, int16_t{1000});
+}
+
+TEST(mix_ops_gain_scales_the_voice) {
+    MixState mix = one_source_mix(ramp_pcm(48000, 1, 48000), 0.0, 100.0,
+                                  0.0, 1.0);
+    MixOp gain;
+    gain.kind = MixOpKind::Gain;
+    gain.p[0] = 2.0f;
+    mix.sources[0].ops.push_back(gain);
+    std::vector<float> scratch;
+    std::vector<int16_t> out(8, 0);
+    render_mix(mix, 4000, out.data(), 8, scratch);
+    for (uint32_t i = 0; i < 8; ++i)
+        CHECK_EQ(out[i], static_cast<int16_t>((4000 + i) * 2));
+}
+
+TEST(mix_ops_bitcrush_quantizes_amplitude) {
+    auto flat = std::make_shared<PcmBuffer>();
+    flat->channels = 1;
+    flat->rate = 48000;
+    flat->samples.assign(48000, int16_t{1000});
+    MixState mix = one_source_mix(flat, 0.0, 100.0, 0.0, 1.0);
+    MixOp crush;
+    crush.kind = MixOpKind::Bitcrush;
+    crush.p[0] = 8.0f;   // step 65536/256 = 256 -> 1000 snaps to 1024
+    mix.sources[0].ops.push_back(crush);
+    std::vector<float> scratch;
+    std::vector<int16_t> out(4, 0);
+    render_mix(mix, 4000, out.data(), 4, scratch);
+    for (int16_t v : out) CHECK_EQ(v, int16_t{1024});
+}
+
+TEST(mix_ops_delay_echoes_the_past) {
+    // Impulse at source frame 0; 100 ms at 48 kHz is 4800 samples. The
+    // echoes re-read the source at shifted positions - no carried state.
+    auto pcm = std::make_shared<PcmBuffer>();
+    pcm->channels = 1;
+    pcm->rate = 48000;
+    pcm->samples.assign(48000, int16_t{0});
+    pcm->samples[0] = 16000;
+    MixState mix = one_source_mix(pcm, 0.0, 100.0, 0.0, 1.0);
+    MixOp delay;
+    delay.kind = MixOpKind::Delay;
+    delay.p[0] = 100.0f;
+    delay.p[1] = 0.5f;
+    mix.sources[0].ops.push_back(delay);
+    std::vector<float> scratch;
+    std::vector<int16_t> out(1, 0);
+    render_mix(mix, 4800, out.data(), 1, scratch);
+    CHECK_EQ(out[0], int16_t{8000});    // first tap: fb^1
+    render_mix(mix, 9600, out.data(), 1, scratch);
+    CHECK_EQ(out[0], int16_t{4000});    // second tap: fb^2
+    render_mix(mix, 7200, out.data(), 1, scratch);
+    CHECK_EQ(out[0], int16_t{0});       // between taps: silence
+}
+
+TEST(mix_render_processed_pcm_applies_ops) {
+    // The runtime-analysis path renders the whole source through the
+    // ops at native rate; no ops is a straight copy.
+    auto pcm = ramp_pcm(64, 1, 48000);
+    looks::media::PcmBuffer out;
+    looks::media::render_processed_pcm(*pcm, {}, &out);
+    CHECK_EQ(out.samples.size(), pcm->samples.size());
+    CHECK_EQ(out.samples[10], pcm->samples[10]);
+    MixOp gain;
+    gain.kind = MixOpKind::Gain;
+    gain.p[0] = 2.0f;
+    looks::media::render_processed_pcm(*pcm, {gain}, &out);
+    CHECK_EQ(out.samples[10], int16_t{20});
+}
+
+TEST(mix_ops_are_pure_under_any_chunking) {
+    // The purity contract survives DSP: whole-range, odd-sized chunks,
+    // and sample-at-a-time renders of a delay+filter chain produce
+    // identical bytes - ops are functions of absolute position.
+    MixState mix = one_source_mix(ramp_pcm(48000, 1, 48000), 0.0, 100.0,
+                                  0.0, 1.0);
+    MixOp delay;
+    delay.kind = MixOpKind::Delay;
+    delay.p[0] = 50.0f;
+    delay.p[1] = 0.6f;
+    MixOp filt;
+    filt.kind = MixOpKind::Filter;
+    filt.p[0] = 0.2f;
+    mix.sources[0].ops = {delay, filt};
+
+    std::vector<float> scratch;
+    constexpr uint32_t kN = 192;
+    const int64_t at = 10000;
+    std::vector<int16_t> whole(kN, 0);
+    render_mix(mix, at, whole.data(), kN, scratch);
+
+    std::vector<int16_t> chunked(kN, 0);
+    for (uint32_t off = 0; off < kN; off += 29) {
+        const uint32_t n = std::min<uint32_t>(29, kN - off);
+        render_mix(mix, at + off, chunked.data() + off, n, scratch);
+    }
+    std::vector<int16_t> single(kN, 0);
+    for (uint32_t off = 0; off < kN; ++off)
+        render_mix(mix, at + off, single.data() + off, 1, scratch);
+
+    for (size_t i = 0; i < kN; ++i) {
+        CHECK_EQ(whole[i], chunked[i]);
+        CHECK_EQ(whole[i], single[i]);
+    }
 }

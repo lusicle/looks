@@ -4,6 +4,7 @@
 #include <cmath>
 #include <unordered_map>
 
+#include "doc/instances.h"
 #include "util/hash.h"
 
 namespace looks::gfx {
@@ -246,6 +247,14 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (ito == owner.end()) return false;
         const size_t li = ito->second;
         const doc::EffectInstance& fx = *fx_by_id[id];
+        // Audio modifiers are image-identity: the image graph routes
+        // around them like bypassed nodes; the audio flatten collects
+        // them into the voice's DSP op list instead. Offset shims never
+        // dispatch either - pass A2 turns the source-adjacent ones into
+        // shifted source reads, the rest route through.
+        if (doc::is_audio_effect(fx.type) ||
+            fx.type == doc::EffectType::Offset)
+            return false;
         return look.layers[li].visible && !fx.bypass &&
                !(layer_solo[li] && !fx.solo) &&
                !group_bypassed_in(li, fx.group_id);
@@ -264,17 +273,26 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         const doc::Layer& layer = look.layers[li];
         if (!layer.visible) continue;
         int cur = -1;
-        if (doc::layer_is_clip(layer)) {
-            // An unbound clip node is DORMANT, the way an unwired port
+        if (doc::layer_is_media(layer)) {
+            // An unbound media node is DORMANT, the way an unwired port
             // is. A bound one plays its media from local 0 (plus slip);
-            // past the media it is a CLOSED GATE.
+            // past the media it is a CLOSED GATE. A timeline-locked
+            // node reads (and windows) on the ROOT clock instead.
             if (!layer.asset) continue;
             const doc::Asset* a = doc.find_asset(layer.asset);
+            // An asset with no picture at all (audio import without
+            // cover art: no frames, no dimensions) has NO image head:
+            // the node is image-dormant and only the audio walk carries
+            // it. The flatten mirrors this exactly.
+            if (a && !a->frame_count && !a->width && !a->height) continue;
             const uint32_t frames = a ? a->frame_count : 0;
+            const double t = layer.timeline_lock
+                                 ? graph.instances[0].local_time
+                                 : self.local_time;
             if (frames) {
                 const uint32_t playable =
                     frames > layer.slip ? frames - layer.slip : 0;
-                if (self.local_time >= static_cast<double>(playable)) {
+                if (t >= static_cast<double>(playable)) {
                     time_culled[layer.id] = 1;
                     continue;
                 }
@@ -283,8 +301,9 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             src.kind = GraphNode::Kind::Source;
             src.layer_index = static_cast<int>(li);
             cur = add(std::move(src), inst,
-                      hash_combine(subject_key(layer.id), layer.asset));
-            // REFERENCE SOURCE: the first clip emitted anywhere — the
+                      doc::media_stream_key(path, layer.id, layer.asset,
+                                            layer.timeline_lock, 0));
+            // REFERENCE SOURCE: the first media source emitted anywhere — the
             // bottom-most, earliest chain — anchors the A/B wipe and the
             // shared motion field.
             if (graph.source < 0) graph.source = cur;
@@ -305,8 +324,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             if (self.depth + 1 >= doc::kMaxLookDepth) continue;
             LookInstance child;
             child.look = layer.target;
-            child.path = hash_combine(hash_combine(path, layer.id),
-                                      layer.target);
+            child.path = doc::nested_child_path(path, layer.id,
+                                                layer.target, 0);
             child.depth = self.depth + 1;
             child.local_time = self.local_time;
             child.local_frame = self.local_frame;
@@ -333,13 +352,115 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         heads[layer.id] = cur;
     }
 
+    std::unordered_map<uint64_t, int> fx_out;   // fx id → output node
+
+    // Pass A2: OFFSET shims. A live Offset wired DIRECTLY onto a source
+    // layer becomes a SHIFTED read of that source - media re-keys its
+    // decode stream, a nested ref re-instances on the shifted clock -
+    // and settles into fx_out like a producer. Wired anywhere else (an
+    // effect, a generator, dangling) it is a pass-through wire. The
+    // flatten mirrors this exactly (walk_look's vshifts + voice offset).
+    std::unordered_map<uint64_t, char> offset_terminal;
+    if (!strip_effects) {
+        for (size_t li = 0; li < look.layers.size(); ++li) {
+            if (!look.layers[li].visible) continue;
+            for (const doc::EffectInstance& fx : look.layers[li].stack) {
+                if (fx.type != doc::EffectType::Offset || fx.bypass)
+                    continue;
+                if (layer_solo[li] && !fx.solo) continue;
+                if (group_bypassed_in(li, fx.group_id)) continue;
+                if (!doc::offset_targets_video(fx)) continue;
+                const int64_t off = doc::offset_frames(fx);
+                if (!off) continue;
+                const uint64_t src = link_into(fx.id, 0);
+                const doc::Layer* sl = nullptr;
+                size_t sli = 0;
+                for (size_t k = 0; k < look.layers.size(); ++k)
+                    if (look.layers[k].id == src) {
+                        sl = &look.layers[k];
+                        sli = k;
+                    }
+                if (!sl || !sl->visible ||
+                    !(doc::layer_is_media(*sl) || doc::layer_is_nested(*sl)))
+                    continue;
+                offset_terminal[fx.id] = 1;
+                int shifted = -1;
+                if (doc::layer_is_media(*sl)) {
+                    if (!sl->asset) continue;   // dormant, like the base
+                    const doc::Asset* a = doc.find_asset(sl->asset);
+                    // Audio-only asset: image-dormant, like the base.
+                    if (a && !a->frame_count && !a->width && !a->height)
+                        continue;
+                    const uint32_t frames = a ? a->frame_count : 0;
+                    const double t = sl->timeline_lock
+                                         ? graph.instances[0].local_time
+                                         : self.local_time;
+                    const double m =
+                        t + static_cast<double>(sl->slip) +
+                        static_cast<double>(off);
+                    if (m < 0.0 ||
+                        (frames && m >= static_cast<double>(frames))) {
+                        time_culled[fx.id] = 1;
+                        continue;
+                    }
+                    GraphNode srcn;
+                    srcn.kind = GraphNode::Kind::Source;
+                    srcn.layer_index = static_cast<int>(sli);
+                    shifted = add(std::move(srcn), inst,
+                                  doc::media_stream_key(
+                                      path, sl->id, sl->asset,
+                                      sl->timeline_lock, off));
+                } else {
+                    if (!sl->target) continue;   // dangling: dormant
+                    const doc::Look* tl = doc.find_look(sl->target);
+                    const doc::Sequence* ts =
+                        tl ? nullptr : doc.find_sequence(sl->target);
+                    if (!tl && !ts) continue;
+                    const uint32_t dur = tl ? tl->duration : ts->duration;
+                    const double ct =
+                        self.local_time + static_cast<double>(off);
+                    if (ct < 0.0 ||
+                        (dur && ct >= static_cast<double>(dur))) {
+                        time_culled[fx.id] = 1;
+                        continue;
+                    }
+                    if (self.depth + 1 >= doc::kMaxLookDepth) continue;
+                    LookInstance child;
+                    child.look = sl->target;
+                    child.path = doc::nested_child_path(path, sl->id,
+                                                        sl->target, off);
+                    child.depth = self.depth + 1;
+                    child.local_time = ct;
+                    child.local_frame =
+                        ct <= 0.0 ? 0u
+                                  : static_cast<uint32_t>(std::floor(ct));
+                    graph.instances.push_back(child);
+                    const int ci =
+                        static_cast<int>(graph.instances.size()) - 1;
+                    shifted =
+                        emit_entity(sl->target, ci, /*is_root=*/false);
+                    if (shifted < 0) continue;
+                }
+                if (doc::layer_has_transform(*sl)) {
+                    GraphNode xf;
+                    xf.kind = GraphNode::Kind::LayerTransform;
+                    xf.layer_index = static_cast<int>(sli);
+                    xf.inputs.push_back(shifted);
+                    shifted = add(std::move(xf), inst, subject_key(sl->id));
+                }
+                fx_out[fx.id] = shifted;
+            }
+        }
+    }
+
     // Effective node behind an id: follow In links THROUGH inactive
     // effects (a bypassed node passes its input along) to a head, an
-    // active effect, or the shared source.
+    // active effect, a settled Offset shim, or the shared source.
     auto effective_from = [&](uint64_t cur) -> uint64_t {
         for (int guard = 0; guard < 512; ++guard) {
             if (owner.find(cur) == owner.end()) return cur;   // head / 0
             if (effect_active(cur)) return cur;
+            if (offset_terminal.count(cur)) return cur;
             cur = link_into(cur, 0);
         }
         return 0;
@@ -353,6 +474,9 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     auto feed_time_culled = [&](uint64_t id) {
         for (int guard = 0; guard < 512 && id; ++guard) {
             if (time_culled.count(id)) return true;
+            // A settled Offset shim is a live producer: the chain ends
+            // here, whatever the raw layer behind it is doing.
+            if (offset_terminal.count(id)) return false;
             if (owner.find(id) == owner.end()) return false;   // live head
             id = link_into(id, 0);
         }
@@ -362,7 +486,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     // One effect emission, with the In node resolved from the links.
     // matte_node (a port-1 IMAGE link — masks ARE images) runs through
     // the luma extract so the wired image gates the effect.
-    std::unordered_map<uint64_t, int> fx_out;   // fx id → output node
     auto emit_one = [&](size_t li, size_t stack_index, int in_node,
                         int aux_node = -1, int matte_node = -1) {
         const doc::EffectInstance& fx = look.layers[li].stack[stack_index];
@@ -504,11 +627,13 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
 
     // Resolves any document node id to its graph output for compositing.
     // Dormant / unresolvable = -1: the contribution simply does not
-    // exist (nothing is fabricated in its place).
+    // exist (nothing is fabricated in its place). fx_out first: it holds
+    // exactly the emitted producers (active effects + Offset shims).
     auto resolve = [&](uint64_t id) -> int {
-        if (effect_active(id))
-            if (auto it = fx_out.find(id); it != fx_out.end())
-                return it->second;
+        if (auto it = fx_out.find(id); it != fx_out.end()) return it->second;
+        // A shim with no head is time-culled or dormant: the chain ends
+        // here - never fall through to the unshifted layer.
+        if (offset_terminal.count(id)) return -1;
         const uint64_t up = owner.count(id) ? upstream_of(id) : id;
         if (auto it = fx_out.find(up); it != fx_out.end()) return it->second;
         if (auto it = heads.find(up); it != heads.end()) return it->second;
@@ -562,7 +687,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             if (gate_out >= 0) {
                 // Nothing below: the matte reveals TRANSPARENT black, the
                 // premultiplied zero. (Pre-alpha this revealed the raw
-                // clip, which was chain residue.)
+                // source, which was chain residue.)
                 GraphNode apply;
                 apply.kind = GraphNode::Kind::MatteApply;
                 apply.inputs = {black(), cur, gate_out};

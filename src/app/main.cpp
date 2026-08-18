@@ -1,7 +1,7 @@
 // looks — the app shell.
 //
 // The timeline is the clock: the transport runs the
-// scoped look's local time, the decode pool decodes one frame per clip
+// scoped look's local time, the decode pool decodes one frame per media
 // PLACEMENT in the instance tree, and the engine composites them into the
 // project canvas → letterboxed viewport blit, with the UI on top.
 // Sidebar: transport + effect stack + inspector; every document mutation is
@@ -34,6 +34,7 @@
 #include "doc/effects.h"
 #include "doc/stack_commands.h"
 #include "gfx/engine.h"
+#include "gfx/graph.h"
 #include "gfx/readback.h"
 #include "gfx/renderer.h"
 #include "gfx/viewport_pass.h"
@@ -90,8 +91,8 @@ struct ImportJob {
     std::atomic<bool> done{false};
     std::filesystem::path source;
     // Generic import: the asset joins the browser on completion and
-    // NOTHING is placed or played ("open clip" stays the fast lane).
-    // bind_layer additionally points a clip NODE at the new asset.
+    // NOTHING is placed or played ("open media" stays the fast lane).
+    // bind_layer additionally points a media NODE at the new asset.
     bool import_only = false;
     uint64_t bind_look = 0;
     uint64_t bind_layer = 0;
@@ -140,6 +141,48 @@ struct BundlePaths {
     bool ready = false;
 };
 
+// COMPLETENESS: freshness by mtime alone let a partial mez from an old
+// aborted import pass as the whole clip forever (it looked like a valid
+// SHORTER file). The mezzanine must cover the source's video duration;
+// short = stale, the caller re-imports over it. Probes cache per file
+// mtime; UI thread only.
+bool bundle_covers_source(const std::filesystem::path& mez,
+                          const std::filesystem::path& source) {
+    std::wstring ext = source.extension().wstring();
+    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+    if (ext != L".mp4" && ext != L".mov") return true;
+    struct Probe {
+        std::filesystem::file_time_type mtime;
+        double secs = 0.0;
+    };
+    static std::map<std::wstring, Probe> cache;
+    auto probe = [&](const std::filesystem::path& p, auto&& measure) {
+        std::error_code ec;
+        const auto t = std::filesystem::last_write_time(p, ec);
+        auto it = cache.find(p.native());
+        if (it != cache.end() && !ec && it->second.mtime == t)
+            return it->second.secs;
+        const double secs = measure(p);
+        cache[p.native()] = {t, secs};
+        return secs;
+    };
+    const double src_secs =
+        probe(source, [](const std::filesystem::path& p) {
+            return media::probe_video_duration_seconds(p);
+        });
+    if (src_secs <= 0.0) return true;   // unknown: trust freshness
+    const double mez_secs =
+        probe(mez, [](const std::filesystem::path& p) {
+            uint32_t frames = 0;
+            double fps = 0.0;
+            if (!codec::mez_probe(p, &frames, &fps) || fps <= 0.0)
+                return 0.0;
+            return static_cast<double>(frames) / fps;
+        });
+    if (mez_secs <= 0.0) return true;   // unreadable: downstream reports
+    return mez_secs + 2.0 >= src_secs;
+}
+
 BundlePaths resolve_bundle(const std::filesystem::path& source) {
     BundlePaths out;
     std::filesystem::path mez = source;
@@ -152,9 +195,31 @@ BundlePaths resolve_bundle(const std::filesystem::path& source) {
             mez = bundle_dir_for(source) /
                   (source.stem().wstring() + L".mez");
     }
-    const bool have = mez == source ? std::filesystem::exists(mez)
-                                    : bundle_is_fresh(mez, source);
-    if (!have) return out;
+    const bool have = (mez == source ? std::filesystem::exists(mez)
+                                     : bundle_is_fresh(mez, source)) &&
+                      bundle_covers_source(mez, source);
+    if (!have) {
+        // Audio sources (wav/mp3) with no mezzanine - no embedded cover
+        // art - are PCM-only bundles: the media node carries the sound
+        // and has no image side at all.
+        std::wstring ext = source.extension().wstring();
+        for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+        if (ext == L".wav" || ext == L".mp3") {
+            std::filesystem::path beside = source;
+            beside.replace_extension(".pcm");
+            const std::filesystem::path cached =
+                bundle_dir_for(source) /
+                (source.stem().wstring() + L".pcm");
+            if (bundle_is_fresh(beside, source))
+                out.pcm = beside;
+            else if (bundle_is_fresh(cached, source))
+                out.pcm = cached;
+            else
+                return out;
+            out.ready = true;
+        }
+        return out;
+    }
     out.mez = mez;
     out.pcm = mez;
     out.pcm.replace_extension(".pcm");
@@ -164,9 +229,9 @@ BundlePaths resolve_bundle(const std::filesystem::path& source) {
     return out;
 }
 
-// Still-image clips (import scope: PNG/TGA) get different clip UI:
+// Still-image media (import scope: PNG/TGA) get different media UI:
 // a duration entry instead of the time/audio rows, which are meaningless
-// when every frame is identical and there is no clip audio.
+// when every frame is identical and there is no media audio.
 bool is_still_source(const std::filesystem::path& source) {
     std::wstring ext = source.extension().wstring();
     for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
@@ -192,30 +257,35 @@ std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
 struct AppState;
 void open_source(AppState& app, const std::filesystem::path& picked);
 
-// ---- look scope + the project's clip
+// ---- look scope + the project's media
 
-// The project's first asset's path - the fallback clip for helpers that
+// The project's first asset's path - the fallback media for helpers that
 // need one representative media file. Empty when nothing is imported.
-inline std::string primary_clip_path(const doc::Document& doc) {
+inline std::string primary_media_path(const doc::Document& doc) {
     const doc::Asset* a = doc.primary_asset();
     return a ? a->path : std::string();
 }
 
-// Binds `path` as the project's clip and points every unbound clip NODE
-// at it. Environment, not an undoable edit — the same policy the single
-// clip_path field carried.
-inline void bind_primary_clip(doc::Document& doc, const std::string& path) {
-    if (doc.assets.empty()) {
+// Resolves `path` to an ASSET - reusing one that already carries the
+// path, else appending a new one - and points every unbound media NODE at
+// it. Environment, not an undoable edit. It must NEVER rewrite an
+// existing asset's path: repointing assets.front() at whatever file was
+// opened silently swapped the media under every placement of asset[0].
+inline void bind_primary_media(doc::Document& doc, const std::string& path) {
+    uint64_t asset_id = 0;
+    for (const doc::Asset& a : doc.assets)
+        if (a.path == path) asset_id = a.id;
+    if (!asset_id) {
         doc::Asset a;
         a.id = doc.next_effect_id++;
+        a.path = path;
+        a.name = std::filesystem::path(path).filename().string();
+        asset_id = a.id;
         doc.assets.push_back(std::move(a));
     }
-    doc::Asset& asset = doc.assets.front();
-    asset.path = path;
-    asset.name = std::filesystem::path(path).filename().string();
     for (doc::Look& look : doc.looks)
         for (doc::Layer& l : look.layers)
-            if (doc::layer_is_clip(l) && !l.asset) l.asset = asset.id;
+            if (doc::layer_is_media(l) && !l.asset) l.asset = asset_id;
 }
 
 // Still-image length lives on the asset (it describes the media, not the
@@ -310,6 +380,36 @@ inline void frame_rate_ratio(double fps,
 using PcmCache =
     std::unordered_map<uint64_t, std::shared_ptr<const media::PcmBuffer>>;
 
+// doc -> mix op translation, shared by the mix build and the runtime
+// analysis path. False for non-audio types (never emitted by a flatten).
+inline bool to_mix_op(const doc::AudioOp& op, media::MixOp* m) {
+    switch (op.type) {
+        case doc::EffectType::AudioGain:
+            m->kind = media::MixOpKind::Gain;
+            break;
+        case doc::EffectType::AudioBitcrush:
+            m->kind = media::MixOpKind::Bitcrush;
+            break;
+        case doc::EffectType::AudioDownsample:
+            m->kind = media::MixOpKind::Downsample;
+            break;
+        case doc::EffectType::AudioDistortion:
+            m->kind = media::MixOpKind::Distortion;
+            break;
+        case doc::EffectType::AudioDelay:
+            m->kind = media::MixOpKind::Delay;
+            break;
+        case doc::EffectType::AudioFilter:
+            m->kind = media::MixOpKind::Filter;
+            break;
+        default:
+            return false;
+    }
+    for (int i = 0; i < 4; ++i) m->p[i] = op.params[i];
+    m->wet = op.wet;
+    return true;
+}
+
 // The audio half of the instance tree: the same flattened placements the
 // decode pool decodes, carrying PCM instead of pixels.
 inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
@@ -331,8 +431,9 @@ inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
         static_cast<double>(std::max<uint32_t>(span, 1));
     // Sound rides AUDIO tracks only: a video block with no linked audio
     // partner genuinely has no audio; a scoped look sounds like its
-    // clips in lockstep.
-    for (const doc::ClipInstance& c : doc::flatten_audio_sources(doc, look_id)) {
+    // VOICE - the chain wired into its Output - with the chain's
+    // audio-modifier hops riding along as the instance's DSP op list.
+    for (const doc::MediaInstance& c : doc::flatten_audio_sources(doc, look_id)) {
         if (c.gain <= 0.0f) continue;
         const auto it = pcm.find(c.asset);
         if (it == pcm.end() || !it->second) continue;
@@ -343,6 +444,10 @@ inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
         src.source_in = c.source_in;
         src.speed = c.speed;
         src.gain = c.gain;
+        for (uint32_t oi = 0; oi < c.op_count; ++oi) {
+            media::MixOp m;
+            if (to_mix_op(c.ops[oi], &m)) src.ops.push_back(m);
+        }
         if (src.t_out <= src.t_in) continue;
         mix.sources.push_back(std::move(src));
     }
@@ -382,6 +487,9 @@ struct RenderWorker {
         mod::AnalysisCurves analysis;
         bool has_analysis = false;
         uint64_t analysis_stamp = ~0ull;
+        // Wired analysis nodes' runtime curves (immutable snapshot,
+        // republished by pointer each push).
+        std::shared_ptr<const mod::NodeAudioMap> node_audio;
         // Where every asset's media lives (media/bundle.h): the decode
         // pool resolves placements through this, not through the document.
         std::vector<media::AssetBundle> bundles;
@@ -411,7 +519,7 @@ struct RenderWorker {
         bool glyph_is_color = false;
         bool glyph_pending = false;
         // Audio Scope hand-off: mono PCM copy for the engine's waveform
-        // strip (empty = silent clip).
+        // strip (empty = silent media).
         std::vector<int16_t> scope_data;
         uint32_t scope_rate = 0;
         bool scope_pending = false;
@@ -495,7 +603,7 @@ struct RenderWorker {
         cv_.notify_all();
     }
 
-    // Drop published frames (clip changed — stale pixels must not linger).
+    // Drop published frames (media changed — stale pixels must not linger).
     void invalidate() {
         std::lock_guard<std::mutex> lock(m_);
         latest_ = -1;
@@ -686,6 +794,7 @@ void RenderWorker::run() {
     mod::AnalysisCurves analysis;
     bool has_analysis = false;
     uint64_t analysis_stamp = ~0ull;
+    std::shared_ptr<const mod::NodeAudioMap> node_audio;
     uint64_t cache_doc_hash = 0;
     bool cache_doc_history = false;
     uint64_t cache_hash_revision = ~0ull;
@@ -746,6 +855,10 @@ void RenderWorker::run() {
                 has_analysis = job_.has_analysis;
                 analysis_stamp = job_.analysis_stamp;
                 doc_changed = true;   // curves feed the render too
+            }
+            if (job_.node_audio != node_audio) {
+                node_audio = job_.node_audio;
+                doc_changed = true;
             }
             if (job_.bundle_stamp != bundle_stamp) {
                 bundles = job_.bundles;
@@ -829,7 +942,7 @@ void RenderWorker::run() {
                 span, live_mode ? app_seconds : -1.0);
         }
 
-        // Clip pixels: one decoded frame per PLACEMENT in the instance
+        // Media pixels: one decoded frame per PLACEMENT in the instance
         // tree, keyed exactly as the compiler keys its Source nodes.
         const auto tp0 = std::chrono::steady_clock::now();
         pool.set_document(doc, look_id, bundles, doc_revision);
@@ -857,7 +970,7 @@ void RenderWorker::run() {
         const doc::Document resolved = mod::resolve(
             doc, mod_frame, mod_fps, has_analysis ? &analysis : nullptr,
             live_mode ? app_seconds : -1.0, live_mode ? env_key_time : -1.0,
-            &sfv);
+            &sfv, node_audio ? node_audio.get() : nullptr);
         const auto tp2 = std::chrono::steady_clock::now();
         engine->set_preview_divisor(preview_div);
         engine->cache().set_budget(static_cast<size_t>(doc.cache_mb) << 20);
@@ -1097,6 +1210,7 @@ std::unique_ptr<ExportJob> start_export(
     const std::vector<media::AssetBundle>& bundles, const PcmCache& pcm,
     const std::filesystem::path& scope_pcm, const doc::Document& doc,
     uint64_t export_look_id, const mod::AnalysisCurves* analysis,
+    std::shared_ptr<const mod::NodeAudioMap> node_audio,
     const std::filesystem::path& out_path) {
     auto job = std::make_unique<ExportJob>();
     job->out_path = out_path;
@@ -1112,6 +1226,7 @@ std::unique_ptr<ExportJob> start_export(
                                pcm_copy = std::move(pcm_copy),
                                doc_copy = std::move(doc_copy),
                                curves_copy = std::move(curves_copy),
+                               node_audio = std::move(node_audio),
                                has_analysis, raw, out_path,
                                export_look_id] {
         auto engine = gfx::Engine::create(device, shader_dir);
@@ -1143,20 +1258,24 @@ std::unique_ptr<ExportJob> start_export(
         pool.set_document(doc_copy, export_look_id, bundle_copy, 1);
         mod::TimeRemap remap;
         const double fps = project_fps(doc_copy, bundle_copy);
-        // Look trim: export renders exactly the trim region; modulation
-        // still resolves on absolute timeline frames so preview and export
-        // stay bit-identical.
-        const doc::Sequence& export_seq = doc_copy.sequence(export_look_id);
-        const uint32_t total = doc::sequence_duration(doc_copy, export_seq);
+        // The exported id is a LOOK or a SEQUENCE - resolve duration and
+        // trim for whichever it actually is (the fallback accessor would
+        // silently take the root sequence's trim for a look export).
+        uint32_t total = 0, t_in = 0, t_out = 0;
+        if (const doc::Look* el = doc_copy.find_look(export_look_id)) {
+            total = doc::look_duration(doc_copy, *el);
+            t_out = total;
+        } else if (const doc::Sequence* es =
+                       doc_copy.find_sequence(export_look_id)) {
+            total = doc::sequence_duration(doc_copy, *es);
+            t_in = total ? std::min(es->trim_in, total - 1) : 0;
+            t_out = es->trim_out ? std::min(es->trim_out, total) : total;
+        }
         if (total == 0) {
-            raw->result.error = "nothing to export (empty sequence)";
+            raw->result.error = "nothing to export (empty entity)";
             raw->done = true;
             return;
         }
-        const uint32_t t_in = std::min(export_seq.trim_in, total - 1);
-        const uint32_t t_out = export_seq.trim_out
-                                   ? std::min(export_seq.trim_out, total)
-                                   : total;
         const uint32_t span = t_out > t_in ? t_out - t_in : total;
         auto producer = [&](uint32_t f, std::vector<uint8_t>& nv12) {
             const uint32_t abs_f = t_in + f;
@@ -1187,7 +1306,8 @@ std::unique_ptr<ExportJob> start_export(
             }
             const doc::Document resolved = mod::resolve(
                 doc_copy, abs_f, fps, has_analysis ? &curves_copy : nullptr,
-                -1.0, -1.0, &sfv);
+                -1.0, -1.0, &sfv,
+                node_audio ? node_audio.get() : nullptr);
             return readback->render(*engine, resolved, export_look_id,
                                     play_frame, fps, canvas_w, canvas_h, nv12,
                                     0, abs_f,
@@ -1267,8 +1387,8 @@ struct RouteUiState {
 struct LayerUiState {
     ui::ButtonState select_button, visible_check, remove_button;
     ui::ButtonState up_button, down_button, unique_button;
-    ui::DropdownState blend_dd, osc_dd, clip_dd;
-    ui::ButtonState clip_browse;
+    ui::DropdownState blend_dd, osc_dd, media_dd;
+    ui::ButtonState media_browse;
     ui::SwatchState swatch_a, swatch_b;
     ui::SliderState sliders[9];
     ui::ButtonState value_edit_button;   // rail type-in field
@@ -1279,7 +1399,7 @@ struct LayerUiState {
     ui::ButtonState audio_mute_btn;
     // Transform + trim, folded by default.
     bool xf_open = false;
-    ui::ButtonState xf_header, flip_h_btn, flip_v_btn;
+    ui::ButtonState xf_header, flip_h_btn, flip_v_btn, lock_btn;
     ui::SliderState xf_sliders[8];
     ui::ButtonState xf_route_buttons[8], xf_key_buttons[8];
 };
@@ -1398,15 +1518,16 @@ struct AppState {
 
     // Two different questions the UI used to ask the player. A TIMELINE
     // exists whenever the scoped look has length - generators alone are
-    // enough. MEDIA is about the primary clip bundle: its name, its
-    // analysis, its still duration, the proxy row.
+    // enough. MEDIA means the project owns assets - keying this on the
+    // single opened media file hid the whole inspector from projects built by
+    // browser/timeline drops.
     bool has_timeline() const { return player.frame_count() > 0; }
-    bool has_media() const { return !mez_path.empty(); }
+    bool has_media() const { return !document.assets.empty(); }
 
     media::Player player;
     std::unique_ptr<ImportJob> import;
     std::unique_ptr<ExportJob> export_job;
-    std::filesystem::path mez_path, pcm_path;   // PRIMARY clip bundle
+    std::filesystem::path mez_path, pcm_path;   // PRIMARY media bundle
     // Every asset's resolved media, plus its PCM in RAM. Rebuilt when the
     // asset list, the proxy toggle or a bundle on disk changes; the stamp
     // is what the render worker and the mix watch.
@@ -1422,31 +1543,46 @@ struct AppState {
     // loop polls pcm_path and re-posts on change; empty = silent).
     std::filesystem::path scope_pcm_loaded;
     bool scope_pcm_init = false;
-    mod::AnalysisCurves analysis;               // merged view (see sidechain)
+    mod::AnalysisCurves analysis;   // the media's own curves; eval reads
+                                    // only the VIDEO set from these
     bool has_analysis = false;
     // Bumped whenever `analysis` is replaced — the render worker copies
     // the curves only when this moves.
     uint64_t analysis_stamp = 1;
+    // Runtime analysis for WIRED analysis nodes: per-node curves of the
+    // wired chain's processed audio. Rebuilt on document settle (stale
+    // during a coalescing gesture, recomputed on release - same class
+    // as the render cache's interactive skip); entries cached by chain
+    // content so a settled document rebuilds for free.
+    std::shared_ptr<const mod::NodeAudioMap> node_audio_map;
+    std::unordered_map<uint64_t, std::shared_ptr<const mod::AnalysisCurves>>
+        node_audio_cache;
+    uint64_t node_audio_revision = ~0ull;
+    uint64_t node_audio_stamp = 0;
     // Preview render thread; owned by wWinMain, pointer here so
-    // clip open/close paths can pause it around player mutation.
+    // media open/close paths can pause it around player mutation.
     RenderWorker* render_worker = nullptr;
     uint64_t ui_frame_counter = 0;
-    // Sidechain: analysis = clip video curves + (sidechain or
-    // clip) audio curves. clip_analysis keeps the clip's own set.
-    mod::AnalysisCurves clip_analysis;
-    bool has_clip_analysis = false;
-    std::string sc_active_path;         // sidechain merged into `analysis`
+    // Sidechain: external audio for the EXPORT MUX only - modulation
+    // never reads it (reactive audio is the wired chain's own signal).
+    mod::AnalysisCurves media_analysis;
+    bool has_media_analysis = false;
+    std::string sc_active_path;         // probed document path
     std::filesystem::path sc_pcm_path;  // extracted PCM cache (export mux)
     bool sc_ok = false;
     double env_key_time = -1.0;         // live keypress trigger
     // Thumbnail strip: RGBA staging until the renderer registers
-    // it (textures are long-lived; a new clip just registers another one).
+    // it (textures are long-lived; a new media file just registers another one).
     std::vector<uint8_t> thumbs_rgba;
     uint32_t thumbs_w = 0, thumbs_h = 0, thumbs_count = 0;
     bool thumbs_dirty = false;
     const ui::UiTexture* thumbs_tex = nullptr;
-    // Half-res proxy: which file the player currently plays.
+    // Half-res proxy: which files the bundles currently resolve to.
+    // The probe is per-ASSET (any asset with a proxy counts) and cached
+    // per bundle stamp - asset[0] alone was the single-clip-era key.
     bool proxy_active = false;
+    uint64_t proxy_probe_stamp = ~0ull;
+    bool proxy_probe_has = false;
     // Lossless import (mezzanine option), applies to the NEXT
     // import. App preference (ui.json), not project state.
     bool import_lossless = false;
@@ -1456,19 +1592,19 @@ struct AppState {
     std::string preset_filter;
     bool preset_search_focus = false;
     ui::ButtonState preset_search_btn, preset_import_btn;
-    // Still-clip duration entry (seconds): same capture-the-keyboard field
+    // Still-media duration entry (seconds): same capture-the-keyboard field
     // pattern as the preset search; Enter commits, Escape cancels.
     std::string duration_edit;
     bool duration_focus = false;
     ui::ButtonState duration_btn;
-    std::string clip_name;      // empty = test pattern
+    std::string media_name;      // empty = test pattern
     std::string status;         // transient message line
     ConfirmDialog confirm;      // in-app modal guard (unsaved / restore)
     // Timeline audio-strip acceleration: per-frame combined amplitude plus
     // 64-frame block maxima, rebuilt when the analysis stamp moves. The
     // strip's per-column max scan otherwise touches every frame in the
     // visible span each UI frame - milliseconds per frame zoomed out on
-    // long clips.
+    // long media.
     struct StripAccel {
         uint64_t stamp = 0;
         std::vector<float> amp_frame;         // max(low, mid, high) per frame
@@ -1547,7 +1683,7 @@ struct AppState {
     float split_timeline = 0.26f;   // timeline share of the left column
     float split_preview = 0.42f;    // preview share of the right column
     ui::SliderState split_drag[3];
-    // Inspector tabs: 0 = node (selection context), 1 = project (clip +
+    // Inspector tabs: 0 = node (selection context), 1 = project (media +
     // project — the old left rail), 2 = presets (the browser).
     int inspector_tab = 0;
     ui::ButtonState tab_buttons[4];
@@ -1595,8 +1731,8 @@ struct AppState {
 
     // Timeline view: the visible frame range shared by the ruler,
     // audio strip, and every lane so they stay column-aligned. v1 <= v0
-    // reads as "whole clip". Wheel zooms around the cursor, shift+wheel
-    // pans; zooming fully out restores the whole-clip view.
+    // reads as "whole span". Wheel zooms around the cursor, shift+wheel
+    // pans; zooming fully out restores the whole-span view.
     double tl_v0 = 0.0, tl_v1 = 0.0;
     // Timeline region rect: strips union into _accum during draw, the
     // frame loop swaps it in — the wheel pre-router and the keyboard
@@ -1688,7 +1824,7 @@ struct AppState {
     bool alpha_checker = false;
 
     // Render queue: pending exports, each a full snapshot taken
-    // at queue time (document, analysis, clip bundle) so edits made while
+    // at queue time (document, analysis, media bundle) so edits made while
     // a job runs don't leak into it. FIFO; the front starts when the
     // active job finishes.
     struct QueuedExport {
@@ -1698,6 +1834,7 @@ struct AppState {
         uint64_t look_id = 0;
         bool has_analysis = false;
         mod::AnalysisCurves analysis;
+        std::shared_ptr<const mod::NodeAudioMap> node_audio;
         std::vector<media::AssetBundle> bundles;
         PcmCache pcm;
         std::filesystem::path scope_pcm;
@@ -1913,6 +2050,9 @@ int layer_index_by_id(const doc::Look& look, uint64_t id) {
 
 // Drops a selection whose subject no longer exists (undo, remove, load).
 void validate_selection(AppState& app) {
+    // Node selection is look-scope state; at sequence scope there is
+    // nothing to validate (and app.look() would be the fallback).
+    if (!app.scope_is_look()) return;
     const doc::Look& d = app.look();
     size_t li = 0, fi = 0;
     switch (app.sel.kind) {
@@ -1965,13 +2105,85 @@ void validate_selection(AppState& app) {
         app.multi_sel.end());
 }
 
-void load_clip_analysis(AppState& app) {
+// Runtime analysis for wired analysis nodes: render each wired chain's
+// processed audio once, run the import analyzer over it, publish the
+// per-node map resolve() samples. Cached by chain content - a settled
+// document rebuilds in microseconds; the first analysis of a changed
+// chain costs a beat on the UI thread, only when the wiring or an
+// audio op actually changed.
+void refresh_node_audio(AppState& app) {
+    auto map = std::make_shared<mod::NodeAudioMap>();
+    std::unordered_map<uint64_t, std::shared_ptr<const mod::AnalysisCurves>>
+        keep;
+    const double fps = project_fps(app.document, app.bundles);
+    for (const doc::Look& look : app.document.looks)
+        for (const doc::ValueNode& vn : look.value_nodes) {
+            if (!doc::value_kind_wants_audio(vn.source.type) ||
+                !vn.audio_src)
+                continue;
+            const doc::AudioChain chain =
+                doc::resolve_audio_chain(app.document, look, vn.audio_src);
+            if (!chain.asset) continue;   // no entry: the node reads 0
+            const auto pit = app.pcm_cache.find(chain.asset);
+            if (pit == app.pcm_cache.end() || !pit->second) continue;
+            const media::PcmBuffer& pcm = *pit->second;
+            uint64_t key = hash_combine(chain.asset, pcm.frames());
+            uint64_t bits = 0;
+            std::memcpy(&bits, &fps, 8);
+            key = hash_combine(key, bits);
+            for (uint32_t i = 0; i < chain.op_count; ++i) {
+                const doc::AudioOp& op = chain.ops[i];
+                key = hash_combine(key, static_cast<uint64_t>(op.type));
+                uint32_t pb = 0;
+                for (int p = 0; p < 4; ++p) {
+                    std::memcpy(&pb, &op.params[p], 4);
+                    key = hash_combine(key, pb);
+                }
+                std::memcpy(&pb, &op.wet, 4);
+                key = hash_combine(key, pb);
+            }
+            std::shared_ptr<const mod::AnalysisCurves> curves;
+            if (auto it = app.node_audio_cache.find(key);
+                it != app.node_audio_cache.end()) {
+                curves = it->second;
+            } else {
+                std::vector<media::MixOp> ops;
+                for (uint32_t i = 0; i < chain.op_count; ++i) {
+                    media::MixOp m;
+                    if (to_mix_op(chain.ops[i], &m)) ops.push_back(m);
+                }
+                media::PcmBuffer processed;
+                media::render_processed_pcm(pcm, ops, &processed);
+                const doc::Asset* a = app.document.find_asset(chain.asset);
+                const double secs =
+                    pcm.rate ? static_cast<double>(pcm.frames()) / pcm.rate
+                             : 0.0;
+                const uint32_t media_frames = std::max<uint32_t>(
+                    a ? a->frame_count : 0,
+                    static_cast<uint32_t>(secs * fps) + 1);
+                mod::AnalysisData data;
+                mod::analyze_audio(processed.samples.data(),
+                                   processed.frames(), processed.channels,
+                                   processed.rate, fps, media_frames,
+                                   &data);
+                auto owned = std::make_shared<mod::AnalysisCurves>();
+                *owned = data.curves();
+                curves = owned;
+            }
+            keep.emplace(key, curves);
+            (*map)[vn.id] = {curves, chain.slip, chain.offset};
+        }
+    app.node_audio_cache = std::move(keep);   // unreferenced entries drop
+    app.node_audio_map = std::move(map);
+}
+
+void load_media_analysis(AppState& app) {
     app.has_analysis = false;
     app.analysis = {};
-    app.clip_analysis = {};
-    app.has_clip_analysis = false;
+    app.media_analysis = {};
+    app.has_media_analysis = false;
     ++app.analysis_stamp;
-    app.sc_active_path.clear();   // force a sidechain re-merge
+    app.sc_active_path.clear();   // force a sidechain re-probe
     app.sc_pcm_path.clear();
     app.sc_ok = false;
     app.proxy_active = false;     // open_source opened the full-res file
@@ -1979,9 +2191,9 @@ void load_clip_analysis(AppState& app) {
     path.replace_extension(".analysis");
     mod::AnalysisData data;
     if (mod::load_analysis(path, &data)) {
-        app.clip_analysis = data.curves();
-        app.has_clip_analysis = true;
-        app.analysis = app.clip_analysis;
+        app.media_analysis = data.curves();
+        app.has_media_analysis = true;
+        app.analysis = app.media_analysis;
         app.has_analysis = true;
     }
 
@@ -2030,9 +2242,11 @@ void load_clip_analysis(AppState& app) {
     }
 }
 
-// Sidechain: keep `analysis` = clip video curves + the sidechain
-// audio curves. Extraction result is cached next to the clip bundle as
-// <stem>.sc.pcm and re-analyzed only when the document path changes.
+// Sidechain: the EXTERNAL AUDIO export can mux in place of the media's
+// (sidechain_mux) - PCM-extracted and cached next to the bundle as
+// <stem>.sc.pcm. Modulation NEVER reads it: reactive audio is the wired
+// chain's own signal (import a wav as media to react to external
+// audio).
 void sync_sidechain(AppState& app) {
     if (!app.has_media()) return;   // the .sc.pcm cache sits by the bundle
     const std::string& want = app.document.sidechain_path;
@@ -2040,9 +2254,6 @@ void sync_sidechain(AppState& app) {
     app.sc_active_path = want;
     app.sc_ok = false;
     app.sc_pcm_path.clear();
-    app.analysis = app.clip_analysis;
-    app.has_analysis = app.has_clip_analysis;
-    ++app.analysis_stamp;
     if (want.empty()) return;
 
     const std::filesystem::path src(want);
@@ -2062,27 +2273,6 @@ void sync_sidechain(AppState& app) {
         app.status = "sidechain: " + error;
         return;
     }
-
-    media::PcmReader pcm;
-    if (!pcm.open(dest, &error)) {
-        app.status = "sidechain pcm: " + error;
-        return;
-    }
-    std::vector<int16_t> samples(
-        static_cast<size_t>(pcm.frame_count()) * pcm.channels());
-    pcm.read(0, samples.data(), static_cast<size_t>(pcm.frame_count()));
-    mod::AnalysisData data;
-    const double fps = app.player.fps() > 0.0 ? app.player.fps() : 30.0;
-    mod::analyze_audio(samples.data(), pcm.frame_count(), pcm.channels(),
-                       pcm.sample_rate(), fps, app.player.frame_count(),
-                       &data);
-    app.analysis.low = std::move(data.low);
-    app.analysis.mid = std::move(data.mid);
-    app.analysis.high = std::move(data.high);
-    app.analysis.onset = std::move(data.onset);
-    app.analysis.bpm = data.bpm;
-    app.has_analysis = true;
-    ++app.analysis_stamp;
     app.sc_pcm_path = dest;
     app.sc_ok = true;
     app.status = "sidechain: " + src.filename().string();
@@ -2150,7 +2340,7 @@ void load_ui_prefs(AppState& app) {
     ui::set_active_theme(app.theme_index);
 }
 
-// Open a clip: an existing sidecar bundle (<stem>.mez[/.pcm]) opens
+// Open media: an existing sidecar bundle (<stem>.mez[/.pcm]) opens
 // directly; otherwise a background import produces one first.
 bool set_still_frames(AppState& app, uint32_t frames);
 
@@ -2169,30 +2359,36 @@ void refresh_bundles(AppState& app) {
             const BundlePaths paths =
                 resolve_bundle(std::filesystem::path(asset.path));
             if (paths.ready) {
-                // Preview may run the half-res proxy; export never does.
-                std::filesystem::path open_path = paths.mez;
-                if (app.document.use_proxy) {
-                    std::filesystem::path proxy = paths.mez;
-                    proxy.replace_extension(".proxy.mez");
-                    std::error_code ec;
-                    if (std::filesystem::exists(proxy, ec)) open_path = proxy;
+                if (!paths.mez.empty()) {
+                    // Preview may run the half-res proxy; export never
+                    // does.
+                    std::filesystem::path open_path = paths.mez;
+                    if (app.document.use_proxy) {
+                        std::filesystem::path proxy = paths.mez;
+                        proxy.replace_extension(".proxy.mez");
+                        std::error_code ec;
+                        if (std::filesystem::exists(proxy, ec))
+                            open_path = proxy;
+                    }
+                    codec::MezReader reader;
+                    std::string error;
+                    if (reader.open(open_path, &error)) {
+                        bundle.mez = open_path;
+                        bundle.frames = reader.frame_count();
+                        bundle.width = reader.width();
+                        bundle.height = reader.height();
+                        bundle.fps = reader.fps();
+                        bundle.timescale = reader.timescale();
+                        bundle.frame_duration = reader.frame_duration();
+                    }
                 }
-                codec::MezReader reader;
-                std::string error;
-                if (reader.open(open_path, &error)) {
-                    bundle.mez = open_path;
-                    bundle.pcm = paths.pcm;
-                    bundle.frames = reader.frame_count();
-                    bundle.width = reader.width();
-                    bundle.height = reader.height();
-                    bundle.fps = reader.fps();
-                    bundle.timescale = reader.timescale();
-                    bundle.frame_duration = reader.frame_duration();
-                }
+                // The PCM rides regardless of the mez: audio-only
+                // bundles (wav) have no mez at all.
+                bundle.pcm = paths.pcm;
             }
         }
         // The document caches what looks need before any decode opens.
-        // Direct write, like the clip binding: media facts, not edits.
+        // Direct write, like the media binding: media facts, not edits.
         if (asset.frame_count != bundle.frames || asset.fps != bundle.fps ||
             asset.width != bundle.width || asset.height != bundle.height) {
             asset.frame_count = bundle.frames;
@@ -2271,26 +2467,26 @@ void refresh_asset_amp(AppState& app) {
     }
 }
 
-// The look wrapping an asset: a clip is the simplest look, so raw media
+// The look wrapping an asset: a lone media node is the simplest look, so raw media
 // never sits on a timeline. Reused per asset - dropping the same file
-// twice places the same treated clip twice (templates by design).
+// twice places the same treated media twice (templates by design).
 uint64_t find_wrapper_look(const doc::Document& doc, uint64_t asset_id) {
     for (const doc::Look& l : doc.looks)
-        if (l.layers.size() == 1 && doc::layer_is_clip(l.layers[0]) &&
+        if (l.layers.size() == 1 && doc::layer_is_media(l.layers[0]) &&
             l.layers[0].asset == asset_id)
             return l.id;
     return 0;
 }
 
 // Adds `picked` to the project as an ASSET and places it at `at_frame`:
-// at sequence scope the clip arrives WRAPPED IN A LOOK and lands as a
+// at sequence scope the media arrives WRAPPED IN A LOOK and lands as a
 // block on the first lane (with its linked audio pair when the media has
-// sound); scoped inside a look it lands as a clip NODE in the graph -
+// sound); scoped inside a look it lands as a media NODE in the graph -
 // looks are timeless, so a drop into one carries no when. Reuses an
 // asset already bound to the same path so dropping twice does not import
 // twice. Returns false when the media has no usable bundle yet (the
 // caller imports first); everything it does lands in ONE undo step.
-bool place_clip_block(AppState& app, const std::filesystem::path& picked,
+bool place_media_block(AppState& app, const std::filesystem::path& picked,
                       uint32_t at_frame, uint64_t track_id) {
     const BundlePaths paths = resolve_bundle(picked);
     if (!paths.ready) return false;
@@ -2300,12 +2496,12 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
         if (a.path == picked.string()) asset_id = a.id;
 
     if (app.scope_is_look()) {
-        // Graph drop: a clip node, in lockstep like every source.
+        // Graph drop: a media node, in lockstep like every source.
         if (app.look().layers.size() >= doc::kMaxLayers) {
             app.status = "layer limit reached";
             return true;
         }
-        app.undo.begin_group("Add Clip");
+        app.undo.begin_group("Add Media");
         if (!asset_id) {
             doc::Asset asset = doc::make_asset(app.document,
                                                picked.filename().string(),
@@ -2317,7 +2513,7 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
         app.undo.execute(app.document,
                          doc::materialize_links_command(app.look().id));
         doc::Layer layer =
-            doc::make_layer(app.document, doc::LayerSourceKind::Clip);
+            doc::make_layer(app.document, doc::LayerSourceKind::Media);
         layer.name = picked.stem().string();
         layer.asset = asset_id;
         const uint64_t layer_id = layer.id;
@@ -2348,7 +2544,7 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
         return true;
     }
     const uint64_t lane_id = lane->id;
-    app.undo.begin_group("Add Clip");
+    app.undo.begin_group("Add Media");
     if (!asset_id) {
         doc::Asset asset = doc::make_asset(app.document,
                                            picked.filename().string(),
@@ -2360,24 +2556,31 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
     uint64_t wrapper = find_wrapper_look(app.document, asset_id);
     if (!wrapper) {
         doc::Look look = doc::make_look(app.document, picked.stem().string());
-        doc::Layer clip =
-            doc::make_layer(app.document, doc::LayerSourceKind::Clip);
-        clip.name = picked.stem().string();
-        clip.asset = asset_id;
-        look.layers.push_back(std::move(clip));
+        doc::Layer media =
+            doc::make_layer(app.document, doc::LayerSourceKind::Media);
+        media.name = picked.stem().string();
+        media.asset = asset_id;
+        look.layers.push_back(std::move(media));
         wrapper = look.id;
         app.undo.execute(app.document,
                          doc::add_look_command(std::move(look)));
     }
-    doc::Placement block;
-    block.id = app.document.next_effect_id++;
-    block.target = wrapper;
-    block.t_in = at_frame;
-    block.t_out = 0;   // runs as long as the media does
-    const uint64_t video_place_id = block.id;
-    app.undo.execute(app.document,
-                     doc::add_placement_command(seq.id, lane_id, block));
-    // A clip WITH sound lays a linked audio placement beside the video
+    // Audio-only media (wav: no mez) lays JUST the audio placement -
+    // there is no picture to put on a video lane, and an unbounded
+    // empty block would overwrite the lane for nothing.
+    const bool audio_only = paths.mez.empty();
+    uint64_t video_place_id = 0;
+    if (!audio_only) {
+        doc::Placement block;
+        block.id = app.document.next_effect_id++;
+        block.target = wrapper;
+        block.t_in = at_frame;
+        block.t_out = 0;   // runs as long as the media does
+        video_place_id = block.id;
+        app.undo.execute(app.document,
+                         doc::add_placement_command(seq.id, lane_id, block));
+    }
+    // Media WITH sound lays a linked audio placement beside the video
     // one: audio presence is a placement that exists, never an inference
     // from the asset. Silent media lays none.
     if (!paths.pcm.empty()) {
@@ -2393,8 +2596,9 @@ bool place_clip_block(AppState& app, const std::filesystem::path& picked,
                              video_place_id));
     }
     // The landed block OVERWRITES whatever its span covers on the lane.
-    if (const doc::Placement* landed =
-            doc::find_placement(app.sequence(), video_place_id)) {
+    if (const doc::Placement* landed = video_place_id
+            ? doc::find_placement(app.sequence(), video_place_id)
+            : nullptr) {
         const uint32_t end = doc::placement_end(
             *landed, doc::source_length(app.document, *landed));
         doc::overwrite_lane_span(app.document, app.undo, seq.id, lane_id,
@@ -2514,14 +2718,14 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame,
     return true;
 }
 
-// "Open clip" and a finished import ENSURE the clip is on the timeline:
+// "Open media" and a finished import ENSURE the media is on the timeline:
 // one block of its wrapper look (with the linked audio pair), laid
 // through the SAME undoable path a drop uses - there is exactly one way
 // anything enters the arrangement, and Delete makes it stay gone.
-// Already-placed clips place nothing, so reopening never stacks blocks;
-// at look scope the clip lands as a graph node instead (place_clip_block
+// Already-placed media places nothing, so reopening never stacks blocks;
+// at look scope the media lands as a graph node instead (place_media_block
 // branches there).
-void ensure_clip_placed(AppState& app,
+void ensure_media_placed(AppState& app,
                         const std::filesystem::path& picked) {
     if (!app.scope_is_look()) {
         uint64_t asset_id = 0;
@@ -2536,7 +2740,7 @@ void ensure_clip_placed(AppState& app,
                         if (p.target == wrapper) return;
         }
     }
-    place_clip_block(app, picked, app.player.current_frame_index(), 0);
+    place_media_block(app, picked, app.player.current_frame_index(), 0);
 }
 
 // Generic IMPORT: the asset joins the browser and NOTHING is placed or
@@ -2571,17 +2775,17 @@ void import_media(AppState& app, const std::filesystem::path& picked) {
     app.import->import_only = true;
 }
 
-// Browse-and-bind for a clip NODE (card row and inspector button share
+// Browse-and-bind for a media NODE (card row and inspector button share
 // this): existing or ready media binds now in one undo group; fresh
 // media runs the import job carrying the bind target.
-void browse_and_bind_clip(AppState& app, platform::Window* window,
+void browse_and_bind_media(AppState& app, platform::Window* window,
                           uint64_t look_id, uint64_t layer_id) {
     if (app.import) {
         app.status = "an import is already running";
         return;
     }
     auto picked = platform::show_open_dialog(
-        window, {{"video / image", "*.mp4;*.mov;*.mez;*.png;*.tga"},
+        window, {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
                  {"all files", "*.*"}});
     if (!picked) return;
     uint64_t asset_id = 0;
@@ -2594,8 +2798,8 @@ void browse_and_bind_clip(AppState& app, platform::Window* window,
         doc::Layer* layer = nullptr;
         for (doc::Layer& l : look->layers)
             if (l.id == layer_id) layer = &l;
-        if (!layer || !doc::layer_is_clip(*layer)) return;
-        app.undo.begin_group("Bind Clip");
+        if (!layer || !doc::layer_is_media(*layer)) return;
+        app.undo.begin_group("Bind Media");
         if (!asset_id) {
             doc::Asset asset = doc::make_asset(
                 app.document, picked->filename().string(),
@@ -2625,9 +2829,9 @@ void browse_and_bind_clip(AppState& app, platform::Window* window,
 }
 
 void open_source(AppState& app, const std::filesystem::path& picked) {
-    // Bind the clip to the document so save/open restores it. Direct write,
-    // not a command: the clip binding is environment, not an undoable edit.
-    bind_primary_clip(app.document, picked.string());
+    // Bind the media to the document so save/open restores it. Direct write,
+    // not a command: the media binding is environment, not an undoable edit.
+    bind_primary_media(app.document, picked.string());
     app.duration_focus = false;
     app.duration_edit.clear();
     // The render worker must not touch the decode pool's files while the
@@ -2648,12 +2852,12 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
     // app never dumps files into footage folders.
     const BundlePaths paths = resolve_bundle(picked);
     if (paths.ready) {
-        app.clip_name = picked.filename().string();
+        app.media_name = picked.filename().string();
         app.mez_path = paths.mez;
         app.pcm_path = paths.pcm;
         refresh_bundles(app);
-        ensure_clip_placed(app, picked);
-        load_clip_analysis(app);
+        ensure_media_placed(app, picked);
+        load_media_analysis(app);
         app.player.set_looping(app.loop);
         app.player.play();
         app.status.clear();
@@ -2663,7 +2867,7 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
             is_still_source(picked))
             set_still_frames(app, primary_still_duration(app.document));
     } else {
-        app.clip_name.clear();
+        app.media_name.clear();
         app.mez_path.clear();
         app.pcm_path.clear();
         refresh_bundles(app);
@@ -2723,7 +2927,7 @@ void apply_still_duration(AppState& app, double seconds) {
     doc::Asset* asset =
         app.document.assets.empty() ? nullptr : &app.document.assets.front();
     if (asset && asset->still_duration_frames != frames) {
-        // Direct write + revision bump, like the clip binding: not an
+        // Direct write + revision bump, like the media binding: not an
         // undoable edit (undo cannot restore the rewritten file), but it
         // must dirty the project and refresh the worker's doc copy.
         asset->still_duration_frames = frames;
@@ -2836,6 +3040,13 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
     }
     app.document = std::move(*loaded);
     app.undo.clear();
+    // The revision counter RESTARTS in a loaded document; every
+    // revision-gated cache must resync, or an accidental match with the
+    // old counter keeps serving the previous project - the first frame
+    // then never renders until some command bumps the revision.
+    app.pushed_doc_revision = ~0ull;
+    app.node_audio_revision = ~0ull;
+    app.mix_revision = ~0ull;
     // The scope belongs to the OLD document. Ids restart low in every
     // project, so a stale one does not merely dangle - it resolves to an
     // unrelated look in the new one, and AppState::look() only
@@ -2864,20 +3075,20 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
             app.render_worker->pause();
             app.render_worker->invalidate();
         }
-        app.clip_name.clear();
+        app.media_name.clear();
         app.mez_path.clear();
         app.pcm_path.clear();
         app.pcm_cache.clear();
         refresh_bundles(app);
         if (app.render_worker) app.render_worker->resume();
     };
-    const std::filesystem::path clip = primary_clip_path(app.document);
+    const std::filesystem::path media = primary_media_path(app.document);
     std::error_code ec;
-    if (!clip.empty() && std::filesystem::exists(clip, ec)) {
-        open_source(app, clip);   // may report its own failure
+    if (!media.empty() && std::filesystem::exists(media, ec)) {
+        open_source(app, media);   // may report its own failure
     } else {
         drop_media();
-        if (!clip.empty()) note += " (clip missing)";
+        if (!media.empty()) note += " (media missing)";
     }
     if (app.status.empty()) app.status = std::move(note);
 }
@@ -2998,13 +3209,16 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
                 if (auto rec = doc::load_document(d.path, &error)) {
                     app.document = std::move(*rec);
                     app.undo.clear();
+                    app.pushed_doc_revision = ~0ull;
+                    app.node_audio_revision = ~0ull;
+                    app.mix_revision = ~0ull;
                     app.saved_revision = app.document.revision - 1;
                     app.autosaved_revision = app.document.revision;
-                    if (!primary_clip_path(app.document).empty()) {
-                        const std::filesystem::path clip =
-                            primary_clip_path(app.document);
-                        if (std::filesystem::exists(clip, ec))
-                            open_source(app, clip);
+                    if (!primary_media_path(app.document).empty()) {
+                        const std::filesystem::path media =
+                            primary_media_path(app.document);
+                        if (std::filesystem::exists(media, ec))
+                            open_source(app, media);
                     }
                     app.status = "restored unsaved session";
                 } else {
@@ -3156,6 +3370,15 @@ void draw_confirm_dialog(ui::Canvas2D& canvas, const ui::Font& font,
 // bumps the serial so the worker wakes when a re-render is due.
 void push_render_job(RenderWorker& w, AppState& app) {
     bool changed = false;
+    // Wired-analysis curves follow the document, but never mid-gesture:
+    // recompute on settle, serve the stale map while coalescing.
+    if ((app.node_audio_revision != app.document.revision ||
+         app.node_audio_stamp != app.bundle_stamp) &&
+        !app.undo.coalescing_active()) {
+        refresh_node_audio(app);
+        app.node_audio_revision = app.document.revision;
+        app.node_audio_stamp = app.bundle_stamp;
+    }
     // One document copy per revision, built OUTSIDE the lock; the worker
     // retains the pointer without copying. A revision that IS the
     // in-flight gesture's placement edit skips the snapshot entirely and
@@ -3190,6 +3413,10 @@ void push_render_job(RenderWorker& w, AppState& app) {
             j.analysis_stamp = app.analysis_stamp;
             changed = true;
         }
+        if (j.node_audio != app.node_audio_map) {
+            j.node_audio = app.node_audio_map;
+            changed = true;
+        }
         const bool want_source = app.ab_wipe || app.bypass_all;
         auto set = [&](auto& dst, const auto& src) {
             if (!(dst == src)) {
@@ -3219,9 +3446,20 @@ void push_render_job(RenderWorker& w, AppState& app) {
             default:
                 break;
         }
-        if (preview_key == 0 && app.layer_sel &&
-            app.selected_layer < app.look().layers.size())
-            preview_layer_key = app.look().layers[app.selected_layer].id;
+        // selected_layer is dual-typed: a look LAYER index at look
+        // scope, a sequence TRACK index at sequence scope - the tap id
+        // must match the scoped entity or it lands on the fallback look.
+        if (preview_key == 0 && app.layer_sel) {
+            if (app.scope_is_look()) {
+                if (app.selected_layer < app.look().layers.size())
+                    preview_layer_key =
+                        app.look().layers[app.selected_layer].id;
+            } else if (app.selected_layer <
+                       app.sequence().tracks.size()) {
+                preview_layer_key =
+                    app.sequence().tracks[app.selected_layer].id;
+            }
+        }
         set(j.preview_node, preview_key);
         set(j.preview_layer, preview_layer_key);
         // The monitor's content box: measure the selected video block's
@@ -3421,7 +3659,7 @@ struct FrameUi {
         Opacity, ColorAR, ColorAG, ColorAB, ColorBR, ColorBG, ColorBB,
         Scale, Angle,
         CropL, CropR, CropT, CropB, XfScale, Rotate,
-        // The clip node's one timing nuance: a static media in-point.
+        // The media node's one timing nuance: a static media in-point.
         Slip,
         OscShape,   // waveform/shape selector (canvas dropdown row)
     };
@@ -3455,27 +3693,27 @@ struct FrameUi {
     // the monitor returns to the film. Shift presses stay inert so a
     // collect spree survives a missed block.
     bool* tl_deselect = nullptr;
-    // The selected clip NODE's media binding: pick an imported asset or
+    // The selected media NODE's media binding: pick an imported asset or
     // browse for new media (imports, then binds).
-    struct ClipBind {
+    struct MediaBind {
         uint64_t layer_id;
         int* selected;      // index into the document's asset list
         bool* browse;
     };
-    std::vector<ClipBind> clip_binds;
+    std::vector<MediaBind> media_binds;
     // The same binding ON THE CARD: a dropdown row whose entries are
     // "(none)", every asset, then "import...". *staged holds the pick.
-    struct ClipRowBind {
+    struct MediaRowBind {
         uint64_t layer_id;
         float* staged;
         bool* changed;
         int n_assets;
     };
-    std::vector<ClipRowBind> clip_row_binds;
+    std::vector<MediaRowBind> media_row_binds;
     bool* import_media_clicked = nullptr;
     // BROWSER: the project tab lists what the user
     // deliberately made - sequences and assets - never the internal graph
-    // every clip carries. Open sets the editing scope; place lays a block
+    // every imported media carries. Open sets the editing scope; place lays a block
     // at the playhead.
     struct BrowserAction {
         uint64_t id;
@@ -3547,10 +3785,11 @@ struct FrameUi {
         bool* xf_toggle = nullptr;   // fold/unfold the transform section
         bool* flip_h = nullptr;      // toggle clicks (transform)
         bool* flip_v = nullptr;
+        bool* clock_lock = nullptr;  // media: lockstep <-> timeline clock
         bool* audio_mute = nullptr;  // silence this source in the mix
     };
     std::vector<LayerRow> layer_rows;
-    // solid, gradient, noise, test pattern, oscillator, shape, clip tap
+    // solid, gradient, noise, test pattern, oscillator, shape, media tap
     bool* add_layer_clicked[7] = {};
 
     // Group + preset staging.
@@ -3600,7 +3839,10 @@ struct FrameUi {
     int* project_fps_selected = nullptr;
     int* project_res_selected = nullptr;
     // Sidechain + audio nudge.
-    int* sc_selected = nullptr;          // [clip, <file>, pick]; -1 untouched
+    int* sc_selected = nullptr;          // [media, <file>, pick]; -1 untouched
+    // Output card audio-routing dropdown (combined|split).
+    float* out_audio_staged = nullptr;
+    bool* out_audio_changed = nullptr;
     bool* sc_mux_changed = nullptr;
     bool* sc_mux_staged = nullptr;
     float* nudge_staged = nullptr;
@@ -3612,7 +3854,7 @@ struct FrameUi {
     bool* lossless_staged = nullptr;
     bool* preset_search_clicked = nullptr;  // searchable browser
     bool* preset_import_clicked = nullptr;  // single-file import
-    bool* duration_clicked = nullptr;       // still-clip duration field
+    bool* duration_clicked = nullptr;       // still-media duration field
     bool* ab_clicked = nullptr;
     float* wipe_staged = nullptr;
     bool* wipe_changed = nullptr;
@@ -4631,7 +4873,7 @@ uint32_t timeline_frame_at(const AppState& app, float x) {
 }
 
 // Wheel over the timeline region: zoom around the cursor; shift+wheel
-// pans. Zooming out clamps back to the whole clip. The x mapping uses the
+// pans. Zooming out clamps back to the whole span. The x mapping uses the
 // ruler column (label column excluded via tl_strip_x/w).
 void timeline_zoom_wheel(AppState& app, ui::UiInput& input,
                          uint32_t frame_count) {
@@ -4722,7 +4964,7 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const float px_per_sec =
             static_cast<float>(u->fps / vspan) * r.w;
         // Ticks thin with density: under ~5 px apart the per-second lines
-        // merge into noise and the loop scales with clip length instead of
+        // merge into noise and the loop scales with media length instead of
         // strip width. Labels stay on tick multiples so they still land.
         const int tick_every =
             px_per_sec >= 5.0f
@@ -4866,7 +5108,7 @@ struct AudioStripUser {
     double v0, v1;
 };
 
-// 64 frames per acceleration block: coarse enough that a whole-clip span
+// 64 frames per acceleration block: coarse enough that a whole-media span
 // costs span/64 block reads, fine enough that partial edges stay cheap.
 constexpr uint32_t kStripBlock = 64;
 
@@ -4952,12 +5194,12 @@ void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
 // One audio contributor inside a block: samples the per-asset amp array
 // through the block's (possibly nested) time map. `outer` is the block
-// layer's placement in scoped-local time; `inner` is a flattened clip
+// layer's placement in scoped-local time; `inner` is a flattened media
 // placement in the referenced look's local time (nested blocks only).
 struct TlAmpSrc {
     const std::vector<float>* amp = nullptr;
     doc::Placement outer;
-    doc::ClipInstance inner;
+    doc::MediaInstance inner;
     bool nested = false;
     float gain = 1.0f;
 };
@@ -4966,8 +5208,8 @@ inline float tl_amp_sample(const TlAmpSrc& s, double local) {
     double af;
     if (s.nested) {
         const double rl = doc::placement_source_frame(s.outer, local);
-        if (!doc::clip_active(s.inner, rl)) return 0.0f;
-        af = doc::clip_source_frame(s.inner, rl);
+        if (!doc::media_active(s.inner, rl)) return 0.0f;
+        af = doc::media_source_frame(s.inner, rl);
     } else {
         af = doc::placement_source_frame(s.outer, local);
     }
@@ -4982,7 +5224,7 @@ struct TlBlock {
     uint64_t placement_id = 0;
     double t0 = 0.0, t1 = 0.0;    // local frame span (t1 resolved)
     const char* name = "";
-    int kind = 0;                 // 0 clip, 2 look
+    int kind = 0;                 // 0 media, 2 look
     bool selected = false;
     doc::Placement place;
     uint32_t src_len = 0;         // 0 = unbounded
@@ -6376,19 +6618,19 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
 }
 
 // Popup source entries: sources are just
-// nodes you add like anything else. "source: clip" is THE input — a tap
-// off the project clip (the adjustment type is gone; a clip tap merged
+// nodes you add like anything else. "source: media" is THE input — a tap
+// off the project media (the adjustment type is gone; a media tap merged
 // back through a Blend IS an adjustment). Order here MUST match the pick
 // handler's walk.
 // "source: look" mints a NEW empty look and places an instance of it —
 // the one way to nest from the canvas; double-click the
 // card to go edit it.
 static const char* kSrcAddLabels[] = {
-    "source: clip",  "source: solid", "source: gradient",
+    "source: media",  "source: solid", "source: gradient",
     "source: noise", "source: pattern", "source: osc",
     "source: shape", "source: look"};
 static const doc::LayerSourceKind kSrcAddKinds[] = {
-    doc::LayerSourceKind::Clip,
+    doc::LayerSourceKind::Media,
     doc::LayerSourceKind::Solid, doc::LayerSourceKind::Gradient,
     doc::LayerSourceKind::Noise, doc::LayerSourceKind::TestPattern,
     doc::LayerSourceKind::Oscillator, doc::LayerSourceKind::Shape,
@@ -6488,7 +6730,7 @@ struct AddAction {
 enum class CtxAction : uint8_t {
     Bypass, Duplicate, Group, Ungroup, OpenGroup, RenameGroup, SavePreset,
     AlignLeft, AlignTop, SpreadH, SpreadV, Delete, Export, RenameFrame,
-    FrameColor, DeleteFrame,
+    FrameColor, DeleteFrame, ToggleAudioSplit,
     // Param housekeeping: defaults / clipboard across same-type
     // effects.
     ResetParams, CopyParams, PasteParams,
@@ -6627,7 +6869,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         app.has_analysis ? &app.analysis : nullptr;
     doc::Look resolved = d;
     mod::resolve_look(d, resolved, live_frame, live_fps, live_analysis,
-                      live_audio_off);
+                      live_audio_off, -1.0, -1.0, nullptr,
+                      app.node_audio_map.get());
     mod::ValueEnv venv;
     venv.look = &d;
     venv.t = live_frame / live_fps;
@@ -6635,6 +6878,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     venv.analysis = live_analysis;
     venv.fps = live_fps;
     venv.audio_off = live_audio_off;
+    venv.node_audio = app.node_audio_map.get();
     auto resolved_fx_value = [&](uint64_t eid, int pi, float* out_v) {
         size_t rli = 0, rfi = 0;
         if (!find_effect_by_id(resolved, eid, &rli, &rfi)) return false;
@@ -6769,9 +7013,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                           static_cast<float>(layer.osc_shape % 3), "%.0f",
                           "circle|box|diamond");
             }
-            if (doc::layer_is_clip(layer) && srow < 10) {
+            if (doc::layer_is_media(layer) && srow < 10) {
                 // MEDIA on the card: "(none)", every asset, then
-                // "import..." - the node names its clip where it lives,
+                // "import..." - the node names its media where it lives,
                 // not only in the rail.
                 std::string opts = "(none)";
                 int current = 0;
@@ -6779,20 +7023,20 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      ++ai) {
                     const doc::Asset& a = app.document.assets[ai];
                     opts += '|';
-                    opts += a.name.empty() ? "clip" : a.name;
+                    opts += a.name.empty() ? "media" : a.name;
                     if (a.id == layer.asset)
                         current = static_cast<int>(ai) + 1;
                 }
                 opts += "|import...";
-                FrameUi::ClipRowBind crb{};
+                FrameUi::MediaRowBind crb{};
                 crb.layer_id = layer.id;
                 crb.staged = arena.alloc<float>();
                 *crb.staged = static_cast<float>(current);
                 crb.changed = arena.alloc<bool>();
                 crb.n_assets =
                     static_cast<int>(app.document.assets.size());
-                out.clip_row_binds.push_back(crb);
-                rows[srow].label = "clip";
+                out.media_row_binds.push_back(crb);
+                rows[srow].label = "media";
                 rows[srow].kind = 1;
                 rows[srow].options = arena.dup(opts.c_str(), opts.size());
                 rows[srow].min_v = 0.0f;
@@ -6807,10 +7051,10 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             flow::Node src{};
             src.id = flow::node_id(flow::NodeKind::Source, layer.id);
             src.kind = flow::NodeKind::Source;
-            // The card names WHAT the node is — clips and refs title by
+            // The card names WHAT the node is — media and refs title by
             // their kind, generators name theirs. "layer N" was
             // storage-bag residue (flat graph).
-            static const char* kSrcTitles[] = {"clip",    "solid",
+            static const char* kSrcTitles[] = {"media",    "solid",
                                                "gradient", "noise",
                                                "pattern",  "osc",
                                                "shape",    "look",
@@ -7262,12 +7506,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             }
             // Same-card links are group internals — invisible.
             if (cf && ct && cf != ct)
-                wires.push_back(
-                    {cf, ct,
-                     static_cast<uint8_t>(l.to_port == 2
-                                              ? 3
-                                              : (l.to_port == 1 ? 1
-                                                                : 0))});
+                wires.push_back({cf, ct, l.to_port});
         }
     }
 
@@ -7439,9 +7678,23 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             app.look().value_nodes[ni].node_x = rn.x;
             app.look().value_nodes[ni].node_y = rn.y;
         }
+        // Audio-driven kinds REQUIRE a media input: the card grows an
+        // In pin, and the wired connection draws as a plain media wire.
+        const bool analysis_kind =
+            doc::value_kind_wants_audio(vn.source.type);
+        rn.has_in = analysis_kind;
         aux_x += kAutoPitch;
         nodes.push_back(rn);
         grid_max_x = std::max(grid_max_x, aux_x);
+        if (analysis_kind && vn.audio_src) {
+            const uint64_t src_cid =
+                layer_index_by_id(d, vn.audio_src) >= 0
+                    ? flow::node_id(flow::NodeKind::Source, vn.audio_src)
+                    : (fx_node.count(vn.audio_src)
+                           ? fx_node[vn.audio_src]
+                           : 0);
+            if (src_cid) wires.push_back({src_cid, rn.id, 0});
+        }
 
         // Helper-input wires: upstream node -> this card's operand row.
         for (int which = 0; which < 2; ++which) {
@@ -7451,7 +7704,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             if (trow < 0) continue;
             wires.push_back(
                 {flow::node_id(flow::NodeKind::ModSource, src_id), rn.id,
-                 2, trow});
+                 0, true, trow});
         }
     }
 
@@ -7492,7 +7745,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 : r.target.param_index >= 0 ? 2 + r.target.param_index
                                             : -1;
         }
-        if (target) wires.push_back({from, target, 2, to_row});
+        if (target) wires.push_back({from, target, 0, true, to_row});
     }
 
     // Output card (hidden in a scoped view — GroupOut is the boundary).
@@ -7502,6 +7755,28 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         on.kind = flow::NodeKind::Output;
         on.title = "output";
         on.has_in = true;
+        // SPLIT audio routing: the dedicated audio-in rides the port-1
+        // slot, relabeled; combined mode hides it (the voice is the In
+        // wire's chain).
+        on.has_matte_port = d.audio_split;
+        on.matte_label = "audio";
+        // Routing dropdown on the card (the ctx menu toggles the same
+        // flag).
+        flow::ParamRow* arow = arena.alloc<flow::ParamRow>();
+        *arow = flow::ParamRow{};
+        arow->label = "audio";
+        arow->kind = 1;
+        arow->options = "combined|split";
+        arow->min_v = 0.0f;
+        arow->max_v = 1.0f;
+        out.out_audio_staged = arena.alloc<float>();
+        *out.out_audio_staged = d.audio_split ? 1.0f : 0.0f;
+        out.out_audio_changed = arena.alloc<bool>();
+        *out.out_audio_changed = false;
+        arow->staged = out.out_audio_staged;
+        arow->changed = out.out_audio_changed;
+        on.rows = arow;
+        on.row_count = 1;
         set_preview(on, 0);
         if (d.out_node_x != 0.0f || d.out_node_y != 0.0f) {
             on.x = d.out_node_x;
@@ -7567,7 +7842,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             bool dup = false;
             for (const flow::Wire& e : unique_wires)
                 dup = dup || (e.from == w.from && e.to == w.to &&
-                              e.kind == w.kind && e.to_row == w.to_row);
+                              e.data == w.data && e.to_port == w.to_port &&
+                              e.to_row == w.to_row);
             if (!dup) unique_wires.push_back(w);
         }
         wires.swap(unique_wires);
@@ -7728,6 +8004,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         const uint64_t doc_id = target & 0x00FFFFFFFFFFFFFFull;
         if (target == flow::kOutNodeId) {
             push("export...", CtxAction::Export);
+            push(d.audio_split ? "combine audio (voice = In wire)"
+                               : "split audio in",
+                 CtxAction::ToggleAudioSplit);
         } else if (kind == flow::NodeKind::Frame) {
             push("rename", CtxAction::RenameFrame);
             push("cycle colour", CtxAction::FrameColor);
@@ -7826,21 +8105,21 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         out.import_media_clicked = arena.alloc<bool>();
         ButtonOpts open_opts;
         open_opts.width = SizeSpec::fixed(90);
-        open_opts.tooltip = "open an mp4/mov clip";
+        open_opts.tooltip = "open an mp4/mov file";
         StackOpts hdr;
         hdr.gap = kSpaceTight;
         hdr.cross_align = AlignMode::Center;
         std::vector<LayoutNode*> hdr_cells{
             Heading(arena, "looks"), Spacer(arena),
-            Button(arena, "open clip...", &app.open_button, out.open_clicked,
+            Button(arena, "open media...", &app.open_button, out.open_clicked,
                    open_opts)};
         LayoutNode* hdr_stack = VStackDyn(arena, hdr, hdr_cells);
         hdr_stack->kind = NodeKind::HStack;
         rows.push_back(hdr_stack);
     }
 
-    // ---- clip status
-    const bool has_clip = app.has_media();
+    // ---- media status
+    const bool has_media_file = app.has_media();
     char line[96];
     if (app.import) {
         const uint32_t total = app.import->progress.frames_total.load();
@@ -7848,8 +8127,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         std::snprintf(line, sizeof(line), "importing %u%%",
                       total ? done * 100 / total : 0);
         rows.push_back(Label(arena, line, dim));
-    } else if (has_clip) {
-        rows.push_back(Label(arena, app.clip_name.c_str(), small_dim));
+    } else if (has_media_file) {
+        rows.push_back(Label(arena, app.media_name.c_str(), small_dim));
     }
 
     // ---- BROWSER: the project panel, its own inspector tab. One mixed
@@ -7955,7 +8234,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     tree_row(lk.id, 2, lk.name, "look", 0, false);
             for (const doc::Asset& a : app.document.assets)
                 if (matches(a.name))
-                    tree_row(a.id, 3, a.name, "clip", 0, false);
+                    tree_row(a.id, 3, a.name, "media", 0, false);
         } else {
             auto walk = [&](auto&& self, uint64_t parent,
                             int depth) -> void {
@@ -7975,7 +8254,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         tree_row(lk.id, 2, lk.name, "look", depth, false);
                 for (const doc::Asset& a : app.document.assets)
                     if (a.bin == parent)
-                        tree_row(a.id, 3, a.name, "clip", depth, false);
+                        tree_row(a.id, 3, a.name, "media", depth, false);
             };
             walk(walk, 0, 0);
         }
@@ -8033,11 +8312,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      "canvas size (auto = first asset)")));
     }
 
-    if (has_clip) {
-        const bool is_still = is_still_source(primary_clip_path(app.document));
-        // Still clips: a duration field replaces the time/audio rows —
+    if (has_media_file) {
+        const bool is_still = is_still_source(primary_media_path(app.document));
+        // Still media: a duration field replaces the time/audio rows —
         // speed/direction/sidechain/nudge do nothing when every frame is
-        // identical and there is no clip audio.
+        // identical and there is no media audio.
         if (is_still) {
             out.duration_clicked = arena.alloc<bool>();
             std::string label;
@@ -8094,7 +8373,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             const char** items = arena.alloc<const char*>(3);
             int n = 0;
             int current = 0;
-            items[n++] = "clip audio";
+            items[n++] = "media audio";
             if (has_sc) {
                 const std::string file =
                     std::filesystem::path(app.document.sidechain_path)
@@ -8109,7 +8388,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 arena, "sidechain",
                 Dropdown(arena, items, n, current, &app.sc_dd,
                          out.sc_selected, SizeSpec::fill(),
-                         "audio-reactive source: clip or external wav/mp4")));
+                         "audio-reactive source: media or external wav/mp4")));
             if (has_sc) {
                 out.sc_mux_changed = arena.alloc<bool>();
                 out.sc_mux_staged = arena.alloc<bool>();
@@ -8132,21 +8411,16 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         &app.nudge_slider, nopts)));
         }
         }   // !is_still
-        // Half-res proxy toggle, shown when the import
-        // produced one.
-        {
-            std::filesystem::path proxy = app.mez_path;
-            proxy.replace_extension(".proxy.mez");
-            std::error_code pec;
-            if (std::filesystem::exists(proxy, pec)) {
-                out.proxy_toggle_changed = arena.alloc<bool>();
-                out.proxy_toggle_staged = arena.alloc<bool>();
-                *out.proxy_toggle_staged = app.document.use_proxy;
-                rows.push_back(Checkbox(arena, "half-res proxy",
-                                        out.proxy_toggle_staged,
-                                        &app.proxy_check,
-                                        out.proxy_toggle_changed));
-            }
+        // Half-res proxy toggle, shown when ANY asset's import
+        // produced one (per-asset probe, cached per bundle stamp).
+        if (app.proxy_probe_has) {
+            out.proxy_toggle_changed = arena.alloc<bool>();
+            out.proxy_toggle_staged = arena.alloc<bool>();
+            *out.proxy_toggle_staged = app.document.use_proxy;
+            rows.push_back(Checkbox(arena, "half-res proxy",
+                                    out.proxy_toggle_staged,
+                                    &app.proxy_check,
+                                    out.proxy_toggle_changed));
         }
     } else if (!app.import) {
         rows.push_back(Label(arena, "test pattern", small_dim));
@@ -8219,7 +8493,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         crow_opts.cross_align = AlignMode::Center;
         ButtonOpts tiny_clear = tiny;
         tiny_clear.tooltip =
-            "delete every cached import bundle except the open clip's";
+            "delete every cached import bundle except the open project's";
         tiny.tooltip = "open the cache folder";
         std::vector<LayoutNode*> crow{
             Label(arena, arena.dup(cache_line, std::strlen(cache_line)),
@@ -8330,21 +8604,21 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      static_cast<int>(layer.blend), &ls.blend_dd,
                      lrow.blend_selected, SizeSpec::fill(),
                      "blend mode over the composite below")));
-        // The clip node's MEDIA: pick any imported asset, or browse to
+        // The media node's MEDIA: pick any imported asset, or browse to
         // import-and-bind - no invisible binding.
-        if (doc::layer_is_clip(layer)) {
+        if (doc::layer_is_media(layer)) {
             const size_t n_assets = app.document.assets.size();
             const char** items =
                 arena.alloc<const char*>(std::max<size_t>(n_assets, 1));
             int current = -1;
             for (size_t ai = 0; ai < n_assets; ++ai) {
                 const doc::Asset& a = app.document.assets[ai];
-                const std::string an = a.name.empty() ? "clip" : a.name;
+                const std::string an = a.name.empty() ? "media" : a.name;
                 items[ai] = arena.dup(an.c_str(), an.size());
                 if (a.id == layer.asset) current = static_cast<int>(ai);
             }
             if (n_assets == 0) items[0] = "(no media imported)";
-            FrameUi::ClipBind bind{};
+            FrameUi::MediaBind bind{};
             bind.layer_id = layer.id;
             bind.selected = arena.alloc<int>();
             *bind.selected = -1;
@@ -8356,17 +8630,17 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             crow.gap = 4.0f;
             crow.width = SizeSpec::fill();
             layer_rows_ui.push_back(value_row(
-                arena, "clip",
+                arena, "media",
                 HStack(arena, crow,
                        {Dropdown(arena, items,
                                  static_cast<int>(
                                      std::max<size_t>(n_assets, 1)),
-                                 current, &ls.clip_dd, bind.selected,
+                                 current, &ls.media_dd, bind.selected,
                                  SizeSpec::fill(),
                                  "the media this node reads"),
-                        Button(arena, "+", &ls.clip_browse, bind.browse,
+                        Button(arena, "+", &ls.media_browse, bind.browse,
                                bopts)})));
-            out.clip_binds.push_back(bind);
+            out.media_binds.push_back(bind);
         }
 
         int lslider = 0;
@@ -8557,7 +8831,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                          "matte geometry")));
         }
 
-        // Transform (crop/flip/scale/rotate + the clip's slip live on
+        // Transform (crop/flip/scale/rotate + the media's slip live on
         // the layer). Folded per layer; the header marks
         // itself when the transform is active so a folded card still tells.
         lrow.xf_toggle = arena.alloc<bool>();
@@ -8629,17 +8903,28 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                              &ls.flip_h_btn, lrow.flip_h, "mirror left-right"),
                         Chip(arena, "vertical", layer.flip_v, &ls.flip_v_btn,
                              lrow.flip_v, "mirror top-bottom")})));
-            // SLIP: the clip node's static media in-point - the one
-            // timing nuance a timeless look allows, so two clips can
+            // SLIP: the media node's static media in-point - the one
+            // timing nuance a timeless look allows, so two media nodes can
             // hold a fixed sync offset. All scheduling lives on the
             // sequence's blocks.
-            if (doc::layer_is_clip(layer)) {
+            if (doc::layer_is_media(layer)) {
                 const doc::Asset* la = app.document.find_asset(layer.asset);
                 const uint32_t media = la ? la->frame_count : 0;
                 if (media > 1)
                     xf_slider(LF::Slip, "slip", 0.0f,
                               static_cast<float>(media - 1),
                               static_cast<float>(layer.slip), "%.0f f");
+                // TIMELINE LOCK: read the asset at the root timeline
+                // frame instead of the look clock, so every placement
+                // reads identical positions (synced reactivity).
+                lrow.clock_lock = arena.alloc<bool>();
+                layer_rows_ui.push_back(value_row(
+                    arena, "clock",
+                    HStack(arena, {6.0f},
+                           {Chip(arena, "timeline", layer.timeline_lock,
+                                 &ls.lock_btn, lrow.clock_lock,
+                                 "locked: media follows the timeline "
+                                 "frame, not the look clock")})));
             }
         }
 
@@ -8655,13 +8940,13 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     }
     if (app.sel.kind == SelKind::AddLayer &&
         app.look().layers.size() < doc::kMaxLayers) {
-        // Paired rows: full labels never fit one 300 px row. clip = a
-        // tap off THE source clip (the adjustment type is gone — a clip
+        // Paired rows: full labels never fit one 300 px row. media = a
+        // tap off THE source media (the adjustment type is gone — a media
         // tap wired back through a Blend IS an adjustment).
         static const char* kAddLayer[] = {"+ solid",   "+ gradient",
                                           "+ noise",   "+ pattern",
                                           "+ osc",     "+ shape",
-                                          "+ clip"};
+                                          "+ media"};
         for (int t = 0; t < 7; ++t)
             out.add_layer_clicked[t] = arena.alloc<bool>();
         ButtonOpts half;
@@ -8704,7 +8989,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                                    : "inspector";
         rows.push_back(Heading(arena, insp_title));
     }
-    if (app.sel.kind == SelKind::None) {
+    // Node/randomize machinery is LOOK-scope: at sequence scope these
+    // controls would edit the FALLBACK look (add-node and randomize
+    // both landed on look #1 before this gate).
+    if (app.sel.kind == SelKind::None && app.scope_is_look()) {
         rows.push_back(Label(arena,
                              "select a node below - double-click the "
                              "canvas to add",
@@ -8713,7 +9001,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(Button(arena, "+ add node...", &app.open_add_button,
                               out.open_add_clicked));
     }
-    if ((app.sel.kind == SelKind::None || app.sel.kind == SelKind::Effect ||
+    if (app.scope_is_look() &&
+        (app.sel.kind == SelKind::None || app.sel.kind == SelKind::Effect ||
          app.sel.kind == SelKind::Group) &&
         !app.look().layers.empty()) {
         // Randomize: chaos slider + whole-stack button; each
@@ -9236,7 +9525,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         pstack->gap = 4.0f;
         rows.push_back(pstack);
     }
-    if (has_clip) {
+    if (has_media_file) {
         // Export settings: bitrate / output scale / audio — project
         // state through set_export_config_command like every other edit.
         out.export_bitrate_staged = arena.alloc<float>();
@@ -9605,7 +9894,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     const auto table = mod::build_param_table(app.document, app.look());
 
     // Resolve the shared view range (zoom): invalid/stale = whole
-    // clip. Every strip below maps through the same [v0, v1).
+    // span. Every strip below maps through the same [v0, v1).
     double v0 = app.tl_v0, v1 = app.tl_v1;
     if (v1 - v0 < 1.0 || v1 > frame_count || v0 < 0.0) {
         v0 = 0.0;
@@ -9659,7 +9948,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         for (const uint32_t m : app.sequence().markers)
             app.tl_snap_edges.push_back({static_cast<double>(m), 0, 0});
     // Filmstrips live in the BLOCKS now, not across the ruler — the
-    // timeline shows an arrangement, not one clip.
+    // timeline shows an arrangement, not one media file.
     const float ruler_h = 20.0f;
     LayoutNode* ruler = make_node(arena, NodeKind::Leaf);
     ruler->width = SizeSpec::fill();
@@ -9698,12 +9987,12 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         const uint64_t primary =
             app.document.primary_asset() ? app.document.primary_asset()->id
                                          : 0;
-        // The clip a wrapper look reads, for the filmstrip: single clip
+        // The media a wrapper look reads, for the filmstrip: single media
         // node bound to an asset, whatever effects ride it.
         auto wrapped_asset = [&](uint64_t target) -> uint64_t {
             const doc::Look* l = app.document.find_look(target);
             if (!l || l->layers.size() != 1 ||
-                !doc::layer_is_clip(l->layers[0]))
+                !doc::layer_is_media(l->layers[0]))
                 return 0;
             return l->layers[0].asset;
         };
@@ -9865,7 +10154,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.kind = 0;
                 // The silhouette: the target entity's whole submix
                 // through this placement's time map - a look sounds like
-                // its clips in lockstep, a sequence like its tracks.
+                // its media in lockstep, a sequence like its tracks.
                 std::vector<TlAmpSrc> srcs;
                 const float pgain =
                     (track.mute || place.audio_mute)
@@ -9873,7 +10162,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                         : std::max(track.gain, 0.0f) *
                               std::max(place.audio_gain, 0.0f);
                 if (pgain > 0.0f && place.target) {
-                    for (const doc::ClipInstance& c :
+                    for (const doc::MediaInstance& c :
                          doc::flatten_audio_sources(app.document,
                                                     place.target)) {
                         if (c.gain <= 0.0f) continue;
@@ -10052,7 +10341,12 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         return false;
     };
     std::vector<LayoutNode*> lane_rows;
-    for (const doc::KeyframeLane& lane : app.look().lanes) {
+    // Keyframe lanes are LOOK-LOCAL: at sequence scope none may build,
+    // or their fully-interactive widgets edit the FALLBACK look.
+    static const std::vector<doc::KeyframeLane> kNoLanes;
+    const std::vector<doc::KeyframeLane>& tl_lanes =
+        app.scope_is_look() ? app.look().lanes : kNoLanes;
+    for (const doc::KeyframeLane& lane : tl_lanes) {
         // Human name ("Dither levels"), not the raw address — the path
         // stays serialize/display sugar elsewhere.
         std::string path;
@@ -10133,10 +10427,10 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             ScrollAreaV(arena, &app.timeline_scroll,
                         VStackDyn(arena, lane_col, lane_rows)));
     }
-    if (lane_rows.empty())
+    if (lane_rows.empty() && app.scope_is_look())
         rows.push_back(Label(
             arena,
-            app.look().lanes.empty()
+            tl_lanes.empty()
                 ? "no keyframe lanes - click the k dot next to a param"
                 : "no lanes for this selection",
             small_dim));
@@ -10292,12 +10586,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     }
 
     // A fresh document starts MINIMAL (user demand — the demo
-    // stack got deleted every launch): one clip source wired to the
-    // Output, nothing else. Opening a clip shows immediately; presets
+    // stack got deleted every launch): one media source wired to the
+    // Output, nothing else. Opening media shows immediately; presets
     // and the add menu build from there.
 
-    // `looks.exe <clip|project.json>` opens it at startup (projects load
-    // their bound clip themselves).
+    // `looks.exe <media|project.json>` opens it at startup (projects load
+    // their bound media themselves).
     if (cmdline && cmdline[0]) {
         std::wstring arg = cmdline;
         // Launchers pad the command line (Start-Process appends a trailing
@@ -10724,7 +11018,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         // keys; else the picked BLOCK goes (with its
                         // whole link group - picture and sound leave
                         // together); else the canvas selection (texed).
-                        if (!(tl_hovered &&
+                        // Key edits are LOOK-LOCAL - at sequence scope
+                        // they must not land on the fallback look (or
+                        // swallow the block delete).
+                        if (!(tl_hovered && app.scope_is_look() &&
                               timeline_delete_selected_keys(app))) {
                             if (app.sel_placement && !app.scope_is_look() &&
                                 doc::find_placement(app.sequence(),
@@ -10874,8 +11171,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.canvas_state.view_inited = false;
                     } else if (e.key == platform::Key::C && !e.repeat &&
                                (e.mods & platform::kModCtrl)) {
-                        // Over the timeline Ctrl+C copies keys.
-                        if (!(tl_hovered &&
+                        // Over the timeline Ctrl+C copies keys
+                        // (look scope - keys are look-local).
+                        if (!(tl_hovered && app.scope_is_look() &&
                               timeline_copy_selected_keys(app)))
                             do_copy = true;    // texed Ctrl+C
                     } else if (e.key == platform::Key::X && !e.repeat &&
@@ -10884,7 +11182,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         do_cut = true;
                     } else if (e.key == platform::Key::V && !e.repeat &&
                                (e.mods & platform::kModCtrl)) {
-                        if (!(tl_hovered && timeline_paste_keys(app)))
+                        if (!(tl_hovered && app.scope_is_look() &&
+                              timeline_paste_keys(app)))
                             do_paste = true;   // texed Ctrl+V
                     } else if (e.key == platform::Key::A && !e.repeat &&
                                (e.mods & (platform::kModCtrl |
@@ -11057,7 +11356,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 } import_resume{render_worker};
                 if (job->import_only) {
                     // Generic import: the asset joins the browser and
-                    // an asking clip node binds - nothing placed,
+                    // an asking media node binds - nothing placed,
                     // nothing plays, no primary rebinding.
                     uint64_t asset_id = 0;
                     for (const doc::Asset& a : app.document.assets)
@@ -11080,7 +11379,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         if (bl2)
                             for (doc::Layer& l : bl2->layers)
                                 if (l.id == job->bind_layer &&
-                                    doc::layer_is_clip(l)) {
+                                    doc::layer_is_media(l)) {
                                     doc::Layer edited = l;
                                     edited.asset = asset_id;
                                     app.undo.execute(
@@ -11095,12 +11394,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.status =
                         "imported " + job->source.filename().string();
                 } else {
-                    app.clip_name = job->source.filename().string();
+                    app.media_name = job->source.filename().string();
                     app.mez_path = job->result.mez_path;
                     app.pcm_path = job->result.pcm_path;
                     refresh_bundles(app);
-                    ensure_clip_placed(app, job->source);
-                    load_clip_analysis(app);
+                    ensure_media_placed(app, job->source);
+                    load_media_analysis(app);
                     app.player.set_looping(app.loop);
                     app.player.play();
                     app.status.clear();
@@ -11118,7 +11417,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
 
         // Audio Scope: keep the engine's mono PCM copy in sync with the
-        // current clip — every open path funnels through app.pcm_path, so
+        // current media — every open path funnels through app.pcm_path, so
         // one poll covers them all (empty path = silent, flat line).
         if (!app.scope_pcm_init || app.scope_pcm_loaded != app.pcm_path) {
             app.scope_pcm_init = true;
@@ -11148,7 +11447,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     renderer->device(), shader_dir, next.bundles, next.pcm,
                     next.scope_pcm, next.doc, next.look_id,
                     next.has_analysis ? &next.analysis : nullptr,
-                    next.out_path);
+                    next.node_audio, next.out_path);
             }
         }
 
@@ -11309,7 +11608,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         // Menu bar: every file/edit/view action stays reachable without
         // the old rail buttons; picks dispatch after RunPopup below.
         static const char* kFileItems[] = {
-            "open clip...",           "import media...",
+            "open media...",           "import media...",
             "open project...  (ctrl+o)",
             "save project  (ctrl+s)", "save project as...",
             "import preset...",       "export..."};
@@ -11402,14 +11701,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             center.width = ui::SizeSpec::fill();
             center.height = ui::SizeSpec::fill();
             center.gap = 10.0f;
-            // The blank start offers both doors: a look FROM a clip, or
+            // The blank start offers both doors: a look FROM media, or
             // an empty one to build in. Either way you land in a look's
             // editing view - that is home.
             frame_ui.new_look_clicked = arena.alloc<bool>();
             ui::LayoutNode* empty_ui = ui::VStack(
                 arena, center,
-                {ui::Label(arena, "drag a clip here", hint),
-                 ui::Button(arena, "look from clip...",
+                {ui::Label(arena, "drag media here", hint),
+                 ui::Button(arena, "look from media...",
                             &app.open_big_button, frame_ui.open_clicked,
                             big),
                  ui::Button(arena, "new look", &app.new_look_button,
@@ -11480,7 +11779,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                       "project browser: bins, looks, sequences, media"),
              ui::Chip(arena, "project", app.inspector_tab == 1,
                       &app.tab_buttons[1], tab_project,
-                      "clip & project settings"),
+                      "media & project settings"),
              ui::Chip(arena, "presets", app.inspector_tab == 2,
                       &app.tab_buttons[2], tab_presets,
                       "preset browser")});
@@ -11841,7 +12140,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 app.document.find_asset(did)) {
                             if (!ln.audio) {
                                 if (!as->path.empty())
-                                    place_clip_block(
+                                    place_media_block(
                                         app,
                                         std::filesystem::path(as->path),
                                         at, ln.track_id);
@@ -12236,11 +12535,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     const std::string nm =
                         a->name.empty() ? "look" : a->name;
                     doc::Look look = doc::make_look(app.document, nm);
-                    doc::Layer clip = doc::make_layer(
-                        app.document, doc::LayerSourceKind::Clip);
-                    clip.name = nm;
-                    clip.asset = a->id;
-                    look.layers.push_back(std::move(clip));
+                    doc::Layer media = doc::make_layer(
+                        app.document, doc::LayerSourceKind::Media);
+                    media.name = nm;
+                    media.asset = a->id;
+                    look.layers.push_back(std::move(media));
                     const uint64_t nid = look.id;
                     app.undo.execute(
                         app.document,
@@ -12278,8 +12577,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         doc::find_value_node(app.look(), app.sel.id);
                     if (!vn) break;
                     doc::ValueNode n = *vn;
-                    n.source.px = m.value;
-                    n.source.py = m.def_v;
+                    // px/py are SOURCE-normalized (the sampler reads the
+                    // native decoded frame); the click is canvas uv -
+                    // invert the aspect fit or the point lands off by
+                    // the letterbox bars.
+                    float sx = m.value, sy = m.def_v;
+                    const doc::Asset* ra = nullptr;
+                    for (const doc::Layer& l : app.look().layers)
+                        if (l.visible && doc::layer_is_media(l)) {
+                            ra = app.document.find_asset(l.asset);
+                            if (ra) break;
+                        }
+                    if (ra && ra->width && ra->height) {
+                        uint32_t scw = 0, sch = 0;
+                        doc::canvas_size(app.document, &scw, &sch);
+                        float fit[4];
+                        gfx::source_fit_rect(ra->width, ra->height, scw,
+                                             sch, fit);
+                        sx = std::clamp(
+                            (sx * static_cast<float>(scw) - fit[0]) /
+                                std::max(fit[2], 1.0f),
+                            0.0f, 1.0f);
+                        sy = std::clamp(
+                            (sy * static_cast<float>(sch) - fit[1]) /
+                                std::max(fit[3], 1.0f),
+                            0.0f, 1.0f);
+                    }
+                    n.source.px = sx;
+                    n.source.py = sy;
                     app.undo.execute(app.document,
                                      doc::set_value_node_command(
                                          app.scope_look, n));
@@ -12805,13 +13130,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 // selection; Delete cuts the connection(s). Shift-click
                 // TOGGLES the wire in the set (texed toggleLinkSelect).
                 const flow::Wire w{fe.wire_from, fe.wire_to,
-                                   fe.wire_kind, fe.wire_to_row};
+                                   fe.wire_to_port, fe.wire_data,
+                                   fe.wire_to_row};
                 if (fe.wire_clicked_shift) {
                     auto it = std::find_if(
                         app.sel_wires.begin(), app.sel_wires.end(),
                         [&](const flow::Wire& s) {
                             return s.from == w.from && s.to == w.to &&
-                                   s.kind == w.kind &&
+                                   s.data == w.data && s.to_port == w.to_port &&
                                    s.to_row == w.to_row;
                         });
                     if (it != app.sel_wires.end())
@@ -12998,6 +13324,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case CtxAction::Export:
                         if (frame_ui.export_clicked)
                             *frame_ui.export_clicked = true;
+                        break;
+                    case CtxAction::ToggleAudioSplit:
+                        app.undo.execute(
+                            app.document,
+                            doc::set_look_audio_split_command(
+                                app.scope_look,
+                                !app.look().audio_split));
                         break;
                     case CtxAction::RenameFrame:
                         ctx_frame_rename = did;
@@ -13334,7 +13667,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     fe.connect_requested && fe.disconnect_requested;
                 if (grouped) app.undo.begin_group("Rewire");
                 if (fe.disconnect_requested) {
-                    if (fe.disconnect_port == 1) {
+                    if (is_kind(fe.disconnect_to,
+                                flow::NodeKind::ModSource)) {
+                        // Grabbing an analysis card's media wire off:
+                        // clearing audio_src IS the cut.
+                        const doc::ValueNode* tn = doc::find_value_node(
+                            app.look(), tag_doc(fe.disconnect_to));
+                        if (tn) {
+                            doc::ValueNode up = *tn;
+                            up.audio_src = 0;
+                            app.undo.execute(
+                                app.document,
+                                doc::set_value_node_command(
+                                    app.scope_look, up));
+                        }
+                    } else if (fe.disconnect_port == 1) {
                         // Image matte: a plain port-1 link cut.
                         app.undo.execute(
                             app.document,
@@ -13386,6 +13733,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                tag_kind(fe.connect_from) !=
                                    flow::NodeKind::Group) {
                         app.status = "only image nodes feed In ports";
+                    } else if (tag_kind(fe.connect_to) ==
+                               flow::NodeKind::ModSource) {
+                        // Media out -> analysis card: the node's
+                        // REQUIRED audio input (audio_src), never a
+                        // look link.
+                        const doc::ValueNode* tn = doc::find_value_node(
+                            app.look(), tag_doc(fe.connect_to));
+                        const bool ok =
+                            tn &&
+                            doc::value_kind_wants_audio(tn->source.type);
+                        if (!ok) {
+                            app.status =
+                                "only audio-driven nodes take a media "
+                                "input";
+                        } else if (tag_kind(fe.connect_from) ==
+                                   flow::NodeKind::Group) {
+                            app.status =
+                                "wire from a media or effect node";
+                        } else {
+                            doc::ValueNode up = *tn;
+                            up.audio_src = tag_doc(fe.connect_from);
+                            app.undo.execute(
+                                app.document,
+                                doc::set_value_node_command(
+                                    app.scope_look, up));
+                        }
                     } else {
                         // Group cards resolve to their boundary members
                         // before the link edit + cycle guard.
@@ -14002,10 +14375,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         if (app.look().layers.empty()) {
                             // v3: effects need a storage bag, never a
                             // user-facing precondition — conjure the
-                            // clip host silently.
+                            // media host silently.
                             doc::Layer host = doc::make_layer(
                                 app.document,
-                                doc::LayerSourceKind::Clip);
+                                doc::LayerSourceKind::Media);
                             app.undo.execute(app.document,
                                              doc::add_layer_command(app.scope_look,
                                                  std::move(host), 0));
@@ -14403,7 +14776,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                      doc::materialize_links_command(app.scope_look));
                 if (!cb.effects.empty() && app.look().layers.empty()) {
                     doc::Layer host = doc::make_layer(
-                        app.document, doc::LayerSourceKind::Clip);
+                        app.document, doc::LayerSourceKind::Media);
                     app.undo.execute(app.document,
                                      doc::add_layer_command(app.scope_look,
                                          std::move(host), 0));
@@ -14609,7 +14982,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     for (size_t w = 0; w < flow_ui.graph->wire_count; ++w)
                         if (flow_ui.graph->wires[w].from == sw.from &&
                             flow_ui.graph->wires[w].to == sw.to &&
-                            flow_ui.graph->wires[w].kind == sw.kind)
+                            flow_ui.graph->wires[w].data == sw.data &&
+                            flow_ui.graph->wires[w].to_port == sw.to_port)
                             return true;
                     return false;
                 };
@@ -14663,17 +15037,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         : (is_cid_kind(sw.to, flow::NodeKind::Group)
                                ? boundary_of(sw.to, false)
                                : tag_doc(sw.to));
-                    if (sw.kind == 0 || sw.kind == 3) {
+                    if (!sw.data &&
+                        is_cid_kind(sw.to, flow::NodeKind::ModSource)) {
+                        // Media wire into an analysis card: clearing
+                        // audio_src IS the cut (it is not a look link).
+                        const doc::ValueNode* tn = doc::find_value_node(
+                            app.look(), tag_doc(sw.to));
+                        if (tn) {
+                            doc::ValueNode up = *tn;
+                            up.audio_src = 0;
+                            app.undo.execute(
+                                app.document,
+                                doc::set_value_node_command(
+                                    app.scope_look, up));
+                        }
+                    } else if (!sw.data) {
+                        // MEDIA: one disconnect, whatever the port -
+                        // chain, matte, aux and audio all cut the same
+                        // way.
                         app.undo.execute(
                             app.document,
-                            doc::disconnect_command(app.scope_look,
-                                {wf, wt, sw.kind == 3 ? 2u : 0u}));
-                    } else if (sw.kind == 1) {
-                        // Image matte: a plain port-1 link cut.
-                        app.undo.execute(
-                            app.document,
-                            doc::disconnect_command(app.scope_look,{wf, wt, 1}));
-                    } else if (sw.kind == 2) {
+                            doc::disconnect_command(
+                                app.scope_look, {wf, wt, sw.to_port}));
+                    } else {
                         // Value wires: into a helper's operand row =
                         // unwire that input; onto a param row = remove
                         // the route(s) this wire drew.
@@ -14997,7 +15383,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             } else if (sel == pick_index) {
                 auto picked = platform::show_open_dialog(
                     window.get(),
-                    {{"audio (wav / mp4 / mov)", "*.wav;*.mp4;*.mov"},
+                    {{"audio (wav / mp3 / mp4 / mov)", "*.wav;*.mp3;*.mp4;*.mov"},
                      {"all files", "*.*"}});
                 if (picked)
                     app.undo.execute(app.document,
@@ -15197,7 +15583,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 // Same silent host conjure as the effect popup — a
                 // storage bag is never a user-facing precondition.
                 doc::Layer host = doc::make_layer(
-                    app.document, doc::LayerSourceKind::Clip);
+                    app.document, doc::LayerSourceKind::Media);
                 app.undo.execute(app.document,
                                  doc::add_layer_command(app.scope_look,std::move(host),
                                                         0));
@@ -15596,6 +15982,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 // View state, no undo (like section folds).
                 app.layer_ui[lrow.id].xf_open =
                     !app.layer_ui[lrow.id].xf_open;
+            } else if (lrow.clock_lock && *lrow.clock_lock) {
+                doc::Layer edited = *layer;
+                edited.timeline_lock = !edited.timeline_lock;
+                app.undo.execute(app.document,
+                                 doc::set_layer_props_command(app.scope_look,edited));
             } else if (lrow.flip_h && *lrow.flip_h) {
                 doc::Layer edited = *layer;
                 edited.flip_h = !edited.flip_h;
@@ -15634,10 +16025,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 break;
             }
         }
-        // Clip node media binding: dropdown picks an imported asset;
+        // Output card audio-routing dropdown.
+        if (frame_ui.out_audio_changed && *frame_ui.out_audio_changed &&
+            frame_ui.out_audio_staged) {
+            const bool split = *frame_ui.out_audio_staged >= 0.5f;
+            if (split != app.look().audio_split)
+                app.undo.execute(app.document,
+                                 doc::set_look_audio_split_command(
+                                     app.scope_look, split));
+        }
+
+        // Media node binding: dropdown picks an imported asset;
         // "+" browses - ready bundles bind now, fresh media runs the
         // import job carrying the bind target.
-        for (const FrameUi::ClipBind& cb2 : frame_ui.clip_binds) {
+        for (const FrameUi::MediaBind& cb2 : frame_ui.media_binds) {
             doc::Layer* layer = nullptr;
             for (doc::Layer& l : app.look().layers)
                 if (l.id == cb2.layer_id) layer = &l;
@@ -15657,13 +16058,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 refresh_bundles(app);
             }
             if (*cb2.browse)
-                browse_and_bind_clip(app, window.get(), app.scope_look,
+                browse_and_bind_media(app, window.get(), app.scope_look,
                                      layer->id);
         }
         // The same binding from the CARD's dropdown row: entry 0 unbinds
         // (a deliberately dormant node), the tail entry browses, the
         // rest bind the picked asset.
-        for (const FrameUi::ClipRowBind& crb : frame_ui.clip_row_binds) {
+        for (const FrameUi::MediaRowBind& crb : frame_ui.media_row_binds) {
             if (!*crb.changed) continue;
             doc::Layer* layer = nullptr;
             for (doc::Layer& l : app.look().layers)
@@ -15671,7 +16072,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (!layer) continue;
             const int pick = static_cast<int>(*crb.staged + 0.5f);
             if (pick == crb.n_assets + 1) {
-                browse_and_bind_clip(app, window.get(), app.scope_look,
+                browse_and_bind_media(app, window.get(), app.scope_look,
                                      layer->id);
             } else if (pick == 0) {
                 if (layer->asset) {
@@ -15905,7 +16306,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 doc::LayerSourceKind::Noise, doc::LayerSourceKind::TestPattern,
                 doc::LayerSourceKind::Oscillator,
                 doc::LayerSourceKind::Shape,
-                doc::LayerSourceKind::Clip};
+                doc::LayerSourceKind::Media};
             for (int t = 0; t < 7; ++t) {
                 if (frame_ui.add_layer_clicked[t] &&
                     *frame_ui.add_layer_clicked[t] &&
@@ -16005,19 +16406,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.cache_clear_clicked &&
             *frame_ui.cache_clear_clicked) {
-            // Every bundle dir except the open clip's; autosaves stay.
+            // Every bundle dir except the OPEN PROJECT'S assets (all of
+            // them - keeping only asset[0] destroyed every other
+            // asset's bundle); autosaves stay.
             const std::filesystem::path root = executable_dir() / "cache";
-            const std::filesystem::path keep =
-                primary_clip_path(app.document).empty()
-                    ? std::filesystem::path{}
-                    : bundle_dir_for(primary_clip_path(app.document));
+            std::vector<std::filesystem::path> keep;
+            for (const doc::Asset& a : app.document.assets)
+                if (!a.path.empty()) keep.push_back(bundle_dir_for(a.path));
             std::error_code ec;
             uint64_t removed = 0;
             for (auto it = std::filesystem::directory_iterator(root, ec);
                  !ec && it != std::filesystem::directory_iterator();
                  it.increment(ec)) {
                 if (!it->is_directory(ec)) continue;
-                if (!keep.empty() && it->path() == keep) continue;
+                bool kept = false;
+                for (const std::filesystem::path& k : keep)
+                    if (it->path() == k) {
+                        kept = true;
+                        break;
+                    }
+                if (kept) continue;
                 std::error_code rec_ec;
                 removed +=
                     std::filesystem::remove_all(it->path(), rec_ec);
@@ -16047,7 +16455,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (frame_ui.open_clicked && *frame_ui.open_clicked && !app.import) {
             auto picked = platform::show_open_dialog(
                 window.get(),
-                {{"video / image", "*.mp4;*.mov;*.mez;*.png;*.tga"},
+                {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
                  {"all files", "*.*"}});
             if (picked) open_source(app, *picked);
         }
@@ -16055,7 +16463,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             *frame_ui.import_media_clicked && !app.import) {
             auto picked = platform::show_open_dialog(
                 window.get(),
-                {{"video / image", "*.mp4;*.mov;*.mez;*.png;*.tga"},
+                {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
                  {"all files", "*.*"}});
             if (picked) import_media(app, *picked);
         }
@@ -16125,9 +16533,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (!ba.place || !*ba.place) continue;
             const doc::Asset* asset = app.document.find_asset(ba.id);
             if (!asset || asset->path.empty()) continue;
-            if (!place_clip_block(app, std::filesystem::path(asset->path),
+            if (!place_media_block(app, std::filesystem::path(asset->path),
                                   app.player.current_frame_index(), 0))
-                app.status = "no bundle yet - import the clip first";
+                app.status = "no bundle yet - import the media first";
         }
         if (frame_ui.new_sequence_clicked &&
             *frame_ui.new_sequence_clicked) {
@@ -16270,9 +16678,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     open_project(app, p, window.get());
                 }
             } else if (ext == ".mp4" || ext == ".mov" || ext == ".mez" ||
-                       ext == ".tga") {
+                       ext == ".tga" || ext == ".wav" || ext == ".mp3") {
                 // ONTO THE TIMELINE = a new block at the drop frame; the
-                // project's clip is not what a drop is about once there
+                // project's media is not what a drop is about once there
                 // is an arrangement to drop into. Anywhere else keeps the
                 // old meaning, and unimported media imports first.
                 const Vec2 at{dropped_at.x / scale, dropped_at.y / scale};
@@ -16280,13 +16688,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (app.tl_rect.w > 0.0f && at.x >= app.tl_rect.x &&
                     at.x < app.tl_rect.right() && at.y >= app.tl_rect.y &&
                     at.y < app.tl_rect.bottom())
-                    placed = place_clip_block(
+                    placed = place_media_block(
                         app, p, timeline_frame_at(app, at.x), 0);
                 if (!placed) open_source(app, p);
             } else if (ext == ".png") {
                 // A PNG with a sibling .json grid descriptor ({"tile": 8,
                 // "cols": 16, "rows": 6}) installs as a custom glyph set
-                //; a bare PNG opens as a still clip.
+                //; a bare PNG opens as still media.
                 std::filesystem::path desc = p;
                 desc.replace_extension(".json");
                 std::error_code dec;
@@ -16400,7 +16808,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 l_in = 0;
                 l_out = 0;
             }
-            // Dragging the out handle back to the clip end stores 0
+            // Dragging the out handle back to the media end stores 0
             // ("full") so untouched projects stay byte-stable.
             if (app.has_timeline() && t_out >= app.player.frame_count())
                 t_out = 0;
@@ -16443,7 +16851,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         // entity's local time at the project rate - a sequence plays its
         // arrangement inside its trim band, a look loops its own
         // duration whole (timeless: no region of its own). Nothing here
-        // depends on a clip being open.
+        // depends on media being open.
         {
             const double rate = project_fps(app.document, app.bundles);
             const uint32_t content = app.scope_duration();
@@ -16481,13 +16889,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         refresh_mix(app);
         sync_sidechain(app);
         // Half-res proxy: the bundle table names the file every placement
-        // decodes, so a toggle is a re-resolve, not a reopen.
+        // decodes, so a toggle is a re-resolve, not a reopen. The probe
+        // is per-ASSET (asset[0] alone was the single-clip key) and
+        // re-runs only when the bundles moved.
         {
-            std::filesystem::path proxy = app.mez_path;
-            proxy.replace_extension(".proxy.mez");
-            std::error_code pec;
-            const bool want = app.document.use_proxy && !app.mez_path.empty() &&
-                              std::filesystem::exists(proxy, pec);
+            if (app.proxy_probe_stamp != app.bundle_stamp) {
+                app.proxy_probe_stamp = app.bundle_stamp;
+                app.proxy_probe_has = false;
+                for (const doc::Asset& a : app.document.assets) {
+                    if (a.path.empty()) continue;
+                    std::filesystem::path proxy =
+                        resolve_bundle(std::filesystem::path(a.path)).mez;
+                    proxy.replace_extension(".proxy.mez");
+                    std::error_code pec;
+                    if (std::filesystem::exists(proxy, pec)) {
+                        app.proxy_probe_has = true;
+                        break;
+                    }
+                }
+            }
+            const bool want =
+                app.document.use_proxy && app.proxy_probe_has;
             if (want != app.proxy_active) {
                 render_worker.pause();
                 app.proxy_active = want;
@@ -16540,15 +16962,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.export_clicked && *frame_ui.export_clicked &&
             app.has_timeline()) {
-            std::filesystem::path default_name(app.clip_name);
-            default_name.replace_extension("");
+            // Export renders the SCOPED entity and is named after it -
+            // never the fallback look or the last-opened media file.
+            const doc::Look* sl = app.document.find_look(app.scope_look);
+            const doc::Sequence* ss =
+                sl ? nullptr : app.document.find_sequence(app.scope_look);
+            std::string ename = sl ? sl->name : (ss ? ss->name : "");
+            if (ename.empty()) ename = "export";
             auto out = platform::show_save_dialog(
-                window.get(), {{"MP4 video", "*.mp4"}},
-                default_name.string() + "_look.mp4");
+                window.get(), {{"MP4 video", "*.mp4"}}, ename + ".mp4");
             if (out) {
                 if (out->extension() != ".mp4") out->replace_extension(".mp4");
                 // Sidechain mux: the Audio Scope reads the sidechain's PCM
-                // instead of the clip's when asked (and available).
+                // instead of the media's when asked (and available).
                 const std::filesystem::path scope_pcm =
                     app.document.sidechain_mux && app.sc_ok
                         ? app.sc_pcm_path
@@ -16556,16 +16982,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (!app.export_job) {
                     app.export_job = start_export(
                         renderer->device(), shader_dir, app.bundles,
-                        app.pcm_cache, scope_pcm, app.document, app.look().id,
-                        app.has_analysis ? &app.analysis : nullptr, *out);
+                        app.pcm_cache, scope_pcm, app.document,
+                        app.scope_look,
+                        app.has_analysis ? &app.analysis : nullptr,
+                        app.node_audio_map, *out);
                 } else {
                     // Render queue: snapshot now, render later.
                     AppState::QueuedExport q;
                     q.out_path = *out;
                     q.doc = app.document;
-                    q.look_id = app.look().id;
+                    q.look_id = app.scope_look;
                     q.has_analysis = app.has_analysis;
                     if (app.has_analysis) q.analysis = app.analysis;
+                    q.node_audio = app.node_audio_map;
                     q.bundles = app.bundles;
                     q.pcm = app.pcm_cache;
                     q.scope_pcm = scope_pcm;

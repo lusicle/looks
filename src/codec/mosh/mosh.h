@@ -55,7 +55,7 @@ struct MvField {
 
 class MoshCodec {
 public:
-    // Drops both persistent chains (clip change / discontinuity).
+    // Drops both persistent chains (media change / discontinuity).
     void reset();
     bool has_state() const { return has_state_; }
 

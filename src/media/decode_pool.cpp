@@ -33,8 +33,11 @@ bool same_bundles(const std::vector<AssetBundle>& a,
 }  // namespace
 
 DecodePool::DecodePool() {
+    // Enough workers to keep a stream's whole reader bank busy: one 4K
+    // stream needs ~3 concurrent decodes just to match its own frame
+    // rate, and stacked streams multiply that.
     const unsigned hw = std::thread::hardware_concurrency();
-    const unsigned count = std::clamp(hw / 4, 1u, 4u);
+    const unsigned count = std::clamp(hw / 3, 2u, 8u);
     for (unsigned i = 0; i < count; ++i)
         workers_.emplace_back([this] { worker_main(); });
 }
@@ -66,17 +69,17 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
     if (revision == revision_ && look_id == look_ &&
         same_bundles(bundles, bundles_))
         return;
-    // A revision that left the CLIP TABLE identical (param drags, block
+    // A revision that left the SOURCE TABLE identical (param drags, block
     // Motion, effect edits) must not stall the decode workers - draining
     // per gesture frame is what made dragging hitch during playback.
-    std::vector<doc::ClipInstance> next =
-        doc::flatten_clip_sources(doc, look_id);
+    std::vector<doc::MediaInstance> next =
+        doc::flatten_media_sources(doc, look_id);
     if (look_id == look_ && same_bundles(bundles, bundles_) &&
-        next.size() == clips_.size()) {
+        next.size() == sources_.size()) {
         bool same = true;
         for (size_t i = 0; i < next.size(); ++i) {
-            const doc::ClipInstance& a = next[i];
-            const doc::ClipInstance& b = clips_[i];
+            const doc::MediaInstance& a = next[i];
+            const doc::MediaInstance& b = sources_[i];
             if (a.key != b.key || a.owner != b.owner || a.layer != b.layer ||
                 a.asset != b.asset || a.t_in != b.t_in ||
                 a.t_out != b.t_out || a.source_in != b.source_in ||
@@ -95,15 +98,15 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
     revision_ = revision;
     look_ = look_id;
     bundles_ = bundles;
-    clips_ = std::move(next);
+    sources_ = std::move(next);
 
     std::lock_guard<std::mutex> lock(map_m_);
     for (auto it = streams_.begin(); it != streams_.end();) {
-        const doc::ClipInstance* clip = nullptr;
-        for (const doc::ClipInstance& c : clips_)
-            if (c.key == it->first) clip = &c;
+        const doc::MediaInstance* src = nullptr;
+        for (const doc::MediaInstance& c : sources_)
+            if (c.key == it->first) src = &c;
         const AssetBundle* b =
-            clip ? find_bundle(bundles_, clip->asset) : nullptr;
+            src ? find_bundle(bundles_, src->asset) : nullptr;
         // A placement that moved to another asset - or vanished - must not
         // keep serving the old file's pixels.
         if (!b || b->mez != it->second->path)
@@ -116,14 +119,14 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
 std::vector<DecodePool::Request> DecodePool::plan(uint32_t root_frame) const {
     std::vector<Request> out;
     const double f = static_cast<double>(root_frame);
-    for (size_t i = 0; i < clips_.size(); ++i) {
-        const doc::ClipInstance& c = clips_[i];
-        if (!doc::clip_active(c, f)) continue;
+    for (size_t i = 0; i < sources_.size(); ++i) {
+        const doc::MediaInstance& c = sources_[i];
+        if (!doc::media_active(c, f)) continue;
         const AssetBundle* b = find_bundle(bundles_, c.asset);
         if (!b || b->mez.empty() || b->frames == 0) continue;
         // A placement may outlive its media (an explicit out point past
         // the end): it holds the last frame rather than going blank.
-        const double src = std::floor(doc::clip_source_frame(c, f));
+        const double src = std::floor(doc::media_source_frame(c, f));
         const double last = static_cast<double>(b->frames - 1);
         const uint32_t idx = static_cast<uint32_t>(
             std::clamp(src, 0.0, last));
@@ -134,8 +137,8 @@ std::vector<DecodePool::Request> DecodePool::plan(uint32_t root_frame) const {
         bool replaced = false;
         for (Request& r : out)
             if (r.key == c.key) {
-                if (clips_[r.clip].t_in <= c.t_in) {
-                    r.clip = i;
+                if (sources_[r.source].t_in <= c.t_in) {
+                    r.source = i;
                     r.frame = idx;
                 }
                 replaced = true;
@@ -147,7 +150,7 @@ std::vector<DecodePool::Request> DecodePool::plan(uint32_t root_frame) const {
 }
 
 DecodePool::Stream* DecodePool::stream_for(const Request& req) {
-    const doc::ClipInstance& c = clips_[req.clip];
+    const doc::MediaInstance& c = sources_[req.source];
     const AssetBundle* b = find_bundle(bundles_, c.asset);
     if (!b || b->mez.empty()) return nullptr;
     std::lock_guard<std::mutex> lock(map_m_);
@@ -169,31 +172,47 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
             if (e.first == frame) return e.second;
     }
     if (was_miss) *was_miss = true;
-    // The reader is stateful, so decodes serialize per stream - but on
-    // decode_m, never on the ring lock: a probe returns immediately and
-    // a miss waits at most the ONE decode in flight.
-    std::lock_guard<std::mutex> dlock(s.decode_m);
+    // Grab a FREE reader slot so concurrent decodes of one stream run
+    // in parallel; only when the whole bank is busy does this wait, on
+    // a frame-hashed slot, at most one decode deep.
+    Stream::Slot* slot = nullptr;
+    std::unique_lock<std::mutex> dlock;
+    for (Stream::Slot& c : s.slots) {
+        std::unique_lock<std::mutex> attempt(c.m, std::try_to_lock);
+        if (attempt.owns_lock()) {
+            slot = &c;
+            dlock = std::move(attempt);
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &s.slots[frame % Stream::kSlots];
+        dlock = std::unique_lock<std::mutex>(slot->m);
+    }
     {
         std::lock_guard<std::mutex> lock(s.m);
         for (const auto& e : s.ring)
             if (e.first == frame) return e.second;   // landed while waiting
     }
-    if (!s.opened) {
-        s.opened = true;
+    if (!slot->opened) {
+        slot->opened = true;
         std::string error;
-        s.ok = s.reader.open(s.path, &error);
-        if (!s.ok)
+        slot->ok = slot->reader.open(s.path, &error);
+        if (!slot->ok)
             log_warn("decode pool: open failed (%s)", error.c_str());
     }
-    if (!s.ok) return nullptr;
+    if (!slot->ok) return nullptr;
     codec::DecodedFrame decoded;
-    if (!s.reader.decode(frame, decoded)) {
+    if (!slot->reader.decode(frame, decoded)) {
         log_warn("decode pool: decode failed for frame %u", frame);
         return nullptr;
     }
     auto shared =
         std::make_shared<const codec::DecodedFrame>(std::move(decoded));
     std::lock_guard<std::mutex> lock(s.m);
+    // A parallel slot may have landed the same frame; keep one entry.
+    for (const auto& e : s.ring)
+        if (e.first == frame) return e.second;
     s.ring.emplace_back(frame, shared);
     // Evict what the playhead has left furthest behind (or never reaches).
     const size_t depth = std::max<size_t>(ring_depth_, 1);
@@ -242,14 +261,14 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
     // it decodes frames that evict themselves, then re-queues them every
     // cycle: permanent decode churn whose stream-lock traffic stalled
     // collect() by the whole backlog. Frames already ringed (or already
-    // queued - slowed clips repeat source frames) never re-queue, so a
+    // queued - slowed sources repeat source frames) never re-queue, so a
     // settled steady state queues NOTHING.
     std::vector<Job> queued;
     const uint32_t span = std::min(
         kDecodeAhead, ring_depth_ > 1 ? ring_depth_ - 1 : 1u);
     for (uint32_t n = 0; n < span; ++n) {
-        for (size_t i = 0; i < clips_.size(); ++i) {
-            const doc::ClipInstance& c = clips_[i];
+        for (size_t i = 0; i < sources_.size(); ++i) {
+            const doc::MediaInstance& c = sources_[i];
             const double first =
                 std::max(static_cast<double>(root_frame) + 1.0,
                          std::ceil(c.t_in));
@@ -259,10 +278,10 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
                 continue;
             const AssetBundle* b = find_bundle(bundles_, c.asset);
             if (!b || b->mez.empty() || b->frames == 0) continue;
-            const double src = std::floor(doc::clip_source_frame(c, at));
+            const double src = std::floor(doc::media_source_frame(c, at));
             Request req;
             req.key = c.key;
-            req.clip = i;
+            req.source = i;
             req.frame = static_cast<uint32_t>(std::clamp(
                 src, 0.0, static_cast<double>(b->frames - 1)));
             bool dup = false;

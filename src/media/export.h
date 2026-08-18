@@ -19,7 +19,7 @@ struct ExportOptions {
     uint32_t video_bitrate_bps = 8'000'000;
     uint32_t audio_bitrate_bps = 128'000;
     // Source-audio offset: seconds of PCM skipped before the
-    // first exported video frame — clip trim plus the user nudge. Negative
+    // first exported video frame — source trim plus the user nudge. Negative
     // delays the audio with leading silence. Out-of-range reads are
     // silence, so any offset is safe.
     double audio_offset_seconds = 0.0;

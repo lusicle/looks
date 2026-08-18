@@ -7,7 +7,7 @@
 // and id counters are re-derived from the highest id seen so a hand-edited
 // file can never mint duplicate ids.
 //
-// Version 4: two entities. Looks are timeless graphs (clip nodes with a
+// Version 4: two entities. Looks are timeless graphs (media nodes with a
 // slip, generators, nested look/sequence refs - no placements, no audio
 // of their own); sequences arrange placements on video lanes and audio
 // tracks and carry the timeline region. Older files do not load - no

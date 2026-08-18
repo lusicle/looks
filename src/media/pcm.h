@@ -26,6 +26,7 @@ public:
 
 private:
     void* file_ = nullptr;
+    std::filesystem::path path_;
     uint32_t channels_ = 0;
     uint64_t frames_ = 0;
     bool finished_ = false;

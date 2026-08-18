@@ -17,7 +17,7 @@ using json::Value;
 
 const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
-const char* const kSourceKindNames[] = {"clip",  "solid", "gradient",
+const char* const kSourceKindNames[] = {"media", "solid", "gradient",
                                         "noise", "test",  "oscillator",
                                         "shape", "look",  "sequence"};
 static_assert(sizeof(kSourceKindNames) / sizeof(kSourceKindNames[0]) ==
@@ -162,6 +162,7 @@ Value value_node_to_json(const ValueNode& n) {
     }
     if (n.in_a) v.set("in_a", static_cast<int64_t>(n.in_a));
     if (n.in_b) v.set("in_b", static_cast<int64_t>(n.in_b));
+    if (n.audio_src) v.set("audio_src", static_cast<int64_t>(n.audio_src));
     if (n.node_x != 0.0f || n.node_y != 0.0f) {
         v.set("node_x", static_cast<double>(n.node_x));
         v.set("node_y", static_cast<double>(n.node_y));
@@ -177,6 +178,7 @@ ValueNode value_node_from_json(const Value& v) {
         enum_index(kValueOpNames, v.get("op").as_string()));
     n.in_a = static_cast<uint64_t>(v.get("in_a").as_int(0));
     n.in_b = static_cast<uint64_t>(v.get("in_b").as_int(0));
+    n.audio_src = static_cast<uint64_t>(v.get("audio_src").as_int(0));
     n.const_a = num(v, "const_a", 0.0f);
     n.const_b = num(v, "const_b", 1.0f);
     n.in_min = num(v, "in_min", 0.0f);
@@ -336,6 +338,7 @@ Value layer_to_json(const Layer& l) {
           enum_name(kSourceKindNames, static_cast<uint32_t>(l.source)));
     if (l.asset) v.set("asset", static_cast<int64_t>(l.asset));
     if (l.slip) v.set("slip", static_cast<int64_t>(l.slip));
+    if (l.timeline_lock) v.set("timeline_lock", true);
     if (l.target) v.set("target", static_cast<int64_t>(l.target));
     v.set("color_a", f3_to_json(l.color_a));
     v.set("color_b", f3_to_json(l.color_b));
@@ -377,10 +380,13 @@ Layer layer_from_json(const Value& v) {
     Layer l;
     l.id = static_cast<uint64_t>(v.get("id").as_int(0));
     l.name = v.get("name").as_string();
+    std::string src_name = v.get("source").as_string();
+    if (src_name == "clip") src_name = "media";   // pre-rename projects
     l.source = static_cast<LayerSourceKind>(
-        enum_index(kSourceKindNames, v.get("source").as_string()));
+        enum_index(kSourceKindNames, src_name));
     l.asset = static_cast<uint64_t>(v.get("asset").as_int(0));
     l.slip = static_cast<uint32_t>(v.get("slip").as_int(0));
+    l.timeline_lock = v.get("timeline_lock").as_bool(false);
     l.target = static_cast<uint64_t>(v.get("target").as_int(0));
     f3_from_json(v.get("color_a"), l.color_a);
     f3_from_json(v.get("color_b"), l.color_b);
@@ -471,6 +477,7 @@ Value look_to_json(const Look& look) {
     if (look.duration)
         v.set("duration", static_cast<int64_t>(look.duration));
     if (look.bin) v.set("bin", static_cast<int64_t>(look.bin));
+    if (look.audio_split) v.set("audio_split", true);
 
     Value layers = Value::make_array();
     for (const Layer& l : look.layers) layers.push(layer_to_json(l));
@@ -539,6 +546,7 @@ Look look_from_json(const Value& v) {
     look.name = v.get("name").as_string();
     look.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
     look.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
+    look.audio_split = v.get("audio_split").as_bool(false);
 
     for (const Value& lv : v.get("layers").array()) {
         if (look.layers.size() >= kMaxLayers) break;

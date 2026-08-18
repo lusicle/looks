@@ -11,8 +11,14 @@ constexpr size_t kHeaderSize = 16;
 }  // namespace
 
 PcmWriter::~PcmWriter() {
-    if (file_ && !finished_) finish();
+    // Unfinished = aborted import: remove the partial instead of
+    // sealing it (a sealed short sidecar reads as valid shorter audio).
+    const bool partial = file_ && !finished_;
     if (file_) std::fclose(static_cast<FILE*>(file_));
+    if (partial) {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
 }
 
 bool PcmWriter::open(const std::filesystem::path& path, uint32_t channels,
@@ -20,6 +26,7 @@ bool PcmWriter::open(const std::filesystem::path& path, uint32_t channels,
     FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) return false;
     file_ = f;
+    path_ = path;
     channels_ = channels;
     frames_ = 0;
     finished_ = false;

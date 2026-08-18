@@ -1,14 +1,18 @@
 // Muxer <-> demuxer roundtrip: our BmffMuxer writes a file, our BmffFile
 // parses it back — sample tables, avcC/esds, offsets, and payload bytes
 // must survive. No codecs involved (payloads are arbitrary bytes).
-// Also home to the WAV codec roundtrip.
+// Also home to the WAV codec roundtrip and the MP3 container walk.
 
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 
 #include "media/bmff.h"
 #include "media/bmff_mux.h"
 #include "media/h264_util.h"
+#include "media/import.h"
+#include "media/mp3.h"
+#include "media/pcm.h"
 #include "media/wav.h"
 #include "test_framework.h"
 
@@ -35,6 +39,96 @@ TEST(wav_roundtrip) {
         identical = identical && back.samples[i] == samples[i];
     CHECK(identical);
     std::filesystem::remove(path);
+}
+
+TEST(wav_imports_as_audio_only_bundle) {
+    // A wav import writes JUST the PCM sidecar: no mezzanine, no video
+    // side - asset frame_count stays 0 (image-dormant media node).
+    const auto dir = std::filesystem::temp_directory_path() / "looks_wavimp";
+    std::filesystem::create_directories(dir);
+    const auto src = dir / "tone.wav";
+    std::vector<int16_t> samples(48000);
+    for (size_t i = 0; i < samples.size(); ++i)
+        samples[i] = static_cast<int16_t>(
+            12000.0 * std::sin(2.0 * 3.14159265 * 220.0 * i / 48000.0));
+    std::string error;
+    CHECK(write_wav(src, samples.data(), samples.size(), 1, 48000, &error));
+
+    const ImportResult r = import_media(src, dir);
+    CHECK(r.ok);
+    CHECK(r.mez_path.empty());
+    CHECK(!r.pcm_path.empty());
+    CHECK_EQ(r.frame_count, 0u);
+    CHECK_EQ(r.width, 0u);
+    CHECK_EQ(r.audio_channels, 1u);
+    CHECK_EQ(r.audio_sample_rate, 48000u);
+    CHECK_EQ(r.audio_frames, uint64_t{48000});
+
+    {
+        PcmReader pcm;
+        CHECK(pcm.open(r.pcm_path, &error));
+        CHECK_EQ(pcm.frame_count(), uint64_t{48000});
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST(mp3_cover_art_parses_id3v2_apic) {
+    // Synthetic ID3v2.3 tag: one TIT2 frame, then APIC with a marker
+    // payload. The parser walks frames and slices the image bytes out.
+    const uint8_t img[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
+    std::vector<uint8_t> apic;
+    apic.push_back(0);                        // text encoding: latin-1
+    const char* mime = "image/jpeg";
+    apic.insert(apic.end(), mime, mime + std::strlen(mime) + 1);
+    apic.push_back(3);                        // picture type: front cover
+    apic.push_back(0);                        // empty description
+    apic.insert(apic.end(), img, img + 5);
+
+    std::vector<uint8_t> tag = {'I', 'D', '3', 3, 0, 0};
+    auto push_be32 = [&](uint32_t v) {
+        tag.push_back(static_cast<uint8_t>(v >> 24));
+        tag.push_back(static_cast<uint8_t>(v >> 16));
+        tag.push_back(static_cast<uint8_t>(v >> 8));
+        tag.push_back(static_cast<uint8_t>(v));
+    };
+    auto push_syncsafe = [&](uint32_t v) {
+        tag.push_back(static_cast<uint8_t>((v >> 21) & 0x7F));
+        tag.push_back(static_cast<uint8_t>((v >> 14) & 0x7F));
+        tag.push_back(static_cast<uint8_t>((v >> 7) & 0x7F));
+        tag.push_back(static_cast<uint8_t>(v & 0x7F));
+    };
+    const uint32_t body =
+        10 + 5 + 10 + static_cast<uint32_t>(apic.size());
+    push_syncsafe(body);
+    tag.insert(tag.end(), {'T', 'I', 'T', '2'});
+    push_be32(5);
+    tag.push_back(0);
+    tag.push_back(0);
+    tag.insert(tag.end(), {0, 't', 'e', 's', 't'});
+    tag.insert(tag.end(), {'A', 'P', 'I', 'C'});
+    push_be32(static_cast<uint32_t>(apic.size()));
+    tag.push_back(0);
+    tag.push_back(0);
+    tag.insert(tag.end(), apic.begin(), apic.end());
+
+    std::vector<uint8_t> out;
+    CHECK(mp3_cover_art(tag.data(), tag.size(), &out));
+    CHECK_EQ(out.size(), size_t{5});
+    CHECK(!std::memcmp(out.data(), img, 5));
+
+    // No APIC frame = no art; garbage = no art.
+    std::vector<uint8_t> plain = {'I', 'D', '3', 3, 0, 0, 0, 0, 0, 0};
+    CHECK(!mp3_cover_art(plain.data(), plain.size(), &out));
+    CHECK(!mp3_cover_art(img, 5, &out));
+}
+
+TEST(mp3_decode_refuses_garbage) {
+    Mp3Data data;
+    std::string error;
+    std::vector<uint8_t> junk(4096, 0xAB);
+    CHECK(!decode_mp3(junk.data(), junk.size(), &data, &error));
+    CHECK(!decode_mp3(nullptr, 0, &data, &error));
 }
 
 TEST(mux_demux_roundtrip) {

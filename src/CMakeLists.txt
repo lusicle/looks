@@ -8,6 +8,12 @@ add_library(looks_util STATIC
     util/inflate.cpp
     util/image.cpp)
 target_include_directories(looks_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Pixel/byte loops (image decode, inflate, the doc-hash JSON writer) are
+# hot on the import and autosave paths - same Debug-/O2 tradeoff as
+# looks_codec below.
+if(MSVC)
+    target_compile_options(looks_util PRIVATE $<$<CONFIG:Debug>:/O2 /Ob2 /Oi>)
+endif()
 
 # ---- doc: document model + command/undo core + effect stack + mod data.
 add_library(looks_doc STATIC
@@ -35,6 +41,11 @@ add_library(looks_mod STATIC
     mod/analysis.cpp)
 target_include_directories(looks_mod PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(looks_mod PUBLIC looks_doc looks_util)
+# FFT + per-frame analysis run over whole tracks at import and on every
+# wired-chain rebuild - optimized in every config, like looks_codec.
+if(MSVC)
+    target_compile_options(looks_mod PRIVATE $<$<CONFIG:Debug>:/O2 /Ob2 /Oi>)
+endif()
 
 # ---- codec: codec_core + mezzanine + Codec-Box mosh codec. Pure CPU.
 add_library(looks_codec STATIC
@@ -53,9 +64,16 @@ endif()
 add_library(looks_platform STATIC
     platform/win/win_window.cpp
     platform/win/win_dialog.cpp
-    platform/win/mf_codec.cpp)
+    platform/win/mf_codec.cpp
+    platform/win/wic_image.cpp)
 target_include_directories(looks_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(looks_platform PRIVATE looks_util)
+# The MFT sample copies move 12+ MB per 4K frame - optimized in every
+# config, like looks_codec.
+if(MSVC)
+    target_compile_options(looks_platform PRIVATE
+        $<$<CONFIG:Debug>:/O2 /Ob2 /Oi>)
+endif()
 
 # ---- media: BMFF demux, PCM sidecar, import pipeline (muxer + player next).
 add_library(looks_media STATIC
@@ -64,6 +82,7 @@ add_library(looks_media STATIC
     media/h264_util.cpp
     media/pcm.cpp
     media/wav.cpp
+    media/mp3.cpp
     media/import.cpp
     media/export.cpp
     media/player.cpp
@@ -75,6 +94,13 @@ target_include_directories(looks_media SYSTEM PUBLIC
     ${LOOKS_THIRD_PARTY}/miniaudio)
 target_link_libraries(looks_media PUBLIC
     looks_util looks_codec looks_platform looks_mod)
+# The import's per-frame pixel stages (NV12->I420, proxy downsample) and
+# the audio mix DSP live here - optimized in every config, like
+# looks_codec (at /Od these made 4K import ~2x slower than the codec).
+if(MSVC)
+    target_compile_options(looks_media PRIVATE
+        $<$<CONFIG:Debug>:/O2 /Ob2 /Oi>)
+endif()
 
 # ---- gfx: Vulkan loader/device/swapchain/frame loop + VMA + the engine
 # (graph compiler/evaluator, pooled targets, compute dispatch, viewport

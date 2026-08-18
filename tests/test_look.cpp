@@ -27,7 +27,7 @@ TEST(look_fresh_document_has_look_and_sequence) {
     CHECK_EQ(d.sequences[0].id, d.root_sequence);
     CHECK_EQ(d.sequences[0].tracks.size(), size_t{1});
     CHECK_EQ(d.looks[0].layers.size(), size_t{1});
-    CHECK(doc::layer_is_clip(d.looks[0].layers[0]));
+    CHECK(doc::layer_is_media(d.looks[0].layers[0]));
     // Ids are unique across kinds: one counter for everything.
     CHECK(d.looks[0].id != d.sequences[0].id);
     CHECK(d.looks[0].id != d.looks[0].layers[0].id);
@@ -52,6 +52,54 @@ TEST(look_add_remove_undo) {
     undo.undo(d);
     CHECK_EQ(d.looks.size(), size_t{2});
     CHECK_EQ(d.look(id).name, "second");
+}
+
+TEST(look_audio_split_toggle_undo) {
+    Document d;
+    doc::UndoStack undo;
+    const uint64_t id = d.looks[0].id;
+    CHECK(!d.looks[0].audio_split);
+    undo.execute(d, doc::set_look_audio_split_command(id, true));
+    CHECK(d.looks[0].audio_split);
+    undo.undo(d);
+    CHECK(!d.looks[0].audio_split);
+    undo.redo(d);
+    CHECK(d.looks[0].audio_split);
+
+    // Combining DROPS the audio wire; undo brings it back with the mode.
+    doc::ensure_links(d.looks[0]);
+    d.looks[0].links.push_back({d.looks[0].layers[0].id, 0, 1});
+    const size_t wired = d.looks[0].links.size();
+    undo.execute(d, doc::set_look_audio_split_command(id, false));
+    CHECK(!d.looks[0].audio_split);
+    CHECK_EQ(d.looks[0].links.size(), wired - 1);
+    for (const doc::NodeLink& l : d.looks[0].links)
+        CHECK(!(l.to == 0 && l.to_port == 1));
+    undo.undo(d);
+    CHECK(d.looks[0].audio_split);
+    CHECK_EQ(d.looks[0].links.size(), wired);
+}
+
+TEST(look_disconnect_last_wire_stays_deleted) {
+    // Deleting the last real wire must not fall back into the
+    // empty-table synthesis sentinel - the chain would resurrect.
+    Document d;
+    d.looks[0].layers[0].asset = d.next_effect_id++;
+    doc::UndoStack undo;
+    const uint64_t lid = d.looks[0].layers[0].id;
+    undo.execute(d, doc::disconnect_command(d.looks[0].id, {lid, 0, 0}));
+    CHECK(!d.looks[0].links.empty());   // sealed, not synthesized
+    for (const doc::NodeLink& l : d.looks[0].links)
+        CHECK(!(l.to == 0 && l.to_port == 0));
+    // A real connect prunes the seal; undo restores it.
+    undo.execute(d, doc::connect_command(d.looks[0].id, {lid, 0, 0}));
+    for (const doc::NodeLink& l : d.looks[0].links)
+        CHECK(!doc::link_is_tombstone(l));
+    undo.undo(d);
+    for (const doc::NodeLink& l : d.looks[0].links)
+        CHECK(!(l.to == 0 && l.to_port == 0));
+    undo.undo(d);
+    CHECK(d.looks[0].links.empty());   // back to synthesized wiring
 }
 
 TEST(sequence_add_remove_undo) {
@@ -287,10 +335,10 @@ TEST(look_duration_is_lockstep_content) {
     d.assets.push_back(a);
     d.looks[0].layers[0].asset = a.id;
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{90});
-    // Slip shortens what the clip can play.
+    // Slip shortens what the media can play.
     d.looks[0].layers[0].slip = 30;
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{60});
-    // A second, longer clip extends the lockstep length.
+    // A second, longer media extends the lockstep length.
     doc::Layer l;
     l.id = d.next_effect_id++;
     doc::Asset b;
@@ -452,7 +500,7 @@ TEST(look_nest_wraps_graph_selection_in_a_lockstep_ref) {
     solid.source = doc::LayerSourceKind::Solid;
     base.layers.push_back(std::move(solid));
     const uint64_t solid_id = base.layers.back().id;
-    const uint64_t clip_id = base.layers[0].id;
+    const uint64_t media_id = base.layers[0].id;
 
     auto cmd = doc::nest_layers_command(d, base.id, {solid_id}, "wrap");
     CHECK(cmd != nullptr);
@@ -466,8 +514,8 @@ TEST(look_nest_wraps_graph_selection_in_a_lockstep_ref) {
     CHECK(nested != nullptr);
     CHECK_EQ(nested->layers.size(), size_t{1});
     CHECK(nested->layers[0].source == doc::LayerSourceKind::Solid);
-    // The parent kept its other chain; the clip stayed put.
-    CHECK_EQ(d.looks[0].layers[0].id, clip_id);
+    // The parent kept its other chain; the media layer stayed put.
+    CHECK_EQ(d.looks[0].layers[0].id, media_id);
 
     undo.undo(d);
     CHECK_EQ(d.looks.size(), size_t{1});

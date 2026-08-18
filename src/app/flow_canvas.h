@@ -82,6 +82,9 @@ struct Node {
     bool feedback = false;           // self-loop glyph in the title bar
     bool has_in = false;
     bool has_matte_port = false;
+    // Port-1 label; null = "matte". The Output relabels its port-1 slot
+    // "audio" (the split-mode audio-in rides the same anchor + wire kind).
+    const char* matte_label = nullptr;
     bool has_aux_port = false;   // second image input (N-ports)
     const char* aux_label = "b"; // port name on the card ("b", "map")
     bool has_out = false;
@@ -108,13 +111,16 @@ struct Node {
     bool is_look = false;
 };
 
-// kind: 0 = chain (solid, In port), 1 = matte (dashed, matte port),
-// 2 = mod (dashed dim), 3 = aux (solid, "b" port).
+// TWO families, nothing else: MEDIA wires mirror the doc link's
+// to_port verbatim (0 = In, 1 = matte/audio slot, 2 = aux) and draw
+// one generic solid style; DATA wires (the value graph) land on param
+// rows and draw dashed dim. Selection alone wears the accent.
 struct Wire {
     uint64_t from = 0;   // leaves from's Out port
     uint64_t to = 0;
-    uint8_t kind = 0;
-    // Mod wires land on the driven PARAM's row instead of the card
+    uint32_t to_port = 0;   // media: the doc link's port; data: unused
+    bool data = false;
+    // Data wires land on the driven PARAM's row instead of the card
     // edge; -1 = no row (card-edge fallback).
     int to_row = -1;
 };
@@ -281,7 +287,8 @@ struct Output {
     bool wire_clicked = false;
     bool wire_clicked_shift = false;
     uint64_t wire_from = 0, wire_to = 0;
-    uint8_t wire_kind = 0;
+    uint32_t wire_to_port = 0;
+    bool wire_data = false;
     int wire_to_row = -1;
     // Context menu: item picked this frame (index into Graph::ctx_items;
     // -1 = none — the app MUST re-init the sentinel after arena alloc),

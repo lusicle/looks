@@ -39,7 +39,7 @@ float eval_lfo(const doc::ModSource& s, double t) {
 }
 
 // BPM-synced LFO: rate_hz holds beats-per-cycle. Falls back to
-// 120 BPM when the clip has no analysis/estimate.
+// 120 BPM when the media has no analysis/estimate.
 float eval_lfo_beat(const doc::ModSource& s, double t,
                     const AnalysisCurves* analysis) {
     const double bpm =
@@ -223,42 +223,26 @@ float eval_source(const doc::ModSource& source, double t_seconds,
                   uint32_t frame_index, const AnalysisCurves* analysis,
                   double fps, double audio_offset_seconds, double key_time,
                   const SourceFrameView* video) {
-    // Audio nudge: audio-derived sources read a shifted clock so
-    // a positive offset delays audio-driven wiggles against video.
-    const double ta = t_seconds - audio_offset_seconds;
-    uint32_t af = frame_index;
-    if (audio_offset_seconds != 0.0 && fps > 0.0) {
-        const double shifted =
-            static_cast<double>(frame_index) - audio_offset_seconds * fps;
-        af = shifted <= 0.0 ? 0u : static_cast<uint32_t>(shifted + 0.5);
-    }
+    // Audio-driven kinds (bands, onset, Beat, LfoBeat, Envelope's
+    // onset/beat triggers) evaluate ONLY on the wired path in
+    // eval_value_node - they require their media input, and the global
+    // curves carry no audio for them. The nudge rides that path too.
+    (void)audio_offset_seconds;
     switch (source.type) {
         case doc::ModSourceType::Lfo:
             return eval_lfo(source, t_seconds);
-        case doc::ModSourceType::LfoBeat:
-            return eval_lfo_beat(source, ta, analysis);
-        case doc::ModSourceType::Beat:
-            return eval_beat(source, ta, analysis);
         case doc::ModSourceType::Envelope:
-            // Onset triggers ride the audio clock; cuts are video-derived.
-            return eval_envelope(source,
-                                 source.trigger == 0 ? af : frame_index,
-                                 analysis, fps, source.trigger == 2 ? ta
-                                                                    : t_seconds,
-                                 key_time);
+            // Only the video-cut and live-keypress triggers are not
+            // audio; the onset/beat triggers read 0 here (unwired =
+            // never fires).
+            if (source.trigger != 1 && source.trigger != 3) return 0.0f;
+            return eval_envelope(source, frame_index, analysis, fps,
+                                 t_seconds, key_time);
         case doc::ModSourceType::VideoCut:
             return analysis ? analysis->sample(analysis->cut, frame_index)
                             : 0.0f;
         case doc::ModSourceType::Drift:
             return eval_drift(source, t_seconds);
-        case doc::ModSourceType::AudioLow:
-            return analysis ? analysis->sample(analysis->low, af) : 0.0f;
-        case doc::ModSourceType::AudioMid:
-            return analysis ? analysis->sample(analysis->mid, af) : 0.0f;
-        case doc::ModSourceType::AudioHigh:
-            return analysis ? analysis->sample(analysis->high, af) : 0.0f;
-        case doc::ModSourceType::AudioOnset:
-            return analysis ? analysis->sample(analysis->onset, af) : 0.0f;
         case doc::ModSourceType::VideoMotion:
             return analysis ? analysis->sample(analysis->motion, frame_index) : 0.0f;
         case doc::ModSourceType::VideoBrightness:
@@ -303,11 +287,70 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
             if (std::fabs(span) < 1e-6f) return 0.0f;
             return std::clamp((a - n->in_min * m) / span, 0.0f, 1.0f);
         }
+        case doc::ModSourceType::AudioLow:
+        case doc::ModSourceType::AudioMid:
+        case doc::ModSourceType::AudioHigh:
+        case doc::ModSourceType::AudioOnset:
+        case doc::ModSourceType::Beat:
+        case doc::ModSourceType::LfoBeat:
+        case doc::ModSourceType::Envelope: {
+            // An audio-driven node REQUIRES its input: the wire is the
+            // only audio source. It taps its own connection - curves of
+            // the wired chain's processed audio, media-frame indexed
+            // (slip + Offset shims map the look clock in). Unwired or
+            // unresolvable reads 0, never the global curves. Beat
+            // clocks anchor on the MEDIA position, so cuts of one media
+            // beat-match. Envelope's cut/keypress triggers are not
+            // audio - they fall through to eval_source.
+            if (n->source.type == doc::ModSourceType::Envelope &&
+                n->source.trigger != 0 && n->source.trigger != 2)
+                break;
+            if (!n->audio_src || !env.node_audio) return 0.0f;
+            const auto it = env.node_audio->find(n->id);
+            if (it == env.node_audio->end() || !it->second.curves)
+                return 0.0f;
+            const AnalysisCurves& c = *it->second.curves;
+            // The same audio-nudge shift eval_source used to apply.
+            const double shifted = static_cast<double>(env.frame) -
+                                   env.audio_off * env.fps;
+            const uint32_t local =
+                shifted <= 0.0 ? 0u
+                               : static_cast<uint32_t>(shifted + 0.5);
+            const int64_t pos = static_cast<int64_t>(local) +
+                                static_cast<int64_t>(it->second.slip) +
+                                it->second.offset;
+            const uint32_t mf =
+                pos < 0 ? 0u : static_cast<uint32_t>(pos);
+            switch (n->source.type) {
+                case doc::ModSourceType::AudioLow:
+                    return c.sample(c.low, mf);
+                case doc::ModSourceType::AudioMid:
+                    return c.sample(c.mid, mf);
+                case doc::ModSourceType::AudioHigh:
+                    return c.sample(c.high, mf);
+                case doc::ModSourceType::AudioOnset:
+                    return c.sample(c.onset, mf);
+                default: {
+                    // Beat / LfoBeat / Envelope on the chain's clock.
+                    const double tm =
+                        env.fps > 0.0
+                            ? static_cast<double>(mf) / env.fps
+                            : 0.0;
+                    if (n->source.type == doc::ModSourceType::LfoBeat)
+                        return eval_lfo_beat(n->source, tm, &c);
+                    if (n->source.type == doc::ModSourceType::Beat)
+                        return eval_beat(n->source, tm, &c);
+                    return eval_envelope(n->source, mf, &c, env.fps, tm,
+                                         env.key_time);
+                }
+            }
+        }
         default:
-            return eval_source(n->source, env.t, env.frame, env.analysis,
-                               env.fps, env.audio_off, env.key_time,
-                               env.video);
+            break;
     }
+    return eval_source(n->source, env.t, env.frame, env.analysis,
+                       env.fps, env.audio_off, env.key_time,
+                       env.video);
 }
 
 float apply_curve(doc::ResponseCurve curve, float x) {
@@ -349,7 +392,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                   uint32_t local_frame, double fps,
                   const AnalysisCurves* analysis, double audio_off,
                   double live_seconds, double key_time,
-                  const SourceFrameView* video) {
+                  const SourceFrameView* video,
+                  const NodeAudioMap* node_audio) {
     const uint32_t frame_index = local_frame;
     const double t = live_seconds >= 0.0
                          ? live_seconds
@@ -357,7 +401,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
     // Value nodes read the PRE-RESOLVE look: node params are not
     // themselves mod targets, so the copy-in-progress never feeds back.
     const ValueEnv env{&look, t,         frame_index, analysis,
-                       fps,   audio_off, key_time,    video};
+                       fps,   audio_off, key_time,    video,
+                       node_audio};
 
     auto param_slot = [](doc::EffectInstance& fx, int param_index) -> float* {
         if (param_index == doc::kWetParam) return &fx.wet;
@@ -475,7 +520,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
 doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
                       double live_seconds, double key_time,
-                      const SourceFrameView* video) {
+                      const SourceFrameView* video,
+                      const NodeAudioMap* node_audio) {
     doc::Document out = doc;
     const double audio_off =
         static_cast<double>(doc.audio_offset_ms) * 0.001;
@@ -485,7 +531,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     // above takes the frame explicitly.
     for (size_t i = 0; i < out.looks.size(); ++i)
         resolve_look(doc.looks[i], out.looks[i], frame_index, fps, analysis,
-                     audio_off, live_seconds, key_time, video);
+                     audio_off, live_seconds, key_time, video, node_audio);
     return out;
 }
 
@@ -536,7 +582,7 @@ uint32_t TimeRemap::source_frame(const doc::Document& doc, uint32_t frame,
             const double folded = p <= last ? p : period - p;
             return static_cast<uint32_t>(std::floor(folded));
         }
-        default: {  // forward: wrap around the clip
+        default: {  // forward: wrap around the media
             return static_cast<uint32_t>(std::floor(std::fmod(position, count)));
         }
     }

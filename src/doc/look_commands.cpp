@@ -345,6 +345,53 @@ private:
     uint32_t old_duration_ = 0;
 };
 
+// Output audio routing (Look::audio_split): combined rides the In wire,
+// split reads the dedicated audio-in. Combining DROPS the audio wire
+// (undo restores it) - a hidden port must not hold a live link.
+class SetLookAudioSplitCommand final : public LookCommand {
+public:
+    SetLookAudioSplitCommand(uint64_t look, bool split)
+        : LookCommand(look), split_(split) {}
+    std::string name() const override {
+        return split_ ? "Split Output Audio" : "Combine Output Audio";
+    }
+
+    void apply(Document& doc) override {
+        Look& look = look_of(doc);
+        old_split_ = look.audio_split;
+        look.audio_split = split_;
+        had_wire_ = false;
+        sealed_ = false;
+        if (!split_)
+            for (auto it = look.links.begin(); it != look.links.end();
+                 ++it)
+                if (it->to == 0 && it->to_port == 1) {
+                    wire_ = *it;
+                    had_wire_ = true;
+                    look.links.erase(it);
+                    if (look.links.empty()) {
+                        seal_links(look);
+                        sealed_ = true;
+                    }
+                    break;
+                }
+    }
+
+    void revert(Document& doc) override {
+        Look& look = look_of(doc);
+        look.audio_split = old_split_;
+        if (sealed_) prune_tombstone(look);
+        if (had_wire_) look.links.push_back(wire_);
+    }
+
+private:
+    bool split_;
+    bool old_split_ = false;
+    NodeLink wire_{};
+    bool had_wire_ = false;
+    bool sealed_ = false;
+};
+
 class AddSequenceCommand final : public Command {
 public:
     explicit AddSequenceCommand(Sequence seq) : seq_(std::move(seq)) {}
@@ -437,7 +484,7 @@ private:
 class AddAssetCommand final : public Command {
 public:
     explicit AddAssetCommand(Asset asset) : asset_(std::move(asset)) {}
-    std::string name() const override { return "Add Clip"; }
+    std::string name() const override { return "Add Media"; }
 
     void apply(Document& doc) override { doc.assets.push_back(asset_); }
 
@@ -456,7 +503,7 @@ private:
 class SetAssetCommand final : public Command {
 public:
     explicit SetAssetCommand(Asset updated) : updated_(std::move(updated)) {}
-    std::string name() const override { return "Edit Clip"; }
+    std::string name() const override { return "Edit Media"; }
 
     void apply(Document& doc) override {
         Asset* a = doc.find_asset(updated_.id);
@@ -505,7 +552,7 @@ std::vector<uint64_t> owned_ids(const Look& look,
 // a LookRef source standing where it stood. One command, because half a
 // nest is not a document anyone wants to undo into. Everything plays in
 // lockstep, so nothing rebases and no audio moves - a look's sound IS
-// its clips', wherever they sit in the nesting.
+// its media's, wherever they sit in the nesting.
 class NestLayersCommand final : public LookCommand {
 public:
     NestLayersCommand(uint64_t look, Look nested, Layer ref,
@@ -821,6 +868,11 @@ std::unique_ptr<Command> set_look_props_command(uint64_t look,
                                                 uint32_t duration) {
     return std::make_unique<SetLookPropsCommand>(look, std::move(name),
                                                  duration);
+}
+
+std::unique_ptr<Command> set_look_audio_split_command(uint64_t look,
+                                                      bool split) {
+    return std::make_unique<SetLookAudioSplitCommand>(look, split);
 }
 
 std::unique_ptr<Command> add_sequence_command(Sequence seq) {

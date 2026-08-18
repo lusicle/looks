@@ -1,5 +1,5 @@
 // Dev CLI: headless transport + decode pool verification. Builds a
-// one-clip project over an imported bundle, runs the
+// one-media project over an imported bundle, runs the
 // timeline clock, pulls frames through the pool, and exercises seek and
 // trim.
 //   looks_playtest <bundle.mez> [bundle.pcm]
@@ -31,12 +31,12 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     // A project the way the app builds one: an asset, the starter look's
-    // clip node bound to it, and one block placing that look on the root
+    // media node bound to it, and one block placing that look on the root
     // sequence.
     doc::Document doc;
     doc::Asset asset;
     asset.id = doc.next_effect_id++;
-    asset.name = "clip";
+    asset.name = "media";
     asset.frame_count = probe.frame_count();
     asset.fps = probe.fps();
     asset.width = probe.width();
@@ -78,7 +78,7 @@ int wmain(int argc, wchar_t** argv) {
     expect(span == probe.frame_count(),
            "timeline length derives from the placement");
 
-    // The mix: one clip source across the whole span.
+    // The mix: one media source across the whole span.
     {
         auto mix = std::make_shared<media::MixState>();
         mix->fps = doc.fps;

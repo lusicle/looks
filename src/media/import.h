@@ -58,4 +58,10 @@ bool extract_audio_pcm(const std::filesystem::path& source,
                        const std::filesystem::path& dest_pcm,
                        std::string* error);
 
+// The source's VIDEO track duration by a light box walk (moov/trak/
+// mdhd - no sample tables). 0 = unknown (not BMFF, or no video track).
+// The bundle completeness gate compares the mezzanine against this, so
+// a sealed partial from an old aborted import cannot pass as fresh.
+double probe_video_duration_seconds(const std::filesystem::path& source);
+
 }  // namespace looks::media

@@ -269,22 +269,75 @@ TEST(mod_resolve_lane_and_route) {
     CHECK(near(rc.looks[0].layers[0].stack[0].wet, 1.0f));
 }
 
+TEST(mod_wired_analysis_node_reads_its_connection) {
+    // An analysis node REQUIRES its input: the wired connection's
+    // curves sample at the look clock plus the chain's slip; a wire
+    // with no entry and an unwired node both read 0 - never the
+    // global set.
+    doc::Document d;
+    doc::Look& look = d.looks[0];
+    look.layers[0].asset = d.next_effect_id++;
+    doc::ValueNode n;
+    n.id = d.next_effect_id++;
+    n.source.type = doc::ModSourceType::AudioLow;
+    n.audio_src = look.layers[0].id;
+    look.value_nodes.push_back(n);
+
+    auto curves = std::make_shared<mod::AnalysisCurves>();
+    curves->low = {0.1f, 0.2f, 0.3f, 0.4f};
+    mod::NodeAudioMap map;
+    map[n.id] = {curves, 1};   // slip 1: local frame 2 reads curve[3]
+
+    mod::ValueEnv env;
+    env.look = &look;
+    env.frame = 2;
+    env.t = 2.0 / 30.0;
+    env.node_audio = &map;
+    CHECK(near(mod::eval_value_node(env, n.id), 0.4f));
+
+    mod::AnalysisCurves global;
+    global.low = {0.9f, 0.9f, 0.9f, 0.9f};
+    env.analysis = &global;
+    mod::NodeAudioMap empty;
+    env.node_audio = &empty;
+    CHECK_EQ(mod::eval_value_node(env, n.id), 0.0f);
+
+    look.value_nodes[0].audio_src = 0;
+    CHECK_EQ(mod::eval_value_node(env, n.id), 0.0f);
+}
+
 TEST(mod_resolve_analysis_sources) {
+    // Analysis nodes require their input: the wired connection's
+    // curves drive the param through resolve(); unwired reads 0 (the
+    // range floor) even with global curves present.
     doc::Document d = make_doc();
     doc::ModSource low;
     low.type = doc::ModSourceType::AudioLow;
     // rgb shift_x, range -64..64: the wire maps low onto the full span.
     add_valued_route(d, low, {d.looks[0].layers[0].stack[1].id, 0});
+    doc::ValueNode& vn = d.looks[0].value_nodes.back();
+    vn.audio_src = d.looks[0].layers[0].id;
 
-    mod::AnalysisCurves curves;
-    curves.low = {0.0f, 1.0f, 0.5f};
+    auto curves = std::make_shared<mod::AnalysisCurves>();
+    curves->low = {0.0f, 1.0f, 0.5f};
+    mod::NodeAudioMap map;
+    map[vn.id] = {curves, 0};
     // shift = -64 + 128*low
-    doc::Document r0 = mod::resolve(d, 0, 30.0, &curves);
-    doc::Document r1 = mod::resolve(d, 1, 30.0, &curves);
-    doc::Document r9 = mod::resolve(d, 9, 30.0, &curves);   // clamps to last
+    doc::Document r0 =
+        mod::resolve(d, 0, 30.0, nullptr, -1.0, -1.0, nullptr, &map);
+    doc::Document r1 =
+        mod::resolve(d, 1, 30.0, nullptr, -1.0, -1.0, nullptr, &map);
+    doc::Document r9 =
+        mod::resolve(d, 9, 30.0, nullptr, -1.0, -1.0, nullptr, &map);
     CHECK(near(r0.looks[0].layers[0].stack[1].params[0], -64.0f));
     CHECK(near(r1.looks[0].layers[0].stack[1].params[0], 64.0f));
     CHECK(near(r9.looks[0].layers[0].stack[1].params[0], 0.0f));
+
+    d.looks[0].value_nodes.back().audio_src = 0;
+    mod::AnalysisCurves global;
+    global.low = {1.0f, 1.0f, 1.0f};
+    doc::Document ru = mod::resolve(d, 1, 30.0, &global);
+    CHECK(near(ru.looks[0].layers[0].stack[1].params[0], -64.0f));
 }
 
 TEST(mod_route_commands_undo) {
@@ -601,7 +654,7 @@ TEST(mod_time_remap_identity_and_modes) {
     CHECK_EQ(remap.source_frame(d, 7, 30.0, nullptr, 10), 7u);
     CHECK_EQ(remap.source_frame(d, 42, 30.0, nullptr, 10), 9u);
 
-    // 2x forward wraps around the clip.
+    // 2x forward wraps around the media.
     d.speed = 2.0f;
     CHECK(mod::time_remap_active(d));
     mod::TimeRemap fwd;
@@ -663,19 +716,34 @@ TEST(mod_speed_at_is_the_project_scalar) {
 }
 
 TEST(mod_envelope_source) {
-    mod::AnalysisCurves curves;
-    curves.onset.assign(40, 0.0f);
-    curves.onset[10] = 1.0f;
-    curves.cut.assign(40, 0.0f);
-    curves.cut[4] = 1.0f;
+    // Envelope's onset trigger is audio-driven: it REQUIRES the wired
+    // media input and fires from the chain's onset curve at the MEDIA
+    // position. The cut trigger stays video-derived (global curves).
+    doc::Document d;
+    doc::Look& look = d.looks[0];
+    look.layers[0].asset = d.next_effect_id++;
+    doc::ValueNode n;
+    n.id = d.next_effect_id++;
+    n.source.type = doc::ModSourceType::Envelope;
+    n.source.attack = 0.02f;
+    n.source.decay = 0.3f;
+    n.audio_src = look.layers[0].id;
+    look.value_nodes.push_back(n);
 
-    doc::ModSource env;
-    env.type = doc::ModSourceType::Envelope;
-    env.attack = 0.02f;
-    env.decay = 0.3f;
+    auto curves = std::make_shared<mod::AnalysisCurves>();
+    curves->onset.assign(40, 0.0f);
+    curves->onset[10] = 1.0f;
+    mod::NodeAudioMap map;
+    map[n.id] = {curves, 0};
 
+    mod::ValueEnv env;
+    env.look = &look;
+    env.node_audio = &map;
+    env.fps = 30.0;
     auto at = [&](uint32_t f) {
-        return mod::eval_source(env, f / 30.0, f, &curves, 30.0);
+        env.frame = f;
+        env.t = f / 30.0;
+        return mod::eval_value_node(env, n.id);
     };
     CHECK_EQ(at(5), 0.0f);            // before the trigger
     CHECK(at(10) > 0.5f);             // burst on the trigger frame
@@ -685,29 +753,79 @@ TEST(mod_envelope_source) {
     // Deterministic: a cold re-evaluation matches (pure function of frame).
     CHECK_EQ(at(20), at(20));
 
-    env.trigger = 1;                  // scene-cut trigger instead
-    CHECK_EQ(mod::eval_source(env, 0.0, 0, &curves, 30.0), 0.0f);
-    CHECK(mod::eval_source(env, 4 / 30.0, 4, &curves, 30.0) > 0.5f);
+    // Unwired = never fires, global curves or not.
+    mod::AnalysisCurves global;
+    global.onset.assign(40, 1.0f);
+    env.analysis = &global;
+    look.value_nodes[0].audio_src = 0;
+    CHECK_EQ(at(10), 0.0f);
+    look.value_nodes[0].audio_src = look.layers[0].id;
+
+    // The onset trigger reads 0 through eval_source: no wire there.
+    doc::ModSource envs = n.source;
+    CHECK_EQ(mod::eval_source(envs, 10 / 30.0, 10, &global, 30.0), 0.0f);
+
+    // Scene-cut trigger: video-derived, fires from the global curves
+    // with no wire at all.
+    envs.trigger = 1;
+    mod::AnalysisCurves vid;
+    vid.cut.assign(40, 0.0f);
+    vid.cut[4] = 1.0f;
+    CHECK_EQ(mod::eval_source(envs, 0.0, 0, &vid, 30.0), 0.0f);
+    CHECK(mod::eval_source(envs, 4 / 30.0, 4, &vid, 30.0) > 0.5f);
 }
 
 TEST(mod_lfo_beat_synced) {
-    mod::AnalysisCurves curves;
-    curves.bpm = 120.0f;              // 2 beats/s -> 0.5 s per cycle at x1
+    // Beat-synced kinds REQUIRE the wired input, take their BPM from
+    // its curves, and anchor phase on the MEDIA position (local + slip
+    // + offset) - cuts of one media beat-match by construction.
+    doc::Document d;
+    doc::Look& look = d.looks[0];
+    look.layers[0].asset = d.next_effect_id++;
+    doc::ValueNode n;
+    n.id = d.next_effect_id++;
+    n.source.type = doc::ModSourceType::LfoBeat;
+    n.source.shape = doc::LfoShape::Square;
+    n.source.rate_hz = 1.0f;          // beats per cycle
+    n.audio_src = look.layers[0].id;
+    look.value_nodes.push_back(n);
 
-    doc::ModSource lfo;
-    lfo.type = doc::ModSourceType::LfoBeat;
-    lfo.shape = doc::LfoShape::Square;
-    lfo.rate_hz = 1.0f;               // beats per cycle
+    auto curves = std::make_shared<mod::AnalysisCurves>();
+    curves->bpm = 120.0f;             // 2 beats/s -> 0.5 s per cycle
+    mod::NodeAudioMap map;
+    map[n.id] = {curves, 0};
 
-    CHECK_EQ(mod::eval_source(lfo, 0.1, 3, &curves, 30.0), 1.0f);
-    CHECK_EQ(mod::eval_source(lfo, 0.3, 9, &curves, 30.0), 0.0f);
-    CHECK_EQ(mod::eval_source(lfo, 0.6, 18, &curves, 30.0), 1.0f);
+    mod::ValueEnv env;
+    env.look = &look;
+    env.node_audio = &map;
+    env.fps = 30.0;
+    auto at = [&](uint32_t f) {
+        env.frame = f;
+        env.t = f / 30.0;
+        return mod::eval_value_node(env, n.id);
+    };
+    CHECK_EQ(at(3), 1.0f);            // 0.1 s: first half-cycle high
+    CHECK_EQ(at(9), 0.0f);            // 0.3 s: low half
+    CHECK_EQ(at(18), 1.0f);           // 0.6 s: high again
     // Two beats per cycle: period doubles.
-    lfo.rate_hz = 2.0f;
-    CHECK_EQ(mod::eval_source(lfo, 0.3, 9, &curves, 30.0), 1.0f);
-    // No analysis: falls back to 120 BPM instead of going silent.
-    lfo.rate_hz = 1.0f;
-    CHECK_EQ(mod::eval_source(lfo, 0.1, 3, nullptr, 30.0), 1.0f);
+    look.value_nodes[0].source.rate_hz = 2.0f;
+    CHECK_EQ(at(9), 1.0f);
+    look.value_nodes[0].source.rate_hz = 1.0f;
+
+    // MEDIA anchoring: slip shifts the phase - local 3 with slip 6
+    // reads the beat grid at media frame 9.
+    map[n.id] = {curves, 6};
+    CHECK_EQ(at(3), 0.0f);
+    // An Offset shim on the chain shifts it the same way.
+    map[n.id] = {curves, 0, 9};
+    CHECK_EQ(at(0), 0.0f);
+
+    // Unwired reads 0 - eval_source carries no beat clock anymore.
+    doc::ModSource lfo = look.value_nodes[0].source;
+    CHECK_EQ(mod::eval_source(lfo, 0.1, 3, nullptr, 30.0), 0.0f);
+    mod::AnalysisCurves gcurves;
+    gcurves.bpm = 120.0f;
+    CHECK_EQ(mod::eval_source(lfo, 0.1, 3, &gcurves, 30.0), 0.0f);
 }
 
 TEST(mod_video_cut_source) {

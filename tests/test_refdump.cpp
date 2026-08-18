@@ -5,6 +5,7 @@
 // absent, so CI and other machines never notice it.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -89,7 +90,7 @@ void i420_to_rgb(const looks::codec::FrameView& v, std::vector<uint8_t>& rgb) {
 // Same dev-harness pattern for long-form footage: when
 // temp/long example.mp4 exists, import it once with the app's default
 // options (bundle cached under temp/long_example/) so timeline and player
-// behavior on long clips can be exercised through the smoke workflow.
+// behavior on long media can be exercised through the smoke workflow.
 TEST(long_example_import) {
     namespace fs = std::filesystem;
     const fs::path root(LOOKS_REPO_ROOT);
@@ -103,6 +104,32 @@ TEST(long_example_import) {
     const looks::media::ImportResult res =
         looks::media::import_media(src, bundle_dir, {});
     CHECK(res.ok);
+}
+
+TEST(mez_decode_throughput_bench) {
+    // Dev bench, not an assertion: sequential single-reader decode cost
+    // of the cached 4K bundle - the number the preview's per-stream
+    // decode budget lives or dies on. Silent when the harness footage
+    // is absent.
+    namespace fs = std::filesystem;
+    const fs::path root(LOOKS_REPO_ROOT);
+    const fs::path mez = root / "temp" / "long_example" / "long example.mez";
+    if (!fs::exists(mez)) return;
+    looks::codec::MezReader reader;
+    std::string error;
+    CHECK(reader.open(mez, &error));
+    if (reader.frame_count() < 2) return;
+    looks::codec::DecodedFrame frame;
+    reader.decode(0, frame);   // warm the file cache / first-touch
+    const uint32_t n = std::min(48u, reader.frame_count());
+    const auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < n; ++i) CHECK(reader.decode(i, frame));
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    std::fprintf(stderr, "  [bench] mez %ux%u decode %.1f ms/frame\n",
+                 reader.width(), reader.height(),
+                 ms / static_cast<double>(n));
 }
 
 TEST(ref_frames_dump) {

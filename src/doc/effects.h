@@ -75,6 +75,7 @@ enum class FxCategory : uint8_t {
     PaintPrint,   // paint & print (painterly + repro processes)
     Signal,       // signal & codec
     Overlay,      // frame & overlay
+    Audio,        // audio & dsp (voice modifiers - image passes through)
     Count,
 };
 

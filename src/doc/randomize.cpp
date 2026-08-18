@@ -17,7 +17,7 @@ bool param_randomizable(const ParamDesc& desc) {
     static const char* const kFrozenExact[] = {
         "op",     "channels", "counter", "pattern", "flip",
         "r_from", "g_from",   "b_from",  "font",    "drop_i",
-        "output"};
+        "output", "offset",   "target"};
     for (const char* f : kFrozenExact)
         if (std::strcmp(desc.id, f) == 0) return false;
     return true;
@@ -28,6 +28,11 @@ namespace {
 void randomize_one(Document& doc, UndoStack& undo, uint64_t look,
                    size_t layer_index, size_t effect_index, float intensity,
                    uint64_t rng_seed) {
+    // A wrong-kind or stale id must not land on the fallback look.
+    const Look* guard = doc.find_look(look);
+    if (!guard || layer_index >= guard->layers.size() ||
+        effect_index >= guard->layers[layer_index].stack.size())
+        return;
     const EffectInstance& fx =
         doc.look(look).layers[layer_index].stack[effect_index];
     const EffectInfo& info = effect_info(fx.type);
@@ -58,6 +63,8 @@ void randomize_effect(Document& doc, UndoStack& undo, uint64_t look,
 
 void randomize_stack(Document& doc, UndoStack& undo, uint64_t look,
                      size_t layer_index, float intensity, uint64_t rng_seed) {
+    const Look* guard = doc.find_look(look);
+    if (!guard || layer_index >= guard->layers.size()) return;
     undo.begin_group("Randomize Stack");
     const size_t n = doc.look(look).layers[layer_index].stack.size();
     for (size_t i = 0; i < n; ++i)

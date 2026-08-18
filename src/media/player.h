@@ -2,14 +2,14 @@
 //
 // This used to be a clip player - it owned a mezzanine reader, a decode
 // ring, and a clock driven by one clip's PCM. None of that survives the
-// look model: a look tree has many clips playing at once (decode_pool.h
+// look model: a look tree has many media sources playing at once (decode_pool.h
 // serves their frames) and its audio is a mix over the whole instance tree
 // (audio_mix.h). What is left here is the part that was always a transport:
 // a frame-indexed position over the PROJECT's length, advanced by the audio
 // device callback, with the mix pulled through it.
 //
-// The clock no longer belongs to a clip, so a project with no audio, no
-// media, or several clips all behave the same way. When no audio device
+// The clock no longer belongs to a media file, so a project with no audio, no
+// media, or several sources all behave the same way. When no audio device
 // opens, a wall-clock fallback steps the same cursor with identical
 // semantics - callers tick() it and cannot tell the difference.
 //

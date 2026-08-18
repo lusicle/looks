@@ -12,6 +12,13 @@ cbuffer Push
     float fps;
     float gain;
     float pure_diff;   // 0 source scaled by motion, 1 raw difference
+    // The reference source's aspect-fit rect (canvas px): the luma
+    // planes are NATIVE while `input` is the canvas - the motion mask
+    // must sample where the content actually composites.
+    float rect_x;
+    float rect_y;
+    float inv_fit_w;
+    float inv_fit_h;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -28,9 +35,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float cur = cur_luma.SampleLevel(uv, 0).r;
-    const float prev = prev_luma.SampleLevel(uv, 0).r;
-    const float diff = saturate(abs(cur - prev) * max(gain, 0.0));
+    const float2 luma_uv = (float2(tid.xy) + 0.5 - float2(rect_x, rect_y))
+                         * float2(inv_fit_w, inv_fit_h);
+    const bool inside = luma_uv.x >= 0.0 && luma_uv.x <= 1.0 &&
+                        luma_uv.y >= 0.0 && luma_uv.y <= 1.0;
+    const float cur = cur_luma.SampleLevel(luma_uv, 0).r;
+    const float prev = prev_luma.SampleLevel(luma_uv, 0).r;
+    const float diff =
+        inside ? saturate(abs(cur - prev) * max(gain, 0.0)) : 0.0;
 
     const float3 diff_rgb = float3(diff, diff, diff);
     const float3 scaled = base.rgb * diff;

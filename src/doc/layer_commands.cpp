@@ -308,7 +308,7 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     Layer layer;
     layer.id = doc.next_effect_id++;
     layer.source = kind;
-    static const char* kNames[] = {"clip",  "solid", "gradient",
+    static const char* kNames[] = {"media", "solid", "gradient",
                                    "noise", "pattern", "osc",
                                    "shape", "look",  "sequence"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
@@ -316,10 +316,10 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
                   "layer names track the enum");
     layer.name = std::string(kNames[static_cast<size_t>(kind)]) + " " +
                  std::to_string(layer.id);
-    // A clip node binds to the project's first asset by default; the
+    // A media node binds to the project's first asset by default; the
     // browser retargets it. Nested refs bind when the caller names the
     // entity (and checks nest_reaches first).
-    if (kind == LayerSourceKind::Clip && !doc.assets.empty())
+    if (kind == LayerSourceKind::Media && !doc.assets.empty())
         layer.asset = doc.assets.front().id;
     // Generators default to half opacity so adding one doesn't blank the
     // composite.

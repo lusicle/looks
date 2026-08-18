@@ -244,7 +244,7 @@ struct Player::Impl {
 Player::Player() : impl_(new Impl) {
     Impl& p = *impl_;
     p.last_tick = std::chrono::steady_clock::now();
-    // The device opens ONCE and stays: it is the clock, not a clip's
+    // The device opens ONCE and stays: it is the clock, not a media file's
     // playback. A machine without one falls back to wall time.
     p.device_thread = std::thread([&p] { p.device_main(); });
     std::unique_lock<std::mutex> lock(p.device_mutex);

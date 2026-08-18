@@ -69,6 +69,18 @@ enum class ModSourceType : uint32_t {
     Count,
 };
 
+// Audio-driven node kinds REQUIRE a wired media input (audio_src): the
+// bands and onset sample the wired chain's curves, Beat/LfoBeat clock
+// on its BPM, Envelope's onset/beat triggers fire from it. Unwired = 0,
+// never the global curves. (Envelope's cut/keypress triggers are not
+// audio, but the kind keeps its input port for the audio ones.)
+inline bool value_kind_wants_audio(ModSourceType t) {
+    return t == ModSourceType::AudioLow || t == ModSourceType::AudioMid ||
+           t == ModSourceType::AudioHigh || t == ModSourceType::AudioOnset ||
+           t == ModSourceType::Beat || t == ModSourceType::LfoBeat ||
+           t == ModSourceType::Envelope;
+}
+
 enum class LfoShape : uint32_t { Sine = 0, Triangle, Square, SampleHold, Count };
 
 enum class ResponseCurve : uint32_t { Linear = 0, Exp, SCurve, Inverted, Count };
@@ -108,6 +120,11 @@ struct ValueNode {
     ValueOp op = ValueOp::Add;
     uint64_t in_a = 0, in_b = 0;    // upstream value-node ids; 0 = constant
     float const_a = 0.0f, const_b = 1.0f;
+    // Analysis kinds (audio low/mid/high/onset): the media-graph node
+    // (layer or effect id, same look) whose AUDIO this node analyzes -
+    // runtime curves of the wired chain's processed signal. The input
+    // is REQUIRED: 0 = unwired = the node reads 0, nothing else.
+    uint64_t audio_src = 0;
     // Normalise: the window [in_min, in_max] (bounds capped -1..1)
     // scaled by the multiplier m = const_b, so wide windows come from
     // the multiplier, not wide sliders:

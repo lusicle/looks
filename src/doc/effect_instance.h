@@ -129,8 +129,32 @@ enum class EffectType : uint32_t {
     WhiteBalance,      // temperature / tint, linear-light channel gains
     Sharpen,           // clean unsharp mask (Oversharpen is the artifact)
     CornerPin,         // perspective quad warp: offset the four corners
+    // AUDIO MODIFIERS: nodes that transform the VOICE and pass the image
+    // through untouched (the inverse of every effect above). They ride
+    // the same stack/card/link machinery but never reach the image
+    // graph - the compiler routes around them and the audio flatten
+    // collects them into per-instance DSP op lists. New audio types
+    // append INSIDE this span (is_audio_effect is a range test).
+    AudioGain,         // linear level
+    AudioBitcrush,     // amplitude quantize to N bits
+    AudioDownsample,   // sample-and-hold rate crush
+    AudioDistortion,   // normalized tanh waveshaper
+    AudioDelay,        // feedback echo taps
+    AudioFilter,       // windowed-sinc FIR low/high pass
+    // OFFSET: a time shim, not an image pass. Wired DIRECTLY onto a
+    // source node (media or nested ref) it shifts that source's read
+    // by a signed frame count - video, audio, or both per its target
+    // selector; wired anywhere else it passes through unchanged. The
+    // shift folds into the source's stream key, so fan-out through
+    // different offsets decodes separate streams.
+    Offset,
     Count,
 };
+
+// Audio-modifier span: image-identity in the graph, DSP ops in the mix.
+inline bool is_audio_effect(EffectType type) {
+    return type >= EffectType::AudioGain && type <= EffectType::AudioFilter;
+}
 
 // True for effects that read their own previous output (engine keeps a
 // persistent per-instance target; the one-frame-delay rule, ).
@@ -200,5 +224,23 @@ struct EffectInstance {
     float node_x = 0.0f;
     float node_y = 0.0f;
 };
+
+// The Offset node's shift in whole frames, and which signal it moves
+// (params: 0 = offset, 1 = target selector video|audio|both).
+inline int64_t offset_frames(const EffectInstance& fx) {
+    return fx.params.empty()
+               ? 0
+               : static_cast<int64_t>(
+                     fx.params[0] < 0.0f ? fx.params[0] - 0.5f
+                                         : fx.params[0] + 0.5f);
+}
+inline bool offset_targets_video(const EffectInstance& fx) {
+    const float t = fx.params.size() > 1 ? fx.params[1] : 2.0f;
+    return t < 0.5f || t >= 1.5f;
+}
+inline bool offset_targets_audio(const EffectInstance& fx) {
+    const float t = fx.params.size() > 1 ? fx.params[1] : 2.0f;
+    return t >= 0.5f;
+}
 
 }  // namespace looks::doc
