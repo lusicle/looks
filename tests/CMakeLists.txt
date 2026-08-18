@@ -11,6 +11,7 @@ add_executable(looks_tests
     test_layout.cpp
     test_ui.cpp
     test_bmff.cpp
+    test_frame_index.cpp
     test_codec.cpp
     test_mux.cpp
     test_mod.cpp

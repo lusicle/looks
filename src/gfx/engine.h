@@ -58,6 +58,10 @@ public:
         // The instance-scoped key of the placement these planes belong
         // to: hash(instance path, layer id), matching GraphNode::key.
         uint64_t key = 0;
+        // Producer's content identity (codec::DecodedFrame::stamp): the
+        // upload is skipped when a key re-presents the stamp it already
+        // uploaded. 0 = always upload.
+        uint64_t content_stamp = 0;
         SourcePlanes planes;
     };
 
@@ -91,6 +95,13 @@ public:
     // gets the alpha-bounds reduction (read_measure_bounds after the
     // fence). Preview-only - it bypasses the render cache LOOKUP so the
     // measurement actually runs; export always passes 0.
+    // cache_store gates the WRITE side of the render cache: a miss arms
+    // a full-frame readback whose harvest crosses ~66 MB of
+    // write-combined memory at 4K - per frame, that is most of a bare
+    // feed's record cost. Continuous playback rarely revisits a frame,
+    // so the transport passes false while playing; paused and stepping
+    // states (where revisits are the point) keep storing. Reads (hits)
+    // stay on either way.
     GpuImage* render(VkCommandBuffer cmd, uint32_t frame_index,
                      const doc::Document& doc,
                      uint64_t root_id, uint32_t timeline_frame, double fps,
@@ -101,7 +112,8 @@ public:
                      size_t layer_source_count = 0,
                      uint64_t preview_node = 0,
                      uint64_t preview_layer = 0,
-                     uint64_t measure_placement = 0);
+                     uint64_t measure_placement = 0,
+                     bool cache_store = true);
 
     // Alpha bounds of the last render's measure tap, as a canvas-fraction
     // rect {x, y, w, h}. Valid only after the submission that recorded it
@@ -339,6 +351,7 @@ private:
     struct LayerPlanes {
         std::unique_ptr<GpuImage> y, u, v;
         uint32_t width = 0, height = 0;
+        uint64_t stamp = 0;   // content already uploaded (0 = none)
     };
     std::unordered_map<uint64_t, LayerPlanes> layer_planes_;
     std::unique_ptr<ComputePipeline> layer_transform_;

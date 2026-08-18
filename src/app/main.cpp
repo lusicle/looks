@@ -43,6 +43,7 @@
 #include "media/bundle.h"
 #include "media/decode_pool.h"
 #include "media/export.h"
+#include "media/frame_index.h"
 #include "media/import.h"
 #include "media/pcm.h"
 #include "media/player.h"
@@ -96,6 +97,9 @@ struct ImportJob {
     bool import_only = false;
     uint64_t bind_look = 0;
     uint64_t bind_layer = 0;
+    // The bind/place ran (at `ready` for video ingest, at completion for
+    // the fast paths); the job may still be analyzing after it.
+    bool announced = false;
 
     ~ImportJob() {
         progress.cancel = true;
@@ -133,77 +137,88 @@ bool bundle_is_fresh(const std::filesystem::path& bundle,
     return e1 || e2 || bundle_t >= source_t;
 }
 
-// Where an asset's media lives: a hand-built bundle beside the source, else
-// the scratch cache. `ready` is false when nothing usable exists yet (the
-// source still needs importing).
+// Where an asset's media lives. Video (mp4/mov) resolves to the SOURCE
+// itself - the pool decodes it in place - plus ingest sidecars in the
+// scratch cache; stills, cover art and direct .mez files resolve to a
+// mezzanine. `base` is the sidecar naming anchor (swap its extension for
+// .pcm/.analysis/.thumbs); for mez-backed media it IS the mez path.
+// `ready` is false when the source still needs ingesting.
 struct BundlePaths {
-    std::filesystem::path mez, pcm;
+    std::filesystem::path mez, native, pcm, base;
     bool ready = false;
 };
 
-// COMPLETENESS: freshness by mtime alone let a partial mez from an old
-// aborted import pass as the whole clip forever (it looked like a valid
-// SHORTER file). The mezzanine must cover the source's video duration;
-// short = stale, the caller re-imports over it. Probes cache per file
-// mtime; UI thread only.
-bool bundle_covers_source(const std::filesystem::path& mez,
-                          const std::filesystem::path& source) {
-    std::wstring ext = source.extension().wstring();
-    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
-    if (ext != L".mp4" && ext != L".mov") return true;
+// Container probe for native video, cached per (path, mtime): the facts
+// the bundle table republishes on every asset edit must not re-parse
+// sample tables each time. UI thread only.
+const media::VideoFacts* probe_native_facts(
+    const std::filesystem::path& source) {
     struct Probe {
         std::filesystem::file_time_type mtime;
-        double secs = 0.0;
+        media::VideoFacts facts;
+        bool ok = false;
     };
     static std::map<std::wstring, Probe> cache;
-    auto probe = [&](const std::filesystem::path& p, auto&& measure) {
-        std::error_code ec;
-        const auto t = std::filesystem::last_write_time(p, ec);
-        auto it = cache.find(p.native());
-        if (it != cache.end() && !ec && it->second.mtime == t)
-            return it->second.secs;
-        const double secs = measure(p);
-        cache[p.native()] = {t, secs};
-        return secs;
-    };
-    const double src_secs =
-        probe(source, [](const std::filesystem::path& p) {
-            return media::probe_video_duration_seconds(p);
-        });
-    if (src_secs <= 0.0) return true;   // unknown: trust freshness
-    const double mez_secs =
-        probe(mez, [](const std::filesystem::path& p) {
-            uint32_t frames = 0;
-            double fps = 0.0;
-            if (!codec::mez_probe(p, &frames, &fps) || fps <= 0.0)
-                return 0.0;
-            return static_cast<double>(frames) / fps;
-        });
-    if (mez_secs <= 0.0) return true;   // unreadable: downstream reports
-    return mez_secs + 2.0 >= src_secs;
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(source, ec);
+    auto it = cache.find(source.native());
+    if (it == cache.end() || ec || it->second.mtime != t) {
+        Probe p;
+        p.mtime = t;
+        std::string error;
+        p.ok = media::probe_video_facts(source, &p.facts, &error);
+        it = cache.insert_or_assign(source.native(), std::move(p)).first;
+    }
+    return it->second.ok ? &it->second.facts : nullptr;
 }
 
 BundlePaths resolve_bundle(const std::filesystem::path& source) {
     BundlePaths out;
-    std::filesystem::path mez = source;
-    if (mez.extension() != ".mez") {
-        std::filesystem::path beside = source;
-        beside.replace_extension(".mez");
-        if (bundle_is_fresh(beside, source))
-            mez = beside;
-        else
-            mez = bundle_dir_for(source) /
-                  (source.stem().wstring() + L".mez");
+    std::wstring ext = source.extension().wstring();
+    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+
+    // A .mez opened directly is its own bundle.
+    if (ext == L".mez") {
+        std::error_code ec;
+        if (!std::filesystem::exists(source, ec)) return out;
+        out.mez = source;
+        out.base = source;
+        out.pcm = source;
+        out.pcm.replace_extension(".pcm");
+        if (!std::filesystem::exists(out.pcm, ec)) out.pcm.clear();
+        out.ready = true;
+        return out;
     }
-    const bool have = (mez == source ? std::filesystem::exists(mez)
-                                     : bundle_is_fresh(mez, source)) &&
-                      bundle_covers_source(mez, source);
-    if (!have) {
+
+    // Native video: the source is the decodable file. Readiness is the
+    // ingest fast stage's last write - the analysis sidecar - so a fresh
+    // source (or one overwritten in place) re-ingests; there is no
+    // derived video file left to go stale or partial.
+    if (ext == L".mp4" || ext == L".mov") {
+        if (!probe_native_facts(source)) return out;
+        out.base = bundle_dir_for(source) /
+                   (source.stem().wstring() + L".media");
+        std::filesystem::path analysis = out.base;
+        analysis.replace_extension(".analysis");
+        if (!bundle_is_fresh(analysis, source)) return out;
+        out.native = source;
+        std::filesystem::path pcm = out.base;
+        pcm.replace_extension(".pcm");
+        if (bundle_is_fresh(pcm, source)) out.pcm = pcm;
+        out.ready = true;
+        return out;
+    }
+
+    // Stills and audio files: mezzanine in the scratch cache (or a
+    // hand-built one beside the source).
+    std::filesystem::path mez = source;
+    mez.replace_extension(".mez");
+    if (!bundle_is_fresh(mez, source))
+        mez = bundle_dir_for(source) / (source.stem().wstring() + L".mez");
+    if (!bundle_is_fresh(mez, source)) {
         // Audio sources (wav/mp3) with no mezzanine - no embedded cover
         // art - are PCM-only bundles: the media node carries the sound
         // and has no image side at all.
-        std::wstring ext = source.extension().wstring();
-        for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
         if (ext == L".wav" || ext == L".mp3") {
             std::filesystem::path beside = source;
             beside.replace_extension(".pcm");
@@ -216,11 +231,14 @@ BundlePaths resolve_bundle(const std::filesystem::path& source) {
                 out.pcm = cached;
             else
                 return out;
+            out.base = cached;
+            out.base.replace_extension(".mez");
             out.ready = true;
         }
         return out;
     }
     out.mez = mez;
+    out.base = mez;
     out.pcm = mez;
     out.pcm.replace_extension(".pcm");
     std::error_code ec;
@@ -321,6 +339,7 @@ inline std::vector<gfx::Engine::LayerSourceFrame> to_layer_sources(
         const codec::FrameView view = sf.frame->view();
         gfx::Engine::LayerSourceFrame lf;
         lf.key = sf.key;
+        lf.content_stamp = sf.frame->stamp;
         lf.planes.y = view.y.data;
         lf.planes.y_stride = view.y.stride;
         lf.planes.u = view.u.data;
@@ -725,6 +744,22 @@ private:
     std::atomic<uint64_t> frames_advanced_{0};
     std::atomic<uint32_t> cycle_ms_x100_{0};
     std::atomic<uint32_t> phase_ms_x100_[4] = {};
+    // Performance record, worker-thread only. The HUD's EMA answers "how
+    // is it right now"; these answer "how was the last five seconds",
+    // with the distribution a single glance at an instant cannot show.
+    // Every window logs one summary line (avg/p95/max per phase) to
+    // looks.log; a perf_trace.txt flag file beside the exe additionally
+    // streams every cycle to looks_perf.csv.
+    struct Perf {
+        std::vector<float> rt, ph[4];
+        std::chrono::steady_clock::time_point window_start{};
+        bool started = false;
+        FILE* trace = nullptr;
+        bool trace_checked = false;
+        uint64_t cycle_no = 0;
+    };
+    Perf perf_;
+    void perf_record(double rt, const double phase[4]);
     // Old-size images wait here until the UI frames that sampled them have
     // retired.
     std::vector<std::pair<uint64_t, std::unique_ptr<gfx::GpuImage>>>
@@ -776,6 +811,65 @@ bool RenderWorker::ensure_published(Published& p, uint32_t w, uint32_t h,
     return true;
 }
 
+void RenderWorker::perf_record(double rt, const double phase[4]) {
+    Perf& p = perf_;
+    const auto now = std::chrono::steady_clock::now();
+    if (!p.started) {
+        p.started = true;
+        p.window_start = now;
+    }
+    if (!p.trace_checked) {
+        p.trace_checked = true;
+        std::error_code ec;
+        if (std::filesystem::exists(executable_dir() / "perf_trace.txt",
+                                    ec)) {
+            p.trace = _wfopen(
+                (executable_dir() / "looks_perf.csv").c_str(), L"wb");
+            if (p.trace)
+                std::fprintf(p.trace, "cycle,rt_ms,d_ms,r_ms,c_ms,g_ms\n");
+        }
+    }
+    p.rt.push_back(static_cast<float>(rt));
+    for (int i = 0; i < 4; ++i)
+        p.ph[i].push_back(static_cast<float>(phase[i]));
+    if (p.trace) {
+        std::fprintf(p.trace, "%llu,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                     static_cast<unsigned long long>(p.cycle_no), rt,
+                     phase[0], phase[1], phase[2], phase[3]);
+        std::fflush(p.trace);
+    }
+    ++p.cycle_no;
+    const double window_s =
+        std::chrono::duration<double>(now - p.window_start).count();
+    if (window_s < 5.0) return;
+    auto stat = [](std::vector<float>& v, double* avg, double* p95,
+                   double* mx) {
+        double sum = 0.0;
+        for (const float x : v) sum += x;
+        *avg = v.empty() ? 0.0 : sum / static_cast<double>(v.size());
+        std::sort(v.begin(), v.end());
+        *p95 = v.empty() ? 0.0 : v[v.size() * 95 / 100];
+        *mx = v.empty() ? 0.0 : v.back();
+    };
+    double avg, p95, mx;
+    stat(p.rt, &avg, &p95, &mx);
+    char line[256];
+    int n = std::snprintf(line, sizeof(line),
+                          "perf: %zu cycles / %.1fs, rt avg %.1f p95 %.1f "
+                          "max %.1f",
+                          p.rt.size(), window_s, avg, p95, mx);
+    static const char* names[4] = {"d", "r", "c", "g"};
+    for (int i = 0; i < 4 && n > 0; ++i) {
+        stat(p.ph[i], &avg, &p95, &mx);
+        n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
+                           " | %s %.1f/%.1f/%.1f", names[i], avg, p95, mx);
+    }
+    log_info("%s", line);
+    p.rt.clear();
+    for (auto& v : p.ph) v.clear();
+    p.window_start = now;
+}
+
 void RenderWorker::run() {
     // Worker-local decode/remap state (moved off AppState — these hold
     // FILE handles and are single-thread objects).
@@ -823,7 +917,11 @@ void RenderWorker::run() {
                 return quit_ ||
                        (pause_count_ == 0 && job_serial_ != last_serial);
             });
-            if (quit_) return;
+            if (quit_) {
+                if (perf_.trace) std::fclose(perf_.trace);
+                perf_.trace = nullptr;
+                return;
+            }
             if (pause_count_ > 0) continue;
             idle_ = false;
             // The serial bumps only on REAL job-field changes (selection,
@@ -1041,12 +1139,17 @@ void RenderWorker::run() {
         vkBeginCommandBuffer(cmd_, &begin);
 
         gfx::GpuImage* source_image = nullptr;
+        // Cache stores pause while the transport runs: linear playback
+        // rarely revisits a frame, and the store's full-frame readback
+        // harvest (~66 MB of write-combined reads at 4K) was most of a
+        // bare feed's per-frame record cost. Hits still serve.
         gfx::GpuImage* final_image = engine->render(
             cmd_, slot, resolved, look_id, play_frame, mod_fps, canvas_w,
             canvas_h, cache_ctx, mod_frame,
             want_source ? &source_image : nullptr,
             lsrc.empty() ? nullptr : lsrc.data(), lsrc.size(),
-            preview_node, preview_layer, sel_placement);
+            preview_node, preview_layer, sel_placement,
+            /*cache_store=*/!player.playing());
         slot = (slot + 1) % gfx::kFramesInFlight;
 
         bool published_ok = false;
@@ -1109,12 +1212,15 @@ void RenderWorker::run() {
                 continue;
         }
         vkWaitForFences(device.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+        double phase_now[4] = {};
         {
             const auto tp4 = std::chrono::steady_clock::now();
-            auto ema_ms = [&](std::atomic<uint32_t>& cell, auto a, auto b) {
+            auto ema_ms = [&](std::atomic<uint32_t>& cell, int idx, auto a,
+                              auto b) {
                 const double ms =
                     std::chrono::duration<double, std::milli>(b - a)
                         .count();
+                phase_now[idx] = ms;
                 const double prev =
                     cell.load(std::memory_order_relaxed) / 100.0;
                 const double ema =
@@ -1123,10 +1229,10 @@ void RenderWorker::run() {
                     static_cast<uint32_t>(std::min(ema * 100.0, 4.0e9)),
                     std::memory_order_relaxed);
             };
-            ema_ms(phase_ms_x100_[0], tp0, tp1);   // decode wait
-            ema_ms(phase_ms_x100_[1], tp1, tp2);   // modulation resolve
-            ema_ms(phase_ms_x100_[2], tp2, tp3);   // record + segments
-            ema_ms(phase_ms_x100_[3], tp3, tp4);   // gpu fence
+            ema_ms(phase_ms_x100_[0], 0, tp0, tp1);   // decode wait
+            ema_ms(phase_ms_x100_[1], 1, tp1, tp2);   // modulation resolve
+            ema_ms(phase_ms_x100_[2], 2, tp2, tp3);   // record + segments
+            ema_ms(phase_ms_x100_[3], 3, tp3, tp4);   // gpu fence
         }
 
         if (published_ok) {
@@ -1159,6 +1265,7 @@ void RenderWorker::run() {
             cycle_ms_x100_.store(
                 static_cast<uint32_t>(std::min(ema * 100.0, 4.0e9)),
                 std::memory_order_relaxed);
+            perf_record(ms, phase_now);
         }
         pending_render = false;
     }
@@ -1527,7 +1634,10 @@ struct AppState {
     media::Player player;
     std::unique_ptr<ImportJob> import;
     std::unique_ptr<ExportJob> export_job;
-    std::filesystem::path mez_path, pcm_path;   // PRIMARY media bundle
+    // PRIMARY media bundle: `bundle_base` anchors the sidecar names
+    // (swap its extension for .analysis/.thumbs); for mez-backed media
+    // (stills, cover art) it IS the mez file stills rewrite in place.
+    std::filesystem::path bundle_base, pcm_path;
     // Every asset's resolved media, plus its PCM in RAM. Rebuilt when the
     // asset list, the proxy toggle or a bundle on disk changes; the stamp
     // is what the render worker and the mix watch.
@@ -2187,7 +2297,7 @@ void load_media_analysis(AppState& app) {
     app.sc_pcm_path.clear();
     app.sc_ok = false;
     app.proxy_active = false;     // open_source opened the full-res file
-    std::filesystem::path path = app.mez_path;
+    std::filesystem::path path = app.bundle_base;
     path.replace_extension(".analysis");
     mod::AnalysisData data;
     if (mod::load_analysis(path, &data)) {
@@ -2202,7 +2312,7 @@ void load_media_analysis(AppState& app) {
     app.thumbs_tex = nullptr;
     app.thumbs_count = 0;
     app.thumbs_dirty = false;
-    std::filesystem::path tpath = app.mez_path;
+    std::filesystem::path tpath = app.bundle_base;
     tpath.replace_extension(".thumbs");
     if (const auto bytes = read_file_bytes(tpath);
         bytes && bytes->size() > 10 &&
@@ -2262,7 +2372,7 @@ void sync_sidechain(AppState& app) {
         app.status = "sidechain missing: " + src.filename().string();
         return;
     }
-    std::filesystem::path dest = app.mez_path;
+    std::filesystem::path dest = app.bundle_base;
     dest.replace_filename(src.stem().wstring() + L".sc.pcm");
     std::string error;
     const bool have =
@@ -2359,7 +2469,20 @@ void refresh_bundles(AppState& app) {
             const BundlePaths paths =
                 resolve_bundle(std::filesystem::path(asset.path));
             if (paths.ready) {
-                if (!paths.mez.empty()) {
+                if (!paths.native.empty()) {
+                    // Native video: facts straight from the container -
+                    // no derived file to read or to trust.
+                    if (const media::VideoFacts* f =
+                            probe_native_facts(paths.native)) {
+                        bundle.native = paths.native;
+                        bundle.frames = f->frames;
+                        bundle.width = f->width;
+                        bundle.height = f->height;
+                        bundle.fps = f->fps;
+                        bundle.timescale = f->timescale;
+                        bundle.frame_duration = f->frame_duration;
+                    }
+                } else if (!paths.mez.empty()) {
                     // Preview may run the half-res proxy; export never
                     // does.
                     std::filesystem::path open_path = paths.mez;
@@ -2382,8 +2505,8 @@ void refresh_bundles(AppState& app) {
                         bundle.frame_duration = reader.frame_duration();
                     }
                 }
-                // The PCM rides regardless of the mez: audio-only
-                // bundles (wav) have no mez at all.
+                // The PCM rides regardless of the image side: audio-only
+                // bundles (wav/mp3) have neither mez nor native video.
                 bundle.pcm = paths.pcm;
             }
         }
@@ -2565,10 +2688,10 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
         app.undo.execute(app.document,
                          doc::add_look_command(std::move(look)));
     }
-    // Audio-only media (wav: no mez) lays JUST the audio placement -
-    // there is no picture to put on a video lane, and an unbounded
-    // empty block would overwrite the lane for nothing.
-    const bool audio_only = paths.mez.empty();
+    // Audio-only media (wav/mp3 with no cover art) lays JUST the audio
+    // placement - there is no picture to put on a video lane, and an
+    // unbounded empty block would overwrite the lane for nothing.
+    const bool audio_only = paths.mez.empty() && paths.native.empty();
     uint64_t video_place_id = 0;
     if (!audio_only) {
         doc::Placement block;
@@ -2853,7 +2976,7 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
     const BundlePaths paths = resolve_bundle(picked);
     if (paths.ready) {
         app.media_name = picked.filename().string();
-        app.mez_path = paths.mez;
+        app.bundle_base = paths.base;
         app.pcm_path = paths.pcm;
         refresh_bundles(app);
         ensure_media_placed(app, picked);
@@ -2868,7 +2991,7 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
             set_still_frames(app, primary_still_duration(app.document));
     } else {
         app.media_name.clear();
-        app.mez_path.clear();
+        app.bundle_base.clear();
         app.pcm_path.clear();
         refresh_bundles(app);
         const std::filesystem::path dest = bundle_dir_for(picked);
@@ -2886,7 +3009,7 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
 // their next open; harmless for a still, where every frame is one payload.
 // Returns true when the asset runs at `frames`.
 bool set_still_frames(AppState& app, uint32_t frames) {
-    if (app.mez_path.empty() || frames == 0) return false;
+    if (app.bundle_base.empty() || frames == 0) return false;
     const doc::Asset* primary = app.document.primary_asset();
     if (primary && primary->frame_count == frames) return true;
     if (app.render_worker) {
@@ -2899,11 +3022,11 @@ bool set_still_frames(AppState& app, uint32_t frames) {
             if (app.render_worker) app.render_worker->resume();
         }
     } resume_guard{app};
-    const bool rewrote = codec::mez_set_frame_count(app.mez_path, frames);
+    const bool rewrote = codec::mez_set_frame_count(app.bundle_base, frames);
     if (!rewrote) {
         app.status = "duration change failed";
     } else {
-        std::filesystem::path proxy = app.mez_path;
+        std::filesystem::path proxy = app.bundle_base;
         proxy.replace_extension(".proxy.mez");
         std::error_code pec;
         if (std::filesystem::exists(proxy, pec))
@@ -2918,7 +3041,7 @@ bool set_still_frames(AppState& app, uint32_t frames) {
 // bundle is regenerable (cache clear, another machine), so the project
 // file is the durable record and reopening reconciles the bundle to it.
 void apply_still_duration(AppState& app, double seconds) {
-    if (app.mez_path.empty()) return;
+    if (app.bundle_base.empty()) return;
     const double fps = app.player.fps() > 0.0 ? app.player.fps() : 30.0;
     const uint32_t frames = std::clamp(
         static_cast<uint32_t>(seconds * fps + 0.5), 1u,
@@ -3076,7 +3199,7 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
             app.render_worker->invalidate();
         }
         app.media_name.clear();
-        app.mez_path.clear();
+        app.bundle_base.clear();
         app.pcm_path.clear();
         app.pcm_cache.clear();
         refresh_bundles(app);
@@ -8124,7 +8247,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     if (app.import) {
         const uint32_t total = app.import->progress.frames_total.load();
         const uint32_t done = app.import->progress.frames_done.load();
-        std::snprintf(line, sizeof(line), "importing %u%%",
+        // Past `ready` the asset is already usable - the tail of the bar
+        // is the background curves/thumbs pass.
+        std::snprintf(line, sizeof(line), "%s %u%%",
+                      app.import->progress.ready.load() ? "analyzing"
+                                                        : "importing",
                       total ? done * 100 / total : 0);
         rows.push_back(Label(arena, line, dim));
     } else if (has_media_file) {
@@ -11343,11 +11470,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             continue;
         }
 
-        // Finished import → bind the bundle (worker held off its readers).
-        if (app.import && app.import->done.load()) {
-            auto job = std::move(app.import);
-            if (job->thread.joinable()) job->thread.join();
-            if (job->result.ok) {
+        // Ingest is two-stage: `ready` flips the moment the asset is
+        // usable (facts + PCM + audio curves) and the bind/place happens
+        // THEN, while the video pass (curves + thumbs) keeps running in
+        // the same job; `done` reloads the finished sidecars. Fast paths
+        // (stills, audio files) never flip ready and announce on done.
+        if (app.import) {
+            ImportJob* job = app.import.get();
+            const bool done = job->done.load();
+            if (!job->announced &&
+                (job->progress.ready.load() || (done && job->result.ok))) {
+                job->announced = true;
                 render_worker.pause();
                 render_worker.invalidate();
                 struct ResumeGuard {
@@ -11394,9 +11527,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.status =
                         "imported " + job->source.filename().string();
                 } else {
+                    // Mid-job the result struct is still the worker's;
+                    // everything the bind needs re-derives from disk.
+                    const BundlePaths paths = resolve_bundle(job->source);
                     app.media_name = job->source.filename().string();
-                    app.mez_path = job->result.mez_path;
-                    app.pcm_path = job->result.pcm_path;
+                    app.bundle_base = paths.base;
+                    app.pcm_path = paths.pcm;
                     refresh_bundles(app);
                     ensure_media_placed(app, job->source);
                     load_media_analysis(app);
@@ -11411,8 +11547,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         set_still_frames(
                             app, primary_still_duration(app.document));
                 }
-            } else {
-                app.status = "import failed: " + job->result.error;
+            }
+            if (done) {
+                auto owned = std::move(app.import);
+                if (owned->thread.joinable()) owned->thread.join();
+                if (!owned->result.ok) {
+                    app.status =
+                        "import failed: " + owned->result.error;
+                } else if (owned->announced) {
+                    // The video pass may have landed curves and thumbs
+                    // after the announce; reload them for the primary.
+                    if (!app.bundle_base.empty() &&
+                        resolve_bundle(owned->source).base ==
+                            app.bundle_base)
+                        load_media_analysis(app);
+                }
             }
         }
 

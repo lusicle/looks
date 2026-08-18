@@ -4,7 +4,10 @@
 // later the determinism harness. Also doubles as the first exercise of the
 // export path's building blocks.
 //
-//   looks_makefixture <out.mp4> [seconds] [width] [height]
+//   looks_makefixture <out.mp4> [seconds] [width] [height] [gop_frames]
+//
+// gop_frames > 0 pins the keyframe interval - seek-latency benches need
+// fixtures with controlled spacing.
 
 #include <cmath>
 #include <cstdio>
@@ -45,12 +48,15 @@ void synth_frame(std::vector<uint8_t>& nv12, uint32_t w, uint32_t h,
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
-                     "usage: looks_makefixture <out.mp4> [seconds] [w] [h]\n");
+                     "usage: looks_makefixture <out.mp4> [seconds] [w] [h] "
+                     "[gop_frames]\n");
         return 2;
     }
     const double seconds = argc > 2 ? _wtof(argv[2]) : 2.0;
     const uint32_t width = argc > 3 ? static_cast<uint32_t>(_wtoi(argv[3])) : 320;
     const uint32_t height = argc > 4 ? static_cast<uint32_t>(_wtoi(argv[4])) : 240;
+    const uint32_t gop_frames =
+        argc > 5 ? static_cast<uint32_t>(_wtoi(argv[5])) : 0;
     const uint32_t fps = 30;
     const uint32_t sample_rate = 48000;
     const uint32_t channels = 2;
@@ -64,7 +70,8 @@ int wmain(int argc, wchar_t** argv) {
 
     std::string error;
     looks::platform::H264Encoder video_encoder;
-    if (!video_encoder.create(width, height, fps, 1, 1'500'000, &error)) {
+    if (!video_encoder.create(width, height, fps, 1, 1'500'000, &error,
+                              gop_frames)) {
         std::fprintf(stderr, "video encoder: %s\n", error.c_str());
         return 1;
     }

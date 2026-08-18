@@ -1431,7 +1431,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          const LayerSourceFrame* layer_sources,
                          size_t layer_source_count,
                          uint64_t preview_node, uint64_t preview_layer,
-                         uint64_t measure_placement) {
+                         uint64_t measure_placement, bool cache_store) {
     bounds_recorded_ = false;
     // The entity being rendered (a sequence or a scoped look) and the
     // frame it plays at. Nodes belonging to NESTED instances read their
@@ -1507,7 +1507,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 return dst;
             }
         }
-        arm_readback = true;
+        arm_readback = cache_store;
     }
 
     const RenderGraph graph =
@@ -1619,6 +1619,18 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             if (!lp.y || !lp.u || !lp.v) return nullptr;
             lp.width = lf.planes.width;
             lp.height = lf.planes.height;
+            lp.stamp = 0;
+        }
+        // A key re-presenting the stamp it already uploaded holds the
+        // same pixels on the GPU - stills, slowed placements and paused
+        // re-renders would otherwise re-copy megabytes of identical
+        // planes every render. Layouts still normalize: the prev-luma
+        // copy above may have left Y in TRANSFER_SRC.
+        if (lp.stamp != 0 && lp.stamp == lf.content_stamp) {
+            lp.y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            lp.u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            continue;
         }
         const uint32_t lch = (lp.height + 1) / 2;
         if (!staging.upload_image(rec, lf.planes.y,
@@ -1631,6 +1643,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                   lf.planes.v_stride * lch,
                                   lf.planes.v_stride, *lp.v))
             return nullptr;
+        lp.stamp = lf.content_stamp;
         lp.y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         lp.u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

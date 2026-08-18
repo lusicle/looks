@@ -36,6 +36,8 @@
 #include "codec/mez.h"
 #include "doc/instances.h"
 #include "media/bundle.h"
+#include "media/frame_index.h"
+#include "platform/win/mf_codec.h"
 
 namespace looks::media {
 
@@ -78,17 +80,20 @@ public:
 
 private:
     struct Stream {
-        std::filesystem::path path;
+        std::filesystem::path path;   // decodable file: source (native) or mez
+        bool native = false;
         uint32_t frames = 0;
         // `m` guards the ring/want and is only ever held briefly - a
-        // ring PROBE must never wait behind a decode in flight.
+        // ring PROBE must never wait behind a decode in flight. `cv`
+        // fires on every ring insert: a consumer whose frame is already
+        // on a supplier's in-flight roll waits HERE, not on the session
+        // mutex - seizing the session serialized all decode into the
+        // consumer's blocked window and pinned supply to the playhead.
         std::mutex m;
-        // Reader BANK: the mezzanine is intra-only, so frames decode
-        // independently - each slot owns its own FILE* + scratch and
-        // several frames of one stream decode concurrently. One
-        // stateful reader capped a 4K stream at ~20 fps, under the
-        // media's own rate; the bank multiplies that by the slots a
-        // worker can grab.
+        std::condition_variable cv;
+        // Mez reader BANK (stills, cover art, direct .mez): intra-only,
+        // so frames decode independently - each slot owns its own FILE* +
+        // scratch and several frames of one stream decode concurrently.
         struct Slot {
             std::mutex m;
             codec::MezReader reader;
@@ -97,10 +102,54 @@ private:
         };
         static constexpr size_t kSlots = 4;
         Slot slots[kSlots];
+        // Hold-frame alias (stills, cover art): the payload decoded last
+        // and where it lives, guarded by `m`. A frame pointing at the
+        // same offset reuses the decoded pixels instead of re-decoding
+        // an identical payload every timeline frame.
+        uint64_t last_payload_off = 0;
+        std::shared_ptr<const codec::DecodedFrame> last_payload_frame;
+        // Native SESSION bank: a session is a demux cursor over the frame
+        // index plus an H.264 decoder rolling forward through the source.
+        // The playback session tracks the playhead; the second serves a
+        // seek or a prewarmed cut without disturbing it. Same locking
+        // shape as the slots: one mutex per session, held across a
+        // decode; the ring mutex stays brief.
+        struct Session {
+            std::mutex m;
+            platform::H264Decoder dec;
+            void* file = nullptr;         // FILE* on the source
+            bool created = false;         // guarded by the session mutex
+            bool ok = false;
+            uint32_t next_decode = 0;     // next decode-order sample to feed
+            // Expected next output (-1 = must seek) and the keyframe run
+            // the session currently sits in (its start, decode order).
+            // Written under the session mutex; read lock-free as routing
+            // HINTS: an ask inside a session's run WAITS on that session
+            // - duplicating its roll on the idle one is what turned one
+            // miss into two concurrent full-GOP decodes.
+            std::atomic<int64_t> next_present{-1};
+            std::atomic<int64_t> run_key{-1};
+            // One advisory waiter may queue behind a busy owner: with a
+            // plain try-lock, the consumer's own roll starved every
+            // prewarm worker and ended up doing all decode serially
+            // inside collect; with unbounded waiters, workers convoy.
+            std::atomic<bool> waiter{false};
+            bool draining = false;        // end of stream was signalled
+
+            ~Session();
+        };
+        static constexpr size_t kSessions = 2;
+        Session sessions[kSessions];
+        // Built once on first use, then immutable; sessions share it.
+        std::mutex index_m;
+        bool index_built = false;
+        bool index_ok = false;
+        FrameIndex index;
         // Decoded frames by index, newest last. Bounded by ring_depth_.
         std::deque<std::pair<uint32_t, std::shared_ptr<const codec::DecodedFrame>>>
             ring;
-        uint32_t want = 0;   // the frame the consumer last asked for
+        uint32_t want = 0;       // the frame the consumer last asked for
+        uint32_t last_want = 0;  // previous ask: backward motion widens rolls
     };
 
     struct Job {
@@ -110,10 +159,19 @@ private:
     };
 
     Stream* stream_for(const Request& req);
-    // Returns the decoded frame; a ring miss decodes under `decode_m`
-    // (waiting at most one in-flight decode, never the prewarm backlog).
+    // Returns the decoded frame; a ring miss decodes on a free slot or
+    // session (waiting at most one in-flight decode, never the prewarm
+    // backlog).
     std::shared_ptr<const codec::DecodedFrame> fetch(Stream& s, uint32_t frame,
                                                      bool* was_miss);
+    std::shared_ptr<const codec::DecodedFrame> fetch_mez(Stream& s,
+                                                         uint32_t frame);
+    std::shared_ptr<const codec::DecodedFrame> fetch_native(Stream& s,
+                                                            uint32_t frame,
+                                                            bool advisory);
+    std::shared_ptr<const codec::DecodedFrame> ring_insert(
+        Stream& s, uint32_t frame,
+        std::shared_ptr<const codec::DecodedFrame> decoded, size_t depth);
     void worker_main();
     void drain();
 

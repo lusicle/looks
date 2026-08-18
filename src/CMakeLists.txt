@@ -79,6 +79,7 @@ endif()
 add_library(looks_media STATIC
     media/bmff.cpp
     media/bmff_mux.cpp
+    media/frame_index.cpp
     media/h264_util.cpp
     media/pcm.cpp
     media/wav.cpp

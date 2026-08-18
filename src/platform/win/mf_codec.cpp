@@ -234,6 +234,12 @@ struct H264Decoder::Impl {
     uint32_t width = 0;
     uint32_t height = 0;
     bool sent_params = false;
+    // PIPELINED READBACK (DXVA): decoded samples held unmapped so the GPU
+    // decodes ahead while the CPU maps the OLDEST one - mapping a surface
+    // whose decode already finished is a copy, not a stall, and the stall
+    // was most of the hardware path's per-frame cost. Depth 1 (software
+    // samples are system memory) keeps the old emit-immediately behavior.
+    std::deque<Com<IMFSample>> inflight;
 
     // D3D11/DXVA acceleration: kept alive for the MFT's lifetime.
     Com<IMFDXGIDeviceManager> dxgi_mgr;
@@ -302,7 +308,8 @@ H264Decoder::H264Decoder() : impl_(new Impl) {}
 H264Decoder::~H264Decoder() = default;
 
 bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
-                         uint32_t height, std::string* error, bool allow_d3d) {
+                         uint32_t height, std::string* error, bool allow_d3d,
+                         bool low_latency) {
     Impl& d = *impl_;
     d.width = width;
     d.height = height;
@@ -353,7 +360,19 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
     if (allow_d3d && d.try_d3d())
         log_info("mf: H.264 decode D3D11-accelerated (DXVA)");
     else
-        log_info("mf: H.264 decode on the software path");
+        log_info("mf: H.264 decode on the software path%s",
+                 low_latency ? " (low latency)" : "");
+
+    // Latency cap for the SOFTWARE decoder only: its output lag equals
+    // its thread count (~40 frames on a big CPU), which no ring survives.
+    // The DXVA path lags only its DPB (a handful) and MF_LOW_LATENCY
+    // there just forces per-frame completion, defeating the GPU's own
+    // pipelining.
+    if (low_latency && !d.dxgi_mgr) {
+        Com<IMFAttributes> attrs;
+        if (SUCCEEDED(d.mft->GetAttributes(attrs.put())))
+            attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+    }
 
     Com<IMFMediaType> input;
     MFCreateMediaType(input.put());
@@ -414,17 +433,32 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
     Impl& d = *impl_;
     if (!d.mft) return false;
 
-    for (;;) {
-        Com<IMFSample> sample;
+    // Fill the in-flight queue without mapping anything, then emit the
+    // OLDEST - pulled earliest, so its decode has finished while newer
+    // frames were still on the GPU and the map below is a copy, not a
+    // stall.
+    const size_t depth = d.dxgi_mgr ? 3 : 1;
+    while (d.inflight.size() < depth) {
+        Com<IMFSample> pulled;
         bool stream_changed = false;
-        const HRESULT hr = pump_output(d.mft.get(), sample, &stream_changed);
+        const HRESULT hr = pump_output(d.mft.get(), pulled, &stream_changed);
         if (stream_changed) {
             std::string err;
             if (!d.negotiate_output(&err)) return false;
             continue;
         }
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
-        if (FAILED(hr) || !sample) return false;
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
+        if (FAILED(hr) || !pulled) {
+            if (d.inflight.empty()) return false;
+            break;
+        }
+        d.inflight.push_back(std::move(pulled));
+    }
+    if (d.inflight.empty()) return false;
+
+    {
+        Com<IMFSample> sample = std::move(d.inflight.front());
+        d.inflight.pop_front();
 
         LONGLONG pts = 0;
         sample->GetSampleTime(&pts);
@@ -479,6 +513,15 @@ void H264Decoder::drain() {
         impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
+}
+
+void H264Decoder::flush() {
+    Impl& d = *impl_;
+    if (!d.mft) return;
+    d.inflight.clear();
+    d.mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    d.sent_params = false;
 }
 
 // ------------------------------------------------------------ AacDecoder
@@ -728,8 +771,24 @@ struct H264Encoder::Impl {
     bool async_read_output();
     bool async_pump(bool wait);
     bool try_hardware(uint32_t width, uint32_t height, uint32_t fps_num,
-                      uint32_t fps_den, uint32_t bitrate_bps);
+                      uint32_t fps_den, uint32_t bitrate_bps,
+                      uint32_t gop_frames);
 };
+
+// B-frames off (pts == dts, the muxer then emits no ctts); an explicit
+// GOP size pins the keyframe cadence when the caller asked for one.
+static void apply_encoder_codec_api(IMFTransform* mft, uint32_t gop_frames) {
+    Com<ICodecAPI> codec_api;
+    if (FAILED(mft->QueryInterface(IID_PPV_ARGS(codec_api.put())))) return;
+    VARIANT v{};
+    v.vt = VT_UI4;
+    v.ulVal = 0;
+    codec_api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
+    if (gop_frames > 0) {
+        v.ulVal = gop_frames;
+        codec_api->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
+    }
+}
 
 // Reads one encoded packet from an async encoder's output stream.
 bool H264Encoder::Impl::async_read_output() {
@@ -818,7 +877,8 @@ bool H264Encoder::Impl::async_pump(bool wait) {
 // software (sync) encoder with the impl reset to a clean slate.
 bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
                                      uint32_t fps_num, uint32_t fps_den,
-                                     uint32_t bitrate_bps) {
+                                     uint32_t bitrate_bps,
+                                     uint32_t gop_frames) {
     Impl& e = *this;
     auto fail = [](const char* stage, HRESULT hr) {
         log_warn("mf: hardware H.264 encoder unavailable at %s "
@@ -945,14 +1005,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
                  "hardware path continues with CPU sample input",
                  static_cast<unsigned long>(hr));
 
-    // No B-frames: keeps pts == dts (muxer then emits no ctts).
-    Com<ICodecAPI> codec_api;
-    if (SUCCEEDED(e.mft->QueryInterface(IID_PPV_ARGS(codec_api.put())))) {
-        VARIANT v{};
-        v.vt = VT_UI4;
-        v.ulVal = 0;
-        codec_api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
-    }
+    apply_encoder_codec_api(e.mft.get(), gop_frames);
 
     hr = e.mft->QueryInterface(IID_PPV_ARGS(e.events.put()));
     if (FAILED(hr)) return fail("event generator", hr);
@@ -969,7 +1022,7 @@ H264Encoder::~H264Encoder() = default;
 
 bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
                          uint32_t fps_den, uint32_t bitrate_bps,
-                         std::string* error) {
+                         std::string* error, uint32_t gop_frames) {
     Impl& e = *impl_;
     e.width = width;
     e.height = height;
@@ -977,7 +1030,8 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     // Hardware first: async MFT + IMFDXGIDeviceManager. Any
     // failure resets to a clean slate and falls through to software —
     // import/export are offline, so the fallback is only a speed loss.
-    if (e.try_hardware(width, height, fps_num, fps_den, bitrate_bps)) {
+    if (e.try_hardware(width, height, fps_num, fps_den, bitrate_bps,
+                       gop_frames)) {
         log_info("mf: hardware H.264 encoder active (async MFT + D3D11)");
         return true;
     }
@@ -1034,14 +1088,7 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     hr = e.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(NV12)", hr);
 
-    // No B-frames: keeps pts == dts (muxer then emits no ctts).
-    Com<ICodecAPI> codec_api;
-    if (SUCCEEDED(e.mft->QueryInterface(IID_PPV_ARGS(codec_api.put())))) {
-        VARIANT v{};
-        v.vt = VT_UI4;
-        v.ulVal = 0;
-        codec_api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
-    }
+    apply_encoder_codec_api(e.mft.get(), gop_frames);
 
     e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);

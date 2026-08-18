@@ -16,7 +16,13 @@ namespace looks::media {
 
 struct AssetBundle {
     uint64_t asset = 0;
-    std::filesystem::path mez;   // empty = nothing decodable yet
+    // Exactly one of the two video paths is set for image-bearing media:
+    // `native` points at the SOURCE file itself (mp4/mov, decoded in
+    // place by the pool's H.264 sessions); `mez` carries the mezzanine
+    // for what still transcodes (stills, audio cover art, direct .mez).
+    // Both empty = image-dormant (audio-only) or nothing decodable yet.
+    std::filesystem::path mez;
+    std::filesystem::path native;
     std::filesystem::path pcm;   // empty = silent
     uint32_t frames = 0;
     uint32_t width = 0, height = 0;

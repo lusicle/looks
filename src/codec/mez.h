@@ -34,6 +34,12 @@ struct DecodedFrame {
     uint32_t height = 0;
     size_t y_stride = 0;
     size_t uv_stride = 0;
+    // Content identity for upload skipping: producers that keep frames
+    // alive across renders (the decode pool) stamp each decode from a
+    // process-wide counter, so a consumer re-fed the SAME frame (stills,
+    // slowed placements, paused re-renders) can skip re-copying megabytes
+    // of identical planes. 0 = unstamped, always treated as fresh.
+    uint64_t stamp = 0;
 
     FrameView view() const {
         return {{y.data(), y_stride}, {u.data(), uv_stride},
@@ -145,6 +151,13 @@ public:
     // Thread-compatible with itself only under external locking (single
     // FILE*); the player's decode workers each own a reader instance.
     bool decode(uint32_t frame_index, DecodedFrame& out);
+
+    // Where a frame's payload lives: hold-frame entries (stills, cover
+    // art) repeat one offset, so a consumer can decode the payload once
+    // and alias every frame that points at it. 0 = out of range.
+    uint64_t payload_offset(uint32_t frame_index) const {
+        return frame_index < offsets_.size() ? offsets_[frame_index] : 0;
+    }
 
 private:
     void* file_ = nullptr;

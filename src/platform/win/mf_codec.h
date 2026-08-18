@@ -59,8 +59,14 @@ public:
     // allow_d3d gates the DXVA path: GPU decode pays a fixed sync-readback
     // stall per frame, so CPU-consuming callers (import) may prefer the
     // multithreaded software decoder.
+    // low_latency caps the software decoder's output lag at a couple of
+    // frames (MF_LOW_LATENCY). Without it the inbox MFT pipelines as deep
+    // as the machine has threads - 40+ frames on a big CPU - which is
+    // right for offline transcode and fatal for a playback session that
+    // steers by what has come OUT.
     bool create(const std::vector<uint8_t>& avcc, uint32_t width,
-                uint32_t height, std::string* error, bool allow_d3d = true);
+                uint32_t height, std::string* error, bool allow_d3d = true,
+                bool low_latency = false);
 
     // One demuxed sample (length-prefixed NALs). Returns false on hard error.
     bool feed(const uint8_t* data, size_t size, int64_t pts_100ns,
@@ -72,6 +78,11 @@ public:
 
     // Signals end of stream; keep calling receive() until it returns false.
     void drain();
+
+    // Discards everything in flight and rearms the stream: the seek
+    // primitive. The next feed must start at a keyframe (parameter sets
+    // are re-injected). Also the way back in after a drain() hit the end.
+    void flush();
 
 private:
     struct Impl;
@@ -134,8 +145,11 @@ public:
     H264Encoder();
     ~H264Encoder();
 
+    // gop_frames > 0 forces the keyframe interval (fixture generation
+    // wants controlled spacing); 0 leaves the encoder's default cadence.
     bool create(uint32_t width, uint32_t height, uint32_t fps_num,
-                uint32_t fps_den, uint32_t bitrate_bps, std::string* error);
+                uint32_t fps_den, uint32_t bitrate_bps, std::string* error,
+                uint32_t gop_frames = 0);
     // NV12, tightly packed (stride == width). B-frames are disabled at
     // create time so pts == dts and the muxer needs no ctts.
     bool feed_nv12(const uint8_t* data, int64_t pts_100ns,

@@ -1,15 +1,9 @@
 #include "media/import.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <deque>
-#include <map>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 #include "codec/mez.h"
@@ -164,189 +158,32 @@ struct StageClock {
     }
 };
 
-// The import pixel pipeline: double-buffered batches. The decode thread
-// pushes raw NV12 frames (ownership moves) and never touches pixels;
-// when a batch fills, a background thread fans it out over the worker
-// count (convert, proxy downsample, both encodes per frame - the
-// atomic-cursor loop) and then appends IN ORDER (main mez, proxy mez,
-// thumbs) while the decode thread fills the next batch. The batch is
-// sized so cooking a full batch is FASTER than decoding the next one -
-// the submit join then never waits and the pixel work hides entirely
-// behind the decode. Deliberately batch-synchronous: a persistent
-// work-queue variant convoyed on its queue lock and deadlocked; this
-// shape is dumb, measured, and correct. Peak transient = two batches
-// of raw NV12 (~600 MB at 4K).
-class ImportPipeline {
-public:
-    ImportPipeline(codec::MezWriter& writer, codec::MezWriter* proxy,
-                   ThumbStrip* strip, size_t thumb_every, int quality,
-                   int threads)
-        : writer_(writer), proxy_(proxy), strip_(strip),
-          thumb_every_(thumb_every), quality_(quality) {
-        // Leave the MF decoder's internal threads a few cores of
-        // headroom - starving the pump just moves the wall.
-        const unsigned hw =
-            std::max(1u, std::thread::hardware_concurrency());
-        threads_ = threads > 0
-                       ? threads
-                       : static_cast<int>(
-                             std::max(2u, hw > 4 ? hw - 4 : hw));
-    }
-
-    ~ImportPipeline() { join(); }
-
-    void push(platform::VideoFrameNV12 frame) {
-        batch_.push_back({std::move(frame), frame_index_++});
-        const size_t cap =
-            std::min<size_t>(static_cast<size_t>(threads_), 24);
-        if (batch_.size() >= cap) submit();
-    }
-
-    // Flushes everything and joins; the writers are fully caught up on
-    // return. False when any main-mez append failed.
-    bool finish() {
-        submit();
-        join();
-        return ok_;
-    }
-
-    bool ok() const { return ok_; }
-    bool proxy_ok() const { return proxy_ok_; }
-    int worker_count() const { return threads_; }
-    double pixels_seconds() const { return t_pixels_.seconds; }
-    double append_seconds() const { return t_append_.seconds; }
-
-private:
-    struct Raw {
-        platform::VideoFrameNV12 nv12;
-        uint64_t index = 0;
-    };
-    struct Cooked {
-        std::vector<uint8_t> main_payload;
-        std::vector<uint8_t> proxy_payload;
-        I420Frame thumb_frame;
-        bool thumb = false;
-    };
-
-    void submit() {
-        if (batch_.empty()) return;
-        join();   // instant when the batch outpaced the decode fill
-        bg_batch_ = std::move(batch_);
-        batch_.clear();
-        bg_ = std::thread([this] { run_batch(); });
-    }
-
-    void join() {
-        if (bg_.joinable()) bg_.join();
-    }
-
-    void run_batch() {
-        std::vector<Cooked> cooked(bg_batch_.size());
-        t_pixels_.begin();
-        std::atomic<size_t> next{0};
-        auto worker = [&] {
-            for (;;) {
-                const size_t i = next.fetch_add(1);
-                if (i >= bg_batch_.size()) break;
-                Cooked& c = cooked[i];
-                I420Frame f;
-                nv12_to_i420(bg_batch_[i].nv12, f);
-                bg_batch_[i].nv12 = {};   // 12 MB freed early
-                codec::encode_frame(f.view(), quality_, c.main_payload);
-                if (proxy_) {
-                    I420Frame half;
-                    downsample_half(f, half);
-                    codec::encode_frame(half.view(), quality_,
-                                        c.proxy_payload);
-                }
-                if (thumb_every_ &&
-                    bg_batch_[i].index % thumb_every_ == 0) {
-                    c.thumb = true;
-                    c.thumb_frame = std::move(f);
-                }
-            }
-        };
-        std::vector<std::thread> pool;
-        const int n =
-            std::min<int>(threads_, static_cast<int>(bg_batch_.size()));
-        pool.reserve(static_cast<size_t>(n) - 1);
-        for (int i = 1; i < n; ++i) pool.emplace_back(worker);
-        worker();
-        for (std::thread& t : pool) t.join();
-        t_pixels_.end();
-
-        t_append_.begin();
-        for (Cooked& c : cooked) {
-            ok_ = ok_ && writer_.add_encoded_frame(c.main_payload);
-            if (proxy_ && proxy_ok_)
-                proxy_ok_ = proxy_->add_encoded_frame(c.proxy_payload);
-            if (c.thumb && strip_) strip_->add(c.thumb_frame);
-        }
-        t_append_.end();
-        bg_batch_.clear();
-    }
-
-    codec::MezWriter& writer_;
-    codec::MezWriter* proxy_;
-    ThumbStrip* strip_;
-    size_t thumb_every_;
-    uint64_t frame_index_ = 0;
-    int quality_;
-    int threads_ = 1;
-    std::vector<Raw> batch_;
-    std::vector<Raw> bg_batch_;   // owned by bg_ while it runs
-    std::thread bg_;
-    bool ok_ = true;         // bg-thread written, read after join only
-    bool proxy_ok_ = true;
-    StageClock t_pixels_;    // parallel convert+downsample+encode wall
-    StageClock t_append_;    // ordered writes + thumb adds
-};
-
-bool import_video(BmffFile& file, const TrackInfo& track,
-                  const std::filesystem::path& mez_path,
-                  const ImportOptions& options, ImportProgress* progress,
-                  ImportResult* result, mod::VideoAnalyzer* analyzer) {
+// The background half of video ingest: ONE software decode over the
+// whole track, feeding the motion/brightness/cut curves and the
+// thumbnail strip - the only stages that still need every pixel now that
+// playback decodes the source natively. Nothing is written until the
+// pass completes, so a cancel leaves the fast-stage sidecars intact and
+// the asset stays usable (curves and thumbs just never land).
+bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
+                       const ImportOptions& options,
+                       ImportProgress* progress, mod::AnalysisData* analysis,
+                       const std::filesystem::path& dest_dir,
+                       const std::wstring& stem, ImportResult* result) {
     platform::H264Decoder decoder;
     std::string error;
-    // Software decode for import: every frame is consumed on the CPU, and
-    // the DXVA path's per-frame sync readback stall (~8 ms flat) costs more
-    // than the multithreaded software decoder at any resolution.
+    // Software decode: every frame is consumed on the CPU, and the DXVA
+    // path's per-frame sync readback stall (~8 ms flat) costs more than
+    // the multithreaded software decoder at any resolution.
     if (!decoder.create(track.avcc, track.width, track.height, &error,
                         /*allow_d3d=*/false)) {
-        result->error = "video decoder: " + error;
+        log_warn("ingest: video pass decoder failed (%s)", error.c_str());
         return false;
     }
-
-    // Frame duration: assume CFR from the first sample (VFR sources get
-    // resampled to this grid implicitly — acceptable for v1).
-    const uint32_t frame_duration =
-        track.samples.empty() ? 1 : std::max(1u, track.samples[0].duration);
-
-    codec::MezWriter writer;
-    if (!writer.open(mez_path, track.width, track.height, track.timescale,
-                     frame_duration, options.quality)) {
-        result->error = "cannot create " + mez_path.string();
-        return false;
-    }
-
     if (progress)
-        progress->frames_total.store(static_cast<uint32_t>(track.samples.size()));
+        progress->frames_total.store(
+            static_cast<uint32_t>(track.samples.size()));
 
-    // Half-res proxy: second mezzanine, same timeline.
-    codec::MezWriter proxy_writer;
-    const std::filesystem::path proxy_path = [&] {
-        std::filesystem::path p = mez_path;
-        p.replace_extension(".proxy.mez");
-        return p;
-    }();
-    const uint32_t proxy_w = std::max(2u, (track.width / 2) & ~1u);
-    const uint32_t proxy_h = std::max(2u, (track.height / 2) & ~1u);
-    const bool proxy_on =
-        options.proxy && proxy_writer.open(proxy_path, proxy_w, proxy_h,
-                                           track.timescale, frame_duration,
-                                           options.quality);
-
-    // Thumbnail strip: every Nth frame, budgeted count.
+    mod::VideoAnalyzer analyzer;
     ThumbStrip strip;
     const size_t thumb_every =
         options.thumb_count > 0
@@ -354,33 +191,24 @@ bool import_video(BmffFile& file, const TrackInfo& track,
                                       static_cast<size_t>(options.thumb_count))
             : 0;
 
-    ImportPipeline pipeline(writer, proxy_on ? &proxy_writer : nullptr,
-                            thumb_every ? &strip : nullptr, thumb_every,
-                            options.quality, options.encode_threads);
-
     std::vector<uint8_t> sample_bytes;
     platform::VideoFrameNV12 nv12;
+    I420Frame thumb_frame;
     uint32_t decoded = 0;
-    StageClock t_decode, t_analyze;
-    const auto t_start = std::chrono::steady_clock::now();
+    StageClock t_pass;
+    t_pass.begin();
 
     auto pump_decoder = [&]() {
-        for (;;) {
-            t_decode.begin();
-            const bool got = decoder.receive(nv12);
-            t_decode.end();
-            if (!got) break;
+        while (decoder.receive(nv12)) {
             // The analyzer reads the luma plane straight off the NV12
-            // (identical bytes to the converted Y, so the curves stay
-            // bit-identical) - the decode thread hands the frame to the
-            // pipeline untouched and pixels never run serially here.
-            if (analyzer) {
-                t_analyze.begin();
-                analyzer->push_frame(nv12.data.data(), nv12.width,
-                                     nv12.width, nv12.height);
-                t_analyze.end();
+            // (identical bytes to a converted Y plane, so the curves
+            // match what the old transcode-time analysis produced).
+            analyzer.push_frame(nv12.data.data(), nv12.width, nv12.width,
+                                nv12.height);
+            if (thumb_every && decoded % thumb_every == 0) {
+                nv12_to_i420(nv12, thumb_frame);
+                strip.add(thumb_frame);
             }
-            pipeline.push(std::move(nv12));
             ++decoded;
             if (progress) progress->frames_done.store(decoded);
         }
@@ -389,11 +217,11 @@ bool import_video(BmffFile& file, const TrackInfo& track,
     const double to_100ns = 1.0e7 / track.timescale;
     for (const SampleInfo& sample : track.samples) {
         if (progress && progress->cancel.load()) {
-            result->error = "cancelled";
+            log_info("ingest: video pass cancelled — curves/thumbs skipped");
             return false;
         }
         if (!file.read_sample(sample, sample_bytes)) {
-            result->error = "sample read failed";
+            log_warn("ingest: sample read failed — curves/thumbs skipped");
             return false;
         }
         const int64_t pts = static_cast<int64_t>(
@@ -401,65 +229,34 @@ bool import_video(BmffFile& file, const TrackInfo& track,
                                 sample.cts_offset) * to_100ns);
         const int64_t duration =
             static_cast<int64_t>(sample.duration * to_100ns);
-        t_decode.begin();
-        const bool fed = decoder.feed(sample_bytes.data(), sample_bytes.size(),
-                                      pts, duration, sample.keyframe);
-        t_decode.end();
-        if (!fed) {
-            result->error = "video decode failed";
+        if (!decoder.feed(sample_bytes.data(), sample_bytes.size(), pts,
+                          duration, sample.keyframe)) {
+            log_warn("ingest: video decode failed — curves/thumbs skipped");
             return false;
         }
         pump_decoder();
     }
     decoder.drain();
     pump_decoder();
-    const bool pipeline_ok = pipeline.finish();
+    t_pass.end();
+    if (decoded == 0) return false;
 
-    // Stage split for the speed target (import ≥ 2× realtime). Decode
-    // and pixels overlap by design, so the stages sum past the total
-    // once the overlap is winning.
-    const double t_total =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      t_start)
-            .count();
-    log_info("import: video stages %.2fs total — decode %.2fs, analyze "
-             "%.2fs, pixels %.2fs / %d workers, append %.2fs "
-             "(%u frames, %.1f fps)",
-             t_total, t_decode.seconds, t_analyze.seconds,
-             pipeline.pixels_seconds(), pipeline.worker_count(),
-             pipeline.append_seconds(), decoded,
-             t_total > 0.0 ? decoded / t_total : 0.0);
-
-    if (!pipeline_ok) {
-        result->error = "mezzanine encode/write failed";
-        return false;
-    }
-    if (!writer.finish()) {
-        result->error = "mez finalize failed";
-        return false;
-    }
-    if (proxy_on) {
-        if (pipeline.proxy_ok() && proxy_writer.finish())
-            result->proxy_path = proxy_path;
-        else
-            log_warn("import: proxy encode failed — full-res only");
-    }
+    // Video curves join the audio set already on disk; one writer, whole
+    // rewrite, so a reader sees old-complete or new-complete.
+    analyzer.finish(analysis);
+    const std::filesystem::path analysis_path =
+        dest_dir / (stem + L".analysis");
+    if (mod::write_analysis(analysis_path, *analysis))
+        result->analysis_path = analysis_path;
+    else
+        log_warn("ingest: analysis rewrite failed (non-fatal)");
     if (thumb_every) {
-        std::filesystem::path tpath = mez_path;
-        tpath.replace_extension(".thumbs");
+        const std::filesystem::path tpath = dest_dir / (stem + L".thumbs");
         if (strip.write(tpath)) result->thumbs_path = tpath;
     }
-    if (decoded == 0) {
-        result->error = "no frames decoded";
-        return false;
-    }
-
-    result->mez_path = mez_path;
-    result->width = track.width;
-    result->height = track.height;
-    result->frame_count = writer.frame_count();
-    result->fps = frame_duration
-        ? static_cast<double>(track.timescale) / frame_duration : 0.0;
+    log_info("ingest: video pass %.2fs (%u frames, %.1f fps)",
+             t_pass.seconds, decoded,
+             t_pass.seconds > 0.0 ? decoded / t_pass.seconds : 0.0);
     return true;
 }
 
@@ -796,92 +593,6 @@ bool import_audio_file(const std::filesystem::path& source,
 
 }  // namespace
 
-double probe_video_duration_seconds(const std::filesystem::path& source) {
-    FILE* f = _wfopen(source.c_str(), L"rb");
-    if (!f) return 0.0;
-    _fseeki64(f, 0, SEEK_END);
-    const int64_t file_end = _ftelli64(f);
-    auto be32 = [](const uint8_t* p) {
-        return (static_cast<uint32_t>(p[0]) << 24) |
-               (static_cast<uint32_t>(p[1]) << 16) |
-               (static_cast<uint32_t>(p[2]) << 8) | p[3];
-    };
-    auto be64 = [&](const uint8_t* p) {
-        return (static_cast<uint64_t>(be32(p)) << 32) | be32(p + 4);
-    };
-    // Finds a child box inside [begin, end); returns payload begin/end.
-    auto find_box = [&](int64_t begin, int64_t end, const char* fourcc,
-                        int64_t* pb, int64_t* pe) {
-        int64_t at = begin;
-        uint8_t hdr[16];
-        for (int guard = 0; guard < 4096 && at + 8 <= end; ++guard) {
-            _fseeki64(f, at, SEEK_SET);
-            if (std::fread(hdr, 1, 8, f) != 8) return false;
-            uint64_t size = be32(hdr);
-            int64_t payload = at + 8;
-            if (size == 1) {
-                if (std::fread(hdr + 8, 1, 8, f) != 8) return false;
-                size = be64(hdr + 8);
-                payload = at + 16;
-            } else if (size == 0) {
-                size = static_cast<uint64_t>(end - at);
-            }
-            if (size < 8) return false;
-            if (!std::memcmp(hdr + 4, fourcc, 4)) {
-                *pb = payload;
-                *pe = at + static_cast<int64_t>(size);
-                return true;
-            }
-            at += static_cast<int64_t>(size);
-        }
-        return false;
-    };
-    double secs = 0.0;
-    int64_t moov_b = 0, moov_e = 0;
-    if (find_box(0, file_end, "moov", &moov_b, &moov_e)) {
-        // Walk every trak; the VIDEO handler's mdhd is the duration the
-        // mezzanine must cover (mvhd would count a longer audio tail
-        // and force a re-import loop).
-        int64_t at = moov_b;
-        int64_t trak_b = 0, trak_e = 0;
-        while (find_box(at, moov_e, "trak", &trak_b, &trak_e)) {
-            int64_t mdia_b = 0, mdia_e = 0;
-            if (find_box(trak_b, trak_e, "mdia", &mdia_b, &mdia_e)) {
-                int64_t hb = 0, he = 0;
-                uint8_t buf[36];
-                bool is_video = false;
-                if (find_box(mdia_b, mdia_e, "hdlr", &hb, &he)) {
-                    _fseeki64(f, hb, SEEK_SET);
-                    if (std::fread(buf, 1, 12, f) == 12)
-                        is_video = !std::memcmp(buf + 8, "vide", 4);
-                }
-                if (is_video &&
-                    find_box(mdia_b, mdia_e, "mdhd", &hb, &he)) {
-                    _fseeki64(f, hb, SEEK_SET);
-                    if (std::fread(buf, 1, 32, f) == 32) {
-                        uint32_t ts = 0;
-                        uint64_t dur = 0;
-                        if (buf[0] == 1) {
-                            ts = be32(buf + 20);
-                            dur = be64(buf + 24);
-                        } else {
-                            ts = be32(buf + 12);
-                            dur = be32(buf + 16);
-                        }
-                        if (ts) {
-                            secs = static_cast<double>(dur) / ts;
-                            break;
-                        }
-                    }
-                }
-            }
-            at = trak_e;
-        }
-    }
-    std::fclose(f);
-    return secs;
-}
-
 bool extract_audio_pcm(const std::filesystem::path& source,
                        const std::filesystem::path& dest_pcm,
                        std::string* error) {
@@ -984,10 +695,16 @@ ImportResult import_media(const std::filesystem::path& source,
     std::filesystem::create_directories(dest_dir, ec);
     const std::wstring stem = source.stem().wstring();
 
-    mod::VideoAnalyzer video_analyzer;
-    if (!import_video(file, *video, dest_dir / (stem + L".mez"), options,
-                      progress, &result, &video_analyzer))
-        return result;
+    // ---- fast stage: everything the asset needs to be USABLE. Video
+    // facts come from the container (playback decodes the source in
+    // place - no transcode); the AAC decode into the PCM sidecar and the
+    // audio curves are the only real work. `ready` flips here and the
+    // app binds/places the asset while the video pass below still runs.
+    result.width = video->width;
+    result.height = video->height;
+    result.frame_count = static_cast<uint32_t>(video->samples.size());
+    const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
+    result.fps = static_cast<double>(video->timescale) / frame_duration;
 
     const TrackInfo* audio = file.movie().first_audio();
     if (audio && std::string(audio->fourcc) == "mp4a" &&
@@ -996,38 +713,43 @@ ImportResult import_media(const std::filesystem::path& source,
             return result;
     }
 
-    // ---- analysis sidecar: video curves from the decode pass,
-    // audio curves from the PCM sidecar we just wrote.
-    {
-        mod::AnalysisData analysis;
-        analysis.fps = result.fps;
-        analysis.frame_count = result.frame_count;
-        video_analyzer.finish(&analysis);
-        if (!result.pcm_path.empty()) {
-            PcmReader pcm;
-            std::string pcm_error;
-            if (pcm.open(result.pcm_path, &pcm_error)) {
-                std::vector<int16_t> samples(
-                    static_cast<size_t>(pcm.frame_count()) * pcm.channels());
-                pcm.read(0, samples.data(),
-                         static_cast<size_t>(pcm.frame_count()));
-                mod::analyze_audio(samples.data(), pcm.frame_count(),
-                                   pcm.channels(), pcm.sample_rate(),
-                                   result.fps, result.frame_count, &analysis);
-            }
+    mod::AnalysisData analysis;
+    analysis.fps = result.fps;
+    analysis.frame_count = result.frame_count;
+    if (!result.pcm_path.empty()) {
+        PcmReader pcm;
+        std::string pcm_error;
+        if (pcm.open(result.pcm_path, &pcm_error)) {
+            std::vector<int16_t> samples(
+                static_cast<size_t>(pcm.frame_count()) * pcm.channels());
+            pcm.read(0, samples.data(),
+                     static_cast<size_t>(pcm.frame_count()));
+            mod::analyze_audio(samples.data(), pcm.frame_count(),
+                               pcm.channels(), pcm.sample_rate(),
+                               result.fps, result.frame_count, &analysis);
         }
-        const std::filesystem::path analysis_path =
-            dest_dir / (stem + L".analysis");
-        if (mod::write_analysis(analysis_path, analysis))
-            result.analysis_path = analysis_path;
-        else
-            log_warn("import: analysis write failed (non-fatal)");
     }
+    // The analysis sidecar is the READY marker resolve_bundle gates on:
+    // written last in the fast stage, deleted never, rewritten (with the
+    // video curves merged in) when the pass below completes.
+    const std::filesystem::path analysis_path =
+        dest_dir / (stem + L".analysis");
+    if (mod::write_analysis(analysis_path, analysis))
+        result.analysis_path = analysis_path;
+    else
+        log_warn("ingest: analysis write failed");
 
     result.ok = true;
-    log_info("import: %s -> %u frames @%0.3f fps%s", source.string().c_str(),
-             result.frame_count, result.fps,
+    if (progress) progress->ready.store(true);
+    log_info("ingest: %s ready — %u frames @%0.3f fps%s",
+             source.string().c_str(), result.frame_count, result.fps,
              result.pcm_path.empty() ? "" : " + audio");
+
+    // ---- background stage, same job: the one full decode feeding the
+    // video curves and the thumbnail strip.
+    if (!(progress && progress->cancel.load()))
+        ingest_video_pass(file, *video, options, progress, &analysis,
+                          dest_dir, stem, &result);
     return result;
 }
 

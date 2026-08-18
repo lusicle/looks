@@ -1,4 +1,6 @@
-// Dev CLI: exercises the import pipeline end-to-end on a real file.
+// Dev CLI: exercises ingest end-to-end on a real file. Video sources
+// write sidecars only (playback decodes the source natively); stills and
+// audio cover art still produce a mezzanine.
 //   looks_import <input.mp4> <output_dir> [quality]
 // Prints the resulting bundle info; exit 0 on success.
 
@@ -24,7 +26,13 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(stderr, "import failed: %s\n", result.error.c_str());
         return 1;
     }
-    std::printf("mez: %s\n", result.mez_path.string().c_str());
+    if (!result.mez_path.empty())
+        std::printf("mez: %s\n", result.mez_path.string().c_str());
+    if (!result.analysis_path.empty())
+        std::printf("analysis: %s\n",
+                    result.analysis_path.string().c_str());
+    if (!result.thumbs_path.empty())
+        std::printf("thumbs: %s\n", result.thumbs_path.string().c_str());
     std::printf("  %ux%u, %u frames, %.3f fps\n", result.width, result.height,
                 result.frame_count, result.fps);
     if (!result.pcm_path.empty()) {

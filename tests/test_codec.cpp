@@ -351,3 +351,32 @@ TEST(codec_mez_set_frame_count) {
     }
     std::filesystem::remove(path);
 }
+
+TEST(codec_mez_payload_offset_aliases_hold_frames) {
+    // Hold-frame entries repeat one payload offset - the contract the
+    // decode pool's still alias rides (decode once, serve every frame
+    // that points at the same payload). Distinct frames get distinct
+    // offsets.
+    const auto path =
+        std::filesystem::temp_directory_path() / "looks_test_alias.mez";
+    {
+        MezWriter writer;
+        CHECK(writer.open(path, 96, 64, 30000, 1000, 88));
+        CHECK(writer.add_frame(make_test_frame(96, 64, 7).view()));
+        CHECK(writer.add_hold_frames(3));
+        CHECK(writer.add_frame(make_test_frame(96, 64, 9).view()));
+        CHECK(writer.finish());
+    }
+    MezReader reader;
+    std::string error;
+    CHECK(reader.open(path, &error));
+    CHECK_EQ(reader.frame_count(), 5u);
+    const uint64_t held = reader.payload_offset(0);
+    CHECK(held != 0);
+    CHECK_EQ(reader.payload_offset(1), held);
+    CHECK_EQ(reader.payload_offset(3), held);
+    CHECK(reader.payload_offset(4) != held);
+    CHECK_EQ(reader.payload_offset(5), uint64_t{0});   // out of range
+    reader.close();
+    std::filesystem::remove(path);
+}
