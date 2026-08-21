@@ -14,6 +14,7 @@
 #pragma once
 
 #include <initializer_list>
+#include <vector>
 
 #include "ui/arena.h"
 #include "ui/canvas2d.h"
@@ -51,7 +52,7 @@ struct SizeSpec {
 };
 
 enum class NodeKind : uint8_t {
-    Leaf, VStack, HStack, ZStack, Padding, ScrollArea, Clip
+    Leaf, VStack, HStack, ZStack, Padding, ScrollArea
 };
 
 enum class AlignMode : uint8_t { Start, Center, End, Stretch };
@@ -127,6 +128,13 @@ LayoutNode* VStack(LayoutArena& arena, const StackOpts& opts,
                    std::initializer_list<LayoutNode*> children);
 LayoutNode* HStack(LayoutArena& arena, const StackOpts& opts,
                    std::initializer_list<LayoutNode*> children);
+// Dynamic-count variants: null children are SKIPPED, matching the
+// initializer_list path - a conditional push_back(nullptr) must be
+// ignored, never crash the measure walk.
+LayoutNode* VStackDyn(LayoutArena& arena, const StackOpts& opts,
+                      const std::vector<LayoutNode*>& children);
+LayoutNode* HStackDyn(LayoutArena& arena, const StackOpts& opts,
+                      const std::vector<LayoutNode*>& children);
 LayoutNode* ZStack(LayoutArena& arena,
                    std::initializer_list<LayoutNode*> children);
 LayoutNode* Padding_(LayoutArena& arena, Edges edges, LayoutNode* child);
@@ -136,7 +144,6 @@ LayoutNode* Spacer(LayoutArena& arena, float weight = 1.0f);
 LayoutNode* ScrollAreaV(LayoutArena& arena, ScrollState* state,
                         LayoutNode* child, SizeSpec width = SizeSpec::fill(),
                         SizeSpec height = SizeSpec::fill());
-LayoutNode* Clip(LayoutArena& arena, LayoutNode* child);
 
 // ---- passes
 Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame);

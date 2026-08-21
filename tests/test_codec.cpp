@@ -289,18 +289,19 @@ TEST(codec_mez_partial_writer_removes_its_file) {
     }
     CHECK(!std::filesystem::exists(path));
 
-    // mez_probe reads the header without touching the index.
+    // A finished writer's file survives and reopens.
     {
         MezWriter writer;
         CHECK(writer.open(path, 96, 64, 30000, 1001, 88));
         CHECK(writer.add_frame(make_test_frame(96, 64, 3).view()));
         CHECK(writer.finish());
     }
-    uint32_t frames = 0;
-    double fps = 0.0;
-    CHECK(mez_probe(path, &frames, &fps));
-    CHECK_EQ(frames, 1u);
-    CHECK(fps > 29.0 && fps < 30.5);
+    MezReader reader;
+    std::string error;
+    CHECK(reader.open(path, &error));
+    CHECK_EQ(reader.frame_count(), 1u);
+    CHECK(reader.fps() > 29.0 && reader.fps() < 30.5);
+    reader.close();
     std::filesystem::remove(path);
 }
 

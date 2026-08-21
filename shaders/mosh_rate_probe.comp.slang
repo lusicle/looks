@@ -6,6 +6,8 @@
 // its size is a sum of pairwise terms - that is what makes rate control
 // a reduction instead of a CPU job.
 
+#include "mosh_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -21,85 +23,11 @@ cbuffer Push
     uint4 rungs_hi;       // scalar arrays get 16-byte std140 strides)
 };
 
-uint rung_at(uint r)
-{
-    return r < 4 ? rungs_lo[r] : rungs_hi[r - 4];
-}
-
 [[vk::binding(0, 0)]] Sampler2D nv_y;
 [[vk::binding(1, 0)]] Sampler2D nv_uv;
 [[vk::binding(2, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> clean_pred;
 [[vk::binding(3, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_dc;
 [[vk::binding(4, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_bits;
-
-static const int kQuantBaseLuma[64] = {
-    16, 11, 10, 16, 24,  40,  51,  61,
-    12, 12, 14, 19, 26,  58,  60,  55,
-    14, 13, 16, 24, 40,  57,  69,  56,
-    14, 17, 22, 29, 51,  87,  80,  62,
-    18, 22, 37, 56, 68,  109, 103, 77,
-    24, 35, 55, 64, 81,  104, 113, 92,
-    49, 64, 78, 87, 103, 121, 120, 101,
-    72, 92, 95, 98, 112, 100, 103, 99};
-
-static const int kQuantBaseChroma[64] = {
-    17, 18, 24, 47, 99, 99, 99, 99,
-    18, 21, 26, 66, 99, 99, 99, 99,
-    24, 26, 56, 99, 99, 99, 99, 99,
-    47, 66, 99, 99, 99, 99, 99, 99,
-    99, 99, 99, 99, 99, 99, 99, 99,
-    99, 99, 99, 99, 99, 99, 99, 99,
-    99, 99, 99, 99, 99, 99, 99, 99,
-    99, 99, 99, 99, 99, 99, 99, 99};
-
-static const uint kZigzag[64] = {
-    0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
-    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
-    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
-    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
-
-int round13(int acc)
-{
-    return clamp((acc + 4096) >> 13, -32768, 32767);
-}
-
-void fwd_pass8(inout int blk[64], uint base, uint stride)
-{
-    int s[4];
-    int d[4];
-    for (uint j = 0; j < 4; ++j)
-    {
-        const int a = blk[base + j * stride];
-        const int b = blk[base + (7 - j) * stride];
-        s[j] = a + b;
-        d[j] = a - b;
-    }
-    int o[8];
-    o[0] = round13(2896 * (s[0] + s[1] + s[2] + s[3]));
-    o[4] = round13(2896 * ((s[0] + s[3]) - (s[1] + s[2])));
-    o[2] = round13(3784 * (s[0] - s[3]) + 1567 * (s[1] - s[2]));
-    o[6] = round13(1567 * (s[0] - s[3]) - 3784 * (s[1] - s[2]));
-    o[1] = round13(4017 * d[0] + 3406 * d[1] + 2276 * d[2] + 799 * d[3]);
-    o[3] = round13(3406 * d[0] - 799 * d[1] - 4017 * d[2] - 2276 * d[3]);
-    o[5] = round13(2276 * d[0] - 4017 * d[1] + 799 * d[2] + 3406 * d[3]);
-    o[7] = round13(799 * d[0] - 2276 * d[1] + 3406 * d[2] - 4017 * d[3]);
-    for (uint k = 0; k < 8; ++k)
-        blk[base + k * stride] = o[k];
-}
-
-uint ue_bits(uint v)
-{
-    const uint x = v + 1;
-    uint bits = 0;
-    while ((x >> bits) > 1)
-        ++bits;
-    return 2 * bits + 1;
-}
-
-uint se_bits(int v)
-{
-    return ue_bits(v > 0 ? uint(v) * 2 - 1 : uint(-v) * 2);
-}
 
 int fetch_src(int2 p)
 {
@@ -154,17 +82,16 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     for (uint r = 0; r < rung_count; ++r)
     {
-        const int quality = int(clamp(rung_at(r), 1u, 100u));
-        const int scale = quality < 50 ? 5000 / quality : 200 - quality * 2;
+        const int quality =
+            int(clamp(mosh_rung_at(rungs_lo, rungs_hi, r), 1u, 100u));
+        const int scale = mosh_quant_scale(quality);
         int dc = 0;
         uint bits = 0;
         int last_nonzero = 0;
         int qz[64];
         for (uint i = 0; i < 64; ++i)
         {
-            const int base = plane == 0 ? kQuantBaseLuma[i]
-                                        : kQuantBaseChroma[i];
-            const int qv = clamp((base * scale + 50) / 100, 1, 255);
+            const int qv = mosh_quant_step(i, plane, scale);
             const int v = coeffs[i];
             const int mag = (abs(v) + qv / 2) / qv;
             qz[i] = v < 0 ? -mag : mag;

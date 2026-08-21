@@ -3,11 +3,19 @@
 #include <cstdio>
 #include <cstring>
 
+#include "util/bytes.h"
+
 namespace looks::media {
 
 namespace {
 constexpr uint32_t kMagic = 0x314D4350;   // 'PCM1'
 constexpr size_t kHeaderSize = 16;
+
+// Header fields are explicit little-endian bytes (the sample payload is
+// native int16, which is the same thing on every platform this builds
+// for - pcm.h states the format as LE throughout).
+using bytes::le32;
+using bytes::put_le32;
 }  // namespace
 
 PcmWriter::~PcmWriter() {
@@ -32,11 +40,11 @@ bool PcmWriter::open(const std::filesystem::path& path, uint32_t channels,
     finished_ = false;
 
     uint8_t header[kHeaderSize] = {};
-    std::memcpy(header, &kMagic, 4);
+    put_le32(header, kMagic);
     header[4] = static_cast<uint8_t>(channels);
     header[5] = static_cast<uint8_t>(channels >> 8);
     header[6] = 16;
-    std::memcpy(header + 8, &sample_rate, 4);
+    put_le32(header + 8, sample_rate);
     return std::fwrite(header, 1, kHeaderSize, f) == kHeaderSize;
 }
 
@@ -53,8 +61,10 @@ bool PcmWriter::finish() {
     FILE* f = static_cast<FILE*>(file_);
     const uint32_t frames32 =
         frames_ > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(frames_);
+    uint8_t le[4];
+    put_le32(le, frames32);
     _fseeki64(f, 12, SEEK_SET);
-    if (std::fwrite(&frames32, 4, 1, f) != 1) return false;
+    if (std::fwrite(le, 1, 4, f) != 4) return false;
     std::fflush(f);
     finished_ = true;
     return true;
@@ -78,18 +88,15 @@ bool PcmReader::open(const std::filesystem::path& path, std::string* error) {
     }
     file_ = f;
     uint8_t header[kHeaderSize];
-    uint32_t magic = 0;
     if (std::fread(header, 1, kHeaderSize, f) != kHeaderSize ||
-        (std::memcpy(&magic, header, 4), magic != kMagic)) {
+        le32(header) != kMagic) {
         if (error) *error = "not a PCM1 file";
         close();
         return false;
     }
     channels_ = header[4] | (header[5] << 8);
-    std::memcpy(&sample_rate_, header + 8, 4);
-    uint32_t frames32 = 0;
-    std::memcpy(&frames32, header + 12, 4);
-    frames_ = frames32;
+    sample_rate_ = le32(header + 8);
+    frames_ = le32(header + 12);
     if (channels_ == 0 || channels_ > 8 || sample_rate_ == 0) {
         if (error) *error = "bad pcm header";
         close();

@@ -39,7 +39,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 fx = b;                                    // normal
     if (op == 1) fx = a + b;                          // add
     else if (op == 2) fx = a * b;                     // multiply
-    else if (op == 3) fx = 1.0 - (1.0 - a) * (1.0 - b);   // screen
+    else if (op == 3) fx = fx_screen(a, b);           // screen
     else if (op == 4) fx = abs(a - b);                // difference
     else if (op == 5) fx = max(a - b, 0.0);           // subtract
     else if (op == 6) fx = min(a, b);                 // darken

@@ -35,7 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     // Blue-sensitive collodion response; weights sum to 1 at both ends.
-    const float3 w = lerp(float3(0.2126, 0.7152, 0.0722),
+    const float3 w = lerp(kFxLumaW,
                           float3(0.05, 0.25, 0.70), saturate(ortho));
     float l = dot(enc, w);
 

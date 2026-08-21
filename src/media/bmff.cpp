@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "util/bytes.h"
+
 namespace looks::media {
 
 namespace {
@@ -14,49 +16,7 @@ constexpr uint32_t fourcc(const char (&s)[5]) {
            static_cast<uint32_t>(static_cast<uint8_t>(s[3]));
 }
 
-struct Reader {
-    const uint8_t* data;
-    size_t size;
-    size_t pos = 0;
-    bool ok = true;
-
-    bool has(size_t n) const { return ok && pos + n <= size; }
-    void fail() { ok = false; }
-
-    uint8_t u8() {
-        if (!has(1)) { fail(); return 0; }
-        return data[pos++];
-    }
-    uint16_t u16() {
-        if (!has(2)) { fail(); return 0; }
-        uint16_t v = (static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1];
-        pos += 2;
-        return v;
-    }
-    uint32_t u32() {
-        if (!has(4)) { fail(); return 0; }
-        uint32_t v = 0;
-        for (int i = 0; i < 4; ++i) v = (v << 8) | data[pos + i];
-        pos += 4;
-        return v;
-    }
-    uint64_t u64() {
-        if (!has(8)) { fail(); return 0; }
-        uint64_t v = 0;
-        for (int i = 0; i < 8; ++i) v = (v << 8) | data[pos + i];
-        pos += 8;
-        return v;
-    }
-    void skip(size_t n) {
-        if (!has(n)) { fail(); return; }
-        pos += n;
-    }
-    void bytes(void* out, size_t n) {
-        if (!has(n)) { fail(); std::memset(out, 0, n); return; }
-        std::memcpy(out, data + pos, n);
-        pos += n;
-    }
-};
+using Reader = bytes::BeReader;
 
 struct Box {
     uint32_t type = 0;
@@ -170,28 +130,19 @@ void parse_stsd(Reader& r, TrackInfo* track) {
             if (child.type == fourcc("esds")) {
                 Reader& es = child.payload;
                 full_box(es);
-                // Descriptor walk: tag byte + 7-bit varlen length.
-                auto desc_len = [](Reader& d) -> size_t {
-                    size_t len = 0;
-                    for (int i = 0; i < 4; ++i) {
-                        const uint8_t b = d.u8();
-                        len = (len << 7) | (b & 0x7F);
-                        if (!(b & 0x80)) break;
-                    }
-                    return len;
-                };
-                if (es.u8() != 0x03) break;   // ES_Descriptor
-                desc_len(es);
+                // Descriptor walk: tag byte + shared 7-bit varlen.
+                if (es.u8() != kEsdsTagES) break;
+                esds_read_len(es);
                 es.skip(2);                    // ES_ID
                 const uint8_t es_flags = es.u8();
                 if (es_flags & 0x80) es.skip(2);            // streamDependence
                 if (es_flags & 0x40) es.skip(es.u8());      // URL
                 if (es_flags & 0x20) es.skip(2);            // OCR
-                if (es.u8() != 0x04) break;   // DecoderConfigDescriptor
-                desc_len(es);
+                if (es.u8() != kEsdsTagDecoderConfig) break;
+                esds_read_len(es);
                 es.skip(1 + 4 + 4 + 4);       // objType + stream/buffer + rates
-                if (es.u8() != 0x05) break;   // DecoderSpecificInfo
-                const size_t asc_len = desc_len(es);
+                if (es.u8() != kEsdsTagDecoderSpecific) break;
+                const size_t asc_len = esds_read_len(es);
                 if (es.has(asc_len)) {
                     track->audio_specific_config.assign(
                         es.data + es.pos, es.data + es.pos + asc_len);
@@ -466,27 +417,32 @@ bool BmffFile::open(const std::filesystem::path& path, std::string* error) {
     }
     file_ = f;
 
-    // Walk top-level boxes to find moov.
+    // Walk top-level boxes to find moov. The file length bounds every
+    // declared size - a corrupt box must not drive an unbounded
+    // allocation, and a largesize smaller than its own 16-byte header
+    // must not seek backwards into it (the in-memory walker, next_box,
+    // enforces the same two rules).
+    _fseeki64(f, 0, SEEK_END);
+    const int64_t file_size = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
     std::vector<uint8_t> moov;
     for (;;) {
         uint8_t header[16];
         const int64_t box_start = _ftelli64(f);
         if (std::fread(header, 1, 8, f) != 8) break;
-        uint64_t box_size = (static_cast<uint64_t>(header[0]) << 24) |
-                            (header[1] << 16) | (header[2] << 8) | header[3];
-        const uint32_t type = (static_cast<uint32_t>(header[4]) << 24) |
-                              (header[5] << 16) | (header[6] << 8) | header[7];
+        uint64_t box_size = bytes::be32(header);
+        const uint32_t type = bytes::be32(header + 4);
+        uint64_t header_bytes = 8;
         if (box_size == 1) {
             if (std::fread(header + 8, 1, 8, f) != 8) break;
-            box_size = 0;
-            for (int i = 8; i < 16; ++i)
-                box_size = (box_size << 8) | header[i];
+            box_size = bytes::be64(header + 8);
+            header_bytes = 16;
         } else if (box_size == 0) {
-            _fseeki64(f, 0, SEEK_END);
-            box_size = static_cast<uint64_t>(_ftelli64(f) - box_start);
-            _fseeki64(f, box_start + 8, SEEK_SET);
+            box_size = static_cast<uint64_t>(file_size - box_start);
         }
-        if (box_size < 8) break;
+        if (box_size < header_bytes ||
+            box_size > static_cast<uint64_t>(file_size - box_start))
+            break;
 
         if (type == fourcc("moov")) {
             moov.resize(static_cast<size_t>(box_size));
@@ -516,10 +472,15 @@ bool BmffFile::open(const std::filesystem::path& path, std::string* error) {
 
 bool BmffFile::read_sample(const SampleInfo& sample, std::vector<uint8_t>& out) {
     if (!file_) return false;
-    FILE* f = static_cast<FILE*>(file_);
-    if (_fseeki64(f, static_cast<int64_t>(sample.file_offset), SEEK_SET) != 0)
+    return read_at(file_, sample.file_offset, sample.size, out);
+}
+
+bool BmffFile::read_at(void* file, uint64_t offset, uint32_t size,
+                       std::vector<uint8_t>& out) {
+    FILE* f = static_cast<FILE*>(file);
+    if (_fseeki64(f, static_cast<int64_t>(offset), SEEK_SET) != 0)
         return false;
-    out.resize(sample.size);
+    out.resize(size);
     return std::fread(out.data(), 1, out.size(), f) == out.size();
 }
 

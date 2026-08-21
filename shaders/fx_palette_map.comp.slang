@@ -32,46 +32,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float3 c = fx_srgb_oetf(saturate(base.rgb));
     const int pal = int(palette + 0.5);
-    float3 result;
-    if (pal == 0)
-    {
-        // DMG greens, darkest to lightest.
-        const float l = fx_luma(c);
-        result = fx_nearest_of4(float3(l, l, l),
-                                float3(0.059, 0.220, 0.059),
-                                float3(0.188, 0.384, 0.188),
-                                float3(0.545, 0.675, 0.059),
-                                float3(0.608, 0.737, 0.059));
-    }
-    else if (pal == 1)
-    {
-        // CGA palette 1.
-        result = fx_nearest_of4(c,
-                                float3(0.0, 0.0, 0.0),
-                                float3(0.333, 1.0, 1.0),
-                                float3(1.0, 0.333, 1.0),
-                                float3(1.0, 1.0, 1.0));
-    }
-    else if (pal == 2)
-    {
-        result = fx_nes_nearest(c);
-    }
-    else if (pal == 3)
-    {
-        // The 8 saturated teletext colors: each channel snaps to 0 or 1.
-        result = round(c);
-    }
-    else
-    {
-        const float l = fx_luma(c);
-        const float3 ha = fx_hue_to_rgb(pal_hue_a);
-        const float3 hb = fx_hue_to_rgb(pal_hue_b);
-        result = fx_nearest_of4(float3(l, l, l),
-                                float3(0.02, 0.02, 0.02),
-                                ha * 0.45,
-                                hb * 0.85,
-                                float3(0.98, 0.98, 0.98));
-    }
+    const float3 result =
+        fx_palette_snap(pal, c, fx_luma(c), pal_hue_a, pal_hue_b);
 
     const float4 mapped = float4(fx_srgb_eotf(saturate(result)), base.a);
     const float4 wetted = lerp(base, mapped, saturate(wet));

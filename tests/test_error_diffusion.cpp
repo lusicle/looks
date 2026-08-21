@@ -319,6 +319,20 @@ uint32_t hash32(uint32_t x) {
     return x;
 }
 
+// Test-side encoder; production only decodes halves (half_to_float).
+uint16_t float_to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t exp =
+        static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+    const uint32_t man = x & 0x7FFFFFu;
+    if (exp <= 0) return static_cast<uint16_t>(sign);            // -> 0
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); // clamp
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
+                                 (man >> 13));
+}
+
 std::vector<uint16_t> make_halves(uint32_t w, uint32_t h, uint32_t seed) {
     std::vector<uint16_t> halves(static_cast<size_t>(w) * h * 4);
     for (uint32_t y = 0; y < h; ++y)
@@ -329,7 +343,7 @@ std::vector<uint16_t> make_halves(uint32_t w, uint32_t h, uint32_t seed) {
                                        0xFFFF) /
                     65535.0f;
                 halves[(static_cast<size_t>(y) * w + x) * 4 + c] =
-                    looks::gfx::float_to_half(f);
+                    float_to_half(f);
             }
     return halves;
 }

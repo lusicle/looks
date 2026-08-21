@@ -80,30 +80,13 @@ uint64_t link_into(const std::vector<NodeLink>& links, uint64_t to,
 void walk_chain(const Look& look, const std::vector<NodeLink>& links,
                 uint64_t start, const Layer** root,
                 std::vector<AudioOp>& rev, int64_t* audio_off) {
-    auto find_layer = [&](uint64_t id) -> const Layer* {
-        for (const Layer& l : look.layers)
-            if (l.id == id) return &l;
-        return nullptr;
-    };
     auto find_fx = [&](uint64_t id,
                        const Layer** owner) -> const EffectInstance* {
-        for (const Layer& l : look.layers)
-            for (const EffectInstance& fx : l.stack)
-                if (fx.id == id) {
-                    *owner = &l;
-                    return &fx;
-                }
-        return nullptr;
-    };
-    auto group_bypassed = [&](const Layer& l, uint64_t gid) {
-        if (gid == 0) return false;
-        for (const Group& g : l.groups)
-            if (g.id == gid) return g.bypass;
-        return false;
+        return find_effect(look, id, owner);
     };
     uint64_t cur = start;
     for (int guard = 0; guard < 512 && cur; ++guard) {
-        if (const Layer* layer = find_layer(cur)) {
+        if (const Layer* layer = find_layer(look, cur)) {
             *root = layer;
             return;
         }
@@ -123,7 +106,7 @@ void walk_chain(const Look& look, const std::vector<NodeLink>& links,
         const uint64_t next = link_into(links, fx->id, 0);
         if (audio_off && fx->type == EffectType::Offset && !fx->bypass &&
             !group_bypassed(*owner, fx->group_id) &&
-            offset_targets_audio(*fx) && find_layer(next))
+            offset_targets_audio(*fx) && find_layer(look, next))
             *audio_off += offset_frames(*fx);
         cur = next;
     }
@@ -157,23 +140,18 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                           const std::vector<AudioOp>& chain, int64_t off) {
         if (!layer.asset) return;
         const Asset* a = doc.find_asset(layer.asset);
-        // An asset with no picture (audio import without cover art:
-        // no frames, no dimensions) has no image side: the PICTURE walk
-        // emits nothing - the compiler mirrors this - while the audio
-        // walk carries the voice.
-        if (!audio && a && !a->frame_count && !a->width && !a->height)
+        // A DANGLING id (asset removed) is dormant exactly like an
+        // unbound node, in BOTH walks. An asset with no picture (audio
+        // import without cover art: no frames, no dimensions) has no
+        // image side: the PICTURE walk emits nothing - the compiler
+        // mirrors both - while the audio walk carries the voice.
+        if (!a) return;
+        if (!audio && !a->frame_count && !a->width && !a->height)
             return;
-        const uint32_t frames = a ? a->frame_count : 0;
-        // Playable window: media = local + slip + off must stay inside
-        // the asset; a negative shift delays the start (closed gate
-        // before it), a positive one shortens the tail.
+        const uint32_t frames = a->frame_count;
         const int64_t shift = static_cast<int64_t>(layer.slip) + off;
-        const double lo = shift < 0 ? static_cast<double>(-shift) : 0.0;
-        double hi = kUnbounded;
-        if (frames) {
-            hi = static_cast<double>(frames) - static_cast<double>(shift);
-            if (hi < lo) hi = lo;
-        }
+        double lo = 0.0, hi = 0.0;
+        shifted_window(static_cast<double>(frames), shift, &lo, &hi);
         Cursor leaf;
         if (layer.timeline_lock) {
             // The node reads the asset at the ROOT clock: identity map,
@@ -225,12 +203,8 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         } else {
             return;   // dangling ref: dormant
         }
-        const double lo = off < 0 ? static_cast<double>(-off) : 0.0;
-        double hi = kUnbounded;
-        if (dur > 0.0) {
-            hi = dur - static_cast<double>(off);
-            if (hi < lo) hi = lo;
-        }
+        double lo = 0.0, hi = 0.0;
+        shifted_window(dur, off, &lo, &hi);
         Cursor child;
         if (!child_window(cur, lo, hi, 1.0,
                           lo + static_cast<double>(off), &child))
@@ -267,16 +241,10 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
             bool any_solo = false;
             for (const EffectInstance& fx : holder.stack)
                 if (fx.solo && !fx.bypass) any_solo = true;
-            auto group_off = [&](uint64_t gid) {
-                if (!gid) return false;
-                for (const Group& g : holder.groups)
-                    if (g.id == gid) return g.bypass;
-                return false;
-            };
             for (const EffectInstance& fx : holder.stack) {
                 if (fx.type != EffectType::Offset || fx.bypass) continue;
                 if (any_solo && !fx.solo) continue;
-                if (group_off(fx.group_id)) continue;
+                if (group_bypassed(holder, fx.group_id)) continue;
                 if (!offset_targets_video(fx)) continue;
                 const int64_t off = offset_frames(fx);
                 if (!off) continue;
@@ -331,8 +299,7 @@ void walk_sequence(const Document& doc, const Sequence& seq,
                           static_cast<double>(p.source_in), &child))
             return;
         child.entity = p.target;
-        child.path = hash_combine(hash_combine(cur.path, container),
-                                  p.target);
+        child.path = seq_child_path(cur.path, container, p.target);
         child.gain = p.audio_mute
             ? 0.0f
             : base_gain * std::max(p.audio_gain, 0.0f);
@@ -402,7 +369,9 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
         walk_chain(*cur, links, start, &root, rev, &off);
         if (!root) return {};
         if (layer_is_media(*root)) {
-            if (!root->asset) return {};
+            // Unbound or dangling (asset removed): no voice, like the
+            // media walks.
+            if (!root->asset || !doc.find_asset(root->asset)) return {};
             out.asset = root->asset;
             out.slip = root->slip;
             out.offset = off;

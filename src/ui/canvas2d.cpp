@@ -21,7 +21,6 @@ void Canvas2D::begin_frame(float logical_to_physical, Vec2 viewport_logical) {
     clip_stack_.clear();
     scale_ = logical_to_physical > 1e-3f ? logical_to_physical : 1e-3f;
     viewport_logical_ = viewport_logical;
-    pixel_snap_ = true;
 }
 
 bool Canvas2D::clip_collapsed() const {
@@ -118,19 +117,6 @@ void Canvas2D::draw_rect_outline(const Rect& r, float stroke, Color color) {
     draw_rect({r.x, r.y + stroke, stroke, r.h - 2 * stroke}, color);            // left
     draw_rect({r.right() - stroke, r.y + stroke, stroke, r.h - 2 * stroke},     // right
               color);
-}
-
-void Canvas2D::draw_gradient_quad(const Rect& r, Color tl, Color tr, Color br,
-                                  Color bl) {
-    if (r.empty()) return;
-    const Vec2 p0 = to_physical({r.x, r.y});
-    const Vec2 p1 = to_physical({r.right(), r.bottom()});
-    const Vec2 pos[4] = {p0, {p1.x, p0.y}, p1, {p0.x, p1.y}};
-    const Vec2 uv[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-    const uint32_t colors[4] = {tl.to_rgba8(), tr.to_rgba8(), br.to_rgba8(),
-                                bl.to_rgba8()};
-    const float shape[4] = {0, 0, 0, 0};
-    emit_quad_physical(BatchKind::Solid, nullptr, pos, uv, colors, shape);
 }
 
 void Canvas2D::draw_triangle(Vec2 a, Vec2 b, Vec2 c, Color color) {

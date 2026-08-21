@@ -84,10 +84,6 @@ std::string UndoStack::undo_name() const {
     return can_undo() ? undo_.back()->name() : std::string();
 }
 
-std::string UndoStack::redo_name() const {
-    return can_redo() ? redo_.back()->name() : std::string();
-}
-
 void UndoStack::begin_group(std::string name) {
     open_groups_.push_back({std::move(name), {}});
     ++group_depth_;

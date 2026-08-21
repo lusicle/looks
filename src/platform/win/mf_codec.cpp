@@ -16,6 +16,8 @@
 #include <cstring>
 #include <deque>
 
+#include "media/h264_util.h"
+#include "platform/win/com_ptr.h"
 #include "util/log.h"
 
 #pragma comment(lib, "mfplat")
@@ -27,42 +29,6 @@ namespace looks::platform {
 
 namespace {
 
-// Minimal intrusive COM pointer — enough for this TU, no ATL.
-template <typename T>
-class Com {
-public:
-    Com() = default;
-    ~Com() { reset(); }
-    Com(const Com&) = delete;
-    Com& operator=(const Com&) = delete;
-    Com(Com&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
-    Com& operator=(Com&& o) noexcept {
-        if (this != &o) {
-            reset();
-            p_ = o.p_;
-            o.p_ = nullptr;
-        }
-        return *this;
-    }
-
-    T** put() {
-        reset();
-        return &p_;
-    }
-    T* get() const { return p_; }
-    T* operator->() const { return p_; }
-    explicit operator bool() const { return p_ != nullptr; }
-    void reset() {
-        if (p_) {
-            p_->Release();
-            p_ = nullptr;
-        }
-    }
-
-private:
-    T* p_ = nullptr;
-};
-
 bool set_error(std::string* error, const char* what, HRESULT hr) {
     char buf[160];
     std::snprintf(buf, sizeof(buf), "%s (hr=0x%08lX)", what,
@@ -72,21 +38,23 @@ bool set_error(std::string* error, const char* what, HRESULT hr) {
     return false;
 }
 
-// Finds and activates the first synchronous MFT matching category + input
-// subtype, preferring non-hardware (software) transforms.
-HRESULT create_sync_mft(const GUID& category, const GUID& input_subtype,
-                        const GUID& major_type, IMFTransform** out) {
-    MFT_REGISTER_TYPE_INFO input_info{major_type, input_subtype};
+// Finds and activates a synchronous MFT for the category, matched by
+// input and/or output type (either may be null). Candidates are tried
+// in MFTEnumEx's sorted order until one activates - the first-ranked
+// transform is not always usable on a given machine.
+HRESULT create_sync_mft(const GUID& category,
+                        const MFT_REGISTER_TYPE_INFO* input_info,
+                        const MFT_REGISTER_TYPE_INFO* output_info,
+                        IMFTransform** out) {
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(category, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                           &input_info, nullptr, &activates, &count);
+    HRESULT hr = MFTEnumEx(category,
+                           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                           input_info, output_info, &activates, &count);
     if (FAILED(hr)) return hr;
-    if (count == 0) {
-        CoTaskMemFree(activates);
-        return MF_E_TOPO_CODEC_NOT_FOUND;
-    }
-    hr = activates[0]->ActivateObject(IID_PPV_ARGS(out));
+    hr = MF_E_TOPO_CODEC_NOT_FOUND;
+    for (UINT32 i = 0; i < count && FAILED(hr); ++i)
+        hr = activates[i]->ActivateObject(IID_PPV_ARGS(out));
     for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
     CoTaskMemFree(activates);
     return hr;
@@ -117,11 +85,29 @@ HRESULT make_sample(const uint8_t* data, size_t size, int64_t pts,
     return S_OK;
 }
 
+// Fallback sizes for MFTs that report cbSize 0: one comfortable audio
+// chunk, and a worst-case 4K video keyframe.
+constexpr DWORD kAudioAllocFallback = 4096;
+constexpr DWORD kVideoAllocFallback = 4u << 20;
+
+// Allocates the output sample when the MFT does not provide its own.
+HRESULT alloc_output_sample(const MFT_OUTPUT_STREAM_INFO& info,
+                            DWORD fallback, Com<IMFSample>& out) {
+    Com<IMFMediaBuffer> buffer;
+    HRESULT hr =
+        MFCreateMemoryBuffer(info.cbSize ? info.cbSize : fallback,
+                             buffer.put());
+    if (FAILED(hr)) return hr;
+    hr = MFCreateSample(out.put());
+    if (FAILED(hr)) return hr;
+    return out->AddBuffer(buffer.get());
+}
+
 // Common sync-MFT output pump: allocates the output sample when the MFT
 // does not provide one, handles stream changes. Returns S_OK with a sample,
 // MF_E_TRANSFORM_NEED_MORE_INPUT, or a hard error.
-HRESULT pump_output(IMFTransform* mft, Com<IMFSample>& out,
-                    bool* stream_changed) {
+HRESULT pump_output(IMFTransform* mft, DWORD alloc_fallback,
+                    Com<IMFSample>& out, bool* stream_changed) {
     *stream_changed = false;
     MFT_OUTPUT_STREAM_INFO info{};
     HRESULT hr = mft->GetOutputStreamInfo(0, &info);
@@ -134,12 +120,8 @@ HRESULT pump_output(IMFTransform* mft, Com<IMFSample>& out,
     MFT_OUTPUT_DATA_BUFFER output{};
     Com<IMFSample> allocated;
     if (!provides) {
-        Com<IMFMediaBuffer> buffer;
-        hr = MFCreateMemoryBuffer(info.cbSize ? info.cbSize : 4096, buffer.put());
+        hr = alloc_output_sample(info, alloc_fallback, allocated);
         if (FAILED(hr)) return hr;
-        hr = MFCreateSample(allocated.put());
-        if (FAILED(hr)) return hr;
-        allocated->AddBuffer(buffer.get());
         output.pSample = allocated.get();
     }
 
@@ -163,6 +145,29 @@ HRESULT pump_output(IMFTransform* mft, Com<IMFSample>& out,
         }
     }
     return S_OK;
+}
+
+// Copies one sample's contiguous payload and timing into a packet.
+// `key_default` seeds the keyframe flag for streams that do not stamp
+// MFSampleExtension_CleanPoint (every AAC frame is a sync point).
+bool sample_to_packet(IMFSample* sample, EncodedPacket& out,
+                      bool key_default) {
+    LONGLONG pts = 0, duration = 0;
+    sample->GetSampleTime(&pts);
+    sample->GetSampleDuration(&duration);
+    UINT32 clean = key_default ? 1u : 0u;
+    sample->GetUINT32(MFSampleExtension_CleanPoint, &clean);
+    Com<IMFMediaBuffer> buffer;
+    if (FAILED(sample->ConvertToContiguousBuffer(buffer.put()))) return false;
+    BYTE* src = nullptr;
+    DWORD len = 0;
+    if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
+    out.data.assign(src, src + len);
+    buffer->Unlock();
+    out.pts_100ns = pts;
+    out.duration_100ns = duration;
+    out.keyframe = clean != 0;
+    return true;
 }
 
 // Pitch-aware NV12 copy via IMF2DBuffer2 — the layout D3D-backed decoder
@@ -314,45 +319,19 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
     d.width = width;
     d.height = height;
 
-    // avcC: ver(1) profile(1) compat(1) level(1) lengthSizeMinusOne(1)
-    // numSPS(1) [len(2) sps]... numPPS(1) [len(2) pps]...
-    if (avcc.size() < 7 || avcc[0] != 1) {
+    // The record layout lives in media/h264_util.h beside its builder.
+    media::AvccInfo info;
+    if (!media::parse_avcc(avcc, &info)) {
         if (error) *error = "bad avcC";
         return false;
     }
-    d.nal_length_size = (avcc[4] & 0x3) + 1;
-    size_t pos = 5;
-    const int num_sps = avcc[pos++] & 0x1F;
-    auto read_sets = [&](int count) -> bool {
-        for (int i = 0; i < count; ++i) {
-            if (pos + 2 > avcc.size()) return false;
-            const size_t len = (avcc[pos] << 8) | avcc[pos + 1];
-            pos += 2;
-            if (pos + len > avcc.size()) return false;
-            const uint8_t start[4] = {0, 0, 0, 1};
-            d.sps_pps.insert(d.sps_pps.end(), start, start + 4);
-            d.sps_pps.insert(d.sps_pps.end(), avcc.begin() + pos,
-                             avcc.begin() + pos + len);
-            pos += len;
-        }
-        return true;
-    };
-    if (!read_sets(num_sps)) {
-        if (error) *error = "bad avcC sps";
-        return false;
-    }
-    if (pos >= avcc.size()) {
-        if (error) *error = "bad avcC pps";
-        return false;
-    }
-    const int num_pps = avcc[pos++];
-    if (!read_sets(num_pps)) {
-        if (error) *error = "bad avcC pps";
-        return false;
-    }
+    d.nal_length_size = info.nal_length_size;
+    d.sps_pps = std::move(info.sps_pps_annexb);
 
-    HRESULT hr = create_sync_mft(MFT_CATEGORY_VIDEO_DECODER, MFVideoFormat_H264,
-                                 MFMediaType_Video, d.mft.put());
+    const MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Video,
+                                         MFVideoFormat_H264};
+    HRESULT hr = create_sync_mft(MFT_CATEGORY_VIDEO_DECODER, &in_info,
+                                 nullptr, d.mft.put());
     if (FAILED(hr)) return set_error(error, "H.264 decoder MFT not found", hr);
 
     // Wire the D3D11 manager for speed — before type negotiation
@@ -408,9 +387,7 @@ bool H264Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns,
             nal_len = (nal_len << 8) | data[pos + i];
         pos += d.nal_length_size;
         if (nal_len == 0 || pos + nal_len > size) break;
-        const uint8_t start[4] = {0, 0, 0, 1};
-        d.annexb.insert(d.annexb.end(), start, start + 4);
-        d.annexb.insert(d.annexb.end(), data + pos, data + pos + nal_len);
+        media::append_annexb_nal(d.annexb, data + pos, nal_len);
         pos += nal_len;
     }
     if (d.annexb.empty()) return true;   // nothing usable; skip
@@ -441,7 +418,8 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
     while (d.inflight.size() < depth) {
         Com<IMFSample> pulled;
         bool stream_changed = false;
-        const HRESULT hr = pump_output(d.mft.get(), pulled, &stream_changed);
+        const HRESULT hr = pump_output(d.mft.get(), kVideoAllocFallback,
+                                       pulled, &stream_changed);
         if (stream_changed) {
             std::string err;
             if (!d.negotiate_output(&err)) return false;
@@ -524,12 +502,16 @@ void H264Decoder::flush() {
     d.sent_params = false;
 }
 
-// ------------------------------------------------------------ AacDecoder
+// ------------------------------------------- shared PCM decode core
+// AAC and MP3 decode through the same sync-MFT shape: negotiate a
+// 16-bit PCM output, feed compressed samples, drain PCM chunks. Only
+// create() differs (the input type), so the engine lives here once.
 
-struct AacDecoder::Impl {
+struct PcmMftCore {
     Com<IMFTransform> mft;
     uint32_t out_channels = 0;
     uint32_t out_rate = 0;
+    const char* label = "audio";
 
     bool negotiate_output(std::string* error) {
         for (DWORD i = 0;; ++i) {
@@ -549,7 +531,72 @@ struct AacDecoder::Impl {
             }
         }
     }
+
+    // Negotiates the output and opens the stream (the tail of create()).
+    bool start(std::string* error) {
+        if (!negotiate_output(error)) return false;
+        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        return true;
+    }
+
+    bool feed(const uint8_t* data, size_t size, int64_t pts_100ns) {
+        if (!mft) return false;
+        Com<IMFSample> sample;
+        if (FAILED(make_sample(data, size, pts_100ns, 0, sample.put())))
+            return false;
+        const HRESULT hr = mft->ProcessInput(0, sample.get(), 0);
+        if (hr == MF_E_NOTACCEPTING) {
+            log_warn("mf: %s ProcessInput not accepting — receive() first",
+                     label);
+            return false;
+        }
+        return SUCCEEDED(hr);
+    }
+
+    bool receive(AudioChunk& out) {
+        if (!mft) return false;
+        for (;;) {
+            Com<IMFSample> sample;
+            bool stream_changed = false;
+            const HRESULT hr = pump_output(mft.get(), kAudioAllocFallback,
+                                           sample, &stream_changed);
+            if (stream_changed) {
+                std::string err;
+                if (!negotiate_output(&err)) return false;
+                continue;
+            }
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
+            if (FAILED(hr) || !sample) return false;
+
+            LONGLONG pts = 0;
+            sample->GetSampleTime(&pts);
+            Com<IMFMediaBuffer> buffer;
+            if (FAILED(sample->ConvertToContiguousBuffer(buffer.put())))
+                return false;
+            BYTE* src = nullptr;
+            DWORD len = 0;
+            if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
+            out.channels = out_channels;
+            out.sample_rate = out_rate;
+            out.pts_100ns = pts;
+            out.samples.resize(len / 2);
+            std::memcpy(out.samples.data(), src, out.samples.size() * 2);
+            buffer->Unlock();
+            return true;
+        }
+    }
+
+    void drain() {
+        if (!mft) return;
+        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
 };
+
+// ------------------------------------------------------------ AacDecoder
+
+struct AacDecoder::Impl : PcmMftCore {};
 
 AacDecoder::AacDecoder() : impl_(new Impl) {}
 AacDecoder::~AacDecoder() = default;
@@ -557,8 +604,10 @@ AacDecoder::~AacDecoder() = default;
 bool AacDecoder::create(const std::vector<uint8_t>& asc, uint32_t channels,
                         uint32_t sample_rate, std::string* error) {
     Impl& d = *impl_;
-    HRESULT hr = create_sync_mft(MFT_CATEGORY_AUDIO_DECODER, MFAudioFormat_AAC,
-                                 MFMediaType_Audio, d.mft.put());
+    d.label = "AAC";
+    const MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Audio, MFAudioFormat_AAC};
+    HRESULT hr = create_sync_mft(MFT_CATEGORY_AUDIO_DECODER, &in_info,
+                                 nullptr, d.mft.put());
     if (FAILED(hr)) return set_error(error, "AAC decoder MFT not found", hr);
 
     Com<IMFMediaType> input;
@@ -576,95 +625,20 @@ bool AacDecoder::create(const std::vector<uint8_t>& asc, uint32_t channels,
     hr = d.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(AAC)", hr);
 
-    if (!d.negotiate_output(error)) return false;
-
-    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    return true;
+    return d.start(error);
 }
 
 bool AacDecoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns) {
-    Impl& d = *impl_;
-    if (!d.mft) return false;
-    Com<IMFSample> sample;
-    if (FAILED(make_sample(data, size, pts_100ns, 0, sample.put())))
-        return false;
-    const HRESULT hr = d.mft->ProcessInput(0, sample.get(), 0);
-    if (hr == MF_E_NOTACCEPTING) {
-        log_warn("mf: AAC ProcessInput not accepting — receive() first");
-        return false;
-    }
-    return SUCCEEDED(hr);
+    return impl_->feed(data, size, pts_100ns);
 }
 
-bool AacDecoder::receive(AudioChunk& out) {
-    Impl& d = *impl_;
-    if (!d.mft) return false;
+bool AacDecoder::receive(AudioChunk& out) { return impl_->receive(out); }
 
-    for (;;) {
-        Com<IMFSample> sample;
-        bool stream_changed = false;
-        const HRESULT hr = pump_output(d.mft.get(), sample, &stream_changed);
-        if (stream_changed) {
-            std::string err;
-            if (!d.negotiate_output(&err)) return false;
-            continue;
-        }
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
-        if (FAILED(hr) || !sample) return false;
-
-        LONGLONG pts = 0;
-        sample->GetSampleTime(&pts);
-        Com<IMFMediaBuffer> buffer;
-        if (FAILED(sample->ConvertToContiguousBuffer(buffer.put())))
-            return false;
-        BYTE* src = nullptr;
-        DWORD len = 0;
-        if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
-        out.channels = d.out_channels;
-        out.sample_rate = d.out_rate;
-        out.pts_100ns = pts;
-        out.samples.resize(len / 2);
-        std::memcpy(out.samples.data(), src, out.samples.size() * 2);
-        buffer->Unlock();
-        return true;
-    }
-}
-
-void AacDecoder::drain() {
-    if (impl_->mft) {
-        impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    }
-}
+void AacDecoder::drain() { impl_->drain(); }
 
 // ------------------------------------------------------------ Mp3Decoder
 
-struct Mp3Decoder::Impl {
-    Com<IMFTransform> mft;
-    uint32_t out_channels = 0;
-    uint32_t out_rate = 0;
-
-    bool negotiate_output(std::string* error) {
-        for (DWORD i = 0;; ++i) {
-            Com<IMFMediaType> type;
-            HRESULT hr = mft->GetOutputAvailableType(0, i, type.put());
-            if (FAILED(hr)) return set_error(error, "no PCM output type", hr);
-            GUID subtype{};
-            type->GetGUID(MF_MT_SUBTYPE, &subtype);
-            UINT32 bits = 0;
-            type->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
-            if (subtype == MFAudioFormat_PCM && bits == 16) {
-                hr = mft->SetOutputType(0, type.get(), 0);
-                if (FAILED(hr))
-                    return set_error(error, "SetOutputType(PCM)", hr);
-                type->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &out_channels);
-                type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &out_rate);
-                return true;
-            }
-        }
-    }
-};
+struct Mp3Decoder::Impl : PcmMftCore {};
 
 Mp3Decoder::Mp3Decoder() : impl_(new Impl) {}
 Mp3Decoder::~Mp3Decoder() = default;
@@ -672,8 +646,10 @@ Mp3Decoder::~Mp3Decoder() = default;
 bool Mp3Decoder::create(uint32_t channels, uint32_t sample_rate,
                         std::string* error) {
     Impl& d = *impl_;
-    HRESULT hr = create_sync_mft(MFT_CATEGORY_AUDIO_DECODER, MFAudioFormat_MP3,
-                                 MFMediaType_Audio, d.mft.put());
+    d.label = "MP3";
+    const MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Audio, MFAudioFormat_MP3};
+    HRESULT hr = create_sync_mft(MFT_CATEGORY_AUDIO_DECODER, &in_info,
+                                 nullptr, d.mft.put());
     if (FAILED(hr)) return set_error(error, "MP3 decoder MFT not found", hr);
 
     Com<IMFMediaType> input;
@@ -685,67 +661,16 @@ bool Mp3Decoder::create(uint32_t channels, uint32_t sample_rate,
     hr = d.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(MP3)", hr);
 
-    if (!d.negotiate_output(error)) return false;
-
-    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    return true;
+    return d.start(error);
 }
 
 bool Mp3Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns) {
-    Impl& d = *impl_;
-    if (!d.mft) return false;
-    Com<IMFSample> sample;
-    if (FAILED(make_sample(data, size, pts_100ns, 0, sample.put())))
-        return false;
-    const HRESULT hr = d.mft->ProcessInput(0, sample.get(), 0);
-    if (hr == MF_E_NOTACCEPTING) {
-        log_warn("mf: MP3 ProcessInput not accepting — receive() first");
-        return false;
-    }
-    return SUCCEEDED(hr);
+    return impl_->feed(data, size, pts_100ns);
 }
 
-bool Mp3Decoder::receive(AudioChunk& out) {
-    Impl& d = *impl_;
-    if (!d.mft) return false;
+bool Mp3Decoder::receive(AudioChunk& out) { return impl_->receive(out); }
 
-    for (;;) {
-        Com<IMFSample> sample;
-        bool stream_changed = false;
-        const HRESULT hr = pump_output(d.mft.get(), sample, &stream_changed);
-        if (stream_changed) {
-            std::string err;
-            if (!d.negotiate_output(&err)) return false;
-            continue;
-        }
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
-        if (FAILED(hr) || !sample) return false;
-
-        LONGLONG pts = 0;
-        sample->GetSampleTime(&pts);
-        Com<IMFMediaBuffer> buffer;
-        if (FAILED(sample->ConvertToContiguousBuffer(buffer.put())))
-            return false;
-        BYTE* src = nullptr;
-        DWORD len = 0;
-        if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
-        out.channels = d.out_channels;
-        out.sample_rate = d.out_rate;
-        out.pts_100ns = pts;
-        out.samples.resize(len / 2);
-        std::memcpy(out.samples.data(), src, out.samples.size() * 2);
-        buffer->Unlock();
-        return true;
-    }
-}
-
-void Mp3Decoder::drain() {
-    if (impl_->mft) {
-        impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    }
-}
+void Mp3Decoder::drain() { impl_->drain(); }
 
 // ----------------------------------------------------------- H264Encoder
 
@@ -802,11 +727,7 @@ bool H264Encoder::Impl::async_read_output() {
     MFT_OUTPUT_DATA_BUFFER odb{};
     odb.dwStreamID = e.out_id;
     if (!provides) {
-        Com<IMFMediaBuffer> buffer;
-        if (FAILED(MFCreateSample(ours.put())) ||
-            FAILED(MFCreateMemoryBuffer(
-                info.cbSize ? info.cbSize : 4u << 20, buffer.put())) ||
-            FAILED(ours->AddBuffer(buffer.get())))
+        if (FAILED(alloc_output_sample(info, kVideoAllocFallback, ours)))
             return false;
         odb.pSample = ours.get();
     }
@@ -820,25 +741,7 @@ bool H264Encoder::Impl::async_read_output() {
     }
 
     EncodedPacket pkt;
-    LONGLONG pts = 0, duration = 0;
-    got->GetSampleTime(&pts);
-    got->GetSampleDuration(&duration);
-    UINT32 clean_point = 0;
-    got->GetUINT32(MFSampleExtension_CleanPoint, &clean_point);
-    bool ok = false;
-    Com<IMFMediaBuffer> buffer;
-    if (SUCCEEDED(got->ConvertToContiguousBuffer(buffer.put()))) {
-        BYTE* src = nullptr;
-        DWORD len = 0;
-        if (SUCCEEDED(buffer->Lock(&src, nullptr, &len))) {
-            pkt.data.assign(src, src + len);
-            buffer->Unlock();
-            pkt.pts_100ns = pts;
-            pkt.duration_100ns = duration;
-            pkt.keyframe = clean_point != 0;
-            ok = true;
-        }
-    }
+    const bool ok = sample_to_packet(got, pkt, /*key_default=*/false);
     if (provides && got) got->Release();
     if (ok) e.ready.push_back(std::move(pkt));
     return ok;
@@ -1044,21 +947,12 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     e.in_id = e.out_id = 0;
 
     // Software encoder: enumerate by OUTPUT type for encoders.
-    MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Video, MFVideoFormat_H264};
-    IMFActivate** activates = nullptr;
-    UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                           nullptr, &out_info, &activates, &count);
-    if (FAILED(hr) || count == 0) {
-        if (activates) CoTaskMemFree(activates);
-        return set_error(error, "H.264 encoder MFT not found",
-                         FAILED(hr) ? hr : MF_E_TOPO_CODEC_NOT_FOUND);
-    }
-    hr = activates[0]->ActivateObject(IID_PPV_ARGS(e.mft.put()));
-    for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
-    CoTaskMemFree(activates);
-    if (FAILED(hr)) return set_error(error, "H.264 encoder activate", hr);
+    const MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Video,
+                                          MFVideoFormat_H264};
+    HRESULT hr = create_sync_mft(MFT_CATEGORY_VIDEO_ENCODER, nullptr,
+                                 &out_info, e.mft.put());
+    if (FAILED(hr))
+        return set_error(error, "H.264 encoder MFT not found", hr);
 
     // Encoders: set OUTPUT type first, then input.
     Com<IMFMediaType> output;
@@ -1133,27 +1027,11 @@ bool H264Encoder::receive(EncodedPacket& out) {
     }
     Com<IMFSample> sample;
     bool stream_changed = false;
-    const HRESULT hr = pump_output(e.mft.get(), sample, &stream_changed);
+    const HRESULT hr = pump_output(e.mft.get(), kVideoAllocFallback, sample,
+                                   &stream_changed);
     if (stream_changed || hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
     if (FAILED(hr) || !sample) return false;
-
-    LONGLONG pts = 0, duration = 0;
-    sample->GetSampleTime(&pts);
-    sample->GetSampleDuration(&duration);
-    UINT32 clean_point = 0;
-    sample->GetUINT32(MFSampleExtension_CleanPoint, &clean_point);
-
-    Com<IMFMediaBuffer> buffer;
-    if (FAILED(sample->ConvertToContiguousBuffer(buffer.put()))) return false;
-    BYTE* src = nullptr;
-    DWORD len = 0;
-    if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
-    out.data.assign(src, src + len);
-    buffer->Unlock();
-    out.pts_100ns = pts;
-    out.duration_100ns = duration;
-    out.keyframe = clean_point != 0;
-    return true;
+    return sample_to_packet(sample.get(), out, /*key_default=*/false);
 }
 
 void H264Encoder::drain() {
@@ -1189,21 +1067,11 @@ bool AacEncoder::create(uint32_t channels, uint32_t sample_rate,
     Impl& e = *impl_;
     e.channels = channels;
 
-    MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Audio, MFAudioFormat_AAC};
-    IMFActivate** activates = nullptr;
-    UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(MFT_CATEGORY_AUDIO_ENCODER,
-                           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                           nullptr, &out_info, &activates, &count);
-    if (FAILED(hr) || count == 0) {
-        if (activates) CoTaskMemFree(activates);
-        return set_error(error, "AAC encoder MFT not found",
-                         FAILED(hr) ? hr : MF_E_TOPO_CODEC_NOT_FOUND);
-    }
-    hr = activates[0]->ActivateObject(IID_PPV_ARGS(e.mft.put()));
-    for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
-    CoTaskMemFree(activates);
-    if (FAILED(hr)) return set_error(error, "AAC encoder activate", hr);
+    const MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Audio,
+                                          MFAudioFormat_AAC};
+    HRESULT hr = create_sync_mft(MFT_CATEGORY_AUDIO_ENCODER, nullptr,
+                                 &out_info, e.mft.put());
+    if (FAILED(hr)) return set_error(error, "AAC encoder MFT not found", hr);
 
     Com<IMFMediaType> input;
     MFCreateMediaType(input.put());
@@ -1270,24 +1138,11 @@ bool AacEncoder::receive(EncodedPacket& out) {
     if (!e.mft) return false;
     Com<IMFSample> sample;
     bool stream_changed = false;
-    const HRESULT hr = pump_output(e.mft.get(), sample, &stream_changed);
+    const HRESULT hr = pump_output(e.mft.get(), kAudioAllocFallback, sample,
+                                   &stream_changed);
     if (stream_changed || hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
     if (FAILED(hr) || !sample) return false;
-
-    LONGLONG pts = 0, duration = 0;
-    sample->GetSampleTime(&pts);
-    sample->GetSampleDuration(&duration);
-    Com<IMFMediaBuffer> buffer;
-    if (FAILED(sample->ConvertToContiguousBuffer(buffer.put()))) return false;
-    BYTE* src = nullptr;
-    DWORD len = 0;
-    if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
-    out.data.assign(src, src + len);
-    buffer->Unlock();
-    out.pts_100ns = pts;
-    out.duration_100ns = duration;
-    out.keyframe = true;
-    return true;
+    return sample_to_packet(sample.get(), out, /*key_default=*/true);
 }
 
 void AacEncoder::drain() {

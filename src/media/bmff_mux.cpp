@@ -3,25 +3,17 @@
 #include <cstdio>
 #include <cstring>
 
+#include "media/bmff.h"
+#include "util/bytes.h"
+
 namespace looks::media {
 
 namespace {
 
-// Big-endian byte building (mirror of the demuxer's Reader).
-struct Bytes {
-    std::vector<uint8_t> v;
-
-    void u8(uint32_t x) { v.push_back(static_cast<uint8_t>(x)); }
-    void u16(uint32_t x) { u8(x >> 8); u8(x); }
-    void u32(uint32_t x) { u16(x >> 16); u16(x); }
-    void u64(uint64_t x) { u32(static_cast<uint32_t>(x >> 32)); u32(static_cast<uint32_t>(x)); }
-    void raw(const void* data, size_t n) {
-        const uint8_t* p = static_cast<const uint8_t*>(data);
-        v.insert(v.end(), p, p + n);
-    }
+// Big-endian building on the shared writer; tag() is the only mux-local
+// vocabulary.
+struct Bytes : bytes::BeWriter {
     void tag(const char* s) { raw(s, 4); }
-    void zeros(size_t n) { v.insert(v.end(), n, 0); }
-    void append(const Bytes& o) { v.insert(v.end(), o.v.begin(), o.v.end()); }
 };
 
 Bytes box(const char* type, const Bytes& payload) {
@@ -49,20 +41,12 @@ void write_matrix_identity(Bytes& b) {
     b.u32(0); b.u32(0); b.u32(0x40000000);
 }
 
-// MP4 descriptor with 7-bit varlen length (single byte is enough for our
-// esds sizes, but emit canonical 4-byte form some muxers use? No — minimal
-// single-byte lengths; parsers accept both).
+// MP4 descriptor over the shared tag + varlen coding (bmff.h): minimal
+// length form; parsers accept both minimal and padded.
 Bytes descriptor(uint8_t desc_tag, const Bytes& payload) {
     Bytes b;
     b.u8(desc_tag);
-    // varlen: up to 2 bytes covers ASC sizes we produce
-    const size_t len = payload.v.size();
-    if (len < 128) {
-        b.u8(static_cast<uint32_t>(len));
-    } else {
-        b.u8(0x80 | static_cast<uint32_t>(len >> 7));
-        b.u8(static_cast<uint32_t>(len & 0x7F));
-    }
+    esds_write_len(b.v, payload.v.size());
     b.append(payload);
     return b;
 }
@@ -78,18 +62,18 @@ Bytes build_esds(const MuxAudioParams& audio) {
     dcd.u8(0); dcd.u16(0);            // bufferSizeDB (24-bit)
     dcd.u32(audio.avg_bitrate);       // maxBitrate
     dcd.u32(audio.avg_bitrate);       // avgBitrate
-    dcd.append(descriptor(0x05, dsi));
+    dcd.append(descriptor(kEsdsTagDecoderSpecific, dsi));
 
     Bytes es;                         // ES_Descriptor
     es.u16(0);                        // ES_ID
     es.u8(0);                         // flags
-    es.append(descriptor(0x04, dcd));
+    es.append(descriptor(kEsdsTagDecoderConfig, dcd));
     Bytes sl;
     sl.u8(0x02);                      // SLConfig: MP4
-    es.append(descriptor(0x06, sl));
+    es.append(descriptor(kEsdsTagSLConfig, sl));
 
     Bytes payload;
-    payload.append(descriptor(0x03, es));
+    payload.append(descriptor(kEsdsTagES, es));
     return full_box("esds", 0, 0, payload);
 }
 
@@ -418,19 +402,13 @@ bool BmffMuxer::finish() {
             // i points at the tag; entries start at tag+4(fullbox)+4(count).
             const size_t count_pos = i + 4 + 4;
             if (count_pos + 4 > m.size()) continue;
-            const uint32_t count = (m[count_pos] << 24) | (m[count_pos + 1] << 16) |
-                                   (m[count_pos + 2] << 8) | m[count_pos + 3];
+            const uint32_t count = bytes::be32(&m[count_pos]);
             size_t entry = count_pos + 4;
             if (entry + static_cast<size_t>(count) * 4 > m.size()) continue;
             for (uint32_t k = 0; k < count; ++k, entry += 4) {
-                uint64_t v = (static_cast<uint32_t>(m[entry]) << 24) |
-                             (m[entry + 1] << 16) | (m[entry + 2] << 8) |
-                             m[entry + 3];
-                v += mdat_payload_start;
-                m[entry] = static_cast<uint8_t>(v >> 24);
-                m[entry + 1] = static_cast<uint8_t>(v >> 16);
-                m[entry + 2] = static_cast<uint8_t>(v >> 8);
-                m[entry + 3] = static_cast<uint8_t>(v);
+                bytes::put_be32(&m[entry],
+                                static_cast<uint32_t>(bytes::be32(&m[entry]) +
+                                                      mdat_payload_start));
             }
         }
     }
@@ -441,11 +419,7 @@ bool BmffMuxer::finish() {
     bool ok = std::fwrite(ftyp.v.data(), 1, ftyp.v.size(), out) == ftyp.v.size();
     ok = ok && std::fwrite(moov.v.data(), 1, moov.v.size(), out) == moov.v.size();
     uint8_t mdat_header[8];
-    const uint64_t mdat_size = mdat_bytes_ + 8;
-    mdat_header[0] = static_cast<uint8_t>(mdat_size >> 24);
-    mdat_header[1] = static_cast<uint8_t>(mdat_size >> 16);
-    mdat_header[2] = static_cast<uint8_t>(mdat_size >> 8);
-    mdat_header[3] = static_cast<uint8_t>(mdat_size);
+    bytes::put_be32(mdat_header, static_cast<uint32_t>(mdat_bytes_ + 8));
     std::memcpy(mdat_header + 4, "mdat", 4);
     ok = ok && std::fwrite(mdat_header, 1, 8, out) == 8;
 

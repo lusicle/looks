@@ -222,6 +222,16 @@ public:
         }
     }
 
+    // Coalesce like every other props command: a per-keystroke rename
+    // must land as ONE undo entry.
+    bool merge(const Command& next) override {
+        const auto* other = dynamic_cast<const SetBinPropsCommand*>(&next);
+        if (!other || other->bin_id_ != bin_id_) return false;
+        name_ = other->name_;
+        parent_ = other->parent_;
+        return true;
+    }
+
 private:
     uint64_t bin_id_;
     std::string name_;
@@ -299,7 +309,9 @@ public:
 
     void revert(Document& doc) override {
         if (!had_) return;
-        doc.looks.insert(doc.looks.begin() + static_cast<ptrdiff_t>(index_),
+        // Clamp: the vector can have shrunk between apply and revert.
+        const size_t at = std::min(index_, doc.looks.size());
+        doc.looks.insert(doc.looks.begin() + static_cast<ptrdiff_t>(at),
                          removed_);
     }
 
@@ -431,9 +443,10 @@ public:
 
     void revert(Document& doc) override {
         if (!had_) return;
+        // Clamp: the vector can have shrunk between apply and revert.
+        const size_t at = std::min(index_, doc.sequences.size());
         doc.sequences.insert(
-            doc.sequences.begin() + static_cast<ptrdiff_t>(index_),
-            removed_);
+            doc.sequences.begin() + static_cast<ptrdiff_t>(at), removed_);
     }
 
 private:
@@ -528,6 +541,40 @@ public:
 private:
     Asset updated_;
     Asset old_;
+    bool had_ = false;
+};
+
+class RemoveAssetCommand final : public Command {
+public:
+    explicit RemoveAssetCommand(uint64_t asset_id) : asset_id_(asset_id) {}
+    std::string name() const override { return "Remove Media"; }
+
+    void apply(Document& doc) override {
+        for (size_t i = 0; i < doc.assets.size(); ++i)
+            if (doc.assets[i].id == asset_id_) {
+                index_ = i;
+                removed_ = doc.assets[i];
+                had_ = true;
+                doc.assets.erase(doc.assets.begin() +
+                                 static_cast<ptrdiff_t>(i));
+                break;
+            }
+    }
+
+    void revert(Document& doc) override {
+        if (!had_) return;
+        // Clamp: the vector can have shrunk between apply and revert.
+        // Index-preserving: the FIRST asset drives auto canvas/fps, so
+        // the restored entry must land where it was.
+        const size_t at = std::min(index_, doc.assets.size());
+        doc.assets.insert(doc.assets.begin() + static_cast<ptrdiff_t>(at),
+                          removed_);
+    }
+
+private:
+    uint64_t asset_id_;
+    size_t index_ = 0;
+    Asset removed_;
     bool had_ = false;
 };
 
@@ -892,6 +939,10 @@ std::unique_ptr<Command> set_sequence_props_command(uint64_t seq,
 
 std::unique_ptr<Command> add_asset_command(Asset asset) {
     return std::make_unique<AddAssetCommand>(std::move(asset));
+}
+
+std::unique_ptr<Command> remove_asset_command(uint64_t asset_id) {
+    return std::make_unique<RemoveAssetCommand>(asset_id);
 }
 
 std::unique_ptr<Command> set_asset_command(Asset updated) {

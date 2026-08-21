@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "util/bytes.h"
 #include "util/file.h"
 #include "util/inflate.h"
 
@@ -15,10 +16,7 @@ void set_error(std::string* error, const char* message) {
     if (error) *error = message;
 }
 
-uint32_t be32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) |
-           p[3];
-}
+using bytes::be32;
 
 int paeth(int a, int b, int c) {
     const int p = a + b - c;
@@ -177,8 +175,8 @@ bool decode_tga(const uint8_t* data, size_t size, ImageRgba* out,
     const uint8_t id_length = data[0];
     const uint8_t color_map_type = data[1];
     const uint8_t image_type = data[2];
-    const uint32_t width = data[12] | (data[13] << 8);
-    const uint32_t height = data[14] | (data[15] << 8);
+    const uint32_t width = bytes::le16(data + 12);
+    const uint32_t height = bytes::le16(data + 14);
     const uint8_t bpp = data[16];
     const bool top_origin = (data[17] & 0x20) != 0;
 

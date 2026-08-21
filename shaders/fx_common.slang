@@ -32,9 +32,32 @@ float fx_hash01(uint h)
     return float(h >> 8) * (1.0 / 16777216.0);
 }
 
+static const float3 kFxLumaW = float3(0.2126, 0.7152, 0.0722);
+
 float fx_luma(float3 rgb)
 {
-    return dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    return dot(rgb, kFxLumaW);
+}
+
+// BT.709 chroma difference scales: Cb carries (B-Y)/kFxCb709, Cr carries
+// (R-Y)/kFxCr709. Every encoder, decoder and scope derives from these two
+// anchors plus the fx_luma weights so the round trip stays inverse.
+static const float kFxCb709 = 1.8556;
+static const float kFxCr709 = 1.5748;
+static const float kFxCb709G = kFxCb709 * kFxLumaW.b / kFxLumaW.g;
+static const float kFxCr709G = kFxCr709 * kFxLumaW.r / kFxLumaW.g;
+
+// Encoded-domain RGB to (Cb, Cr) about the given luma.
+float2 fx_rgb_to_cbcr709(float3 enc, float y)
+{
+    return float2((enc.b - y) / kFxCb709, (enc.r - y) / kFxCr709);
+}
+
+// Screen blend, bounded: inputs saturate so linear-light values above 1
+// cannot flip the term negative and push the result past white.
+float3 fx_screen(float3 a, float3 b)
+{
+    return 1.0 - (1.0 - saturate(a)) * (1.0 - saturate(b));
 }
 
 // Hue (0..1) -> fully saturated RGB, abs-ramp construction.
@@ -143,6 +166,37 @@ float3 fx_nes_nearest(float3 c)
         if (d < best_d) { best_d = d; best = nes[i]; }
     }
     return best;
+}
+
+// Fixed-palette snap shared by the Quantizer and PaletteMap: 0 DMG
+// greens, 1 CGA, 2 NES, 3 teletext, 4 duotone. Luma palettes read l,
+// color palettes read c_enc; callers prepare both (dither, cycling).
+float3 fx_palette_snap(int pal, float3 c_enc, float l,
+                       float hue_a, float hue_b)
+{
+    if (pal == 0)
+        return fx_nearest_of4(float3(l, l, l),
+                              float3(0.059, 0.220, 0.059),
+                              float3(0.188, 0.384, 0.188),
+                              float3(0.545, 0.675, 0.059),
+                              float3(0.608, 0.737, 0.059));
+    if (pal == 1)
+        return fx_nearest_of4(c_enc,
+                              float3(0.0, 0.0, 0.0),
+                              float3(0.333, 1.0, 1.0),
+                              float3(1.0, 0.333, 1.0),
+                              float3(1.0, 1.0, 1.0));
+    if (pal == 2)
+        return fx_nes_nearest(c_enc);
+    if (pal == 3)
+        return round(c_enc);
+    const float3 ha = fx_hue_to_rgb(hue_a);
+    const float3 hb = fx_hue_to_rgb(hue_b);
+    return fx_nearest_of4(float3(l, l, l),
+                          float3(0.02, 0.02, 0.02),
+                          ha * 0.45,
+                          hb * 0.85,
+                          float3(0.98, 0.98, 0.98));
 }
 
 // Picks between the two encoded levels bracketing lin using the LINEAR

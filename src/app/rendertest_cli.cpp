@@ -20,6 +20,7 @@
 
 #include "doc/document.h"
 #include "doc/effects.h"
+#include "app/dev_synth.h"
 #include "gfx/engine.h"
 #include "gfx/readback.h"
 #include "gfx/vk_device.h"
@@ -61,20 +62,13 @@ struct SyntheticSource {
     }
 
     gfx::SourcePlanes planes(uint32_t frame) {
-        for (uint32_t r = 0; r < kHeight; ++r) {
-            for (uint32_t c = 0; c < kWidth; ++c) {
-                uint32_t value = (c + r + frame * 3) & 0xFF;
-                const uint32_t bar = (frame * 5) % kWidth;
-                if (c >= bar && c < bar + 24) value = 235;
-                y[r * kWidth + c] = static_cast<uint8_t>(16 + value * 219 / 255);
-            }
-        }
+        for (uint32_t r = 0; r < kHeight; ++r)
+            for (uint32_t c = 0; c < kWidth; ++c)
+                y[r * kWidth + c] = devsynth::luma(c, r, frame, kWidth);
         for (uint32_t r = 0; r < kHeight / 2; ++r) {
             for (uint32_t c = 0; c < kWidth / 2; ++c) {
-                u[r * (kWidth / 2) + c] =
-                    static_cast<uint8_t>(96 + ((c * 2 + frame) & 63));
-                v[r * (kWidth / 2) + c] =
-                    static_cast<uint8_t>(160 - ((r + frame) & 63));
+                u[r * (kWidth / 2) + c] = devsynth::cb(c, frame);
+                v[r * (kWidth / 2) + c] = devsynth::cr(r, frame);
             }
         }
         gfx::SourcePlanes p;
@@ -89,15 +83,6 @@ struct SyntheticSource {
         return p;
     }
 };
-
-uint64_t fnv1a(const uint8_t* data, size_t size) {
-    uint64_t hash = 14695981039346656037ull;
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= data[i];
-        hash *= 1099511628211ull;
-    }
-    return hash;
-}
 
 // The fixed "project": a broad slice of the roster at non-default settings —
 // stochastic effects (grain, jitter, quantizer boil), the multi-pass glow,
@@ -341,16 +326,18 @@ struct BenchSource {
     }
 
     gfx::SourcePlanes planes(uint32_t frame) {
+        // The harness's signal at bench resolution: content-dependent
+        // kernels must be measured against what determinism verifies.
         for (uint32_t r = 0; r < h; ++r)
             for (uint32_t c = 0; c < w; ++c)
                 y[static_cast<size_t>(r) * w + c] =
-                    static_cast<uint8_t>(16 + ((c + r + frame * 3) & 0xDB));
+                    devsynth::luma(c, r, frame, w);
         for (uint32_t r = 0; r < h / 2; ++r)
             for (uint32_t c = 0; c < w / 2; ++c) {
                 u[static_cast<size_t>(r) * (w / 2) + c] =
-                    static_cast<uint8_t>(96 + ((c * 2 + frame) & 63));
+                    devsynth::cb(c, frame);
                 v[static_cast<size_t>(r) * (w / 2) + c] =
-                    static_cast<uint8_t>(160 - ((r + frame) & 63));
+                    devsynth::cr(r, frame);
             }
         gfx::SourcePlanes p;
         p.y = y.data();

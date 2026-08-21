@@ -8,6 +8,8 @@
 // replacement and scale/rotate/random mangling (rotation arrives as
 // cos/sin push values so no trig runs here).
 
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -36,21 +38,6 @@ cbuffer Push
 [[vk::binding(4, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> pred_y;
 [[vk::binding(5, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> pred_u;
 [[vk::binding(6, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> pred_v;
-
-uint mosh_hash(uint x)
-{
-    x ^= x >> 16;
-    x *= 0x7FEB352Du;
-    x ^= x >> 15;
-    x *= 0x846CA68Bu;
-    x ^= x >> 16;
-    return x;
-}
-
-float mosh_hash01(uint h)
-{
-    return float(h >> 8) * (1.0 / 16777216.0);
-}
 
 // lround port: half away from zero, truncating int() casts.
 int round_away(float v)
@@ -87,10 +74,10 @@ int2 block_mv(uint mbx, uint mby)
         vy = ry * mv_scale;
         if (mv_random > 0.0)
         {
-            const uint hb = mosh_hash(seed_mv ^ mosh_hash(frame ^ mosh_hash(
+            const uint hb = fx_hash(seed_mv ^ fx_hash(frame ^ fx_hash(
                 mby * 4096u + mbx)));
-            vx += (mosh_hash01(hb) - 0.5) * 2.0 * mv_random;
-            vy += (mosh_hash01(mosh_hash(hb)) - 0.5) * 2.0 * mv_random;
+            vx += (fx_hash01(hb) - 0.5) * 2.0 * mv_random;
+            vy += (fx_hash01(fx_hash(hb)) - 0.5) * 2.0 * mv_random;
         }
     }
     return int2(round_away(vx), round_away(vy));

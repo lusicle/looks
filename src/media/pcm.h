@@ -41,9 +41,6 @@ public:
     uint32_t channels() const { return channels_; }
     uint32_t sample_rate() const { return sample_rate_; }
     uint64_t frame_count() const { return frames_; }
-    double duration_seconds() const {
-        return sample_rate_ ? static_cast<double>(frames_) / sample_rate_ : 0.0;
-    }
 
     // Reads `frames` frames starting at `first_frame`; zero-fills past EOF.
     // Returns frames actually read from the file.

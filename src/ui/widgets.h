@@ -52,6 +52,24 @@ struct LabelOpts {
     bool header = false;        // draw with the frame's header (serif) font
 };
 
+// Registers the node's clipped rect as a hit target keyed on `state` -
+// the one hit/clip contract, shared with the app's custom widgets.
+void register_rect_hit(LayoutNode& node, LayoutFrame& frame,
+                       const void* state);
+
+// Shared list-popup geometry: `count` rows sized to the widest label
+// (at least `min_w`), opening below the anchor, flipped above when the
+// viewport bottom would clip it and clamped inside horizontally. Every
+// menu-shaped overlay derives its rect here so the off-screen policy
+// cannot fork per menu.
+inline constexpr float kPopupRowH = 20.0f;
+Rect list_popup_rect(const Rect& anchor, float min_w,
+                     const char* const* items, int count, const Font& font,
+                     float font_size, Vec2 viewport);
+Rect list_popup_rect(const Rect& anchor, float min_w,
+                     const char* const* items, int count,
+                     const LayoutFrame& frame);
+
 LayoutNode* Label(LayoutArena& arena, std::string_view text,
                   const LabelOpts& opts = {});
 LayoutNode* Heading(LayoutArena& arena, std::string_view text);
@@ -186,6 +204,7 @@ struct PanelOpts {
     float corner_radius = -1.0f;   // <0 = theme
     bool outline = true;           // hairline; nested cards go without
     bool accent_edge = false;      // 2 px accent bar on the left (selection)
+    Color bg{0, 0, 0, 0};          // alpha 0 = theme panel_bg
 };
 
 // Background + outline drawn behind `child`.

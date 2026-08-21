@@ -9,9 +9,9 @@ namespace looks {
 std::optional<std::vector<uint8_t>> read_file_bytes(const std::filesystem::path& path) {
     FILE* f = _wfopen(path.c_str(), L"rb");
     if (!f) return std::nullopt;
-    std::fseek(f, 0, SEEK_END);
-    const long size = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    _fseeki64(f, 0, SEEK_END);
+    const int64_t size = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
     std::vector<uint8_t> data(size > 0 ? static_cast<size_t>(size) : 0);
     if (!data.empty() && std::fread(data.data(), 1, data.size(), f) != data.size()) {
         std::fclose(f);

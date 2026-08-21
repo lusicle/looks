@@ -24,6 +24,17 @@ GraphNode node(std::initializer_list<int> inputs) {
     return n;
 }
 
+// A registered asset for media binds: a media node naming an id the
+// document cannot resolve is DORMANT (a removed import), so bound
+// fixtures must register what they name.
+uint64_t bind_asset(Document& doc, uint32_t frames = 600) {
+    Asset a;
+    a.id = doc.next_effect_id++;
+    a.frame_count = frames;
+    doc.assets.push_back(a);
+    return a.id;
+}
+
 }  // namespace
 
 TEST(graph_topo_linear_chain) {
@@ -70,8 +81,8 @@ TEST(graph_topo_detects_cycle) {
 TEST(graph_compile_empty_stack) {
     // A fresh look holds one UNBOUND media node: dormant, so the
     // composite is the black display generator - never a fabricated
-    // source. Binding an asset (even one the document does not know:
-    // unknown length = always on) emits the Source head.
+    // source. Binding a registered asset emits the Source head; an id
+    // the document cannot resolve (a removed import) stays dormant.
     Document doc;
     RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
@@ -79,7 +90,7 @@ TEST(graph_compile_empty_stack) {
     CHECK(graph.nodes[0].kind == GraphNode::Kind::Generator);
     CHECK_EQ(graph.nodes[0].layer_index, -1);
 
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     RenderGraph bound = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(bound.valid);
     CHECK(bound.nodes[static_cast<size_t>(bound.output)].kind ==
@@ -91,7 +102,7 @@ TEST(graph_audio_effects_compile_out_of_the_image_graph) {
     // graph around them like bypassed nodes, so the video effect behind
     // one heads straight at the source.
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(
         make_effect(doc, EffectType::AudioDelay));
     doc.looks[0].layers[0].stack.push_back(
@@ -110,7 +121,7 @@ TEST(graph_audio_effects_compile_out_of_the_image_graph) {
 
 TEST(graph_compile_layers) {
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     // A noise generator layer with its own effect, screened over the base.
     looks::doc::Layer overlay;
@@ -125,7 +136,7 @@ TEST(graph_compile_layers) {
     looks::doc::Layer adjust;
     adjust.id = doc.next_effect_id++;
     adjust.source = looks::doc::LayerSourceKind::Media;
-    adjust.asset = doc.next_effect_id++;
+    adjust.asset = bind_asset(doc);
     adjust.stack.push_back(make_effect(doc, EffectType::Grain));
     doc.looks[0].layers.push_back(adjust);
 
@@ -163,7 +174,7 @@ TEST(graph_compile_dormant_unwired) {
     // fabricated in its place — and an unwired Output composites nothing
     // (black display node, which no effect may consume as input).
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
     const uint64_t layer_id = doc.looks[0].layers[0].id;
@@ -207,7 +218,7 @@ TEST(graph_preview_layer_taps_the_chain_end) {
     // the chain leaving it, pre-blend - where the NODE tap on the same
     // layer id stays the bare source head. A node tap outranks it.
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Grain));
     const uint64_t base_id = doc.looks[0].layers[0].id;
@@ -244,7 +255,7 @@ TEST(graph_preview_layer_resolves_a_mask_only_feed) {
     // Output, but it still has an output of its own: the tap resolves
     // the link leaving the layer, Output or not.
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t base_id = doc.looks[0].layers[0].id;
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
@@ -266,7 +277,7 @@ TEST(graph_preview_layer_resolves_a_mask_only_feed) {
 
 TEST(graph_compile_chain_and_bypass) {
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::RgbSplit));
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Pixelate));
@@ -297,7 +308,7 @@ TEST(graph_layer_matte_gates_composite) {
     // gates its whole contribution: the compile must wrap the overlay's
     // LayerBlend in a MatteApply whose base is the composite below.
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.source = LayerSourceKind::Noise;
@@ -334,7 +345,7 @@ TEST(graph_effect_matte_diamond) {
     // apply joins (dry, fx, matte) and the matte source feeds ONLY the
     // gate — never the composite.
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
     Layer matte;
@@ -370,7 +381,7 @@ TEST(graph_layer_transform_and_source_keys) {
     // source is private and keyed per instance - there is no shared
     // playhead source to fall back to.
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
 
     RenderGraph plain = compile_graph(doc, doc.looks[0].id, 0);
@@ -777,7 +788,7 @@ TEST(graph_displace_by_matte_second_input) {
     using looks::doc::LayerSourceKind;
 
     Document doc;
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Displace));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
     Layer matte;

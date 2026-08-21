@@ -13,13 +13,14 @@
 #include <thread>
 #include <vector>
 
+#include "media/sample_clock.h"
 #include "util/log.h"
 
 namespace looks::media {
 
 namespace {
-constexpr uint32_t kMonitorRate = 48000;
-constexpr uint32_t kMonitorChannels = 2;
+constexpr uint32_t kMonitorRate = Player::kClockRate;
+constexpr uint32_t kMonitorChannels = Player::kChannels;
 }  // namespace
 
 struct Player::Impl {
@@ -112,25 +113,19 @@ struct Player::Impl {
         return config;
     }
 
+    // fps is normalized at init and configure, so it is always > 0 and
+    // the shared converter's rounding rule (sample_clock.h) is the whole
+    // story: seek, trim and loop clamps, and configure's reclamp all
+    // round-trip frames through the cursor and rely on it.
     uint64_t frame_to_cursor(uint32_t frame) const {
-        const double f = fps.load(std::memory_order_relaxed);
-        // First cursor tick AT OR AFTER the frame's start: flooring back
-        // through cursor_to_frame lands on the same frame for any rate.
-        // Nearest-rounding can land one tick before the boundary when
-        // fps does not divide the clock rate, and every consumer that
-        // round-trips a frame through the cursor (seek, trim and loop
-        // clamps, configure's reclamp) then reads the previous frame.
-        return static_cast<uint64_t>(std::ceil(
-            static_cast<double>(frame) / (f > 0.0 ? f : 30.0) *
-                clock_rate -
-            1e-6));
+        return static_cast<uint64_t>(frame_to_sample(
+            frame, fps.load(std::memory_order_relaxed), clock_rate));
     }
 
     uint32_t cursor_to_frame(uint64_t c) const {
-        const double f = fps.load(std::memory_order_relaxed);
         const double seconds = static_cast<double>(c) / clock_rate;
-        const uint32_t frame =
-            static_cast<uint32_t>(seconds * (f > 0.0 ? f : 30.0));
+        const uint32_t frame = static_cast<uint32_t>(
+            seconds * fps.load(std::memory_order_relaxed));
         const uint32_t out = trim_out.load();
         return frame >= out ? (out ? out - 1 : 0) : frame;
     }
@@ -334,8 +329,8 @@ void Player::set_loop_region(uint32_t in_frame, uint32_t out_frame) {
 }
 
 void Player::set_audio_offset(double seconds) {
-    impl_->audio_offset_samples.store(static_cast<int64_t>(
-        seconds * impl_->clock_rate + (seconds >= 0.0 ? 0.5 : -0.5)));
+    impl_->audio_offset_samples.store(
+        seconds_to_samples(seconds, impl_->clock_rate));
 }
 
 void Player::seek_frame(uint32_t frame_index) {
@@ -349,11 +344,6 @@ void Player::seek_frame(uint32_t frame_index) {
         std::lock_guard<std::mutex> lock(p.tick_mutex);
         p.last_tick = std::chrono::steady_clock::now();
     }
-}
-
-void Player::seek_seconds(double seconds) {
-    seek_frame(static_cast<uint32_t>(
-        seconds < 0.0 ? 0.0 : seconds * impl_->fps.load()));
 }
 
 uint32_t Player::current_frame_index() const {

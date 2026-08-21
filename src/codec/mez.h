@@ -103,9 +103,6 @@ public:
               int quality);
     // Frames must arrive in presentation order. Encodes and appends.
     bool add_frame(const FrameView& frame);
-    // Appends a pre-encoded frame payload (parallel import encodes on
-    // worker threads and serializes through this).
-    bool add_encoded_frame(const std::vector<uint8_t>& payload);
     // Still-image media: appends `count` index entries pointing at the
     // LAST written frame's payload — N timeline frames for one frame of
     // storage. The reader can't tell the difference.
@@ -116,6 +113,8 @@ public:
     int quality() const { return quality_; }
 
 private:
+    bool add_encoded_frame(const std::vector<uint8_t>& payload);
+
     void* file_ = nullptr;
     std::filesystem::path path_;
     uint32_t width_ = 0;
@@ -125,12 +124,6 @@ private:
     std::vector<uint8_t> scratch_;
     bool finished_ = false;
 };
-
-// Header-only probe: frame count and fps without touching the index
-// (44 bytes read). The bundle completeness gate keys on this. False =
-// unreadable or not a mez.
-bool mez_probe(const std::filesystem::path& path, uint32_t* frames,
-               double* fps);
 
 // Rewrites the frame index in place so the media runs `count` frames:
 // entries past the old count repeat the last surviving frame's payload

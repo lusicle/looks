@@ -126,11 +126,10 @@ bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order);
 // preview_node publishes the named node's output instead of the
 // composite — an effect/layer/group id, resolved when the root is a
 // look; 0 (and anything unresolvable) keeps the composite.
-// preview_layer publishes a whole contribution: at a look root the
-// LAYER's chain end (pre-blend, pre-matte); at a sequence root the
-// LANE's output (its winning block, pre-over) — the id names a layer or
-// a lane track. preview_node outranks it. Preview-only: export passes 0
-// for both.
+// preview_layer publishes one look LAYER's whole contribution (its
+// chain end, pre-blend, pre-matte); look roots only — a sequence root
+// always publishes the composite, Motion applied, whatever is selected.
+// preview_node outranks it. Preview-only: export passes 0 for both.
 // measure_placement names a root-sequence block whose pre-Motion lane
 // image gets the alpha-bounds tap (RenderGraph::measure); 0 disables.
 // with_before additionally emits the effect-stripped composite
@@ -141,26 +140,34 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
                           uint64_t measure_placement = 0,
                           bool with_before = false);
 
+// Even-dimension rounding for video-sized targets: divide, snap down
+// to even, floor at 2. The worker, the engine and the readback MUST
+// size through this one function - the publish guard compares their
+// results for equality and silently drops frames on a mismatch.
+inline uint32_t even_down(uint32_t v, uint32_t div = 1) {
+    const uint32_t d = (v / (div ? div : 1)) & ~1u;
+    return d > 2u ? d : 2u;
+}
+
 // Aspect-preserving source fit: the largest centered rect of the
 // source's aspect inside the working target, as {x, y, w, h} in output
 // pixels. Sources never stretch - the remainder is transparent black.
 // Matching aspects return exactly the full target, so same-shape media
 // keeps its 1:1 normalized sampling. Unknown source dims fill.
-inline void source_fit_rect(uint32_t src_w, uint32_t src_h,
-                            uint32_t out_w, uint32_t out_h, float rect[4]) {
-    float fw = static_cast<float>(out_w);
-    float fh = static_cast<float>(out_h);
-    if (src_w && src_h && out_w && out_h) {
-        const float sa =
-            static_cast<float>(src_w) / static_cast<float>(src_h);
+inline void source_fit_rect(float src_w, float src_h, float out_w,
+                            float out_h, float rect[4]) {
+    float fw = out_w;
+    float fh = out_h;
+    if (src_w > 0.0f && src_h > 0.0f && out_w > 0.0f && out_h > 0.0f) {
+        const float sa = src_w / src_h;
         const float oa = fw / fh;
         if (sa > oa)
             fh = fw / sa;
         else if (sa < oa)
             fw = fh * sa;
     }
-    rect[0] = (static_cast<float>(out_w) - fw) * 0.5f;
-    rect[1] = (static_cast<float>(out_h) - fh) * 0.5f;
+    rect[0] = (out_w - fw) * 0.5f;
+    rect[1] = (out_h - fh) * 0.5f;
     rect[2] = fw;
     rect[3] = fh;
 }

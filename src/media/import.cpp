@@ -8,13 +8,17 @@
 
 #include "codec/mez.h"
 #include "media/bmff.h"
+#include "media/bundle.h"
 #include "media/mp3.h"
 #include "media/pcm.h"
+#include "media/thumbs.h"
 #include "media/wav.h"
 #include "mod/analysis.h"
-#include "util/image.h"
 #include "platform/win/mf_codec.h"
 #include "platform/win/wic_image.h"
+#include "util/color.h"
+#include "util/file.h"
+#include "util/image.h"
 #include "util/log.h"
 
 namespace looks::media {
@@ -89,60 +93,57 @@ void downsample_half(const I420Frame& src, I420Frame& dst) {
     box(src.v, scw, sch, dst.v, dcw, dch);
 }
 
-// Thumbnail strip: fixed-height RGB thumbs appended to a flat
-// buffer; written as <stem>.thumbs = 'THM1' u16 w, u16 h, u16 count + RGB.
+// Thumbnail strip builder over the shared .thumbs sidecar
+// (media/thumbs.h). Each destination pixel box-averages its source
+// region - a 1920 -> 64 px point sample would alias detail into noise.
 struct ThumbStrip {
-    uint32_t w = 0, h = 36;
-    uint32_t count = 0;
-    std::vector<uint8_t> rgb;
+    ThumbStripData data{0, 36, 0, {}};
 
     void add(const I420Frame& f) {
+        uint32_t& w = data.w;
+        const uint32_t h = data.h;
         if (w == 0)
             w = std::max(8u,
                          (h * f.width / std::max(1u, f.height)) & ~1u);
-        const size_t base = rgb.size();
-        rgb.resize(base + static_cast<size_t>(w) * h * 3);
+        const size_t base = data.rgb.size();
+        data.rgb.resize(base + static_cast<size_t>(w) * h * 3);
         const uint32_t scw = (f.width + 1) / 2;
         for (uint32_t y = 0; y < h; ++y) {
-            const uint32_t sy = y * f.height / h;
+            const uint32_t sy0 = y * f.height / h;
+            const uint32_t sy1 =
+                std::max(sy0 + 1, (y + 1) * f.height / h);
             for (uint32_t x = 0; x < w; ++x) {
-                const uint32_t sx = x * f.width / w;
-                const int Y = f.y[static_cast<size_t>(sy) * f.width + sx];
-                const int U =
-                    f.u[static_cast<size_t>(sy / 2) * scw + sx / 2] - 128;
-                const int V =
-                    f.v[static_cast<size_t>(sy / 2) * scw + sx / 2] - 128;
-                // BT.709-ish integer conversion — thumbnails, not color
-                // science.
-                const int r = Y + ((403 * V) >> 8);
-                const int g = Y - ((48 * U + 120 * V) >> 8);
-                const int b = Y + ((475 * U) >> 8);
-                uint8_t* px = rgb.data() + base +
+                const uint32_t sx0 = x * f.width / w;
+                const uint32_t sx1 =
+                    std::max(sx0 + 1, (x + 1) * f.width / w);
+                uint32_t sum_y = 0, sum_u = 0, sum_v = 0, n = 0;
+                for (uint32_t sy = sy0; sy < sy1; ++sy)
+                    for (uint32_t sx = sx0; sx < sx1; ++sx) {
+                        sum_y +=
+                            f.y[static_cast<size_t>(sy) * f.width + sx];
+                        sum_u += f.u[static_cast<size_t>(sy / 2) * scw +
+                                     sx / 2];
+                        sum_v += f.v[static_cast<size_t>(sy / 2) * scw +
+                                     sx / 2];
+                        ++n;
+                    }
+                int r, g, b;
+                color::ycbcr709_to_rgb8(
+                    static_cast<int>((sum_y + n / 2) / n),
+                    static_cast<int>((sum_u + n / 2) / n),
+                    static_cast<int>((sum_v + n / 2) / n), &r, &g, &b);
+                uint8_t* px = data.rgb.data() + base +
                               (static_cast<size_t>(y) * w + x) * 3;
                 px[0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
                 px[1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
                 px[2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
             }
         }
-        ++count;
+        ++data.count;
     }
 
     bool write(const std::filesystem::path& path) const {
-        if (count == 0) return false;
-        FILE* f = _wfopen(path.c_str(), L"wb");
-        if (!f) return false;
-        uint8_t header[10];
-        std::memcpy(header, "THM1", 4);
-        header[4] = static_cast<uint8_t>(w);
-        header[5] = static_cast<uint8_t>(w >> 8);
-        header[6] = static_cast<uint8_t>(h);
-        header[7] = static_cast<uint8_t>(h >> 8);
-        header[8] = static_cast<uint8_t>(count);
-        header[9] = static_cast<uint8_t>(count >> 8);
-        bool ok = std::fwrite(header, 1, 10, f) == 10 &&
-                  std::fwrite(rgb.data(), 1, rgb.size(), f) == rgb.size();
-        std::fclose(f);
-        return ok;
+        return write_thumbs(path, data);
     }
 };
 
@@ -244,15 +245,13 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
     // Video curves join the audio set already on disk; one writer, whole
     // rewrite, so a reader sees old-complete or new-complete.
     analyzer.finish(analysis);
-    const std::filesystem::path analysis_path =
-        dest_dir / (stem + L".analysis");
-    if (mod::write_analysis(analysis_path, *analysis))
-        result->analysis_path = analysis_path;
+    const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
+    if (mod::write_analysis(sc.analysis, *analysis))
+        result->analysis_path = sc.analysis;
     else
         log_warn("ingest: analysis rewrite failed (non-fatal)");
     if (thumb_every) {
-        const std::filesystem::path tpath = dest_dir / (stem + L".thumbs");
-        if (strip.write(tpath)) result->thumbs_path = tpath;
+        if (strip.write(sc.thumbs)) result->thumbs_path = sc.thumbs;
     }
     log_info("ingest: video pass %.2fs (%u frames, %.1f fps)",
              t_pass.seconds, decoded,
@@ -331,10 +330,10 @@ constexpr uint32_t kStillFrames = 300;   // 10 s at 30 fps
 // Writes a one-image bundle: the frame encoded once, every index entry
 // pointing at that payload, plus proxy/thumb/analysis sidecars. Shared
 // by still imports and audio cover art (held for the audio's length).
-bool write_still_bundle(const ImageRgba& img,
-                        const std::filesystem::path& mez_path,
+bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
                         const ImportOptions& options, uint32_t hold_frames,
                         ImportResult* result) {
+    const std::filesystem::path& mez_path = sc.mez;
     // sRGB RGB -> BT.709 limited-range I420: the exact inverse of the
     // engine's frame-fetch matrix (ycbcr_to_rgb), so a still round-trips
     // through preview/export with no color shift. Even dims for the codec
@@ -357,9 +356,8 @@ bool write_still_bundle(const ImageRgba& img,
             const uint8_t* px =
                 img.pixels.data() +
                 (static_cast<size_t>(y) * img.width + x) * 4;
-            const float yf = (0.2126f * px[0] + 0.7152f * px[1] +
-                              0.0722f * px[2]) /
-                             255.0f;
+            const float yf =
+                color::luma709(px[0], px[1], px[2]) / 255.0f;
             frame.y[static_cast<size_t>(y) * frame.width + x] =
                 to_u8(16.0f + 219.0f * yf);
             luma_sum += yf;
@@ -385,11 +383,11 @@ bool write_still_bundle(const ImageRgba& img,
             r *= 0.25f / 255.0f;
             g *= 0.25f / 255.0f;
             b *= 0.25f / 255.0f;
-            const float yf = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const float yf = color::luma709(r, g, b);
             frame.u[static_cast<size_t>(cy) * cw + cx] =
-                to_u8(128.0f + 224.0f * (b - yf) / 1.8556f);
+                to_u8(128.0f + 224.0f * (b - yf) / color::kCb709);
             frame.v[static_cast<size_t>(cy) * cw + cx] =
-                to_u8(128.0f + 224.0f * (r - yf) / 1.5748f);
+                to_u8(128.0f + 224.0f * (r - yf) / color::kCr709);
         }
     }
 
@@ -409,23 +407,19 @@ bool write_still_bundle(const ImageRgba& img,
     if (options.proxy) {
         I420Frame half;
         downsample_half(frame, half);
-        std::filesystem::path proxy_path = mez_path;
-        proxy_path.replace_extension(".proxy.mez");
         codec::MezWriter proxy;
-        if (proxy.open(proxy_path, half.width, half.height, kStillFps * 1000,
+        if (proxy.open(sc.proxy, half.width, half.height, kStillFps * 1000,
                        1000, options.quality) &&
             proxy.add_frame(half.view()) &&
             proxy.add_hold_frames(hold_frames - 1) && proxy.finish())
-            result->proxy_path = proxy_path;
+            result->proxy_path = sc.proxy;
     }
 
     // One-thumb filmstrip; the ruler stretches it across the timeline.
     if (options.thumb_count > 0) {
         ThumbStrip strip;
         strip.add(frame);
-        std::filesystem::path tpath = mez_path;
-        tpath.replace_extension(".thumbs");
-        if (strip.write(tpath)) result->thumbs_path = tpath;
+        if (strip.write(sc.thumbs)) result->thumbs_path = sc.thumbs;
     }
 
     // Analysis: constant brightness, zero motion/cuts — deterministic
@@ -439,10 +433,8 @@ bool write_still_bundle(const ImageRgba& img,
         data.brightness.assign(hold_frames, mean);
         data.motion.assign(hold_frames, 0.0f);
         data.cut.assign(hold_frames, 0.0f);
-        std::filesystem::path apath = mez_path;
-        apath.replace_extension(".analysis");
-        if (mod::write_analysis(apath, data))
-            result->analysis_path = apath;
+        if (mod::write_analysis(sc.analysis, data))
+            result->analysis_path = sc.analysis;
     }
 
     result->ok = true;
@@ -463,16 +455,24 @@ bool import_still(const std::filesystem::path& source,
     ImageRgba img;
     std::string error;
     if (!load_image(source, &img, &error)) {
-        result->error = "image: " + error;
-        return false;
+        // WIC fallback: variants the in-repo decoders refuse (16-bit,
+        // palette, interlaced) import through the same decoder cover
+        // art already uses - one acceptance set for every image path.
+        const auto bytes = read_file_bytes(source);
+        if (!bytes ||
+            !platform::decode_image_rgba(bytes->data(), bytes->size(),
+                                         &img.width, &img.height,
+                                         &img.pixels, &error)) {
+            result->error = "image: " + error;
+            return false;
+        }
     }
     if (progress) {
         progress->frames_total.store(1);
         progress->frames_done.store(0);
     }
-    const bool ok = write_still_bundle(
-        img, dest_dir / (source.stem().wstring() + L".mez"), options,
-        kStillFrames, result);
+    const bool ok = write_still_bundle(img, sidecars_for(dest_dir, source),
+                                       options, kStillFrames, result);
     if (ok && progress) progress->frames_done.store(1);
     return ok;
 }
@@ -504,31 +504,24 @@ bool import_audio_file(const std::filesystem::path& source,
         rate = wav.sample_rate;
         samples = std::move(wav.samples);
     } else {
-        FILE* f = _wfopen(source.c_str(), L"rb");
-        if (!f) {
+        const auto bytes = read_file_bytes(source);
+        if (!bytes) {
             result->error = "cannot open " + source.string();
             return false;
         }
-        std::fseek(f, 0, SEEK_END);
-        const long len = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        std::vector<uint8_t> bytes(len > 0 ? static_cast<size_t>(len) : 0);
-        const size_t got =
-            bytes.empty() ? 0 : std::fread(bytes.data(), 1, bytes.size(), f);
-        std::fclose(f);
-        if (got != bytes.size() || bytes.empty()) {
-            result->error = "short read";
+        if (bytes->empty()) {
+            result->error = "empty file";
             return false;
         }
         Mp3Data mp3;
-        if (!decode_mp3(bytes.data(), bytes.size(), &mp3, &error)) {
+        if (!decode_mp3(bytes->data(), bytes->size(), &mp3, &error)) {
             result->error = "mp3: " + error;
             return false;
         }
         channels = mp3.channels;
         rate = mp3.sample_rate;
         samples = std::move(mp3.samples);
-        mp3_cover_art(bytes.data(), bytes.size(), &art);
+        mp3_cover_art(bytes->data(), bytes->size(), &art);
     }
     if (progress) {
         progress->frames_total.store(1);
@@ -536,7 +529,7 @@ bool import_audio_file(const std::filesystem::path& source,
     }
 
     const std::filesystem::path pcm_path =
-        dest_dir / (source.stem().wstring() + L".pcm");
+        sidecars_for(dest_dir, source).pcm;
     PcmWriter writer;
     if (!writer.open(pcm_path, channels, rate)) {
         result->error = "cannot create " + pcm_path.string();
@@ -565,9 +558,8 @@ bool import_audio_file(const std::filesystem::path& source,
             const uint32_t hold = std::max<uint32_t>(
                 1, static_cast<uint32_t>(secs * kStillFps) + 1);
             ImportResult art_result;
-            if (write_still_bundle(
-                    img, dest_dir / (source.stem().wstring() + L".mez"),
-                    options, hold, &art_result)) {
+            if (write_still_bundle(img, sidecars_for(dest_dir, source),
+                                   options, hold, &art_result)) {
                 result->mez_path = art_result.mez_path;
                 result->proxy_path = art_result.proxy_path;
                 result->thumbs_path = art_result.thumbs_path;
@@ -706,11 +698,11 @@ ImportResult import_media(const std::filesystem::path& source,
     const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
     result.fps = static_cast<double>(video->timescale) / frame_duration;
 
+    const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
     const TrackInfo* audio = file.movie().first_audio();
     if (audio && std::string(audio->fourcc) == "mp4a" &&
         !audio->samples.empty() && !audio->audio_specific_config.empty()) {
-        if (!import_audio(file, *audio, dest_dir / (stem + L".pcm"), &result))
-            return result;
+        if (!import_audio(file, *audio, sc.pcm, &result)) return result;
     }
 
     mod::AnalysisData analysis;
@@ -732,10 +724,8 @@ ImportResult import_media(const std::filesystem::path& source,
     // The analysis sidecar is the READY marker resolve_bundle gates on:
     // written last in the fast stage, deleted never, rewritten (with the
     // video curves merged in) when the pass below completes.
-    const std::filesystem::path analysis_path =
-        dest_dir / (stem + L".analysis");
-    if (mod::write_analysis(analysis_path, analysis))
-        result.analysis_path = analysis_path;
+    if (mod::write_analysis(sc.analysis, analysis))
+        result.analysis_path = sc.analysis;
     else
         log_warn("ingest: analysis write failed");
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "gfx/graph.h"
 #include "gfx/vk_device.h"
 #include "util/file.h"
 #include "util/log.h"
@@ -177,15 +178,13 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
         extent.height == 0 || clip_x1 <= clip_x0)
         return;
 
-    // Aspect-preserving fit, centered in the dst rect.
-    const float aspect = static_cast<float>(image.width()) /
-                         static_cast<float>(image.height());
-    float fit_w = dst_w;
-    float fit_h = fit_w / aspect;
-    if (fit_h > dst_h) {
-        fit_h = dst_h;
-        fit_w = fit_h * aspect;
-    }
+    // Aspect-preserving fit, centered in the dst rect - the one fit
+    // formula (graph.h), so matching aspects fill exactly.
+    float fit[4];
+    source_fit_rect(static_cast<float>(image.width()),
+                    static_cast<float>(image.height()), dst_w, dst_h, fit);
+    const float fit_w = fit[2];
+    const float fit_h = fit[3];
     const float cx = dst_x + dst_w * 0.5f;
     const float cy = dst_y + dst_h * 0.5f;
     const float ew = static_cast<float>(extent.width);

@@ -27,6 +27,12 @@ namespace looks::media {
 
 class Player {
 public:
+    // The monitor's fixed clock: the sample cursor rate and channel
+    // count. Export mixes at the same pair so what was heard is what
+    // is written.
+    static constexpr uint32_t kClockRate = 48000;
+    static constexpr uint32_t kChannels = 2;
+
     Player();
     ~Player();
 
@@ -78,7 +84,6 @@ public:
     void set_audio_offset(double seconds);
 
     void seek_frame(uint32_t frame_index);
-    void seek_seconds(double seconds);
     uint32_t current_frame_index() const;
     double position_seconds() const;
 

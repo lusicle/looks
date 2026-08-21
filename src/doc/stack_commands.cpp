@@ -282,17 +282,16 @@ private:
     Pos resolve(Look& look) const {
         switch (kind_) {
             case NodeRef::Effect:
-                for (Layer& l : look.layers)
-                    for (EffectInstance& fx : l.stack)
-                        if (fx.id == id_) return {&fx.node_x, &fx.node_y};
+                if (EffectInstance* fx = find_effect(look, id_))
+                    return {&fx->node_x, &fx->node_y};
                 return {};
             case NodeRef::Layer:
-                for (Layer& l : look.layers)
-                    if (l.id == id_) return {&l.node_x, &l.node_y};
+                if (Layer* l = find_layer(look, id_))
+                    return {&l->node_x, &l->node_y};
                 return {};
             case NodeRef::Route:
-                for (ValueNode& n : look.value_nodes)
-                    if (n.id == id_) return {&n.node_x, &n.node_y};
+                if (ValueNode* n = find_value_node(look, id_))
+                    return {&n->node_x, &n->node_y};
                 return {};
             case NodeRef::Output:
                 return {&look.out_node_x, &look.out_node_y};
@@ -382,11 +381,10 @@ public:
             // the same layer's old one — leaving it produced ghost wires
             // whose contribution double-composited the chain prefix.
             auto owner_of = [&](uint64_t id) -> uint64_t {
-                for (const Layer& l : look.layers) {
-                    if (l.id == id) return l.id;
-                    for (const EffectInstance& fx : l.stack)
-                        if (fx.id == id) return l.id;
-                }
+                if (find_layer(look, id)) return id;
+                const Layer* owner = nullptr;
+                if (find_effect(std::as_const(look), id, &owner))
+                    return owner->id;
                 return 0;
             };
             const uint64_t own = owner_of(link_.from);

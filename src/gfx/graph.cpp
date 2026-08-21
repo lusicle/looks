@@ -98,30 +98,18 @@ struct Compiler {
         return add(make(0, {upstream}), instance, key);
     }
 
-    // Is a placement playing at its instance's local time? Both bounds are
-    // whole frames, so testing the continuous time and testing its floor
-    // agree exactly - which is what keeps this identical to the flatten
-    // the decode pool and the audio mix run on (doc/instances.h).
+    // Liveness and the shown-block pick are the shared predicates in
+    // doc/document.h - identical to the flatten the decode pool and the
+    // audio mix run on, and to the monitor's click-pick.
     bool active_at(const doc::Placement& place, const LookInstance& p) const {
-        const uint32_t len = doc::source_length(doc, place);
-        if (p.local_time < static_cast<double>(place.t_in)) return false;
-        const uint32_t end = doc::placement_end(place, len);
-        return end == 0 || p.local_time < static_cast<double>(end);
+        return doc::placement_active(place, doc::source_length(doc, place),
+                                     p.local_time);
     }
 
-    // The block a lane SHOWS at this frame: among the active ones, the
-    // latest-starting wins (an overlap reads as the incoming block taking
-    // over at its in-point), list order breaking ties. Audio does not
-    // pick - every active placement sums in the mix.
     const doc::Placement* winner_at(
         const std::vector<doc::Placement>& placements,
         const LookInstance& p) const {
-        const doc::Placement* best = nullptr;
-        for (const doc::Placement& place : placements) {
-            if (!active_at(place, p)) continue;
-            if (!best || place.t_in >= best->t_in) best = &place;
-        }
-        return best;
+        return doc::placement_winner(doc, placements, p.local_time);
     }
 
     // Emits the entity behind a child instance: dispatch by kind.
@@ -155,10 +143,8 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
             continue;   // dangling block: dormant
         LookInstance child;
         child.look = place->target;
-        // The lane AND the target fold into the path: a razor moves
-        // nothing, two different targets cut on one lane stay distinct.
-        child.path = hash_combine(hash_combine(self.path, track.id),
-                                  place->target);
+        child.path =
+            doc::seq_child_path(self.path, track.id, place->target);
         child.depth = self.depth + 1;
         // Composed affine map, evaluated on the parent's CONTINUOUS local
         // time; only the frame the effects clock on is floored.
@@ -171,10 +157,6 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
         const int ci = static_cast<int>(graph.instances.size()) - 1;
         const int out = emit_entity(place->target, ci, /*is_root=*/false);
         if (out < 0) continue;
-        // LANE tap (timeline selection): the lane's own output before it
-        // stacks into the film.
-        if (is_root && preview_layer == track.id && graph.preview < 0)
-            graph.preview = out;
         // Measure tap: the selected block's content pre-Motion - the
         // monitor's box math applies the placement transform itself.
         if (is_root && measure_placement && place->id == measure_placement)
@@ -199,7 +181,7 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
                 blend.p_shift_x = place->pos_x;
                 blend.p_shift_y = place->pos_y;
                 blend.p_scale = place->scale;
-                blend.p_rotate = place->rotate * 0.01745329252f;
+                blend.p_rotate = place->rotate * doc::kDeg2Rad;
             }
             blend.inputs = {below < 0 ? black() : below, out};
             below = add(std::move(blend), inst);
@@ -280,19 +262,23 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             // node reads (and windows) on the ROOT clock instead.
             if (!layer.asset) continue;
             const doc::Asset* a = doc.find_asset(layer.asset);
-            // An asset with no picture at all (audio import without
-            // cover art: no frames, no dimensions) has NO image head:
-            // the node is image-dormant and only the audio walk carries
-            // it. The flatten mirrors this exactly.
-            if (a && !a->frame_count && !a->width && !a->height) continue;
-            const uint32_t frames = a ? a->frame_count : 0;
+            // A DANGLING id (asset removed) is dormant exactly like an
+            // unbound node. An asset with no picture at all (audio
+            // import without cover art: no frames, no dimensions) has
+            // NO image head: the node is image-dormant and only the
+            // audio walk carries it. The flatten mirrors both exactly.
+            if (!a) continue;
+            if (!a->frame_count && !a->width && !a->height) continue;
+            const uint32_t frames = a->frame_count;
             const double t = layer.timeline_lock
                                  ? graph.instances[0].local_time
                                  : self.local_time;
-            if (frames) {
-                const uint32_t playable =
-                    frames > layer.slip ? frames - layer.slip : 0;
-                if (t >= static_cast<double>(playable)) {
+            {
+                double lo = 0.0, hi = 0.0;
+                doc::shifted_window(static_cast<double>(frames),
+                                    static_cast<int64_t>(layer.slip), &lo,
+                                    &hi);
+                if (t < lo || t >= hi) {
                     time_culled[layer.id] = 1;
                     continue;
                 }
@@ -317,9 +303,13 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 tl ? nullptr : doc.find_sequence(layer.target);
             if (!tl && !ts) continue;
             const uint32_t dur = tl ? tl->duration : ts->duration;
-            if (dur && self.local_time >= static_cast<double>(dur)) {
-                time_culled[layer.id] = 1;
-                continue;
+            {
+                double lo = 0.0, hi = 0.0;
+                doc::shifted_window(static_cast<double>(dur), 0, &lo, &hi);
+                if (self.local_time < lo || self.local_time >= hi) {
+                    time_culled[layer.id] = 1;
+                    continue;
+                }
             }
             if (self.depth + 1 >= doc::kMaxLookDepth) continue;
             LookInstance child;
@@ -388,18 +378,19 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 if (doc::layer_is_media(*sl)) {
                     if (!sl->asset) continue;   // dormant, like the base
                     const doc::Asset* a = doc.find_asset(sl->asset);
-                    // Audio-only asset: image-dormant, like the base.
-                    if (a && !a->frame_count && !a->width && !a->height)
+                    // Dangling or audio-only: (image-)dormant, like the
+                    // base.
+                    if (!a || (!a->frame_count && !a->width && !a->height))
                         continue;
-                    const uint32_t frames = a ? a->frame_count : 0;
+                    const uint32_t frames = a->frame_count;
                     const double t = sl->timeline_lock
                                          ? graph.instances[0].local_time
                                          : self.local_time;
-                    const double m =
-                        t + static_cast<double>(sl->slip) +
-                        static_cast<double>(off);
-                    if (m < 0.0 ||
-                        (frames && m >= static_cast<double>(frames))) {
+                    double lo = 0.0, hi = 0.0;
+                    doc::shifted_window(
+                        static_cast<double>(frames),
+                        static_cast<int64_t>(sl->slip) + off, &lo, &hi);
+                    if (t < lo || t >= hi) {
                         time_culled[fx.id] = 1;
                         continue;
                     }
@@ -419,8 +410,10 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     const uint32_t dur = tl ? tl->duration : ts->duration;
                     const double ct =
                         self.local_time + static_cast<double>(off);
-                    if (ct < 0.0 ||
-                        (dur && ct >= static_cast<double>(dur))) {
+                    double lo = 0.0, hi = 0.0;
+                    doc::shifted_window(static_cast<double>(dur), off, &lo,
+                                        &hi);
+                    if (self.local_time < lo || self.local_time >= hi) {
                         time_culled[fx.id] = 1;
                         continue;
                     }

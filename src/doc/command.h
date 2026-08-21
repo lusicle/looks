@@ -88,9 +88,8 @@ public:
     bool can_undo() const { return group_depth_ == 0 && !undo_.empty(); }
     bool can_redo() const { return group_depth_ == 0 && !redo_.empty(); }
 
-    // Names for menu display ("Undo Move Layer"). Empty when unavailable.
+    // Name for menu display ("Undo Move Layer"). Empty when unavailable.
     std::string undo_name() const;
-    std::string redo_name() const;
 
     // Transaction: commands executed between begin/end collapse into one
     // entry named `name`. Groups nest; only the outermost end pushes.

@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "codec/core.h"
+#include "util/bytes.h"
 
 namespace looks::codec {
 
@@ -16,27 +17,10 @@ constexpr uint32_t kMagic = 0x315A454D;   // 'MEZ1' little-endian
 constexpr uint32_t kVersion = 1;
 constexpr size_t kHeaderSize = 64;
 
-void put_u32(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v);
-    p[1] = static_cast<uint8_t>(v >> 8);
-    p[2] = static_cast<uint8_t>(v >> 16);
-    p[3] = static_cast<uint8_t>(v >> 24);
-}
-
-void put_u64(uint8_t* p, uint64_t v) {
-    for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (i * 8));
-}
-
-uint32_t get_u32(const uint8_t* p) {
-    return p[0] | (p[1] << 8) | (p[2] << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-uint64_t get_u64(const uint8_t* p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; --i) v = (v << 8) | p[i];
-    return v;
-}
+using bytes::le32;
+using bytes::le64;
+using bytes::put_le32;
+using bytes::put_le64;
 
 // Lossless mode: quality 0 skips the DCT entirely — per-plane
 // left/above-predicted residuals, signed exp-Golomb. Bit-exact roundtrip,
@@ -227,6 +211,43 @@ void intra_entropy(const IntraDct& dct, int quality,
     bw.finish();
 }
 
+// One 8x8 block's destination inside the macroblock grid, plus the
+// +128 clamp write. Both decode paths (intra_recon, the bitstream
+// decode) go through these two - mez.h's guarantee that intra_recon is
+// bit-identical to encode-then-decode rests on the address math and
+// the write being spelled once.
+struct BlockDst {
+    uint8_t* plane;
+    size_t stride;
+    int px, py, pw, ph;
+};
+
+BlockDst block_dst(DecodedFrame& out, int mx, int my, int b, int w, int h,
+                   int cw, int ch) {
+    const bool luma = b < 4;
+    BlockDst d;
+    d.px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
+    d.py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
+    d.pw = luma ? w : cw;
+    d.ph = luma ? h : ch;
+    d.plane = luma ? out.y.data() : (b == 4 ? out.u.data() : out.v.data());
+    d.stride = luma ? out.y_stride : out.uv_stride;
+    return d;
+}
+
+void recon_block_write(const BlockDst& d, const int16_t* block) {
+    uint8_t* dst =
+        d.plane + static_cast<size_t>(d.py) * d.stride + d.px;
+    const int copy_w = std::min(kBlockSize, d.pw - d.px);
+    const int copy_h = std::min(kBlockSize, d.ph - d.py);
+    for (int y = 0; y < copy_h; ++y)
+        for (int x = 0; x < copy_w; ++x) {
+            const int val = block[y * kBlockSize + x] + 128;
+            dst[static_cast<size_t>(y) * d.stride + x] =
+                static_cast<uint8_t>(std::clamp(val, 0, 255));
+        }
+}
+
 void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
                  bool parallel) {
     uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
@@ -256,26 +277,12 @@ void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
             for (int b = 0; b < 6; ++b) {
                 if (dct.flat[base + b]) continue;   // edge filler
                 const bool luma = b < 4;
-                const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
-                const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
-                const int pw = luma ? w : cw;
-                const int ph = luma ? h : ch;
                 quantize(dct.coeffs.data() + (base + b) * kBlockCoeffs,
                          luma ? qy : qc, quantized);
                 dequantize(quantized, luma ? qy : qc, block);
                 idct8x8(block);
-                uint8_t* plane = luma ? out.y.data()
-                                      : (b == 4 ? out.u.data() : out.v.data());
-                const size_t stride = luma ? out.y_stride : out.uv_stride;
-                uint8_t* dst = plane + static_cast<size_t>(py) * stride + px;
-                const int copy_w = std::min(kBlockSize, pw - px);
-                const int copy_h = std::min(kBlockSize, ph - py);
-                for (int y = 0; y < copy_h; ++y)
-                    for (int x = 0; x < copy_w; ++x) {
-                        const int val = block[y * kBlockSize + x] + 128;
-                        dst[static_cast<size_t>(y) * stride + x] =
-                            static_cast<uint8_t>(std::clamp(val, 0, 255));
-                    }
+                recon_block_write(block_dst(out, mx, my, b, w, h, cw, ch),
+                                  block);
             }
         }
     });
@@ -380,26 +387,13 @@ bool decode_frame_parallel(const uint8_t* data, size_t size, uint32_t width,
             const size_t base = static_cast<size_t>(mb) * 6;
             for (int b = 0; b < 6; ++b) {
                 const bool luma = b < 4;
-                const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
-                const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
-                const int pw = luma ? w : cw;
-                const int ph = luma ? h : ch;
-                if (px >= pw || py >= ph) continue;   // parsed filler
+                const BlockDst d =
+                    block_dst(out, mx, my, b, w, h, cw, ch);
+                if (d.px >= d.pw || d.py >= d.ph) continue;  // parsed filler
                 dequantize(coeffs.data() + (base + b) * kBlockCoeffs,
                            luma ? qy : qc, block);
                 idct8x8(block);
-                uint8_t* plane = luma ? out.y.data()
-                                      : (b == 4 ? out.u.data() : out.v.data());
-                const size_t stride = luma ? out.y_stride : out.uv_stride;
-                uint8_t* dst = plane + static_cast<size_t>(py) * stride + px;
-                const int copy_w = std::min(kBlockSize, pw - px);
-                const int copy_h = std::min(kBlockSize, ph - py);
-                for (int y = 0; y < copy_h; ++y)
-                    for (int x = 0; x < copy_w; ++x) {
-                        const int val = block[y * kBlockSize + x] + 128;
-                        dst[static_cast<size_t>(y) * stride + x] =
-                            static_cast<uint8_t>(std::clamp(val, 0, 255));
-                    }
+                recon_block_write(d, block);
             }
         }
     });
@@ -523,16 +517,16 @@ bool MezWriter::open(const std::filesystem::path& path, uint32_t width,
     offsets_.clear();
 
     uint8_t header[kHeaderSize] = {};
-    put_u32(header + 0, kMagic);
-    put_u32(header + 4, kVersion);
-    put_u32(header + 8, width);
-    put_u32(header + 12, height);
-    put_u32(header + 16, 0);   // frame count (patched)
-    put_u32(header + 20, timescale);
-    put_u32(header + 24, frame_duration);
-    put_u32(header + 28, static_cast<uint32_t>(quality));
-    put_u32(header + 32, 0);   // flags
-    put_u64(header + 36, 0);   // index offset (patched)
+    put_le32(header + 0, kMagic);
+    put_le32(header + 4, kVersion);
+    put_le32(header + 8, width);
+    put_le32(header + 12, height);
+    put_le32(header + 16, 0);   // frame count (patched)
+    put_le32(header + 20, timescale);
+    put_le32(header + 24, frame_duration);
+    put_le32(header + 28, static_cast<uint32_t>(quality));
+    put_le32(header + 32, 0);   // flags
+    put_le64(header + 36, 0);   // index offset (patched)
     return std::fwrite(header, 1, kHeaderSize, f) == kHeaderSize;
 }
 
@@ -546,7 +540,7 @@ bool MezWriter::add_encoded_frame(const std::vector<uint8_t>& payload) {
     FILE* f = static_cast<FILE*>(file_);
     offsets_.push_back(static_cast<uint64_t>(_ftelli64(f)));
     uint8_t size_le[4];
-    put_u32(size_le, static_cast<uint32_t>(payload.size()));
+    put_le32(size_le, static_cast<uint32_t>(payload.size()));
     if (std::fwrite(size_le, 1, 4, f) != 4) return false;
     return std::fwrite(payload.data(), 1, payload.size(), f) == payload.size();
 }
@@ -563,34 +557,18 @@ bool MezWriter::finish() {
     const uint64_t index_offset = static_cast<uint64_t>(_ftelli64(f));
     for (uint64_t offset : offsets_) {
         uint8_t le[8];
-        put_u64(le, offset);
+        put_le64(le, offset);
         if (std::fwrite(le, 1, 8, f) != 8) return false;
     }
     uint8_t patch[12];
-    put_u32(patch, static_cast<uint32_t>(offsets_.size()));
+    put_le32(patch, static_cast<uint32_t>(offsets_.size()));
     _fseeki64(f, 16, SEEK_SET);
     if (std::fwrite(patch, 1, 4, f) != 4) return false;
-    put_u64(patch, index_offset);
+    put_le64(patch, index_offset);
     _fseeki64(f, 36, SEEK_SET);
     if (std::fwrite(patch, 1, 8, f) != 8) return false;
     std::fflush(f);
     finished_ = true;
-    return true;
-}
-
-bool mez_probe(const std::filesystem::path& path, uint32_t* frames,
-               double* fps) {
-    FILE* f = _wfopen(path.c_str(), L"rb");
-    if (!f) return false;
-    uint8_t header[kHeaderSize];
-    const bool ok = std::fread(header, 1, kHeaderSize, f) == kHeaderSize &&
-                    get_u32(header + 0) == kMagic;
-    std::fclose(f);
-    if (!ok) return false;
-    const uint32_t fd = get_u32(header + 24);
-    if (frames) *frames = get_u32(header + 16);
-    if (fps)
-        *fps = fd ? static_cast<double>(get_u32(header + 20)) / fd : 0.0;
     return true;
 }
 
@@ -603,9 +581,9 @@ bool mez_set_frame_count(const std::filesystem::path& path, uint32_t count) {
     uint32_t old_count = 0;
     uint64_t index_offset = 0;
     if (std::fread(header, 1, kHeaderSize, f) == kHeaderSize &&
-        get_u32(header) == kMagic && get_u32(header + 4) == kVersion) {
-        old_count = get_u32(header + 16);
-        index_offset = get_u64(header + 36);
+        le32(header) == kMagic && le32(header + 4) == kVersion) {
+        old_count = le32(header + 16);
+        index_offset = le64(header + 36);
     }
     if (old_count > 0 && index_offset >= kHeaderSize) {
         const uint32_t kept = count < old_count ? count : old_count;
@@ -625,7 +603,7 @@ bool mez_set_frame_count(const std::filesystem::path& path, uint32_t count) {
             }
             if (wrote) {
                 uint8_t patch[4];
-                put_u32(patch, count);
+                put_le32(patch, count);
                 _fseeki64(f, 16, SEEK_SET);
                 ok = std::fwrite(patch, 1, 4, f) == 4;
                 std::fflush(f);
@@ -662,17 +640,17 @@ bool MezReader::open(const std::filesystem::path& path, std::string* error) {
 
     uint8_t header[kHeaderSize];
     if (std::fread(header, 1, kHeaderSize, f) != kHeaderSize ||
-        get_u32(header) != kMagic || get_u32(header + 4) != kVersion) {
+        le32(header) != kMagic || le32(header + 4) != kVersion) {
         if (error) *error = "not a MEZ1 file";
         close();
         return false;
     }
-    width_ = get_u32(header + 8);
-    height_ = get_u32(header + 12);
-    const uint32_t frame_count = get_u32(header + 16);
-    timescale_ = get_u32(header + 20);
-    frame_duration_ = get_u32(header + 24);
-    const uint64_t index_offset = get_u64(header + 36);
+    width_ = le32(header + 8);
+    height_ = le32(header + 12);
+    const uint32_t frame_count = le32(header + 16);
+    timescale_ = le32(header + 20);
+    frame_duration_ = le32(header + 24);
+    const uint64_t index_offset = le64(header + 36);
 
     if (frame_count == 0 || index_offset < kHeaderSize) {
         if (error) *error = "unfinished mez file";
@@ -688,7 +666,7 @@ bool MezReader::open(const std::filesystem::path& path, std::string* error) {
         return false;
     }
     for (uint32_t i = 0; i < frame_count; ++i)
-        offsets_[i] = get_u64(raw.data() + i * 8u);
+        offsets_[i] = le64(raw.data() + i * 8u);
     return true;
 }
 
@@ -699,7 +677,7 @@ bool MezReader::decode(uint32_t frame_index, DecodedFrame& out) {
         return false;
     uint8_t size_le[4];
     if (std::fread(size_le, 1, 4, f) != 4) return false;
-    const uint32_t payload_size = get_u32(size_le);
+    const uint32_t payload_size = le32(size_le);
     if (payload_size == 0 || payload_size > (1u << 30)) return false;
     scratch_.resize(payload_size);
     if (std::fread(scratch_.data(), 1, payload_size, f) != payload_size)

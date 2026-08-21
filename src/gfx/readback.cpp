@@ -1,5 +1,7 @@
 #include "gfx/readback.h"
 
+#include "gfx/graph.h"
+
 #include <vk_mem_alloc.h>
 
 #include <cstring>
@@ -99,8 +101,8 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
     // exact working-target math from Engine::render, so the NV12 planes
     // match the composite instead of resampling it back up.
     const uint32_t div = engine.preview_divisor();
-    const uint32_t w = std::max((canvas_w / div) & ~1u, 2u);
-    const uint32_t h = std::max((canvas_h / div) & ~1u, 2u);
+    const uint32_t w = even_down(canvas_w, div);
+    const uint32_t h = even_down(canvas_h, div);
     if (canvas_w == 0 || canvas_h == 0 || (canvas_w & 1) || (canvas_h & 1)) {
         log_error("readback: dimensions must be even (%ux%u)", canvas_w,
                   canvas_h);

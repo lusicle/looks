@@ -39,4 +39,35 @@ inline const AssetBundle* find_bundle(const std::vector<AssetBundle>& table,
     return nullptr;
 }
 
+// Sidecar naming for one source, spelled once: the ingest writes these
+// files and resolve_bundle rebinds them. `base` is the app's stored
+// anchor - swapping its extension reproduces any sibling, which the
+// load-time readers rely on; that equivalence holds by construction
+// because every field derives from the same stem.
+struct SidecarPaths {
+    std::filesystem::path base;      // <stem>.media (the anchor)
+    std::filesystem::path mez;       // <stem>.mez
+    std::filesystem::path proxy;     // <stem>.proxy.mez
+    std::filesystem::path pcm;       // <stem>.pcm
+    std::filesystem::path analysis;  // <stem>.analysis
+    std::filesystem::path thumbs;    // <stem>.thumbs
+};
+
+inline SidecarPaths sidecars_for_stem(const std::filesystem::path& dir,
+                                      const std::wstring& stem) {
+    SidecarPaths s;
+    s.base = dir / (stem + L".media");
+    s.mez = dir / (stem + L".mez");
+    s.proxy = dir / (stem + L".proxy.mez");
+    s.pcm = dir / (stem + L".pcm");
+    s.analysis = dir / (stem + L".analysis");
+    s.thumbs = dir / (stem + L".thumbs");
+    return s;
+}
+
+inline SidecarPaths sidecars_for(const std::filesystem::path& dir,
+                                 const std::filesystem::path& source) {
+    return sidecars_for_stem(dir, source.stem().wstring());
+}
+
 }  // namespace looks::media

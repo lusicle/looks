@@ -48,8 +48,33 @@ inline uint64_t nested_child_path(uint64_t path, uint64_t layer_id,
     return k;
 }
 
+// Instance path of a sequence placement's child: the lane AND the
+// target fold in, so a razor moves nothing and two targets cut on one
+// lane stay distinct. The flatten and compile_graph both stamp EXACTLY
+// this - divergence would hand the decode pool keys the graph's Source
+// nodes do not carry.
+inline uint64_t seq_child_path(uint64_t path, uint64_t container,
+                               uint64_t target) {
+    return hash_combine(hash_combine(path, container), target);
+}
+
 // A window whose end is the parent's end rather than its own.
 inline constexpr double kUnbounded = 1e18;
+
+// Playable window of a shifted stream in LOCAL time: local + shift must
+// stay inside [0, length); length 0 = unbounded (hi = kUnbounded). A
+// negative shift delays the start (closed gate before it), a positive
+// one shortens the tail. The flatten's intervals and the compiler's
+// point tests are this ONE formula - live means lo <= t < hi.
+inline void shifted_window(double length, int64_t shift, double* lo,
+                           double* hi) {
+    *lo = shift < 0 ? static_cast<double>(-shift) : 0.0;
+    *hi = kUnbounded;
+    if (length > 0.0) {
+        *hi = length - static_cast<double>(shift);
+        if (*hi < *lo) *hi = *lo;
+    }
+}
 
 // One audio-modifier hop on a voice: the effect's params snapshotted at
 // flatten time (audio DSP params are not modulatable - the mix rebuilds

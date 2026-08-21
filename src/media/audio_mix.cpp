@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "media/pcm.h"
+#include "media/sample_clock.h"
 
 namespace looks::media {
 
@@ -176,12 +177,11 @@ void render_mix(const MixState& mix, int64_t start, int16_t* out,
         const int64_t pcm_frames = static_cast<int64_t>(pcm.frames());
         if (pcm_frames <= 0 || pcm.channels == 0 || pcm.rate == 0) continue;
 
-        // The placement's span in OUTPUT samples.
-        const double per_frame = rate / mix.fps;
-        const int64_t s0 =
-            static_cast<int64_t>(std::ceil(src.t_in * per_frame));
-        const int64_t s1 =
-            static_cast<int64_t>(std::ceil(src.t_out * per_frame));
+        // The placement's span in OUTPUT samples, on the same rounding
+        // rule as the transport cursor (sample_clock.h) so a block's
+        // first sample is exactly the cursor of its first frame.
+        const int64_t s0 = frame_to_sample(src.t_in, mix.fps, rate);
+        const int64_t s1 = frame_to_sample(src.t_out, mix.fps, rate);
         const int64_t lo = std::max(s0, start);
         const int64_t hi =
             std::min(s1, start + static_cast<int64_t>(count));

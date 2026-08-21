@@ -3,6 +3,8 @@
 // block writes that block's interleaved UV texel from the encoded-domain
 // average.
 
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -14,22 +16,10 @@ cbuffer Push
 [[vk::binding(1, 0)]] [[vk::image_format("r8")]] RWTexture2D<float> out_y;
 [[vk::binding(2, 0)]] [[vk::image_format("rg8")]] RWTexture2D<float2> out_uv;
 
-float3 srgb_oetf(float3 lin)
-{
-    const float3 hi = 1.055 * pow(lin, 1.0 / 2.4) - 0.055;
-    const float3 lo = lin * 12.92;
-    return lerp(hi, lo, step(lin, 0.0031308));
-}
-
-float luma709(float3 encoded)
-{
-    return dot(encoded, float3(0.2126, 0.7152, 0.0722));
-}
-
 float3 fetch_encoded(float2 texel, float2 size)
 {
     const float2 uv = texel / size;
-    return srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb));
+    return fx_srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb));
 }
 
 [shader("compute")]
@@ -41,7 +31,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 size = float2(width, height);
     const float3 encoded = fetch_encoded(float2(tid.xy) + 0.5, size);
 
-    out_y[tid.xy] = (16.0 + 219.0 * luma709(encoded)) / 255.0;
+    out_y[tid.xy] = (16.0 + 219.0 * fx_luma(encoded)) / 255.0;
 
     if ((tid.x & 1) == 0 && (tid.y & 1) == 0)
     {
@@ -50,10 +40,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         sum += fetch_encoded(float2(tid.xy) + float2(0.5, 1.5), size);
         sum += fetch_encoded(float2(tid.xy) + float2(1.5, 1.5), size);
         const float3 avg = sum * 0.25;
-        const float avg_y = luma709(avg);
-        const float cb = (avg.b - avg_y) / 1.8556;
-        const float cr = (avg.r - avg_y) / 1.5748;
-        out_uv[tid.xy >> 1] = float2((128.0 + 224.0 * cb) / 255.0,
-                                     (128.0 + 224.0 * cr) / 255.0);
+        const float2 cbcr = fx_rgb_to_cbcr709(avg, fx_luma(avg));
+        out_uv[tid.xy >> 1] = (128.0 + 224.0 * cbcr) / 255.0;
     }
 }

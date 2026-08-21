@@ -49,6 +49,10 @@ std::unique_ptr<Command> add_asset_command(Asset asset);
 // Whole-asset replacement matched by id: rebinding a path, or writing
 // back what opening the bundle probed (frame count, fps, still length).
 std::unique_ptr<Command> set_asset_command(Asset updated);
+// Un-import: the entry leaves the project. Media layers naming the id
+// go DORMANT (both walks treat dangling as unbound); the source file
+// and its cache stay on disk.
+std::unique_ptr<Command> remove_asset_command(uint64_t asset_id);
 
 // Browser bins: project-panel folders. Membership is the `bin` field on
 // looks, sequences and assets; bins nest by parent.

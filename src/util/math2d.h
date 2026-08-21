@@ -22,7 +22,6 @@ struct Vec2 {
     constexpr bool operator==(const Vec2&) const = default;
 
     float length() const { return std::sqrt(x * x + y * y); }
-    constexpr float length_sq() const { return x * x + y * y; }
     Vec2 normalized_or_zero() const {
         float len = length();
         return len > 1e-8f ? Vec2{x / len, y / len} : Vec2{};

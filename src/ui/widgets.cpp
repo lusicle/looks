@@ -8,6 +8,35 @@
 
 namespace looks::ui {
 
+void register_rect_hit(LayoutNode& node, LayoutFrame& frame,
+                       const void* state) {
+    Rect r = node.rect;
+    if (!node.clip.empty()) r = r.intersect(node.clip);
+    frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(state));
+}
+
+Rect list_popup_rect(const Rect& anchor, float min_w,
+                     const char* const* items, int count, const Font& font,
+                     float font_size, Vec2 viewport) {
+    float widest = min_w;
+    for (int i = 0; i < count; ++i)
+        widest = std::max(widest,
+                          measure_text(font, items[i], font_size).x + 24.0f);
+    const float h = static_cast<float>(count) * kPopupRowH + 8.0f;
+    float y = anchor.bottom() + 2.0f;
+    if (y + h > viewport.y - 4.0f) y = anchor.y - h - 2.0f;  // flip upward
+    const float x =
+        std::max(4.0f, std::min(anchor.x, viewport.x - widest - 4.0f));
+    return {x, y, widest, h};
+}
+
+Rect list_popup_rect(const Rect& anchor, float min_w,
+                     const char* const* items, int count,
+                     const LayoutFrame& frame) {
+    return list_popup_rect(anchor, min_w, items, count, frame.font,
+                           frame.theme.font_size, frame.canvas.viewport());
+}
+
 namespace {
 
 Theme make_night() {
@@ -71,8 +100,6 @@ void set_active_theme(int index) {
     g_theme_index = ((index % theme_count()) + theme_count()) % theme_count();
 }
 
-int active_theme_index() { return g_theme_index; }
-
 namespace {
 
 constexpr float kTransitionSeconds = 0.12f;
@@ -114,12 +141,6 @@ void maybe_tooltip(const ButtonState& state, const char* tooltip,
         frame.ctx.set_tooltip(tooltip,
                               {frame.input.mouse.x + 12.0f,
                                frame.input.mouse.y + 18.0f});
-}
-
-void register_rect_hit(LayoutNode& node, LayoutFrame& frame, const void* state) {
-    Rect r = node.rect;
-    if (!node.clip.empty()) r = r.intersect(node.clip);
-    frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(state));
 }
 
 // ---- Label
@@ -462,21 +483,11 @@ struct DropdownUser {
     const char* tooltip;
 };
 
-constexpr float kOptionRowH = 20.0f;
+constexpr float kOptionRowH = kPopupRowH;
 
 Rect dropdown_popup_rect(const DropdownUser& u, const Rect& anchor,
                          const LayoutFrame& frame) {
-    float widest = anchor.w;
-    for (int i = 0; i < u.count; ++i)
-        widest = std::max(widest,
-                          measure_text(frame.font, u.items[i],
-                                       frame.theme.font_size).x + 24.0f);
-    const float h = static_cast<float>(u.count) * kOptionRowH + 8.0f;
-    float y = anchor.bottom() + 2.0f;
-    const Vec2 view = frame.canvas.viewport();
-    if (y + h > view.y - 4.0f) y = anchor.y - h - 2.0f;   // flip upward
-    const float x = std::max(4.0f, std::min(anchor.x, view.x - widest - 4.0f));
-    return {x, y, widest, h};
+    return list_popup_rect(anchor, anchor.w, u.items, u.count, frame);
 }
 
 Vec2 measure_dropdown(LayoutNode& node, const Constraints& c,
@@ -1194,13 +1205,15 @@ struct PanelUser {
     float corner_radius;
     bool outline;
     bool accent_edge;
+    Color bg;
 };
 
 void draw_panel(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const PanelUser*>(node.user);
     const float radius =
         u->corner_radius < 0.0f ? frame.theme.corner_radius : u->corner_radius;
-    frame.canvas.draw_sdf_rect(node.rect, radius, frame.theme.panel_bg);
+    frame.canvas.draw_sdf_rect(
+        node.rect, radius, u->bg.a > 0.0f ? u->bg : frame.theme.panel_bg);
     if (u->outline)
         frame.canvas.draw_sdf_rect_outline(node.rect, radius,
                                            frame.theme.stroke_width,
@@ -1494,6 +1507,7 @@ LayoutNode* Panel(LayoutArena& arena, LayoutNode* child, const PanelOpts& opts) 
     u->corner_radius = opts.corner_radius;
     u->outline = opts.outline;
     u->accent_edge = opts.accent_edge;
+    u->bg = opts.bg;
     n->user = u;
     n->draw_fn = draw_panel;
     n->debug_name = "panel";

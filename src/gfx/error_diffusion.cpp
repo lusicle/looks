@@ -7,15 +7,11 @@
 
 #include "codec/core.h"   // parallel_blocks for the conversion passes
 #include "doc/effect_instance.h"
+#include "util/color.h"
 
 namespace looks::gfx {
 
 namespace {
-
-float cpu_srgb_eotf(float x) {
-    return x <= 0.04045f ? x / 12.92f
-                         : std::pow((x + 0.055f) / 1.055f, 2.4f);
-}
 
 // Hilbert d -> (x, y) on a 2^order square (the standard rotate-and-
 // reflect walk). The curve visits 4^order cells; callers skip the ones
@@ -182,15 +178,11 @@ void run_error_diffusion(const uint16_t* halves, uint32_t width,
     // encoded midpoints as linear thresholds — `count(thresh < value)` IS
     // nearest-in-encoded, exactly, with ≤15 compares and no transfer
     // function in the hot loop. After the pick, v[] holds the level INDEX.
-    const int nlevels_q =
-        std::min(17, static_cast<int>(std::lround(std::ceil(steps))) + 1);
     float level_lin[17];
     float thresh_lin[16];
-    for (int k = 0; k < nlevels_q; ++k)
-        level_lin[k] = cpu_srgb_eotf(
-            std::clamp(static_cast<float>(k) / steps, 0.0f, 1.0f));
+    const int nlevels_q = ed_level_table(fx, level_lin);
     for (int k = 0; k + 1 < nlevels_q; ++k)
-        thresh_lin[k] = cpu_srgb_eotf(std::clamp(
+        thresh_lin[k] = color::srgb_eotf(std::clamp(
             (static_cast<float>(k) + 0.5f) / steps, 0.0f, 1.0f));
 
     if (kernel == 6) {
@@ -261,7 +253,7 @@ void run_error_diffusion(const uint16_t* halves, uint32_t width,
             for (int j = 0; j < 4096; ++j) {
                 const float vj = (static_cast<float>(j) + 0.5f) / 4096.0f;
                 while (b < 255 &&
-                       vj > cpu_srgb_eotf(
+                       vj > color::srgb_eotf(
                                 (static_cast<float>(b) + 0.5f) / 255.0f))
                     ++b;
                 row_lut[j] = static_cast<uint8_t>(b < 128 ? b : 255 - b);
@@ -494,7 +486,7 @@ int ed_level_table(const doc::EffectInstance& fx, float out_levels[17]) {
     const int nlevels_q =
         std::min(17, static_cast<int>(std::lround(std::ceil(steps))) + 1);
     for (int k = 0; k < nlevels_q; ++k)
-        out_levels[k] = cpu_srgb_eotf(
+        out_levels[k] = color::srgb_eotf(
             std::clamp(static_cast<float>(k) / steps, 0.0f, 1.0f));
     for (int k = nlevels_q; k < 17; ++k)
         out_levels[k] = 0.0f;

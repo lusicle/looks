@@ -1,6 +1,8 @@
 // One Gray-Scott step. No randomness anywhere: the sim is deterministic
 // given the sequential frame stream, which is what keeps it replayable.
 
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -48,7 +50,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     // Midtones only: injecting at the extremes floods the sim flat.
     const float3 rgb = frame_in.SampleLevel(uv, 0).rgb;
-    const float l = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    const float l = fx_luma(rgb);
     const float mid = smoothstep(0.05, 0.25, l) * (1.0 - smoothstep(0.5, 0.9, l));
     b += inject * 0.02 * mid * (1.0 - b);
 

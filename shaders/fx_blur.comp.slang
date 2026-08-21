@@ -47,7 +47,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float d = abs(pos - focus);
             radius *= saturate((d - band) / max(band, 1.0e-3));
         }
-        const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
         float4 acc = base;
         float wsum = 1.0;
         [unroll]
@@ -60,7 +59,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             float wgt;
             if (m == 5u) {
                 // Energy-weighted so bright points bloom into discs.
-                const float lum = dot(c.rgb, kLuma);
+                const float lum = fx_luma(c.rgb);
                 wgt = 1.0 + lum * lum * 6.0;
             } else if (m == 6u) {
                 // Bilateral: spatial falloff x range weight, so texture

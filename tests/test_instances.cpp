@@ -581,6 +581,13 @@ TEST(flatten_skips_hidden_and_dangling_sources) {
     CHECK_EQ(
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
         size_t{0});
+    rig.placement().target = rig.look;
+    // Dangling ASSET id (media removed): dormant like an unbound node
+    // (emit_media guards both walks).
+    rig.doc.looks[0].layers[0].asset = 888888;
+    CHECK_EQ(
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
+        size_t{0});
 }
 
 TEST(canvas_size_derives_from_the_first_asset) {

@@ -14,6 +14,7 @@
 #include "doc/effects.h"   // param_option_count/_at (dropdown rows)
 #include "ui/text.h"
 #include "ui/theme.h"
+#include "ui/widgets.h"
 
 namespace looks::flow {
 
@@ -70,9 +71,7 @@ int port_row_count(const Node& nd) {
 
 void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<CanvasUser*>(node.user);
-    Rect r = node.rect;
-    if (!node.clip.empty()) r = r.intersect(node.clip);
-    frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(u->state));
+    ui::register_rect_hit(node, frame, u->state);
 }
 
 void dashed_line(ui::Canvas2D& canvas, Vec2 a, Vec2 b, float thickness,
@@ -353,9 +352,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                          14));
     const float menu_h = 26.0f + menu_visible * 18.0f + 6.0f;
     auto menu_rect = [&]() {
-        return Rect{std::min(st.add_anchor.x, r.right() - kMenuW - 8.0f),
-                    std::min(st.add_anchor.y, r.bottom() - menu_h - 8.0f),
-                    kMenuW, menu_h};
+        // Clamped INSIDE the canvas on both ends: a short canvas must
+        // pin the menu to its top, never push it above the panel.
+        return Rect{
+            std::max(r.x + 4.0f,
+                     std::min(st.add_anchor.x, r.right() - kMenuW - 8.0f)),
+            std::max(r.y + 4.0f,
+                     std::min(st.add_anchor.y, r.bottom() - menu_h - 8.0f)),
+            kMenuW, menu_h};
     };
     // Flyout beside the open category row; flips left when clipped.
     auto fly_rect = [&]() {
@@ -366,8 +370,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const float h = static_cast<float>(fly1 - fly0) * 18.0f + 8.0f;
         float x = mr.right() + 2.0f;
         if (x + kMenuW > r.right() - 4.0f) x = mr.x - kMenuW - 2.0f;
-        const float y = std::min(mr.y + 26.0f + vis_row * 18.0f,
-                                 r.bottom() - h - 8.0f);
+        const float y =
+            std::max(r.y + 4.0f, std::min(mr.y + 26.0f + vis_row * 18.0f,
+                                          r.bottom() - h - 8.0f));
         return Rect{x, y, kMenuW, h};
     };
     if (owns && st.add_open && frame.input.wheel_y != 0.0f &&
@@ -514,9 +519,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const float kCtxW = 170.0f;
     const float ctx_h = static_cast<float>(g.ctx_count) * 20.0f + 8.0f;
     auto ctx_rect = [&]() {
-        return Rect{std::min(st.ctx_anchor.x, r.right() - kCtxW - 8.0f),
-                    std::min(st.ctx_anchor.y, r.bottom() - ctx_h - 8.0f),
-                    kCtxW, ctx_h};
+        return Rect{
+            std::max(r.x + 4.0f,
+                     std::min(st.ctx_anchor.x, r.right() - kCtxW - 8.0f)),
+            std::max(r.y + 4.0f,
+                     std::min(st.ctx_anchor.y, r.bottom() - ctx_h - 8.0f)),
+            kCtxW, ctx_h};
     };
 
     // Right-click: a card or frame title gets its CONTEXT menu (texed
@@ -597,7 +605,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const float h = static_cast<float>(n) * 20.0f + 8.0f;
         return Rect{
             std::clamp(st.dd_field.x, r.x + 4.0f, r.right() - w - 4.0f),
-            std::min(st.dd_field.bottom() + 2.0f, r.bottom() - h - 4.0f),
+            std::max(r.y + 4.0f, std::min(st.dd_field.bottom() + 2.0f,
+                                          r.bottom() - h - 4.0f)),
             w, h};
     };
     if (dd_row_p && frame.input.left_pressed() && owns) {

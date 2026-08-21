@@ -5,6 +5,7 @@
 #include "media/bmff_mux.h"
 #include "media/h264_util.h"
 #include "media/pcm.h"
+#include "media/sample_clock.h"
 #include "platform/win/mf_codec.h"
 #include "util/log.h"
 
@@ -52,7 +53,8 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
     // ---- video: produce -> encode -> AVCC packets (pts == dts, no B).
     platform::H264Encoder video_encoder;
     if (!video_encoder.create(width, height, fps_num, fps_den,
-                              options.video_bitrate_bps, &result.error))
+                              options.video_bitrate_bps, &result.error,
+                              options.gop_frames))
         return result;
 
     std::vector<VideoPacket> video_packets;
@@ -119,15 +121,16 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
             while (audio_encoder.receive(packet))
                 audio_packets.push_back({packet.data, packet.pts_100ns});
         };
-        // Export exactly the video's duration of audio. The offset maps
-        // output sample s to mix position s + skip; anything outside every
-        // source is silence (a gap, a negative nudge, trim past the end).
-        const uint64_t total_frames =
-            static_cast<uint64_t>(audio_rate) * frame_count * fps_den /
-            fps_num;
-        const int64_t skip = static_cast<int64_t>(
-            options.audio_offset_seconds * audio_rate +
-            (options.audio_offset_seconds >= 0.0 ? 0.5 : -0.5));
+        // Export exactly the video's duration of audio, measured by the
+        // same frame->sample rule the monitor cursor uses. The skip maps
+        // output sample s to mix position s + skip; anything outside
+        // every source is silence (a gap, a negative nudge, trim past
+        // the end).
+        const double vfps =
+            static_cast<double>(fps_num) / static_cast<double>(fps_den);
+        const uint64_t total_frames = static_cast<uint64_t>(
+            frame_to_sample(frame_count, vfps, audio_rate));
+        const int64_t skip = options.audio_skip_samples;
         std::vector<int16_t> chunk(static_cast<size_t>(1024) * audio_channels);
         for (uint64_t s = 0; s < total_frames; s += 1024) {
             if (progress && progress->cancel.load()) {
@@ -174,6 +177,7 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
     const uint32_t video_tick =
         static_cast<uint32_t>(90000ull * fps_den / fps_num);
     for (const VideoPacket& p : video_packets) {
+        // 100ns -> 90 kHz ticks: * 90000 / 1e7 reduced.
         const uint64_t dts = static_cast<uint64_t>(p.pts) * 9 / 1000;
         if (!muxer.add_video_sample(p.avcc_sample.data(), p.avcc_sample.size(),
                                     dts, video_tick, 0, p.keyframe)) {

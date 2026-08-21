@@ -1,6 +1,8 @@
 // The wired image's luma IS the matte: masks are ordinary images, so
 // inverting or shaping one happens upstream with ordinary effects.
 
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -18,7 +20,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= width || tid.y >= height)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
-    const float v =
-        dot(input.SampleLevel(uv, 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    const float v = fx_luma(input.SampleLevel(uv, 0).rgb);
     output[tid.xy] = float4(v, v, v, 1.0);
 }

@@ -265,10 +265,6 @@ inline bool layer_has_transform(const Layer& l) {
 inline bool layer_is_media(const Layer& l) {
     return l.source == LayerSourceKind::Media;
 }
-inline bool layer_is_generator(const Layer& l) {
-    return l.source >= LayerSourceKind::Solid &&
-           l.source <= LayerSourceKind::Shape;
-}
 inline bool layer_is_nested(const Layer& l) {
     return l.source == LayerSourceKind::LookRef ||
            l.source == LayerSourceKind::SequenceRef;
@@ -624,13 +620,34 @@ inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
     return end;
 }
 
-// Is this placement playing at a local frame? An unbounded placement is
-// always live from t_in.
+// Is this placement playing at a local time? An unbounded placement is
+// always live from t_in. Both bounds are whole frames, so testing the
+// continuous time and testing its floor agree exactly - the compiler,
+// the flatten, the monitor pick and the razor all decide liveness
+// through this one predicate (the razor additionally excludes the exact
+// head: a cut AT t_in is a no-op, not a zero-width left half).
 inline bool placement_active(const Placement& p, uint32_t source_len,
-                             uint32_t local) {
-    if (local < p.t_in) return false;
+                             double local) {
+    if (local < static_cast<double>(p.t_in)) return false;
     const uint32_t end = placement_end(p, source_len);
-    return end == 0 || local < end;
+    return end == 0 || local < static_cast<double>(end);
+}
+
+// The block a video lane SHOWS at a local time: among the active
+// placements the latest-starting wins (an overlap reads as the incoming
+// block taking over at its in-point), list order breaking ties. Audio
+// never picks - every active placement sums in the mix. The compiler
+// and the monitor's click-pick must share this tiebreak or a click
+// selects a block the render did not draw.
+inline const Placement* placement_winner(
+    const Document& doc, const std::vector<Placement>& placements,
+    double local) {
+    const Placement* best = nullptr;
+    for (const Placement& p : placements) {
+        if (!placement_active(p, source_length(doc, p), local)) continue;
+        if (!best || p.t_in >= best->t_in) best = &p;
+    }
+    return best;
 }
 
 // Local frame -> target frame. The affine map that composes under
@@ -639,6 +656,39 @@ inline double placement_source_frame(const Placement& p, double local) {
     return (local - static_cast<double>(p.t_in)) *
                static_cast<double>(p.speed) +
            static_cast<double>(p.source_in);
+}
+
+inline constexpr float kDeg2Rad = 0.01745329252f;
+
+// Inverse of the placement's canvas affine: monitor-content UV
+// (fractions of the rect) to the block's own frame, which spans
+// [-0.5, 0.5] on both axes. Mirrors layer_blend.comp.slang's forward
+// map; the click picker and the overlay drawer must both go through
+// this or the selection box detaches from the pixels - in opposite
+// directions.
+inline void placement_uv_to_block(const Placement& p, float u, float v,
+                                  float aspect, float* bx, float* by) {
+    const float rad = p.rotate * kDeg2Rad;
+    const float cs = std::cos(rad), sn = std::sin(rad);
+    const float cxf = u - 0.5f - p.pos_x;
+    const float cyf = v - 0.5f - p.pos_y;
+    const float qx = cxf * aspect, qy = cyf;
+    const float rx = qx * cs + qy * sn;
+    const float ry = -qx * sn + qy * cs;
+    const float s = std::max(p.scale, 1e-4f);
+    *bx = rx / s / aspect;
+    *by = ry / s;
+}
+
+// Head-trim: move the start to `at` with the surviving content held on
+// the same source frames. ONE rounding rule (truncate, floored at zero)
+// for razor, trim drags and overwrite - paths rounding differently land
+// razored and overwritten heads on different source frames at
+// fractional speeds.
+inline void trim_placement_head(Placement& p, uint32_t at) {
+    const double src = placement_source_frame(p, static_cast<double>(at));
+    p.source_in = src <= 0.0 ? 0u : static_cast<uint32_t>(src);
+    p.t_in = at;
 }
 
 // True when browser bin `from` reaches bin `to` walking parents - the
@@ -679,6 +729,50 @@ inline bool nest_reaches(const Document& doc, uint64_t from, uint64_t to,
             }
     }
     return false;
+}
+
+// The layer behind an id. Null when the look holds no such layer.
+inline Layer* find_layer(Look& look, uint64_t layer_id) {
+    for (Layer& l : look.layers)
+        if (l.id == layer_id) return &l;
+    return nullptr;
+}
+inline const Layer* find_layer(const Look& look, uint64_t layer_id) {
+    return find_layer(const_cast<Look&>(look), layer_id);
+}
+
+// The effect behind an id, with its owning layer. Null when absent.
+inline EffectInstance* find_effect(Look& look, uint64_t fx_id,
+                                   Layer** owner = nullptr) {
+    for (Layer& l : look.layers)
+        for (EffectInstance& fx : l.stack)
+            if (fx.id == fx_id) {
+                if (owner) *owner = &l;
+                return &fx;
+            }
+    return nullptr;
+}
+inline const EffectInstance* find_effect(const Look& look, uint64_t fx_id,
+                                         const Layer** owner = nullptr) {
+    return find_effect(const_cast<Look&>(look), fx_id,
+                       const_cast<Layer**>(owner));
+}
+
+// The group behind an id on one layer. Null when absent.
+inline Group* find_group(Layer& layer, uint64_t group_id) {
+    for (Group& g : layer.groups)
+        if (g.id == group_id) return &g;
+    return nullptr;
+}
+inline const Group* find_group(const Layer& layer, uint64_t group_id) {
+    return find_group(const_cast<Layer&>(layer), group_id);
+}
+
+// Whether an effect's enclosing group is bypassed (0 = ungrouped).
+inline bool group_bypassed(const Layer& layer, uint64_t group_id) {
+    if (group_id == 0) return false;
+    const Group* g = find_group(layer, group_id);
+    return g && g->bypass;
 }
 
 // The value node behind an id. Null when the look holds no such node.

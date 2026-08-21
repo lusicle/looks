@@ -3,26 +3,12 @@
 #include <objbase.h>
 #include <wincodec.h>
 
+#include "platform/win/com_ptr.h"
+
 #pragma comment(lib, "windowscodecs")
 #pragma comment(lib, "ole32")
 
 namespace looks::platform {
-
-namespace {
-
-template <typename T>
-struct Com {
-    T* p = nullptr;
-    ~Com() {
-        if (p) p->Release();
-    }
-    T** put() { return &p; }
-    T* get() const { return p; }
-    T* operator->() const { return p; }
-    explicit operator bool() const { return p != nullptr; }
-};
-
-}  // namespace
 
 bool decode_image_rgba(const uint8_t* bytes, size_t size, uint32_t* width,
                        uint32_t* height, std::vector<uint8_t>* rgba,

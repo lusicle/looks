@@ -1,6 +1,8 @@
 // Positions arrive in PHYSICAL pixels. Vertex color bytes are sRGB RGB
 // with linear alpha, decoded here once so interpolation and blending stay
-// linear. Duplicated in text.vert.slang; the two must stay in sync.
+// linear.
+
+#include "fx_common.slang"
 
 [[vk::push_constant]]
 cbuffer Push
@@ -24,20 +26,13 @@ struct VSOutput
     [[vk::location(2)]] float4 v_shape : TEXCOORD1;
 };
 
-float3 srgb_to_linear(float3 c)
-{
-    const float3 hi = pow((c + 0.055) / 1.055, 2.4);
-    const float3 lo = c / 12.92;
-    return lerp(hi, lo, step(c, 0.04045));
-}
-
 [shader("vertex")]
 VSOutput main(VSInput input)
 {
     VSOutput o;
     o.sv_position = mul(projection, float4(input.a_pos, 0.0, 1.0));
     o.v_uv        = input.a_uv;
-    o.v_color     = float4(srgb_to_linear(input.a_color.rgb), input.a_color.a);
+    o.v_color     = float4(fx_srgb_eotf(input.a_color.rgb), input.a_color.a);
     o.v_shape     = input.a_shape;
     return o;
 }

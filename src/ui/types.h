@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include "util/color.h"
 #include "util/math2d.h"
 
 namespace looks::ui {
@@ -65,10 +66,6 @@ struct Color {
 
     Color with_alpha(float alpha) const { return {r, g, b, alpha}; }
 
-    float luminance() const {  // Rec.709, linear
-        return 0.2126f * r + 0.7152f * g + 0.0722f * b;
-    }
-
     // Little-endian packed R,G,B,A bytes; RGB re-encoded to sRGB.
     uint32_t to_rgba8() const {
         auto encode = [](float linear) -> uint32_t {
@@ -79,14 +76,8 @@ struct Color {
         return encode(r) | (encode(g) << 8) | (encode(b) << 16) | (ab << 24);
     }
 
-    static float srgb_to_linear(float c) {
-        return c <= 0.04045f ? c / 12.92f
-                             : std::pow((c + 0.055f) / 1.055f, 2.4f);
-    }
-    static float linear_to_srgb(float c) {
-        return c <= 0.0031308f ? c * 12.92f
-                               : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-    }
+    static float srgb_to_linear(float c) { return color::srgb_eotf(c); }
+    static float linear_to_srgb(float c) { return color::srgb_oetf(c); }
 
     constexpr bool operator==(const Color&) const = default;
 };

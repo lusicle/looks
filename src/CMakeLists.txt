@@ -82,6 +82,7 @@ add_library(looks_media STATIC
     media/frame_index.cpp
     media/h264_util.cpp
     media/pcm.cpp
+    media/thumbs.cpp
     media/wav.cpp
     media/mp3.cpp
     media/import.cpp

@@ -27,10 +27,6 @@ std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated);
 // -1 (toward the bottom of the stack) or +1; caller bounds-checks.
 std::unique_ptr<Command> move_layer_command(uint64_t look, size_t index,
                                             int direction);
-// Whole-layer replacement including the stack — resets the last remaining
-// layer, since removing it outright would leave the look empty.
-std::unique_ptr<Command> replace_layer_command(uint64_t look, size_t index,
-                                               Layer fresh);
 // Razor: splits a placement at a LOCAL frame into two abutting
 // placements on the SAME lane. The right half is a fresh placement of
 // the same target whose source_in lands on the cut's source frame, so

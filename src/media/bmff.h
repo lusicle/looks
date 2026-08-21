@@ -15,7 +15,42 @@
 #include <string>
 #include <vector>
 
+#include "util/bytes.h"
+
 namespace looks::media {
+
+// MP4 elementary-stream descriptors (esds): the tag bytes and the 7-bit
+// varlen size coding, shared by this demuxer and the muxer so the two
+// sides cannot drift.
+inline constexpr uint8_t kEsdsTagES = 0x03;
+inline constexpr uint8_t kEsdsTagDecoderConfig = 0x04;
+inline constexpr uint8_t kEsdsTagDecoderSpecific = 0x05;
+inline constexpr uint8_t kEsdsTagSLConfig = 0x06;
+
+// Reads a descriptor length: up to 4 continuation bytes per spec.
+inline uint32_t esds_read_len(bytes::BeReader& r) {
+    uint32_t len = 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t b = r.u8();
+        len = (len << 7) | (b & 0x7F);
+        if (!(b & 0x80)) break;
+    }
+    return len;
+}
+
+// Writes the minimal varlen form. Refuses payloads whose length needs
+// more than two bytes - overflowing the continuation byte silently
+// emits a corrupt length the reader then mis-parses.
+inline bool esds_write_len(std::vector<uint8_t>& out, size_t len) {
+    if (len >= (1u << 14)) return false;
+    if (len < 128) {
+        out.push_back(static_cast<uint8_t>(len));
+        return true;
+    }
+    out.push_back(static_cast<uint8_t>(0x80 | (len >> 7)));
+    out.push_back(static_cast<uint8_t>(len & 0x7F));
+    return true;
+}
 
 struct SampleInfo {
     uint64_t file_offset = 0;
@@ -47,10 +82,6 @@ struct TrackInfo {
     std::vector<uint8_t> audio_specific_config;  // from esds
 
     std::vector<SampleInfo> samples;
-
-    double duration_seconds() const {
-        return timescale ? static_cast<double>(duration) / timescale : 0.0;
-    }
 };
 
 struct MovieInfo {
@@ -80,6 +111,12 @@ public:
 
     // Reads one sample's payload from mdat.
     bool read_sample(const SampleInfo& sample, std::vector<uint8_t>& out);
+
+    // Reads `size` bytes at `offset` from an open file - the one sample
+    // fetch every consumer (this class, the decode pool's session FILE*)
+    // shares.
+    static bool read_at(void* file, uint64_t offset, uint32_t size,
+                        std::vector<uint8_t>& out);
 
 private:
     void* file_ = nullptr;   // FILE*

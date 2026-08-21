@@ -5,6 +5,8 @@
 #include <cstring>
 
 #include "platform/win/mf_codec.h"
+#include "util/bytes.h"
+#include "util/file.h"
 #include "util/log.h"
 
 namespace looks::media {
@@ -23,9 +25,7 @@ struct FrameHeader {
 };
 
 bool parse_header(const uint8_t* p, FrameHeader* out) {
-    const uint32_t h = (static_cast<uint32_t>(p[0]) << 24) |
-                       (static_cast<uint32_t>(p[1]) << 16) |
-                       (static_cast<uint32_t>(p[2]) << 8) | p[3];
+    const uint32_t h = bytes::be32(p);
     if ((h & 0xFFE00000u) != 0xFFE00000u) return false;   // 11-bit sync
     const uint32_t version_bits = (h >> 19) & 3;   // 0=2.5, 2=2, 3=1
     if (version_bits == 1) return false;           // reserved
@@ -183,11 +183,7 @@ bool mp3_cover_art(const uint8_t* b, size_t size,
                (static_cast<uint32_t>(p[1] & 0x7F) << 14) |
                (static_cast<uint32_t>(p[2] & 0x7F) << 7) | (p[3] & 0x7F);
     };
-    auto be32 = [](const uint8_t* p) {
-        return (static_cast<uint32_t>(p[0]) << 24) |
-               (static_cast<uint32_t>(p[1]) << 16) |
-               (static_cast<uint32_t>(p[2]) << 8) | p[3];
-    };
+    const auto& be32 = bytes::be32;
     size_t pos = 10;
     const size_t end = std::min<size_t>(size, 10 + syncsafe(b + 6));
     if (tag_flags & 0x40) {   // extended header
@@ -247,20 +243,10 @@ bool read_mp3(const std::filesystem::path& path, Mp3Data* out,
         if (error) *error = std::move(what);
         return false;
     };
-    FILE* f = _wfopen(path.c_str(), L"rb");
-    if (!f) return fail("cannot open " + path.string());
-    std::fseek(f, 0, SEEK_END);
-    const long len = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (len <= 0) {
-        std::fclose(f);
-        return fail("empty file");
-    }
-    std::vector<uint8_t> bytes(static_cast<size_t>(len));
-    const size_t got = std::fread(bytes.data(), 1, bytes.size(), f);
-    std::fclose(f);
-    if (got != bytes.size()) return fail("short read");
-    if (!decode_mp3(bytes.data(), bytes.size(), out, error)) return false;
+    const auto bytes = read_file_bytes(path);
+    if (!bytes) return fail("cannot open " + path.string());
+    if (bytes->empty()) return fail("empty file");
+    if (!decode_mp3(bytes->data(), bytes->size(), out, error)) return false;
     log_info("mp3: %u ch @%u Hz, %llu frames", out->channels,
              out->sample_rate,
              static_cast<unsigned long long>(out->frame_count()));

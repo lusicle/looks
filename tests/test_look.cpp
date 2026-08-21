@@ -123,6 +123,26 @@ TEST(sequence_add_remove_undo) {
     CHECK_EQ(d.sequences.size(), size_t{2});
 }
 
+TEST(asset_add_remove_undo) {
+    Document d;
+    doc::UndoStack undo;
+    doc::Asset a = doc::make_asset(d, "clip", "clip.mp4");
+    doc::Asset b = doc::make_asset(d, "roll", "roll.mp4");
+    const uint64_t aid = a.id;
+    undo.execute(d, doc::add_asset_command(std::move(a)));
+    undo.execute(d, doc::add_asset_command(std::move(b)));
+    CHECK_EQ(d.assets.size(), size_t{2});
+
+    // Removal un-imports the entry; undo restores it AT ITS INDEX -
+    // the first asset drives auto canvas/fps, so order carries meaning.
+    undo.execute(d, doc::remove_asset_command(aid));
+    CHECK_EQ(d.assets.size(), size_t{1});
+    CHECK(d.find_asset(aid) == nullptr);
+    undo.undo(d);
+    CHECK_EQ(d.assets.size(), size_t{2});
+    CHECK_EQ(d.assets[0].id, aid);
+}
+
 TEST(sequence_track_commands_undo) {
     Document d;
     doc::UndoStack undo;

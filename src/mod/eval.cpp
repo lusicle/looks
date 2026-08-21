@@ -5,6 +5,7 @@
 
 #include "doc/stack_commands.h"
 #include "mod/param_table.h"
+#include "util/color.h"
 #include "util/hash.h"
 
 namespace looks::mod {
@@ -141,37 +142,39 @@ float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
         const uint8_t* yrow = video->y + py * video->y_stride;
         for (int i = 0; i < nx; ++i) {
             const int px = x0 + ((x1 - x0) * i) / std::max(nx - 1, 1);
-            const float Y = static_cast<float>(yrow[px]);
+            const float yf =
+                color::y709_norm(static_cast<float>(yrow[px]));
             if (luma) {
-                sum += Y;
+                sum += yf;
                 continue;
             }
-            // Half-res chroma; BT.601 — close enough for a control
-            // value, and identical preview vs export.
-            float U, V;
+            // Half-res chroma; BT.709 limited range, the same expansion
+            // and primaries the render decodes with, so a sampled
+            // channel tracks the on-screen pixel.
+            float cb, cr;
             if (video->nv12) {
                 const uint8_t* uv = video->u +
                                     (py >> 1) * video->u_stride +
                                     ((px >> 1) << 1);
-                U = static_cast<float>(uv[0]) - 128.0f;
-                V = static_cast<float>(uv[1]) - 128.0f;
+                cb = color::chroma709_norm(static_cast<float>(uv[0]));
+                cr = color::chroma709_norm(static_cast<float>(uv[1]));
             } else {
-                U = static_cast<float>(
-                        video->u[(py >> 1) * video->u_stride +
-                                 (px >> 1)]) - 128.0f;
-                V = static_cast<float>(
-                        video->v[(py >> 1) * video->v_stride +
-                                 (px >> 1)]) - 128.0f;
+                cb = color::chroma709_norm(static_cast<float>(
+                    video->u[(py >> 1) * video->u_stride + (px >> 1)]));
+                cr = color::chroma709_norm(static_cast<float>(
+                    video->v[(py >> 1) * video->v_stride + (px >> 1)]));
             }
             switch (s.channel) {
-                case 1: sum += Y + 1.402f * V; break;
-                case 2: sum += Y - 0.344f * U - 0.714f * V; break;
-                default: sum += Y + 1.772f * U; break;
+                case 1: sum += yf + color::kCr709 * cr; break;
+                case 2:
+                    sum += yf - color::kCb709G * cb - color::kCr709G * cr;
+                    break;
+                default: sum += yf + color::kCb709 * cb; break;
             }
         }
     }
-    const float mean = sum / (static_cast<float>(nx) *
-                              static_cast<float>(ny) * 255.0f);
+    const float mean =
+        sum / (static_cast<float>(nx) * static_cast<float>(ny));
     return std::clamp(mean, 0.0f, 1.0f);
 }
 

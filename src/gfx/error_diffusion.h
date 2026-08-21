@@ -15,7 +15,7 @@ struct EffectInstance;
 
 namespace looks::gfx {
 
-// Half-float converters shared with the engine (flow-field readback).
+// Half-float decode shared with the engine (flow-field readback).
 inline float half_to_float(uint16_t h) {
     const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -42,19 +42,6 @@ inline float half_to_float(uint16_t h) {
     static_assert(sizeof(out) == sizeof(bits));
     std::memcpy(&out, &bits, sizeof(out));
     return out;
-}
-
-inline uint16_t float_to_half(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, 4);
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const int32_t exp =
-        static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
-    const uint32_t man = x & 0x7FFFFFu;
-    if (exp <= 0) return static_cast<uint16_t>(sign);            // -> 0
-    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); // clamp
-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
-                                 (man >> 13));
 }
 
 // Per-instance persistent state (temporal carry, cached Hilbert walk,

@@ -119,9 +119,7 @@ constexpr uint32_t kRows = 6;   // ceil(95 / 16)
 
 Font Font::create_debug() {
     Font font;
-    font.em_size_ = 8.0f;
     font.ascender_ = 7.0f / 8.0f;    // baseline between rows 6 and 7
-    font.descender_ = -1.0f / 8.0f;
     font.line_height_ = 1.25f;
     font.atlas_width_ = kColumns * kCell;    // 128
     font.atlas_height_ = kRows * kCell;      // 48
@@ -189,13 +187,10 @@ std::optional<Font> Font::load_msdf(const std::filesystem::path& atlas_png,
     font.atlas_rgba_ = std::move(image.pixels);
     // -yorigin top flips the metrics' vertical axis to y-down (ascender
     // comes out negative); our Glyph model is y-up, so negate.
-    font.em_size_ = static_cast<float>(atlas.get("size").as_number(32.0));
     font.px_range_ =
         static_cast<float>(atlas.get("distanceRange").as_number(4.0));
     font.ascender_ =
         -static_cast<float>(metrics.get("ascender").as_number(-0.9));
-    font.descender_ =
-        -static_cast<float>(metrics.get("descender").as_number(0.2));
     font.line_height_ =
         static_cast<float>(metrics.get("lineHeight").as_number(1.2));
 

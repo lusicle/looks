@@ -1,7 +1,18 @@
 #include "media/h264_util.h"
 
+#include "util/bytes.h"
+
 namespace looks::media {
 
+namespace {
+
+struct NalView {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    uint8_t type() const { return size ? data[0] & 0x1F : 0; }
+};
+
+// Splits an Annex B buffer (3- or 4-byte start codes) into NAL units.
 std::vector<NalView> split_annexb(const uint8_t* data, size_t size) {
     std::vector<NalView> nals;
     size_t i = 0;
@@ -23,6 +34,8 @@ std::vector<NalView> split_annexb(const uint8_t* data, size_t size) {
         nals.push_back({data + nal_start, size - nal_start});
     return nals;
 }
+
+}  // namespace
 
 bool annexb_to_avcc_sample(const uint8_t* data, size_t size,
                            std::vector<uint8_t>& out,
@@ -47,11 +60,7 @@ bool annexb_to_avcc_sample(const uint8_t* data, size_t size,
             default:
                 break;
         }
-        const uint32_t len = static_cast<uint32_t>(nal.size);
-        out.push_back(static_cast<uint8_t>(len >> 24));
-        out.push_back(static_cast<uint8_t>(len >> 16));
-        out.push_back(static_cast<uint8_t>(len >> 8));
-        out.push_back(static_cast<uint8_t>(len));
+        bytes::app_be32(out, static_cast<uint32_t>(nal.size));
         out.insert(out.end(), nal.data, nal.data + nal.size);
     }
     return idr;
@@ -67,14 +76,44 @@ std::vector<uint8_t> build_avcc(const std::vector<uint8_t>& sps,
     avcc.push_back(sps[3]);                // AVCLevelIndication
     avcc.push_back(0xFF);                  // lengthSizeMinusOne = 3
     avcc.push_back(0xE1);                  // 1 SPS
-    avcc.push_back(static_cast<uint8_t>(sps.size() >> 8));
-    avcc.push_back(static_cast<uint8_t>(sps.size()));
+    bytes::app_be16(avcc, static_cast<uint16_t>(sps.size()));
     avcc.insert(avcc.end(), sps.begin(), sps.end());
     avcc.push_back(1);                     // 1 PPS
-    avcc.push_back(static_cast<uint8_t>(pps.size() >> 8));
-    avcc.push_back(static_cast<uint8_t>(pps.size()));
+    bytes::app_be16(avcc, static_cast<uint16_t>(pps.size()));
     avcc.insert(avcc.end(), pps.begin(), pps.end());
     return avcc;
+}
+
+bool parse_avcc(const std::vector<uint8_t>& avcc, AvccInfo* out) {
+    // avcC: ver(1) profile(1) compat(1) level(1) lengthSizeMinusOne(1)
+    // numSPS(1) [len(2) sps]... numPPS(1) [len(2) pps]...
+    if (avcc.size() < 7 || avcc[0] != 1) return false;
+    out->nal_length_size = (avcc[4] & 0x3) + 1;
+    out->sps_pps_annexb.clear();
+    size_t pos = 5;
+    const int num_sps = avcc[pos++] & 0x1F;
+    auto read_sets = [&](int count) -> bool {
+        for (int i = 0; i < count; ++i) {
+            if (pos + 2 > avcc.size()) return false;
+            const size_t len = bytes::be16(avcc.data() + pos);
+            pos += 2;
+            if (pos + len > avcc.size()) return false;
+            append_annexb_nal(out->sps_pps_annexb, avcc.data() + pos, len);
+            pos += len;
+        }
+        return true;
+    };
+    if (!read_sets(num_sps)) return false;
+    if (pos >= avcc.size()) return false;
+    const int num_pps = avcc[pos++];
+    return read_sets(num_pps);
+}
+
+void append_annexb_nal(std::vector<uint8_t>& out, const uint8_t* data,
+                       size_t size) {
+    static constexpr uint8_t kStart[4] = {0, 0, 0, 1};
+    out.insert(out.end(), kStart, kStart + 4);
+    out.insert(out.end(), data, data + size);
 }
 
 }  // namespace looks::media

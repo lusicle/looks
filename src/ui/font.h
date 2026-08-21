@@ -52,9 +52,7 @@ public:
     // back to '?' (then to any glyph). Never returns null on a valid font.
     const Glyph* find_glyph(uint32_t codepoint) const;
 
-    float em_size() const { return em_size_; }          // px in atlas space
     float ascender() const { return ascender_; }        // em units
-    float descender() const { return descender_; }      // em units (negative)
     float line_height() const { return line_height_; }  // em units
 
     uint32_t atlas_width() const { return atlas_width_; }
@@ -73,9 +71,7 @@ private:
     float px_range_ = 4.0f;
     uint32_t atlas_width_ = 0;
     uint32_t atlas_height_ = 0;
-    float em_size_ = 8.0f;
     float ascender_ = 0.875f;
-    float descender_ = -0.125f;
     float line_height_ = 1.25f;
     const UiTexture* texture_ = nullptr;
 };

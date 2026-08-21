@@ -4,6 +4,8 @@
 // control never touches the CPU. Rule matches the CPU box: first rung
 // whose stream fits the budget, else the ladder's floor.
 
+#include "mosh_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -15,11 +17,6 @@ cbuffer Push
     uint4 rungs_hi;
 };
 
-uint rung_at(uint r)
-{
-    return r < 4 ? rungs_lo[r] : rungs_hi[r - 4];
-}
-
 [[vk::binding(0, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_bits;
 [[vk::binding(1, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> qsel;
 
@@ -29,13 +26,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x != 0 || tid.y != 0)
         return;
-    uint chosen = rung_at(rung_count - 1);
+    uint chosen = mosh_rung_at(rungs_lo, rungs_hi, rung_count - 1);
     for (uint r = 0; r < rung_count; ++r)
     {
         const uint bytes = header_bytes + (rate_bits[int2(int(r), 0)] + 7) / 8;
         if (bytes <= budget)
         {
-            chosen = rung_at(r);
+            chosen = mosh_rung_at(rungs_lo, rungs_hi, r);
             break;
         }
     }

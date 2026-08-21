@@ -6,6 +6,8 @@
 // attribute of the composite, never an effect pass; use_xform 0 keeps
 // the untransformed path identical for look layers.
 
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -62,9 +64,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     {
     case 1: blended = a.rgb + bu; break;
     case 2: blended = a.rgb * bu; break;
-    case 3:
-        blended = 1.0 - (1.0 - saturate(a.rgb)) * (1.0 - saturate(bu));
-        break;
+    case 3: blended = fx_screen(a.rgb, bu); break;
     case 4: blended = abs(a.rgb - bu); break;
     default: blended = bu; break;
     }

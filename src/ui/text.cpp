@@ -23,7 +23,7 @@ float draw_text(Canvas2D& canvas, const Font& font, std::string_view text,
     // the 8x8 debug font at integer scales this keeps glyphs pixel-exact.
     const float scale = canvas.scale();
     auto snap = [&](float v) {
-        return canvas.pixel_snap() ? std::floor(v * scale + 0.5f) / scale : v;
+        return std::floor(v * scale + 0.5f) / scale;
     };
 
     const float baseline = snap(top_left.y + font.ascender() * size);

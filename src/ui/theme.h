@@ -40,7 +40,6 @@ const char* theme_name(int index);
 const Theme& theme_preset(int index);
 const Theme& active_theme();
 void set_active_theme(int index);   // wrapped into range
-int active_theme_index();
 
 inline Color lerp(Color a, Color b, float t) {
     return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,

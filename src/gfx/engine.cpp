@@ -13,6 +13,7 @@
 #include "gfx/error_diffusion.h"
 #include "gfx/graph.h"
 #include "gfx/vk_device.h"
+#include "util/color.h"
 #include "util/file.h"
 #include "util/hash.h"
 #include "util/image.h"
@@ -21,6 +22,30 @@
 namespace looks::gfx {
 
 namespace {
+
+// xorshift32 walk for procedural atlas/plate content: stable per seed
+// and deliberately decoupled from the effect-hash family, so a change
+// to the project hash never redraws these baked assets.
+struct XorShift32 {
+    uint32_t s;
+    uint32_t next() {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        return s;
+    }
+};
+
+// Hash-shuffle the first n entries of order (Fisher-Yates).
+void seeded_shuffle(uint8_t* order, int n, uint32_t seed) {
+    XorShift32 rng{seed};
+    for (int i = n - 1; i > 0; --i) {
+        const int j = static_cast<int>(rng.next() % (i + 1));
+        const uint8_t tmpv = order[i];
+        order[i] = order[j];
+        order[j] = tmpv;
+    }
+}
 
 struct FxShaderDesc {
     const char* spv_name;
@@ -179,7 +204,7 @@ codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
             mp.mv_random = p[3];
             mp.residual_corrupt = p[4];
             mp.p_repeat = static_cast<int>(p[5]);
-            mp.mv_rotate = p[6] * 0.01745329252f;
+            mp.mv_rotate = p[6] * doc::kDeg2Rad;
             mp.byte_flips = static_cast<uint32_t>(p[7]);
             mp.mv_field = static_cast<int>(p[8] + 0.5f);
             mp.mv_field_amount = p[9];
@@ -551,17 +576,8 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                 (tile * 8 + 47) / 95;   // 0..8 dots, rounded ramp
             // Stable dot pick: knuth-hash the tile, take `lit` of the 8
             // dot slots in a hash-shuffled order.
-            uint32_t hash = tile * 2654435761u + 0x9E3779B9u;
             uint8_t order[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-            for (int i = 7; i > 0; --i) {
-                hash ^= hash << 13;
-                hash ^= hash >> 17;
-                hash ^= hash << 5;
-                const int j = static_cast<int>(hash % (i + 1));
-                const uint8_t tmpv = order[i];
-                order[i] = order[j];
-                order[j] = tmpv;
-            }
+            seeded_shuffle(order, 8, tile * 2654435761u + 0x9E3779B9u);
             for (uint32_t d = 0; d < lit && d < 8; ++d) {
                 const uint32_t slot = order[d];
                 const uint32_t dx = tx + 2 + (slot & 1u) * 3;   // cols 2/5
@@ -592,17 +608,8 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             const uint32_t tx = (tile % 16) * 8;
             const uint32_t ty = (tile / 16) * 8;
             const uint32_t lit = (tile * 6 + 47) / 95;   // 0..6 blocks
-            uint32_t hash = tile * 2246822519u + 0x9E3779B9u;
             uint8_t order[6] = {0, 1, 2, 3, 4, 5};
-            for (int i = 5; i > 0; --i) {
-                hash ^= hash << 13;
-                hash ^= hash >> 17;
-                hash ^= hash << 5;
-                const int j = static_cast<int>(hash % (i + 1));
-                const uint8_t tmpv = order[i];
-                order[i] = order[j];
-                order[j] = tmpv;
-            }
+            seeded_shuffle(order, 6, tile * 2246822519u + 0x9E3779B9u);
             // Sextant grid inside the 8x8 tile: cols [0,4)/[4,8),
             // rows [0,3)/[3,6)/[6,8) — full-bleed mosaic blocks.
             for (uint32_t b = 0; b < lit && b < 6; ++b) {
@@ -642,20 +649,14 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             plate.resize(static_cast<size_t>(pw) * ph);
             for (size_t i = 0; i < plate.size(); ++i) {
                 const uint8_t* p = img.pixels.data() + i * 4;
-                plate[i] = static_cast<uint8_t>(
-                    (p[0] * 54u + p[1] * 183u + p[2] * 19u) >> 8);
+                plate[i] = color::luma709_u8(p[0], p[1], p[2]);
             }
         } else {
             // Grunge fallback: mostly-white plate with hashed blotch
             // clusters and a few long fibers.
             plate.assign(static_cast<size_t>(kDustW) * kDustH, 255);
-            uint32_t h32 = 0x9E3779B9u;
-            auto next = [&h32] {
-                h32 ^= h32 << 13;
-                h32 ^= h32 >> 17;
-                h32 ^= h32 << 5;
-                return h32;
-            };
+            XorShift32 rng{0x9E3779B9u};
+            auto next = [&rng] { return rng.next(); };
             for (int blob = 0; blob < 90; ++blob) {
                 const uint32_t bx = next() % kDustW;
                 const uint32_t by = next() % kDustH;
@@ -1458,8 +1459,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // source sizes must not resize the graph.
     // Working dimensions shrink under the preview proxy — kernels sample
     // by uv, so everything scales; even dims keep the codec paths happy.
-    const uint32_t w = std::max((canvas_w / preview_divisor_) & ~1u, 2u);
-    const uint32_t h = std::max((canvas_h / preview_divisor_) & ~1u, 2u);
+    const uint32_t w = even_down(canvas_w, preview_divisor_);
+    const uint32_t h = even_down(canvas_h, preview_divisor_);
 
     // ---- frame render cache. First harvest the readback this
     // slot recorded kFramesInFlight renders ago — the caller has waited the
@@ -1895,7 +1896,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 push[6] = (layer.flip_h ? 1u : 0u) |
                           (layer.flip_v ? 2u : 0u);
                 push[7] = as_bits(layer.xf_scale);
-                push[8] = as_bits(layer.xf_rotate * 0.01745329252f);
+                push[8] = as_bits(layer.xf_rotate * doc::kDeg2Rad);
                 const GpuImage* sampled[1] = {input_image(0)};
                 layer_transform_->dispatch(rec, arena_, frame_index, sampled,
                                            1, &dst, 1, push, sizeof(push), w,

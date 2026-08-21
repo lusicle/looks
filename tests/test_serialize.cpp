@@ -531,7 +531,11 @@ TEST(group_commands_lifecycle) {
 
 TEST(group_bypass_compiles_out) {
     Document d;
-    d.looks[0].layers[0].asset = d.next_effect_id++;
+    doc::Asset media;
+    media.id = d.next_effect_id++;
+    media.frame_count = 100;
+    d.assets.push_back(media);
+    d.looks[0].layers[0].asset = media.id;
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Pixelate));
     doc::Group g = doc::make_group(d, "off");

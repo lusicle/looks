@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "media/bmff.h"
 #include "util/log.h"
 
 namespace looks::media {
@@ -77,10 +78,7 @@ std::shared_ptr<const codec::DecodedFrame> nv12_to_decoded(
 
 bool read_sample_at(FILE* file, const FrameIndex::Sample& s,
                     std::vector<uint8_t>& out) {
-    if (_fseeki64(file, static_cast<int64_t>(s.offset), SEEK_SET) != 0)
-        return false;
-    out.resize(s.size);
-    return std::fread(out.data(), 1, s.size, file) == s.size;
+    return BmffFile::read_at(file, s.offset, s.size, out);
 }
 
 }  // namespace

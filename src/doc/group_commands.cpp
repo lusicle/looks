@@ -8,12 +8,6 @@ namespace looks::doc {
 
 namespace {
 
-Group* find_group(Layer& layer, uint64_t group_id) {
-    for (Group& g : layer.groups)
-        if (g.id == group_id) return &g;
-    return nullptr;
-}
-
 class GroupEffectsCommand final : public LookCommand {
 public:
     GroupEffectsCommand(uint64_t look, size_t layer_index, Group group,
@@ -127,15 +121,18 @@ public:
     std::string name() const override { return "Edit Group"; }
 
     void apply(Document& doc) override {
-        Group* g = find_group(look_of(doc).layers[layer_index_], updated_.id);
-        assert(g);
+        Look& look = look_of(doc);
+        if (layer_index_ >= look.layers.size()) return;
+        Group* g = find_group(look.layers[layer_index_], updated_.id);
+        if (!g) return;
         old_ = *g;
         *g = updated_;
     }
 
     void revert(Document& doc) override {
-        if (Group* g =
-                find_group(look_of(doc).layers[layer_index_], updated_.id))
+        Look& look = look_of(doc);
+        if (layer_index_ >= look.layers.size()) return;
+        if (Group* g = find_group(look.layers[layer_index_], updated_.id))
             *g = old_;
     }
 

@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include "mod/fft.h"
+#include "util/bytes.h"
+#include "util/file.h"
 
 namespace looks::mod {
 
@@ -202,18 +204,9 @@ void VideoAnalyzer::finish(AnalysisData* out) {
 
 namespace {
 
-void put_u32(std::vector<uint8_t>& out, uint32_t v) {
-    out.push_back(static_cast<uint8_t>(v));
-    out.push_back(static_cast<uint8_t>(v >> 8));
-    out.push_back(static_cast<uint8_t>(v >> 16));
-    out.push_back(static_cast<uint8_t>(v >> 24));
-}
-
-void put_f32(std::vector<uint8_t>& out, float v) {
-    uint32_t bits;
-    std::memcpy(&bits, &v, 4);
-    put_u32(out, bits);
-}
+using bytes::app_f32;
+using bytes::app_le32;
+using Reader = bytes::LeReader;
 
 void put_curve(std::vector<uint8_t>& out, const char* name,
                const std::vector<float>& curve, uint32_t frame_count) {
@@ -221,35 +214,8 @@ void put_curve(std::vector<uint8_t>& out, const char* name,
     out.push_back(static_cast<uint8_t>(len));
     out.insert(out.end(), name, name + len);
     for (uint32_t i = 0; i < frame_count; ++i)
-        put_f32(out, i < curve.size() ? curve[i] : 0.0f);
+        app_f32(out, i < curve.size() ? curve[i] : 0.0f);
 }
-
-struct Reader {
-    const uint8_t* p;
-    const uint8_t* end;
-    bool ok = true;
-
-    uint32_t u32() {
-        if (end - p < 4) { ok = false; return 0; }
-        uint32_t v = static_cast<uint32_t>(p[0]) | (p[1] << 8) | (p[2] << 16) |
-                     (static_cast<uint32_t>(p[3]) << 24);
-        p += 4;
-        return v;
-    }
-    float f32() {
-        const uint32_t bits = u32();
-        float v;
-        std::memcpy(&v, &bits, 4);
-        return v;
-    }
-    double f64() {
-        if (end - p < 8) { ok = false; return 0; }
-        double v;
-        std::memcpy(&v, p, 8);
-        p += 8;
-        return v;
-    }
-};
 
 }  // namespace
 
@@ -257,13 +223,13 @@ bool write_analysis(const std::filesystem::path& path,
                     const AnalysisData& data) {
     std::vector<uint8_t> out;
     out.insert(out.end(), {'A', 'N', 'L', '1'});
-    put_u32(out, 1);
+    app_le32(out, 1);
     uint64_t fps_bits;
     std::memcpy(&fps_bits, &data.fps, 8);
     for (int i = 0; i < 8; ++i)
         out.push_back(static_cast<uint8_t>(fps_bits >> (i * 8)));
-    put_u32(out, data.frame_count);
-    put_f32(out, data.bpm);
+    app_le32(out, data.frame_count);
+    app_f32(out, data.bpm);
 
     const std::pair<const char*, const std::vector<float>*> curves[] = {
         {"low", &data.low},           {"mid", &data.mid},
@@ -271,7 +237,7 @@ bool write_analysis(const std::filesystem::path& path,
         {"motion", &data.motion},     {"brightness", &data.brightness},
         {"cut", &data.cut},
     };
-    put_u32(out, static_cast<uint32_t>(std::size(curves)));
+    app_le32(out, static_cast<uint32_t>(std::size(curves)));
     for (const auto& [name, curve] : curves)
         put_curve(out, name, *curve, data.frame_count);
 
@@ -283,19 +249,11 @@ bool write_analysis(const std::filesystem::path& path,
 }
 
 bool load_analysis(const std::filesystem::path& path, AnalysisData* out) {
-    FILE* f = _wfopen(path.c_str(), L"rb");
-    if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
-    const long size = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> bytes(static_cast<size_t>(std::max(0l, size)));
-    const bool read_ok =
-        std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
-    std::fclose(f);
-    if (!read_ok || bytes.size() < 24) return false;
-    if (std::memcmp(bytes.data(), "ANL1", 4) != 0) return false;
+    const auto bytes = read_file_bytes(path);
+    if (!bytes || bytes->size() < 24) return false;
+    if (std::memcmp(bytes->data(), "ANL1", 4) != 0) return false;
 
-    Reader r{bytes.data() + 4, bytes.data() + bytes.size()};
+    Reader r{bytes->data() + 4, bytes->data() + bytes->size()};
     if (r.u32() != 1) return false;
     out->fps = r.f64();
     out->frame_count = r.u32();

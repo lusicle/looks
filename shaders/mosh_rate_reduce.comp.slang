@@ -5,6 +5,8 @@
 // Intra edge fillers repeat the predictor (chain-transparent, bounded
 // lookback); P fillers are zero blocks that reset it.
 
+#include "mosh_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -18,20 +20,6 @@ cbuffer Push
 
 [[vk::binding(0, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_dc;
 [[vk::binding(1, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_bits;
-
-uint ue_bits(uint v)
-{
-    const uint x = v + 1;
-    uint bits = 0;
-    while ((x >> bits) > 1)
-        ++bits;
-    return 2 * bits + 1;
-}
-
-uint se_bits(int v)
-{
-    return ue_bits(v > 0 ? uint(v) * 2 - 1 : uint(-v) * 2);
-}
 
 // Sequence index -> block coordinates for this plane's traversal.
 int2 seq_to_block(uint seq, uint mb_w)

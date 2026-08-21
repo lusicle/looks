@@ -4,6 +4,8 @@
 // reciprocal size, output pixels); outside it the target is transparent
 // black - sources never stretch to the canvas.
 
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -22,13 +24,6 @@ cbuffer Push
 [[vk::binding(1, 0)]] Sampler2D plane_u;
 [[vk::binding(2, 0)]] Sampler2D plane_v;
 [[vk::binding(3, 0)]] RWTexture2D<float4> output;
-
-float3 srgb_eotf(float3 encoded)
-{
-    const float3 hi = pow((encoded + 0.055) / 1.055, 2.4);
-    const float3 lo = encoded / 12.92;
-    return lerp(hi, lo, step(encoded, 0.04045));
-}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -54,10 +49,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float crf = (cr * 255.0 - 128.0) / 224.0;
 
     float3 rgb;
-    rgb.r = yf + 1.5748 * crf;
-    rgb.g = yf - 0.1873 * cbf - 0.4681 * crf;
-    rgb.b = yf + 1.8556 * cbf;
+    rgb.r = yf + kFxCr709 * crf;
+    rgb.g = yf - kFxCb709G * cbf - kFxCr709G * crf;
+    rgb.b = yf + kFxCb709 * cbf;
     rgb = saturate(rgb);
 
-    output[tid.xy] = float4(srgb_eotf(rgb), 1.0);
+    output[tid.xy] = float4(fx_srgb_eotf(rgb), 1.0);
 }

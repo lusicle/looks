@@ -560,9 +560,7 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
                         right = &p;
             if (!right) continue;
             Placement np = *right;
-            np.source_in += static_cast<uint32_t>(std::llround(
-                (static_cast<double>(t1) - np.t_in) * np.speed));
-            np.t_in = t1;
+            trim_placement_head(np, t1);
             undo.execute(doc, set_placement_command(sequence, np));
             continue;
         }
@@ -575,9 +573,7 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
         } else {
             // Its head sits under: slide the start past the newcomer,
             // source_in follows so the surviving content holds still.
-            np.source_in += static_cast<uint32_t>(std::llround(
-                (static_cast<double>(t1) - np.t_in) * np.speed));
-            np.t_in = t1;
+            trim_placement_head(np, t1);
         }
         undo.execute(doc, set_placement_command(sequence, np));
     }

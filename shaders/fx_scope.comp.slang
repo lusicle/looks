@@ -98,9 +98,10 @@ void main(uint3 tid : SV_DispatchThreadID)
                 input.SampleLevel(float2(su, sv), 0).rgb;
             const float3 enc = fx_srgb_oetf(saturate(rgb));
             const float l = fx_luma(enc);
-            const float cb = (enc.b - l) * 0.564;
-            const float cr = (enc.r - l) * 0.713;
-            const float2 pos = float2(cb, -cr) * 1.8 * gain;
+            // Same chroma scales as the NV12 encoder: the ring reads in
+            // the units the export actually emits.
+            const float2 cbcr = fx_rgb_to_cbcr709(enc, l);
+            const float2 pos = float2(cbcr.x, -cbcr.y) * 1.8 * gain;
             const float d_px = length(pos - ndc) * 0.5 * size.y;
             const float a = exp(-d_px * d_px * 0.28);
             const float3 dot_col =

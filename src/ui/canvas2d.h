@@ -49,13 +49,10 @@ public:
 
     float scale() const { return scale_; }
     Vec2 viewport() const { return viewport_logical_; }
-    bool pixel_snap() const { return pixel_snap_; }
-    void set_pixel_snap(bool snap) { pixel_snap_ = snap; }
 
     // ---- primitives (logical px)
     void draw_rect(const Rect& r, Color color);
     void draw_rect_outline(const Rect& r, float stroke, Color color);
-    void draw_gradient_quad(const Rect& r, Color tl, Color tr, Color br, Color bl);
     void draw_triangle(Vec2 a, Vec2 b, Vec2 c, Color color);
     void draw_line(Vec2 a, Vec2 b, float thickness, Color color);
     void draw_sdf_rect(const Rect& r, float radius, Color color);
@@ -98,7 +95,6 @@ private:
     std::vector<Rect> clip_stack_;   // physical px
     float scale_ = 1.0f;
     Vec2 viewport_logical_{};
-    bool pixel_snap_ = true;
     bool warned_overflow_ = false;
 };
 

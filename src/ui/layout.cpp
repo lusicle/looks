@@ -232,7 +232,6 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
             desired = measure_stack(node, c, frame, false);
             break;
         case NodeKind::ZStack:
-        case NodeKind::Clip:
         case NodeKind::Padding: {
             Constraints inner = c;
             inner.min_w = inner.min_h = 0;
@@ -285,8 +284,7 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
 
 void arrange(LayoutNode& node, const Rect& rect, const Rect& parent_clip) {
     node.rect = rect;
-    const bool narrows = node.kind == NodeKind::ScrollArea ||
-                         node.kind == NodeKind::Clip;
+    const bool narrows = node.kind == NodeKind::ScrollArea;
     node.clip = narrows
         ? (parent_clip.empty() ? rect : rect.intersect(parent_clip))
         : parent_clip;
@@ -301,7 +299,6 @@ void arrange(LayoutNode& node, const Rect& rect, const Rect& parent_clip) {
             arrange_stack(node, rect, node.clip, false);
             break;
         case NodeKind::ZStack:
-        case NodeKind::Clip:
         case NodeKind::Padding: {
             const Rect inner{rect.x + node.padding.l, rect.y + node.padding.t,
                              rect.w - node.padding.l - node.padding.r,
@@ -439,6 +436,37 @@ static LayoutNode* make_stack(LayoutArena& arena, NodeKind kind,
     return with_children(arena, n, children);
 }
 
+static LayoutNode* make_stack_dyn(LayoutArena& arena, NodeKind kind,
+                                  const StackOpts& opts,
+                                  const std::vector<LayoutNode*>& children) {
+    LayoutNode* n = make_node(arena, kind);
+    n->gap = opts.gap;
+    n->padding = opts.padding;
+    n->justify = opts.justify;
+    n->cross_align = opts.cross_align;
+    n->width = opts.width;
+    n->height = opts.height;
+    size_t count = 0;
+    for (LayoutNode* c : children)
+        if (c) ++count;
+    n->children = arena.alloc<LayoutNode*>(count);
+    n->child_count = static_cast<uint16_t>(count);
+    size_t i = 0;
+    for (LayoutNode* c : children)
+        if (c) n->children[i++] = c;
+    return n;
+}
+
+LayoutNode* VStackDyn(LayoutArena& arena, const StackOpts& opts,
+                      const std::vector<LayoutNode*>& children) {
+    return make_stack_dyn(arena, NodeKind::VStack, opts, children);
+}
+
+LayoutNode* HStackDyn(LayoutArena& arena, const StackOpts& opts,
+                      const std::vector<LayoutNode*>& children) {
+    return make_stack_dyn(arena, NodeKind::HStack, opts, children);
+}
+
 LayoutNode* VStack(LayoutArena& arena, const StackOpts& opts,
                    std::initializer_list<LayoutNode*> children) {
     return make_stack(arena, NodeKind::VStack, opts, children);
@@ -486,10 +514,6 @@ LayoutNode* ScrollAreaV(LayoutArena& arena, ScrollState* state,
         draw_scrollbar(node, frame);
     };
     return with_children(arena, n, {child});
-}
-
-LayoutNode* Clip(LayoutArena& arena, LayoutNode* child) {
-    return with_children(arena, make_node(arena, NodeKind::Clip), {child});
 }
 
 }  // namespace looks::ui

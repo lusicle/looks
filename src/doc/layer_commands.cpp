@@ -7,12 +7,6 @@ namespace looks::doc {
 
 namespace {
 
-Layer* find_layer(Look& look, uint64_t layer_id) {
-    for (Layer& l : look.layers)
-        if (l.id == layer_id) return &l;
-    return nullptr;
-}
-
 class AddLayerCommand final : public LookCommand {
 public:
     AddLayerCommand(uint64_t look, Layer layer, size_t insert_index)
@@ -116,29 +110,6 @@ private:
     int direction_;
 };
 
-class ReplaceLayerCommand final : public LookCommand {
-public:
-    ReplaceLayerCommand(uint64_t look, size_t index, Layer fresh)
-        : LookCommand(look), index_(index), fresh_(std::move(fresh)) {}
-    std::string name() const override { return "Reset Layer"; }
-
-    void apply(Document& doc) override {
-        Look& look = look_of(doc);
-        assert(index_ < look.layers.size());
-        old_ = look.layers[index_];
-        look.layers[index_] = fresh_;
-    }
-
-    void revert(Document& doc) override {
-        look_of(doc).layers[index_] = old_;
-    }
-
-private:
-    size_t index_;
-    Layer fresh_;
-    Layer old_;
-};
-
 // The placement list holding an id, wherever it lives - a video lane or
 // an audio track - plus the index inside it.
 std::vector<Placement>* placement_container(Sequence& seq,
@@ -237,12 +208,8 @@ PlacementSplit split_of(Document& doc, const Placement& place, uint32_t at) {
     s.left_id = place.id;
     s.right = place;
     s.right.id = doc.next_effect_id++;
-    s.right.t_in = at;
     s.right.t_out = place.t_out;   // 0 stays "to the source end"
-    const double cut_src =
-        placement_source_frame(place, static_cast<double>(at));
-    s.right.source_in =
-        cut_src <= 0.0 ? 0u : static_cast<uint32_t>(cut_src);
+    trim_placement_head(s.right, at);
     return s;
 }
 
@@ -364,11 +331,6 @@ std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated) {
 std::unique_ptr<Command> move_layer_command(uint64_t look, size_t index,
                                             int direction) {
     return std::make_unique<MoveLayerCommand>(look, index, direction);
-}
-
-std::unique_ptr<Command> replace_layer_command(uint64_t look, size_t index,
-                                               Layer fresh) {
-    return std::make_unique<ReplaceLayerCommand>(look, index, std::move(fresh));
 }
 
 }  // namespace looks::doc
