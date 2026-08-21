@@ -13,6 +13,9 @@ cbuffer Push
     float rect_y;
     float inv_fit_w;
     float inv_fit_h;
+    // NV12 chroma: plane_u is the interleaved RG8 CbCr texture (bound to
+    // both chroma slots) - Cb in .r either way, Cr moves to plane_u.g.
+    uint nv12;
 };
 
 [[vk::binding(0, 0)]] Sampler2D plane_y;
@@ -43,7 +46,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float y = plane_y.SampleLevel(uv, 0).r;
     const float cb = plane_u.SampleLevel(uv, 0).r;
-    const float cr = plane_v.SampleLevel(uv, 0).r;
+    const float cr = nv12 != 0 ? plane_u.SampleLevel(uv, 0).g
+                               : plane_v.SampleLevel(uv, 0).r;
 
     const float yf = (y * 255.0 - 16.0) / 219.0;
     const float cbf = (cb * 255.0 - 128.0) / 224.0;

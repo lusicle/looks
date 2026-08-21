@@ -32,6 +32,10 @@ struct SourcePlanes {
     size_t v_stride = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    // NV12: `u` is the interleaved CbCr plane (u_stride = bytes per row,
+    // 2 bytes per chroma sample), `v` unused. The native decode path
+    // hands the decoder's buffer through untouched - no deinterleave.
+    bool nv12 = false;
 };
 
 class Engine {
@@ -119,6 +123,11 @@ public:
     // rect {x, y, w, h}. Valid only after the submission that recorded it
     // has fenced. False: nothing measured, or fully transparent content.
     bool read_measure_bounds(float rect[4]) const;
+    // Did the LAST render() record a measure tap? A pipelined caller
+    // snapshots this per submission and reads the bounds only at that
+    // submission's fence (measures are one-shot per selection, so two
+    // in flight never both record one).
+    bool measure_recorded() const;
 
     RenderCache& cache() { return cache_; }
 
@@ -166,7 +175,8 @@ public:
 
 private:
     explicit Engine(Device& device)
-        : device_(device), arena_(device), pool_(device) {}
+        : device_(device), arena_(device),
+          pools_{TargetPool(device), TargetPool(device)} {}
 
     bool init(const std::filesystem::path& shader_dir);
     bool ensure_prev_ref(uint32_t width, uint32_t height);
@@ -176,7 +186,11 @@ private:
 
     Device& device_;
     DescriptorArena arena_;
-    TargetPool pool_;
+    TargetPool pools_[kFramesInFlight];
+    // The slot whose intermediates this render may touch - set at render()
+    // entry. Per-slot pools let frame N record while N-1 still executes:
+    // shared intermediates would be a GPU data race.
+    TargetPool* pool_ = nullptr;
     std::unique_ptr<StagingBuffer> staging_[kFramesInFlight];
     // Previous frame's REFERENCE luma for flow/motion. Valid only when
     // this render's timeline frame directly follows the last one AND the
@@ -349,9 +363,10 @@ private:
     // key, not a layer index: two placements of one look each want their
     // own decoded frame.
     struct LayerPlanes {
-        std::unique_ptr<GpuImage> y, u, v;
+        std::unique_ptr<GpuImage> y, u, v;   // v empty for NV12 media
         uint32_t width = 0, height = 0;
-        uint64_t stamp = 0;   // content already uploaded (0 = none)
+        bool nv12 = false;   // u is the interleaved RG8 CbCr texture
+        uint64_t stamp = 0;  // content already uploaded (0 = none)
     };
     std::unordered_map<uint64_t, LayerPlanes> layer_planes_;
     std::unique_ptr<ComputePipeline> layer_transform_;

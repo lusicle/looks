@@ -40,8 +40,17 @@ struct DecodedFrame {
     // slowed placements, paused re-renders) can skip re-copying megabytes
     // of identical planes. 0 = unstamped, always treated as fresh.
     uint64_t stamp = 0;
+    // NV12 carriage (native decode, zero-copy): `y` holds the decoder's
+    // WHOLE buffer - Y rows then interleaved CbCr rows at the same
+    // stride; u/v vectors stay empty and view() points the chroma plane
+    // into the buffer. The codec paths never see NV12 frames.
+    bool nv12 = false;
 
     FrameView view() const {
+        if (nv12)
+            return {{y.data(), y_stride},
+                    {y.data() + y_stride * height, y_stride},
+                    {nullptr, 0}, width, height};
         return {{y.data(), y_stride}, {u.data(), uv_stride},
                 {v.data(), uv_stride}, width, height};
     }

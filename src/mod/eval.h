@@ -67,6 +67,9 @@ struct SourceFrameView {
     const uint8_t* v = nullptr;
     int v_stride = 0;
     int width = 0, height = 0;
+    // NV12: `u` is the interleaved CbCr plane (2 bytes per sample), `v`
+    // unused - same layout the native decode path uploads.
+    bool nv12 = false;
 };
 
 // One source's value at time t (seconds, = frame/fps). Deterministic.

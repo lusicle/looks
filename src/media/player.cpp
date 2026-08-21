@@ -1,5 +1,7 @@
 #include "media/player.h"
 
+#include <cmath>
+
 #include <miniaudio.h>
 
 #include <algorithm>
@@ -112,9 +114,16 @@ struct Player::Impl {
 
     uint64_t frame_to_cursor(uint32_t frame) const {
         const double f = fps.load(std::memory_order_relaxed);
-        return static_cast<uint64_t>(
-            static_cast<double>(frame) / (f > 0.0 ? f : 30.0) * clock_rate +
-            0.5);
+        // First cursor tick AT OR AFTER the frame's start: flooring back
+        // through cursor_to_frame lands on the same frame for any rate.
+        // Nearest-rounding can land one tick before the boundary when
+        // fps does not divide the clock rate, and every consumer that
+        // round-trips a frame through the cursor (seek, trim and loop
+        // clamps, configure's reclamp) then reads the previous frame.
+        return static_cast<uint64_t>(std::ceil(
+            static_cast<double>(frame) / (f > 0.0 ? f : 30.0) *
+                clock_rate -
+            1e-6));
     }
 
     uint32_t cursor_to_frame(uint64_t c) const {

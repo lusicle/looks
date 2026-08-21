@@ -340,6 +340,7 @@ inline std::vector<gfx::Engine::LayerSourceFrame> to_layer_sources(
         gfx::Engine::LayerSourceFrame lf;
         lf.key = sf.key;
         lf.content_stamp = sf.frame->stamp;
+        lf.planes.nv12 = sf.frame->nv12;
         lf.planes.y = view.y.data;
         lf.planes.y_stride = view.y.stride;
         lf.planes.u = view.u.data;
@@ -524,6 +525,7 @@ struct RenderWorker {
         // pre-Motion alpha bounds for the monitor's content box.
         uint64_t sel_placement = 0;
         uint32_t preview_div = 1;
+        uint32_t pub_w = 0, pub_h = 0;
         bool live_mode = false;
         double app_seconds = 0.0;
         double env_key_time = -1.0;
@@ -577,15 +579,19 @@ struct RenderWorker {
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cb.commandPool = pool_;
         cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cb.commandBufferCount = 1;
-        if (vkAllocateCommandBuffers(device.device(), &cb, &cmd_) !=
+        cb.commandBufferCount = gfx::kFramesInFlight;
+        if (vkAllocateCommandBuffers(device.device(), &cb, cmd_) !=
             VK_SUCCESS)
             return false;
         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if (vkCreateFence(device.device(), &fence_info, nullptr, &fence_) !=
-            VK_SUCCESS)
-            return false;
-        published_.resize(3);
+        for (uint32_t i = 0; i < gfx::kFramesInFlight; ++i)
+            if (vkCreateFence(device.device(), &fence_info, nullptr,
+                              &fence_[i]) != VK_SUCCESS)
+                return false;
+        // latest_ (UI-visible) + kFramesInFlight submissions writing +
+        // one free target; a smaller ring starves the pipelined loop
+        // into publish-slot retries.
+        published_.resize(2 + gfx::kFramesInFlight);
         thread_ = std::thread([this] { run(); });
         return true;
     }
@@ -601,9 +607,11 @@ struct RenderWorker {
         published_.clear();
         graveyard_.clear();
         engine.reset();
-        if (fence_) vkDestroyFence(device.device(), fence_, nullptr);
+        for (uint32_t i = 0; i < gfx::kFramesInFlight; ++i) {
+            if (fence_[i]) vkDestroyFence(device.device(), fence_[i], nullptr);
+            fence_[i] = VK_NULL_HANDLE;
+        }
         if (pool_) vkDestroyCommandPool(device.device(), pool_, nullptr);
-        fence_ = VK_NULL_HANDLE;
         pool_ = VK_NULL_HANDLE;
     }
 
@@ -767,8 +775,21 @@ private:
 
     std::thread thread_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    // Per-slot command buffers and fences: the cycle waits the fence of
+    // the slot it is about to REUSE, not the one it just submitted, so
+    // the next frame's decode/resolve/record overlaps the previous
+    // frame's GPU execution. The publish handoff defers to that wait.
+    VkCommandBuffer cmd_[gfx::kFramesInFlight] = {};
+    VkFence fence_[gfx::kFramesInFlight] = {};
+    struct InFlight {
+        bool pending = false;
+        bool published_ok = false;
+        int target = -1;
+        uint64_t doc_revision = 0;
+        uint64_t sel_placement = 0;
+        bool measured = false;
+    };
+    InFlight inflight_[gfx::kFramesInFlight];
 };
 
 bool RenderWorker::ensure_published(Published& p, uint32_t w, uint32_t h,
@@ -901,10 +922,40 @@ void RenderWorker::run() {
     uint32_t slot = 0;
     std::chrono::steady_clock::time_point cycle_start{};
 
+    // Retire a slot's submission: wait its fence (the cycle's only GPU
+    // sync) and hand its publish target to the UI. Returns the wait's
+    // wall time - near zero once the GPU runs ahead of the CPU.
+    auto complete_slot = [&](uint32_t s) -> double {
+        InFlight& fl = inflight_[s];
+        if (!fl.pending) return 0.0;
+        const auto w0 = std::chrono::steady_clock::now();
+        vkWaitForFences(device.device(), 1, &fence_[s], VK_TRUE, UINT64_MAX);
+        const double wait_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - w0)
+                .count();
+        fl.pending = false;
+        if (fl.published_ok && fl.target >= 0) {
+            Published& fpub = published_[static_cast<size_t>(fl.target)];
+            float mb[4];
+            const bool mb_ok =
+                fl.measured && engine->read_measure_bounds(mb);
+            std::lock_guard<std::mutex> lock(m_);
+            fpub.doc_revision = fl.doc_revision;
+            fpub.bounds_valid = mb_ok;
+            fpub.bounds_placement = mb_ok ? fl.sel_placement : 0;
+            if (mb_ok)
+                for (int i = 0; i < 4; ++i) fpub.bounds[i] = mb[i];
+            fpub.ready = true;
+            latest_ = fl.target;
+        }
+        return wait_ms;
+    };
+
     for (;;) {
         // Small-field snapshot; doc/analysis copied only on change.
         uint64_t preview_node, preview_layer, look_id, sel_placement;
-        uint32_t preview_div;
+        uint32_t preview_div, pub_w, pub_h;
         bool live_mode, want_source, proxy_active, interactive;
         double app_seconds, env_key_time;
         bool doc_changed = false;
@@ -922,7 +973,16 @@ void RenderWorker::run() {
                 perf_.trace = nullptr;
                 return;
             }
-            if (pause_count_ > 0) continue;
+            if (pause_count_ > 0) {
+                // Paused means QUIESCENT: callers mutate bundles and
+                // rewrite media after pause(), so nothing may be in
+                // flight when they proceed.
+                lock.unlock();
+                for (uint32_t s = 0; s < gfx::kFramesInFlight; ++s)
+                    complete_slot(s);
+                lock.lock();
+                continue;
+            }
             idle_ = false;
             // The serial bumps only on REAL job-field changes (selection,
             // scope, proxy...) - a paused preview re-renders on those too.
@@ -994,6 +1054,8 @@ void RenderWorker::run() {
             sel_placement = job_.sel_placement;
             look_id = job_.look_id;
             preview_div = job_.preview_div;
+            pub_w = job_.pub_w;
+            pub_h = job_.pub_h;
             live_mode = job_.live_mode;
             app_seconds = job_.app_seconds;
             env_key_time = job_.env_key_time;
@@ -1064,6 +1126,7 @@ void RenderWorker::run() {
             sfv.v_stride = ref->planes.v_stride;
             sfv.width = static_cast<int>(ref->planes.width);
             sfv.height = static_cast<int>(ref->planes.height);
+            sfv.nv12 = ref->planes.nv12;
         }
         const doc::Document resolved = mod::resolve(
             doc, mod_frame, mod_fps, has_analysis ? &analysis : nullptr,
@@ -1108,16 +1171,43 @@ void RenderWorker::run() {
             }
         }
 
-        // Pick a publish slot the UI is provably done with.
-        const uint32_t pw = std::max((canvas_w / preview_div) & ~1u, 2u);
-        const uint32_t ph = std::max((canvas_h / preview_div) & ~1u, 2u);
+        // Retire the submission that used this slot two cycles ago - the
+        // only GPU sync in the cycle, taken AFTER decode/resolve so that
+        // CPU work overlapped the previous frame's execution.
+        const double g_wait = complete_slot(slot);
+
+        // Pick a publish slot the UI is provably done with and no
+        // in-flight submission is still writing.
+        // Render at working res; PUBLISH auto-fit to the DISPLAY - the
+        // monitor samples no more texture than it can show (zoom already
+        // inflates the content rect). The big sequence preview stays
+        // native: the program monitor is the output you eyeball.
+        const uint32_t fw = std::max((canvas_w / preview_div) & ~1u, 2u);
+        const uint32_t fh = std::max((canvas_h / preview_div) & ~1u, 2u);
+        // Snap to the full/half/quarter rung that still COVERS the
+        // display. Exact-fit publishing made a continuum of arbitrary
+        // sizes: every zoom/pan/resize frame re-created the publish
+        // images at a new resolution, and the draw then rescaled AGAIN
+        // at an unrelated ratio - two stacked non-integer filters
+        // compounding with the working-res divisor.
+        uint32_t vdiv = 1;
+        if (look_id != doc.root_sequence && pub_w && pub_h) {
+            if (fw / 2 >= pub_w && fh / 2 >= pub_h) vdiv = 2;
+            if (fw / 4 >= pub_w && fh / 4 >= pub_h) vdiv = 4;
+        }
+        const uint32_t pw = std::max((fw / vdiv) & ~1u, 2u);
+        const uint32_t ph = std::max((fh / vdiv) & ~1u, 2u);
         int target = -1;
         {
             std::lock_guard<std::mutex> lock(m_);
             const uint64_t completed =
                 completed_ui_frame_.load(std::memory_order_relaxed);
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < static_cast<int>(published_.size()); ++i) {
                 if (i == latest_) continue;
+                bool held = false;
+                for (const InFlight& fl : inflight_)
+                    if (fl.pending && fl.target == i) held = true;
+                if (held) continue;
                 if (published_[static_cast<size_t>(i)].last_ui_frame <=
                     completed) {
                     target = i;
@@ -1132,11 +1222,11 @@ void RenderWorker::run() {
         if (target < 0) continue;   // UI briefly holds all slots — retry
         Published& pub = published_[static_cast<size_t>(target)];
 
-        vkResetFences(device.device(), 1, &fence_);
+        vkResetFences(device.device(), 1, &fence_[slot]);
         VkCommandBufferBeginInfo begin{
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd_, &begin);
+        vkBeginCommandBuffer(cmd_[slot], &begin);
 
         gfx::GpuImage* source_image = nullptr;
         // Cache stores pause while the transport runs: linear playback
@@ -1144,30 +1234,34 @@ void RenderWorker::run() {
         // harvest (~66 MB of write-combined reads at 4K) was most of a
         // bare feed's per-frame record cost. Hits still serve.
         gfx::GpuImage* final_image = engine->render(
-            cmd_, slot, resolved, look_id, play_frame, mod_fps, canvas_w,
+            cmd_[slot], slot, resolved, look_id, play_frame, mod_fps, canvas_w,
             canvas_h, cache_ctx, mod_frame,
             want_source ? &source_image : nullptr,
             lsrc.empty() ? nullptr : lsrc.data(), lsrc.size(),
             preview_node, preview_layer, sel_placement,
             /*cache_store=*/!player.playing());
-        slot = (slot + 1) % gfx::kFramesInFlight;
 
         bool published_ok = false;
-        if (final_image && final_image->width() == pw &&
-            final_image->height() == ph) {
+        if (final_image && final_image->width() == fw &&
+            final_image->height() == fh) {
+            // Blit, not copy: the publish may downscale (viewport res).
             auto copy_into = [&](gfx::GpuImage& src, gfx::GpuImage& dst) {
-                src.transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                dst.transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                VkImageCopy region{};
+                src.transition(cmd_[slot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                dst.transition(cmd_[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkImageBlit region{};
                 region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                region.extent = {pw, ph, 1};
-                vkCmdCopyImage(cmd_, src.image(),
+                region.srcOffsets[1] = {static_cast<int32_t>(src.width()),
+                                        static_cast<int32_t>(src.height()),
+                                        1};
+                region.dstOffsets[1] = {static_cast<int32_t>(pw),
+                                        static_cast<int32_t>(ph), 1};
+                vkCmdBlitImage(cmd_[slot], src.image(),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                dst.image(),
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                               &region);
-                dst.transition(cmd_,
+                               &region, VK_FILTER_LINEAR);
+                dst.transition(cmd_[slot],
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             };
             copy_into(*final_image, *pub.final_img);
@@ -1177,49 +1271,56 @@ void RenderWorker::run() {
             // Node-canvas thumbnails: publish the atlas + a cell map
             // snapshot consistent with its pixels.
             if (gfx::GpuImage* atlas = engine->thumb_atlas()) {
-                atlas->transition(cmd_,
+                atlas->transition(cmd_[slot],
                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                 pub.thumb_img->transition(
-                    cmd_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    cmd_[slot], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 VkImageCopy tregion{};
                 tregion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
                                           1};
                 tregion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
                                           1};
                 tregion.extent = {atlas->width(), atlas->height(), 1};
-                vkCmdCopyImage(cmd_, atlas->image(),
+                vkCmdCopyImage(cmd_[slot], atlas->image(),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                pub.thumb_img->image(),
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                &tregion);
                 pub.thumb_img->transition(
-                    cmd_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    cmd_[slot], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 pub.thumb_cells = engine->thumb_cells();
                 pub.has_thumbs = true;
             }
             published_ok = true;
         }
-        vkEndCommandBuffer(cmd_);
+        vkEndCommandBuffer(cmd_[slot]);
         const auto tp3 = std::chrono::steady_clock::now();
 
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &cmd_;
+        submit.pCommandBuffers = &cmd_[slot];
         {
             std::lock_guard<std::mutex> qlock(device.queue_mutex());
-            if (vkQueueSubmit(device.graphics_queue(), 1, &submit, fence_) !=
-                VK_SUCCESS)
+            if (vkQueueSubmit(device.graphics_queue(), 1, &submit,
+                              fence_[slot]) != VK_SUCCESS)
                 continue;
         }
-        vkWaitForFences(device.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+        // No wait here: the publish hands off when this slot's fence is
+        // retired at its next reuse (complete_slot above), one cycle of
+        // extra latency for a cycle of CPU/GPU overlap.
+        InFlight& fl = inflight_[slot];
+        fl.pending = true;
+        fl.published_ok = published_ok;
+        fl.target = target;
+        fl.doc_revision = doc_revision;
+        fl.sel_placement = sel_placement;
+        fl.measured = engine->measure_recorded();
+        slot = (slot + 1) % gfx::kFramesInFlight;
+
         double phase_now[4] = {};
         {
-            const auto tp4 = std::chrono::steady_clock::now();
-            auto ema_ms = [&](std::atomic<uint32_t>& cell, int idx, auto a,
-                              auto b) {
-                const double ms =
-                    std::chrono::duration<double, std::milli>(b - a)
-                        .count();
+            auto ema_ms = [&](std::atomic<uint32_t>& cell, int idx,
+                              double ms) {
                 phase_now[idx] = ms;
                 const double prev =
                     cell.load(std::memory_order_relaxed) / 100.0;
@@ -1229,29 +1330,19 @@ void RenderWorker::run() {
                     static_cast<uint32_t>(std::min(ema * 100.0, 4.0e9)),
                     std::memory_order_relaxed);
             };
-            ema_ms(phase_ms_x100_[0], 0, tp0, tp1);   // decode wait
-            ema_ms(phase_ms_x100_[1], 1, tp1, tp2);   // modulation resolve
-            ema_ms(phase_ms_x100_[2], 2, tp2, tp3);   // record + segments
-            ema_ms(phase_ms_x100_[3], 3, tp3, tp4);   // gpu fence
+            auto ms_between = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a)
+                    .count();
+            };
+            ema_ms(phase_ms_x100_[0], 0, ms_between(tp0, tp1));  // decode
+            ema_ms(phase_ms_x100_[1], 1, ms_between(tp1, tp2));  // resolve
+            ema_ms(phase_ms_x100_[2], 2, ms_between(tp2, tp3));  // record
+            ema_ms(phase_ms_x100_[3], 3, g_wait);                // gpu wait
         }
 
-        if (published_ok) {
-            // Post-fence: the alpha-bounds copy has landed.
-            float mb[4];
-            const bool mb_ok = engine->read_measure_bounds(mb);
-            {
-                std::lock_guard<std::mutex> lock(m_);
-                pub.doc_revision = doc_revision;
-                pub.bounds_valid = mb_ok;
-                pub.bounds_placement = mb_ok ? sel_placement : 0;
-                if (mb_ok)
-                    for (int i = 0; i < 4; ++i) pub.bounds[i] = mb[i];
-                pub.ready = true;
-                latest_ = target;
-            }
-            if (!last_had_frame || mod_frame != last_rendered_frame)
-                frames_advanced_.fetch_add(1, std::memory_order_relaxed);
-        }
+        if (published_ok &&
+            (!last_had_frame || mod_frame != last_rendered_frame))
+            frames_advanced_.fetch_add(1, std::memory_order_relaxed);
         last_rendered_frame = mod_frame;
         last_had_frame = true;
         {
@@ -1410,6 +1501,7 @@ std::unique_ptr<ExportJob> start_export(
                 sfv.v_stride = p.v_stride;
                 sfv.width = static_cast<int>(p.width);
                 sfv.height = static_cast<int>(p.height);
+                sfv.nv12 = p.nv12;
             }
             const doc::Document resolved = mod::resolve(
                 doc_copy, abs_f, fps, has_analysis ? &curves_copy : nullptr,
@@ -1990,6 +2082,10 @@ struct AppState {
     ui::ButtonState morph_route_button;
     ui::ButtonState live_button;
     ui::DropdownState proxy_dd;
+    // Monitor content rect size in screen px (zoom included), fed to the
+    // worker each frame: publishes auto-fit the DISPLAY everywhere except
+    // the big sequence preview, which stays native. 0 = unknown, native.
+    uint32_t auto_pub_w = 0, auto_pub_h = 0;
     ui::SliderState speed_slider;
     ui::DropdownState time_mode_dd;
     ui::DropdownState sc_dd;
@@ -3595,6 +3691,8 @@ void push_render_job(RenderWorker& w, AppState& app) {
         // look's graph - never a fallback.
         set(j.look_id, app.scope_look);
         set(j.preview_div, app.preview_div);
+        set(j.pub_w, app.auto_pub_w);
+        set(j.pub_h, app.auto_pub_h);
         set(j.live_mode, app.live_mode);
         set(j.want_source, want_source);
         set(j.proxy_active, app.proxy_active);
@@ -17094,6 +17192,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.preview_div = *frame_ui.proxy_selected == 0
                                   ? 1u
                                   : (*frame_ui.proxy_selected == 1 ? 2u : 4u);
+        if (frame_ui.preview) {
+            const ui::Rect vcr = monitor_content_rect(
+                app, frame_ui.preview->rect.inset(1.0f));
+            app.auto_pub_w = static_cast<uint32_t>(std::max(2.0f, vcr.w));
+            app.auto_pub_h = static_cast<uint32_t>(std::max(2.0f, vcr.h));
+        }
         if (frame_ui.ab_clicked && *frame_ui.ab_clicked)
             app.ab_wipe = !app.ab_wipe;
         if (frame_ui.bypass_all_clicked && *frame_ui.bypass_all_clicked)

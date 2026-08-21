@@ -135,6 +135,10 @@ private:
             // inside collect; with unbounded waiters, workers convoy.
             std::atomic<bool> waiter{false};
             bool draining = false;        // end of stream was signalled
+            // Receive scratch: capacity survives across fetches, so the
+            // decoder fills it without a fresh multi-MB allocation per
+            // frame.
+            platform::VideoFrameNV12 scratch;
 
             ~Session();
         };
@@ -148,6 +152,10 @@ private:
         // Decoded frames by index, newest last. Bounded by ring_depth_.
         std::deque<std::pair<uint32_t, std::shared_ptr<const codec::DecodedFrame>>>
             ring;
+        // Evicted frames nobody else holds recycle here (guarded by `m`):
+        // their vectors keep capacity, so the next decode reuses pages
+        // instead of paying an ~18 MB alloc + fault per 4K frame.
+        std::vector<std::shared_ptr<codec::DecodedFrame>> spare;
         uint32_t want = 0;       // the frame the consumer last asked for
         uint32_t last_want = 0;  // previous ask: backward motion widens rolls
     };
@@ -172,6 +180,7 @@ private:
     std::shared_ptr<const codec::DecodedFrame> ring_insert(
         Stream& s, uint32_t frame,
         std::shared_ptr<const codec::DecodedFrame> decoded, size_t depth);
+    static std::shared_ptr<codec::DecodedFrame> take_spare(Stream& s);
     void worker_main();
     void drain();
 

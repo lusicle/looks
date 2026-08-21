@@ -55,37 +55,23 @@ const std::filesystem::path& bundle_video(const AssetBundle& b) {
 // process-wide so keys can never collide across pools.
 std::atomic<uint64_t> g_frame_stamp{1};
 
-// NV12 (decoder output) -> the I420 planes the engine binds. Tight
-// output; honors the source stride.
+// NV12 (decoder output) -> a frame the engine binds, ZERO-COPY: the
+// decoder's buffer swaps whole into the frame (Y rows then interleaved
+// CbCr rows, one stride) and the caller's scratch inherits the old
+// capacity - no deinterleave, no copy, no allocation in steady state.
 std::shared_ptr<const codec::DecodedFrame> nv12_to_decoded(
-    const platform::VideoFrameNV12& src) {
-    auto out = std::make_shared<codec::DecodedFrame>();
+    std::shared_ptr<codec::DecodedFrame> out,
+    platform::VideoFrameNV12& src) {
+    if (!out) out = std::make_shared<codec::DecodedFrame>();
     out->stamp = g_frame_stamp.fetch_add(1, std::memory_order_relaxed);
-    const uint32_t w = src.width;
-    const uint32_t h = src.height;
-    const uint32_t cw = (w + 1) / 2;
-    const uint32_t ch = (h + 1) / 2;
-    const size_t stride = src.stride ? src.stride : w;
-    out->width = w;
-    out->height = h;
-    out->y_stride = w;
-    out->uv_stride = cw;
-    out->y.resize(static_cast<size_t>(w) * h);
-    out->u.resize(static_cast<size_t>(cw) * ch);
-    out->v.resize(static_cast<size_t>(cw) * ch);
-    for (uint32_t row = 0; row < h; ++row)
-        std::memcpy(out->y.data() + static_cast<size_t>(row) * w,
-                    src.data.data() + static_cast<size_t>(row) * stride, w);
-    const uint8_t* uv = src.data.data() + stride * h;
-    for (uint32_t row = 0; row < ch; ++row) {
-        const uint8_t* s = uv + static_cast<size_t>(row) * stride;
-        uint8_t* du = out->u.data() + static_cast<size_t>(row) * cw;
-        uint8_t* dv = out->v.data() + static_cast<size_t>(row) * cw;
-        for (uint32_t x = 0; x < cw; ++x) {
-            du[x] = s[x * 2];
-            dv[x] = s[x * 2 + 1];
-        }
-    }
+    out->width = src.width;
+    out->height = src.height;
+    out->y_stride = src.stride ? src.stride : src.width;
+    out->uv_stride = out->y_stride;
+    out->nv12 = true;
+    out->y.swap(src.data);
+    out->u.clear();
+    out->v.clear();
     return out;
 }
 
@@ -265,10 +251,23 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::ring_insert(
             }
         }
         if (worst == SIZE_MAX) break;   // everything held is live
+        // Nobody else holds the victim: recycle its buffers.
+        if (s.ring[worst].second.use_count() == 1 && s.spare.size() < 8)
+            s.spare.push_back(std::const_pointer_cast<codec::DecodedFrame>(
+                s.ring[worst].second));
         s.ring.erase(s.ring.begin() + static_cast<ptrdiff_t>(worst));
     }
     s.cv.notify_all();
     return decoded;
+}
+
+// A recycled frame if one is waiting; its vectors keep their capacity.
+std::shared_ptr<codec::DecodedFrame> DecodePool::take_spare(Stream& s) {
+    std::lock_guard<std::mutex> lock(s.m);
+    if (s.spare.empty()) return nullptr;
+    auto f = std::move(s.spare.back());
+    s.spare.pop_back();
+    return f;
 }
 
 std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
@@ -559,7 +558,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
 
     std::shared_ptr<const codec::DecodedFrame> result;
     std::vector<uint8_t> sample_bytes;
-    platform::VideoFrameNV12 nv12;
+    platform::VideoFrameNV12& nv12 = sess->scratch;
     // Emissions are labeled by ARRIVAL ORDER from the roll's floor -
     // presentation order is guaranteed from a sync point, while output
     // timestamps are not: the decoder's first post-flush stamp can be
@@ -623,7 +622,8 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
             expect = static_cast<int64_t>(p) + 1;
             sess->next_present.store(expect, std::memory_order_relaxed);
             if (p < floor_present) continue;   // pre-keyframe stragglers
-            auto kept = ring_insert(s, p, nv12_to_decoded(nv12), depth);
+            auto kept = ring_insert(
+                s, p, nv12_to_decoded(take_spare(s), nv12), depth);
             if (p == target) result = std::move(kept);
         }
         hold_was_dry = held && !emitted;

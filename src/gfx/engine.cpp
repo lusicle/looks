@@ -277,7 +277,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     to_rgb_desc.spv_name = "ycbcr_to_rgb.comp.spv";
     to_rgb_desc.sampled_inputs = 3;
     to_rgb_desc.storage_outputs = 1;
-    to_rgb_desc.push_bytes = 6 * sizeof(uint32_t);
+    to_rgb_desc.push_bytes = 7 * sizeof(uint32_t);
     to_rgb_ = ComputePipeline::create(device_, shader_dir, to_rgb_desc);
     if (!to_rgb_) return false;
 
@@ -1201,7 +1201,7 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     codec_io_.up_y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     codec_io_.up_u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     codec_io_.up_v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    GpuImage* temp = pool_.acquire(w, h);
+    GpuImage* temp = pool_->acquire(w, h);
     if (!temp) return false;
     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
     {
@@ -1231,7 +1231,7 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
         fx_mix_->dispatch(rec, arena_, frame_index, sampled2, 2, &dst, 1,
                           mix_push, sizeof(mix_push), w, h, linear_sampler_);
     }
-    pool_.release(temp);
+    pool_->release(temp);
     return true;
 }
 
@@ -1246,7 +1246,7 @@ bool Engine::composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
                                          *codec_io_.up_idx))
         return false;
     codec_io_.up_idx->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
-    GpuImage* temp = pool_.acquire(w, h);
+    GpuImage* temp = pool_->acquire(w, h);
     if (!temp) return false;
     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
     {
@@ -1273,7 +1273,7 @@ bool Engine::composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
         fx_mix_->dispatch(rec, arena_, frame_index, sampled2, 2, &dst, 1,
                           mix_push, sizeof(mix_push), w, h, linear_sampler_);
     }
-    pool_.release(temp);
+    pool_->release(temp);
     return true;
 }
 
@@ -1400,8 +1400,15 @@ void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                          linear_sampler_);
 }
 
+bool Engine::measure_recorded() const { return bounds_recorded_; }
+
 bool Engine::read_measure_bounds(float rect[4]) const {
-    if (!bounds_recorded_ || !bounds_mapped_ || !bounds_w_ || !bounds_h_)
+    // No bounds_recorded_ gate: a pipelined caller reads at the fence of
+    // the submission that recorded the tap, by which time a NEWER render
+    // has already reset the flag. The caller's measure_recorded()
+    // snapshot is the per-submission truth; the untouched-clear sentinel
+    // below still rejects garbage.
+    if (!bounds_mapped_ || !bounds_w_ || !bounds_h_)
         return false;
     vmaInvalidateAllocation(device_.allocator(), bounds_alloc_, 0,
                             VK_WHOLE_SIZE);
@@ -1442,7 +1449,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     if (canvas_w == 0 || canvas_h == 0) return nullptr;
 
     arena_.reset(frame_index);
-    pool_.release_all();
+    pool_ = &pools_[frame_index % kFramesInFlight];
+    pool_->release_all();
     StagingBuffer& staging = *staging_[frame_index % kFramesInFlight];
     staging.reset();
 
@@ -1486,7 +1494,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             const size_t bytes = static_cast<size_t>(w) * h * 8;
             GpuImage* dst = nullptr;
             if (ensure_cache_io(cio, bytes) &&
-                (dst = pool_.acquire(w, h)) != nullptr) {
+                (dst = pool_->acquire(w, h)) != nullptr) {
                 std::memcpy(cio.mapped, hit->halves.data(), bytes);
                 vmaFlushAllocation(device_.allocator(), cio.alloc, 0,
                                    VK_WHOLE_SIZE);
@@ -1599,11 +1607,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // Media sources: one I420 upload per PLACEMENT, keyed per instance.
     for (size_t i = 0; i < layer_source_count; ++i) {
         const LayerSourceFrame& lf = layer_sources[i];
-        if (!lf.planes.y || !lf.planes.u || !lf.planes.v ||
-            lf.planes.width == 0 || lf.key == 0)
+        if (!lf.planes.y || !lf.planes.u ||
+            (!lf.planes.nv12 && !lf.planes.v) || lf.planes.width == 0 ||
+            lf.key == 0)
             continue;
         LayerPlanes& lp = layer_planes_[lf.key];
-        if (lp.width != lf.planes.width || lp.height != lf.planes.height) {
+        if (lp.width != lf.planes.width || lp.height != lf.planes.height ||
+            lp.nv12 != lf.planes.nv12) {
             device_.wait_idle();
             const VkImageUsageFlags lu =
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1614,11 +1624,21 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             lp.y = GpuImage::create(device_, VK_FORMAT_R8_UNORM,
                                     lf.planes.width, lf.planes.height,
                                     lu | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-            lp.u = GpuImage::create(device_, VK_FORMAT_R8_UNORM, lcw, lch, lu);
-            lp.v = GpuImage::create(device_, VK_FORMAT_R8_UNORM, lcw, lch, lu);
-            if (!lp.y || !lp.u || !lp.v) return nullptr;
+            if (lf.planes.nv12) {
+                lp.u = GpuImage::create(device_, VK_FORMAT_R8G8_UNORM, lcw,
+                                        lch, lu);
+                lp.v.reset();
+                if (!lp.y || !lp.u) return nullptr;
+            } else {
+                lp.u = GpuImage::create(device_, VK_FORMAT_R8_UNORM, lcw,
+                                        lch, lu);
+                lp.v = GpuImage::create(device_, VK_FORMAT_R8_UNORM, lcw,
+                                        lch, lu);
+                if (!lp.y || !lp.u || !lp.v) return nullptr;
+            }
             lp.width = lf.planes.width;
             lp.height = lf.planes.height;
+            lp.nv12 = lf.planes.nv12;
             lp.stamp = 0;
         }
         // A key re-presenting the stamp it already uploaded holds the
@@ -1629,24 +1649,36 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         if (lp.stamp != 0 && lp.stamp == lf.content_stamp) {
             lp.y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             lp.u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            if (lp.v)
+                lp.v->transition(rec,
+                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             continue;
         }
         const uint32_t lch = (lp.height + 1) / 2;
         if (!staging.upload_image(rec, lf.planes.y,
                                   lf.planes.y_stride * lp.height,
-                                  lf.planes.y_stride, *lp.y) ||
-            !staging.upload_image(rec, lf.planes.u,
-                                  lf.planes.u_stride * lch,
-                                  lf.planes.u_stride, *lp.u) ||
-            !staging.upload_image(rec, lf.planes.v,
-                                  lf.planes.v_stride * lch,
-                                  lf.planes.v_stride, *lp.v))
+                                  lf.planes.y_stride, *lp.y))
             return nullptr;
+        if (lp.nv12) {
+            // Interleaved CbCr rows into the RG8 texture; bufferRowLength
+            // is texels, two bytes each.
+            if (!staging.upload_image(rec, lf.planes.u,
+                                      lf.planes.u_stride * lch,
+                                      lf.planes.u_stride / 2, *lp.u))
+                return nullptr;
+        } else if (!staging.upload_image(rec, lf.planes.u,
+                                         lf.planes.u_stride * lch,
+                                         lf.planes.u_stride, *lp.u) ||
+                   !staging.upload_image(rec, lf.planes.v,
+                                         lf.planes.v_stride * lch,
+                                         lf.planes.v_stride, *lp.v)) {
+            return nullptr;
+        }
         lp.stamp = lf.content_stamp;
         lp.y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         lp.u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (lp.v)
+            lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
     // The motion pair the shared Flow field and MotionExtract read. With
@@ -1798,8 +1830,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         // Flow lives at block resolution; everything else at frame size.
         const bool is_flow = node.kind == GraphNode::Kind::Flow;
         GpuImage* dst = is_flow
-            ? pool_.acquire((w + 15) / 16, (h + 15) / 16)
-            : pool_.acquire(w, h);
+            ? pool_->acquire((w + 15) / 16, (h + 15) / 16)
+            : pool_->acquire(w, h);
         if (!dst) return nullptr;
         dst->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
 
@@ -1824,9 +1856,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                          &clear, 1, &range);
                     break;
                 }
-                const GpuImage* planes[3] = {it->second.y.get(),
-                                             it->second.u.get(),
-                                             it->second.v.get()};
+                // NV12 media binds the interleaved chroma texture to
+                // both chroma slots; the shader's flag reads Cr from .g.
+                const GpuImage* planes[3] = {
+                    it->second.y.get(), it->second.u.get(),
+                    it->second.v ? it->second.v.get()
+                                 : it->second.u.get()};
                 // Aspect-preserving fit: the media lands centered at its
                 // own shape, transparent outside - never stretched.
                 float fit[4];
@@ -1835,10 +1870,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 struct {
                     uint32_t w, h;
                     float rx, ry, iw, ih;
+                    uint32_t nv12;
                 } push = {w,      h,
                           fit[0], fit[1],
                           1.0f / std::max(fit[2], 1.0f),
-                          1.0f / std::max(fit[3], 1.0f)};
+                          1.0f / std::max(fit[3], 1.0f),
+                          it->second.nv12 ? 1u : 0u};
                 to_rgb_->dispatch(rec, arena_, frame_index, planes, 3, &dst, 1,
                                   &push, sizeof(push), w, h, linear_sampler_);
                 break;
@@ -2102,7 +2139,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                     codec_io_.up_v->transition(
                         rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    GpuImage* temp = pool_.acquire(w, h);
+                    GpuImage* temp = pool_->acquire(w, h);
                     if (!temp) return nullptr;
                     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                     {
@@ -2134,7 +2171,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                           sizeof(mix_push), w, h,
                                           linear_sampler_);
                     }
-                    pool_.release(temp);
+                    pool_->release(temp);
                     break;
                 }
 
@@ -3315,7 +3352,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
-                pool_.release(results[static_cast<size_t>(input)]);
+                pool_->release(results[static_cast<size_t>(input)]);
     }
 
     // Alpha-bounds reduction on the measure tap: cleared bounds cells,

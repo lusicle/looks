@@ -133,7 +133,8 @@ float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
                               video->height - 1);
     const int nx = std::min(x1 - x0 + 1, 48);
     const int ny = std::min(y1 - y0 + 1, 48);
-    const bool luma = s.channel == 0 || !video->u || !video->v;
+    const bool luma =
+        s.channel == 0 || !video->u || (!video->nv12 && !video->v);
     float sum = 0.0f;
     for (int j = 0; j < ny; ++j) {
         const int py = y0 + ((y1 - y0) * j) / std::max(ny - 1, 1);
@@ -145,12 +146,23 @@ float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
                 sum += Y;
                 continue;
             }
-            // I420 chroma at half resolution; BT.601 — close enough for a
-            // control value, and identical preview vs export.
-            const float U = static_cast<float>(
-                video->u[(py >> 1) * video->u_stride + (px >> 1)]) - 128.0f;
-            const float V = static_cast<float>(
-                video->v[(py >> 1) * video->v_stride + (px >> 1)]) - 128.0f;
+            // Half-res chroma; BT.601 — close enough for a control
+            // value, and identical preview vs export.
+            float U, V;
+            if (video->nv12) {
+                const uint8_t* uv = video->u +
+                                    (py >> 1) * video->u_stride +
+                                    ((px >> 1) << 1);
+                U = static_cast<float>(uv[0]) - 128.0f;
+                V = static_cast<float>(uv[1]) - 128.0f;
+            } else {
+                U = static_cast<float>(
+                        video->u[(py >> 1) * video->u_stride +
+                                 (px >> 1)]) - 128.0f;
+                V = static_cast<float>(
+                        video->v[(py >> 1) * video->v_stride +
+                                 (px >> 1)]) - 128.0f;
+            }
             switch (s.channel) {
                 case 1: sum += Y + 1.402f * V; break;
                 case 2: sum += Y - 0.344f * U - 0.714f * V; break;
