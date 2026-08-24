@@ -2,9 +2,7 @@
   "looks_preset": 1,
   "name": "teletext",
   "tags": [
-    "broadcast",
-    "mosaic",
-    "retro"
+    "signal"
   ],
   "group": {
     "id": 100,

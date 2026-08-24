@@ -19,6 +19,7 @@ add_executable(looks_tests
     test_image.cpp
     test_serialize.cpp
     test_cache.cpp
+    test_script.cpp
     test_refdump.cpp
     test_truetype.cpp
     test_error_diffusion.cpp
@@ -35,7 +36,8 @@ endif()
 target_compile_definitions(looks_tests PRIVATE
     LOOKS_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 target_link_libraries(looks_tests PRIVATE
-    looks_util looks_doc looks_ui_core looks_media looks_codec looks_mod)
+    looks_util looks_doc looks_ui_core looks_media looks_codec looks_mod
+    looks_script)
 
 add_test(NAME looks_tests COMMAND looks_tests)
 

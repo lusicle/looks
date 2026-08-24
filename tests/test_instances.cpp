@@ -11,7 +11,10 @@
 
 #include <algorithm>
 
+#include "doc/command.h"
 #include "doc/effects.h"
+#include "doc/group_commands.h"
+#include "doc/stack_commands.h"
 #include "gfx/graph.h"
 #include "test_framework.h"
 #include "util/hash.h"
@@ -427,6 +430,50 @@ TEST(flatten_audio_voice_is_the_bottom_output_chain) {
     CHECK_EQ(voice[0].asset, rig.asset);
     CHECK_EQ(voice[0].layer, rig.doc.looks[0].layers[0].id);
     CHECK_EQ(voice[0].op_count, uint32_t{0});
+}
+
+TEST(flatten_audio_voice_survives_a_preset_splice) {
+    // Splicing a preset into the BOTTOM chain rewires its Output link
+    // (disconnect + connect re-append at the table's end). The voice is
+    // owner-layer-ordered, never table-ordered, so it must stay on the
+    // bottom media chain - table order would flip it to the top layer
+    // (a silent generator: the audio cuts out).
+    Rig rig(60);
+    Document& d = rig.doc;
+    doc::Look& look = d.looks[0];
+    const uint64_t media_layer = look.layers[0].id;
+    doc::Layer top;
+    top.id = d.next_effect_id++;
+    top.source = doc::LayerSourceKind::Solid;
+    look.layers.push_back(top);
+    lay_audio_block(d, rig.look);
+
+    doc::UndoStack undo;
+    doc::Group g;
+    g.id = d.next_effect_id++;
+    std::vector<doc::EffectInstance> members;
+    members.push_back(doc::make_effect(d, doc::EffectType::Grain));
+    members.push_back(doc::make_effect(d, doc::EffectType::Posterize));
+    const uint64_t m0 = members[0].id, m1 = members[1].id;
+    undo.execute(d, doc::insert_group_command(rig.look, 0, g,
+                                              std::move(members)));
+    // The drop gesture's splice: disconnect the bottom chain's Output
+    // wire, then wire the group's boundary members in.
+    undo.execute(d,
+                 doc::disconnect_command(rig.look, {media_layer, 0, 0}));
+    undo.execute(d, doc::connect_command(rig.look, {media_layer, m0, 0}));
+    undo.execute(d, doc::connect_command(rig.look, {m1, 0, 0}));
+
+    const auto voice = doc::flatten_audio_sources(d, d.root_sequence);
+    CHECK_EQ(voice.size(), size_t{1});
+    CHECK_EQ(voice[0].asset, rig.asset);
+    CHECK_EQ(voice[0].layer, media_layer);
+
+    // Undoing the whole splice restores the voice unchanged.
+    while (undo.can_undo()) undo.undo(d);
+    const auto voice2 = doc::flatten_audio_sources(d, d.root_sequence);
+    CHECK_EQ(voice2.size(), size_t{1});
+    CHECK_EQ(voice2[0].asset, rig.asset);
 }
 
 TEST(flatten_audio_collects_voice_ops_in_play_order) {

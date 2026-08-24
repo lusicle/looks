@@ -233,6 +233,10 @@ struct Layer {
     float color_b[3] = {0.1f, 0.1f, 0.1f};
     float gen_scale = 6.0f;
     float gen_angle = 0.0f;
+    // Oscillator phase, percent of one period: the pattern slides along
+    // its own direction and wraps (0 and 100 are identical), so typed
+    // and keyframed values may run past 100 for long loops.
+    float gen_phase = 0.0f;
     // Oscillator waveform: 0 sine bars, 1 concentric rings, 2 plasma.
     uint32_t osc_shape = 0;
     BlendMode blend = BlendMode::Normal;

@@ -32,6 +32,12 @@ add_library(looks_doc STATIC
 target_include_directories(looks_doc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(looks_doc PUBLIC looks_util)
 
+# ---- script: the automation language core (lexer/compiler/VM). Pure
+# std C++ - the app registers every native that touches it.
+add_library(looks_script STATIC
+    script/script.cpp)
+target_include_directories(looks_script PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ---- mod: param table, modulation evaluation, FFT + import analysis.
 # Pure CPU, deterministic — unit-tested without a GPU.
 add_library(looks_mod STATIC
@@ -146,6 +152,7 @@ add_library(looks_ui_core STATIC
     ui/font.cpp
     ui/input.cpp
     ui/layout.cpp
+    ui/probe.cpp
     ui/text.cpp
     ui/truetype.cpp
     ui/ui_context.cpp
@@ -165,7 +172,7 @@ add_executable(looks WIN32
     app/main.cpp)
 target_link_libraries(looks PRIVATE
     looks_platform looks_gfx looks_ui looks_doc looks_media looks_mod
-    looks_util)
+    looks_script looks_util)
 target_stage_shaders(looks looks_shaders)
 
 # Ship assets (era presets, generated dither LUT) next to the exe so the

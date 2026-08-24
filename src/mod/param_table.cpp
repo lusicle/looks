@@ -83,6 +83,8 @@ float* layer_param_slot(doc::Layer& layer, int param_index) {
         case 12: return &layer.crop_b;
         case 13: return &layer.xf_scale;
         case 14: return &layer.xf_rotate;
+        // 15 slip / 16 waveform: field ids only, never modulatable.
+        case 17: return &layer.gen_phase;
         default: return nullptr;
     }
 }
@@ -102,6 +104,9 @@ void layer_param_range(int param_index, float* min_value, float* max_value) {
         case 12: *max_value = 0.45f; break;                    // crops
         case 13: *min_value = 0.25f; *max_value = 4.0f; break; // xf_scale
         case 14: *min_value = -180.0f; *max_value = 180.0f; break;
+        // Phase wraps in the kernel, so keys and wires may run far past
+        // one period (long loops) without the eval clamp folding them.
+        case 17: *max_value = 1.0e6f; break;
         default: break;   // opacity + colors, normalized 0..1
     }
 }
@@ -111,13 +116,14 @@ namespace {
 constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
     "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
     "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
-    "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate"};
+    "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
+    "slip",    "waveform",  "phase"};
 
 constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
     "opacity", "color a r", "color a g", "color a b", "color b r",
     "color b g", "color b b", "scale",   "angle",     "crop left",
     "crop right", "crop top", "crop bottom", "transform scale",
-    "transform rotate"};
+    "transform rotate", "slip", "waveform", "phase"};
 
 }  // namespace
 

@@ -2,6 +2,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include <algorithm>
 #include <cstring>
 
 #include "gfx/vk_device.h"
@@ -145,6 +146,7 @@ GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
         if (!e.in_use && e.image->width() == width &&
             e.image->height() == height) {
             e.in_use = true;
+            e.last_used = gen_;
             return e.image.get();
         }
     }
@@ -156,7 +158,7 @@ GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
             VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (!image) return nullptr;
-    entries_.push_back({std::move(image), true});
+    entries_.push_back({std::move(image), true, gen_});
     return entries_.back().image.get();
 }
 
@@ -166,7 +168,16 @@ void TargetPool::release(GpuImage* image) {
 }
 
 void TargetPool::release_all() {
+    ++gen_;
     for (Entry& e : entries_) e.in_use = false;
+    // Retire sizes nothing acquired lately; the slot fence the caller
+    // just waited on proves free entries are GPU-idle here.
+    entries_.erase(
+        std::remove_if(entries_.begin(), entries_.end(),
+                       [&](const Entry& e) {
+                           return gen_ - e.last_used > kRetireFrames;
+                       }),
+        entries_.end());
 }
 
 void TargetPool::clear() {

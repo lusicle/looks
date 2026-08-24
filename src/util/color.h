@@ -40,6 +40,25 @@ inline void ycbcr709_to_rgb8(int y, int cb, int cr,
     *b = (yf + 541 * (cb - 128)) >> 8;
 }
 
+// Full-range RGB bytes to limited-range BT.709, 8.8 fixed point - the
+// forward of ycbcr709_to_rgb8. Any CPU-built I420 (thumbnail refeeds)
+// must encode with THESE constants or the shader decode shifts levels.
+// 47/157/16 = luma weights * 219/255 * 256; 121/143 = 224/255 over the
+// kCb709/kCr709 spans * 256.
+inline void rgb8_to_ycbcr709(int r, int g, int b, uint8_t* y, uint8_t* cb,
+                             uint8_t* cr) {
+    const int yl = 16 + ((47 * r + 157 * g + 16 * b + 128) >> 8);
+    const int yf = (54 * r + 183 * g + 19 * b) >> 8;   // full-range luma
+    const int cbv = 128 + ((121 * (b - yf)) >> 8);
+    const int crv = 128 + ((143 * (r - yf)) >> 8);
+    auto clamp8 = [](int v, int lo, int hi) {
+        return static_cast<uint8_t>(v < lo ? lo : (v > hi ? hi : v));
+    };
+    *y = clamp8(yl, 16, 235);
+    *cb = clamp8(cbv, 16, 240);
+    *cr = clamp8(crv, 16, 240);
+}
+
 // Limited-range expansions in float, byte inputs to 0..1 outputs.
 inline float y709_norm(float y8) { return (y8 - 16.0f) * (1.0f / 219.0f); }
 inline float chroma709_norm(float c8) {

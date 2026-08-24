@@ -97,6 +97,34 @@ private:
     bool old_bypass_ = false;
 };
 
+class SetEffectBlendCommand final : public LookCommand {
+public:
+    SetEffectBlendCommand(uint64_t look, size_t layer_index,
+                          size_t effect_index, BlendMode blend)
+        : LookCommand(look), layer_index_(layer_index),
+          effect_index_(effect_index), blend_(blend) {}
+
+    std::string name() const override { return "Effect Blend"; }
+
+    void apply(Document& doc) override {
+        auto& stack = stack_of(look_of(doc), layer_index_);
+        assert(effect_index_ < stack.size());
+        old_blend_ = stack[effect_index_].blend;
+        stack[effect_index_].blend = blend_;
+    }
+
+    void revert(Document& doc) override {
+        stack_of(look_of(doc), layer_index_)[effect_index_].blend =
+            old_blend_;
+    }
+
+private:
+    size_t layer_index_;
+    size_t effect_index_;
+    BlendMode blend_;
+    BlendMode old_blend_ = BlendMode::Normal;
+};
+
 class SetEffectTextCommand final : public LookCommand {
 public:
     SetEffectTextCommand(uint64_t look, size_t layer_index, size_t effect_index,
@@ -693,6 +721,14 @@ std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
                                             size_t effect_index, bool bypass) {
     return std::make_unique<SetBypassCommand>(look, layer_index, effect_index,
                                               bypass);
+}
+
+std::unique_ptr<Command> set_effect_blend_command(uint64_t look,
+                                                  size_t layer_index,
+                                                  size_t effect_index,
+                                                  BlendMode blend) {
+    return std::make_unique<SetEffectBlendCommand>(look, layer_index,
+                                                   effect_index, blend);
 }
 
 std::unique_ptr<Command> set_solo_command(uint64_t look, size_t layer_index,

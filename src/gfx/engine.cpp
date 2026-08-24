@@ -226,11 +226,24 @@ codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
     return mp;
 }
 
+// Signature of everything a GATED stateful pass reads from its instance.
+// Gates that only withhold state ADVANCEMENT (feedback, RD, sweep fronts)
+// need no signature - their composite re-reads params every render. Gates
+// that withhold the effect's whole parameter response (the mosh boxes,
+// the dither walk) re-arm on a paused edit through this.
+uint64_t stateful_param_sig(const doc::EffectInstance& fx, uint64_t seed) {
+    return hash_combine(
+        seed, fnv1a(fx.params.data(), fx.params.size() * sizeof(float)));
+}
+
 }  // namespace
 
 std::unique_ptr<Engine> Engine::create(Device& device,
-                                       const std::filesystem::path& shader_dir) {
+                                       const std::filesystem::path& shader_dir,
+                                       VkQueue submit_queue) {
     auto e = std::unique_ptr<Engine>(new Engine(device));
+    e->submit_queue_ =
+        submit_queue ? submit_queue : device.graphics_queue();
     if (!e->init(shader_dir)) return nullptr;
     return e;
 }
@@ -409,6 +422,16 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     thumb_tap_ = ComputePipeline::create(device_, shader_dir, tt_desc);
     if (!thumb_tap_) return false;
 
+    // Library gallery tap: aspect-FIT variant with caller-assigned
+    // cells (the worker owns the atlas's lifecycle, unlike node thumbs).
+    ComputePipelineDesc gt_desc;
+    gt_desc.spv_name = "gallery_tap.comp.spv";
+    gt_desc.sampled_inputs = 1;
+    gt_desc.storage_outputs = 1;
+    gt_desc.push_bytes = 4 * sizeof(uint32_t);
+    gallery_tap_ = ComputePipeline::create(device_, shader_dir, gt_desc);
+    if (!gallery_tap_) return false;
+
     ComputePipelineDesc rd_desc;
     rd_desc.spv_name = "rd_step.comp.spv";
     rd_desc.sampled_inputs = 2;
@@ -497,7 +520,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     gen_desc.spv_name = "gen.comp.spv";
     gen_desc.sampled_inputs = 0;
     gen_desc.storage_outputs = 1;
-    gen_desc.push_bytes = 14 * sizeof(uint32_t);
+    gen_desc.push_bytes = 15 * sizeof(uint32_t);
     generator_ = ComputePipeline::create(device_, shader_dir, gen_desc);
 
     ComputePipelineDesc blend_desc;
@@ -917,6 +940,12 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     }
     // Stateful advance happens once per timeline frame; paused re-renders
     // reuse the resident state (same contract as the CPU box's cache).
+    // A paused PARAM EDIT re-arms as a discontinuity - state drops and the
+    // frame rebuilds as a fresh I, so the edit shows without moving the
+    // playhead. Advancing frames keep their chain (params apply forward).
+    const uint64_t sig = stateful_param_sig(fx, mp.seed);
+    if (g.has_state && g.last_frame == timeline_frame && g.sig != sig)
+        g.has_state = false;
     const bool advance = !g.has_state || g.last_frame != timeline_frame;
 
     const auto barrier = [&] {
@@ -1183,6 +1212,7 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
         }
         g.has_state = true;
         g.last_frame = timeline_frame;
+        g.sig = sig;
     }
 
     // Moshed planes -> unorm upload images -> shared RGB + composite tail.
@@ -1206,14 +1236,18 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     if (!temp) return false;
     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
     {
-        // Moshed planes are already working-size: identity fit.
+        // Moshed planes are already working-size: identity fit. The nv12
+        // word must be pushed explicitly (up_u/up_v are separate planes):
+        // a short push would inherit the previous dispatch's value.
         struct {
             uint32_t w, h;
             float rx, ry, iw, ih;
+            uint32_t nv12;
         } rgb_push = {w,    h,
                       0.0f, 0.0f,
                       1.0f / static_cast<float>(w),
-                      1.0f / static_cast<float>(h)};
+                      1.0f / static_cast<float>(h),
+                      0u};
         const GpuImage* planes3[3] = {codec_io_.up_y.get(),
                                       codec_io_.up_u.get(),
                                       codec_io_.up_v.get()};
@@ -1371,7 +1405,7 @@ void Engine::codec_flush_segment() {
     submit.pCommandBuffers = &codec_io_.cmd;
     {
         std::lock_guard<std::mutex> lock(device_.queue_mutex());
-        vk_check(vkQueueSubmit(device_.graphics_queue(), 1, &submit,
+        vk_check(vkQueueSubmit(submit_queue_, 1, &submit,
                                codec_io_.fence),
                  "vkQueueSubmit(codecbox)");
     }
@@ -1399,6 +1433,33 @@ void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
     thumb_tap_->dispatch(rec, arena_, frame_index, sampled, 1, storage, 1,
                          push, sizeof(push), kThumbCellW, kThumbCellH,
                          linear_sampler_);
+}
+
+// Library gallery tap: downsample a rendered thumbnail into the CALLER's
+// atlas cell, aspect-fit. Cells persist across renders - the worker
+// assigns and evicts them - so unlike the node thumb atlas nothing here
+// resets per frame.
+void Engine::record_gallery_tap(VkCommandBuffer rec, uint32_t frame_index,
+                                GpuImage* src, uint32_t cell) {
+    if (!gallery_tap_ || !src) return;
+    if (cell >= kGalleryCols * kGalleryRows) return;
+    if (!gallery_atlas_) {
+        gallery_atlas_ = GpuImage::create(
+            device_, VK_FORMAT_R8G8B8A8_UNORM,
+            kGalleryCellW * kGalleryCols, kGalleryCellH * kGalleryRows,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        if (!gallery_atlas_) return;
+    }
+    src->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    gallery_atlas_->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    const uint32_t push[4] = {cell % kGalleryCols, cell / kGalleryCols,
+                              src->width(), src->height()};
+    const GpuImage* sampled[1] = {src};
+    GpuImage* storage[1] = {gallery_atlas_.get()};
+    gallery_tap_->dispatch(rec, arena_, frame_index, sampled, 1, storage,
+                           1, push, sizeof(push), kGalleryCellW,
+                           kGalleryCellH, linear_sampler_);
 }
 
 bool Engine::measure_recorded() const { return bounds_recorded_; }
@@ -1776,8 +1837,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     }
 
     // Thumbnail atlas + cell map: reset only when the graph actually
-    // evaluates (a render-cache hit above kept the previous, still-valid
-    // taps on screen).
+    // evaluates. A render-cache hit above keeps the previous taps — the
+    // app only serves hits while a SEQUENCE renders, where no canvas
+    // reads them.
     if (thumb_tap_ && !thumb_atlas_)
         thumb_atlas_ = GpuImage::create(
             device_, VK_FORMAT_R8G8B8A8_UNORM, kThumbCellW * kThumbGridCols,
@@ -1904,7 +1966,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::Generator: {
-                uint32_t push[14] = {};
+                uint32_t push[15] = {};
                 push[0] = w;
                 push[1] = h;
                 if (node.layer_index >= 0) {
@@ -1921,6 +1983,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[11] = as_bits(layer.gen_scale);
                     push[12] = as_bits(layer.gen_angle);
                     push[13] = layer.osc_shape;
+                    push[14] = as_bits(layer.gen_phase);
                 } else {
                     // Unwired Output: a solid with zeroed colors —
                     // an empty composite renders black, never the source.
@@ -2066,8 +2129,20 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
                     // 2. CPU: mosh with persistent per-instance state. A
                     // paused re-render reuses the cached output so the
-                    // decoder does not keep stewing (vs export).
+                    // decoder does not keep stewing (vs export). A paused
+                    // PARAM EDIT re-arms as a discontinuity (codec reset,
+                    // fresh I) - the edit shows without moving the
+                    // playhead; advancing frames keep their chain.
                     MoshSlot& slot = mosh_state_[skey];
+                    const uint64_t box_seed = hash_combine(
+                        hash_combine(doc.master_seed, fx.id), fx.seed);
+                    const uint64_t box_sig =
+                        stateful_param_sig(fx, box_seed);
+                    if (slot.valid && slot.last_frame == timeline_frame &&
+                        slot.sig != box_sig) {
+                        slot.codec.reset();
+                        slot.valid = false;
+                    }
                     if (!slot.valid || slot.last_frame != timeline_frame) {
                         vmaInvalidateAllocation(device_.allocator(),
                                                 codec_io_.readback_alloc, 0,
@@ -2111,12 +2186,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             }
                             field = {mvx.data(), mvy.data(), bw, bh};
                         }
-                        const uint64_t box_seed = hash_combine(
-                            hash_combine(doc.master_seed, fx.id), fx.seed);
                         slot.codec.process(view, timeline_frame,
                                            mosh_params(fx, box_seed), field,
                                            slot.last_out);
                         slot.last_frame = timeline_frame;
+                        slot.sig = box_sig;
                         slot.valid = true;
                     }
                     const codec::DecodedFrame& mo = slot.last_out;
@@ -2145,14 +2219,18 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     temp->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                     {
                         // Codec round-trip planes are working-size:
-                        // identity fit.
+                        // identity fit. nv12 pushed explicitly (separate
+                        // U/V planes): a short push would inherit the
+                        // previous dispatch's value.
                         struct {
                             uint32_t w, h;
                             float rx, ry, iw, ih;
+                            uint32_t nv12;
                         } rgb_push = {w,    h,
                                       0.0f, 0.0f,
                                       1.0f / static_cast<float>(w),
-                                      1.0f / static_cast<float>(h)};
+                                      1.0f / static_cast<float>(h),
+                                      0u};
                         const GpuImage* planes3[3] = {codec_io_.up_y.get(),
                                                       codec_io_.up_u.get(),
                                                       codec_io_.up_v.get()};
@@ -2212,8 +2290,14 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
                     // 2. Capture THIS frame's input and walk it during the
                     // rest of the frame; next frame consumes the result.
-                    // Once per timeline frame (paused re-renders reuse).
-                    if (slot.captured_frame != timeline_frame) {
+                    // Once per timeline frame (paused re-renders reuse) -
+                    // unless the params changed: a paused edit kicks a
+                    // fresh walk (the worker's settle pass lands it), so
+                    // the pattern follows the edit without playhead moves.
+                    const uint64_t ed_sig = stateful_param_sig(
+                        fx, hash_combine(doc.master_seed, fx.seed));
+                    if (slot.captured_frame != timeline_frame ||
+                        slot.sig != ed_sig) {
                         in_img->transition(
                             rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                         VkMemoryBarrier ed_pre{
@@ -2254,6 +2338,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.result_w = w;
                         slot.result_h = h;
                         slot.captured_frame = timeline_frame;
+                        slot.sig = ed_sig;
                         slot.busy = true;
                         EdSlotAsync* s = &slot;
                         const uint32_t cap_w = w, cap_h = h;
@@ -3332,19 +3417,25 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
 
         results[static_cast<size_t>(index)] = dst;
-        // Node-canvas thumbnail taps: effects key on
-        // their id, layer sources on layer.id | bit 62 (id spaces
+        // Node-canvas thumbnail taps, ROOT instance only: the canvas
+        // shows the scoped look's own cards, so nested instances' taps
+        // would burn atlas cells on keys nothing displays (topo order
+        // evaluates nested nodes FIRST — a big nested ref could exhaust
+        // the grid before the visible cards tapped) and two instances
+        // of one look would overwrite each other's cells. Effects key
+        // on their id, layer sources on layer.id | bit 62 (id spaces
         // overlap).
         constexpr uint64_t kThumbSourceBit = 1ull << 62;
-        if (node.kind == GraphNode::Kind::Effect &&
+        if (node.instance == 0 && node.kind == GraphNode::Kind::Effect &&
             node.effect_index >= 0 && node.layer_index >= 0) {
             const doc::EffectInstance& tfx =
                 look.layers[static_cast<size_t>(node.layer_index)]
                     .stack[static_cast<size_t>(node.effect_index)];
             record_thumb_tap(rec, frame_index, dst, tfx.id);
-        } else if (node.kind == GraphNode::Kind::Source ||
-                   node.kind == GraphNode::Kind::Generator ||
-                   node.kind == GraphNode::Kind::LayerTransform) {
+        } else if (node.instance == 0 &&
+                   (node.kind == GraphNode::Kind::Source ||
+                    node.kind == GraphNode::Kind::Generator ||
+                    node.kind == GraphNode::Kind::LayerTransform)) {
             if (node.layer_index >= 0)
                 record_thumb_tap(
                     rec, frame_index, dst,

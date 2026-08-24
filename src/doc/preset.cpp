@@ -61,13 +61,20 @@ std::vector<Preset> scan_presets(const std::filesystem::path& dir,
                                  int* failed) {
     std::vector<Preset> out;
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (!entry.is_regular_file(ec)) continue;
-        if (entry.path().extension() != ".json") continue;
-        if (auto p = load_preset(entry.path()))
-            out.push_back(std::move(*p));
-        else if (failed)
-            ++*failed;   // a corrupt preset must not vanish silently
+    std::filesystem::recursive_directory_iterator it(dir, ec), end;
+    while (!ec && it != end) {
+        // Subdirectories are the browser's bins; a few levels bound the
+        // walk against link loops and stray deep trees.
+        if (it.depth() > 3) it.disable_recursion_pending();
+        std::error_code fec;
+        if (it->is_regular_file(fec) &&
+            it->path().extension() == ".json") {
+            if (auto p = load_preset(it->path()))
+                out.push_back(std::move(*p));
+            else if (failed)
+                ++*failed;   // a corrupt preset must not vanish silently
+        }
+        it.increment(ec);
     }
     std::sort(out.begin(), out.end(),
               [](const Preset& a, const Preset& b) { return a.name < b.name; });

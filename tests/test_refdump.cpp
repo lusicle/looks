@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "codec/mez.h"
+#include "media/bmff.h"
+#include "media/export.h"
 #include "media/frame_index.h"
 #include "media/import.h"
 #include "platform/win/mf_codec.h"
@@ -193,6 +195,66 @@ struct Roller {
 // media can be exercised through the smoke workflow. The video pass is
 // one full decode - a one-time cost per machine, gated by the analysis
 // sidecar it produces.
+// CONSOLIDATE: a long-GOP fixture transcodes to all-intra with the
+// frame count preserved, and the artifact demuxes with EVERY sample a
+// keyframe — the property that turns a cold scrub into a one-frame
+// decode. The fixture is synthesized in-test through the export path.
+TEST(consolidate_all_intra) {
+    const fs::path root(LOOKS_REPO_ROOT);
+    const fs::path dir = root / "temp" / "consolidate_test";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const fs::path src = dir / "gop30.mp4";
+
+    looks::media::ExportOptions opt;
+    opt.video_bitrate_bps = 1'000'000;
+    opt.gop_frames = 30;
+    const auto producer = [](uint32_t f, std::vector<uint8_t>& nv12) {
+        const uint32_t w = 128, h = 96;
+        nv12.assign(static_cast<size_t>(w) * h * 3 / 2, 128);
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+                nv12[static_cast<size_t>(y) * w + x] =
+                    static_cast<uint8_t>(x * 2 + f * 4);
+        return true;
+    };
+    const looks::media::ExportResult made = looks::media::export_movie(
+        128, 96, 30, 1, 60, producer, {}, src, opt);
+    CHECK(made.ok);
+
+    {
+        looks::media::BmffFile f;
+        std::string err;
+        CHECK(f.open(src, &err));
+        const looks::media::TrackInfo* v = f.movie().first_video();
+        CHECK(v != nullptr);
+        CHECK_EQ(v->samples.size(), size_t{60});
+        uint32_t keys = 0;
+        for (const looks::media::SampleInfo& s : v->samples)
+            keys += s.keyframe ? 1u : 0u;
+        CHECK(keys < 10);   // really long-GOP before the transcode
+    }
+
+    const looks::media::ImportResult res =
+        looks::media::consolidate_video(src, dir);
+    CHECK(res.ok);
+    CHECK_EQ(res.frame_count, 60u);
+
+    const fs::path intra = dir / "gop30.intra.mp4";
+    {
+        looks::media::BmffFile f;
+        std::string err;
+        CHECK(f.open(intra, &err));
+        const looks::media::TrackInfo* v = f.movie().first_video();
+        CHECK(v != nullptr);
+        CHECK_EQ(v->samples.size(), size_t{60});
+        for (const looks::media::SampleInfo& s : v->samples)
+            CHECK(s.keyframe);
+    }
+    fs::remove(src, ec);     // test-owned temp fixtures
+    fs::remove(intra, ec);
+}
+
 TEST(long_example_ingest) {
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path src = root / "temp" / "long example.mp4";

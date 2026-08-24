@@ -633,10 +633,18 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         return -1;
     };
 
-    // Pass C: the composite — Output links in table order, bottom-up.
-    // Each contribution blends with its OWNER layer's mode/opacity and
-    // layer matte.
-    int below = -1;
+    // Pass C: the composite — Output contributions stack in OWNER LAYER
+    // order (bottom layer first), never link-table order: wire edits and
+    // preset splices re-append links, and a gesture that rewires one
+    // chain's end must not restack the layers or move the audio voice
+    // (the flatten's output_feed picks the voice by the same rule). Each
+    // contribution blends with its OWNER layer's mode/opacity and layer
+    // matte.
+    struct OutFeed {
+        const doc::NodeLink* l;
+        size_t li;
+    };
+    std::vector<OutFeed> feeds;
     for (const doc::NodeLink& l : links) {
         if (l.to != 0 || l.to_port != 0) continue;
         size_t li = SIZE_MAX;
@@ -647,6 +655,16 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 if (look.layers[k].id == l.from) li = k;
         }
         if (li == SIZE_MAX || !look.layers[li].visible) continue;
+        feeds.push_back({&l, li});
+    }
+    std::stable_sort(feeds.begin(), feeds.end(),
+                     [](const OutFeed& a, const OutFeed& b) {
+                         return a.li < b.li;
+                     });
+    int below = -1;
+    for (const OutFeed& feed : feeds) {
+        const doc::NodeLink& l = *feed.l;
+        const size_t li = feed.li;
         const doc::Layer& layer = look.layers[li];
 
         // Every contribution resolves through the links — the adjustment

@@ -227,16 +227,34 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
     log_info("gpu: %s", dev->properties_.deviceName);
 
     // ---- logical device
+    // A second graphics-family queue (lower priority) carries the
+    // thumbnail worker's background renders: the driver schedules them
+    // around frame work instead of in line with it. Same family, so
+    // every resource shares with no ownership transfers; one-queue
+    // families fall back to the shared graphics queue.
+    uint32_t gfx_queue_count = 1;
+    {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(best, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(best, &n, fams.data());
+        if (dev->graphics_family_ < n &&
+            fams[dev->graphics_family_].queueCount >= 2)
+            gfx_queue_count = 2;
+    }
     float priority = 1.0f;
+    const float gfx_priorities[2] = {1.0f, 0.5f};
     std::vector<VkDeviceQueueCreateInfo> queue_infos;
     {
         VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qi.queueFamilyIndex = dev->graphics_family_;
-        qi.queueCount = 1;
-        qi.pQueuePriorities = &priority;
+        qi.queueCount = gfx_queue_count;
+        qi.pQueuePriorities = gfx_priorities;
         queue_infos.push_back(qi);
         if (dev->transfer_family_ != dev->graphics_family_) {
             qi.queueFamilyIndex = dev->transfer_family_;
+            qi.queueCount = 1;
+            qi.pQueuePriorities = &priority;
             queue_infos.push_back(qi);
         }
     }
@@ -295,6 +313,8 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
 
     vkGetDeviceQueue(dev->device_, dev->graphics_family_, 0, &dev->graphics_queue_);
     vkGetDeviceQueue(dev->device_, dev->transfer_family_, 0, &dev->transfer_queue_);
+    vkGetDeviceQueue(dev->device_, dev->graphics_family_,
+                     gfx_queue_count > 1 ? 1 : 0, &dev->thumb_queue_);
 
     // ---- VMA
     VmaVulkanFunctions functions{};

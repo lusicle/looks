@@ -15,6 +15,8 @@
 
 #include <cstring>
 #include <deque>
+#include <memory>
+#include <mutex>
 
 #include "media/h264_util.h"
 #include "platform/win/com_ptr.h"
@@ -89,6 +91,42 @@ HRESULT make_sample(const uint8_t* data, size_t size, int64_t pts,
 // chunk, and a worst-case 4K video keyframe.
 constexpr DWORD kAudioAllocFallback = 4096;
 constexpr DWORD kVideoAllocFallback = 4u << 20;
+
+// One D3D11 device + DXGI manager shared by every hardware MFT session
+// alive at once: per-session devices multiply per stream (two decode
+// sessions each) plus the export encoder. Refcounted through the
+// sessions, so the last one drops the device and an MF
+// startup/shutdown cycle never sees a stale cached one.
+struct SharedD3d {
+    Com<IMFDXGIDeviceManager> mgr;
+    Com<ID3D11Device> d3d;
+};
+
+std::shared_ptr<SharedD3d> acquire_shared_d3d() {
+    static std::mutex m;
+    static std::weak_ptr<SharedD3d> cache;
+    std::lock_guard<std::mutex> lock(m);
+    if (auto held = cache.lock()) return held;
+    auto fresh = std::make_shared<SharedD3d>();
+    Com<ID3D11DeviceContext> ctx;
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        fresh->d3d.put(), nullptr, ctx.put());
+    if (FAILED(hr)) return nullptr;
+    // Decode sessions, the readback maps and an encoder may all submit
+    // concurrently on this one device.
+    Com<ID3D11Multithread> mt;
+    if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(mt.put()))))
+        mt->SetMultithreadProtected(TRUE);
+    UINT reset_token = 0;
+    hr = MFCreateDXGIDeviceManager(&reset_token, fresh->mgr.put());
+    if (SUCCEEDED(hr))
+        hr = fresh->mgr->ResetDevice(fresh->d3d.get(), reset_token);
+    if (FAILED(hr)) return nullptr;
+    cache = fresh;
+    return fresh;
+}
 
 // Allocates the output sample when the MFT does not provide its own.
 HRESULT alloc_output_sample(const MFT_OUTPUT_STREAM_INFO& info,
@@ -246,40 +284,26 @@ struct H264Decoder::Impl {
     // samples are system memory) keeps the old emit-immediately behavior.
     std::deque<Com<IMFSample>> inflight;
 
-    // D3D11/DXVA acceleration: kept alive for the MFT's lifetime.
-    Com<IMFDXGIDeviceManager> dxgi_mgr;
-    Com<ID3D11Device> d3d;
+    // D3D11/DXVA acceleration: a reference on the process-shared device,
+    // held for the MFT's lifetime.
+    std::shared_ptr<SharedD3d> shared;
 
-    // Attaches a DXGI device manager when the decoder is D3D11-aware, so
-    // the pixel work runs on the GPU (DXVA). Failure is non-fatal — decode
-    // just stays on the pure software path.
+    // Attaches the shared DXGI device manager when the decoder is
+    // D3D11-aware, so the pixel work runs on the GPU (DXVA). Failure is
+    // non-fatal — decode just stays on the pure software path.
     bool try_d3d() {
         Com<IMFAttributes> attrs;
         UINT32 aware = 0;
         if (FAILED(mft->GetAttributes(attrs.put())) ||
             FAILED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &aware)) || !aware)
             return false;
-        Com<ID3D11DeviceContext> ctx;
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
-                                       nullptr,
-                                       D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                                       nullptr, 0, D3D11_SDK_VERSION,
-                                       d3d.put(), nullptr, ctx.put());
-        if (FAILED(hr)) return false;
-        Com<ID3D11Multithread> mt;
-        if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(mt.put()))))
-            mt->SetMultithreadProtected(TRUE);
-        UINT reset_token = 0;
-        hr = MFCreateDXGIDeviceManager(&reset_token, dxgi_mgr.put());
-        if (SUCCEEDED(hr))
-            hr = dxgi_mgr->ResetDevice(d3d.get(), reset_token);
-        if (SUCCEEDED(hr))
-            hr = mft->ProcessMessage(
-                MFT_MESSAGE_SET_D3D_MANAGER,
-                reinterpret_cast<ULONG_PTR>(dxgi_mgr.get()));
+        shared = acquire_shared_d3d();
+        if (!shared) return false;
+        const HRESULT hr = mft->ProcessMessage(
+            MFT_MESSAGE_SET_D3D_MANAGER,
+            reinterpret_cast<ULONG_PTR>(shared->mgr.get()));
         if (FAILED(hr)) {
-            dxgi_mgr.reset();
-            d3d.reset();
+            shared.reset();
             return false;
         }
         return true;
@@ -311,6 +335,8 @@ struct H264Decoder::Impl {
 
 H264Decoder::H264Decoder() : impl_(new Impl) {}
 H264Decoder::~H264Decoder() = default;
+
+void H264Decoder::destroy() { impl_ = std::make_unique<Impl>(); }
 
 bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
                          uint32_t height, std::string* error, bool allow_d3d,
@@ -347,7 +373,7 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
     // The DXVA path lags only its DPB (a handful) and MF_LOW_LATENCY
     // there just forces per-frame completion, defeating the GPU's own
     // pipelining.
-    if (low_latency && !d.dxgi_mgr) {
+    if (low_latency && !d.shared) {
         Com<IMFAttributes> attrs;
         if (SUCCEEDED(d.mft->GetAttributes(attrs.put())))
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
@@ -414,7 +440,7 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
     // OLDEST - pulled earliest, so its decode has finished while newer
     // frames were still on the GPU and the map below is a copy, not a
     // stall.
-    const size_t depth = d.dxgi_mgr ? 3 : 1;
+    const size_t depth = d.shared ? 3 : 1;
     while (d.inflight.size() < depth) {
         Com<IMFSample> pulled;
         bool stream_changed = false;
@@ -687,8 +713,7 @@ struct H264Encoder::Impl {
     bool async_mode = false;
     DWORD in_id = 0, out_id = 0;
     Com<IMFMediaEventGenerator> events;
-    Com<IMFDXGIDeviceManager> dxgi_mgr;
-    Com<ID3D11Device> d3d;
+    std::shared_ptr<SharedD3d> shared;
     int needs_input = 0;             // granted-but-unused input slots
     bool drain_complete = false;
     std::deque<EncodedPacket> ready; // outputs collected while pumping
@@ -880,21 +905,10 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
     CoTaskMemFree(activates);
     if (!e.mft) return fail(last_stage, last_hr);
 
-    // D3D11 device + DXGI manager: hardware MFTs only run in
+    // Shared D3D11 device + DXGI manager: hardware MFTs only run in
     // hardware with a device manager attached.
-    UINT reset_token = 0;
-    Com<ID3D11DeviceContext> ctx;
-    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                           D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr, 0,
-                           D3D11_SDK_VERSION, e.d3d.put(), nullptr,
-                           ctx.put());
-    if (FAILED(hr)) return fail("D3D11 device", hr);
-    Com<ID3D11Multithread> mt;
-    if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(mt.put()))))
-        mt->SetMultithreadProtected(TRUE);
-    hr = MFCreateDXGIDeviceManager(&reset_token, e.dxgi_mgr.put());
-    if (SUCCEEDED(hr)) hr = e.dxgi_mgr->ResetDevice(e.d3d.get(), reset_token);
-    if (FAILED(hr)) return fail("DXGI manager", hr);
+    e.shared = acquire_shared_d3d();
+    if (!e.shared) return fail("DXGI manager", E_FAIL);
 
     // Attach the DXGI manager. Some encoder MFTs accept it only
     // after type negotiation; a refusal is non-fatal — the async hardware
@@ -902,7 +916,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
     // enables zero-copy D3D surface input.
     hr = e.mft->ProcessMessage(
         MFT_MESSAGE_SET_D3D_MANAGER,
-        reinterpret_cast<ULONG_PTR>(e.dxgi_mgr.get()));
+        reinterpret_cast<ULONG_PTR>(e.shared->mgr.get()));
     if (FAILED(hr))
         log_warn("mf: encoder refused DXGI manager (hr=0x%08lX) — "
                  "hardware path continues with CPU sample input",
@@ -940,8 +954,7 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     }
     e.mft.reset();
     e.events.reset();
-    e.dxgi_mgr.reset();
-    e.d3d.reset();
+    e.shared.reset();
     e.async_mode = false;
     e.needs_input = 0;
     e.in_id = e.out_id = 0;

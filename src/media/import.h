@@ -56,6 +56,31 @@ ImportResult import_media(const std::filesystem::path& source,
                           const ImportOptions& options = {},
                           ImportProgress* progress = nullptr);
 
+// Re-run JUST the video pass (curves + thumbs) for an already-usable
+// native video bundle whose pass never completed (killed mid-ingest).
+// Rewrites .analysis with the video curves merged over the audio set on
+// disk and lands the .thumbs strip; `ready` is set immediately (the
+// asset was usable all along).
+ImportResult resume_video_pass(const std::filesystem::path& source,
+                               const std::filesystem::path& dest_dir,
+                               const ImportOptions& options = {},
+                               ImportProgress* progress = nullptr);
+
+// Rebuild a mezzanine bundle's one-cell thumb strip from its first
+// frame (stills, cover art) — the migration for sidecars written at an
+// older cell height.
+bool rebuild_still_thumbs(const std::filesystem::path& mez_path,
+                          const std::filesystem::path& thumbs_path);
+
+// CONSOLIDATE: transcode a native video source to all-intra H.264
+// (<stem>.intra.mp4 beside its sidecars). Preview decode prefers the
+// artifact — every frame a keyframe, so a cold scrub decodes one frame
+// instead of rolling a GOP — while export keeps the original. Video
+// only: audio rides the .pcm sidecar either way.
+ImportResult consolidate_video(const std::filesystem::path& source,
+                               const std::filesystem::path& dest_dir,
+                               ImportProgress* progress = nullptr);
+
 // Sidechain audio: pull just the audio out of a WAV or MP4/MOV
 // into a .pcm sidecar at dest_pcm. Fails with `error` set when the source
 // has no usable audio track.

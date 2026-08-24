@@ -38,7 +38,10 @@ namespace looks::doc {
 //   8 gen_angle, 9 crop_l, 10 crop_r, 11 crop_t, 12 crop_b,
 //   13 xf_scale, 14 xf_rotate.
 inline constexpr uint64_t kLayerParamBit = 1ull << 62;
-inline constexpr int kLayerParamCount = 15;
+// Indexes into the layer param slots; 15/16 are the slip and waveform
+// FIELD ids (view rows, not modulatable slots), 17 is the oscillator
+// phase.
+inline constexpr int kLayerParamCount = 18;
 
 struct ParamKey {
     uint64_t effect_id = 0;

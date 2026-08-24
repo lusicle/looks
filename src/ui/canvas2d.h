@@ -52,6 +52,11 @@ public:
 
     // ---- primitives (logical px)
     void draw_rect(const Rect& r, Color color);
+    // Per-corner colors, bilinear across the quad (smooth gradients:
+    // the color picker's SV square is ONE quad, not banded strips).
+    // Order: top-left, top-right, bottom-right, bottom-left.
+    void draw_rect_corners(const Rect& r, Color c00, Color c10, Color c11,
+                           Color c01);
     void draw_rect_outline(const Rect& r, float stroke, Color color);
     void draw_triangle(Vec2 a, Vec2 b, Vec2 c, Color color);
     void draw_line(Vec2 a, Vec2 b, float thickness, Color color);

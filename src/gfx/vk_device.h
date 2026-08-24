@@ -45,11 +45,23 @@ public:
     uint32_t transfer_family() const { return transfer_family_; }
     VkQueue transfer_queue() const { return transfer_queue_; }
     bool has_dedicated_transfer() const { return transfer_family_ != graphics_family_; }
+    // Second graphics-family queue (priority 0.5) for the thumbnail
+    // worker's background renders; the graphics queue itself when the
+    // family exposes only one. Same family = shared resources, and a
+    // host fence wait plus the consumer's own barriers carry work
+    // across queues (execution ordered through the host, visibility
+    // through the barrier).
+    VkQueue thumb_queue() const { return thumb_queue_; }
+    bool has_dedicated_thumb_queue() const {
+        return thumb_queue_ != graphics_queue_;
+    }
 
     const VkPhysicalDeviceProperties& properties() const { return properties_; }
 
-    // Serializes vkQueueSubmit/vkQueuePresentKHR/vkDeviceWaitIdle: the
-    // preview loop and an export worker share the one graphics queue.
+    // Serializes vkQueueSubmit/vkQueuePresentKHR/vkDeviceWaitIdle
+    // across ALL queues - preview loop, export worker, UI present and
+    // the thumbnail queue take this one lock for every submit, so no
+    // per-queue ownership bookkeeping exists to get wrong.
     std::mutex& queue_mutex() const { return queue_mutex_; }
 
     void wait_idle() const {
@@ -70,6 +82,7 @@ private:
     uint32_t transfer_family_ = 0;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
     VkQueue transfer_queue_ = VK_NULL_HANDLE;
+    VkQueue thumb_queue_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
     mutable std::mutex queue_mutex_;
 };

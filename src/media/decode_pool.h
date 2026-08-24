@@ -70,13 +70,32 @@ public:
 
     // Decodes the whole plan (blocking on a miss) and queues the prewarm
     // for the frames after it. Frames stay alive until the next collect().
-    const std::vector<SourceFrame>& collect(uint32_t root_frame);
+    // `scrub` marks an in-progress playhead DRAG: every position is
+    // disposable, so a native ask that would cost a keyframe roll snaps
+    // to the nearest frame the session serves in one feed instead of
+    // stalling the caller per position. The gesture's end re-renders the
+    // exact frame; the caller must gate its frame cache while scrubbing
+    // so approximate pixels are never stored (which is what the
+    // exact-decode rule exists to protect).
+    const std::vector<SourceFrame>& collect(uint32_t root_frame,
+                                            bool scrub = false);
+
+    // Shutdown point of no return: every in-flight and future roll bails
+    // at its next sample and misses return null, so a stopping consumer
+    // never waits out a keyframe roll.
+    void abort();
 
     const std::vector<doc::MediaInstance>& sources() const { return sources_; }
 
     // Frames decoded from disk since the last reset - a decode this frame
     // that prewarm did not already have. Playback smoothness, measurable.
     uint64_t misses() const { return misses_; }
+
+    // True when the LAST collect served any scrub-approximated frame
+    // (nearest ringed, or a snapped roll floor). The caller must treat
+    // that render as UNSETTLED — re-collect until exact — and must not
+    // store it anywhere durable.
+    bool approximated() const { return approximated_; }
 
 private:
     struct Stream {
@@ -158,6 +177,10 @@ private:
         std::vector<std::shared_ptr<codec::DecodedFrame>> spare;
         uint32_t want = 0;       // the frame the consumer last asked for
         uint32_t last_want = 0;  // previous ask: backward motion widens rolls
+        // Idle-close bookkeeping, consumer thread only (written by
+        // stream_for and the scan, both inside collect, under map_m_).
+        uint64_t last_touch = 0;
+        bool idle_closed = false;
     };
 
     struct Job {
@@ -171,18 +194,21 @@ private:
     // session (waiting at most one in-flight decode, never the prewarm
     // backlog).
     std::shared_ptr<const codec::DecodedFrame> fetch(Stream& s, uint32_t frame,
-                                                     bool* was_miss);
+                                                     bool* was_miss,
+                                                     bool scrub = false);
     std::shared_ptr<const codec::DecodedFrame> fetch_mez(Stream& s,
                                                          uint32_t frame);
     std::shared_ptr<const codec::DecodedFrame> fetch_native(Stream& s,
                                                             uint32_t frame,
-                                                            bool advisory);
+                                                            bool advisory,
+                                                            bool scrub);
     std::shared_ptr<const codec::DecodedFrame> ring_insert(
         Stream& s, uint32_t frame,
         std::shared_ptr<const codec::DecodedFrame> decoded, size_t depth);
     static std::shared_ptr<codec::DecodedFrame> take_spare(Stream& s);
     void worker_main();
     void drain();
+    void idle_close_scan();
 
     std::vector<doc::MediaInstance> sources_;
     std::vector<AssetBundle> bundles_;
@@ -190,12 +216,15 @@ private:
     uint64_t look_ = 0;
     std::vector<SourceFrame> frames_;
     uint64_t misses_ = 0;
+    bool approximated_ = false;   // consumer thread only
     // Read by the decode workers: a size hint, sized to how many streams
     // are live so the frame budget divides across them.
     std::atomic<uint32_t> ring_depth_{4};
 
     std::mutex map_m_;
     std::unordered_map<uint64_t, std::unique_ptr<Stream>> streams_;
+    uint64_t collect_gen_ = 0;
+    std::atomic<bool> abort_{false};
 
     std::mutex job_m_;
     std::condition_variable job_cv_;
@@ -203,6 +232,17 @@ private:
     uint64_t gen_ = 0;
     int busy_ = 0;
     bool quit_ = false;
+    // Scrub state. While the playhead is DRAGGED, the CONSUMER never
+    // decodes (it serves the nearest ringed frame instantly) and the
+    // plan queues one advisory CHASER per stream toward the drag
+    // target — a worker session rolls at full decode rate, decoupled
+    // from the render cadence. The epoch marks the drag's start:
+    // advisories from BEFORE it bail at their next sample (they hold
+    // the sessions the chase needs), while chasers queued during the
+    // drag carry the current epoch and run to completion.
+    std::atomic<bool> scrub_{false};
+    std::atomic<uint64_t> scrub_epoch_{0};
+    bool prev_scrub_ = false;
     std::vector<std::thread> workers_;
 };
 

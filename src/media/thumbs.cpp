@@ -41,13 +41,27 @@ bool read_thumbs(const std::filesystem::path& path, ThumbStripData* out) {
     const uint32_t h = bytes::le16(p + 6);
     const uint32_t count = bytes::le16(p + 8);
     const size_t need = 10 + static_cast<size_t>(w) * h * 3 * count;
-    if (!w || !h || !count || data->size() < need || w * count > 16384)
-        return false;
+    if (!w || !h || !count || data->size() < need) return false;
     out->w = w;
     out->h = h;
     out->count = count;
     out->rgb.assign(p + 10, p + need);
     return true;
+}
+
+bool read_thumbs_header(const std::filesystem::path& path,
+                        ThumbStripData* out) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    uint8_t header[10];
+    const bool got = std::fread(header, 1, 10, f) == 10;
+    std::fclose(f);
+    if (!got || std::memcmp(header, "THM1", 4) != 0) return false;
+    out->w = bytes::le16(header + 4);
+    out->h = bytes::le16(header + 6);
+    out->count = bytes::le16(header + 8);
+    out->rgb.clear();
+    return out->w && out->h && out->count;
 }
 
 }  // namespace looks::media

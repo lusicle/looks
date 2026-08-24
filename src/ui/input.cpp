@@ -23,6 +23,8 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
     wheel_y = 0.0f;
     wheel_x = 0.0f;
     typed.clear();
+    backspace_pressed = false;
+    enter_pressed = false;
     consumed = false;
 
     const float inv = dpi_scale > 1e-3f ? 1.0f / dpi_scale : 1.0f;
@@ -57,6 +59,12 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
                 typed.push_back(e.codepoint);
                 break;
             case platform::Event::Type::KeyDown:
+                if (e.key == platform::Key::Backspace)
+                    backspace_pressed = true;
+                else if (e.key == platform::Key::Enter)
+                    enter_pressed = true;
+                mods = e.mods;
+                break;
             case platform::Event::Type::KeyUp:
                 mods = e.mods;
                 break;

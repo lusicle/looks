@@ -1,5 +1,9 @@
 #include "gfx/renderer.h"
 
+#include <vk_mem_alloc.h>
+
+#include <cstring>
+
 #include "util/log.h"
 
 namespace looks::gfx {
@@ -49,6 +53,8 @@ Renderer::~Renderer() {
     if (!device_) return;
     device_->wait_idle();
     VkDevice dev = device_->device();
+    if (capture_buf_)
+        vmaDestroyBuffer(device_->allocator(), capture_buf_, capture_alloc_);
     for (Frame& f : frames_) {
         if (f.in_flight) vkDestroyFence(dev, f.in_flight, nullptr);
         if (f.acquire) vkDestroySemaphore(dev, f.acquire, nullptr);
@@ -57,6 +63,44 @@ Renderer::~Renderer() {
     for (VkSemaphore s : render_done_)
         vkDestroySemaphore(dev, s, nullptr);
     swapchain_.reset();
+}
+
+bool Renderer::ensure_capture_buffer(size_t bytes) {
+    if (capture_capacity_ >= bytes) return true;
+    if (capture_buf_) {
+        vmaDestroyBuffer(device_->allocator(), capture_buf_, capture_alloc_);
+        capture_buf_ = VK_NULL_HANDLE;
+        capture_capacity_ = 0;
+    }
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = bytes;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo mapped{};
+    if (vmaCreateBuffer(device_->allocator(), &info, &alloc_info,
+                        &capture_buf_, &capture_alloc_,
+                        &mapped) != VK_SUCCESS) {
+        log_error("gfx: capture buffer alloc failed (%zu bytes)", bytes);
+        capture_buf_ = VK_NULL_HANDLE;
+        return false;
+    }
+    capture_mapped_ = mapped.pMappedData;
+    capture_capacity_ = bytes;
+    return true;
+}
+
+bool Renderer::take_capture(std::vector<uint8_t>* out, uint32_t* w,
+                            uint32_t* h) {
+    if (!capture_ready_) return false;
+    *out = std::move(capture_rgba_);
+    *w = capture_w_;
+    *h = capture_h_;
+    capture_rgba_.clear();
+    capture_ready_ = false;
+    return true;
 }
 
 void Renderer::create_per_image_sync() {
@@ -163,17 +207,50 @@ void Renderer::end_frame(const FrameContext& frame) {
 
     vkCmdEndRendering(f.cmd);
 
+    // Screenshot capture: route the finished image through TRANSFER_SRC
+    // and copy it out before the present transition.
+    const size_t cap_bytes = size_t{frame.extent.width} *
+                             frame.extent.height * 4;
+    const bool capturing =
+        capture_pending_ && ensure_capture_buffer(cap_bytes);
+    capture_pending_ = false;   // a failed alloc drops the request, logged
+    if (capturing) {
+        VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        to_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.image = swapchain_->image(frame.image_index);
+        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(f.cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_src);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {frame.extent.width, frame.extent.height, 1};
+        vkCmdCopyImageToBuffer(f.cmd, swapchain_->image(frame.image_index),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               capture_buf_, 1, &region);
+    }
+
     VkImageMemoryBarrier to_present{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    to_present.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_present.srcAccessMask = capturing ? VK_ACCESS_TRANSFER_READ_BIT
+                                         : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     to_present.dstAccessMask = 0;
-    to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_present.oldLayout = capturing
+                               ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                               : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_present.image = swapchain_->image(frame.image_index);
     to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(f.cmd,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         capturing ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                   : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &to_present);
 
@@ -203,6 +280,34 @@ void Renderer::end_frame(const FrameContext& frame) {
         vk_check(r, "vkQueuePresentKHR");
     }
     ++frame_counter_;
+
+    if (capturing) {
+        // One blocking fence wait on the capturing frame only; then the
+        // bytes convert to RGBA rows (swapchain formats are BGRA-ordered
+        // on this platform; sRGB-encoded bytes are exactly what the PNG
+        // wants).
+        vk_check(vkWaitForFences(device_->device(), 1, &f.in_flight, VK_TRUE,
+                                 UINT64_MAX),
+                 "vkWaitForFences(capture)");
+        vmaInvalidateAllocation(device_->allocator(), capture_alloc_, 0,
+                                cap_bytes);
+        capture_rgba_.resize(cap_bytes);
+        std::memcpy(capture_rgba_.data(), capture_mapped_, cap_bytes);
+        const VkFormat fmt = swapchain_->format();
+        const bool bgra = fmt == VK_FORMAT_B8G8R8A8_UNORM ||
+                          fmt == VK_FORMAT_B8G8R8A8_SRGB;
+        if (bgra) {
+            uint8_t* p = capture_rgba_.data();
+            for (size_t i = 0; i < cap_bytes; i += 4)
+                std::swap(p[i], p[i + 2]);
+        }
+        // The UI composites opaque; force alpha so viewers ignore
+        // whatever the blend left in the channel.
+        for (size_t i = 3; i < cap_bytes; i += 4) capture_rgba_[i] = 255;
+        capture_w_ = frame.extent.width;
+        capture_h_ = frame.extent.height;
+        capture_ready_ = true;
+    }
 }
 
 }  // namespace looks::gfx

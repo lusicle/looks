@@ -27,6 +27,10 @@ struct UiInput {
     float wheel_x = 0.0f;
     uint32_t mods = 0;              // platform::kModCtrl / Shift / Alt
     std::vector<uint32_t> typed;    // UTF-32 chars this frame
+    // Edit-key edges for widget-owned inline fields (the color picker's
+    // entry boxes); app-level fields keep reading platform events.
+    bool backspace_pressed = false;
+    bool enter_pressed = false;
     bool consumed = false;          // pointer claimed by UI this frame
 
     bool left_down() const { return buttons_down & kMouseLeft; }

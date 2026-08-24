@@ -29,7 +29,28 @@ struct ParamDesc {
     // Selector params are integer implicitly via `options`; %.0f params
     // where fractions are meaningful (px radii, hz rates) stay false.
     bool integer = false;
+    // Conditional visibility: >= 0 names a sibling SELECTOR param, and bit
+    // v of vis_mask shows this row while that selector holds value v.
+    // -1 = always shown. Hidden params keep their value, wires and keys -
+    // only their ROWS hide (card, inspector, group face), and cards
+    // shrink to the visible set. Kernels must ignore a hidden param in
+    // the modes that hide it, so a stale value can never leak into them.
+    int8_t vis_param = -1;
+    uint32_t vis_mask = 0;
+    // Radian-stored angle: rows DISPLAY degrees and render as the angle
+    // DIAL (deg-formatted params dial as they are - this flag is only
+    // for params whose stored unit is radians).
+    bool display_deg = false;
 };
+
+// Row visibility for one param of a live instance (see ParamDesc above).
+inline bool param_visible(const EffectInstance& fx, const ParamDesc& d) {
+    if (d.vis_param < 0) return true;
+    const size_t ctrl = static_cast<size_t>(d.vis_param);
+    if (ctrl >= fx.params.size()) return true;
+    const int v = static_cast<int>(fx.params[ctrl] + 0.5f);
+    return v >= 0 && v < 32 && ((d.vis_mask >> v) & 1u) != 0;
+}
 
 inline bool param_is_discrete(const ParamDesc& d) {
     return d.integer || d.options != nullptr;

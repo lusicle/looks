@@ -85,8 +85,12 @@ private:
 };
 
 // Pooled RGBA16F render targets: acquire per pass, release when the frame's
-// evaluation is done. Images are reused by (width, height); the pool never
-// shrinks (a handful of 1080p targets is the steady state).
+// evaluation is done. Images are reused by (width, height); sizes that
+// stop being served (proxy divisor change, a nested canvas or flow field
+// dropping out of the graph) retire after kRetireFrames unused
+// release_all cycles — release_all runs at render entry AFTER the owning
+// slot's fence wait, the one point where a free entry is provably
+// unreferenced by the GPU.
 class TargetPool {
 public:
     explicit TargetPool(Device& device) : device_(device) {}
@@ -99,12 +103,16 @@ public:
     void clear();
 
 private:
+    static constexpr uint64_t kRetireFrames = 60;
+
     struct Entry {
         std::unique_ptr<GpuImage> image;
         bool in_use = false;
+        uint64_t last_used = 0;
     };
     Device& device_;
     std::vector<Entry> entries_;
+    uint64_t gen_ = 0;
 };
 
 }  // namespace looks::gfx

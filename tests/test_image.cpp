@@ -124,3 +124,27 @@ TEST(tga_decode_uncompressed_and_rle) {
         CHECK_EQ(p[3], 200);
     }
 }
+
+TEST(png_encode_decode_roundtrip) {
+    // Every byte value crosses the encoder: gradient + alpha ramp, odd
+    // size so the stored-block split and row filters see uneven rows.
+    const uint32_t w = 131, h = 67;
+    std::vector<uint8_t> src(size_t{w} * h * 4);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t* p = src.data() + (size_t{y} * w + x) * 4;
+            p[0] = static_cast<uint8_t>(x * 2);
+            p[1] = static_cast<uint8_t>(y * 3);
+            p[2] = static_cast<uint8_t>(x + y);
+            p[3] = static_cast<uint8_t>(255 - (x % 255));
+        }
+    const std::vector<uint8_t> png =
+        looks::encode_png_rgba(src.data(), w, h);
+    CHECK(!png.empty());
+    ImageRgba back;
+    std::string err;
+    CHECK(decode_png(png.data(), png.size(), &back, &err));
+    CHECK_EQ(back.width, w);
+    CHECK_EQ(back.height, h);
+    CHECK(back.pixels == src);
+}

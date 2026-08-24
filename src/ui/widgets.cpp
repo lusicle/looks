@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 
+#include "ui/probe.h"
 #include "ui/text.h"
 
 namespace looks::ui {
@@ -187,6 +189,7 @@ struct ButtonUser {
     bool disabled;
     bool flat;
     bool align_left;
+    bool active;
     const char* tooltip;
     bool* out_ctx;
 };
@@ -209,6 +212,7 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const ButtonUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
+    if (!u->disabled) probe_add(std::string(u->label, u->length), r);
 
     Color bg = theme.control_bg;
     Color fg = u->flat ? theme.text_dim : theme.text;
@@ -227,6 +231,10 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
         if (u->flat) fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
     }
 
+    // Lit state on a TEXT button: label in accent, and chromed buttons
+    // trade the hairline for an accent outline — the same "lit" meaning
+    // the icon buttons carry.
+    if (u->active && !u->disabled) fg = theme.accent;
     if (u->flat) {
         // Chrome fades in with hover; resting state is just the label.
         if (!u->disabled && u->state->hover_t > 0.01f) {
@@ -236,8 +244,9 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
         }
     } else {
         frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
-        frame.canvas.draw_sdf_rect_outline(r, theme.corner_radius,
-                                           theme.stroke_width, theme.hairline);
+        frame.canvas.draw_sdf_rect_outline(
+            r, theme.corner_radius, theme.stroke_width,
+            u->active && !u->disabled ? theme.accent : theme.hairline);
     }
 
     // Label clipped to the button: a label wider than its slot truncates
@@ -254,6 +263,94 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
                r.y + (r.h - frame.font.line_height() * theme.font_size) * 0.5f},
               theme.font_size, fg);
     frame.canvas.pop_clip();
+}
+
+// ---- Segmented (one control, N segments, one active)
+
+struct SegmentedUser {
+    const char* const* labels;
+    const char* const* tooltips;
+    int count;
+    int active;
+    ButtonState* states;
+    bool* const* out_clicked;
+};
+
+Rect segment_rect(const Rect& r, int i, int count) {
+    const float w = r.w / static_cast<float>(count);
+    return {r.x + w * static_cast<float>(i), r.y, w, r.h};
+}
+
+Vec2 measure_segmented(LayoutNode& node, const Constraints&,
+                       const LayoutFrame& frame) {
+    const auto* u = static_cast<const SegmentedUser*>(node.user);
+    float widest = 0.0f;
+    for (int i = 0; i < u->count; ++i)
+        widest = std::max(widest,
+                          measure_text(frame.font, u->labels[i],
+                                       frame.theme.font_size).x);
+    return {(widest + 20.0f) * static_cast<float>(u->count),
+            frame.theme.control_height};
+}
+
+void hit_segmented(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const SegmentedUser*>(node.user);
+    for (int i = 0; i < u->count; ++i) {
+        Rect r = segment_rect(node.rect, i, u->count);
+        if (!node.clip.empty()) r = r.intersect(node.clip);
+        frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(&u->states[i]));
+    }
+}
+
+void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const SegmentedUser*>(node.user);
+    const Theme& theme = frame.theme;
+    const Rect& r = node.rect;
+
+    // The active/inactive read is VALUE alone, and it must survive a
+    // glance: the track sinks well below the control fill and the lit
+    // segment rises above it. control_bg_active is the PRESSED tone
+    // (darker than the fill) — never the lit one.
+    const Color track = lerp(theme.control_bg,
+                             Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+    const Color lit_fill = lerp(theme.control_bg,
+                                Color{1.0f, 1.0f, 1.0f, 1.0f}, 0.10f);
+    frame.canvas.draw_sdf_rect(r, theme.corner_radius, track);
+
+    for (int i = 0; i < u->count; ++i) {
+        const Rect seg = segment_rect(r, i, u->count);
+        probe_add(u->labels[i], seg);
+        ButtonState& st = u->states[i];
+        const WidgetId id = frame.ctx.acquire_widget_id(&st);
+        if (tick_press_release(st, id, seg, frame) && u->out_clicked[i])
+            *u->out_clicked[i] = true;
+        maybe_tooltip(st, u->tooltips ? u->tooltips[i] : nullptr, frame);
+
+        const bool lit = i == u->active;
+        const float seg_radius = std::max(0.0f, theme.corner_radius - 1.0f);
+        if (lit) {
+            frame.canvas.draw_sdf_rect(seg.inset(1.5f), seg_radius,
+                                       lit_fill);
+        } else if (st.hover_t > 0.01f) {
+            Color hover = theme.control_bg_hover;
+            hover.a *= st.hover_t;
+            frame.canvas.draw_sdf_rect(seg.inset(1.5f), seg_radius, hover);
+        }
+        const Color fg = lit ? theme.text : theme.text_dim;
+        const Vec2 ts = measure_text(frame.font, u->labels[i],
+                                     theme.font_size);
+        draw_text(frame.canvas, frame.font, u->labels[i],
+                  {seg.x + (seg.w - ts.x) * 0.5f,
+                   seg.y +
+                       (seg.h - frame.font.line_height() * theme.font_size) *
+                           0.5f},
+                  theme.font_size, fg);
+        if (i > 0)
+            frame.canvas.draw_rect(
+                {seg.x, seg.y + 3.0f, 1.0f, seg.h - 6.0f}, theme.hairline);
+    }
+    frame.canvas.draw_sdf_rect_outline(r, theme.corner_radius,
+                                       theme.stroke_width, theme.hairline);
 }
 
 // ---- Chip (toggle)
@@ -284,6 +381,7 @@ void draw_chip(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const ChipUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
+    probe_add(std::string(u->label, u->length), r);
 
     const WidgetId id = frame.ctx.acquire_widget_id(u->state);
     if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
@@ -333,6 +431,14 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const IconUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
+    if (!u->disabled) {
+        static const char* names[] = {
+            "play", "pause", "up", "down", "close", "wave", "key", "knob",
+            "eye", "eyeoff", "dice", "link", "solo", "soloon", "copy"};
+        const size_t ii = static_cast<size_t>(u->icon);
+        if (ii < sizeof(names) / sizeof(names[0]))
+            probe_add(std::string("icon:") + names[ii], r);
+    }
 
     Color fg = theme.text_dim;
     if (u->disabled) {
@@ -519,6 +625,11 @@ void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
     DropdownState& st = *u->state;
+    probe_add(std::string("dd:") +
+                  (u->selected >= 0 && u->selected < u->count
+                       ? u->items[u->selected]
+                       : "-"),
+              r);
 
     const WidgetId id = frame.ctx.acquire_widget_id(&st.button);
     const bool owns = frame.ctx.widget_owns_mouse(id);
@@ -604,6 +715,8 @@ void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
     const bool owns = frame.ctx.widget_owns_mouse(id);
     if (frame.input.left_pressed() && owns && !s.dragging) {
         s.dragging = true;
+        s.moved = false;
+        s.press_value = -1.0f;
         frame.ctx.set_capture(id);
     }
     if (s.dragging) {
@@ -612,6 +725,8 @@ void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
             ? std::clamp((frame.input.mouse.x - r.x) / r.w, 0.0f, 1.0f)
             : 0.0f;
         const float next = std::round(t * last);
+        if (s.press_value < 0.0f) s.press_value = next;
+        else if (std::fabs(next - s.press_value) >= 1.0f) s.moved = true;
         if (next != *u->frame_value) {
             *u->frame_value = next;
             if (u->out_changed) *u->out_changed = true;
@@ -663,6 +778,7 @@ void draw_checkbox(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const CheckboxUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
+    probe_add(std::string(u->label, u->length), r);
 
     const WidgetId id = frame.ctx.acquire_widget_id(u->state);
     if (tick_press_release(*u->state, id, r, frame)) {
@@ -769,6 +885,14 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
                 : 0.0f;
             next = u->min_value + t * span;
         }
+        // Snap in DISPLAY space so what the readout shows is what the
+        // document stores (deg-displayed radian params included).
+        const float ds =
+            u->display_scale != 0.0f ? u->display_scale : 1.0f;
+        next = (snap_to_format(next * ds + u->display_offset, u->format) -
+                u->display_offset) /
+               ds;
+        next = std::clamp(next, u->min_value, u->max_value);
         if (next != *u->value) {
             *u->value = next;
             if (u->out_changed) *u->out_changed = true;
@@ -877,6 +1001,10 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
         } else {
             s.dragging = true;
             s.dial_angle = dial_mouse_angle(frame.input.mouse, center);
+            // Raw accumulator: the stored value snaps to the display
+            // precision, so slow drags must integrate unsnapped or
+            // sub-step movement would never accumulate.
+            s.fine_anchor_value = *u->value;
             frame.ctx.set_capture(id);
         }
     }
@@ -887,8 +1015,16 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
         if (frame.input.mods & platform::kModShift) delta *= 0.1f;
         const float scale =
             u->display_scale != 0.0f ? u->display_scale : 1.0f;
-        const float next = std::clamp(*u->value + delta / scale,
-                                      u->min_value, u->max_value);
+        s.fine_anchor_value = std::clamp(
+            s.fine_anchor_value + delta / scale, u->min_value,
+            u->max_value);
+        const float next = std::clamp(
+            (snap_to_format(
+                 s.fine_anchor_value * scale + u->display_offset,
+                 u->format) -
+             u->display_offset) /
+                scale,
+            u->min_value, u->max_value);
         if (next != *u->value) {
             *u->value = next;
             if (u->out_changed) *u->out_changed = true;
@@ -933,6 +1069,8 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
 
 // ---- ColorSwatch
 
+}  // namespace
+
 void hsv_to_rgb(float h, float s, float v, float out[3]) {
     h = std::fmod(std::fmod(h, 360.0f) + 360.0f, 360.0f) / 60.0f;
     const float c = v * s;
@@ -967,6 +1105,8 @@ void rgb_to_hsv(const float rgb[3], float& h, float& s, float& v) {
         h = 60.0f * ((rgb[0] - rgb[1]) / d + 4.0f);
 }
 
+namespace {
+
 struct SwatchUser {
     float rgb[3];
     SwatchState* state;
@@ -975,11 +1115,14 @@ struct SwatchUser {
     bool* out_released;
 };
 
-constexpr float kPickerW = 168.0f;
-constexpr float kPickerSvH = 96.0f;
+constexpr float kPickerW = 192.0f;
+constexpr float kPickerSvH = 128.0f;
 constexpr float kPickerHueH = 12.0f;
+constexpr float kPickerFieldH = 17.0f;
 constexpr float kPickerH = 6.0f + kPickerSvH + 6.0f + kPickerHueH + 6.0f +
-                           16.0f + 6.0f;
+                           kPickerFieldH + 4.0f + kPickerFieldH + 6.0f;
+
+}  // namespace
 
 Rect swatch_popup_rect(const Rect& anchor, const LayoutFrame& frame) {
     float y = anchor.bottom() + 2.0f;
@@ -989,6 +1132,8 @@ Rect swatch_popup_rect(const Rect& anchor, const LayoutFrame& frame) {
         std::max(4.0f, std::min(anchor.x, view.x - kPickerW - 4.0f));
     return {x, y, kPickerW, kPickerH};
 }
+
+namespace {
 
 Vec2 measure_swatch(LayoutNode&, const Constraints& c, const LayoutFrame&) {
     return {c.bounded_w() ? c.max_w : 120.0f, 14.0f};
@@ -1016,15 +1161,24 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
         if (st.open) {
             rgb_to_hsv(u->rgb, st.hue, st.sat, st.val);
             st.drag_zone = 0;
+            st.field_edit = -1;
+            st.edit_len = 0;
             frame.ctx.set_popup_owner(&st);
         }
     }
-    if (st.open && frame.ctx.popup_owner() != &st) st.open = false;
+    // Closing lands any typed field first (blur commit) — a click away
+    // must never drop the entered value.
+    const auto close = [&] {
+        swatch_commit_field(st, u->out_rgb, u->out_changed,
+                            u->out_released);
+        st.open = false;
+    };
+    if (st.open && frame.ctx.popup_owner() != &st) close();
     const bool over_popup =
         st.open && frame.ctx.widget_owns_mouse(
                        frame.ctx.acquire_widget_id(u->state));
     if (st.open && !owns && !over_popup && frame.input.left_pressed())
-        st.open = false;
+        close();
 
     frame.canvas.draw_sdf_rect(r, 3.0f,
                                Color{u->rgb[0], u->rgb[1], u->rgb[2], 1.0f});
@@ -1045,6 +1199,56 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
     }
 }
 
+}  // namespace
+
+// Lands the focused entry field: R/G/B take faithful 0-255 bytes, hex
+// takes rrggbb (or the rgb shorthand). Shared by the popup pass, the
+// close paths, and the canvas card swatches, so a click-away never
+// drops a typed value.
+void swatch_commit_field(SwatchState& st, float* out_rgb,
+                         bool* out_changed, bool* out_released) {
+    if (st.field_edit < 0) return;
+    st.edit_buf[std::min(st.edit_len,
+                         static_cast<int>(sizeof(st.edit_buf)) - 1)] = 0;
+    float rgb[3];
+    hsv_to_rgb(st.hue, st.sat, st.val, rgb);
+    bool valid = false;
+    if (st.field_edit < 3) {
+        if (st.edit_len > 0) {
+            rgb[st.field_edit] =
+                std::clamp(std::atoi(st.edit_buf), 0, 255) / 255.0f;
+            valid = true;
+        }
+    } else if (st.edit_len == 6 || st.edit_len == 3) {
+        const auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return 0;
+        };
+        for (int i = 0; i < 3; ++i) {
+            const int byte =
+                st.edit_len == 6
+                    ? nib(st.edit_buf[i * 2]) * 16 +
+                          nib(st.edit_buf[i * 2 + 1])
+                    : nib(st.edit_buf[i]) * 17;
+            rgb[i] = static_cast<float>(byte) / 255.0f;
+        }
+        valid = true;
+    }
+    st.field_edit = -1;
+    st.edit_len = 0;
+    if (!valid) return;
+    rgb_to_hsv(rgb, st.hue, st.sat, st.val);
+    if (out_rgb) {
+        out_rgb[0] = rgb[0];
+        out_rgb[1] = rgb[1];
+        out_rgb[2] = rgb[2];
+    }
+    if (out_changed) *out_changed = true;
+    if (out_released) *out_released = true;
+}
+
 void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
                      const Context::PopupRequest& req, UiInput& input) {
     auto* st = static_cast<SwatchState*>(req.state);
@@ -1056,10 +1260,63 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
                                  theme.hairline);
     const Rect sv{r.x + 6.0f, r.y + 6.0f, r.w - 12.0f, kPickerSvH};
     const Rect hue{sv.x, sv.bottom() + 6.0f, sv.w, kPickerHueH};
+    // Entry rows: chip + the three byte fields, then the hex line.
+    const Rect chip{sv.x, hue.bottom() + 6.0f, kPickerFieldH,
+                    kPickerFieldH};
+    const float fw = (sv.w - chip.w - 4.0f * 3.0f) / 3.0f;
+    Rect fields[4];
+    for (int i = 0; i < 3; ++i)
+        fields[i] = {chip.right() + 4.0f + (fw + 4.0f) * i, chip.y, fw,
+                     kPickerFieldH};
+    fields[3] = {sv.x + 14.0f, chip.bottom() + 4.0f, sv.w - 14.0f,
+                 kPickerFieldH};
 
+    float cur[3];
+    hsv_to_rgb(st->hue, st->sat, st->val, cur);
     if (input.left_pressed()) {
-        if (sv.contains(input.mouse)) st->drag_zone = 1;
-        else if (hue.contains(input.mouse)) st->drag_zone = 2;
+        int hit_field = -1;
+        for (int i = 0; i < 4; ++i)
+            if (fields[i].contains(input.mouse)) hit_field = i;
+        // Any press lands the open field first (blur commit), then
+        // routes: a field focuses and seeds its faithful text, the SV
+        // square / hue strip start their drags.
+        if (st->field_edit >= 0 && hit_field != st->field_edit)
+            swatch_commit_field(*st, req.out_rgb, req.out_changed,
+                                req.out_released);
+        if (hit_field >= 0 && hit_field != st->field_edit) {
+            hsv_to_rgb(st->hue, st->sat, st->val, cur);
+            st->field_edit = hit_field;
+            if (hit_field < 3)
+                st->edit_len = std::snprintf(
+                    st->edit_buf, sizeof(st->edit_buf), "%d",
+                    static_cast<int>(cur[hit_field] * 255.0f + 0.5f));
+            else
+                st->edit_len = std::snprintf(
+                    st->edit_buf, sizeof(st->edit_buf), "%02x%02x%02x",
+                    static_cast<int>(cur[0] * 255.0f + 0.5f),
+                    static_cast<int>(cur[1] * 255.0f + 0.5f),
+                    static_cast<int>(cur[2] * 255.0f + 0.5f));
+        } else if (sv.contains(input.mouse)) {
+            st->drag_zone = 1;
+        } else if (hue.contains(input.mouse)) {
+            st->drag_zone = 2;
+        }
+    }
+    if (st->field_edit >= 0) {
+        for (uint32_t cp : input.typed) {
+            const bool is_digit = cp >= '0' && cp <= '9';
+            const bool is_hex =
+                is_digit || (cp >= 'a' && cp <= 'f') ||
+                (cp >= 'A' && cp <= 'F');
+            const int cap = st->field_edit < 3 ? 3 : 6;
+            if (st->field_edit < 3 ? !is_digit : !is_hex) continue;
+            if (st->edit_len < cap)
+                st->edit_buf[st->edit_len++] = static_cast<char>(cp);
+        }
+        if (input.backspace_pressed && st->edit_len > 0) --st->edit_len;
+        if (input.enter_pressed)
+            swatch_commit_field(*st, req.out_rgb, req.out_changed,
+                                req.out_released);
     }
     if (st->drag_zone != 0) {
         if (st->drag_zone == 1) {
@@ -1085,27 +1342,14 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
         }
     }
 
-    // SV square banded from solid strips (no gradient primitive): hue
-    // ramp columns, then a black alpha ramp down the rows.
-    constexpr int kBands = 32;
+    // SV square: ONE gradient quad — bilinear white/hue over black IS
+    // the SV formula, so the field is smooth at every size.
     float hue_rgb[3];
     hsv_to_rgb(st->hue, 1.0f, 1.0f, hue_rgb);
-    for (int i = 0; i < kBands; ++i) {
-        const float t0 = static_cast<float>(i) / kBands;
-        const float t1 = static_cast<float>(i + 1) / kBands;
-        const Color c{1.0f + (hue_rgb[0] - 1.0f) * t0,
-                      1.0f + (hue_rgb[1] - 1.0f) * t0,
-                      1.0f + (hue_rgb[2] - 1.0f) * t0, 1.0f};
-        canvas.draw_rect({sv.x + sv.w * t0, sv.y,
-                          sv.w * (t1 - t0) + 0.5f, sv.h}, c);
-    }
-    for (int i = 0; i < kBands; ++i) {
-        const float t0 = static_cast<float>(i) / kBands;
-        const float t1 = static_cast<float>(i + 1) / kBands;
-        canvas.draw_rect({sv.x, sv.y + sv.h * t0, sv.w,
-                          sv.h * (t1 - t0) + 0.5f},
-                         Color{0.0f, 0.0f, 0.0f, t0});
-    }
+    canvas.draw_rect_corners(
+        sv, Color{1.0f, 1.0f, 1.0f, 1.0f},
+        Color{hue_rgb[0], hue_rgb[1], hue_rgb[2], 1.0f},
+        Color{0.0f, 0.0f, 0.0f, 1.0f}, Color{0.0f, 0.0f, 0.0f, 1.0f});
     const Vec2 svc{sv.x + sv.w * st->sat, sv.y + sv.h * (1.0f - st->val)};
     canvas.draw_sdf_rect_outline({svc.x - 4.0f, svc.y - 4.0f, 8.0f, 8.0f},
                                  4.0f, 1.5f,
@@ -1113,37 +1357,68 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
                                      ? Color{0.0f, 0.0f, 0.0f, 0.9f}
                                      : Color{1.0f, 1.0f, 1.0f, 0.9f});
 
-    for (int i = 0; i < kBands; ++i) {
-        const float t0 = static_cast<float>(i) / kBands;
-        const float t1 = static_cast<float>(i + 1) / kBands;
-        float c[3];
-        hsv_to_rgb(t0 * 360.0f, 1.0f, 1.0f, c);
-        canvas.draw_rect({hue.x + hue.w * t0, hue.y,
-                          hue.w * (t1 - t0) + 0.5f, hue.h},
-                         Color{c[0], c[1], c[2], 1.0f});
+    // Hue strip: six 60-degree gradient segments (exact between the
+    // primaries, no banding).
+    for (int i = 0; i < 6; ++i) {
+        float c0[3], c1[3];
+        hsv_to_rgb(static_cast<float>(i) * 60.0f, 1.0f, 1.0f, c0);
+        hsv_to_rgb(static_cast<float>(i + 1) * 60.0f, 1.0f, 1.0f, c1);
+        const float x0 = hue.x + hue.w * static_cast<float>(i) / 6.0f;
+        const float x1 = hue.x + hue.w * static_cast<float>(i + 1) / 6.0f;
+        canvas.draw_rect_corners({x0, hue.y, x1 - x0, hue.h},
+                                 Color{c0[0], c0[1], c0[2], 1.0f},
+                                 Color{c1[0], c1[1], c1[2], 1.0f},
+                                 Color{c1[0], c1[1], c1[2], 1.0f},
+                                 Color{c0[0], c0[1], c0[2], 1.0f});
     }
     const float hx = hue.x + hue.w * st->hue / 360.0f;
     canvas.draw_rect({hx - 1.0f, hue.y - 1.0f, 2.0f, hue.h + 2.0f},
                      Color{1.0f, 1.0f, 1.0f, 0.9f});
 
-    // Result chip + rgb readout.
-    float rgb[3];
-    hsv_to_rgb(st->hue, st->sat, st->val, rgb);
-    const Rect chip{hue.x, hue.bottom() + 6.0f, 16.0f, 16.0f};
-    canvas.draw_sdf_rect(chip, 3.0f, Color{rgb[0], rgb[1], rgb[2], 1.0f});
+    // Result chip + the entry fields (0-255 bytes and hex, directly
+    // editable; the focused one shows its faithful typed text).
+    hsv_to_rgb(st->hue, st->sat, st->val, cur);
+    canvas.draw_sdf_rect(chip, 3.0f, Color{cur[0], cur[1], cur[2], 1.0f});
     canvas.draw_sdf_rect_outline(chip, 3.0f, theme.stroke_width,
                                  theme.hairline);
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.2f  %.2f  %.2f", rgb[0], rgb[1],
-                  rgb[2]);
-    draw_text(canvas, font, buf,
-              {chip.right() + 8.0f,
-               chip.y + (chip.h - font.line_height() *
+    const int bytes[3] = {static_cast<int>(cur[0] * 255.0f + 0.5f),
+                          static_cast<int>(cur[1] * 255.0f + 0.5f),
+                          static_cast<int>(cur[2] * 255.0f + 0.5f)};
+    draw_text(canvas, font, "#",
+              {sv.x + 2.0f,
+               fields[3].y +
+                   (fields[3].h - font.line_height() *
                                       theme.font_size_small) * 0.5f},
               theme.font_size_small, theme.text_dim);
+    for (int i = 0; i < 4; ++i) {
+        const bool editing = st->field_edit == i;
+        canvas.draw_sdf_rect(fields[i], 3.0f, theme.control_bg_active);
+        canvas.draw_sdf_rect_outline(fields[i], 3.0f, theme.stroke_width,
+                                     editing ? theme.accent
+                                             : theme.hairline);
+        char buf[12];
+        if (editing) {
+            std::snprintf(buf, sizeof(buf), "%.*s_", st->edit_len,
+                          st->edit_buf);
+        } else if (i < 3) {
+            std::snprintf(buf, sizeof(buf), "%d", bytes[i]);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%02x%02x%02x", bytes[0],
+                          bytes[1], bytes[2]);
+        }
+        draw_text(canvas, font, buf,
+                  {fields[i].x + 5.0f,
+                   fields[i].y +
+                       (fields[i].h - font.line_height() *
+                                          theme.font_size_small) * 0.5f},
+                  theme.font_size_small,
+                  editing ? theme.text : theme.text_dim);
+    }
 }
 
 // ---- SectionHeader
+
+namespace {
 
 struct SectionUser {
     const char* label;
@@ -1173,6 +1448,7 @@ void draw_section(LayoutNode& node, LayoutFrame& frame) {
     const WidgetId id = frame.ctx.acquire_widget_id(u->state);
     if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
         *u->out_clicked = true;
+    probe_add(std::string("sec:") + std::string(u->label, u->length), r);
 
     const Color fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
     // Chevron drawn with two strokes: ▸ folded, ▾ open (no glyph needed).
@@ -1267,6 +1543,7 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
     u->disabled = opts.disabled;
     u->flat = opts.flat;
     u->align_left = opts.align_left;
+    u->active = opts.active;
     u->tooltip = opts.tooltip;
     u->out_ctx = opts.out_ctx;
     n->user = u;
@@ -1293,6 +1570,27 @@ LayoutNode* Chip(LayoutArena& arena, std::string_view label, bool on,
     n->draw_fn = draw_chip;
     n->hit_fn = hit_chip;
     n->debug_name = "chip";
+    return n;
+}
+
+LayoutNode* Segmented(LayoutArena& arena, const char* const* labels,
+                      const char* const* tooltips, int count, int active,
+                      ButtonState* states, bool* const* out_clicked,
+                      SizeSpec width) {
+    LayoutNode* n = make_node(arena, NodeKind::Leaf);
+    auto* u = arena.alloc<SegmentedUser>();
+    u->labels = labels;
+    u->tooltips = tooltips;
+    u->count = count;
+    u->active = active;
+    u->states = states;
+    u->out_clicked = out_clicked;
+    n->user = u;
+    n->width = width;
+    n->measure_fn = measure_segmented;
+    n->draw_fn = draw_segmented;
+    n->hit_fn = hit_segmented;
+    n->debug_name = "segmented";
     return n;
 }
 
@@ -1355,6 +1653,7 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
         const Rect ir{r.x + 4.0f,
                       r.y + 4.0f + static_cast<float>(i) * 20.0f,
                       r.w - 8.0f, 20.0f};
+        probe_add(std::string("opt:") + req.items[i], ir);
         const bool hover = ir.contains(input.mouse);
         if (hover) canvas.draw_sdf_rect(ir, 2.0f, theme.control_bg_hover);
         const Color fg = i == req.selected

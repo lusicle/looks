@@ -2,9 +2,7 @@
   "looks_preset": 1,
   "name": "sstv rx",
   "tags": [
-    "radio",
-    "scan",
-    "lofi"
+    "signal"
   ],
   "group": {
     "id": 100,

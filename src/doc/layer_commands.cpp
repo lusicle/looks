@@ -301,6 +301,12 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
         layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
     }
+    if (kind == LayerSourceKind::TestPattern) {
+        // Checkerboard at a readable cell size, white on black.
+        layer.gen_scale = 64.0f;
+        layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
+        layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
+    }
     if (kind == LayerSourceKind::Shape) {
         // A matte maker: opaque coverage on transparent, a visible size,
         // a soft edge (gen_scale = size, gen_angle = feather — see

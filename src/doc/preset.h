@@ -32,9 +32,10 @@ std::optional<Preset> preset_from_json(const json::Value& v);
 bool save_preset(const std::filesystem::path& path, const Preset& p);
 std::optional<Preset> load_preset(const std::filesystem::path& path);
 
-// All *.json presets in `dir`, sorted by name. Unreadable files are skipped.
-// `failed` (optional) counts unreadable/invalid preset files so the UI
-// can surface them instead of silently dropping them.
+// All *.json presets under `dir`, subdirectories included a few levels
+// deep (they are the preset browser's bins), sorted by name. `failed`
+// (optional) counts unreadable/invalid preset files so the UI can
+// surface them instead of silently dropping them.
 std::vector<Preset> scan_presets(const std::filesystem::path& dir,
                                  int* failed = nullptr);
 

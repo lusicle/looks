@@ -13,6 +13,7 @@
 
 namespace looks::ui {
 struct UiTexture;
+struct SwatchState;
 }
 
 namespace looks::flow {
@@ -39,7 +40,15 @@ inline constexpr uint64_t kOutNodeId = 0xFFull << 56;
 struct ParamRow {
     const char* label = "";
     float min_v = 0.0f, max_v = 1.0f;
+    // Typed values may exceed the SLIDER range up to here (0 = they
+    // clamp to max_v like the slider). For params whose kernel wraps or
+    // is open-ended (oscillator phase past one period).
+    float hard_max = 0.0f;
     const char* format = "%.2f";
+    // Readout multiplier: the row DISPLAYS value*display_scale (radian
+    // params speak degrees). Typed input divides back. A "deg" format
+    // renders the row as a DIAL instead of a slider.
+    float display_scale = 1.0f;
     float* staged = nullptr;
     bool* changed = nullptr;
     bool* released = nullptr;
@@ -47,10 +56,13 @@ struct ParamRow {
     // a '|'-separated list, *staged holds the index, a pick stages it
     // exactly like a slider release; 2 text — `text` shows in the field,
     // a click emits Output::text_edit (the shared inline editor draws in
-    // the field while active). Same geometry as slider rows.
+    // the field while active); 3 swatch — `staged` points at THREE
+    // floats (rgb), `swatch` holds the picker state, a click opens the
+    // shared color popup. Same geometry as slider rows.
     uint8_t kind = 0;
     const char* options = nullptr;
     const char* text = nullptr;
+    ui::SwatchState* swatch = nullptr;
     // Live resolved value at the playhead (lanes + wires baked): a
     // driven row draws an accent tick at this position so modulation
     // visibly moves, while the slider keeps editing the stored base.
@@ -230,6 +242,15 @@ struct CanvasState {
     uint64_t dd_node = 0;
     int dd_row = -1;
     ui::Rect dd_field{};
+    // Open card color swatch: the shared picker popup rides the row's
+    // persistent SwatchState; the anchor is the field rect at open.
+    ui::SwatchState* swatch_open = nullptr;
+    ui::Rect swatch_anchor{};
+    // Dial-row drag (deg-formatted rows): angular, relative, integrated
+    // unsnapped so slow drags below one degree still accumulate.
+    Vec2 dial_center{};
+    float dial_last = 0.0f;
+    float dial_accum = 0.0f;
     // Splice-on-drop (texed _findSpliceLink): while dragging a single
     // unfed node over a wire, that wire highlights and a drop splices.
     uint64_t drag_splice_from = 0, drag_splice_to = 0;
@@ -336,5 +357,12 @@ ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,
 float node_width();
 float node_height(int row_count, bool has_preview, int port_rows = 0);
 float node_height_of(const Node& nd);
+
+// The image wire nearest a SCREEN position (within the canvas's own
+// splice pick radius) — external drops (the preset drag) target their
+// splice through this. Endpoint ids are canvas-tagged, exactly as
+// FlowEvents carries them; false = no wire close enough.
+bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
+               Vec2 screen, uint64_t* from, uint64_t* to, uint32_t* port);
 
 }  // namespace looks::flow

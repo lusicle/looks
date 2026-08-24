@@ -40,8 +40,15 @@ struct SourcePlanes {
 
 class Engine {
 public:
-    static std::unique_ptr<Engine> create(Device& device,
-                                          const std::filesystem::path& shader_dir);
+    // submit_queue: where the engine's INTERNAL submissions land (the
+    // Codec-Box segmented path submits its own command buffers, and
+    // their results must be complete before the caller's submission -
+    // same-queue ordering). Null = the device's graphics queue. A
+    // caller submitting the engine's output on another queue MUST pass
+    // that queue here.
+    static std::unique_ptr<Engine> create(
+        Device& device, const std::filesystem::path& shader_dir,
+        VkQueue submit_queue = VK_NULL_HANDLE);
     ~Engine();
 
     Engine(const Engine&) = delete;
@@ -163,9 +170,12 @@ public:
     uint32_t preview_divisor() const { return preview_divisor_; }
 
     // Node-canvas thumbnails: a fixed 8x8 grid of
-    // 160x90 cells, RGBA8 sRGB-encoded, tapped after each layer-chain
-    // effect plus the final composite (cell key 0). The cell map reflects
-    // the last EVALUATED graph — stale-but-valid across render-cache hits.
+    // 160x90 cells, RGBA8 sRGB-encoded, tapped after each ROOT-instance
+    // layer-chain node plus the final composite (cell key 0). The cell
+    // map reflects the last EVALUATED graph; the app disables the frame
+    // cache while a look renders (the canvas is on screen there), so
+    // every displayed frame re-taps and a card absent from the map means
+    // its node was not evaluated — culled, bypassed, or disconnected.
     static constexpr uint32_t kThumbCellW = 160, kThumbCellH = 90;
     static constexpr uint32_t kThumbGridCols = 8, kThumbGridRows = 8;
     GpuImage* thumb_atlas() { return thumb_atlas_.get(); }
@@ -173,7 +183,21 @@ public:
         return thumb_cells_;
     }
 
+    // Library gallery atlas: 160x90 cells the WORKER assigns (they
+    // persist across renders - entity/preset thumbnails fill one per
+    // idle cycle). Aspect-fit tap, recorded after a render() into the
+    // same command buffer.
+    static constexpr uint32_t kGalleryCellW = 160, kGalleryCellH = 90;
+    static constexpr uint32_t kGalleryCols = 8, kGalleryRows = 8;
+    GpuImage* gallery_atlas() { return gallery_atlas_.get(); }
+    void record_gallery_tap(VkCommandBuffer rec, uint32_t frame_index,
+                            GpuImage* src, uint32_t cell);
+
 private:
+    // Internal submissions (Codec-Box segments) land here so their
+    // results order before the caller's submission on the same queue.
+    VkQueue submit_queue_ = VK_NULL_HANDLE;
+
     explicit Engine(Device& device)
         : device_(device), arena_(device),
           pools_{TargetPool(device), TargetPool(device)} {}
@@ -251,6 +275,10 @@ private:
         codec::MoshCodec codec;
         codec::DecodedFrame last_out;   // paused re-render must not restew
         uint32_t last_frame = 0xFFFFFFFFu;
+        // Param signature of the last process. A paused edit re-arms the
+        // gate as a DISCONTINUITY (codec reset, fresh I) so the change
+        // shows without moving the playhead; advancing frames never reset.
+        uint64_t sig = 0;
         bool valid = false;
     };
     std::unordered_map<uint64_t, MoshSlot> mosh_state_;
@@ -270,6 +298,7 @@ private:
         std::unique_ptr<GpuImage> pred_clean[3], pred_moshed[3], pred_tmp[3];
         uint32_t w = 0, h = 0;
         uint32_t last_frame = 0xFFFFFFFFu;
+        uint64_t sig = 0;   // paused-edit re-arm, same contract as MoshSlot
         bool has_state = false;
     };
     std::unordered_map<uint64_t, MoshGpuSlot> mosh_gpu_;
@@ -411,6 +440,10 @@ private:
     void record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                           GpuImage* src, uint64_t key);
 
+    // Library gallery atlas (see public accessors). Lazy, fixed size.
+    std::unique_ptr<GpuImage> gallery_atlas_;
+    std::unique_ptr<ComputePipeline> gallery_tap_;
+
     // Audio Scope (sidechain family): per-instance 1-D min/max
     // waveform strip re-uploaded each render from the mono PCM copy.
     static constexpr uint32_t kAudioStripBins = 1024;
@@ -432,6 +465,10 @@ private:
         bool has_result = false;
         uint32_t result_w = 0, result_h = 0;
         uint32_t captured_frame = 0xFFFFFFFFu;
+        // Param signature of the last kicked walk: a paused edit kicks a
+        // fresh walk (the settle pass lands it) instead of compositing the
+        // old pattern until the playhead moves.
+        uint64_t sig = 0;
     };
     std::unordered_map<uint64_t, std::unique_ptr<EdSlotAsync>> ed_state_;
     bool composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,

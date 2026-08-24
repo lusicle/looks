@@ -27,4 +27,12 @@ bool decode_tga(const uint8_t* data, size_t size, ImageRgba* out,
 bool load_image(const std::filesystem::path& path, ImageRgba* out,
                 std::string* error = nullptr);
 
+// Minimal RGBA8 PNG writer (stored deflate blocks - uncompressed, valid
+// everywhere). The script screenshot op and dump tooling write through
+// this; scope is single still frames.
+std::vector<uint8_t> encode_png_rgba(const uint8_t* rgba, uint32_t width,
+                                     uint32_t height);
+bool write_png(const std::filesystem::path& path, const uint8_t* rgba,
+               uint32_t width, uint32_t height);
+
 }  // namespace looks

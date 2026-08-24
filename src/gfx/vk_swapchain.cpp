@@ -81,9 +81,11 @@ void Swapchain::create(uint32_t width, uint32_t height) {
     info.imageExtent = extent_;
     info.imageArrayLayers = 1;
     // TRANSFER_DST so the viewport blit can copy the rendered frame straight
-    // onto the swapchain before the UI pass composites over it.
+    // onto the swapchain before the UI pass composites over it; TRANSFER_SRC
+    // so the script screenshot op can read the presented frame back.
     info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;

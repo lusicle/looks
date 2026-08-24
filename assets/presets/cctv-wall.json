@@ -2,9 +2,7 @@
   "looks_preset": 1,
   "name": "cctv wall",
   "tags": [
-    "video",
-    "surveillance",
-    "multicam"
+    "tape"
   ],
   "group": {
     "id": 100,

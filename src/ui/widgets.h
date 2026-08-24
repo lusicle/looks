@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <string_view>
 
 #include "ui/layout.h"
@@ -23,6 +24,24 @@ inline constexpr float kSpaceTight = 4.0f;
 inline constexpr float kSpaceUnit = 8.0f;
 inline constexpr float kSpaceGroup = 12.0f;
 inline constexpr float kMicroSize = 16.0f;
+
+// Stored values match displayed values: the printf format's decimal
+// count IS the edit step ("%.0f px" drags store integers, "%.2f"
+// hundredths). SLIDER and DIAL drags snap through this so the readout
+// never disagrees with the document; typed values stay faithful to
+// what the user entered (range-clamped only).
+inline float snap_to_format(float v, const char* format) {
+    if (!format) return v;   // no readout, nothing to agree with
+    int decimals = 2;
+    for (const char* c = format; *c; ++c)
+        if (*c == '.' && c[1] >= '0' && c[1] <= '9') {
+            decimals = c[1] - '0';
+            break;
+        }
+    float step = 1.0f;
+    for (int i = 0; i < decimals; ++i) step *= 0.1f;
+    return std::round(v / step) * step;
+}
 
 struct ButtonState {
     bool pressed = false;
@@ -44,6 +63,10 @@ struct SliderState {
 
 struct ScrubberState {
     bool dragging = false;
+    // A press is a CLICK until the target actually moves — the app
+    // treats only moved gestures as scrubs (clicks seek exact).
+    bool moved = false;
+    float press_value = -1.0f;
 };
 
 struct LabelOpts {
@@ -104,6 +127,15 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
 LayoutNode* Chip(LayoutArena& arena, std::string_view label, bool on,
                  ButtonState* state, bool* out_clicked,
                  const char* tooltip = nullptr);
+
+// Segmented toggle — ONE outlined control split into labeled segments,
+// exactly one active. The active segment is the LIT one (lighter fill,
+// full-strength text); dark/light only, never accent — accent means
+// selection elsewhere. `states` and `out_clicked` are arrays of `count`.
+LayoutNode* Segmented(LayoutArena& arena, const char* const* labels,
+                      const char* const* tooltips, int count, int active,
+                      ButtonState* states, bool* const* out_clicked,
+                      SizeSpec width = {});
 
 // Icons drawn with anti-aliased primitives only (SDF rects, thin strokes,
 // font glyphs) — filled triangles alias and are avoided except Play.
@@ -189,7 +221,20 @@ struct SwatchState {
     float sat = 0.0f;
     float val = 1.0f;
     int drag_zone = 0;   // 1 = sv square, 2 = hue strip
+    // Inline entry: 0-2 = the R/G/B byte fields, 3 = hex. Typed text is
+    // faithful (commit on enter / click-away); -1 = none focused.
+    int field_edit = -1;
+    char edit_buf[10] = {};
+    int edit_len = 0;
 };
+
+// Shared color helpers (the canvas card swatch rows reuse the picker).
+void hsv_to_rgb(float h, float s, float v, float out[3]);
+void rgb_to_hsv(const float rgb[3], float& h, float& s, float& v);
+Rect swatch_popup_rect(const Rect& anchor, const LayoutFrame& frame);
+// Lands the picker's focused entry field (blur commit); no-op with none.
+void swatch_commit_field(SwatchState& st, float* out_rgb, bool* out_changed,
+                         bool* out_released);
 
 // Color chip that opens a picker overlay on click (RunPopup, same
 // single-open-popup contract as Dropdown). While the picker drags, the

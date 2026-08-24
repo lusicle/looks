@@ -21,7 +21,8 @@ constexpr ParamDesc kPixelateParams[] = {
 
 constexpr ParamDesc kGrainParams[] = {
     {"amount", "amount", 0.0f, 1.0f, 0.35f, "%.2f"},
-    {"size", "size", 1.0f, 8.0f, 1.5f, "%.1f px"},
+    // CCD noise is per-pixel: the kernel forces cell size 1 there.
+    {"size", "size", 1.0f, 8.0f, 1.5f, "%.1f px", nullptr, false, 3, 0x1},
     {"color", "color", 0.0f, 1.0f, 0.3f, "%.2f"},
     // film grain OR the CCD sensor-noise flavor (shadow-
     // weighted, per-pixel, with faint row banding).
@@ -38,7 +39,9 @@ constexpr ParamDesc kJitterParams[] = {
 };
 
 constexpr ParamDesc kQuantizeParams[] = {
-    {"levels", "levels", 2.0f, 16.0f, 4.0f, "%.0f", nullptr, true},
+    // Levels drive the rgb/gray quantizers; the fixed palettes snap to
+    // their own entries.
+    {"levels", "levels", 2.0f, 16.0f, 4.0f, "%.0f", nullptr, true, 1, 0x3},
     {"palette", "palette", 0.0f, 6.0f, 0.0f, "%.0f",
      "rgb|gray|game boy|cga|nes|teletext|duotone"},
     // RD stipple = Gray-Scott dots as the threshold (stateful).
@@ -46,20 +49,34 @@ constexpr ParamDesc kQuantizeParams[] = {
      "none|bayer 2|bayer 4|bayer 8|white noise|blue noise|stbn|moire|"
      "level cycle|rd stipple|spiral|rings|diamond|clustered dot|lines|"
      "checker|ign"},
-    {"dither_amt", "dither amt", 0.0f, 1.0f, 1.0f, "%.2f"},
-    {"boil_hz", "boil rate", 0.0f, 30.0f, 8.0f, "%.0f hz"},
-    {"scroll", "pattern scroll", 0.0f, 64.0f, 0.0f, "%.0f px/s"},
-    {"warp", "wave warp", 0.0f, 1.0f, 0.0f, "%.2f"},
+    // Threshold masks: ordered patterns are dither 1-7 and 10-16
+    // (0x1FCFE); amt also applies to rd stipple (0x1FEFE); boil also
+    // clocks level cycle (0x1FDFE). RD samples the sim in place, so the
+    // pattern-transform legs (scroll/warp/lock/rotate/scale) are
+    // ordered-pattern only.
+    {"dither_amt", "dither amt", 0.0f, 1.0f, 1.0f, "%.2f", nullptr, false,
+     2, 0x1FEFE},
+    {"boil_hz", "boil rate", 0.0f, 30.0f, 8.0f, "%.0f hz", nullptr, false,
+     2, 0x1FDFE},
+    {"scroll", "pattern scroll", 0.0f, 64.0f, 0.0f, "%.0f px/s", nullptr,
+     false, 2, 0x1FCFE},
+    {"warp", "wave warp", 0.0f, 1.0f, 0.0f, "%.2f", nullptr, false,
+     2, 0x1FCFE},
     {"dissolve", "dissolve", 0.0f, 1.0f, 1.0f, "%.2f"},
     // Shared dither controls: lock mode (motion-locked pattern
     // advection along flow) + the rotate/scale legs of pattern transform.
     // Scale floors at 1x — dither can't be finer than one pixel, and
     // sub-1 strides alias the threshold matrix.
-    {"lock", "lock", 0.0f, 1.0f, 0.0f, "%.0f", "screen|motion"},
-    {"pat_rotate", "pattern rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
-    {"pat_scale", "pattern scale", 1.0f, 4.0f, 1.0f, "%.2f x"},
-    {"pal_hue_a", "custom hue a", 0.0f, 1.0f, 0.08f, "%.2f"},
-    {"pal_hue_b", "custom hue b", 0.0f, 1.0f, 0.55f, "%.2f"},
+    {"lock", "lock", 0.0f, 1.0f, 0.0f, "%.0f", "screen|motion", false,
+     2, 0x1FCFE},
+    {"pat_rotate", "pattern rotate", -180.0f, 180.0f, 0.0f, "%.0f deg",
+     nullptr, false, 2, 0x1FCFE},
+    {"pat_scale", "pattern scale", 1.0f, 4.0f, 1.0f, "%.2f x", nullptr,
+     false, 2, 0x1FCFE},
+    {"pal_hue_a", "custom hue a", 0.0f, 1.0f, 0.08f, "%.2f", nullptr,
+     false, 1, 0x40},
+    {"pal_hue_b", "custom hue b", 0.0f, 1.0f, 0.55f, "%.2f", nullptr,
+     false, 1, 0x40},
 };
 
 constexpr ParamDesc kGlowParams[] = {
@@ -70,7 +87,8 @@ constexpr ParamDesc kGlowParams[] = {
      "pro-mist|halation|ccd"},
     // True CCD smear (CCD mode): clipped highlights bleed a
     // full-height column streak, not just a local bloom.
-    {"smear", "ccd smear", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"smear", "ccd smear", 0.0f, 1.0f, 0.0f, "%.2f", nullptr, false,
+     3, 0x4},
 };
 
 constexpr ParamDesc kFlowSmearParams[] = {
@@ -97,7 +115,9 @@ constexpr ParamDesc kDatamoshParams[] = {
     {"byte_flips", "byte flips", 0.0f, 64.0f, 0.0f, "%.0f", nullptr, true},
     {"mv_field", "field", 0.0f, 3.0f, 0.0f, "%.0f",
      "flow|pan|zoom|swirl"},
-    {"field_amt", "field amt", -32.0f, 32.0f, 8.0f, "%.0f px"},
+    // Flow supplies its own vectors; amt drives the synthetic fields.
+    {"field_amt", "field amt", -32.0f, 32.0f, 8.0f, "%.0f px", nullptr,
+     false, 8, 0xE},
     {"drop_i", "i-frames", 0.0f, 1.0f, 1.0f, "%.0f", "accept|drop"},
 };
 
@@ -150,7 +170,8 @@ constexpr ParamDesc kFilmStockParams[] = {
 
 constexpr ParamDesc kKaleidoParams[] = {
     {"segments", "segments", 2.0f, 16.0f, 6.0f, "%.0f", nullptr, true},
-    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f"},
+    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f", nullptr, false,
+     -1, 0, true},
     {"center_x", "center x", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"center_y", "center y", 0.0f, 1.0f, 0.5f, "%.2f"},
 };
@@ -169,7 +190,8 @@ constexpr ParamDesc kTurbulenceParams[] = {
 
 constexpr ParamDesc kDisplaceParams[] = {
     {"amount", "amount", -64.0f, 64.0f, 16.0f, "%.1f px"},
-    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f"},
+    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f", nullptr, false,
+     -1, 0, true},
     {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "luma|gradient"},
     // Second-input displacement: displace by the referenced
     // map's grayscale instead of the input's own luma.
@@ -185,11 +207,13 @@ constexpr ParamDesc kLensDistortParams[] = {
 constexpr ParamDesc kFringeParams[] = {
     {"amount", "amount", 0.0f, 16.0f, 3.0f, "%.1f px"},
     {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "lens ca|purple fringe"},
-    {"threshold", "threshold", 0.0f, 1.0f, 0.7f, "%.2f"},
+    {"threshold", "threshold", 0.0f, 1.0f, 0.7f, "%.2f", nullptr, false,
+     1, 0x2},
 };
 
 constexpr ParamDesc kInterlaceParams[] = {
-    {"shift", "comb shift", 0.0f, 16.0f, 4.0f, "%.1f px"},
+    {"shift", "comb shift", 0.0f, 16.0f, 4.0f, "%.1f px", nullptr, false,
+     2, 0x1},
     {"darken", "line darken", 0.0f, 1.0f, 0.15f, "%.2f"},
     {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "comb|lines only"},
 };
@@ -242,9 +266,14 @@ constexpr ParamDesc kBlurParams[] = {
     // edge-preserving bilateral.
     {"mode", "mode", 0.0f, 6.0f, 0.0f, "%.0f",
      "directional|spin|zoom|gaussian|tilt-shift|bokeh|surface"},
-    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f"},
-    {"focus", "tilt focus", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"band", "tilt band", 0.02f, 0.5f, 0.15f, "%.2f"},
+    // Angle steers directional + the tilt axis; focus doubles as the
+    // surface range weight; band is tilt-shift only.
+    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f", nullptr, false,
+     1, 0x11, true},
+    {"focus", "tilt focus", 0.0f, 1.0f, 0.5f, "%.2f", nullptr, false,
+     1, 0x50},
+    {"band", "tilt band", 0.02f, 0.5f, 0.15f, "%.2f", nullptr, false,
+     1, 0x10},
 };
 
 constexpr ParamDesc kDustScratchesParams[] = {
@@ -374,7 +403,9 @@ constexpr ParamDesc kErrorDiffusionParams[] = {
     {"mode", "kernel", 0.0f, 7.0f, 0.0f, "%.0f",
      "floyd-steinberg|atkinson|jarvis|stucki|burkes|sierra|ostromoukhov|"
      "riemersma"},
-    {"serpentine", "serpentine", 0.0f, 1.0f, 1.0f, "%.0f", "off|on"},
+    // Riemersma walks the Hilbert curve - no raster to serpentine.
+    {"serpentine", "serpentine", 0.0f, 1.0f, 1.0f, "%.0f", "off|on", false,
+     1, 0x7F},
     {"carry", "temporal carry", 0.0f, 1.0f, 0.0f, "%.2f"},
     // fast = the walk runs in 16 independent horizontal bands (error is
     // dropped at band seams like at the frame edge): different pixels
@@ -451,7 +482,9 @@ constexpr ParamDesc kWaveWarpParams[] = {
 };
 
 constexpr ParamDesc kCrtSimParams[] = {
-    {"curvature", "curvature", 0.0f, 1.0f, 0.35f, "%.2f"},
+    // LCD panels are flat; scanline stays (it drives the row gaps there).
+    {"curvature", "curvature", 0.0f, 1.0f, 0.35f, "%.2f", nullptr, false,
+     4, 0x1},
     {"scanline", "scanlines", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"mask", "grille", 0.0f, 1.0f, 0.4f, "%.2f"},
     {"triad", "triad size", 2.0f, 8.0f, 3.0f, "%.0f px"},
@@ -483,7 +516,8 @@ constexpr ParamDesc kStarFilterParams[] = {
 
 constexpr ParamDesc kStreakParams[] = {
     {"length", "length", 0.0f, 256.0f, 80.0f, "%.0f px"},
-    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f"},
+    {"angle", "angle", -3.1416f, 3.1416f, 0.0f, "%.2f", nullptr, false,
+     -1, 0, true},
     {"decay", "decay", 0.5f, 0.99f, 0.9f, "%.2f"},
     {"threshold", "threshold (0=smear)", 0.0f, 1.0f, 0.0f, "%.2f"},
 };
@@ -637,7 +671,8 @@ constexpr ParamDesc kTileParams[] = {
 
 constexpr ParamDesc kEmbossParams[] = {
     {"strength", "strength", 0.0f, 4.0f, 1.5f, "%.1f"},
-    {"angle", "light angle", -3.1416f, 3.1416f, -2.356f, "%.2f"},
+    {"angle", "light angle", -3.1416f, 3.1416f, -2.356f, "%.2f", nullptr,
+     false, -1, 0, true},
     {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f",
      "gray relief|color relief"},
 };
@@ -661,7 +696,8 @@ constexpr ParamDesc kLidarParams[] = {
     {"persist", "persistence", 0.0f, 0.98f, 0.9f, "%.2f"},
     {"rate", "sample rate", 1.0f, 60.0f, 30.0f, "%.0f hz"},
     {"bias", "luma bias", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"spin", "spin/sweep rate", 0.05f, 2.0f, 0.25f, "%.2f hz"},
+    {"spin", "spin/sweep rate", 0.05f, 2.0f, 0.25f, "%.2f hz", nullptr,
+     false, 0, 0x6},
     {"color", "source color", 0.0f, 1.0f, 1.0f, "%.2f"},
 };
 
@@ -787,7 +823,9 @@ constexpr ParamDesc kRisographParams[] = {
     // its own seeded direction — the community-print-shop look.
     {"inks", "inks", 1.0f, 3.0f, 2.0f, "%.0f", nullptr, true},
     {"hue1", "ink 1 hue", 0.0f, 1.0f, 0.55f, "%.2f"},
-    {"hue2", "ink 2 hue", 0.0f, 1.0f, 0.93f, "%.2f"},
+    // Ink 2 prints from two inks up (ink 3 is always yellow).
+    {"hue2", "ink 2 hue", 0.0f, 1.0f, 0.93f, "%.2f", nullptr, false,
+     0, 0xC},
     {"misreg", "misregistration", 0.0f, 12.0f, 4.0f, "%.0f px"},
     {"grain", "ink grain", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"paper", "paper warmth", 0.0f, 1.0f, 0.3f, "%.2f"},
@@ -856,8 +894,11 @@ constexpr ParamDesc kMatteParams[] = {
     // matte, ready for a matte anchor or more processing.
     {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
      "luma|bright key|chroma key"},
-    {"key", "key center", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"range", "key range", 0.01f, 1.0f, 0.25f, "%.2f"},
+    // Straight luma has no key; center/range shape the two key modes.
+    {"key", "key center", 0.0f, 1.0f, 0.5f, "%.2f", nullptr, false,
+     0, 0x6},
+    {"range", "key range", 0.01f, 1.0f, 0.25f, "%.2f", nullptr, false,
+     0, 0x6},
     {"black", "black point", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"white", "white point", 0.0f, 1.0f, 1.0f, "%.2f"},
     {"gamma", "gamma", 0.2f, 5.0f, 1.0f, "%.2f"},
@@ -913,8 +954,10 @@ constexpr ParamDesc kPaletteMapParams[] = {
     // nearest palette color only. Duotone hues from the two knobs.
     {"palette", "palette", 0.0f, 4.0f, 4.0f, "%.0f",
      "game boy|cga|nes|teletext|duotone"},
-    {"pal_hue_a", "duo hue a", 0.0f, 1.0f, 0.08f, "%.2f"},
-    {"pal_hue_b", "duo hue b", 0.0f, 1.0f, 0.55f, "%.2f"},
+    {"pal_hue_a", "duo hue a", 0.0f, 1.0f, 0.08f, "%.2f", nullptr, false,
+     0, 0x10},
+    {"pal_hue_b", "duo hue b", 0.0f, 1.0f, 0.55f, "%.2f", nullptr, false,
+     0, 0x10},
 };
 
 constexpr ParamDesc kDitherParams[] = {

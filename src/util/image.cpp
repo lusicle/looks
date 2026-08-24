@@ -265,4 +265,88 @@ bool load_image(const std::filesystem::path& path, ImageRgba* out,
     return false;
 }
 
+namespace {
+
+void put_be32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v >> 24));
+    out.push_back(static_cast<uint8_t>(v >> 16));
+    out.push_back(static_cast<uint8_t>(v >> 8));
+    out.push_back(static_cast<uint8_t>(v));
+}
+
+// type (4 chars) + payload, with length prefix and CRC over type+payload.
+void put_chunk(std::vector<uint8_t>& out, const char type[4],
+               const uint8_t* payload, size_t size) {
+    put_be32(out, static_cast<uint32_t>(size));
+    const size_t crc_start = out.size();
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), payload, payload + size);
+    put_be32(out, crc32(out.data() + crc_start, 4 + size));
+}
+
+}  // namespace
+
+std::vector<uint8_t> encode_png_rgba(const uint8_t* rgba, uint32_t width,
+                                     uint32_t height) {
+    std::vector<uint8_t> out;
+    if (!rgba || !width || !height) return out;
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    out.insert(out.end(), sig, sig + 8);
+
+    uint8_t ihdr[13];
+    ihdr[0] = static_cast<uint8_t>(width >> 24);
+    ihdr[1] = static_cast<uint8_t>(width >> 16);
+    ihdr[2] = static_cast<uint8_t>(width >> 8);
+    ihdr[3] = static_cast<uint8_t>(width);
+    ihdr[4] = static_cast<uint8_t>(height >> 24);
+    ihdr[5] = static_cast<uint8_t>(height >> 16);
+    ihdr[6] = static_cast<uint8_t>(height >> 8);
+    ihdr[7] = static_cast<uint8_t>(height);
+    ihdr[8] = 8;    // bit depth
+    ihdr[9] = 6;    // color type RGBA
+    ihdr[10] = 0;   // compression
+    ihdr[11] = 0;   // filter method
+    ihdr[12] = 0;   // no interlace
+    put_chunk(out, "IHDR", ihdr, sizeof(ihdr));
+
+    // Raw scanline stream: filter byte 0 per row.
+    const size_t row = size_t{width} * 4;
+    std::vector<uint8_t> raw((row + 1) * height);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* dst = raw.data() + (row + 1) * y;
+        dst[0] = 0;
+        std::memcpy(dst + 1, rgba + row * y, row);
+    }
+
+    // zlib wrapper around stored (uncompressed) deflate blocks.
+    std::vector<uint8_t> z;
+    z.reserve(raw.size() + raw.size() / 65535 * 5 + 16);
+    z.push_back(0x78);
+    z.push_back(0x01);
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        const size_t n = std::min<size_t>(65535, raw.size() - pos);
+        const bool last = pos + n == raw.size();
+        z.push_back(last ? 1 : 0);
+        z.push_back(static_cast<uint8_t>(n & 0xFF));
+        z.push_back(static_cast<uint8_t>(n >> 8));
+        z.push_back(static_cast<uint8_t>(~n & 0xFF));
+        z.push_back(static_cast<uint8_t>((~n >> 8) & 0xFF));
+        z.insert(z.end(), raw.begin() + static_cast<ptrdiff_t>(pos),
+                 raw.begin() + static_cast<ptrdiff_t>(pos + n));
+        pos += n;
+    }
+    put_be32(z, adler32(raw.data(), raw.size()));
+    put_chunk(out, "IDAT", z.data(), z.size());
+    put_chunk(out, "IEND", nullptr, 0);
+    return out;
+}
+
+bool write_png(const std::filesystem::path& path, const uint8_t* rgba,
+               uint32_t width, uint32_t height) {
+    const std::vector<uint8_t> bytes = encode_png_rgba(rgba, width, height);
+    if (bytes.empty()) return false;
+    return write_file_bytes(path, bytes.data(), bytes.size());
+}
+
 }  // namespace looks

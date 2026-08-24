@@ -47,9 +47,10 @@ TEST(mod_param_table_paths) {
     auto table = mod::build_param_table(d, d.looks[0]);
     // global.morph + vignette (wet, opacity, amount, radius,
     // softness = 5) + rgb split (4) + layer params (opacity, colors,
-    // gen, transform = kLayerParamCount). Project speed is a scalar,
-    // not a mod target.
-    CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount});
+    // gen + phase, transform — the modulatable slots; slip and the
+    // waveform selector are field ids with no slot). Project speed is
+    // a scalar, not a mod target.
+    CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount - 2});
     CHECK_EQ(table[0].path, "global.morph");
     CHECK_EQ(table[0].key.effect_id, uint64_t{0});
     CHECK_EQ(table[1].path, "layer0.fx0.wet");

@@ -105,6 +105,19 @@ void Canvas2D::draw_rect(const Rect& r, Color color) {
     emit_quad_physical(BatchKind::Solid, nullptr, pos, uv, colors, shape);
 }
 
+void Canvas2D::draw_rect_corners(const Rect& r, Color c00, Color c10,
+                                 Color c11, Color c01) {
+    if (r.empty()) return;
+    const Vec2 tl = to_physical({r.x, r.y});
+    const Vec2 br = to_physical({r.right(), r.bottom()});
+    const Vec2 pos[4] = {tl, {br.x, tl.y}, br, {tl.x, br.y}};
+    const Vec2 uv[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    const uint32_t colors[4] = {c00.to_rgba8(), c10.to_rgba8(),
+                                c11.to_rgba8(), c01.to_rgba8()};
+    const float shape[4] = {0, 0, 0, 0};
+    emit_quad_physical(BatchKind::Solid, nullptr, pos, uv, colors, shape);
+}
+
 void Canvas2D::draw_rect_outline(const Rect& r, float stroke, Color color) {
     if (r.empty() || stroke <= 0.0f) return;
     // Collapses to a fill when the stroke swallows the interior.

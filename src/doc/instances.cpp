@@ -118,13 +118,41 @@ struct Voice {
     int64_t audio_off = 0;         // Offset shims on the voice's source
 };
 
+// The Output's In-wire fan-in: the BOTTOM chain wins, and bottom means
+// the chain whose OWNER LAYER sits lowest in the layer list - never the
+// link table's order (wire edits and preset splices re-append links, so
+// table order shifts under gestures that must not move the voice). The
+// compiler stacks the composite by the same rule.
+uint64_t output_feed(const Look& look, const std::vector<NodeLink>& links) {
+    auto owner_index = [&](uint64_t id) -> size_t {
+        for (size_t li = 0; li < look.layers.size(); ++li) {
+            if (look.layers[li].id == id) return li;
+            for (const EffectInstance& fx : look.layers[li].stack)
+                if (fx.id == id) return li;
+        }
+        return SIZE_MAX;
+    };
+    uint64_t best = 0;
+    size_t best_li = SIZE_MAX;
+    for (const NodeLink& l : links) {
+        if (l.to != 0 || l.to_port != 0) continue;
+        const size_t li = owner_index(l.from);
+        if (li < best_li) {
+            best_li = li;
+            best = l.from;
+        }
+    }
+    return best;
+}
+
 Voice resolve_voice(const Look& look) {
     Voice v;
     const std::vector<NodeLink> links = effective_links(look);
     std::vector<AudioOp> rev;   // collected output-first
     walk_chain(look, links,
-               link_into(links, 0, look.audio_split ? 1u : 0u), &v.root,
-               rev, &v.audio_off);
+               look.audio_split ? link_into(links, 0, 1u)
+                                : output_feed(look, links),
+               &v.root, rev, &v.audio_off);
     v.ops.assign(rev.rbegin(), rev.rend());
     return v;
 }

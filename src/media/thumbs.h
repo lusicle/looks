@@ -9,6 +9,13 @@
 
 namespace looks::media {
 
+// Strip cell height ingest writes (width follows the source aspect):
+// sized so a gallery card reads one cell crisply at the entity atlas
+// bar (160x90 for 16:9). Consumers derive their own sizes from the
+// cells (the timeline lane box-filters down); the app treats shorter
+// sidecars as stale and regenerates them.
+constexpr uint32_t kThumbStripH = 90;
+
 struct ThumbStripData {
     uint32_t w = 0;
     uint32_t h = 0;
@@ -21,8 +28,12 @@ struct ThumbStripData {
 bool write_thumbs(const std::filesystem::path& path,
                   const ThumbStripData& strip);
 
-// Validates dimensions, the payload size, and the one-texture-row cap
-// (w * count <= 16384) the UI atlas requires.
+// Validates dimensions and the payload size.
 bool read_thumbs(const std::filesystem::path& path, ThumbStripData* out);
+
+// Header only (dimensions and count, `rgb` left empty): the staleness
+// probe, so a rescan never pulls whole strips off disk.
+bool read_thumbs_header(const std::filesystem::path& path,
+                        ThumbStripData* out);
 
 }  // namespace looks::media

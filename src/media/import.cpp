@@ -9,6 +9,7 @@
 #include "codec/mez.h"
 #include "media/bmff.h"
 #include "media/bundle.h"
+#include "media/export.h"
 #include "media/mp3.h"
 #include "media/pcm.h"
 #include "media/thumbs.h"
@@ -95,9 +96,9 @@ void downsample_half(const I420Frame& src, I420Frame& dst) {
 
 // Thumbnail strip builder over the shared .thumbs sidecar
 // (media/thumbs.h). Each destination pixel box-averages its source
-// region - a 1920 -> 64 px point sample would alias detail into noise.
+// region - a 1920 -> 160 px point sample would alias detail into noise.
 struct ThumbStrip {
-    ThumbStripData data{0, 36, 0, {}};
+    ThumbStripData data{0, kThumbStripH, 0, {}};
 
     void add(const I420Frame& f) {
         uint32_t& w = data.w;
@@ -637,6 +638,189 @@ bool extract_audio_pcm(const std::filesystem::path& source,
         return fail(scratch.error);
     if (scratch.pcm_path.empty()) return fail("audio track decoded empty");
     return true;
+}
+
+ImportResult consolidate_video(const std::filesystem::path& source,
+                               const std::filesystem::path& dest_dir,
+                               ImportProgress* progress) {
+    ImportResult result;
+    platform::MfSession session;
+    if (!session.ok()) {
+        result.error = "Media Foundation unavailable";
+        return result;
+    }
+    BmffFile file;
+    std::string error;
+    if (!file.open(source, &error)) {
+        result.error = "demux: " + error;
+        return result;
+    }
+    const TrackInfo* video = file.movie().first_video();
+    if (!video || std::string(video->fourcc) != "avc1" ||
+        video->samples.empty()) {
+        result.error = "no H.264 video track";
+        return result;
+    }
+    const uint32_t w = video->width;
+    const uint32_t h = video->height;
+    const uint32_t frames = static_cast<uint32_t>(video->samples.size());
+    const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
+    result.width = w;
+    result.height = h;
+    result.frame_count = frames;
+    result.fps = static_cast<double>(video->timescale) / frame_duration;
+    if (progress) {
+        progress->ready.store(true);
+        progress->frames_total.store(frames);
+    }
+
+    platform::H264Decoder decoder;
+    if (!decoder.create(video->avcc, w, h, &error, /*allow_d3d=*/true,
+                        /*low_latency=*/false)) {
+        result.error = "decoder: " + error;
+        return result;
+    }
+
+    // Sequential decode feeding the encoder in lockstep; frames come out
+    // in presentation order, the same order the native path's frame
+    // index serves them. receive() emits tightly packed NV12
+    // (stride == width), exactly what the encoder's feed wants — the
+    // buffer swaps through untouched.
+    const double to_100ns = 1.0e7 / video->timescale;
+    size_t next_sample = 0;
+    bool drained = false;
+    std::vector<uint8_t> sample_bytes;
+    platform::VideoFrameNV12 nv12;
+    const FrameProducer producer = [&](uint32_t f,
+                                       std::vector<uint8_t>& out) -> bool {
+        for (;;) {
+            if (progress && progress->cancel.load()) return false;
+            if (decoder.receive(nv12)) break;
+            if (next_sample < video->samples.size()) {
+                const SampleInfo& sm = video->samples[next_sample++];
+                if (!file.read_sample(sm, sample_bytes)) return false;
+                const int64_t pts = static_cast<int64_t>(
+                    static_cast<double>(static_cast<int64_t>(sm.dts) +
+                                        sm.cts_offset) *
+                    to_100ns);
+                const int64_t sdur =
+                    static_cast<int64_t>(sm.duration * to_100ns);
+                if (!decoder.feed(sample_bytes.data(), sample_bytes.size(),
+                                  pts, sdur, sm.keyframe))
+                    return false;
+            } else if (!drained) {
+                decoder.drain();
+                drained = true;
+            } else {
+                return false;   // decoder came up short of the count
+            }
+        }
+        out.swap(nv12.data);
+        if (progress) progress->frames_done.store(f + 1);
+        return true;
+    };
+
+    // All-intra needs generous rate to hold quality: ~0.3 bits per pixel
+    // per frame, the ballpark of a decent intra-only intermediate.
+    ExportOptions options;
+    options.gop_frames = 1;
+    options.video_bitrate_bps = static_cast<uint32_t>(std::clamp(
+        static_cast<double>(w) * h * result.fps * 0.3, 10.0e6, 160.0e6));
+
+    std::filesystem::path out_path =
+        sidecars_for_stem(dest_dir, source.stem().wstring()).base;
+    out_path.replace_extension(".intra.mp4");
+    const ExportResult exported =
+        export_movie(w, h, video->timescale, frame_duration, frames,
+                     producer, ExportAudio{}, out_path, options, nullptr);
+    if (!exported.ok) {
+        result.error = (progress && progress->cancel.load())
+                           ? "cancelled"
+                           : exported.error;
+        return result;
+    }
+    result.ok = true;
+    log_info("consolidate: %s -> all-intra %ux%u, %u frames @%0.3f fps",
+             source.filename().string().c_str(), w, h, frames, result.fps);
+    return result;
+}
+
+bool rebuild_still_thumbs(const std::filesystem::path& mez_path,
+                          const std::filesystem::path& thumbs_path) {
+    codec::MezReader reader;
+    std::string error;
+    if (!reader.open(mez_path, &error)) return false;
+    codec::DecodedFrame frame;
+    if (!reader.decode(0, frame) || frame.nv12) return false;
+    I420Frame f;
+    f.width = frame.width;
+    f.height = frame.height;
+    const uint32_t cw = (f.width + 1) / 2;
+    const uint32_t ch = (f.height + 1) / 2;
+    f.y.resize(static_cast<size_t>(f.width) * f.height);
+    f.u.resize(static_cast<size_t>(cw) * ch);
+    f.v.resize(static_cast<size_t>(cw) * ch);
+    for (uint32_t y = 0; y < f.height; ++y)
+        std::memcpy(f.y.data() + static_cast<size_t>(y) * f.width,
+                    frame.y.data() + static_cast<size_t>(y) * frame.y_stride,
+                    f.width);
+    for (uint32_t y = 0; y < ch; ++y) {
+        std::memcpy(f.u.data() + static_cast<size_t>(y) * cw,
+                    frame.u.data() + static_cast<size_t>(y) * frame.uv_stride,
+                    cw);
+        std::memcpy(f.v.data() + static_cast<size_t>(y) * cw,
+                    frame.v.data() + static_cast<size_t>(y) * frame.uv_stride,
+                    cw);
+    }
+    ThumbStrip strip;
+    strip.add(f);
+    return strip.write(thumbs_path);
+}
+
+ImportResult resume_video_pass(const std::filesystem::path& source,
+                               const std::filesystem::path& dest_dir,
+                               const ImportOptions& options,
+                               ImportProgress* progress) {
+    ImportResult result;
+    platform::MfSession session;
+    if (!session.ok()) {
+        result.error = "Media Foundation unavailable";
+        return result;
+    }
+    BmffFile file;
+    std::string error;
+    if (!file.open(source, &error)) {
+        result.error = "demux: " + error;
+        return result;
+    }
+    const TrackInfo* video = file.movie().first_video();
+    if (!video || std::string(video->fourcc) != "avc1" ||
+        video->samples.empty()) {
+        result.error = "no H.264 video track";
+        return result;
+    }
+    result.width = video->width;
+    result.height = video->height;
+    result.frame_count = static_cast<uint32_t>(video->samples.size());
+    const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
+    result.fps = static_cast<double>(video->timescale) / frame_duration;
+
+    // The fast-stage sidecar carries the audio curves; the pass rewrites
+    // it with the video curves merged, exactly as first ingest would
+    // have. A missing/unreadable sidecar still gets the video curves.
+    const std::wstring stem = source.stem().wstring();
+    const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
+    mod::AnalysisData analysis;
+    mod::load_analysis(sc.analysis, &analysis);
+    analysis.fps = result.fps;
+    analysis.frame_count = result.frame_count;
+
+    if (progress) progress->ready.store(true);
+    result.ok = ingest_video_pass(file, *video, options, progress, &analysis,
+                                  dest_dir, stem, &result);
+    if (!result.ok && result.error.empty())
+        result.error = "video pass failed";
+    return result;
 }
 
 ImportResult import_media(const std::filesystem::path& source,

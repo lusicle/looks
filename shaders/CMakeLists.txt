@@ -136,6 +136,7 @@ add_slang_shaders(looks_shaders
         fx_corner_pin.comp.slang
         mod_integrate.comp.slang
         thumb_tap.comp.slang
+        gallery_tap.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang

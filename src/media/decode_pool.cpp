@@ -35,6 +35,12 @@ constexpr uint32_t kReverseWindow = 24;
 // Feeds past the target's own sample before a roll gives up: reorder
 // depth is a handful of frames on any conformant stream.
 constexpr uint32_t kRollGuard = 64;
+// Collects without a plan/prewarm touch before an idle stream's decoder
+// sessions, file handles and ring memory release. The stream entry and
+// its frame index stay: re-entry pays a session open plus a keyframe
+// roll, not a demux, and a SCHEDULED re-entry prewarms through the same
+// touch a second ahead of playing.
+constexpr uint64_t kIdleCloseCollects = 300;
 
 bool same_bundles(const std::vector<AssetBundle>& a,
                   const std::vector<AssetBundle>& b) {
@@ -81,6 +87,10 @@ bool read_sample_at(FILE* file, const FrameIndex::Sample& s,
     return BmffFile::read_at(file, s.offset, s.size, out);
 }
 
+// The scrub epoch the CURRENT worker thread's job was queued under:
+// an advisory roll bails when a drag started after it was queued.
+thread_local uint64_t t_job_epoch = 0;
+
 }  // namespace
 
 DecodePool::Stream::Session::~Session() {
@@ -107,6 +117,11 @@ DecodePool::~DecodePool() {
     job_cv_.notify_all();
     for (std::thread& t : workers_)
         if (t.joinable()) t.join();
+}
+
+void DecodePool::abort() {
+    abort_.store(true, std::memory_order_relaxed);
+    job_cv_.notify_all();
 }
 
 void DecodePool::drain() {
@@ -211,14 +226,79 @@ DecodePool::Stream* DecodePool::stream_for(const Request& req) {
     if (!b || bundle_video(*b).empty()) return nullptr;
     std::lock_guard<std::mutex> lock(map_m_);
     auto it = streams_.find(req.key);
-    if (it != streams_.end()) return it->second.get();
+    if (it != streams_.end()) {
+        it->second->last_touch = collect_gen_;
+        it->second->idle_closed = false;
+        return it->second.get();
+    }
     auto s = std::make_unique<Stream>();
     s->path = bundle_video(*b);
     s->native = !b->native.empty();
     s->frames = b->frames;
+    s->last_touch = collect_gen_;
     Stream* raw = s.get();
     streams_.emplace(req.key, std::move(s));
     return raw;
+}
+
+// Releases what an idle stream holds open — two decoder sessions (an
+// MFT and possibly a D3D device each), a FILE*, the mez reader bank and
+// the ring's decoded frames — without ever blocking on a busy lock: a
+// held session just means a stale prewarm worker is still inside, so
+// skip and retry next collect. Idempotent; `idle_closed` latches only
+// when every piece released.
+void DecodePool::idle_close_scan() {
+    std::lock_guard<std::mutex> lock(map_m_);
+    for (auto& entry : streams_) {
+        Stream& s = *entry.second;
+        if (s.idle_closed ||
+            collect_gen_ - s.last_touch < kIdleCloseCollects)
+            continue;
+        bool all = true;
+        for (Stream::Session& c : s.sessions) {
+            std::unique_lock<std::mutex> sl(c.m, std::try_to_lock);
+            if (!sl.owns_lock()) {
+                all = false;
+                continue;
+            }
+            if (!c.created) continue;
+            c.dec.destroy();
+            if (c.file) {
+                std::fclose(static_cast<FILE*>(c.file));
+                c.file = nullptr;
+            }
+            c.created = false;
+            c.ok = false;
+            c.next_decode = 0;
+            c.next_present.store(-1, std::memory_order_relaxed);
+            c.run_key.store(-1, std::memory_order_relaxed);
+            c.draining = false;
+            c.scratch = {};
+        }
+        for (Stream::Slot& slot : s.slots) {
+            std::unique_lock<std::mutex> sl(slot.m, std::try_to_lock);
+            if (!sl.owns_lock()) {
+                all = false;
+                continue;
+            }
+            if (!slot.opened) continue;
+            slot.reader.close();
+            slot.opened = false;
+            slot.ok = false;
+        }
+        {
+            std::unique_lock<std::mutex> sl(s.m, std::try_to_lock);
+            if (sl.owns_lock()) {
+                s.ring.clear();
+                s.spare.clear();
+                s.last_payload_frame.reset();
+                s.last_payload_off = 0;
+            } else {
+                all = false;
+            }
+        }
+        if (all) s.idle_closed = true;
+    }
 }
 
 std::shared_ptr<const codec::DecodedFrame> DecodePool::ring_insert(
@@ -229,20 +309,30 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::ring_insert(
     for (const auto& e : s.ring)
         if (e.first == frame) return e.second;
     s.ring.emplace_back(frame, decoded);
-    // Evict what the playhead has left furthest behind (or never
-    // reaches). Frames behind the ask weigh 4x, so the tail a backward
-    // walk will read next survives a forward one's leftovers. The LIVE
-    // window [want, want+lookahead] is untouchable: evicting a frame
-    // the playhead is about to read turns into a re-ask, and a re-ask
-    // of a just-passed frame is a whole keyframe roll - one stray big
-    // roll flooding the ring must not cascade into the next.
+    // Evict against the DIRECTION OF TRAVEL. The live window ahead of
+    // the playhead — in whichever direction it moves — is untouchable:
+    // evicting a frame it is about to read turns into a re-ask, and a
+    // re-ask off the ring is a whole keyframe roll. Frames the playhead
+    // is moving AWAY from weigh 4x, so the other direction's leftovers
+    // yield first. A forward-only rule here shredded the reverse window
+    // fetch_native had just widened (it protected already-shown frames
+    // and evicted the backward tail first), so backward playback
+    // re-rolled the same run every few frames.
+    const bool backward = s.want < s.last_want;
     while (s.ring.size() > std::max<size_t>(depth, 1)) {
         size_t worst = SIZE_MAX;
         uint32_t worst_d = 0;
         for (size_t i = 0; i < s.ring.size(); ++i) {
             const uint32_t idx = s.ring[i].first;
-            if (idx >= s.want && idx <= s.want + kDecodeAhead) continue;
-            const uint32_t d = idx >= s.want ? idx - s.want : (s.want - idx) * 4;
+            if (!backward && idx >= s.want && idx <= s.want + kDecodeAhead)
+                continue;
+            if (backward && idx <= s.want && s.want - idx <= kDecodeAhead)
+                continue;
+            uint32_t d;
+            if (backward)
+                d = idx <= s.want ? s.want - idx : (idx - s.want) * 4;
+            else
+                d = idx >= s.want ? idx - s.want : (s.want - idx) * 4;
             if (d >= worst_d) {
                 worst_d = d;
                 worst = i;
@@ -269,7 +359,7 @@ std::shared_ptr<codec::DecodedFrame> DecodePool::take_spare(Stream& s) {
 }
 
 std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
-    Stream& s, uint32_t frame, bool* was_miss) {
+    Stream& s, uint32_t frame, bool* was_miss, bool scrub) {
     {
         std::lock_guard<std::mutex> lock(s.m);
         for (const auto& e : s.ring)
@@ -279,7 +369,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
     // was_miss == nullptr is the prewarm path: advisory work that must
     // never park a worker behind a busy session - the job re-queues next
     // collect if the frame still matters.
-    return s.native ? fetch_native(s, frame, was_miss == nullptr)
+    return s.native ? fetch_native(s, frame, was_miss == nullptr, scrub)
                     : fetch_mez(s, frame);
 }
 
@@ -354,7 +444,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_mez(
 // window a forward roll just filled. Advisory (prewarm) calls never
 // wait: a parked worker serves nobody, and the job re-queues anyway.
 std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
-    Stream& s, uint32_t frame, bool advisory) {
+    Stream& s, uint32_t frame, bool advisory, bool scrub) {
     // COM/MF per thread that touches the decoder MFTs (consumer thread
     // on a blocking miss, workers on prewarm). Refcounted by the OS.
     thread_local platform::MfSession mf_session;
@@ -397,6 +487,30 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
                      std::memory_order_relaxed)),
                  static_cast<long long>(s.sessions[1].run_key.load(
                      std::memory_order_relaxed)));
+    }
+
+    // SCRUB service, consumer side: NEVER decode mid-drag — serve the
+    // nearest ringed frame whatever its distance (it is the best content
+    // that exists; the chaser is closing the gap at full decode rate on
+    // a worker session) and raise `approximated_` so the caller keeps
+    // re-collecting until the ask comes back exact. An empty ring falls
+    // through to the bounded slice below to seed it.
+    if (scrub && !advisory) {
+        std::lock_guard<std::mutex> lock(s.m);
+        uint32_t best_d = ~0u;
+        std::shared_ptr<const codec::DecodedFrame> best;
+        for (const auto& e : s.ring) {
+            const uint32_t d = e.first > target ? e.first - target
+                                                : target - e.first;
+            if (d < best_d) {
+                best_d = d;
+                best = e.second;
+            }
+        }
+        if (best) {
+            approximated_ = true;
+            return best;
+        }
     }
 
     // Session pick, routed by KEYFRAME RUN: the session inside the
@@ -516,7 +630,6 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
 
     // Continue when the target's keyframe is already behind the cursor
     // and the target itself is not; otherwise flush and reseek.
-    const uint32_t target_decode = idx.present_to_decode[target];
     const int64_t np = sess->next_present.load(std::memory_order_relaxed);
     const bool cont = np >= 0 && !sess->draining &&
                       np <= static_cast<int64_t>(target) &&
@@ -527,9 +640,44 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
     // cold advisory SEEK only when it starts near its keyframe - that is
     // the next-run preroll. A mid-run advisory re-decode floods the ring
     // with frames the playhead already passed; if the playhead truly
-    // needs one of those, the consumer's blocking ask decides it.
-    if (advisory && target - floor_present > (cont ? 48u : kDecodeAhead))
+    // needs one of those, the consumer's blocking ask decides it. A
+    // BACKWARD walk's backfill is exempt: its target sits deep in the
+    // previous run by construction, and the roll rings exactly the
+    // frames the descending playhead reads next.
+    bool backfill = false;
+    {
+        std::lock_guard<std::mutex> lock(s.m);
+        backfill = s.want < s.last_want && target < s.want;
+    }
+    // A scrub CHASER (an advisory queued during the live drag) is
+    // exempt from the cold-seek gate: its whole job is a mid-run roll
+    // to wherever the drag points.
+    const bool chaser =
+        advisory && scrub_.load(std::memory_order_relaxed) &&
+        t_job_epoch == scrub_epoch_.load(std::memory_order_relaxed);
+    if (advisory && !backfill && !chaser &&
+        target - floor_present > (cont ? 48u : kDecodeAhead))
         return nullptr;
+
+    // SCRUB service: mid-drag every position is disposable, so an ask
+    // that would cost a long roll serves the roll's FLOOR instead — the
+    // run's sync point on a cold seek, the cursor's next emission on a
+    // continuation. One feed instead of a GOP, so the preview tracks
+    // the drag; the gesture's end re-renders the exact frame, and the
+    // caller gates its frame cache while a drag is live.
+    constexpr uint32_t kScrubSnapRoll = 6;
+    uint32_t serve = target;
+    if (scrub && !advisory && target - floor_present > kScrubSnapRoll) {
+        // One bounded slice per pass: the re-collect loop turns these
+        // into a visible march toward the true frame.
+        serve = floor_present + kScrubSnapRoll;
+        approximated_ = true;
+        std::lock_guard<std::mutex> lock(s.m);
+        for (const auto& e : s.ring)
+            if (e.first == serve) return e.second;
+    }
+    const uint32_t serve_decode = idx.present_to_decode[serve];
+
     if (!cont) {
         sess->dec.flush();
         sess->draining = false;
@@ -549,7 +697,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
     {
         std::lock_guard<std::mutex> lock(s.m);
         if (s.want < s.last_want) {
-            const uint32_t roll = target - floor_present + 1;
+            const uint32_t roll = serve - floor_present + 1;
             depth = std::clamp<size_t>(roll / 2 + 1, depth, kReverseWindow);
         }
     }
@@ -571,9 +719,17 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
         : 0;
     bool hold_was_dry = false;
     while (!result) {
+        if (abort_.load(std::memory_order_relaxed)) return nullptr;
+        // A drag started AFTER this advisory was queued: bail mid-roll.
+        // Pre-drag speculation holding a session is exactly what starved
+        // scrubs; the drag's own chasers carry the current epoch and
+        // roll through.
+        if (advisory && scrub_.load(std::memory_order_relaxed) &&
+            t_job_epoch != scrub_epoch_.load(std::memory_order_relaxed))
+            return nullptr;
         bool held = false;
         if (sess->next_decode < idx.frame_count() &&
-            sess->next_decode <= target_decode + kRollGuard) {
+            sess->next_decode <= serve_decode + kRollGuard) {
             const FrameIndex::Sample& sm = idx.samples[sess->next_decode];
             // A keyframe is a free seek point: once the target's sample
             // is fed, never feed into the NEXT run - the in-flight
@@ -582,7 +738,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
             // is decoded twice. If a hold pass yields no emission the
             // pipeline needs a push, so feed anyway.
             if (sm.keyframe && sess->next_decode > key &&
-                sess->next_decode > target_decode && !hold_was_dry) {
+                sess->next_decode > serve_decode && !hold_was_dry) {
                 held = true;
             } else if (!read_sample_at(static_cast<FILE*>(sess->file), sm,
                                        sample_bytes) ||
@@ -622,14 +778,14 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
             if (p < floor_present) continue;   // pre-keyframe stragglers
             auto kept = ring_insert(
                 s, p, nv12_to_decoded(take_spare(s), nv12), depth);
-            if (p == target) result = std::move(kept);
+            if (p == serve) result = std::move(kept);
         }
         hold_was_dry = held && !emitted;
     }
     if (sess->draining)
         sess->next_present.store(-1, std::memory_order_relaxed);
-    if (!result)
-        log_warn("decode pool: native roll missed frame %u", target);
+    if (!result && !abort_.load(std::memory_order_relaxed))
+        log_warn("decode pool: native roll missed frame %u", serve);
     // Every expensive roll names itself in looks.log: which session, why
     // it could not continue, how far it fed, what it cost. Hitches are
     // rare by construction, so this stays quiet in steady playback.
@@ -643,7 +799,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
                  "%u (key %u, was np %lld, other np %lld run %lld)",
                  session_index, advisory ? "prewarm " : "",
                  cont ? "cont" : "seek", sess->next_decode - fed_from,
-                 roll_ms, target, key, static_cast<long long>(np),
+                 roll_ms, serve, key, static_cast<long long>(np),
                  static_cast<long long>(
                      other.next_present.load(std::memory_order_relaxed)),
                  static_cast<long long>(
@@ -652,8 +808,15 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
     return result;
 }
 
-const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
+const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
+                                                    bool scrub) {
     frames_.clear();
+    ++collect_gen_;
+    approximated_ = false;
+    if (scrub && !prev_scrub_)
+        scrub_epoch_.fetch_add(1, std::memory_order_relaxed);
+    prev_scrub_ = scrub;
+    scrub_.store(scrub, std::memory_order_relaxed);
     const std::vector<Request> want = plan(root_frame);
     // Depth must clear the prewarm span with SLACK: a ring sized exactly
     // to span+tail evicts decoded-ahead frames the playhead has not
@@ -676,7 +839,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
             }
         }
         bool miss = false;
-        auto frame = fetch(*s, req.frame, &miss);
+        auto frame = fetch(*s, req.frame, &miss, scrub);
         if (miss) ++misses_;
         if (frame) frames_.push_back({req.key, std::move(frame)});
     }
@@ -690,10 +853,14 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
     // cycle: permanent decode churn whose stream-lock traffic stalled
     // collect() by the whole backlog. Frames already ringed (or already
     // queued - slowed sources repeat source frames) never re-queue, so a
-    // settled steady state queues NOTHING.
+    // settled steady state queues NOTHING. A SCRUB queues nothing either
+    // — the drag's next position is unknowable, and speculative rolls
+    // saturating the sessions behind it are what the drag then waits on
+    // (the gen bump below still cancels whatever an earlier plan queued).
     std::vector<Job> queued;
     const uint32_t span = std::min(
         kDecodeAhead, ring_depth_ > 1 ? ring_depth_ - 1 : 1u);
+    if (!scrub) {
     // ONE standing job per placement: advance its stream to the span
     // FRONTIER. The worker's roll rings every frame on the way, so one
     // job replaces a span of one-frame jobs that each fought the
@@ -733,6 +900,11 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
         if (!ps) continue;
         {
             std::lock_guard<std::mutex> lock(ps->m);
+            // A stream moving BACKWARD skips its forward frontier: those
+            // frames were just evicted against the direction of travel,
+            // and re-rolling them ping-pongs the sessions against the
+            // backfill below.
+            if (ps->want < ps->last_want) continue;
             bool ringed = false;
             for (const auto& e : ps->ring)
                 if (e.first == req.frame) {
@@ -742,6 +914,72 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
             if (ringed) continue;
         }
         queued.push_back({req.key, req.frame, 0});
+    }
+    // BACKWARD prewarm: reverse motion exhausts its ring window every
+    // kReverseWindow frames, and each exhaustion was a BLOCKING roll on
+    // the consumer. Queue the frame one window below the ask so the
+    // idle session pre-rolls the PREVIOUS keyframe run concurrently —
+    // the same GOP-striped supply forward playback gets. (Two windows
+    // measured WORSE: their rolls compete for the same two sessions.)
+    for (const Request& req : want) {
+        Stream* ps = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(map_m_);
+            if (auto it = streams_.find(req.key); it != streams_.end())
+                ps = it->second.get();
+        }
+        if (!ps || !ps->native || req.frame == 0) continue;
+        bool backward = false;
+        bool ringed = false;
+        const uint32_t back = req.frame > kReverseWindow
+                                  ? req.frame - kReverseWindow
+                                  : 0u;
+        {
+            std::lock_guard<std::mutex> lock(ps->m);
+            backward = ps->want < ps->last_want;
+            for (const auto& e : ps->ring)
+                if (e.first == back) {
+                    ringed = true;
+                    break;
+                }
+        }
+        if (!backward || ringed) continue;
+        bool dup = false;
+        for (const Job& q : queued)
+            if (q.key == req.key && q.frame == back) {
+                dup = true;
+                break;
+            }
+        if (!dup) queued.push_back({req.key, back, 0});
+    }
+    } else {
+        // SCRUBBING: one CHASER per stream toward the drag target, and
+        // nothing else. The consumer serves ringed frames instantly
+        // (never decodes); the chaser rolls at full decode rate on a
+        // worker session and re-queues each collect with the live
+        // target, so the ring frontier follows the drag as fast as the
+        // codec structure physically allows.
+        for (const Request& req : want) {
+            Stream* ps = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(map_m_);
+                if (auto it = streams_.find(req.key);
+                    it != streams_.end())
+                    ps = it->second.get();
+            }
+            if (!ps || !ps->native) continue;
+            bool ringed = false;
+            {
+                std::lock_guard<std::mutex> lock(ps->m);
+                for (const auto& e : ps->ring)
+                    if (e.first == req.frame) {
+                        ringed = true;
+                        break;
+                    }
+            }
+            if (ringed) continue;
+            queued.push_back({req.key, req.frame, 0});
+        }
     }
     {
         std::lock_guard<std::mutex> lock(job_m_);
@@ -755,6 +993,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame) {
         }
     }
     job_cv_.notify_all();
+    idle_close_scan();
     return frames_;
 }
 
@@ -776,6 +1015,7 @@ void DecodePool::worker_main() {
             if (auto it = streams_.find(job.key); it != streams_.end())
                 s = it->second.get();
         }
+        t_job_epoch = scrub_epoch_.load(std::memory_order_relaxed);
         if (s) fetch(*s, job.frame, nullptr);
         {
             std::lock_guard<std::mutex> lock(job_m_);

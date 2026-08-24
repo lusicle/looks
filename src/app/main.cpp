@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,6 +72,8 @@
 #include "ui/text.h"
 #include "ui/ui_renderer.h"
 #include "ui/widgets.h"
+#include "script/script.h"
+#include "ui/probe.h"
 #include "util/color.h"
 #include "util/file.h"
 #include "util/image.h"
@@ -103,6 +106,11 @@ struct ImportJob {
     // The bind/place ran (at `ready` for video ingest, at completion for
     // the fast paths); the job may still be analyzing after it.
     bool announced = false;
+    // Resume of a killed video pass: nothing to bind or place — the
+    // asset was usable all along, only curves/thumbs land.
+    bool video_pass_only = false;
+    // CONSOLIDATE transcode: likewise bind-free, an .intra.mp4 lands.
+    bool consolidate = false;
 
     ~ImportJob() {
         progress.cancel = true;
@@ -151,17 +159,21 @@ struct BundlePaths {
 
 // Container probe for native video, cached per (path, mtime): the facts
 // the bundle table republishes on every asset edit must not re-parse
-// sample tables each time. UI thread only.
-const media::VideoFacts* probe_native_facts(
-    const std::filesystem::path& source) {
+// sample tables each time. Locked, and the facts copy out under the
+// lock — the thumb worker resolves bundles for its strip reads while
+// the UI thread resolves them constantly.
+bool probe_native_facts(const std::filesystem::path& source,
+                        media::VideoFacts* out) {
     struct Probe {
         std::filesystem::file_time_type mtime;
         media::VideoFacts facts;
         bool ok = false;
     };
     static std::map<std::wstring, Probe> cache;
+    static std::mutex cache_mutex;
     std::error_code ec;
     const auto t = std::filesystem::last_write_time(source, ec);
+    std::lock_guard<std::mutex> lock(cache_mutex);
     auto it = cache.find(source.native());
     if (it == cache.end() || ec || it->second.mtime != t) {
         Probe p;
@@ -170,10 +182,13 @@ const media::VideoFacts* probe_native_facts(
         p.ok = media::probe_video_facts(source, &p.facts, &error);
         it = cache.insert_or_assign(source.native(), std::move(p)).first;
     }
-    return it->second.ok ? &it->second.facts : nullptr;
+    if (!it->second.ok) return false;
+    if (out) *out = it->second.facts;
+    return true;
 }
 
-BundlePaths resolve_bundle(const std::filesystem::path& source) {
+BundlePaths resolve_bundle(const std::filesystem::path& source,
+                           bool preview = true) {
     BundlePaths out;
     std::wstring ext = source.extension().wstring();
     for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
@@ -199,10 +214,21 @@ BundlePaths resolve_bundle(const std::filesystem::path& source) {
     // source (or one overwritten in place) re-ingests; there is no
     // derived video file left to go stale or partial.
     if (ext == L".mp4" || ext == L".mov") {
-        if (!probe_native_facts(source)) return out;
+        if (!probe_native_facts(source, nullptr)) return out;
         out.base = cache.base;
         if (!bundle_is_fresh(cache.analysis, source)) return out;
         out.native = source;
+        // CONSOLIDATE artifact: an all-intra transcode in the cache
+        // replaces the source for PREVIEW decode (a cold scrub decodes
+        // one frame, not a GOP roll); export resolves the original. The
+        // probe guards against a partial file from a killed transcode.
+        if (preview) {
+            std::filesystem::path intra = cache.base;
+            intra.replace_extension(".intra.mp4");
+            if (bundle_is_fresh(intra, source) &&
+                probe_native_facts(intra, nullptr))
+                out.native = intra;
+        }
         if (bundle_is_fresh(cache.pcm, source)) out.pcm = cache.pcm;
         out.ready = true;
         return out;
@@ -241,6 +267,51 @@ BundlePaths resolve_bundle(const std::filesystem::path& source) {
     return out;
 }
 
+// An ingest killed mid-video-pass leaves a READY bundle with no thumb
+// strip (a completed pass always writes one; the strip postdates the
+// source when it did). Those bundles resume the pass in the background —
+// as do sidecars written at an older, smaller cell height, which the
+// resumed pass rewrites at the current one.
+bool video_pass_incomplete(const std::filesystem::path& source) {
+    std::wstring ext = source.extension().wstring();
+    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+    if (ext != L".mp4" && ext != L".mov") return false;
+    const BundlePaths paths = resolve_bundle(source);
+    if (!paths.ready || paths.native.empty()) return false;
+    std::filesystem::path thumbs = paths.base;
+    thumbs.replace_extension(".thumbs");
+    if (!bundle_is_fresh(thumbs, source)) return true;
+    media::ThumbStripData head;
+    return !media::read_thumbs_header(thumbs, &head) ||
+           head.h < media::kThumbStripH;
+}
+
+// The doc-side wire end a GROUP card stands for: its bound face member
+// when set, else the chain end (first member entering, last leaving).
+// 0 = no members. Shared by the canvas node splice and the preset-drop
+// splice — the link table stores members, never the card.
+uint64_t group_boundary_member(const doc::Look& look, uint64_t gid,
+                               bool is_from) {
+    const doc::Group* gr = nullptr;
+    const doc::Layer* gl = nullptr;
+    for (const doc::Layer& l : look.layers)
+        for (const doc::Group& g : l.groups)
+            if (g.id == gid) {
+                gr = &g;
+                gl = &l;
+            }
+    if (!gl) return 0;
+    uint64_t first = 0, last = 0, bind = 0;
+    for (const doc::EffectInstance& e : gl->stack)
+        if (e.group_id == gid) {
+            if (!first) first = e.id;
+            last = e.id;
+            if (gr && e.id == (is_from ? gr->face_out : gr->face_in))
+                bind = e.id;
+        }
+    return bind ? bind : (is_from ? last : first);
+}
+
 // Still-image media (import scope: PNG/TGA) get different media UI:
 // a duration entry instead of the time/audio rows, which are meaningless
 // when every frame is identical and there is no media audio.
@@ -266,8 +337,39 @@ std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
     return job;
 }
 
+std::unique_ptr<ImportJob> start_video_pass_resume(
+    const std::filesystem::path& source, const std::filesystem::path& dest) {
+    auto job = std::make_unique<ImportJob>();
+    job->source = source;
+    job->video_pass_only = true;
+    job->announced = true;   // skips the bind/place block entirely
+    ImportJob* raw = job.get();
+    job->thread = std::thread([raw, source, dest] {
+        raw->result =
+            media::resume_video_pass(source, dest, {}, &raw->progress);
+        raw->done = true;
+    });
+    return job;
+}
+
+std::unique_ptr<ImportJob> start_consolidate(
+    const std::filesystem::path& source, const std::filesystem::path& dest) {
+    auto job = std::make_unique<ImportJob>();
+    job->source = source;
+    job->consolidate = true;
+    job->announced = true;   // nothing to bind or place
+    ImportJob* raw = job.get();
+    job->thread = std::thread([raw, source, dest] {
+        raw->result = media::consolidate_video(source, dest, &raw->progress);
+        raw->done = true;
+    });
+    return job;
+}
+
 struct AppState;
 void open_source(AppState& app, const std::filesystem::path& picked);
+doc::Asset* opened_asset(AppState& app);
+bool import_slot_free(AppState& app);
 
 // ---- look scope + the project's media
 
@@ -298,13 +400,6 @@ inline void bind_primary_media(doc::Document& doc, const std::string& path) {
     for (doc::Look& look : doc.looks)
         for (doc::Layer& l : look.layers)
             if (doc::layer_is_media(l) && !l.asset) l.asset = asset_id;
-}
-
-// Still-image length lives on the asset (it describes the media, not the
-// project); 0 = as imported.
-inline uint32_t primary_still_duration(const doc::Document& doc) {
-    const doc::Asset* a = doc.primary_asset();
-    return a ? a->still_duration_frames : 0;
 }
 
 // ---------------------------------------------------------------- export
@@ -543,6 +638,10 @@ struct RenderWorker {
         double env_key_time = -1.0;
         bool want_source = false;         // A/B wipe or bypass-all
         bool proxy_active = false;        // cache-context ingredient
+        // Playhead drag in progress: the decode pool may serve nearby
+        // frames instead of rolling GOPs, and nothing stores to the
+        // frame cache while it is set (release re-renders exact).
+        bool scrubbing = false;
         // Custom glyph set hand-off: the drop happens on the UI
         // thread, the engine lives here. Gray ramp bytes, or RGBA when
         // `glyph_is_color` (emoji tilesets — coverage from alpha).
@@ -569,6 +668,7 @@ struct RenderWorker {
         // and the measured alpha bounds of the selected block, canvas
         // fractions - valid only for bounds_placement.
         uint64_t doc_revision = 0;
+        uint64_t publish_seq = 0;
         float bounds[4] = {0.0f, 0.0f, 1.0f, 1.0f};
         bool bounds_valid = false;
         uint64_t bounds_placement = 0;
@@ -612,6 +712,9 @@ struct RenderWorker {
         {
             std::lock_guard<std::mutex> lock(m_);
             quit_ = true;
+            // Mid-roll decodes bail at their next sample instead of the
+            // join waiting out a whole GOP.
+            if (pool_ptr_) pool_ptr_->abort();
         }
         cv_.notify_all();
         if (thread_.joinable()) thread_.join();
@@ -664,6 +767,7 @@ struct RenderWorker {
         v.thumb_img = p.has_thumbs ? p.thumb_img.get() : nullptr;
         if (p.has_thumbs) v.thumb_cells = p.thumb_cells;
         v.doc_revision = p.doc_revision;
+        v.publish_seq = p.cycle_seq;
         for (int i = 0; i < 4; ++i) v.bounds[i] = p.bounds[i];
         v.bounds_valid = p.bounds_valid;
         v.bounds_placement = p.bounds_placement;
@@ -672,6 +776,19 @@ struct RenderWorker {
 
     void set_completed_ui_frame(uint64_t f) {
         completed_ui_frame_.store(f, std::memory_order_relaxed);
+    }
+
+    // Script wait_idle support: the cycle counter at "now", and a poke
+    // that guarantees the worker leaves idle for at least one fresh
+    // cycle (a bare seek moves no document revision, so nothing else
+    // would force a render while paused).
+    uint64_t snapshot_seq() const { return cycle_seq_.load(); }
+    void poke() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            ++job_serial_;
+        }
+        cv_.notify_all();
     }
 
     // Distinct TIMELINE frames published so far: the UI's playback-rate
@@ -746,6 +863,7 @@ private:
         bool ready = false;
         uint64_t last_ui_frame = 0;
         uint64_t doc_revision = 0;
+        uint64_t cycle_seq = 0;
         float bounds[4] = {0.0f, 0.0f, 1.0f, 1.0f};
         bool bounds_valid = false;
         uint64_t bounds_placement = 0;
@@ -758,6 +876,9 @@ private:
     bool quit_ = false;
     bool idle_ = false;
     int pause_count_ = 0;
+    // The run()-local decode pool, published under m_ so stop() can
+    // abort a roll in flight; null outside run()'s lifetime.
+    media::DecodePool* pool_ptr_ = nullptr;
     std::vector<Published> published_;
     int latest_ = -1;
     std::atomic<uint64_t> completed_ui_frame_{0};
@@ -798,10 +919,15 @@ private:
         bool published_ok = false;
         int target = -1;
         uint64_t doc_revision = 0;
+        uint64_t cycle_seq = 0;
         uint64_t sel_placement = 0;
         bool measured = false;
     };
     InFlight inflight_[gfx::kFramesInFlight];
+    // Render cycles that passed the input snapshot, monotonic. A publish
+    // stamped N rendered inputs read at cycle N - the script host's
+    // wait_idle keys on "published seq > seq seen at wait start".
+    std::atomic<uint64_t> cycle_seq_{0};
 };
 
 bool RenderWorker::ensure_published(Published& p, uint32_t w, uint32_t h,
@@ -905,8 +1031,21 @@ void RenderWorker::perf_record(double rt, const double phase[4]) {
 
 void RenderWorker::run() {
     // Worker-local decode/remap state (moved off AppState — these hold
-    // FILE handles and are single-thread objects).
+    // FILE handles and are single-thread objects). stop() aborts the
+    // pool through the shared pointer so quitting never waits out a
+    // keyframe roll; the guard unpublishes it before the pool dies.
     media::DecodePool pool;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        pool_ptr_ = &pool;
+    }
+    struct PoolUnpublish {
+        RenderWorker& w;
+        ~PoolUnpublish() {
+            std::lock_guard<std::mutex> lock(w.m_);
+            w.pool_ptr_ = nullptr;
+        }
+    } pool_unpublish{*this};
     mod::TimeRemap remap;
 
     std::shared_ptr<const doc::Document> doc_snap;
@@ -954,6 +1093,7 @@ void RenderWorker::run() {
                 fl.measured && engine->read_measure_bounds(mb);
             std::lock_guard<std::mutex> lock(m_);
             fpub.doc_revision = fl.doc_revision;
+            fpub.cycle_seq = fl.cycle_seq;
             fpub.bounds_valid = mb_ok;
             fpub.bounds_placement = mb_ok ? fl.sel_placement : 0;
             if (mb_ok)
@@ -968,10 +1108,11 @@ void RenderWorker::run() {
         // Small-field snapshot; doc/analysis copied only on change.
         uint64_t preview_node, preview_layer, look_id, sel_placement;
         uint32_t preview_div, pub_w, pub_h;
-        bool live_mode, want_source, proxy_active, interactive;
+        bool live_mode, want_source, proxy_active, interactive, scrubbing;
         double app_seconds, env_key_time;
         bool doc_changed = false;
         bool fields_changed = false;
+        uint64_t this_cycle = 0;
         {
             std::unique_lock<std::mutex> lock(m_);
             idle_ = true;
@@ -996,11 +1137,18 @@ void RenderWorker::run() {
                 continue;
             }
             idle_ = false;
+            this_cycle = cycle_seq_.fetch_add(1) + 1;
             // The serial bumps only on REAL job-field changes (selection,
             // scope, proxy...) - a paused preview re-renders on those too.
             fields_changed = job_serial_ != last_serial;
             last_serial = job_serial_;
-            if (job_.doc_revision != base_revision && job_.doc) {
+            // Adopt on snapshot IDENTITY, never on the revision number:
+            // revision counters restart in every loaded document, and
+            // the startup doc vs a freshly restored project can carry
+            // the SAME number — a numeric gate then kept rendering the
+            // old (empty) document, black until some command bumped
+            // the counter past the collision.
+            if (job_.doc && job_.doc != doc_snap) {
                 doc_snap = job_.doc;   // pointer retain, no copy
                 base_revision = job_.doc_revision;
                 doc_revision = base_revision;
@@ -1074,6 +1222,7 @@ void RenderWorker::run() {
             want_source = job_.want_source;
             proxy_active = job_.proxy_active;
             interactive = job_.interactive;
+            scrubbing = job_.scrubbing;
         }
         if (!doc_snap) continue;   // nothing pushed yet
         const doc::Document& doc = local_valid ? doc_local : *doc_snap;
@@ -1089,8 +1238,16 @@ void RenderWorker::run() {
         // paused frames show the finished result without interaction.
         if (!doc_changed && !fields_changed && !pending_render &&
             !live_mode && last_had_frame &&
-            mod_frame == last_rendered_frame && !engine->ed_walk_pending())
+            mod_frame == last_rendered_frame && !engine->ed_walk_pending()) {
+            // Publish the tail first: a frame hands off only when a LATER
+            // cycle retires its fence, so idling with submissions in
+            // flight would hold the monitor one edit behind - every
+            // paused change would show only after the NEXT action's
+            // cycle. Idle is legal only with an empty pipeline.
+            for (uint32_t s = 0; s < gfx::kFramesInFlight; ++s)
+                complete_slot(s);
             continue;
+        }
         // A decided render stays owed until it actually publishes (a
         // busy publish ring must retry, not stall).
         if (!pending_render)
@@ -1119,7 +1276,7 @@ void RenderWorker::run() {
         const auto tp0 = std::chrono::steady_clock::now();
         pool.set_document(doc, look_id, bundles, doc_revision);
         const std::vector<media::SourceFrame>& decoded =
-            pool.collect(play_frame);
+            pool.collect(play_frame, scrubbing);
         const auto tp1 = std::chrono::steady_clock::now();
         const auto lsrc = to_layer_sources(decoded);
 
@@ -1144,7 +1301,14 @@ void RenderWorker::run() {
         // JSON serialize) and the cache re-arms a full-frame readback
         // EVERY frame for entries the next frame invalidates.
         uint64_t cache_ctx = 0;
-        if (!live_mode && !want_source && !interactive && doc.cache_mb > 0) {
+        // The node canvas is on screen whenever a LOOK renders, and its
+        // per-node thumbnails refresh only when the graph actually
+        // EVALUATES — a cache hit would freeze every card against a
+        // moving monitor (scrub, step, playback over a cached span).
+        // Sequences have no canvas, so they keep the full cache.
+        const bool thumbs_visible = doc.find_look(look_id) != nullptr;
+        if (!live_mode && !want_source && !interactive && !thumbs_visible &&
+            doc.cache_mb > 0) {
             if (cache_hash_revision != doc_revision) {
                 cache_hash_revision = doc_revision;
                 const std::string doc_json =
@@ -1237,7 +1401,7 @@ void RenderWorker::run() {
             want_source ? &source_image : nullptr,
             lsrc.empty() ? nullptr : lsrc.data(), lsrc.size(),
             preview_node, preview_layer, sel_placement,
-            /*cache_store=*/!player.playing());
+            /*cache_store=*/!player.playing() && !scrubbing);
 
         bool published_ok = false;
         if (final_image && final_image->width() == fw &&
@@ -1311,6 +1475,7 @@ void RenderWorker::run() {
         fl.published_ok = published_ok;
         fl.target = target;
         fl.doc_revision = doc_revision;
+        fl.cycle_seq = this_cycle;
         fl.sel_placement = sel_placement;
         fl.measured = engine->measure_recorded();
         slot = (slot + 1) % gfx::kFramesInFlight;
@@ -1343,6 +1508,11 @@ void RenderWorker::run() {
             frames_advanced_.fetch_add(1, std::memory_order_relaxed);
         last_rendered_frame = mod_frame;
         last_had_frame = true;
+        // A scrub-approximated collect NEVER settles: the next cycle
+        // re-collects (each pass advances the decode a slice), so the
+        // preview converges on the true frame and can never end a
+        // gesture stuck on a neighbour's pixels.
+        if (pool.approximated()) last_rendered_frame = 0xFFFFFFFFu;
         {
             const double ms =
                 std::chrono::duration<double, std::milli>(
@@ -1358,6 +1528,508 @@ void RenderWorker::run() {
         }
         pending_render = false;
     }
+}
+
+// ---- library thumbnail worker: gallery thumbnails render on their OWN
+// thread with their OWN Engine - the export pattern (gfx/readback.h) -
+// so playback never shares a cycle with gallery fill, and thumb renders
+// never touch the preview engine's per-effect state (a shared engine
+// resized feedback/history state between thumb and working resolution).
+// Queue submissions serialize on Device::queue_mutex; every submission
+// here is fence-waited inline, so slot 0's arenas never overlap.
+class ThumbWorker {
+public:
+    struct Req {
+        uint64_t key = 0;
+        uint64_t entity = 0;   // doc entity id; 0 = preset payload
+        uint64_t stamp = 0;
+        bool operator==(const Req& o) const {
+            return key == o.key && entity == o.entity && stamp == o.stamp;
+        }
+    };
+
+    ThumbWorker(gfx::Device& dev, std::filesystem::path shader_dir)
+        : device(dev), shader_dir_(std::move(shader_dir)) {}
+    ~ThumbWorker() { stop(); }
+
+    bool start() {
+        VkCommandPoolCreateInfo pool_info{
+            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool_info.queueFamilyIndex = device.graphics_family();
+        if (vkCreateCommandPool(device.device(), &pool_info, nullptr,
+                                &pool_) != VK_SUCCESS)
+            return false;
+        VkCommandBufferAllocateInfo cb{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cb.commandPool = pool_;
+        cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cb.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device.device(), &cb, &cmd_) !=
+            VK_SUCCESS)
+            return false;
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(device.device(), &fence_info, nullptr, &fence_) !=
+            VK_SUCCESS)
+            return false;
+        published_.resize(2 + gfx::kFramesInFlight);
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+        device.wait_idle();
+        published_.clear();
+        engine_.reset();
+        if (fence_) vkDestroyFence(device.device(), fence_, nullptr);
+        fence_ = VK_NULL_HANDLE;
+        if (pool_) vkDestroyCommandPool(device.device(), pool_, nullptr);
+        pool_ = VK_NULL_HANDLE;
+    }
+
+    // Same quiesce contract as the render worker: callers mutate
+    // bundles/media after pause(), so nothing may be in flight.
+    void pause() {
+        std::unique_lock<std::mutex> lock(m_);
+        ++pause_count_;
+        cv_.wait(lock, [&] { return idle_ || quit_; });
+    }
+    void resume() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            --pause_count_;
+        }
+        cv_.notify_all();
+    }
+
+    // UI thread, once per frame. The doc snapshot is the render job's
+    // own copy - no second per-revision copy is ever made. Bundle and
+    // preset payloads copy only when their stamps move.
+    void set_job(std::shared_ptr<const doc::Document> doc,
+                 uint64_t revision,
+                 const std::vector<media::AssetBundle>& bundles,
+                 uint64_t bundle_stamp, const std::vector<Req>& reqs,
+                 const std::vector<std::pair<uint64_t, doc::Preset>>&
+                     presets,
+                 uint64_t presets_stamp) {
+        std::lock_guard<std::mutex> lock(m_);
+        if (doc && doc != job_doc_) {
+            job_doc_ = std::move(doc);
+            job_revision_ = revision;
+        }
+        if (job_bundle_stamp_ != bundle_stamp) {
+            job_bundles_ = bundles;
+            job_bundle_stamp_ = bundle_stamp;
+        }
+        if (job_presets_stamp_ != presets_stamp) {
+            job_presets_ = presets;
+            job_presets_stamp_ = presets_stamp;
+        }
+        if (!(job_reqs_ == reqs)) job_reqs_ = reqs;
+        cv_.notify_all();
+    }
+
+    struct View {
+        gfx::GpuImage* img = nullptr;
+        std::unordered_map<uint64_t, uint32_t> cells;
+    };
+    View acquire(uint64_t ui_frame) {
+        std::lock_guard<std::mutex> lock(m_);
+        if (latest_ < 0 || !published_[static_cast<size_t>(latest_)].ready)
+            return {};
+        Published& p = published_[static_cast<size_t>(latest_)];
+        p.last_ui_frame = ui_frame;
+        View v;
+        v.img = p.img.get();
+        v.cells = p.cells;
+        return v;
+    }
+    void set_completed_ui_frame(uint64_t f) {
+        completed_ui_frame_.store(f, std::memory_order_relaxed);
+    }
+
+    gfx::Device& device;
+
+    std::mutex m_;
+    std::condition_variable cv_;
+
+private:
+    void run();
+    void render_one(const Req& req, const doc::Document& rdoc);
+    void publish();
+    const media::ThumbStripData* strip_for(uint64_t asset,
+                                           const doc::Document& rdoc);
+    void submit_and_wait(VkQueue queue) {
+        {
+            std::lock_guard<std::mutex> qlock(device.queue_mutex());
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &cmd_;
+            if (vkQueueSubmit(queue, 1, &submit, fence_) != VK_SUCCESS)
+                return;
+        }
+        vkWaitForFences(device.device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+        vkResetFences(device.device(), 1, &fence_);
+    }
+
+    std::filesystem::path shader_dir_;
+    std::unique_ptr<gfx::Engine> engine_;   // thread-created, private
+    std::thread thread_;
+    bool quit_ = false;
+    bool idle_ = false;
+    int pause_count_ = 0;
+    VkCommandPool pool_ = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+    VkFence fence_ = VK_NULL_HANDLE;
+
+    // Job mailbox (UI writes under m_).
+    std::shared_ptr<const doc::Document> job_doc_;
+    uint64_t job_revision_ = 0;
+    std::vector<media::AssetBundle> job_bundles_;
+    uint64_t job_bundle_stamp_ = ~0ull;
+    std::vector<Req> job_reqs_;
+    std::vector<std::pair<uint64_t, doc::Preset>> job_presets_;
+    uint64_t job_presets_stamp_ = ~0ull;
+
+    // Worker-side snapshots.
+    std::vector<media::AssetBundle> bundles_;
+    uint64_t bundle_stamp_ = ~0ull;
+    std::vector<Req> reqs_;
+    std::vector<std::pair<uint64_t, doc::Preset>> presets_;
+    uint64_t presets_stamp_ = ~0ull;
+
+    // Atlas cell bookkeeping + per-asset .thumbs cache (dropped on a
+    // bundle change).
+    struct Slot {
+        uint32_t cell = 0;
+        uint64_t stamp = 0;
+        uint64_t last_used = 0;
+    };
+    std::unordered_map<uint64_t, Slot> cells_;
+    uint64_t use_counter_ = 0;
+    std::unordered_map<uint64_t, media::ThumbStripData> strips_;
+
+    // Published atlas copies, the render worker's ring contract: the
+    // UI marks the slot it sampled, and a slot rewrites only when the
+    // UI provably finished with it.
+    struct Published {
+        std::unique_ptr<gfx::GpuImage> img;
+        std::unordered_map<uint64_t, uint32_t> cells;
+        uint64_t last_ui_frame = 0;
+        bool ready = false;
+    };
+    std::vector<Published> published_;
+    int latest_ = -1;
+    std::atomic<uint64_t> completed_ui_frame_{0};
+};
+
+void ThumbWorker::run() {
+    // The private engine builds on this thread: pipeline creation runs
+    // concurrent with app startup instead of lengthening it. Renders
+    // submit on the LOW-PRIORITY thumb queue (the engine's internal
+    // codec submissions follow it), so the driver schedules gallery
+    // fill around frame work instead of in line with it.
+    engine_ = gfx::Engine::create(device, shader_dir_,
+                                  device.thumb_queue());
+    if (!engine_) {
+        log_error("thumb worker: engine create failed - gallery "
+                  "thumbnails stay placeholders");
+        std::unique_lock<std::mutex> lock(m_);
+        idle_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return quit_; });
+        return;
+    }
+    std::shared_ptr<const doc::Document> doc;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(m_);
+            idle_ = true;
+            cv_.notify_all();
+            cv_.wait_for(lock, std::chrono::milliseconds(50),
+                         [&] { return quit_; });
+            if (quit_) return;
+            if (pause_count_ > 0) continue;   // idle_ holds while paused
+            doc = job_doc_;
+            if (bundle_stamp_ != job_bundle_stamp_) {
+                bundles_ = job_bundles_;
+                bundle_stamp_ = job_bundle_stamp_;
+                strips_.clear();
+            }
+            if (presets_stamp_ != job_presets_stamp_) {
+                presets_ = job_presets_;
+                presets_stamp_ = job_presets_stamp_;
+            }
+            reqs_ = job_reqs_;
+        }
+        if (!doc) continue;
+        auto next_pending = [&]() -> const Req* {
+            for (const Req& r : reqs_) {
+                auto it = cells_.find(r.key);
+                if (it == cells_.end() || it->second.stamp != r.stamp)
+                    return &r;
+            }
+            return nullptr;
+        };
+        const Req* pending = next_pending();
+        if (!pending) continue;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            idle_ = false;
+        }
+        for (int n = 0; pending && n < 16; ++n) {
+            // A batch outlives a quit request by up to 16 renders —
+            // check between them so stop() never waits on thumbnails
+            // nobody will see.
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                if (quit_) return;
+            }
+            render_one(*pending, *doc);
+            pending = next_pending();
+        }
+        publish();
+    }
+}
+
+const media::ThumbStripData* ThumbWorker::strip_for(
+    uint64_t asset, const doc::Document& rdoc) {
+    auto it = strips_.find(asset);
+    if (it != strips_.end()) return it->second.count ? &it->second : nullptr;
+    media::ThumbStripData strip;
+    if (const doc::Asset* a = rdoc.find_asset(asset)) {
+        if (!a->path.empty()) {
+            const BundlePaths paths =
+                resolve_bundle(std::filesystem::path(a->path));
+            if (!paths.base.empty()) {
+                std::filesystem::path tpath = paths.base;
+                tpath.replace_extension(".thumbs");
+                media::read_thumbs(tpath, &strip);
+            }
+        }
+    }
+    auto [ins, ok] = strips_.emplace(asset, std::move(strip));
+    (void)ok;
+    return ins->second.count ? &ins->second : nullptr;
+}
+
+void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
+    // Cell: keep the key's cell, take a free one, or evict the least-
+    // recently requested key the current list dropped.
+    constexpr uint32_t kCells =
+        gfx::Engine::kGalleryCols * gfx::Engine::kGalleryRows;
+    uint32_t cell = 0;
+    auto have = cells_.find(req.key);
+    if (have != cells_.end()) {
+        cell = have->second.cell;
+    } else if (cells_.size() < kCells) {
+        std::vector<char> used(kCells, 0);
+        for (const auto& [k, sl] : cells_) used[sl.cell] = 1;
+        for (uint32_t c = 0; c < kCells; ++c)
+            if (!used[c]) {
+                cell = c;
+                break;
+            }
+    } else {
+        uint64_t evict = 0, oldest = ~0ull;
+        for (const auto& [k, sl] : cells_) {
+            bool wanted = false;
+            for (const Req& r : reqs_)
+                if (r.key == k) {
+                    wanted = true;
+                    break;
+                }
+            if (wanted) continue;
+            if (sl.last_used < oldest) {
+                oldest = sl.last_used;
+                evict = k;
+            }
+        }
+        if (!evict) return;   // request list capped at the cell count
+        cell = cells_[evict].cell;
+        cells_.erase(evict);
+    }
+    VkCommandBufferBeginInfo begin{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd_, &begin);
+    gfx::GpuImage* timg = nullptr;
+    // Plane storage must outlive render() (uploads copy at record).
+    std::vector<codec::DecodedFrame> planes;
+    std::vector<gfx::Engine::LayerSourceFrame> lsrc;
+    if (req.entity) {
+        uint32_t cw2 = 0, ch2 = 0;
+        doc::canvas_size(rdoc, &cw2, &ch2);
+        const double ca =
+            ch2 ? static_cast<double>(cw2) / ch2 : 16.0 / 9.0;
+        uint32_t tw = 320, th2 = 180;
+        if (ca >= 320.0 / 180.0)
+            th2 = static_cast<uint32_t>(320.0 / std::max(ca, 0.1));
+        else
+            tw = static_cast<uint32_t>(180.0 * ca);
+        tw = std::max(16u, tw & ~1u);
+        th2 = std::max(16u, th2 & ~1u);
+        const std::vector<doc::MediaInstance> flat =
+            doc::flatten_media_sources(rdoc, req.entity);
+        size_t nact = 0;
+        for (const doc::MediaInstance& mi : flat)
+            if (mi.t_in <= 0.0 && mi.t_out > 0.0) ++nact;
+        planes.reserve(nact);
+        for (const doc::MediaInstance& mi : flat) {
+            if (!(mi.t_in <= 0.0 && mi.t_out > 0.0)) continue;
+            const media::ThumbStripData* strip = strip_for(mi.asset, rdoc);
+            if (!strip) continue;
+            uint32_t frames = 0;
+            if (const doc::Asset* a = rdoc.find_asset(mi.asset))
+                frames = a->frame_count;
+            uint32_t ci = 0;
+            const double sf = std::max(0.0, mi.source_in);
+            if (frames > 1 && strip->count > 1)
+                ci = std::min<uint32_t>(
+                    strip->count - 1,
+                    static_cast<uint32_t>(sf * strip->count / frames));
+            // RGB strip cell -> limited-range I420 (the engine's upload
+            // format), chroma from the top-left of each 2x2.
+            const uint32_t sw = strip->w & ~1u, sh = strip->h & ~1u;
+            if (!sw || !sh) continue;
+            codec::DecodedFrame df;
+            df.width = sw;
+            df.height = sh;
+            df.y_stride = sw;
+            df.uv_stride = sw / 2;
+            df.y.resize(static_cast<size_t>(sw) * sh);
+            df.u.resize(static_cast<size_t>(sw / 2) * (sh / 2));
+            df.v.resize(static_cast<size_t>(sw / 2) * (sh / 2));
+            const uint8_t* rgb = strip->rgb.data() +
+                                 static_cast<size_t>(ci) * strip->w *
+                                     strip->h * 3;
+            for (uint32_t y = 0; y < sh; ++y)
+                for (uint32_t x = 0; x < sw; ++x) {
+                    const uint8_t* p =
+                        rgb + (static_cast<size_t>(y) * strip->w + x) * 3;
+                    uint8_t yy, cb, cr;
+                    color::rgb8_to_ycbcr709(p[0], p[1], p[2], &yy, &cb,
+                                            &cr);
+                    df.y[static_cast<size_t>(y) * sw + x] = yy;
+                    if (!(y & 1) && !(x & 1)) {
+                        const size_t co =
+                            static_cast<size_t>(y / 2) * (sw / 2) + x / 2;
+                        df.u[co] = cb;
+                        df.v[co] = cr;
+                    }
+                }
+            planes.push_back(std::move(df));
+            const codec::DecodedFrame& back = planes.back();
+            gfx::Engine::LayerSourceFrame lf;
+            lf.key = mi.key;
+            lf.content_stamp = 0;
+            lf.planes = {back.y.data(),      back.y_stride,
+                         back.u.data(),      back.uv_stride,
+                         back.v.data(),      back.uv_stride,
+                         back.width,         back.height,
+                         false};
+            lsrc.push_back(lf);
+        }
+        const doc::Document resolved =
+            mod::resolve(rdoc, 0, rdoc.fps > 0.0 ? rdoc.fps : 30.0,
+                         nullptr, -1.0, -1.0, nullptr, nullptr);
+        timg = engine_->render(cmd_, 0, resolved, req.entity, 0,
+                               rdoc.fps > 0.0 ? rdoc.fps : 30.0, tw, th2,
+                               0, 0, nullptr,
+                               lsrc.empty() ? nullptr : lsrc.data(),
+                               lsrc.size(), 0, 0, 0, false);
+    } else {
+        const doc::Preset* pp = nullptr;
+        for (const auto& [k, p] : presets_)
+            if (k == req.key) {
+                pp = &p;
+                break;
+            }
+        if (pp) {
+            // The preview image is the SMPTE-bars pattern (bars +
+            // ramp): deterministic, media-free, and it shows a grade's
+            // character. Pinned by type - the pattern source's DEFAULT
+            // is a checkerboard now.
+            doc::Document pd;
+            doc::Look& lk = pd.looks[0];
+            lk.layers[0].source = doc::LayerSourceKind::TestPattern;
+            lk.layers[0].osc_shape = 4;   // smpte bars
+            doc::Group g;
+            std::vector<doc::EffectInstance> nfx;
+            doc::instantiate_preset(pd, *pp, &g, &nfx);
+            for (doc::EffectInstance& f : nfx)
+                lk.layers[0].stack.push_back(std::move(f));
+            lk.layers[0].groups.push_back(std::move(g));
+            const doc::Document resolved = mod::resolve(
+                pd, 0, 30.0, nullptr, -1.0, -1.0, nullptr, nullptr);
+            timg = engine_->render(cmd_, 0, resolved, lk.id, 0, 30.0, 320,
+                                   180, 0, 0, nullptr, nullptr, 0, 0, 0,
+                                   0, false);
+        }
+    }
+    if (timg) engine_->record_gallery_tap(cmd_, 0, timg, cell);
+    vkEndCommandBuffer(cmd_);
+    submit_and_wait(device.thumb_queue());
+    // Failed renders record the stamp too, or a bad graph would re-arm
+    // every pass forever.
+    cells_[req.key] = Slot{cell, req.stamp, ++use_counter_};
+}
+
+void ThumbWorker::publish() {
+    gfx::GpuImage* ga = engine_->gallery_atlas();
+    if (!ga) return;
+    int target = -1;
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        const uint64_t completed =
+            completed_ui_frame_.load(std::memory_order_relaxed);
+        for (int i = 0; i < static_cast<int>(published_.size()); ++i) {
+            if (i == latest_) continue;
+            if (published_[static_cast<size_t>(i)].last_ui_frame <=
+                completed) {
+                target = i;
+                break;
+            }
+        }
+    }
+    if (target < 0) return;   // UI briefly holds every slot — next batch
+    Published& p = published_[static_cast<size_t>(target)];
+    if (!p.img)
+        p.img = gfx::GpuImage::create(
+            device, VK_FORMAT_R8G8B8A8_UNORM, ga->width(), ga->height(),
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    if (!p.img) return;
+    // The copy runs on the GRAPHICS queue: the atlas renders completed
+    // under host fence waits (execution ordered through the host), the
+    // transition barrier below makes their writes visible, and the pub
+    // image's writes land submission-ordered with the UI's sampling.
+    VkCommandBufferBeginInfo begin{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd_, &begin);
+    ga->transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    p.img->transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {ga->width(), ga->height(), 1};
+    vkCmdCopyImage(cmd_, ga->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   p.img->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                   &region);
+    p.img->transition(cmd_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    vkEndCommandBuffer(cmd_);
+    submit_and_wait(device.graphics_queue());
+    std::lock_guard<std::mutex> lock(m_);
+    p.cells.clear();
+    for (const auto& [k, sl] : cells_) p.cells.emplace(k, sl.cell);
+    p.ready = true;
+    latest_ = target;
 }
 
 // Audio Scope source (family): mono copy of the PCM sidecar,
@@ -1394,6 +2066,63 @@ std::vector<int16_t> load_scope_audio(const std::filesystem::path& pcm_path,
         pos += got;
     }
     *out_rate = sr / decim;
+    return mono;
+}
+
+// The Audio Scope's soundtrack: the PROJECT MIX decimated to a mono
+// ~16 kHz strip — the scope draws what is audible (gains, mutes, voice
+// ops, every placement), never one asset's raw PCM. Deterministic:
+// chunk-independent DSP plus fixed decimation, so preview and export
+// build identical strips from identical mixes. Capped at an hour of
+// program; the scope flatlines past the cap.
+std::vector<int16_t> scope_audio_from_mix(const media::MixState& mix,
+                                          uint32_t* out_rate,
+                                          const std::atomic<bool>* cancel =
+                                              nullptr) {
+    *out_rate = 0;
+    if (mix.sources.empty() || !mix.rate || !mix.channels ||
+        mix.fps <= 0.0)
+        return {};
+    double end_frames = 0.0;
+    for (const media::MixSource& s : mix.sources) {
+        if (!s.pcm || s.pcm->rate == 0) continue;
+        const double media_frames =
+            static_cast<double>(s.pcm->frames()) / s.pcm->rate * mix.fps;
+        const double speed = s.speed > 1e-9 ? s.speed : 1.0;
+        const double end = std::min(
+            s.t_out, s.t_in + (media_frames - s.source_in) / speed);
+        end_frames = std::max(end_frames, end);
+    }
+    if (end_frames <= 0.0) return {};
+    const uint64_t total = std::min<uint64_t>(
+        static_cast<uint64_t>(end_frames / mix.fps * mix.rate),
+        3600ull * mix.rate);
+    const uint32_t decim = std::max(1u, mix.rate / 16000u);
+    std::vector<int16_t> mono;
+    mono.reserve(total / decim + 1);
+    const uint32_t chunk = 65536 - (65536 % decim);
+    std::vector<int16_t> buf(static_cast<size_t>(chunk) * mix.channels);
+    std::vector<float> scratch;
+    for (uint64_t pos = 0; pos < total; pos += chunk) {
+        if (cancel && cancel->load()) {
+            *out_rate = 0;
+            return {};
+        }
+        const uint32_t n =
+            static_cast<uint32_t>(std::min<uint64_t>(chunk, total - pos));
+        media::render_mix(mix, static_cast<int64_t>(pos), buf.data(), n,
+                          scratch);
+        for (uint32_t b = 0; b + decim <= n; b += decim) {
+            int32_t acc = 0;
+            for (uint32_t f = 0; f < decim; ++f)
+                for (uint32_t c = 0; c < mix.channels; ++c)
+                    acc += buf[(static_cast<size_t>(b) + f) * mix.channels +
+                               c];
+            mono.push_back(static_cast<int16_t>(
+                acc / static_cast<int32_t>(decim * mix.channels)));
+        }
+    }
+    *out_rate = mix.rate / decim;
     return mono;
 }
 
@@ -1442,18 +2171,27 @@ std::unique_ptr<ExportJob> start_export(
             gfx::even_down(canvas_w, doc_copy.export_scale);
         const uint32_t out_h =
             gfx::even_down(canvas_h, doc_copy.export_scale);
-        // Audio Scope parity with preview: same PCM reduction.
-        {
-            uint32_t scope_rate = 0;
-            auto scope_mono = load_scope_audio(scope_pcm, &scope_rate);
-            engine->set_scope_audio(std::move(scope_mono), scope_rate);
-        }
         // Its own pool: MezReaders are single-thread objects, and the
         // preview worker is still running its own.
         media::DecodePool pool;
         pool.set_document(doc_copy, export_look_id, bundle_copy, 1);
         mod::TimeRemap remap;
         const double fps = project_fps(doc_copy, bundle_copy);
+        // The exported entity's mix, built exactly as the monitor builds
+        // it: the soundtrack when audio exports, and the Audio Scope's
+        // strip either way. A sidechain mux swaps the scope onto the
+        // sidechain PCM — that is what the file will carry.
+        auto mix = std::make_shared<media::MixState>(
+            build_mix(doc_copy, export_look_id, pcm_copy, fps,
+                      media::Player::kClockRate, media::Player::kChannels));
+        {
+            uint32_t scope_rate = 0;
+            std::vector<int16_t> scope_mono =
+                scope_pcm.empty()
+                    ? scope_audio_from_mix(*mix, &scope_rate)
+                    : load_scope_audio(scope_pcm, &scope_rate);
+            engine->set_scope_audio(std::move(scope_mono), scope_rate);
+        }
         // The exported id is a LOOK or a SEQUENCE - resolve duration and
         // trim for whichever it actually is (the fallback accessor would
         // silently take the root sequence's trim for a look export).
@@ -1513,23 +2251,17 @@ std::unique_ptr<ExportJob> start_export(
             media::seconds_to_samples(
                 static_cast<double>(doc_copy.audio_offset_ms) * 0.001,
                 media::Player::kClockRate);
-        // The soundtrack is the project mix, pulled exactly as the monitor
-        // pulls it: what was heard is what is written.
+        // The soundtrack is the same mix the scope stripped above: what
+        // was heard is what is written.
         media::ExportAudio audio;
-        if (doc_copy.export_audio) {
-            auto mix = std::make_shared<media::MixState>(
-                build_mix(doc_copy, export_look_id, pcm_copy, fps,
-                          media::Player::kClockRate,
-                          media::Player::kChannels));
-            if (!mix->sources.empty()) {
-                audio.channels = mix->channels;
-                audio.rate = mix->rate;
-                auto scratch = std::make_shared<std::vector<float>>();
-                audio.fill = [mix, scratch](int64_t first, int16_t* out,
-                                            uint32_t frames) {
-                    media::render_mix(*mix, first, out, frames, *scratch);
-                };
-            }
+        if (doc_copy.export_audio && !mix->sources.empty()) {
+            audio.channels = mix->channels;
+            audio.rate = mix->rate;
+            auto scratch = std::make_shared<std::vector<float>>();
+            audio.fill = [mix, scratch](int64_t first, int16_t* out,
+                                        uint32_t frames) {
+                media::render_mix(*mix, first, out, frames, *scratch);
+            };
         }
         uint32_t fps_num = 0, fps_den = 0;
         frame_rate_ratio(fps, bundle_copy, &fps_num, &fps_den);
@@ -1537,6 +2269,9 @@ std::unique_ptr<ExportJob> start_export(
             media::export_movie(out_w, out_h, fps_num, fps_den, span,
                                 producer, audio, out_path, options,
                                 &raw->progress);
+        // A cancelled export must not sit out its pool's in-flight
+        // prewarm rolls in the destructor (it runs at app exit too).
+        pool.abort();
         raw->done = true;
     });
     return job;
@@ -1582,10 +2317,13 @@ struct LayerUiState {
     ui::DropdownState blend_dd, osc_dd, media_dd;
     ui::ButtonState media_browse;
     ui::SwatchState swatch_a, swatch_b;
-    ui::SliderState sliders[9];
+    // The canvas card swatches keep separate popup states: one popup
+    // owner per anchor, panel and card never fight over it.
+    ui::SwatchState card_swatch_a, card_swatch_b;
+    ui::SliderState sliders[12];
     ui::ButtonState value_edit_button;   // rail type-in field
     // Layer params are mod targets — route/key micros per row.
-    ui::ButtonState route_buttons[9], key_buttons[9];
+    ui::ButtonState route_buttons[12], key_buttons[12];
     // Tree audio mix: this source's level and mute.
     ui::SliderState audio_slider;
     ui::ButtonState audio_mute_btn;
@@ -1626,6 +2364,11 @@ struct RulerState {
     // 0 idle, 1 scrub, 2 trim-in handle, 3 trim-out handle, 4 loop band.
     int drag_mode = 0;
     double loop_anchor = 0.0;   // frame where the loop drag started
+    // A press is a CLICK until the playhead target moves a whole frame
+    // — only moved gestures count as scrubs (clicks seek exact, no
+    // approximate-then-correct hop).
+    double scrub_anchor = 0.0;
+    bool scrub_moved = false;
 };
 
 // Flow-canvas selection: the inspector shows exactly
@@ -1657,6 +2400,8 @@ struct ConfirmDialog {
         RestoreProjectAutosave,    // yes: load `path` (autosave) as `path2`
         RestoreUntitledAutosave,   // yes: load `path`; retires either way
         DeleteBrowserItem,         // yes: remove entity/bin `id`, undoable
+        DeletePresetFile,          // yes: remove preset file `path`
+        DeletePresetBin,           // yes: contents climb, dir `path` goes
     };
     Kind kind = Kind::None;
     Action action = Action::None;
@@ -1736,16 +2481,43 @@ struct AppState {
     uint64_t mix_revision = ~0ull;
     uint64_t mix_stamp = ~0ull;
     uint64_t mix_look = 0;
-    // Audio Scope: which PCM the render engine currently holds (the main
-    // loop polls pcm_path and re-posts on change; empty = silent).
-    std::filesystem::path scope_pcm_loaded;
-    bool scope_pcm_init = false;
-    mod::AnalysisCurves analysis;   // the media's own curves; eval reads
-                                    // only the VIDEO set from these
+    // Audio Scope soundtrack: the PROJECT MIX decimated to a mono strip,
+    // rebuilt on a helper thread whenever the published mix re-keys (the
+    // engine holds the stale strip while a long timeline renders).
+    struct ScopeJob {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        // A long timeline's mix renders for seconds — the destructor
+        // must never sit through it (it runs at app exit).
+        std::atomic<bool> cancel{false};
+        std::vector<int16_t> mono;
+        uint32_t rate = 0;
+        uint64_t key = 0;
+        ~ScopeJob() {
+            cancel.store(true);
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::shared_ptr<const media::MixState> scope_mix;
+    std::unique_ptr<ScopeJob> scope_job;
+    uint64_t scope_pushed_key = ~0ull;
+    // The SCOPE's analysis composite on its root clock (built by
+    // refresh_scope_analysis): eval's video sources, the timeline
+    // analysis strip, live mode and export all read this one set.
+    mod::AnalysisCurves analysis;
     bool has_analysis = false;
     // Bumped whenever `analysis` is replaced — the render worker copies
     // the curves only when this moves.
     uint64_t analysis_stamp = 1;
+    // Composite rebuild gate (same settle rule as the wired-node
+    // curves): keyed on document revision, bundle table and scope.
+    uint64_t analysis_revision = ~0ull;
+    uint64_t analysis_bundle_stamp = ~0ull;
+    uint64_t analysis_scope = 0;
+    // Import-time curves per ASSET, the composite's inputs; loaded once
+    // per bundle appearance like the PCM cache (null = probed, absent).
+    std::unordered_map<uint64_t, std::shared_ptr<const mod::AnalysisCurves>>
+        asset_analysis;
     // Runtime analysis for WIRED analysis nodes: per-node curves of the
     // wired chain's processed audio. Rebuilt on document settle (stale
     // during a coalescing gesture, recomputed on release - same class
@@ -1759,21 +2531,14 @@ struct AppState {
     // Preview render thread; owned by wWinMain, pointer here so
     // media open/close paths can pause it around player mutation.
     RenderWorker* render_worker = nullptr;
+    ThumbWorker* thumb_worker = nullptr;
     uint64_t ui_frame_counter = 0;
     // Sidechain: external audio for the EXPORT MUX only - modulation
     // never reads it (reactive audio is the wired chain's own signal).
-    mod::AnalysisCurves media_analysis;
-    bool has_media_analysis = false;
     std::string sc_active_path;         // probed document path
     std::filesystem::path sc_pcm_path;  // extracted PCM cache (export mux)
     bool sc_ok = false;
     double env_key_time = -1.0;         // live keypress trigger
-    // Thumbnail strip: RGBA staging until the renderer registers
-    // it (textures are long-lived; a new media file just registers another one).
-    std::vector<uint8_t> thumbs_rgba;
-    uint32_t thumbs_w = 0, thumbs_h = 0, thumbs_count = 0;
-    bool thumbs_dirty = false;
-    const ui::UiTexture* thumbs_tex = nullptr;
     // Half-res proxy: which files the bundles currently resolve to.
     // The probe is per-ASSET (any asset with a proxy counts) and cached
     // per bundle stamp - asset[0] alone was the single-clip-era key.
@@ -1861,9 +2626,10 @@ struct AppState {
     uint64_t open_group = 0;
     float saved_pan_x = 0.0f, saved_pan_y = 0.0f, saved_zoom = 1.0f;
     bool saved_view_valid = false;
-    // Preset drag-out of the browser: index being dragged (-1 none),
-    // press anchor, and whether the drag passed the slop threshold.
-    int preset_drag = -1;
+    // Preset drag-out of the browser (0 = none), press anchor, and
+    // whether the drag passed the slop threshold. Dropping on the
+    // canvas applies; dropping on a preset bin row files the preset.
+    uint64_t preset_drag_key = 0;
     Vec2 preset_press{};
     bool preset_drag_live = false;
     uint64_t insert_before_id = 0;
@@ -1903,6 +2669,63 @@ struct AppState {
     std::string font_options;
     std::vector<doc::Preset> presets;
     int preset_tag_index = -1;      // -1 = all tags
+    // Preset tree metadata, parallel to `presets`. bin = the preset's
+    // directory relative to its root ("" = top level; shipped presets
+    // group under the read-only "shipped" bin). key = fnv1a of the
+    // file path - the selection/drag/thumbnail identity.
+    struct PresetInfo {
+        uint64_t key = 0;
+        std::string bin;
+        bool shipped = false;
+    };
+    std::vector<PresetInfo> preset_info;
+    std::vector<std::string> preset_bins;     // user bin rel-paths, sorted
+    std::unordered_set<uint64_t> preset_bin_closed;
+    uint64_t preset_sel = 0;                  // preset key or bin key
+    // In-place rename (preset file stem or bin directory name).
+    uint64_t preset_rename_key = 0;
+    std::string preset_rename_buf;
+    bool preset_rename_commit = false;
+    // Bumps every rescan: gallery thumbnails of presets key on it.
+    uint64_t preset_scan_stamp = 1;
+    ui::ButtonState preset_new_bin_btn;
+    // Library view mode per panel: 0 = tree list, 1 = thumbnail
+    // gallery. Persisted in ui.json.
+    int browser_view = 0;
+    int preset_view = 0;
+    ui::ButtonState browser_view_btns[2], preset_view_btns[2];
+    // Per-asset filmstrip textures, loaded lazily from the bundle's
+    // .thumbs sidecar (one asset staged per frame). Two textures per
+    // asset, each at its consumer's native scale: `card` is the first
+    // cell at full sidecar resolution (gallery card), `tex` is the
+    // whole strip box-filtered to the timeline lane height (drawn ~1:1,
+    // so no minification shimmer).
+    struct AssetStrip {
+        const ui::UiTexture* tex = nullptr;    // lane strip
+        const ui::UiTexture* card = nullptr;   // first cell, full res
+        uint32_t w = 0, h = 0, count = 0;      // lane strip geometry
+        bool tried = false;   // sidecar missing: never re-probe
+    };
+    std::unordered_map<uint64_t, AssetStrip> asset_strips;
+    // Video-pass resume: whenever the bundle table moves, ready native
+    // bundles missing their thumb strip queue a background re-run of
+    // the killed pass through the import slot — one attempt per source
+    // per session (a source whose pass keeps failing retries next
+    // launch, not in a loop).
+    uint64_t video_pass_scan_stamp = ~0ull;
+    std::vector<std::filesystem::path> video_pass_pending;
+    std::set<std::wstring> video_pass_attempted;
+    uint64_t strip_stage_asset = 0;
+    uint32_t strip_stage_w = 0, strip_stage_h = 0, strip_stage_count = 0;
+    std::vector<uint8_t> strip_stage_rgba;
+    uint32_t strip_stage_card_w = 0, strip_stage_card_h = 0;
+    std::vector<uint8_t> strip_stage_card_rgba;
+    // Gallery thumbnail requests for the thumb worker, rebuilt by the
+    // visible gallery each frame (capped at the atlas cell count).
+    std::vector<ThumbWorker::Req> gallery_reqs;
+    // Preset payload hand-off, rebuilt only when the library rescans.
+    std::vector<std::pair<uint64_t, doc::Preset>> thumb_preset_payload;
+    uint64_t thumb_pushed_preset_stamp = 0;
 
     // Randomize: chaos = intensity; counter advances per gesture
     // so repeated clicks explore, undo walks back one gesture at a time.
@@ -2068,7 +2891,6 @@ struct AppState {
     bool browser_drag_live = false;
     Vec2 browser_drag_from{};
     std::unordered_map<uint64_t, GroupUiState> group_ui;
-    std::map<std::string, ui::ButtonState> preset_buttons;
     ui::DropdownState tag_dd;
     ui::ButtonState save_button, open_project_button;
     ui::ButtonState randomize_all_button;
@@ -2378,60 +3200,96 @@ void refresh_node_audio(AppState& app) {
     app.node_audio_map = std::move(map);
 }
 
-void load_media_analysis(AppState& app) {
-    app.has_analysis = false;
-    app.analysis = {};
-    app.media_analysis = {};
-    app.has_media_analysis = false;
-    ++app.analysis_stamp;
+// Media-environment reset when the transport's media rebinds: sidechain
+// re-probe + proxy state, and the analysis composite re-keys through
+// its revision gate.
+void reset_media_env(AppState& app) {
     app.sc_active_path.clear();   // force a sidechain re-probe
     app.sc_pcm_path.clear();
     app.sc_ok = false;
     app.proxy_active = false;     // open_source opened the full-res file
-    std::filesystem::path path = app.bundle_base;
-    path.replace_extension(".analysis");
-    mod::AnalysisData data;
-    if (mod::load_analysis(path, &data)) {
-        app.media_analysis = data.curves();
-        app.has_media_analysis = true;
-        app.analysis = app.media_analysis;
-        app.has_analysis = true;
-    }
+    app.analysis_revision = ~0ull;
+}
 
-    // Thumbnail strip: RGB thumbs -> one horizontal RGBA strip,
-    // registered as a UI texture by the main loop.
-    app.thumbs_tex = nullptr;
-    app.thumbs_count = 0;
-    app.thumbs_dirty = false;
-    std::filesystem::path tpath = app.bundle_base;
-    tpath.replace_extension(".thumbs");
-    media::ThumbStripData strip;
-    if (media::read_thumbs(tpath, &strip)) {
-        const uint32_t tw = strip.w, th = strip.h, count = strip.count;
-        app.thumbs_w = tw;
-        app.thumbs_h = th;
-        app.thumbs_count = count;
-        app.thumbs_rgba.assign(
-            static_cast<size_t>(tw) * count * th * 4, 255);
-        for (uint32_t t = 0; t < count; ++t) {
-            const uint8_t* src =
-                strip.rgb.data() + static_cast<size_t>(t) * tw * th * 3;
-            for (uint32_t y = 0; y < th; ++y)
-                for (uint32_t x = 0; x < tw; ++x) {
-                    const uint8_t* s =
-                        src + (static_cast<size_t>(y) * tw + x) * 3;
-                    uint8_t* d =
-                        app.thumbs_rgba.data() +
-                        (static_cast<size_t>(y) * tw * count + t * tw +
-                         x) *
-                            4;
-                    d[0] = s[0];
-                    d[1] = s[1];
-                    d[2] = s[2];
+// The SCOPE's analysis composite on its root clock, replacing the old
+// primary-asset-on-root-indices read: at each root frame the playing
+// media instances sample their asset's import-time curves at their
+// media-local frame and combine by max (the silhouette rule). Audio
+// curves follow what SOUNDS (flatten_audio_sources, mute/gain-0
+// culled), video curves what SHOWS (flatten_media_sources). A pure
+// function of (document, asset sidecars), so preview and export agree.
+void refresh_scope_analysis(AppState& app) {
+    app.analysis = {};
+    app.has_analysis = false;
+    ++app.analysis_stamp;
+    constexpr double kMaxFrames = 1u << 20;   // deterministic length cap
+    mod::AnalysisCurves& out = app.analysis;
+    bool any = false;
+    auto composite = [&](const std::vector<doc::MediaInstance>& list,
+                         bool audio) {
+        for (const doc::MediaInstance& c : list) {
+            if (audio && c.gain <= 0.0f) continue;
+            auto it = app.asset_analysis.find(c.asset);
+            if (it == app.asset_analysis.end() || !it->second) continue;
+            const mod::AnalysisCurves& a = *it->second;
+            const std::vector<float>* src[4];
+            std::vector<float>* dst[4];
+            size_t nsets;
+            if (audio) {
+                src[0] = &a.low;
+                src[1] = &a.mid;
+                src[2] = &a.high;
+                src[3] = &a.onset;
+                dst[0] = &out.low;
+                dst[1] = &out.mid;
+                dst[2] = &out.high;
+                dst[3] = &out.onset;
+                nsets = 4;
+                if (out.bpm == 0.0f) out.bpm = a.bpm;
+            } else {
+                src[0] = &a.motion;
+                src[1] = &a.brightness;
+                src[2] = &a.cut;
+                dst[0] = &out.motion;
+                dst[1] = &out.brightness;
+                dst[2] = &out.cut;
+                nsets = 3;
+            }
+            size_t longest = 0;
+            for (size_t s = 0; s < nsets; ++s)
+                longest = std::max(longest, src[s]->size());
+            if (!longest) continue;
+            // Root span where the instance plays INSIDE its curves.
+            const double speed = c.speed > 1e-9 ? c.speed : 1.0;
+            const double lo_f = std::max(0.0, c.t_in);
+            const double hi_f = std::min(
+                {c.t_out,
+                 c.t_in +
+                     (static_cast<double>(longest) - c.source_in) / speed,
+                 kMaxFrames});
+            if (hi_f <= lo_f) continue;
+            const uint32_t lo = static_cast<uint32_t>(std::ceil(lo_f));
+            const uint32_t hi = static_cast<uint32_t>(std::ceil(hi_f));
+            for (size_t s = 0; s < nsets; ++s) {
+                if (src[s]->empty()) continue;
+                if (dst[s]->size() < hi) dst[s]->resize(hi, 0.0f);
+                for (uint32_t f = lo; f < hi; ++f) {
+                    const double mf = doc::media_source_frame(c, f);
+                    if (mf < 0.0) continue;
+                    size_t m = static_cast<size_t>(mf);
+                    if (m >= src[s]->size()) m = src[s]->size() - 1;
+                    float& d = (*dst[s])[f];
+                    if ((*src[s])[m] > d) d = (*src[s])[m];
                 }
+            }
+            any = true;
         }
-        app.thumbs_dirty = true;
-    }
+    };
+    composite(doc::flatten_audio_sources(app.document, app.scope_look),
+              true);
+    composite(doc::flatten_media_sources(app.document, app.scope_look),
+              false);
+    app.has_analysis = any;
 }
 
 // Sidechain: the EXTERNAL AUDIO export can mux in place of the media's
@@ -2481,6 +3339,9 @@ void save_ui_prefs(const AppState& app) {
     v.set("split_right", static_cast<double>(app.split_right));
     v.set("split_timeline", static_cast<double>(app.split_timeline));
     v.set("split_preview", static_cast<double>(app.split_preview));
+    // Library view modes: 0 = tree, 1 = gallery.
+    v.set("browser_view", static_cast<int64_t>(app.browser_view));
+    v.set("preset_view", static_cast<int64_t>(app.preset_view));
     // Monitor volume + recent projects.
     v.set("volume", static_cast<double>(app.audio_gain));
     if (app.audio_muted) v.set("muted", true);
@@ -2517,6 +3378,12 @@ void load_ui_prefs(AppState& app) {
     load_frac("split_right", &app.split_right, 0.15f, 0.5f);
     load_frac("split_timeline", &app.split_timeline, 0.1f, 0.6f);
     load_frac("split_preview", &app.split_preview, 0.15f, 0.7f);
+    app.browser_view = std::clamp(
+        static_cast<int>(parsed.value->get("browser_view").as_int(0)), 0,
+        1);
+    app.preset_view = std::clamp(
+        static_cast<int>(parsed.value->get("preset_view").as_int(0)), 0,
+        1);
     app.audio_gain = std::clamp(
         static_cast<float>(parsed.value->get("volume").as_number(1.0)),
         0.0f, 1.5f);
@@ -2538,34 +3405,36 @@ bool set_still_frames(AppState& app, uint32_t frames);
 // these), and loads its PCM. Cheap enough to call whenever the asset list,
 // the proxy toggle or a bundle on disk may have moved; the stamp it bumps
 // is what the render worker and the mix watch.
-void refresh_bundles(AppState& app) {
+// Builds the bundle table. PREVIEW resolution may substitute the
+// half-res proxy mez and a consolidated all-intra transcode; export
+// builds with preview=false and reads originals only — full res, full
+// quality, correctness first.
+std::vector<media::AssetBundle> build_bundle_table(const doc::Document& doc,
+                                                   bool preview) {
     std::vector<media::AssetBundle> table;
-    bool doc_changed = false;
-    for (doc::Asset& asset : app.document.assets) {
+    for (const doc::Asset& asset : doc.assets) {
         media::AssetBundle bundle;
         bundle.asset = asset.id;
         if (!asset.path.empty()) {
-            const BundlePaths paths =
-                resolve_bundle(std::filesystem::path(asset.path));
+            const BundlePaths paths = resolve_bundle(
+                std::filesystem::path(asset.path), preview);
             if (paths.ready) {
                 if (!paths.native.empty()) {
                     // Native video: facts straight from the container -
                     // no derived file to read or to trust.
-                    if (const media::VideoFacts* f =
-                            probe_native_facts(paths.native)) {
+                    media::VideoFacts f;
+                    if (probe_native_facts(paths.native, &f)) {
                         bundle.native = paths.native;
-                        bundle.frames = f->frames;
-                        bundle.width = f->width;
-                        bundle.height = f->height;
-                        bundle.fps = f->fps;
-                        bundle.timescale = f->timescale;
-                        bundle.frame_duration = f->frame_duration;
+                        bundle.frames = f.frames;
+                        bundle.width = f.width;
+                        bundle.height = f.height;
+                        bundle.fps = f.fps;
+                        bundle.timescale = f.timescale;
+                        bundle.frame_duration = f.frame_duration;
                     }
                 } else if (!paths.mez.empty()) {
-                    // Preview may run the half-res proxy; export never
-                    // does.
                     std::filesystem::path open_path = paths.mez;
-                    if (app.document.use_proxy) {
+                    if (preview && doc.use_proxy) {
                         std::filesystem::path proxy = paths.mez;
                         proxy.replace_extension(".proxy.mez");
                         std::error_code ec;
@@ -2589,6 +3458,18 @@ void refresh_bundles(AppState& app) {
                 bundle.pcm = paths.pcm;
             }
         }
+        table.push_back(std::move(bundle));
+    }
+    return table;
+}
+
+void refresh_bundles(AppState& app) {
+    std::vector<media::AssetBundle> table =
+        build_bundle_table(app.document, true);
+    bool doc_changed = false;
+    for (size_t i = 0; i < app.document.assets.size(); ++i) {
+        doc::Asset& asset = app.document.assets[i];
+        const media::AssetBundle& bundle = table[i];
         // The document caches what looks need before any decode opens.
         // Direct write, like the media binding: media facts, not edits.
         if (asset.frame_count != bundle.frames || asset.fps != bundle.fps ||
@@ -2601,19 +3482,151 @@ void refresh_bundles(AppState& app) {
         }
         if (!bundle.pcm.empty() && !app.pcm_cache.count(asset.id))
             app.pcm_cache[asset.id] = media::load_pcm(bundle.pcm);
-        table.push_back(std::move(bundle));
+        // Import-time curves per asset, the composite's inputs. A null
+        // entry means probed-and-absent; the import-done path erases the
+        // entry when a pass lands new curves.
+        if (!asset.path.empty() && !app.asset_analysis.count(asset.id) &&
+            (bundle.frames || !bundle.pcm.empty())) {
+            std::filesystem::path ap =
+                resolve_bundle(std::filesystem::path(asset.path)).base;
+            if (!ap.empty()) {
+                ap.replace_extension(".analysis");
+                mod::AnalysisData data;
+                if (mod::load_analysis(ap, &data))
+                    app.asset_analysis[asset.id] =
+                        std::make_shared<mod::AnalysisCurves>(data.curves());
+                else
+                    app.asset_analysis[asset.id] = nullptr;
+            }
+        }
     }
-    // Assets that went away must not keep their PCM alive.
+    // Assets that went away must not keep their PCM or curves alive.
     for (auto it = app.pcm_cache.begin(); it != app.pcm_cache.end();) {
         if (media::find_bundle(table, it->first))
             ++it;
         else
             it = app.pcm_cache.erase(it);
     }
+    for (auto it = app.asset_analysis.begin();
+         it != app.asset_analysis.end();) {
+        if (media::find_bundle(table, it->first))
+            ++it;
+        else
+            it = app.asset_analysis.erase(it);
+    }
     app.bundles = std::move(table);
     ++app.bundle_stamp;
     app.mix_stamp = ~0ull;   // the mix is stale by construction
     if (doc_changed) ++app.document.revision;
+    // Late sidecars (a video pass finishing after the announce) land
+    // without a document change: re-probe strips that never loaded.
+    for (auto& e : app.asset_strips)
+        if (!e.second.tex) e.second.tried = false;
+}
+
+// Lazy per-asset filmstrip: the bundle's .thumbs sidecar staged as TWO
+// RGBA textures, at most one asset per frame (the main loop registers
+// them after the UI pass). The card texture is the first cell at full
+// sidecar resolution; the lane texture is the whole strip box-filtered
+// to the timeline's cell height, its row width capped by sampling every
+// k-th cell (the u mapping stays uniform). `tried` pins sidecar-less
+// assets until the bundle table moves again.
+const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
+    constexpr uint32_t kLaneH = 36;
+    constexpr uint32_t kMaxRow = 16384;
+    AppState::AssetStrip& s = app.asset_strips[id];
+    if (s.tex || s.tried || app.strip_stage_asset) return &s;
+    const doc::Asset* a = app.document.find_asset(id);
+    if (!a || a->path.empty()) {
+        s.tried = true;
+        return &s;
+    }
+    const BundlePaths paths =
+        resolve_bundle(std::filesystem::path(a->path));
+    std::filesystem::path tpath = paths.base;
+    tpath.replace_extension(".thumbs");
+    media::ThumbStripData strip;
+    if (paths.base.empty() || !media::read_thumbs(tpath, &strip) ||
+        strip.count == 0) {
+        s.tried = true;
+        return &s;
+    }
+    // Mezzanine bundles (stills, cover art) carry a one-cell strip from
+    // import: one written at an older, smaller cell height rebuilds from
+    // the mez first frame once, then loads sharp forever. Native video
+    // migrates through the video-pass resume instead.
+    if (strip.h < media::kThumbStripH && !paths.mez.empty() &&
+        media::rebuild_still_thumbs(paths.mez, tpath)) {
+        media::ThumbStripData fresh;
+        if (media::read_thumbs(tpath, &fresh) && fresh.count)
+            strip = std::move(fresh);
+    }
+
+    // Card: cell 0, native resolution.
+    app.strip_stage_card_w = strip.w;
+    app.strip_stage_card_h = strip.h;
+    app.strip_stage_card_rgba.assign(
+        static_cast<size_t>(strip.w) * strip.h * 4, 255);
+    for (uint32_t y = 0; y < strip.h; ++y)
+        for (uint32_t x = 0; x < strip.w; ++x) {
+            const uint8_t* sp =
+                strip.rgb.data() +
+                (static_cast<size_t>(y) * strip.w + x) * 3;
+            uint8_t* d = app.strip_stage_card_rgba.data() +
+                         (static_cast<size_t>(y) * strip.w + x) * 4;
+            d[0] = sp[0];
+            d[1] = sp[1];
+            d[2] = sp[2];
+        }
+
+    // Lane strip: box-filter each kept cell down to the lane height.
+    const uint32_t lh = std::min(strip.h, kLaneH);
+    const uint32_t lw = std::max(
+        1u, (strip.w * lh + strip.h / 2) / strip.h);
+    uint32_t step = 1;
+    while ((strip.count + step - 1) / step * lw > kMaxRow) ++step;
+    const uint32_t lcount = (strip.count + step - 1) / step;
+    app.strip_stage_asset = id;
+    app.strip_stage_w = lw;
+    app.strip_stage_h = lh;
+    app.strip_stage_count = lcount;
+    app.strip_stage_rgba.assign(
+        static_cast<size_t>(lw) * lcount * lh * 4, 255);
+    for (uint32_t t = 0; t < lcount; ++t) {
+        const uint8_t* src =
+            strip.rgb.data() + static_cast<size_t>(
+                                   std::min(t * step, strip.count - 1)) *
+                                   strip.w * strip.h * 3;
+        for (uint32_t y = 0; y < lh; ++y) {
+            const uint32_t sy0 = y * strip.h / lh;
+            const uint32_t sy1 =
+                std::max(sy0 + 1, (y + 1) * strip.h / lh);
+            for (uint32_t x = 0; x < lw; ++x) {
+                const uint32_t sx0 = x * strip.w / lw;
+                const uint32_t sx1 =
+                    std::max(sx0 + 1, (x + 1) * strip.w / lw);
+                uint32_t rs = 0, gs = 0, bs = 0, n = 0;
+                for (uint32_t sy = sy0; sy < sy1; ++sy)
+                    for (uint32_t sx = sx0; sx < sx1; ++sx) {
+                        const uint8_t* sp =
+                            src +
+                            (static_cast<size_t>(sy) * strip.w + sx) * 3;
+                        rs += sp[0];
+                        gs += sp[1];
+                        bs += sp[2];
+                        ++n;
+                    }
+                uint8_t* d = app.strip_stage_rgba.data() +
+                             (static_cast<size_t>(y) * lw * lcount +
+                              t * lw + x) *
+                                 4;
+                d[0] = static_cast<uint8_t>((rs + n / 2) / n);
+                d[1] = static_cast<uint8_t>((gs + n / 2) / n);
+                d[2] = static_cast<uint8_t>((bs + n / 2) / n);
+            }
+        }
+    }
+    return &s;
 }
 
 // Republishes the monitor mix when the document, the scope or the media
@@ -2630,6 +3643,7 @@ void refresh_mix(AppState& app) {
         app.document, app.scope_look, app.pcm_cache,
         project_fps(app.document, app.bundles), app.player.audio_sample_rate(),
         app.player.audio_channels()));
+    app.scope_mix = mix;   // the Audio Scope strips from the same mix
     app.player.set_mix(std::move(mix));
 }
 
@@ -2823,6 +3837,56 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
     return true;
 }
 
+// Lays entity `target_id` as a block on `track_id` of `sequence` at
+// `at_frame`: the placement, its linked audio pair when the target has
+// any sound under it, and the lane-span overwrite - one undo step. The
+// UI drop path and the script's place op share this. track_id 0 = the
+// front lane. Returns the video placement id, 0 when the lane is full
+// or missing. Callers guard cycles with nest_reaches FIRST.
+uint64_t lay_block(AppState& app, uint64_t sequence, uint64_t track_id,
+                   uint64_t target_id, uint32_t at_frame) {
+    doc::Sequence& seq = app.document.sequence(sequence);
+    const doc::SeqTrack* lane = nullptr;
+    for (const doc::SeqTrack& t : seq.tracks)
+        if (t.id == track_id) lane = &t;
+    if (!lane && !seq.tracks.empty()) lane = &seq.tracks.front();
+    if (!lane || lane->placements.size() >= doc::kMaxPlacementsPerTrack)
+        return 0;
+    const uint64_t lane_id = lane->id;
+    app.undo.begin_group("Place Block");
+    doc::Placement block;
+    block.id = app.document.next_effect_id++;
+    block.target = target_id;
+    block.t_in = at_frame;
+    const uint64_t video_place_id = block.id;
+    app.undo.execute(app.document,
+                     doc::add_placement_command(seq.id, lane_id, block));
+    // The pair rule: a target WITH sound arrives with its submix linked;
+    // a silent one lays no audio placement at all.
+    if (!doc::flatten_audio_sources(app.document, target_id).empty()) {
+        doc::Placement ap;
+        ap.target = target_id;
+        ap.t_in = at_frame;
+        const uint64_t audio_track =
+            seq.audio.empty() ? 0 : seq.audio.front().id;
+        app.undo.execute(app.document,
+                         doc::add_audio_placement_command(
+                             app.document, seq.id, audio_track, ap,
+                             video_place_id));
+    }
+    // The landed block OVERWRITES whatever its span covers on the lane.
+    if (const doc::Placement* landed = doc::find_placement(
+            app.document.sequence(sequence), video_place_id)) {
+        const uint32_t end = doc::placement_end(
+            *landed, doc::source_length(app.document, *landed));
+        doc::overwrite_lane_span(app.document, app.undo, seq.id, lane_id,
+                                 video_place_id, landed->link, at_frame,
+                                 end);
+    }
+    app.undo.end_group();
+    return video_place_id;
+}
+
 // Places entity `target_id` (a look or a sequence) as a block at
 // `at_frame` - the browser's "+". At look scope it lands as a lockstep
 // ref NODE instead. Lays the linked audio placement when the target has
@@ -2875,47 +3939,10 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame,
         app.status = "that would loop - it cannot reach itself";
         return false;
     }
-    // track_id 0 = the front lane (the drop path names a real one).
-    const doc::SeqTrack* lane = nullptr;
-    for (const doc::SeqTrack& t : seq.tracks)
-        if (t.id == track_id) lane = &t;
-    if (!lane && !seq.tracks.empty()) lane = &seq.tracks.front();
-    if (!lane ||
-        lane->placements.size() >= doc::kMaxPlacementsPerTrack) {
+    if (!lay_block(app, seq.id, track_id, target_id, at_frame)) {
         app.status = "lane is full";
         return true;   // consumed: capacity denials never fall back
     }
-    app.undo.begin_group("Place Block");
-    doc::Placement block;
-    block.id = app.document.next_effect_id++;
-    block.target = target_id;
-    block.t_in = at_frame;
-    const uint64_t video_place_id = block.id;
-    app.undo.execute(app.document,
-                     doc::add_placement_command(seq.id, lane->id, block));
-    // The pair rule: a target WITH sound arrives with its submix linked;
-    // a silent one lays no audio placement at all.
-    if (!doc::flatten_audio_sources(app.document, target_id).empty()) {
-        doc::Placement ap;
-        ap.target = target_id;
-        ap.t_in = at_frame;
-        const uint64_t audio_track =
-            seq.audio.empty() ? 0 : seq.audio.front().id;
-        app.undo.execute(app.document,
-                         doc::add_audio_placement_command(
-                             app.document, seq.id, audio_track, ap,
-                             video_place_id));
-    }
-    // The landed block OVERWRITES whatever its span covers on the lane.
-    if (const doc::Placement* landed =
-            doc::find_placement(app.sequence(), video_place_id)) {
-        const uint32_t end = doc::placement_end(
-            *landed, doc::source_length(app.document, *landed));
-        doc::overwrite_lane_span(app.document, app.undo, seq.id, lane->id,
-                                 video_place_id, landed->link, at_frame,
-                                 end);
-    }
-    app.undo.end_group();
     // Arranging picks nothing - no node, no layer: the monitor keeps
     // the film.
     app.selected_layer = 0;
@@ -2970,7 +3997,7 @@ void import_media(AppState& app, const std::filesystem::path& picked) {
         app.status = "imported " + picked.filename().string();
         return;
     }
-    if (app.import) {
+    if (!import_slot_free(app)) {
         app.status = "an import is already running";
         return;
     }
@@ -2987,7 +4014,7 @@ void import_media(AppState& app, const std::filesystem::path& picked) {
 // media runs the import job carrying the bind target.
 void browse_and_bind_media(AppState& app, platform::Window* window,
                           uint64_t look_id, uint64_t layer_id) {
-    if (app.import) {
+    if (!import_slot_free(app)) {
         app.status = "an import is already running";
         return;
     }
@@ -3042,14 +4069,17 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
     app.duration_focus = false;
     app.duration_edit.clear();
     // The render worker must not touch the decode pool's files while the
-    // bundle table moves under it.
+    // bundle table moves under it; the thumb worker reads the same
+    // sidecars.
     if (app.render_worker) {
         app.render_worker->pause();
         app.render_worker->invalidate();
     }
+    if (app.thumb_worker) app.thumb_worker->pause();
     struct ResumeGuard {
         AppState& app;
         ~ResumeGuard() {
+            if (app.thumb_worker) app.thumb_worker->resume();
             if (app.render_worker) app.render_worker->resume();
         }
     } resume_guard{app};
@@ -3064,15 +4094,15 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
         app.pcm_path = paths.pcm;
         refresh_bundles(app);
         ensure_media_placed(app, picked);
-        load_media_analysis(app);
+        reset_media_env(app);
         app.player.set_looping(app.loop);
         app.player.play();
         app.status.clear();
         // Persisted still duration (project state): reconcile the bundle —
         // fresh, rebuilt, or edited elsewhere — to the document's length.
-        if (primary_still_duration(app.document) > 0 &&
-            is_still_source(picked))
-            set_still_frames(app, primary_still_duration(app.document));
+        const doc::Asset* oa = opened_asset(app);
+        if (oa && oa->still_duration_frames > 0 && is_still_source(picked))
+            set_still_frames(app, oa->still_duration_frames);
     } else {
         app.media_name.clear();
         app.bundle_base.clear();
@@ -3087,6 +4117,36 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
     }
 }
 
+// The asset whose media the transport currently plays (the opened
+// bundle). Duration edits and their reconciliation act on IT — keying
+// them on assets.front() rewrote one asset's file while stamping
+// another's record whenever the opened media was not asset zero.
+doc::Asset* opened_asset(AppState& app) {
+    if (app.bundle_base.empty()) return nullptr;
+    for (doc::Asset& a : app.document.assets)
+        if (!a.path.empty() &&
+            resolve_bundle(std::filesystem::path(a.path)).base ==
+                app.bundle_base)
+            return &a;
+    return nullptr;
+}
+
+// A background video-pass resume yields the import slot to any USER
+// action: its cancel is loss-free (fast-stage sidecars stay, and the
+// pass re-queues when the bundle table next moves) and joins within one
+// sample decode. Real imports and consolidates keep the slot — false
+// means the caller reports "an import is already running".
+bool import_slot_free(AppState& app) {
+    if (!app.import) return true;
+    if (!app.import->video_pass_only) return false;
+    const std::filesystem::path src = app.import->source;
+    app.import.reset();   // the destructor cancels and joins
+    std::wstring key = src.native();
+    for (wchar_t& c : key) c = static_cast<wchar_t>(towlower(c));
+    app.video_pass_attempted.erase(key);
+    return true;
+}
+
 // Core of a still-duration change: rewrite the bundle's frame index in
 // place (the hold-frame trick after the fact — no re-encode) and re-read
 // the bundle at the new length. The pool's readers hold the old index until
@@ -3094,15 +4154,17 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
 // Returns true when the asset runs at `frames`.
 bool set_still_frames(AppState& app, uint32_t frames) {
     if (app.bundle_base.empty() || frames == 0) return false;
-    const doc::Asset* primary = app.document.primary_asset();
-    if (primary && primary->frame_count == frames) return true;
+    const doc::Asset* opened = opened_asset(app);
+    if (opened && opened->frame_count == frames) return true;
     if (app.render_worker) {
         app.render_worker->pause();
         app.render_worker->invalidate();
     }
+    if (app.thumb_worker) app.thumb_worker->pause();
     struct ResumeGuard {
         AppState& app;
         ~ResumeGuard() {
+            if (app.thumb_worker) app.thumb_worker->resume();
             if (app.render_worker) app.render_worker->resume();
         }
     } resume_guard{app};
@@ -3131,8 +4193,7 @@ void apply_still_duration(AppState& app, double seconds) {
         static_cast<uint32_t>(seconds * fps + 0.5), 1u,
         static_cast<uint32_t>(fps * 3600.0));   // up to an hour
     if (!set_still_frames(app, frames)) return;
-    doc::Asset* asset =
-        app.document.assets.empty() ? nullptr : &app.document.assets.front();
+    doc::Asset* asset = opened_asset(app);
     if (asset && asset->still_duration_frames != frames) {
         // Direct write + revision bump, like the media binding: not an
         // undoable edit (undo cannot restore the rewritten file), but it
@@ -3142,16 +4203,191 @@ void apply_still_duration(AppState& app, double seconds) {
     }
 }
 
+// A preset bin's selection/fold key: bins are directories, so the key
+// hashes the rel-path with a prefix that cannot collide with file keys.
+uint64_t preset_bin_key(const std::string& rel) {
+    const std::string s = "bin:" + rel;
+    return fnv1a(s.data(), s.size());
+}
+
 void rescan_presets(AppState& app) {
     int failed = 0;
     app.presets = doc::scan_presets(app.shipped_preset_dir, &failed);
+    const size_t shipped_n = app.presets.size();
     std::vector<doc::Preset> user =
         doc::scan_presets(app.user_preset_dir, &failed);
     for (doc::Preset& p : user) app.presets.push_back(std::move(p));
+    // Tree metadata: a preset's bin is its directory relative to its
+    // root; shipped presets group under the read-only "shipped" bin.
+    app.preset_info.clear();
+    std::set<std::string> bins;
+    std::error_code ec;
+    for (size_t i = 0; i < app.presets.size(); ++i) {
+        AppState::PresetInfo info;
+        info.shipped = i < shipped_n;
+        const std::filesystem::path& root =
+            info.shipped ? app.shipped_preset_dir : app.user_preset_dir;
+        const std::filesystem::path rel = std::filesystem::relative(
+            app.presets[i].path.parent_path(), root, ec);
+        std::string b =
+            (ec || rel.empty() || rel == ".") ? "" : rel.generic_string();
+        if (info.shipped)
+            b = b.empty() ? "shipped" : "shipped/" + b;
+        else if (!b.empty())
+            bins.insert(b);
+        info.bin = std::move(b);
+        const std::string ps = app.presets[i].path.generic_string();
+        info.key = fnv1a(ps.data(), ps.size());
+        app.preset_info.push_back(std::move(info));
+    }
+    // Directories ARE the structure: empty user bins still show.
+    {
+        std::filesystem::recursive_directory_iterator it(
+            app.user_preset_dir, ec),
+            end;
+        while (!ec && it != end) {
+            if (it.depth() > 3) it.disable_recursion_pending();
+            std::error_code dec2;
+            if (it->is_directory(dec2)) {
+                const std::filesystem::path rel = std::filesystem::relative(
+                    it->path(), app.user_preset_dir, dec2);
+                if (!dec2 && !rel.empty() && rel != ".")
+                    bins.insert(rel.generic_string());
+            }
+            it.increment(ec);
+        }
+    }
+    app.preset_bins.assign(bins.begin(), bins.end());
+    ++app.preset_scan_stamp;
     // A corrupt preset must not vanish silently.
     if (failed > 0)
         app.status = std::to_string(failed) +
                      " preset file(s) failed to load";
+}
+
+// presets[] index of a selection/drag key; -1 = not a preset key.
+int preset_index_of(const AppState& app, uint64_t key) {
+    for (size_t i = 0; i < app.preset_info.size(); ++i)
+        if (app.preset_info[i].key == key) return static_cast<int>(i);
+    return -1;
+}
+
+// User bin rel-path of a bin key; null = not a (user) bin key.
+const std::string* preset_bin_of(const AppState& app, uint64_t key) {
+    for (const std::string& b : app.preset_bins)
+        if (preset_bin_key(b) == key) return &b;
+    return nullptr;
+}
+
+// ---- preset library file operations. Presets and their bins are
+// FILES under ./presets, never document state - no undo covers them,
+// so the modal confirm is the destructive guard, and every mutation
+// rescans so the browser always shows the disk.
+
+// Collision-free sibling path: "name" -> "name 2" and so on. Works for
+// files (extension kept) and directories alike.
+std::filesystem::path preset_free_path(const std::filesystem::path& want) {
+    std::error_code ec;
+    if (!std::filesystem::exists(want, ec)) return want;
+    const std::filesystem::path dir = want.parent_path();
+    const std::wstring stem = want.stem().wstring();
+    const std::wstring ext = want.extension().wstring();
+    for (int n = 2; n < 100; ++n) {
+        const std::filesystem::path cand =
+            dir / (stem + L" " + std::to_wstring(n) + ext);
+        if (!std::filesystem::exists(cand, ec)) return cand;
+    }
+    return want;
+}
+
+// Move a user preset file into `bin` ("" = the ./presets root).
+bool preset_move_file(AppState& app, uint64_t key, const std::string& bin) {
+    const int pi = preset_index_of(app, key);
+    if (pi < 0 || app.preset_info[static_cast<size_t>(pi)].shipped)
+        return false;
+    const std::filesystem::path from =
+        app.presets[static_cast<size_t>(pi)].path;
+    std::filesystem::path dir = app.user_preset_dir;
+    if (!bin.empty()) dir /= std::filesystem::path(bin);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path to =
+        preset_free_path(dir / from.filename());
+    if (to == from) return true;
+    std::filesystem::rename(from, to, ec);
+    if (ec) {
+        app.status = "preset move failed";
+        return false;
+    }
+    rescan_presets(app);
+    return true;
+}
+
+void preset_new_bin(AppState& app) {
+    std::error_code ec;
+    for (int n = 1; n < 100; ++n) {
+        const std::filesystem::path dir =
+            app.user_preset_dir / ("bin " + std::to_string(n));
+        if (std::filesystem::exists(dir, ec)) continue;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            app.status = "new bin failed";
+            return;
+        }
+        rescan_presets(app);
+        const std::string rel = dir.filename().string();
+        // A fresh "bin N" is a placeholder: straight into rename.
+        app.preset_sel = preset_bin_key(rel);
+        app.preset_rename_key = app.preset_sel;
+        app.preset_rename_buf = rel;
+        app.preset_rename_commit = false;
+        return;
+    }
+}
+
+// Enter on the preset rename field: renames the preset FILE (stem, and
+// the name stored inside it) or the bin DIRECTORY's last segment.
+void preset_rename_apply(AppState& app) {
+    const uint64_t key = app.preset_rename_key;
+    std::string nm = app.preset_rename_buf;
+    app.preset_rename_key = 0;
+    app.preset_rename_commit = false;
+    app.preset_rename_buf.clear();
+    for (char& c : nm)
+        if (c == '/' || c == '\\' || c == ':') c = '-';
+    if (nm.empty()) return;
+    std::error_code ec;
+    if (const std::string* bin = preset_bin_of(app, key)) {
+        const std::filesystem::path from =
+            app.user_preset_dir / std::filesystem::path(*bin);
+        std::filesystem::path to = from;
+        to.replace_filename(std::filesystem::path(nm));
+        if (to != from) {
+            std::filesystem::rename(from, preset_free_path(to), ec);
+            if (ec) app.status = "bin rename failed";
+        }
+        rescan_presets(app);
+        app.preset_sel = 0;
+        return;
+    }
+    const int pi = preset_index_of(app, key);
+    if (pi < 0 || app.preset_info[static_cast<size_t>(pi)].shipped) return;
+    doc::Preset p = app.presets[static_cast<size_t>(pi)];
+    const std::filesystem::path from = p.path;
+    std::filesystem::path to = from;
+    to.replace_filename(std::filesystem::path(nm + ".json"));
+    if (to != from) {
+        to = preset_free_path(to);
+        std::filesystem::rename(from, to, ec);
+    }
+    if (!ec) {
+        p.name = nm;   // the browser shows the embedded name
+        doc::save_preset(to, p);
+    } else {
+        app.status = "preset rename failed";
+    }
+    rescan_presets(app);
+    app.preset_sel = 0;
 }
 
 // Cache footprint: summed on demand — startup and after clears —
@@ -3289,7 +4525,15 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
     // then never renders until some command bumps the revision.
     app.pushed_doc_revision = ~0ull;
     app.node_audio_revision = ~0ull;
+    app.analysis_revision = ~0ull;
+    app.asset_analysis.clear();
     app.mix_revision = ~0ull;
+    // The gesture overlay belongs to the OLD document; its revision
+    // would outrank the restarted counter and its placement id resolves
+    // to an unrelated real placement in the new project.
+    app.gesture_revision = 0;
+    app.gesture_seq = 0;
+    app.gesture_place = {};
     // The scope belongs to the OLD document. Ids restart low in every
     // project, so a stale one does not merely dangle - it resolves to an
     // unrelated look in the new one, and AppState::look() only
@@ -3320,11 +4564,13 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
             app.render_worker->pause();
             app.render_worker->invalidate();
         }
+        if (app.thumb_worker) app.thumb_worker->pause();
         app.media_name.clear();
         app.bundle_base.clear();
         app.pcm_path.clear();
         app.pcm_cache.clear();
         refresh_bundles(app);
+        if (app.thumb_worker) app.thumb_worker->resume();
         if (app.render_worker) app.render_worker->resume();
     };
     const std::filesystem::path media = primary_media_path(app.document);
@@ -3482,6 +4728,48 @@ void request_browser_delete(AppState& app, uint64_t id) {
     app.confirm = std::move(d);
 }
 
+// Delete a PRESET library item (file or bin directory) behind the same
+// modal confirm. File deletes have no undo - the dialog says so.
+void request_preset_delete(AppState& app, uint64_t key) {
+    if (app.confirm.open()) return;
+    if (const std::string* bin = preset_bin_of(app, key)) {
+        size_t inside = 0;
+        for (const AppState::PresetInfo& info : app.preset_info)
+            if (info.bin == *bin || info.bin.rfind(*bin + "/", 0) == 0)
+                ++inside;
+        ConfirmDialog d;
+        d.kind = ConfirmDialog::Kind::YesNo;
+        d.action = ConfirmDialog::Action::DeletePresetBin;
+        d.path = app.user_preset_dir / std::filesystem::path(*bin);
+        d.title = "delete preset bin";
+        d.text = "delete \"" + *bin + "\"? " +
+                 (inside ? std::to_string(inside) +
+                               (inside == 1 ? " preset moves up a level."
+                                            : " presets move up a level.")
+                         : std::string("the folder is empty."));
+        d.primary = "delete";
+        d.secondary = "cancel";
+        app.confirm = std::move(d);
+        return;
+    }
+    const int pi = preset_index_of(app, key);
+    if (pi < 0) return;
+    if (app.preset_info[static_cast<size_t>(pi)].shipped) {
+        app.status = "shipped presets are read-only";
+        return;
+    }
+    ConfirmDialog d;
+    d.kind = ConfirmDialog::Kind::YesNo;
+    d.action = ConfirmDialog::Action::DeletePresetFile;
+    d.path = app.presets[static_cast<size_t>(pi)].path;
+    d.title = "delete preset";
+    d.text = "delete \"" + app.presets[static_cast<size_t>(pi)].name +
+             "\"? the file leaves ./presets - preset files have no undo.";
+    d.primary = "delete";
+    d.secondary = "cancel";
+    app.confirm = std::move(d);
+}
+
 void run_confirm_action(AppState& app, const ConfirmDialog& d,
                         platform::Window* window, bool* running) {
     switch (d.action) {
@@ -3561,6 +4849,37 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
                 // root sequence with every selection dropped.
                 if (app.scope_look == d.id)
                     enter_scope(app, app.document.root_sequence);
+            }
+            break;
+        case ConfirmDialog::Action::DeletePresetFile:
+            if (pick == 1) {
+                std::filesystem::remove(d.path, ec);
+                app.status = ec ? "preset delete failed"
+                                : "deleted " + d.path.filename().string();
+                rescan_presets(app);
+                app.preset_sel = 0;
+            }
+            break;
+        case ConfirmDialog::Action::DeletePresetBin:
+            if (pick == 1) {
+                // Contents climb to the parent - organisation is never
+                // data, so removing a folder must not remove work.
+                const std::filesystem::path parent = d.path.parent_path();
+                std::error_code iec;
+                for (const auto& e :
+                     std::filesystem::directory_iterator(d.path, iec)) {
+                    std::error_code mec;
+                    std::filesystem::rename(
+                        e.path(),
+                        preset_free_path(parent / e.path().filename()),
+                        mec);
+                }
+                std::filesystem::remove(d.path, ec);
+                app.status = ec ? "bin delete failed"
+                                : "deleted bin " +
+                                      d.path.filename().string();
+                rescan_presets(app);
+                app.preset_sel = 0;
             }
             break;
         default:
@@ -3706,6 +5025,18 @@ void draw_confirm_dialog(ui::Canvas2D& canvas, const ui::Font& font,
 // bumps the serial so the worker wakes when a re-render is due.
 void push_render_job(RenderWorker& w, AppState& app) {
     bool changed = false;
+    // The scope's analysis composite follows the document, the bundle
+    // table and the scope — never mid-gesture (same settle rule as the
+    // wired-node curves below).
+    if ((app.analysis_revision != app.document.revision ||
+         app.analysis_bundle_stamp != app.bundle_stamp ||
+         app.analysis_scope != app.scope_look) &&
+        !app.undo.coalescing_active()) {
+        refresh_scope_analysis(app);
+        app.analysis_revision = app.document.revision;
+        app.analysis_bundle_stamp = app.bundle_stamp;
+        app.analysis_scope = app.scope_look;
+    }
     // Wired-analysis curves follow the document, but never mid-gesture:
     // recompute on settle, serve the stale map while coalescing.
     if ((app.node_audio_revision != app.document.revision ||
@@ -3734,6 +5065,12 @@ void push_render_job(RenderWorker& w, AppState& app) {
         if (snap) {
             j.doc = std::move(snap);
             j.doc_revision = app.document.revision;
+            // A full snapshot SUPERSEDES any overlay (release heals
+            // through it) — and a stale overlay surviving a PROJECT
+            // LOAD would overwrite a real placement in the new
+            // document (ids restart low), leaving it dormant-black
+            // until the next drag replaced the payload.
+            j.gesture_revision = 0;
             app.pushed_doc_revision = app.document.revision;
             changed = true;
         } else if (gesture_fresh &&
@@ -3797,6 +5134,14 @@ void push_render_job(RenderWorker& w, AppState& app) {
             app.scope_is_look() ? uint64_t{0} : app.sel_placement);
         // Gesture in flight: the worker drops cache hash/readback work.
         set(j.interactive, app.undo.coalescing_active());
+        // Playhead drag in flight: the pool may serve nearby frames
+        // instead of rolling GOPs (the release re-renders exact — this
+        // transition marks the job changed, which is that trigger). A
+        // press is a CLICK until the target moves a whole frame, and a
+        // click always seeks exact — no approximate-then-correct hop.
+        set(j.scrubbing,
+            (app.ruler.drag_mode == 1 && app.ruler.scrub_moved) ||
+                (app.scrubber.dragging && app.scrubber.moved));
         // The scoped ENTITY renders: the sequence's arrangement or the
         // look's graph - never a fallback.
         set(j.look_id, app.scope_look);
@@ -3813,6 +5158,29 @@ void push_render_job(RenderWorker& w, AppState& app) {
         if (changed) ++w.job_serial_;
     }
     if (changed) w.cv_.notify_all();
+}
+
+// The thumb worker's job rides the render job's own doc snapshot - no
+// second per-revision copy. Preset payloads rebuild only on a rescan.
+void push_thumb_job(ThumbWorker& t, RenderWorker& w, AppState& app) {
+    std::shared_ptr<const doc::Document> doc;
+    uint64_t rev = 0;
+    {
+        std::lock_guard<std::mutex> lock(w.m_);
+        doc = w.job_.doc;
+        rev = w.job_.doc_revision;
+    }
+    if (app.thumb_pushed_preset_stamp != app.preset_scan_stamp) {
+        app.thumb_preset_payload.clear();
+        for (size_t i = 0;
+             i < app.presets.size() && i < app.preset_info.size(); ++i)
+            app.thumb_preset_payload.emplace_back(app.preset_info[i].key,
+                                                  app.presets[i]);
+        app.thumb_pushed_preset_stamp = app.preset_scan_stamp;
+    }
+    t.set_job(std::move(doc), rev, app.bundles, app.bundle_stamp,
+              app.gallery_reqs, app.thumb_preset_payload,
+              app.preset_scan_stamp);
 }
 
 // Per-frame staged edits: sliders/checkboxes write into arena floats/bools;
@@ -3992,7 +5360,10 @@ struct FrameUi {
         CropL, CropR, CropT, CropB, XfScale, Rotate,
         // The media node's one timing nuance: a static media in-point.
         Slip,
-        OscShape,   // waveform/shape selector (canvas dropdown row)
+        OscShape,   // waveform/pattern/noise type selector (dropdown row)
+        // Oscillator phase (percent of one period; wraps in the kernel,
+        // so typed and keyed values may run past 100).
+        Phase,
     };
     struct LayerStage {
         uint64_t layer_id;
@@ -4065,14 +5436,43 @@ struct FrameUi {
         bool* ctx;
     };
     std::vector<BinRow> bin_rows;
-    // Every tree row's laid-out node, for drag-into-bin and hit checks.
+    // Every tree row's / gallery card's laid-out rect, for drag-into-bin
+    // and hit checks. The rect is arena-owned and filled during DRAW,
+    // clip-intersected - a scrolled-out item reads as an empty rect, so
+    // it can never take a press or a drop.
     struct BrowserNode {
         uint64_t id;
         bool is_bin;
-        ui::LayoutNode* node;
+        const ui::Rect* rect;
     };
     std::vector<BrowserNode> browser_nodes;
     ui::LayoutNode* browser_panel = nullptr;   // background menu + drops
+    // PRESET library: the same row/card contract as the browser, keyed
+    // on preset/bin keys (file-path hashes). open = apply the preset.
+    std::vector<BrowserAction> preset_items;
+    std::vector<BinRow> preset_bin_rows;
+    std::vector<BrowserNode> preset_nodes_r;   // drag/drop rects
+    ui::LayoutNode* preset_panel_node = nullptr;
+    bool* preset_new_bin_clicked = nullptr;
+    // GALLERY view cells (both panels): the same ids, action flags and
+    // exported rects as the tree rows, laid out by the LibraryGallery
+    // leaf - bins as full-width fold rows, items as thumbnail cards.
+    struct GalleryCell {
+        uint64_t id = 0;
+        int kind = 0;    // 0 bin, 1 sequence, 2 look, 3 asset, 4 preset
+        const char* name = "";
+        bool open_bin = false;
+        bool scoped = false;
+        const ui::UiTexture* tex = nullptr;   // null = chip placeholder
+        float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+        bool* clicked = nullptr;
+        bool* opened = nullptr;
+        bool* ctx = nullptr;
+        ui::Rect* out_rect = nullptr;
+    };
+    std::vector<GalleryCell> browser_cells, preset_cells;
+    bool* browser_view_pick[2] = {};   // list / gallery chips
+    bool* preset_view_pick[2] = {};
     // Timeline lane widgets, for drag-from-browser drops.
     struct LaneNode {
         uint64_t track_id;
@@ -4142,14 +5542,6 @@ struct FrameUi {
         bool* clicked;
     };
     std::vector<ExposeToggle> expose_toggles;
-    std::vector<std::pair<size_t, bool*>> preset_clicks;  // presets[] index
-    // Preset drag-out (texed palette drag): the browser buttons' laid-out
-    // nodes, so the post-frame handler can start a drag from a press.
-    struct PresetNode {
-        size_t index;
-        ui::LayoutNode* node;
-    };
-    std::vector<PresetNode> preset_nodes;
     ui::LayoutNode* canvas_node = nullptr;   // the flow canvas leaf
     // Group card X: deletes the whole subgraph (members + group).
     std::vector<std::pair<uint64_t, bool*>> group_removes;
@@ -4272,6 +5664,8 @@ enum CtxSurface : int {
     kCtxBrowserAsset,   // a=asset id
     kCtxBin,            // a=bin id
     kCtxBrowserBg,      // browser panel background (root creations)
+    kCtxPreset,         // a=preset key (file-path hash)
+    kCtxPresetBin,      // a=preset bin key
     kCtxPreview,        // value/def_v = uv of the click inside the image
 };
 
@@ -4300,6 +5694,7 @@ enum CtxItemAct : int {
     kActPlaceAtPlayhead,
     kActRemoveEntity,
     kActNewLookFromAsset,
+    kActConsolidate,
     kActStoreSnap0,     // 0/1/2 contiguous; apply follows the same order
     kActStoreSnap1,
     kActStoreSnap2,
@@ -4353,24 +5748,27 @@ bool layer_field_reset(FrameUi::LayerField f, float* def) {
     }
 }
 
-// ---- browser tree row: one custom leaf per project item, project-panel
-// style. Alternating stripes carry the rows; a type chip colors the
-// kind (bin amber, sequence teal, look violet, asset steel); bins twirl
-// with stroke chevrons; selection wears the accent bar. Single click
-// selects (bins also fold), double-click opens, right-click stages the
-// row's context menu. Drag is app-side, keyed off the row rects.
+// ---- library tree row: one custom leaf per item, shared by the
+// project browser AND the preset library. Alternating stripes carry the
+// rows; a type chip colors the kind (bin amber, sequence teal, look
+// violet, asset steel, preset rose); bins twirl with stroke chevrons;
+// selection wears the accent bar. Single click selects (bins also
+// fold), double-click opens/applies, right-click stages the row's
+// context menu. Drag is app-side, keyed off the exported row rects.
 struct BrowseRowUser {
     AppState* app;
     uint64_t id;
-    int kind;        // 0 bin, 1 sequence, 2 look, 3 asset
+    int kind;        // 0 bin, 1 sequence, 2 look, 3 asset, 4 preset
     const char* name;
     int depth;
     bool stripe;
     bool open_bin;
     bool scoped;
+    uint64_t* sel;   // the owning panel's selection slot
     bool* clicked;
     bool* opened;
     bool* ctx;
+    ui::Rect* out_rect;   // clip-intersected on draw (drag/drop tests)
 };
 
 Vec2 measure_browser_row(ui::LayoutNode&, const ui::Constraints& c,
@@ -4387,11 +5785,13 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<BrowseRowUser*>(node.user);
     const ui::Theme& th = frame.theme;
     const ui::Rect& r = node.rect;
+    if (u->out_rect)
+        *u->out_rect = node.clip.empty() ? r : r.intersect(node.clip);
     const ui::WidgetId id =
         frame.ctx.acquire_widget_id(&u->app->browser_ui[u->id].open);
     const bool owns = frame.ctx.widget_owns_mouse(id);
     const bool hover = owns && r.contains(frame.input.mouse);
-    if (u->app->browser_sel == u->id) {
+    if (*u->sel == u->id) {
         // Selection REPLACES the stripe: one solid fill clearly darker
         // than either stripe state, so the picked row reads the same
         // wherever it falls in the alternating pattern.
@@ -4425,8 +5825,8 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         tx += 12.0f;
     }
-    static const uint32_t kChipHex[4] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
-                                         0x5B84B1};
+    static const uint32_t kChipHex[5] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
+                                         0x5B84B1, 0xC96A8F};
     frame.canvas.draw_sdf_rect(
         {tx, r.y + (r.h - 8.0f) * 0.5f, 8.0f, 8.0f}, 2.0f,
         ui::Color::hex(kChipHex[u->kind],
@@ -4439,9 +5839,8 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                    0.5f},
                   th.font_size,
                   u->scoped ? th.accent
-                            : (hover || u->app->browser_sel == u->id
-                                   ? th.text
-                                   : th.text_dim));
+                            : (hover || *u->sel == u->id ? th.text
+                                                         : th.text_dim));
     frame.canvas.pop_clip();
     if (frame.input.left_pressed() && owns && hover) {
         *u->clicked = true;
@@ -4456,6 +5855,225 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
     if (frame.input.right_pressed() && owns && hover && u->ctx)
         *u->ctx = true;
+}
+
+// One factory for both panels' tree rows: allocates the user blob and
+// the exported rect, wires the callbacks. `out_rect` (optional)
+// receives the arena rect for the caller's drag/drop lists.
+ui::LayoutNode* library_row(ui::LayoutArena& arena, AppState& app,
+                            uint64_t id, int kind, const char* name,
+                            int depth, bool stripe, bool open_bin,
+                            bool scoped, uint64_t* sel, bool* clicked,
+                            bool* opened, bool* ctx,
+                            ui::Rect** out_rect) {
+    auto* u = arena.alloc<BrowseRowUser>();
+    u->app = &app;
+    u->id = id;
+    u->kind = kind;
+    u->name = name;
+    u->depth = depth;
+    u->stripe = stripe;
+    u->open_bin = open_bin;
+    u->scoped = scoped;
+    u->sel = sel;
+    u->clicked = clicked;
+    u->opened = opened;
+    u->ctx = ctx;
+    u->out_rect = arena.alloc<ui::Rect>();
+    *u->out_rect = {};
+    if (out_rect) *out_rect = u->out_rect;
+    ui::LayoutNode* n = ui::make_node(arena, ui::NodeKind::Leaf);
+    n->user = u;
+    n->width = ui::SizeSpec::fill();
+    n->height = ui::SizeSpec::fixed(22.0f);
+    n->measure_fn = measure_browser_row;
+    n->draw_fn = draw_browser_row;
+    n->hit_fn = hit_browser_row;
+    n->debug_name = "library_row";
+    return n;
+}
+
+// ---- library gallery: the tree's sibling view, one custom leaf. Bins
+// render as full-width fold rows, items as thumbnail cards in a
+// wrapping grid. It consumes the SAME ids, action flags and exported
+// rects as the tree rows, so selection, double-click, menus and drags
+// behave identically in both views.
+inline constexpr float kGalCardMinW = 108.0f;
+inline constexpr float kGalGap = 6.0f;
+inline constexpr float kGalBinH = 22.0f;
+inline constexpr float kGalLabelH = 17.0f;
+
+struct GalleryUser {
+    AppState* app;
+    const FrameUi::GalleryCell* items;
+    size_t count;
+    uint64_t* sel;
+};
+
+// One walk serves measure (height from width) and draw (cell rects) -
+// the layout must be a pure function of the width or the two split.
+float gallery_walk(const FrameUi::GalleryCell* items, size_t count,
+                   float w, std::vector<ui::Rect>* rects) {
+    const int cols = std::max(
+        1, static_cast<int>((w + kGalGap) / (kGalCardMinW + kGalGap)));
+    const float card_w = (w - kGalGap * static_cast<float>(cols - 1)) /
+                         static_cast<float>(cols);
+    const float card_h = std::floor(card_w * 9.0f / 16.0f) + kGalLabelH;
+    float y = 0.0f;
+    int col = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i].kind == 0) {
+            if (col > 0) {
+                y += card_h + kGalGap;
+                col = 0;
+            }
+            if (rects) rects->push_back({0.0f, y, w, kGalBinH});
+            y += kGalBinH + kGalGap;
+        } else {
+            if (rects)
+                rects->push_back(
+                    {static_cast<float>(col) * (card_w + kGalGap), y,
+                     card_w, card_h});
+            if (++col >= cols) {
+                col = 0;
+                y += card_h + kGalGap;
+            }
+        }
+    }
+    if (col > 0) y += card_h + kGalGap;
+    return std::max(0.0f, y - kGalGap);
+}
+
+Vec2 measure_gallery(ui::LayoutNode& node, const ui::Constraints& c,
+                     const ui::LayoutFrame&) {
+    auto* u = static_cast<GalleryUser*>(node.user);
+    const float w = c.bounded_w() ? c.max_w : 220.0f;
+    return {w, gallery_walk(u->items, u->count, w, nullptr)};
+}
+
+void hit_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<GalleryUser*>(node.user);
+    ui::register_rect_hit(node, frame, u->sel);
+}
+
+void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
+    auto* u = static_cast<GalleryUser*>(node.user);
+    const ui::Theme& th = frame.theme;
+    std::vector<ui::Rect> rects;
+    rects.reserve(u->count);
+    gallery_walk(u->items, u->count, node.rect.w, &rects);
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(u->sel);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    const Vec2 m = frame.input.mouse;
+    static const uint32_t kChipHex[5] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
+                                         0x5B84B1, 0xC96A8F};
+    for (size_t i = 0; i < u->count && i < rects.size(); ++i) {
+        const FrameUi::GalleryCell& it = u->items[i];
+        ui::Rect r = rects[i];
+        r.x += node.rect.x;
+        r.y += node.rect.y;
+        if (it.out_rect)
+            *it.out_rect = node.clip.empty() ? r : r.intersect(node.clip);
+        const bool hover = owns && r.contains(m);
+        const bool selected = *u->sel == it.id;
+        if (it.kind == 0) {
+            frame.canvas.draw_sdf_rect(
+                r, 3.0f,
+                selected
+                    ? ui::lerp(th.panel_bg,
+                               ui::Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.5f)
+                    : th.control_bg.with_alpha(hover ? 0.7f : 0.45f));
+            if (selected)
+                frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
+            // Chevron strokes: v open, > closed (the tree-row idiom).
+            const float cx = r.x + 11.0f;
+            const float cy = r.y + r.h * 0.5f;
+            const ui::Color cc = th.text_dim;
+            if (it.open_bin) {
+                frame.canvas.draw_line({cx - 3.0f, cy - 1.5f},
+                                       {cx, cy + 1.5f}, 1.5f, cc);
+                frame.canvas.draw_line({cx, cy + 1.5f},
+                                       {cx + 3.0f, cy - 1.5f}, 1.5f, cc);
+            } else {
+                frame.canvas.draw_line({cx - 1.5f, cy - 3.0f},
+                                       {cx + 1.5f, cy}, 1.5f, cc);
+                frame.canvas.draw_line({cx + 1.5f, cy},
+                                       {cx - 1.5f, cy + 3.0f}, 1.5f, cc);
+            }
+            frame.canvas.draw_sdf_rect(
+                {r.x + 20.0f, r.y + (r.h - 8.0f) * 0.5f, 8.0f, 8.0f},
+                2.0f, ui::Color::hex(kChipHex[0], it.open_bin ? 1.0f : 0.7f));
+            frame.canvas.push_clip(r);
+            ui::draw_text(
+                frame.canvas, frame.font, it.name,
+                {r.x + 34.0f,
+                 r.y + (r.h - frame.font.line_height() * th.font_size) *
+                           0.5f},
+                th.font_size,
+                hover || selected ? th.text : th.text_dim);
+            frame.canvas.pop_clip();
+        } else {
+            const float thh = r.h - kGalLabelH;
+            const ui::Rect tr{r.x, r.y, r.w, thh};
+            if (it.tex) {
+                frame.canvas.draw_image_quad(tr, it.tex, it.u0, it.v0,
+                                             it.u1, it.v1,
+                                             {1.0f, 1.0f, 1.0f, 1.0f},
+                                             3.0f);
+            } else {
+                frame.canvas.draw_sdf_rect(
+                    tr, 3.0f, th.control_bg.with_alpha(0.5f));
+                frame.canvas.draw_sdf_rect(
+                    {tr.x + tr.w * 0.5f - 5.0f, tr.y + tr.h * 0.5f - 5.0f,
+                     10.0f, 10.0f},
+                    2.0f, ui::Color::hex(kChipHex[it.kind], 0.8f));
+            }
+            if (selected)
+                frame.canvas.draw_sdf_rect_outline(tr, 3.0f, 1.5f,
+                                                   th.accent);
+            else if (hover)
+                frame.canvas.draw_sdf_rect_outline(tr, 3.0f, 1.0f,
+                                                   th.control_bg_hover);
+            frame.canvas.push_clip(r);
+            ui::draw_text(frame.canvas, frame.font, it.name,
+                          {r.x + 2.0f, r.y + thh + 2.0f},
+                          th.font_size_small,
+                          it.scoped
+                              ? th.accent
+                              : (selected || hover ? th.text
+                                                   : th.text_dim));
+            frame.canvas.pop_clip();
+        }
+        if (frame.input.left_pressed() && owns && hover) {
+            if (it.clicked) *it.clicked = true;
+            if (u->app->browser_click_id == it.id &&
+                u->app->app_seconds - u->app->browser_click_time < 0.4 &&
+                it.opened)
+                *it.opened = true;
+            u->app->browser_click_id = it.id;
+            u->app->browser_click_time = u->app->app_seconds;
+        }
+        if (frame.input.right_pressed() && owns && hover && it.ctx)
+            *it.ctx = true;
+    }
+}
+
+ui::LayoutNode* LibraryGallery(ui::LayoutArena& arena, AppState& app,
+                               const FrameUi::GalleryCell* items,
+                               size_t count, uint64_t* sel) {
+    auto* u = arena.alloc<GalleryUser>();
+    u->app = &app;
+    u->items = items;
+    u->count = count;
+    u->sel = sel;
+    ui::LayoutNode* n = ui::make_node(arena, ui::NodeKind::Leaf);
+    n->user = u;
+    n->width = ui::SizeSpec::fill();
+    n->measure_fn = measure_gallery;
+    n->draw_fn = draw_gallery;
+    n->hit_fn = hit_gallery;
+    n->debug_name = "library_gallery";
+    return n;
 }
 
 ui::Rect app_ctx_menu_rect(const AppState& app, const ui::Font& font) {
@@ -4561,6 +6179,7 @@ void hit_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<MonitorUser*>(node.user);
     AppState& app = *u->app;
+    ui::probe_add("monitor", node.rect);
     frame.canvas.draw_rect_outline(node.rect, 1.0f, frame.theme.hairline);
     // Latch the displayed frame at DRAW time, not frame start - the
     // worker may have published since the build began, and every UI
@@ -5340,6 +6959,8 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             state.loop_anchor = mouse_frame();
         } else {
             state.drag_mode = 1;
+            state.scrub_anchor = mouse_frame();
+            state.scrub_moved = false;
         }
         frame.ctx.set_capture(id);
     }
@@ -5354,6 +6975,8 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const double mf = mouse_frame();
         switch (state.drag_mode) {
             case 1:
+                if (std::abs(mf - state.scrub_anchor) >= 1.0)
+                    state.scrub_moved = true;
                 u->out->seek_to = static_cast<float>(
                     std::min(mf, static_cast<double>(u->frame_count - 1)));
                 break;
@@ -5580,6 +7203,7 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const float x1 = std::max(frame_x(b.t1), x0 + 3.0f);
         if (x1 < r.x || x0 > r.right()) continue;
         const ui::Rect br{x0, r.y + 1.0f, x1 - x0, r.h - 2.0f};
+        ui::probe_add("block:" + std::to_string(b.place.id), br);
         frame.canvas.draw_sdf_rect(br, 3.0f, theme.control_bg_active);
         // Filmstrip: the visible span maps to the SOURCE frames it plays.
         if (b.thumbs && b.asset_frames > 0) {
@@ -6541,7 +8165,8 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                             float max_v, float value, const char* format,
                             SliderState* slider_state,
                             const char* options = nullptr,
-                            const char* tip = nullptr) {
+                            const char* tip = nullptr,
+                            float display_scale = 1.0f) {
         value = shown_param_value(app, {fx.id, param_index}, value, min_v,
                                   max_v);
         ParamStage stage{};
@@ -6558,6 +8183,7 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         opts.out_changed = stage.changed;
         opts.out_released = stage.released;
         opts.tooltip = tip;
+        opts.display_scale = display_scale;
 
         // One grid row: [~ k (m)] mod gutter, label, slider (param_row).
         const doc::ParamKey key{fx.id, param_index};
@@ -6575,6 +8201,8 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                 const float scale = app.rail_edit_scale != 0.0f
                                         ? app.rail_edit_scale
                                         : 1.0f;
+                // Typed values stay faithful to the input (drags snap,
+                // type-ins never do).
                 *stage.staged = std::clamp(
                     static_cast<float>(typed / scale), min_v, max_v);
                 *stage.changed = true;
@@ -6586,11 +8214,12 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         }
         FrameUi::RailEdit redit{};
         redit.key = key;
-        redit.scale = 1.0f;
+        redit.scale = display_scale;
         redit.clicked = arena.alloc<bool>();
         {
             char seed[32];
-            std::snprintf(seed, sizeof(seed), "%g", value);
+            std::snprintf(seed, sizeof(seed), "%g",
+                          value * display_scale);
             redit.seed = arena.dup(seed, std::strlen(seed));
         }
         out.rail_edits.push_back(redit);
@@ -6673,6 +8302,8 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                  "final blend over the input - click the value to type it");
     for (uint32_t p = 0; p < info.param_count && p < 16; ++p) {
         const doc::ParamDesc& desc = info.params[p];
+        // Selector-dependent rows hide with their controlling mode.
+        if (!doc::param_visible(fx, desc)) continue;
         const char* options =
             fx.type == doc::EffectType::Text && p == 0 &&
                     !app.font_options.empty()
@@ -6686,9 +8317,11 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                       desc.label, desc.min_value, desc.max_value,
                       desc.default_value);
         stage_slider(static_cast<int>(p), desc.label, desc.min_value,
-                     desc.max_value, fx.params[p], desc.format,
+                     desc.max_value, fx.params[p],
+                     desc.display_deg ? "%.0f deg" : desc.format,
                      &state.params[p], options,
-                     arena.dup(tipbuf, std::strlen(tipbuf)));
+                     arena.dup(tipbuf, std::strlen(tipbuf)),
+                     desc.display_deg ? 57.29578f : 1.0f);
     }
     if (fx.type == doc::EffectType::Text) {
         // The STRING field: click opens the shared inline editor;
@@ -6782,6 +8415,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
             app.look().layers[fli].stack[ffi];
         const doc::EffectInfo& minfo = doc::effect_info(mfx.type);
         float min_v = 0.0f, max_v = 1.0f, cur = 0.0f;
+        float fscale = 1.0f;
         const char* pname = "?";
         const char* fmt = "%.2f";
         const char* fopts = nullptr;
@@ -6795,11 +8429,15 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
                    fkey.param_index <
                        static_cast<int>(minfo.param_count)) {
             const doc::ParamDesc& d = minfo.params[fkey.param_index];
+            // A face alias hides with its member's mode, exactly like
+            // the member's own row.
+            if (!doc::param_visible(mfx, d)) continue;
             cur = mfx.params[static_cast<size_t>(fkey.param_index)];
             min_v = d.min_value;
             max_v = d.max_value;
             pname = d.label;
-            fmt = d.format;
+            fmt = d.display_deg ? "%.0f deg" : d.format;
+            if (d.display_deg) fscale = 57.29578f;
             fopts = mfx.type == doc::EffectType::Text &&
                             fkey.param_index == 0 &&
                             !app.font_options.empty()
@@ -6816,6 +8454,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
         opts.format = fmt;
         opts.out_changed = stage.changed;
         opts.out_released = stage.released;
+        opts.display_scale = fscale;
         FrameUi::ExposeToggle hide{fli, group.id, fkey, false,
                                    arena.alloc<bool>()};
         out.expose_toggles.push_back(hide);
@@ -6844,6 +8483,9 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
                                        0, fn > 0 ? fn - 1 : 0),
                             &state.face_dd[face_i], fpick.selected,
                             SizeSpec::fill());
+        } else if (fmt && std::strstr(fmt, "deg")) {
+            fctl = DialF(arena, stage.staged, min_v, max_v,
+                         &state.face_sliders[face_i], opts);
         } else {
             fctl = SliderF(arena, stage.staged, min_v, max_v,
                            &state.face_sliders[face_i], opts);
@@ -7174,13 +8816,15 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             // Source card rows (parity): the same conditional field
             // set the rail shows — each continuous field a mod target
             // with key/route dots; the waveform stays a dropdown.
-            flow::ParamRow* rows = arena.alloc<flow::ParamRow>(10);
+            flow::ParamRow* rows = arena.alloc<flow::ParamRow>(12);
             int srow = 0;
             auto layer_row = [&](FrameUi::LayerField field,
                                  const char* label, float min_v,
                                  float max_v, float value, const char* fmt,
-                                 const char* options = nullptr) {
-                if (srow >= 10) return;
+                                 const char* options = nullptr,
+                                 float hard_max = 0.0f,
+                                 float display_scale = 1.0f) {
+                if (srow >= 12) return;
                 FrameUi::LayerStage lstage{};
                 lstage.layer_id = layer.id;
                 lstage.field = field;
@@ -7193,7 +8837,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 rows[srow].label = label;
                 rows[srow].min_v = min_v;
                 rows[srow].max_v = max_v;
+                rows[srow].hard_max = hard_max;
                 rows[srow].format = fmt;
+                rows[srow].display_scale = display_scale;
                 if (options) {
                     rows[srow].kind = 1;
                     rows[srow].options = options;
@@ -7231,37 +8877,78 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             using LSK = doc::LayerSourceKind;
             layer_row(LFs::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                       "%.2f");
+            // Colors edit through the swatch alone (shared picker) -
+            // never as separate channel sliders.
+            auto swatch_row = [&](const char* label, const float* rgb,
+                                  bool is_b, ui::SwatchState* sw) {
+                if (srow >= 12) return;
+                FrameUi::ColorStage cstage{};
+                cstage.layer_id = layer.id;
+                cstage.color_b = is_b;
+                cstage.staged = arena.alloc<float>(3);
+                for (int c = 0; c < 3; ++c) {
+                    cstage.staged[c] = rgb[c];
+                    cstage.original[c] = rgb[c];
+                }
+                cstage.changed = arena.alloc<bool>();
+                cstage.released = arena.alloc<bool>();
+                out.color_stages.push_back(cstage);
+                rows[srow].label = label;
+                rows[srow].kind = 3;
+                rows[srow].swatch = sw;
+                rows[srow].staged = cstage.staged;
+                rows[srow].changed = cstage.changed;
+                rows[srow].released = cstage.released;
+                ++srow;
+            };
+            LayerUiState& lui = app.layer_ui[layer.id];
+            // SMPTE bars keep their fixed colors; every other pattern
+            // type is a two-color screen, so those rows hide with it.
+            const bool pattern_two_color =
+                layer.source == LSK::TestPattern && layer.osc_shape != 4;
             if (layer.source == LSK::Solid ||
                 layer.source == LSK::Gradient ||
                 layer.source == LSK::Noise ||
-                layer.source == LSK::Oscillator) {
-                layer_row(LFs::ColorAR, "color a r", 0.0f, 1.0f,
-                          layer.color_a[0], "%.2f");
-                layer_row(LFs::ColorAG, "color a g", 0.0f, 1.0f,
-                          layer.color_a[1], "%.2f");
-                layer_row(LFs::ColorAB, "color a b", 0.0f, 1.0f,
-                          layer.color_a[2], "%.2f");
-            }
+                layer.source == LSK::Oscillator || pattern_two_color)
+                swatch_row("color a", layer.color_a, false,
+                           &lui.card_swatch_a);
             if (layer.source == LSK::Gradient ||
                 layer.source == LSK::Noise ||
-                layer.source == LSK::Oscillator) {
-                layer_row(LFs::ColorBR, "color b r", 0.0f, 1.0f,
-                          layer.color_b[0], "%.2f");
-                layer_row(LFs::ColorBG, "color b g", 0.0f, 1.0f,
-                          layer.color_b[1], "%.2f");
-                layer_row(LFs::ColorBB, "color b b", 0.0f, 1.0f,
-                          layer.color_b[2], "%.2f");
-            }
+                layer.source == LSK::Oscillator || pattern_two_color)
+                swatch_row("color b", layer.color_b, true,
+                           &lui.card_swatch_b);
             if (layer.source == LSK::Gradient ||
                 layer.source == LSK::Oscillator)
+                // Radians in the doc, degrees on the dial.
                 layer_row(LFs::Angle, "angle", -3.1416f, 3.1416f,
-                          layer.gen_angle, "%.2f");
-            if (layer.source == LSK::Noise)
+                          layer.gen_angle, "%.0f deg", nullptr, 0.0f,
+                          57.29578f);
+            if (layer.source == LSK::Noise) {
+                layer_row(LFs::OscShape, "type", 0.0f, 4.0f,
+                          static_cast<float>(layer.osc_shape), "%.0f",
+                          "value|perlin|cellular|fbm|static");
                 layer_row(LFs::Scale, "scale", 2.0f, 128.0f,
                           layer.gen_scale, "%.0f px");
+            }
+            if (layer.source == LSK::TestPattern) {
+                layer_row(LFs::OscShape, "type", 0.0f, 4.0f,
+                          static_cast<float>(layer.osc_shape), "%.0f",
+                          "checker|stripes|grid|dots|smpte bars");
+                if (pattern_two_color) {
+                    layer_row(LFs::Scale, "cell size", 2.0f, 256.0f,
+                              layer.gen_scale, "%.0f px");
+                    layer_row(LFs::Angle, "rotate", -3.1416f, 3.1416f,
+                              layer.gen_angle, "%.0f deg", nullptr, 0.0f,
+                              57.29578f);
+                }
+            }
             if (layer.source == LSK::Oscillator) {
                 layer_row(LFs::Scale, "frequency", 0.5f, 32.0f,
                           layer.gen_scale, "%.1f cyc");
+                // Typed/keyed phase runs past one period (long loops);
+                // the kernel wraps, so 0 and 100 match exactly.
+                layer_row(LFs::Phase, "phase", 0.0f, 100.0f,
+                          layer.gen_phase, "%.0f %%", nullptr, 1.0e6f);
                 layer_row(LFs::OscShape, "wave", 0.0f, 3.0f,
                           static_cast<float>(layer.osc_shape), "%.0f",
                           "sine bars|rings|plasma|lissajous");
@@ -7275,7 +8962,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                           static_cast<float>(layer.osc_shape % 3), "%.0f",
                           "circle|box|diamond");
             }
-            if (doc::layer_is_media(layer) && srow < 10) {
+            if (doc::layer_is_media(layer) && srow < 12) {
                 // MEDIA on the card: "(none)", every asset, then
                 // "import..." - the node names its media where it lives,
                 // not only in the rail.
@@ -7396,6 +9083,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     const doc::EffectInfo& minfo =
                         doc::effect_info(mfx.type);
                     float min_v = 0.0f, max_v = 1.0f, cur = 0.0f;
+                    float fscale = 1.0f;
                     const char* pname = "?";
                     const char* fmt = "%.2f";
                     const char* fopts = nullptr;
@@ -7410,12 +9098,16 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                    static_cast<int>(minfo.param_count)) {
                         const doc::ParamDesc& pd =
                             minfo.params[fkey.param_index];
+                        // A face alias hides with its member's mode,
+                        // exactly like the member's own row.
+                        if (!doc::param_visible(mfx, pd)) continue;
                         cur = mfx.params[static_cast<size_t>(
                             fkey.param_index)];
                         min_v = pd.min_value;
                         max_v = pd.max_value;
                         pname = pd.label;
-                        fmt = pd.format;
+                        fmt = pd.display_deg ? "%.0f deg" : pd.format;
+                        if (pd.display_deg) fscale = 57.29578f;
                         // Selector aliases keep their dropdown;
                         // the Text font selector keeps the runtime list.
                         fopts = mfx.type == doc::EffectType::Text &&
@@ -7440,6 +9132,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     rows[slot].min_v = min_v;
                     rows[slot].max_v = max_v;
                     rows[slot].format = fmt;
+                    rows[slot].display_scale = fscale;
                     if (fopts) {
                         rows[slot].kind = 1;
                         rows[slot].options = fopts;
@@ -7536,14 +9229,18 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             // Text cards append the STRING row after the params.
             const bool is_text_fx =
                 fx.type == doc::EffectType::Text;
-            const uint32_t n_rows = 2 +
-                                    std::min<uint32_t>(info.param_count, 16) +
-                                    (is_text_fx ? 1 : 0);
+            // Cards carry only the VISIBLE params (selector-dependent
+            // rows hide with their mode) and shrink to that set.
+            uint32_t vis_count = 0;
+            for (uint32_t p = 0; p < info.param_count && p < 16; ++p)
+                if (doc::param_visible(fx, info.params[p])) ++vis_count;
+            const uint32_t n_rows = 2 + vis_count + (is_text_fx ? 1 : 0);
             flow::ParamRow* rows = arena.alloc<flow::ParamRow>(n_rows);
             auto stage_row = [&](uint32_t slot, int param_index,
                                  const char* label, float min_v, float max_v,
                                  float value, const char* fmt,
-                                 const char* options = nullptr) {
+                                 const char* options = nullptr,
+                                 float display_scale = 1.0f) {
                 value = shown_param_value(app, {fx.id, param_index}, value,
                                           min_v, max_v);
                 ParamStage stage{};
@@ -7567,6 +9264,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 row.min_v = min_v;
                 row.max_v = max_v;
                 row.format = fmt;
+                row.display_scale = display_scale;
                 row.staged = stage.staged;
                 row.changed = stage.changed;
                 row.released = stage.released;
@@ -7603,17 +9301,21 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                       "%.2f");
             stage_row(1, doc::kOpacityParam, "opacity", 0.0f, 1.0f,
                       fx.opacity, "%.2f");
+            uint32_t row_slot = 2;
             for (uint32_t p = 0; p < info.param_count && p < 16; ++p) {
                 const doc::ParamDesc& desc = info.params[p];
+                if (!doc::param_visible(fx, desc)) continue;
                 // The Text card's font selector lists the DISCOVERED
                 // .ttf files, not a static table.
                 const char* options =
                     is_text_fx && p == 0 && !app.font_options.empty()
                         ? app.font_options.c_str()
                         : desc.options;
-                stage_row(2 + p, static_cast<int>(p), desc.label,
+                stage_row(row_slot++, static_cast<int>(p), desc.label,
                           desc.min_value, desc.max_value, fx.params[p],
-                          desc.format, options);
+                          desc.display_deg ? "%.0f deg" : desc.format,
+                          options,
+                          desc.display_deg ? 57.29578f : 1.0f);
             }
             if (is_text_fx) {
                 // The STRING row: a real field on the card — click
@@ -8352,8 +10054,42 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                        float fps, ui::LayoutNode** left_out,
                        ui::LayoutNode** right_out,
                        ui::LayoutNode** preset_out,
-                       ui::LayoutNode** browser_out) {
+                       ui::LayoutNode** browser_out,
+                       const ui::UiTexture* gallery_tex,
+                       const std::unordered_map<uint64_t, uint32_t>*
+                           gallery_cell_map) {
     using namespace ui;
+    // Gallery thumbnail requests rebuild from what the VISIBLE gallery
+    // shows this frame; the worker fills one stale cell per idle cycle.
+    app.gallery_reqs.clear();
+    constexpr size_t kGalleryReqCap = static_cast<size_t>(
+        gfx::Engine::kGalleryCols * gfx::Engine::kGalleryRows);
+    auto gallery_uv = [&](uint64_t key, FrameUi::GalleryCell* cell) {
+        if (!gallery_tex || !gallery_cell_map) return;
+        auto it = gallery_cell_map->find(key);
+        if (it == gallery_cell_map->end()) return;
+        const float cu = 1.0f / static_cast<float>(gfx::Engine::kGalleryCols);
+        const float cv = 1.0f / static_cast<float>(gfx::Engine::kGalleryRows);
+        // Half-texel inset, exactly like the node-canvas previews:
+        // sampling the exact cell bounds lets the linear filter blend in
+        // the neighbouring cell's edge row — a coloured sliver of some
+        // other entity's thumb along the card border.
+        const float iu = 0.5f / static_cast<float>(gfx::Engine::kGalleryCols *
+                                                   gfx::Engine::kGalleryCellW);
+        const float iv = 0.5f / static_cast<float>(gfx::Engine::kGalleryRows *
+                                                   gfx::Engine::kGalleryCellH);
+        cell->tex = gallery_tex;
+        cell->u0 = static_cast<float>(it->second %
+                                      gfx::Engine::kGalleryCols) *
+                       cu +
+                   iu;
+        cell->v0 = static_cast<float>(it->second /
+                                      gfx::Engine::kGalleryCols) *
+                       cv +
+                   iv;
+        cell->u1 = cell->u0 + cu - 2.0f * iu;
+        cell->v1 = cell->v0 + cv - 2.0f * iv;
+    };
     LabelOpts dim;
     dim.color = active_theme().text_dim;
     LabelOpts small_dim = dim;
@@ -8388,8 +10124,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         // Past `ready` the asset is already usable - the tail of the bar
         // is the background curves/thumbs pass.
         std::snprintf(line, sizeof(line), "%s %u%%",
-                      app.import->progress.ready.load() ? "analyzing"
-                                                        : "importing",
+                      app.import->consolidate
+                          ? "consolidating"
+                          : (app.import->progress.ready.load()
+                                 ? "analyzing"
+                                 : "importing"),
                       total ? done * 100 / total : 0);
         rows.push_back(Label(arena, line, dim));
     } else if (has_media_file) {
@@ -8403,10 +10142,14 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     // below it. Single click selects (bins also fold), double-click
     // opens, drag files rows into bins or lays them on the timeline.
     std::vector<LayoutNode*> browser_rows;
+    std::vector<FrameUi::GalleryCell> browser_cells;
     LayoutNode* browser_search = nullptr;
     LayoutNode* browser_create = nullptr;
+    const bool browser_gal = app.browser_view == 1;
     {
         out.browser_search_clicked = arena.alloc<bool>();
+        out.browser_view_pick[0] = arena.alloc<bool>();
+        out.browser_view_pick[1] = arena.alloc<bool>();
         {
             std::string label = app.browser_filter;
             if (app.browser_search_focus) label += "_";
@@ -8421,13 +10164,30 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             PanelOpts well;
             well.padding = Edges::all(1);
             well.bg = lerp(active_theme().panel_bg,
-                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.45f);
-            browser_search =
+                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+            LayoutNode* well_node =
                 Panel(arena,
                       Button(arena, arena.dup(label.c_str(), label.size()),
                              &app.browser_search_btn,
                              out.browser_search_clicked, so),
                       well);
+            // The list/gallery toggle rides beside the search well -
+            // one segmented control, the SAME on the preset tab.
+            static const char* kViewLabels[2] = {"list", "grid"};
+            static const char* kViewTips[2] = {"tree list view",
+                                               "thumbnail gallery view"};
+            bool** view_picks = arena.alloc<bool*>(2);
+            view_picks[0] = out.browser_view_pick[0];
+            view_picks[1] = out.browser_view_pick[1];
+            StackOpts srow;
+            srow.gap = 4.0f;
+            srow.cross_align = AlignMode::Center;
+            browser_search = HStack(
+                arena, srow,
+                {well_node,
+                 Segmented(arena, kViewLabels, kViewTips, 2,
+                           app.browser_view, app.browser_view_btns,
+                           view_picks, SizeSpec::fixed(88.0f))});
         }
         int stripe = 0;
         auto rename_row = [&](uint64_t id, int depth) {
@@ -8444,46 +10204,93 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                        &app.browser_ui[id].open, arena.alloc<bool>(), bo));
             ++stripe;
         };
+        // The gallery thumb for an ASSET: the full-resolution card cell
+        // (ensure_asset_strip stages the sidecar read).
+        auto asset_thumb = [&](uint64_t id, FrameUi::GalleryCell* cell) {
+            const AppState::AssetStrip* s = ensure_asset_strip(app, id);
+            if (s->card) {
+                cell->tex = s->card;
+                cell->u1 = 1.0f;
+            }
+        };
+        auto gal_cell = [&](uint64_t id, int kind, const std::string& name,
+                            const char* fallback, bool open_bin) {
+            FrameUi::GalleryCell cell;
+            cell.id = id;
+            cell.kind = kind;
+            std::string shown = name.empty() ? std::string(fallback) : name;
+            if (id == app.browser_rename_id)
+                shown = app.browser_rename_buf + "_";
+            cell.name = arena.dup(shown.c_str(), shown.size());
+            cell.open_bin = open_bin;
+            cell.scoped = id == app.scope_look;
+            cell.clicked = arena.alloc<bool>();
+            cell.opened = arena.alloc<bool>();
+            cell.ctx = arena.alloc<bool>();
+            cell.out_rect = arena.alloc<ui::Rect>();
+            *cell.out_rect = {};
+            if (kind == 3) {
+                asset_thumb(id, &cell);
+            } else if (kind == 1 || kind == 2) {
+                gallery_uv(id, &cell);
+                // Stamp on the bundle table too: a late-landing thumb
+                // strip changes the media planes an entity thumb
+                // composites without touching the document.
+                if (app.inspector_tab == 3 &&
+                    app.gallery_reqs.size() < kGalleryReqCap)
+                    app.gallery_reqs.push_back(
+                        {id, id,
+                         app.document.revision * 0x9E3779B97F4A7C15ull +
+                             app.bundle_stamp});
+            }
+            out.browser_nodes.push_back({id, kind == 0, cell.out_rect});
+            if (kind == 0) {
+                out.bin_rows.push_back({id, cell.clicked, cell.ctx});
+            } else {
+                FrameUi::BrowserAction act{};
+                act.id = id;
+                act.open = cell.opened;
+                act.place = arena.alloc<bool>();
+                act.ctx = cell.ctx;
+                act.select = cell.clicked;
+                (kind == 3 ? out.browser_assets : out.browser_looks)
+                    .push_back(act);
+            }
+            browser_cells.push_back(cell);
+        };
         auto tree_row = [&](uint64_t id, int kind, const std::string& name,
                             const char* fallback, int depth,
                             bool open_bin) {
+            if (browser_gal) {
+                gal_cell(id, kind, name, fallback, open_bin);
+                return;
+            }
             if (id == app.browser_rename_id) {
                 rename_row(id, depth);
                 return;
             }
-            auto* u = arena.alloc<BrowseRowUser>();
-            u->app = &app;
-            u->id = id;
-            u->kind = kind;
             const std::string shown =
                 name.empty() ? std::string(fallback) : name;
-            u->name = arena.dup(shown.c_str(), shown.size());
-            u->depth = depth;
-            u->stripe = (stripe++ & 1) != 0;
-            u->open_bin = open_bin;
-            u->scoped = id == app.scope_look;
-            u->clicked = arena.alloc<bool>();
-            u->opened = arena.alloc<bool>();
-            u->ctx = arena.alloc<bool>();
-            LayoutNode* n = make_node(arena, NodeKind::Leaf);
-            n->user = u;
-            n->width = SizeSpec::fill();
-            n->height = SizeSpec::fixed(22.0f);
-            n->measure_fn = measure_browser_row;
-            n->draw_fn = draw_browser_row;
-            n->hit_fn = hit_browser_row;
-            n->debug_name = "browser_row";
-            out.browser_nodes.push_back({id, kind == 0, n});
+            bool* clicked = arena.alloc<bool>();
+            bool* opened = arena.alloc<bool>();
+            bool* ctx = arena.alloc<bool>();
+            ui::Rect* rrect = nullptr;
+            LayoutNode* n = library_row(
+                arena, app, id, kind,
+                arena.dup(shown.c_str(), shown.size()), depth,
+                (stripe++ & 1) != 0, open_bin, id == app.scope_look,
+                &app.browser_sel, clicked, opened, ctx, &rrect);
+            out.browser_nodes.push_back({id, kind == 0, rrect});
             browser_rows.push_back(n);
             if (kind == 0) {
-                out.bin_rows.push_back({id, u->clicked, u->ctx});
+                out.bin_rows.push_back({id, clicked, ctx});
             } else {
                 FrameUi::BrowserAction act{};
                 act.id = id;
-                act.open = u->opened;
+                act.open = opened;
                 act.place = arena.alloc<bool>();
-                act.ctx = u->ctx;
-                act.select = u->clicked;
+                act.ctx = ctx;
+                act.select = clicked;
                 (kind == 3 ? out.browser_assets : out.browser_looks)
                     .push_back(act);
             }
@@ -8533,20 +10340,29 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             };
             walk(walk, 0, 0);
         }
+        // Gallery view: the cells feed one leaf; the pointer is taken
+        // AFTER the walks so the vector can no longer move.
+        out.browser_cells = std::move(browser_cells);
+        if (browser_gal && !out.browser_cells.empty())
+            browser_rows.push_back(LibraryGallery(
+                arena, app, out.browser_cells.data(),
+                out.browser_cells.size(), &app.browser_sel));
         // Creation strip: the background right-click's button twins,
-        // micro flat buttons anchored bottom right under the tree.
+        // chromed buttons anchored bottom right under the tree — the
+        // padding keeps them off the panel edge (the panel's own right
+        // pad is the scrollbar gutter, too thin to read as a margin).
         out.new_sequence_clicked = arena.alloc<bool>();
         out.browser_new_look_clicked = arena.alloc<bool>();
         out.new_bin_clicked = arena.alloc<bool>();
         ButtonOpts mseq, mlook, mbin;
-        mseq.flat = mlook.flat = mbin.flat = true;
         mseq.tooltip = "new sequence";
         mlook.tooltip = "new look (placed nowhere)";
         mbin.tooltip = "new bin";
         StackOpts strip;
-        strip.gap = 4.0f;
+        strip.gap = 6.0f;
         strip.width = SizeSpec::fill();
         strip.justify = Justify::End;
+        strip.padding = Edges{0.0f, 0.0f, 10.0f, 0.0f};
         browser_create = HStack(
             arena, strip,
             {Button(arena, "+ seq", &app.new_seq_button,
@@ -8593,7 +10409,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     }
 
     if (has_media_file) {
-        const bool is_still = is_still_source(primary_media_path(app.document));
+        const doc::Asset* opened = opened_asset(app);
+        const bool is_still =
+            opened && is_still_source(opened->path);
         // Still media: a duration field replaces the time/audio rows —
         // speed/direction/sidechain/nudge do nothing when every frame is
         // identical and there is no media audio.
@@ -8934,8 +10752,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         auto layer_slider = [&](FrameUi::LayerField field, const char* label,
                                 float min_v, float max_v, float value,
                                 const char* format,
-                                float display_scale = 1.0f) {
-            if (lslider >= 9) return;
+                                float display_scale = 1.0f,
+                                float hard_max = 0.0f) {
+            if (lslider >= 12) return;
             FrameUi::LayerStage stage{};
             stage.layer_id = layer.id;
             stage.field = field;
@@ -8962,7 +10781,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             pctx.has_def = layer_field_reset(field, &pctx.def_v);
             out.param_ctxs.push_back(pctx);
             opts.out_ctx = pctx.clicked;
-            // Rail type-in, same contract as effect rows.
+            // Rail type-in, same contract as effect rows: typed values
+            // stay faithful to the input (only drags snap) and honor
+            // the row's HARD range (open-ended params run past the
+            // slider).
             bool editing = app.rail_edit_key == lkey;
             if (editing && app.rail_edit_commit) {
                 char* endp = nullptr;
@@ -8973,7 +10795,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                             ? app.rail_edit_scale
                                             : 1.0f;
                     *stage.staged = std::clamp(
-                        static_cast<float>(typed / scale), min_v, max_v);
+                        static_cast<float>(typed / scale), min_v,
+                        hard_max > max_v ? hard_max : max_v);
                     *stage.changed = true;
                     *stage.released = true;
                 }
@@ -9021,8 +10844,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         using LF = FrameUi::LayerField;
         layer_slider(LF::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                      "%.2f");
-        // Swatch opens the picker (fast visual edit); the channel rows
-        // below stay because they carry the key/route mod affordances.
+        // Swatch opens the picker; colors have no channel sliders.
         auto color_swatch_row = [&](const char* label, const float rgb[3],
                                     bool is_b, ui::SwatchState& swatch) {
             FrameUi::ColorStage cstage{};
@@ -9041,52 +10863,77 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 ColorSwatch(arena, rgb, &swatch, cstage.staged,
                             cstage.changed, cstage.released)));
         };
+        // SMPTE bars keep their fixed colors; every other pattern type
+        // is a two-color screen, so those rows hide with it.
+        const bool pattern_two_color =
+            layer.source == doc::LayerSourceKind::TestPattern &&
+            layer.osc_shape != 4;
+        // Colors edit through the swatch alone (picker: SV field,
+        // 0-255 bytes, hex) - never as separate channel sliders.
         if (layer.source == doc::LayerSourceKind::Solid ||
             layer.source == doc::LayerSourceKind::Gradient ||
             layer.source == doc::LayerSourceKind::Noise ||
-            layer.source == doc::LayerSourceKind::Oscillator) {
+            layer.source == doc::LayerSourceKind::Oscillator ||
+            pattern_two_color)
             color_swatch_row("color a", layer.color_a, false, ls.swatch_a);
-            layer_slider(LF::ColorAR, "color a r", 0.0f, 1.0f,
-                         layer.color_a[0], "%.2f");
-            layer_slider(LF::ColorAG, "color a g", 0.0f, 1.0f,
-                         layer.color_a[1], "%.2f");
-            layer_slider(LF::ColorAB, "color a b", 0.0f, 1.0f,
-                         layer.color_a[2], "%.2f");
-        }
         if (layer.source == doc::LayerSourceKind::Gradient ||
             layer.source == doc::LayerSourceKind::Noise ||
-            layer.source == doc::LayerSourceKind::Oscillator) {
+            layer.source == doc::LayerSourceKind::Oscillator ||
+            pattern_two_color)
             color_swatch_row("color b", layer.color_b, true, ls.swatch_b);
-            layer_slider(LF::ColorBR, "color b r", 0.0f, 1.0f,
-                         layer.color_b[0], "%.2f");
-            layer_slider(LF::ColorBG, "color b g", 0.0f, 1.0f,
-                         layer.color_b[1], "%.2f");
-            layer_slider(LF::ColorBB, "color b b", 0.0f, 1.0f,
-                         layer.color_b[2], "%.2f");
-        }
         if (layer.source == doc::LayerSourceKind::Gradient ||
             layer.source == doc::LayerSourceKind::Oscillator)
             // Stored in radians; the readout speaks degrees (units).
             layer_slider(LF::Angle, "angle", -3.1416f, 3.1416f,
                          layer.gen_angle, "%.0f deg", 57.29578f);
-        if (layer.source == doc::LayerSourceKind::Noise)
+        auto type_dropdown = [&](const char* label, const char** names,
+                                 int count, int current,
+                                 const char* tip) {
+            lrow.osc_shape_selected = arena.alloc<int>();
+            *lrow.osc_shape_selected = -1;
+            layer_rows_ui.push_back(value_row(
+                arena, label,
+                Dropdown(arena, names, count, current, &ls.osc_dd,
+                         lrow.osc_shape_selected, SizeSpec::fill(), tip)));
+        };
+        if (layer.source == doc::LayerSourceKind::Noise) {
+            static const char* kNoiseKinds[] = {"value", "perlin",
+                                                "cellular", "fbm",
+                                                "static"};
+            type_dropdown("type", kNoiseKinds, 5,
+                          static_cast<int>(layer.osc_shape % 5),
+                          "noise flavor");
             layer_slider(LF::Scale, "scale", 2.0f, 128.0f, layer.gen_scale,
                          "%.0f px");
+        }
+        if (layer.source == doc::LayerSourceKind::TestPattern) {
+            static const char* kPatternKinds[] = {"checker", "stripes",
+                                                  "grid", "dots",
+                                                  "smpte bars"};
+            type_dropdown("type", kPatternKinds, 5,
+                          static_cast<int>(layer.osc_shape % 5),
+                          "pattern screen");
+            if (pattern_two_color) {
+                layer_slider(LF::Scale, "cell size", 2.0f, 256.0f,
+                             layer.gen_scale, "%.0f px");
+                layer_slider(LF::Angle, "rotate", -3.1416f, 3.1416f,
+                             layer.gen_angle, "%.0f deg", 57.29578f);
+            }
+        }
         if (layer.source == doc::LayerSourceKind::Oscillator) {
             layer_slider(LF::Scale, "frequency", 0.5f, 32.0f,
                          layer.gen_scale, "%.1f cyc");
+            // Typed/keyed phase runs past one period (long loops); the
+            // kernel wraps, so 0 and 100 match exactly.
+            layer_slider(LF::Phase, "phase", 0.0f, 100.0f,
+                         layer.gen_phase, "%.0f %%", 1.0f, 1.0e6f);
             // Waveform dropdown (generators): the oscillator is a
             // patchable periodic source, shape picks its geometry.
             static const char* kOscShapes[] = {"sine bars", "rings",
                                                "plasma", "lissajous"};
-            lrow.osc_shape_selected = arena.alloc<int>();
-            *lrow.osc_shape_selected = -1;
-            layer_rows_ui.push_back(value_row(
-                arena, "wave",
-                Dropdown(arena, kOscShapes, 4,
-                         static_cast<int>(layer.osc_shape), &ls.osc_dd,
-                         lrow.osc_shape_selected, SizeSpec::fill(),
-                         "oscillator waveform")));
+            type_dropdown("wave", kOscShapes, 4,
+                          static_cast<int>(layer.osc_shape),
+                          "oscillator waveform");
         }
         if (layer.source == doc::LayerSourceKind::Shape) {
             // The matte maker: size + feather + geometry; place
@@ -9481,13 +11328,18 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     rows.push_back(Separator(arena));
     }   // end right panel (inspector)
 
-    // ---- preset browser: click = drop the group onto the
-    // selected layer's stack. Its OWN inspector tab (it was buried
-    // behind a fold in the project tab — "where are the presets?").
+    // ---- preset browser: its OWN inspector tab, and the same library
+    // surfaces as the project browser. Bins are DIRECTORIES under
+    // ./presets (shipped presets group read-only under "shipped");
+    // single click selects, double-click APPLIES onto the selected
+    // layer's stack, right-click stages the row menu, drag applies onto
+    // the canvas or files the preset into a bin.
     std::vector<LayoutNode*> preset_rows;
+    LayoutNode* preset_head = nullptr;
+    LayoutNode* preset_strip = nullptr;
     {
         std::vector<LayoutNode*>& rows = preset_rows;
-        rows.push_back(Heading(arena, "presets"));
+        std::vector<LayoutNode*> head_rows;
         std::vector<std::string> tags;
         for (const doc::Preset& p : app.presets)
             for (const std::string& t : p.tags)
@@ -9506,15 +11358,12 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         for (int t = 0; t < tag_count; ++t)
             tag_items[t + 1] = arena.dup(tags[static_cast<size_t>(t)].c_str(),
                                          tags[static_cast<size_t>(t)].size());
-        rows.push_back(value_row(
-            arena, "tag",
-            Dropdown(arena, tag_items, tag_count + 1,
-                     app.preset_tag_index + 1, &app.tag_dd, out.tag_selected,
-                     SizeSpec::fill(), "filter presets by tag")));
-        // Text search (browser is searchable). A flat field that
-        // captures the keyboard while focused; enter/escape release it.
+        // ONE head line: search well | tag filter | list/gallery toggle
+        // (the browser carries the same line without the tag).
         {
             out.preset_search_clicked = arena.alloc<bool>();
+            out.preset_view_pick[0] = arena.alloc<bool>();
+            out.preset_view_pick[1] = arena.alloc<bool>();
             std::string label = app.preset_filter;
             if (app.preset_search_focus) label += "_";
             else if (label.empty()) label = "search...";
@@ -9523,12 +11372,122 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             search_opts.flat = true;
             search_opts.align_left = true;
             search_opts.tooltip = "type to filter presets by name";
-            rows.push_back(value_row(
-                arena, "find",
-                Button(arena, arena.dup(label.c_str(), label.size()),
-                       &app.preset_search_btn, out.preset_search_clicked,
-                       search_opts)));
+            PanelOpts well;
+            well.padding = Edges::all(1);
+            well.bg = lerp(active_theme().panel_bg,
+                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+            LayoutNode* well_node =
+                Panel(arena,
+                      Button(arena, arena.dup(label.c_str(), label.size()),
+                             &app.preset_search_btn,
+                             out.preset_search_clicked, search_opts),
+                      well);
+            static const char* kViewLabels[2] = {"list", "grid"};
+            static const char* kViewTips[2] = {"tree list view",
+                                               "thumbnail gallery view"};
+            bool** view_picks = arena.alloc<bool*>(2);
+            view_picks[0] = out.preset_view_pick[0];
+            view_picks[1] = out.preset_view_pick[1];
+            StackOpts srow;
+            srow.gap = 4.0f;
+            srow.cross_align = AlignMode::Center;
+            head_rows.push_back(HStack(
+                arena, srow,
+                {well_node,
+                 Dropdown(arena, tag_items, tag_count + 1,
+                          app.preset_tag_index + 1, &app.tag_dd,
+                          out.tag_selected, SizeSpec::fixed(86.0f),
+                          "filter presets by tag"),
+                 Segmented(arena, kViewLabels, kViewTips, 2,
+                           app.preset_view, app.preset_view_btns,
+                           view_picks, SizeSpec::fixed(88.0f))}));
         }
+        StackOpts head_col;
+        head_col.gap = 6.0f;
+        head_col.cross_align = AlignMode::Stretch;
+        preset_head = VStackDyn(arena, head_col, head_rows);
+
+        const bool preset_gal = app.preset_view == 1;
+        std::vector<FrameUi::GalleryCell> preset_cells;
+        int stripe = 0;
+        auto rename_row = [&](int depth) {
+            std::string shown(static_cast<size_t>(depth) * 2 + 2, ' ');
+            shown += app.preset_rename_buf + "_";
+            ButtonOpts bo;
+            bo.flat = true;
+            bo.align_left = true;
+            bo.width = SizeSpec::fill();
+            rows.push_back(Button(
+                arena, arena.dup(shown.c_str(), shown.size()),
+                &app.browser_ui[app.preset_rename_key].open,
+                arena.alloc<bool>(), bo));
+            ++stripe;
+        };
+        auto tree_row = [&](uint64_t key, int kind, const std::string& name,
+                            int depth, bool open_bin) {
+            if (preset_gal) {
+                FrameUi::GalleryCell cell;
+                cell.id = key;
+                cell.kind = kind;
+                std::string shown = name;
+                if (key == app.preset_rename_key)
+                    shown = app.preset_rename_buf + "_";
+                cell.name = arena.dup(shown.c_str(), shown.size());
+                cell.open_bin = open_bin;
+                cell.clicked = arena.alloc<bool>();
+                cell.opened = arena.alloc<bool>();
+                cell.ctx = arena.alloc<bool>();
+                cell.out_rect = arena.alloc<ui::Rect>();
+                *cell.out_rect = {};
+                if (kind == 4) {
+                    gallery_uv(key, &cell);
+                    if (app.inspector_tab == 2 &&
+                        app.gallery_reqs.size() < kGalleryReqCap)
+                        app.gallery_reqs.push_back(
+                            {key, 0, app.preset_scan_stamp});
+                }
+                out.preset_nodes_r.push_back(
+                    {key, kind == 0, cell.out_rect});
+                if (kind == 0) {
+                    out.preset_bin_rows.push_back(
+                        {key, cell.clicked, cell.ctx});
+                } else {
+                    FrameUi::BrowserAction act{};
+                    act.id = key;
+                    act.open = cell.opened;
+                    act.ctx = cell.ctx;
+                    act.select = cell.clicked;
+                    out.preset_items.push_back(act);
+                }
+                preset_cells.push_back(cell);
+                return;
+            }
+            if (key == app.preset_rename_key) {
+                rename_row(depth);
+                return;
+            }
+            bool* clicked = arena.alloc<bool>();
+            bool* opened = arena.alloc<bool>();
+            bool* ctx = arena.alloc<bool>();
+            ui::Rect* rrect = nullptr;
+            LayoutNode* n = library_row(
+                arena, app, key, kind,
+                arena.dup(name.c_str(), name.size()), depth,
+                (stripe++ & 1) != 0, open_bin, false, &app.preset_sel,
+                clicked, opened, ctx, &rrect);
+            out.preset_nodes_r.push_back({key, kind == 0, rrect});
+            rows.push_back(n);
+            if (kind == 0) {
+                out.preset_bin_rows.push_back({key, clicked, ctx});
+            } else {
+                FrameUi::BrowserAction act{};
+                act.id = key;
+                act.open = opened;
+                act.ctx = ctx;
+                act.select = clicked;
+                out.preset_items.push_back(act);
+            }
+        };
         auto matches_filter = [&](const doc::Preset& p) {
             if (app.preset_filter.empty()) return true;
             auto lower = [](std::string s) {
@@ -9540,29 +11499,97 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             return lower(p.name).find(lower(app.preset_filter)) !=
                    std::string::npos;
         };
-        for (size_t pi = 0; pi < app.presets.size(); ++pi) {
-            const doc::Preset& p = app.presets[pi];
-            if (app.preset_tag_index >= 0 &&
-                std::find(p.tags.begin(), p.tags.end(),
-                          tags[static_cast<size_t>(app.preset_tag_index)]) ==
-                    p.tags.end())
-                continue;
-            if (!matches_filter(p)) continue;
-            bool* clicked = arena.alloc<bool>();
-            LayoutNode* pb = Button(arena, p.name.c_str(),
-                                    &app.preset_buttons[p.path.string()],
-                                    clicked);
-            rows.push_back(pb);
-            out.preset_clicks.push_back({pi, clicked});
-            out.preset_nodes.push_back({pi, pb});
+        auto tag_ok = [&](const doc::Preset& p) {
+            return app.preset_tag_index < 0 ||
+                   std::find(p.tags.begin(), p.tags.end(),
+                             tags[static_cast<size_t>(
+                                 app.preset_tag_index)]) != p.tags.end();
+        };
+        const bool filtering =
+            !app.preset_filter.empty() || app.preset_tag_index >= 0;
+        if (filtering) {
+            // Filtering flattens: matching presets only, bins skipped.
+            for (size_t pi = 0; pi < app.presets.size(); ++pi)
+                if (tag_ok(app.presets[pi]) &&
+                    matches_filter(app.presets[pi]))
+                    tree_row(app.preset_info[pi].key, 4,
+                             app.presets[pi].name, 0, false);
+        } else {
+            // Bins in path order, shipped group first; a closed
+            // ancestor hides the whole subtree.
+            std::set<std::string> bin_set(app.preset_bins.begin(),
+                                          app.preset_bins.end());
+            for (const AppState::PresetInfo& info : app.preset_info)
+                if (!info.bin.empty()) bin_set.insert(info.bin);
+            std::vector<std::string> all_bins;
+            auto is_shipped_bin = [](const std::string& b) {
+                return b == "shipped" || b.rfind("shipped/", 0) == 0;
+            };
+            for (const std::string& b : bin_set)
+                if (is_shipped_bin(b)) all_bins.push_back(b);
+            for (const std::string& b : bin_set)
+                if (!is_shipped_bin(b)) all_bins.push_back(b);
+            auto ancestors_open = [&](const std::string& bin) {
+                size_t pos = bin.find('/');
+                while (pos != std::string::npos) {
+                    if (app.preset_bin_closed.count(
+                            preset_bin_key(bin.substr(0, pos))))
+                        return false;
+                    pos = bin.find('/', pos + 1);
+                }
+                return true;
+            };
+            for (const std::string& bin : all_bins) {
+                if (!ancestors_open(bin)) continue;
+                const uint64_t bkey = preset_bin_key(bin);
+                const bool open = !app.preset_bin_closed.count(bkey);
+                const int depth = static_cast<int>(
+                    std::count(bin.begin(), bin.end(), '/'));
+                const size_t slash = bin.rfind('/');
+                tree_row(bkey, 0,
+                         slash == std::string::npos
+                             ? bin
+                             : bin.substr(slash + 1),
+                         depth, open);
+                if (!open) continue;
+                for (size_t pi = 0; pi < app.presets.size(); ++pi)
+                    if (app.preset_info[pi].bin == bin)
+                        tree_row(app.preset_info[pi].key, 4,
+                                 app.presets[pi].name, depth + 1, false);
+            }
+            for (size_t pi = 0; pi < app.presets.size(); ++pi)
+                if (app.preset_info[pi].bin.empty())
+                    tree_row(app.preset_info[pi].key, 4,
+                             app.presets[pi].name, 0, false);
         }
+        // Gallery view: the cells feed one leaf; the pointer is taken
+        // AFTER the walks so the vector can no longer move.
+        out.preset_cells = std::move(preset_cells);
+        if (preset_gal && !out.preset_cells.empty())
+            rows.push_back(LibraryGallery(arena, app,
+                                          out.preset_cells.data(),
+                                          out.preset_cells.size(),
+                                          &app.preset_sel));
         if (app.presets.empty())
             rows.push_back(Label(arena, "no presets found", small_dim));
-        // Single-file preset import; drag-and-drop works too.
+        // Bottom strip: new bin + single-file import (drag-and-drop
+        // works too), micro flat buttons pinned bottom right.
+        out.preset_new_bin_clicked = arena.alloc<bool>();
         out.preset_import_clicked = arena.alloc<bool>();
-        rows.push_back(Button(arena, "import preset...",
-                              &app.preset_import_btn,
-                              out.preset_import_clicked));
+        ButtonOpts mbin, mimp;
+        mbin.tooltip = "new preset bin (a folder under ./presets)";
+        mimp.tooltip = "copy a preset file into ./presets";
+        StackOpts pstrip;
+        pstrip.gap = 6.0f;
+        pstrip.width = SizeSpec::fill();
+        pstrip.justify = Justify::End;
+        pstrip.padding = Edges{0.0f, 0.0f, 10.0f, 0.0f};
+        preset_strip = HStack(
+            arena, pstrip,
+            {Button(arena, "+ bin", &app.preset_new_bin_btn,
+                    out.preset_new_bin_clicked, mbin),
+             Button(arena, "import...", &app.preset_import_btn,
+                    out.preset_import_clicked, mimp)});
     }
 
     // ---- RIGHT PANEL: modulation routes (selection-filtered) + the
@@ -9881,11 +11908,33 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         ScrollAreaV(arena, &app.right_scroll,
                     VStackDyn(arena, column, right_rows)),
         PanelOpts{panel_pad, -1.0f});
+    // Preset tab: the same head / scroll / strip sandwich as the
+    // browser, rows packed edge to edge. The scrolling library sits in
+    // its own darkened well so the content area reads as a distinct
+    // surface against the panel (the search well is darker still).
+    PanelOpts library_well;
+    library_well.padding = Edges::all(2);
+    library_well.outline = false;
+    library_well.bg = lerp(active_theme().panel_bg,
+                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.38f);
+    StackOpts pcol;
+    pcol.gap = 2.0f;
+    pcol.cross_align = AlignMode::Stretch;
+    StackOpts pwrap;
+    pwrap.gap = 6.0f;
+    pwrap.cross_align = AlignMode::Stretch;
+    pwrap.height = SizeSpec::fill();
+    LayoutNode* preset_well =
+        Panel(arena,
+              ScrollAreaV(arena, &app.preset_scroll,
+                          VStackDyn(arena, pcol, preset_rows)),
+              library_well);
+    preset_well->height = SizeSpec::fill();
     *preset_out = Panel(
         arena,
-        ScrollAreaV(arena, &app.preset_scroll,
-                    VStackDyn(arena, column, preset_rows)),
+        VStack(arena, pwrap, {preset_head, preset_well, preset_strip}),
         PanelOpts{panel_pad, -1.0f});
+    out.preset_panel_node = *preset_out;
     // The browser packs rows edge to edge so the stripes read as one
     // surface; search and the creation strip sit OUTSIDE the scroll so
     // they never leave with a long tree.
@@ -9896,13 +11945,16 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     bwrap.gap = 6.0f;
     bwrap.cross_align = AlignMode::Stretch;
     bwrap.height = SizeSpec::fill();
+    LayoutNode* browser_well =
+        Panel(arena,
+              ScrollAreaV(arena, &app.browser_scroll,
+                          VStackDyn(arena, bcol, browser_rows)),
+              library_well);
+    browser_well->height = SizeSpec::fill();
     *browser_out = Panel(
         arena,
         VStack(arena, bwrap,
-               {browser_search,
-                ScrollAreaV(arena, &app.browser_scroll,
-                            VStackDyn(arena, bcol, browser_rows)),
-                browser_create}),
+               {browser_search, browser_well, browser_create}),
         PanelOpts{panel_pad, -1.0f});
     out.browser_panel = *browser_out;
 }
@@ -10260,9 +12312,6 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             uint64_t track_id = 0;
         };
         std::vector<LaneBuild> lanes;
-        const uint64_t primary =
-            app.document.primary_asset() ? app.document.primary_asset()->id
-                                         : 0;
         // The media a wrapper look reads, for the filmstrip: single media
         // node bound to an asset, whatever effects ride it.
         auto wrapped_asset = [&](uint64_t target) -> uint64_t {
@@ -10322,14 +12371,15 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.selected = app.sel_placement == place.id;
                 // Sound rides AUDIO lanes: a video block draws no
                 // silhouette - its linked audio block does. Filmstrip:
-                // the primary asset's strip when the block plays its
-                // wrapper look, mapped through the placement.
-                if (strip_asset && strip_asset == primary &&
-                    app.thumbs_tex) {
+                // the wrapped asset's own strip, mapped through the
+                // placement.
+                if (strip_asset) {
                     const media::AssetBundle* bd =
                         media::find_bundle(app.bundles, strip_asset);
-                    if (bd && bd->frames) {
-                        b.thumbs = app.thumbs_tex;
+                    const AppState::AssetStrip* s =
+                        ensure_asset_strip(app, strip_asset);
+                    if (bd && bd->frames && s->tex && s->count > 0) {
+                        b.thumbs = s->tex;
                         b.asset_frames = bd->frames;
                     }
                 }
@@ -10719,6 +12769,3146 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                  PanelOpts{Edges::all(8), -1.0f});
 }
 
+// =================================================================== script
+//
+// In-app automation: the script VM (src/script) stepped once per frame
+// at the top of the main loop, before events fold into UiInput. Ops bind
+// to the SAME commands and helpers the UI executes, so scripted edits
+// are ordinary undoable edits; synthetic input appends platform events
+// to the frame's queue, so clicks/keys exercise the genuine UI paths
+// (probes name widget rects, no coordinates needed). Waits suspend the
+// VM: wait_idle keys on the render worker's publish sequence, so "the
+// monitor shows this document" is exact, not a sleep.
+//
+// Every log/assert/error line also appends to temp/script_log.txt - the
+// artifact a smoke run leaves behind.
+
+struct ScriptHost {
+    // Per-pump context, set by the frame loop before pump().
+    AppState* app = nullptr;
+    platform::Window* window = nullptr;
+    gfx::Renderer* renderer = nullptr;
+    RenderWorker* worker = nullptr;
+    std::vector<platform::Event>* events = nullptr;
+    const std::filesystem::path* shader_dir = nullptr;
+    bool* running = nullptr;
+
+    script::Env env;
+    std::unique_ptr<script::Vm> vm;
+    std::string script_name;
+    bool exit_when_done = false;   // --script-exit
+    bool exit_requested = false;   // the exit() op
+    int exit_code = 0;
+    int failures = 0;
+    int open_groups = 0;   // undo groups the script opened and owes
+
+    enum class Wait { None, Frames, Idle, Export, Import, Capture };
+    Wait wait = Wait::None;
+    int wait_frames = 0;
+    uint64_t wait_seq0 = 0;
+    double wait_deadline = 0.0;   // app_seconds
+    std::filesystem::path capture_path;
+
+    // Synthetic input due at future pump counters (logical px converted
+    // to physical at enqueue).
+    struct Timed {
+        uint64_t frame;
+        platform::Event ev;
+    };
+    std::vector<Timed> synth;
+    uint64_t frame_no = 0;
+
+    // Last acquire()'s publish stamp, noted by the frame loop.
+    uint64_t view_seq = 0;
+    uint64_t view_rev = 0;
+
+    // Console (toggled with `): keyboard-only line editor over the
+    // shared log. A submitted line runs as a one-line script through
+    // the same VM slot, so console lines may call waits.
+    bool console_open = false;
+    std::string console_input;
+    std::vector<std::string> console_hist;
+    int hist_pos = -1;
+    std::vector<std::string> log_lines;
+    FILE* log_file = nullptr;
+
+    ~ScriptHost() {
+        if (log_file) std::fclose(log_file);
+    }
+
+    void log(const std::string& line) {
+        log_lines.push_back(line);
+        if (log_lines.size() > 400)
+            log_lines.erase(log_lines.begin(), log_lines.begin() + 100);
+        if (!log_file) {
+            std::error_code ec;
+            std::filesystem::create_directories("temp", ec);
+            log_file = _wfopen(L"temp/script_log.txt", L"wb");
+        }
+        if (log_file) {
+            std::fputs(line.c_str(), log_file);
+            std::fputc('\n', log_file);
+            std::fflush(log_file);
+        }
+        log_info("script: %s", line.c_str());
+    }
+
+    bool active() const { return vm != nullptr; }
+
+    bool start_source(const std::string& source, std::string name) {
+        if (vm) {
+            log("[busy] a script is already running");
+            return false;
+        }
+        script::CompileError err;
+        // Console echo trick: a line that parses as a lone expression
+        // compiles wrapped in `return (...)` so its value prints.
+        std::unique_ptr<script::Vm> compiled;
+        if (name == "console") {
+            compiled = script::Vm::compile("return (" + source + "\n)",
+                                           name, env, &err);
+        }
+        if (!compiled)
+            compiled = script::Vm::compile(source, name, env, &err);
+        if (!compiled) {
+            log("[compile error] " + name + ":" +
+                std::to_string(err.line) + ": " + err.message);
+            ++failures;
+            return false;
+        }
+        vm = std::move(compiled);
+        script_name = std::move(name);
+        wait = Wait::None;
+        return true;
+    }
+
+    bool start_file(const std::filesystem::path& path) {
+        auto bytes = read_file_bytes(path);
+        if (!bytes) {
+            log("[error] cannot read " + path.string());
+            ++failures;
+            return false;
+        }
+        return start_source(
+            std::string(reinterpret_cast<const char*>(bytes->data()),
+                        bytes->size()),
+            path.filename().string());
+    }
+
+    // Synthetic event helpers. Coordinates arrive in LOGICAL px and
+    // convert here (input.begin_frame divides by the DPI scale).
+    void push_ev(uint64_t at, platform::Event ev) {
+        synth.push_back({frame_no + at, std::move(ev)});
+    }
+    platform::Event mouse_ev(platform::Event::Type type, float lx,
+                             float ly) const {
+        platform::Event ev{};
+        ev.type = type;
+        const float s = window ? window->dpi_scale() : 1.0f;
+        ev.mouse_x = lx * s;
+        ev.mouse_y = ly * s;
+        return ev;
+    }
+    // move + press + release starting this pump; returns frames used.
+    int queue_click(float lx, float ly, bool right, bool dbl) {
+        push_ev(0, mouse_ev(platform::Event::Type::MouseMove, lx, ly));
+        platform::Event down =
+            mouse_ev(platform::Event::Type::MouseDown, lx, ly);
+        down.button = right ? platform::MouseButton::Right
+                            : platform::MouseButton::Left;
+        platform::Event up = down;
+        up.type = platform::Event::Type::MouseUp;
+        push_ev(1, down);
+        push_ev(2, up);
+        if (!dbl) return 3;
+        push_ev(3, down);
+        push_ev(4, up);
+        return 5;
+    }
+
+    void finish() {
+        // A script may die inside an undo_group: close what it opened so
+        // the stack stays usable (the group keeps its collected edits).
+        while (open_groups > 0 && app) {
+            app->undo.end_group();
+            --open_groups;
+        }
+        vm.reset();
+        wait = Wait::None;
+        if (exit_when_done || exit_requested) {
+            if (running) *running = false;
+            if (exit_code == 0 && failures > 0) exit_code = 1;
+        }
+    }
+
+    // Console key handling: strips the events it consumes so UI never
+    // sees them. Runs before synthetic injection.
+    void console_events(std::vector<platform::Event>& evs) {
+        for (size_t i = 0; i < evs.size();) {
+            platform::Event& e = evs[i];
+            const bool key_down = e.type == platform::Event::Type::KeyDown;
+            if (!console_open) {
+                if (key_down && e.key == platform::Key::Grave) {
+                    console_open = true;
+                    evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
+                    // The paired WM_CHAR backtick follows in this batch.
+                    for (size_t j = i; j < evs.size(); ++j)
+                        if (evs[j].type == platform::Event::Type::Char &&
+                            (evs[j].codepoint == '`' ||
+                             evs[j].codepoint == '~')) {
+                            evs.erase(evs.begin() +
+                                      static_cast<ptrdiff_t>(j));
+                            break;
+                        }
+                    continue;
+                }
+                ++i;
+                continue;
+            }
+            // Open: the console owns the keyboard, mouse passes through.
+            if (e.type == platform::Event::Type::Char) {
+                if (e.codepoint == '`' || e.codepoint == '~') {
+                } else if (e.codepoint >= 32 && e.codepoint < 127) {
+                    console_input +=
+                        static_cast<char>(e.codepoint);
+                    hist_pos = -1;
+                }
+                evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
+                continue;
+            }
+            if (key_down) {
+                bool eat = true;
+                switch (e.key) {
+                    case platform::Key::Grave:
+                    case platform::Key::Escape:
+                        console_open = false;
+                        break;
+                    case platform::Key::Backspace:
+                        if (!console_input.empty())
+                            console_input.pop_back();
+                        break;
+                    case platform::Key::Enter: {
+                        std::string line = console_input;
+                        console_input.clear();
+                        hist_pos = -1;
+                        if (!line.empty()) {
+                            console_hist.push_back(line);
+                            log("> " + line);
+                            if (!vm) start_source(line, "console");
+                            else log("[busy] a script is running");
+                        }
+                        break;
+                    }
+                    case platform::Key::Up:
+                        if (!console_hist.empty()) {
+                            if (hist_pos < 0)
+                                hist_pos = static_cast<int>(
+                                               console_hist.size()) -
+                                           1;
+                            else if (hist_pos > 0)
+                                --hist_pos;
+                            console_input =
+                                console_hist[static_cast<size_t>(
+                                    hist_pos)];
+                        }
+                        break;
+                    case platform::Key::Down:
+                        if (hist_pos >= 0) {
+                            ++hist_pos;
+                            if (hist_pos >=
+                                static_cast<int>(console_hist.size())) {
+                                hist_pos = -1;
+                                console_input.clear();
+                            } else {
+                                console_input =
+                                    console_hist[static_cast<size_t>(
+                                        hist_pos)];
+                            }
+                        }
+                        break;
+                    default:
+                        eat = e.key != platform::Key::Ctrl &&
+                              e.key != platform::Key::Shift &&
+                              e.key != platform::Key::Alt;
+                        break;
+                }
+                if (eat) {
+                    evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
+                    continue;
+                }
+            }
+            if (e.type == platform::Event::Type::KeyUp) {
+                evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
+                continue;
+            }
+            ++i;
+        }
+    }
+
+    // One frame of script time: console keys, due synthetic input, then
+    // VM progress (resume a satisfied wait / step the budget).
+    void pump() {
+        ++frame_no;
+        console_events(*events);
+        // Due synthetic events append after the real ones, folding
+        // through the identical input path this same frame.
+        for (size_t i = 0; i < synth.size();) {
+            if (synth[i].frame <= frame_no) {
+                events->push_back(synth[i].ev);
+                synth.erase(synth.begin() + static_cast<ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+        if (!vm) return;
+
+        constexpr uint64_t kBudget = 2'000'000;
+        script::Vm::Status st;
+        if (wait != Wait::None) {
+            script::Value resume_v = script::Value::boolean(true);
+            bool ready = false;
+            bool timed_out = app->app_seconds > wait_deadline;
+            switch (wait) {
+                case Wait::Frames:
+                    ready = --wait_frames <= 0;
+                    timed_out = false;
+                    break;
+                case Wait::Idle:
+                    ready = view_seq > wait_seq0 &&
+                            view_rev == app->document.revision;
+                    break;
+                case Wait::Export:
+                    ready = !app->export_job && app->export_queue.empty();
+                    if (ready)
+                        resume_v = script::Value::string(app->status);
+                    break;
+                case Wait::Import:
+                    ready = app->import == nullptr;
+                    break;
+                case Wait::Capture: {
+                    std::vector<uint8_t> rgba;
+                    uint32_t w = 0, h = 0;
+                    if (renderer->take_capture(&rgba, &w, &h)) {
+                        const bool ok = write_png(capture_path,
+                                                  rgba.data(), w, h);
+                        if (ok)
+                            log("[shot] " + capture_path.string() + " " +
+                                std::to_string(w) + "x" +
+                                std::to_string(h));
+                        else
+                            log("[shot failed] " + capture_path.string());
+                        resume_v = script::Value::boolean(ok);
+                        ready = true;
+                    }
+                    break;
+                }
+                case Wait::None: break;
+            }
+            if (!ready && timed_out) {
+                wait = Wait::None;
+                st = vm->fail("wait timed out");
+            } else if (ready) {
+                wait = Wait::None;
+                st = vm->resume(std::move(resume_v), kBudget);
+            } else {
+                return;
+            }
+        } else {
+            st = vm->run(kBudget);
+        }
+        switch (st) {
+            case script::Vm::Status::Yielded:
+                return;   // budget spent, continue next frame
+            case script::Vm::Status::Suspended:
+                return;   // a wait op recorded its condition
+            case script::Vm::Status::Done: {
+                const script::Value& r = vm->result();
+                std::string tail;
+                if (r.kind != script::Value::Kind::Nil)
+                    tail = " -> " + script::to_display(r);
+                log("[done] " + script_name +
+                    (failures ? " (" + std::to_string(failures) +
+                                    " check failure(s))"
+                              : "") +
+                    tail);
+                finish();
+                return;
+            }
+            case script::Vm::Status::Error:
+                log("[error] " + script_name + ":" +
+                    std::to_string(vm->current_line()) + ": " +
+                    vm->error());
+                ++failures;
+                if (exit_code == 0) exit_code = 1;
+                finish();
+                return;
+        }
+    }
+};
+
+// Console overlay: log tail + input line along the viewport bottom.
+// Drawn last, straight onto the canvas - no layout, no hit targets
+// (keyboard-only by design).
+void draw_console(ScriptHost& sh, ui::Canvas2D& canvas,
+                  const ui::Font& font, const ui::Rect& viewport) {
+    if (!sh.console_open) return;
+    const ui::Theme& th = ui::active_theme();
+    const float fs = th.font_size;
+    const float line_h = font.line_height() * fs + 3.0f;
+    const int show = std::min<int>(14, static_cast<int>(
+                                           sh.log_lines.size()));
+    const float h = 30.0f + static_cast<float>(show) * line_h;
+    const ui::Rect r{viewport.x, viewport.bottom() - h, viewport.w, h};
+    ui::Color bg = th.panel_bg;
+    bg.a = 0.96f;
+    canvas.draw_rect(r, bg);
+    canvas.draw_rect({r.x, r.y, r.w, 1.0f}, th.accent);
+    float y = r.y + 6.0f;
+    const size_t start = sh.log_lines.size() - static_cast<size_t>(show);
+    for (size_t i = start; i < sh.log_lines.size(); ++i) {
+        ui::draw_text(canvas, font, sh.log_lines[i],
+                      {r.x + 8.0f, y}, fs, th.text_dim);
+        y += line_h;
+    }
+    ui::draw_text(canvas, font, "] " + sh.console_input + "_",
+                  {r.x + 8.0f, y + 2.0f}, fs, th.text);
+}
+
+// ---- op plumbing: argument readers that raise script errors in place.
+
+script::Value op_err(script::Vm& vm, const std::string& msg) {
+    vm.set_error(msg);
+    return script::Value::nil();
+}
+
+doc::Look* arg_look(ScriptHost& sh, script::Vm& vm,
+                    const script::Value& v) {
+    doc::Look* l = sh.app->document.find_look(v.as_id());
+    if (!l) vm.set_error("no look with id " + script::to_display(v));
+    return l;
+}
+
+doc::Sequence* arg_seq(ScriptHost& sh, script::Vm& vm,
+                       const script::Value& v) {
+    doc::Sequence* s = sh.app->document.find_sequence(v.as_id());
+    if (!s) vm.set_error("no sequence with id " + script::to_display(v));
+    return s;
+}
+
+bool arg_num(script::Vm& vm, const script::Value& v, const char* what,
+             double* out) {
+    if (!v.is_num()) {
+        vm.set_error(std::string(what) + " must be a number");
+        return false;
+    }
+    *out = v.num;
+    return true;
+}
+
+// Effect type from its stable string id ("glow"); Count = not found.
+doc::EffectType effect_type_by_id(const std::string& id) {
+    for (uint32_t t = 0; t < static_cast<uint32_t>(doc::EffectType::Count);
+         ++t) {
+        const auto et = static_cast<doc::EffectType>(t);
+        if (id == doc::effect_info(et).id) return et;
+    }
+    return doc::EffectType::Count;
+}
+
+int blend_by_name(const std::string& n) {
+    const char* names[] = {"normal", "add", "multiply", "screen",
+                           "difference"};
+    for (int i = 0; i < 5; ++i)
+        if (n == names[i]) return i;
+    return -1;
+}
+const char* blend_name(doc::BlendMode m) {
+    const char* names[] = {"normal", "add", "multiply", "screen",
+                           "difference"};
+    const auto i = static_cast<size_t>(m);
+    return i < 5 ? names[i] : "normal";
+}
+
+// Param index from a name ("wet"/"opacity"/a ParamDesc id) or a plain
+// number. INT_MIN = unresolved.
+int param_index_of(const doc::EffectInstance& fx, const script::Value& v) {
+    if (v.is_num()) return static_cast<int>(v.num);
+    if (!v.is_str()) return INT_MIN;
+    const std::string& name = v.as_str();
+    if (name == "wet") return doc::kWetParam;
+    if (name == "opacity") return doc::kOpacityParam;
+    const doc::EffectInfo& info = doc::effect_info(fx.type);
+    for (uint32_t i = 0; i < info.param_count; ++i)
+        if (name == info.params[i].id) return static_cast<int>(i);
+    return INT_MIN;
+}
+
+// Layer param slot index by table id ("opacity", "color_a.r", "phase").
+int layer_param_index_of(const std::string& name) {
+    static constexpr const char* ids[doc::kLayerParamCount] = {
+        "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
+        "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
+        "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
+        "slip",    "waveform",  "phase"};
+    for (int i = 0; i < doc::kLayerParamCount; ++i)
+        if (name == ids[i]) return i;
+    return INT_MIN;
+}
+
+// The tail of `layer`'s wire chain under materialized links, following
+// the port-0 flow (Output preferred on fan-out), and the link leaving
+// it. found_out=false = the tail dangles.
+uint64_t chain_tail(const doc::Look& look, uint64_t layer_id,
+                    doc::NodeLink* out_link, bool* found_out) {
+    uint64_t cur = layer_id;
+    *found_out = false;
+    for (int guard = 0; guard < 256; ++guard) {
+        const doc::NodeLink* next = nullptr;
+        for (const doc::NodeLink& l : look.links) {
+            if (doc::link_is_tombstone(l) || l.from != cur) continue;
+            if (l.to == 0) {
+                next = &l;
+                break;   // the Output feed wins fan-out
+            }
+            if (l.to_port == 0 && !next) next = &l;
+        }
+        if (!next) return cur;   // dangling tail
+        if (next->to == 0 || next->to_port != 0) {
+            *out_link = *next;
+            *found_out = true;
+            return cur;
+        }
+        *out_link = *next;
+        *found_out = true;
+        cur = next->to;
+    }
+    return cur;
+}
+
+script::Value id_list(const std::vector<uint64_t>& ids) {
+    script::Value out = script::Value::make_list();
+    for (const uint64_t id : ids)
+        out.list->push_back(
+            script::Value::number(static_cast<double>(id)));
+    return out;
+}
+
+void map_put(script::Value& m, const char* k, script::Value v) {
+    (*m.map)[k] = std::move(v);
+}
+void map_num(script::Value& m, const char* k, double v) {
+    map_put(m, k, script::Value::number(v));
+}
+void map_str(script::Value& m, const char* k, std::string v) {
+    map_put(m, k, script::Value::string(std::move(v)));
+}
+void map_bool(script::Value& m, const char* k, bool v) {
+    map_put(m, k, script::Value::boolean(v));
+}
+// Optional-field readers for set_* ops taking maps.
+bool map_get_num(const script::Value& m, const char* k, double* out) {
+    const auto it = m.map->find(k);
+    if (it == m.map->end() || !it->second.is_num()) return false;
+    *out = it->second.num;
+    return true;
+}
+bool map_get_bool(const script::Value& m, const char* k, bool* out) {
+    const auto it = m.map->find(k);
+    if (it == m.map->end() ||
+        it->second.kind != script::Value::Kind::Bool)
+        return false;
+    *out = it->second.b;
+    return true;
+}
+bool map_get_str(const script::Value& m, const char* k, std::string* out) {
+    const auto it = m.map->find(k);
+    if (it == m.map->end() || !it->second.is_str()) return false;
+    *out = it->second.as_str();
+    return true;
+}
+
+// ---- meta / logging / waits / app drivers
+
+void register_ops_app(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    using script::Value;
+    using script::Vm;
+
+    env.add("ops", "ops() -> every op signature", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                Value out = Value::make_list();
+                for (const script::NativeDef& d : sh.env.defs())
+                    out.list->push_back(Value::string(d.sig));
+                return out;
+            });
+    env.add("doc", "doc(op_name) -> signature", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const script::NativeDef* d = sh.env.find(a[0].as_str());
+                if (!d) return op_err(vm, "no op named " + a[0].as_str());
+                return Value::string(d->sig);
+            });
+    env.add("log", "log(values...)", 0, -1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                std::string line;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    if (i) line += " ";
+                    line += script::to_display(a[i]);
+                }
+                sh.log(line);
+                return Value::nil();
+            });
+    env.add("status", "status(message) -> the app status line", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->status = script::to_display(a[0]);
+                return Value::nil();
+            });
+    env.add("assert", "assert(cond, message?) - failure aborts the script",
+            1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                if (a[0].truthy()) return Value::boolean(true);
+                const std::string msg =
+                    a.size() > 1 ? script::to_display(a[1]) : "assert";
+                ++sh.failures;
+                sh.log("[assert failed] " + msg);
+                return op_err(vm, "assert failed: " + msg);
+            });
+    env.add("check", "check(cond, message?) - failure logs and continues",
+            1, 2, [&sh](Vm&, std::vector<Value>& a) {
+                if (!a[0].truthy()) {
+                    ++sh.failures;
+                    sh.log("[check failed] " +
+                           (a.size() > 1 ? script::to_display(a[1])
+                                         : std::string("check")));
+                }
+                return Value::boolean(a[0].truthy());
+            });
+    env.add("fail", "fail(message) - abort the script", 1, 1,
+            [](Vm& vm, std::vector<Value>& a) {
+                return op_err(vm, script::to_display(a[0]));
+            });
+    env.add("exit", "exit(code?) - quit the app when the script ends", 0,
+            1, [&sh](Vm&, std::vector<Value>& a) {
+                sh.exit_requested = true;
+                if (!a.empty() && a[0].is_num())
+                    sh.exit_code = static_cast<int>(a[0].num);
+                return Value::nil();
+            });
+
+    env.add("wait", "wait(frames?) - suspend for n frames (default 1)", 0,
+            1, [&sh](Vm& vm, std::vector<Value>& a) {
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames =
+                    !a.empty() && a[0].is_num()
+                        ? std::max(1, static_cast<int>(a[0].num))
+                        : 1;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("wait_idle",
+            "wait_idle(timeout_s?) - until the monitor shows the current "
+            "document",
+            0, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                sh.worker->poke();
+                sh.wait = ScriptHost::Wait::Idle;
+                sh.wait_seq0 = sh.worker->snapshot_seq();
+                const double t =
+                    !a.empty() && a[0].is_num() ? a[0].num : 10.0;
+                sh.wait_deadline = sh.app->app_seconds + t;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("wait_export",
+            "wait_export(timeout_s?) -> the export's status line", 0, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                sh.wait = ScriptHost::Wait::Export;
+                const double t =
+                    !a.empty() && a[0].is_num() ? a[0].num : 600.0;
+                sh.wait_deadline = sh.app->app_seconds + t;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("wait_import", "wait_import(timeout_s?)", 0, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                sh.wait = ScriptHost::Wait::Import;
+                const double t =
+                    !a.empty() && a[0].is_num() ? a[0].num : 600.0;
+                sh.wait_deadline = sh.app->app_seconds + t;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("screenshot",
+            "screenshot(path) - the app window, exact pixels", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str())
+                    return op_err(vm, "screenshot(path)");
+                sh.renderer->request_capture();
+                sh.capture_path = std::filesystem::path(a[0].as_str());
+                sh.wait = ScriptHost::Wait::Capture;
+                sh.wait_deadline = sh.app->app_seconds + 5.0;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+
+    env.add("open", "open(path) - project json or media", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const std::filesystem::path p(a[0].as_str());
+                std::error_code ec;
+                if (!std::filesystem::exists(p, ec))
+                    return op_err(vm, "no file " + p.string());
+                if (p.extension() == ".json")
+                    open_project(*sh.app, p, sh.window);
+                else
+                    open_source(*sh.app, p);
+                return Value::boolean(true);
+            });
+    env.add("import", "import(path) - media into the project", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const std::filesystem::path p(a[0].as_str());
+                std::error_code ec;
+                if (!std::filesystem::exists(p, ec))
+                    return op_err(vm, "no file " + p.string());
+                if (sh.app->import)
+                    return op_err(vm, "an import is already running");
+                open_source(*sh.app, p);
+                return Value::boolean(true);
+            });
+    env.add("save", "save() - to the project's own path", 0, 0,
+            [&sh](Vm& vm, std::vector<Value>&) {
+                if (sh.app->project_path.empty())
+                    return op_err(vm,
+                                  "untitled project - use save_as(path)");
+                save_project(*sh.app, sh.app->project_path);
+                return Value::boolean(true);
+            });
+    env.add("save_as", "save_as(path)", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str()) return op_err(vm, "save_as(path)");
+                std::filesystem::path p(a[0].as_str());
+                if (p.extension() != ".json")
+                    p.replace_extension(".json");
+                save_project(*sh.app, p);
+                return Value::boolean(true);
+            });
+    env.add("export_mp4",
+            "export_mp4(path) - the scoped entity; wait_export() joins it",
+            1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str()) return op_err(vm, "export_mp4(path)");
+                AppState& app = *sh.app;
+                if (!app.has_timeline())
+                    return op_err(vm, "nothing to export");
+                std::filesystem::path out(a[0].as_str());
+                if (out.extension() != ".mp4")
+                    out.replace_extension(".mp4");
+                const std::filesystem::path scope_pcm =
+                    app.document.sidechain_mux && app.sc_ok
+                        ? app.sc_pcm_path
+                        : std::filesystem::path();
+                if (!app.export_job) {
+                    app.export_job = start_export(
+                        sh.renderer->device(), *sh.shader_dir,
+                        build_bundle_table(app.document, false),
+                        app.pcm_cache, scope_pcm, app.document,
+                        app.scope_look,
+                        app.has_analysis ? &app.analysis : nullptr,
+                        app.node_audio_map, out);
+                } else {
+                    AppState::QueuedExport q;
+                    q.out_path = out;
+                    q.doc = app.document;
+                    q.look_id = app.scope_look;
+                    q.has_analysis = app.has_analysis;
+                    if (app.has_analysis) q.analysis = app.analysis;
+                    q.node_audio = app.node_audio_map;
+                    q.bundles = build_bundle_table(app.document, false);
+                    q.pcm = app.pcm_cache;
+                    q.scope_pcm = scope_pcm;
+                    app.export_queue.push_back(std::move(q));
+                }
+                return Value::boolean(true);
+            });
+
+    env.add("scope", "scope(id?) - enter, or read the current scope", 0, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (a.empty())
+                    return Value::number(
+                        static_cast<double>(sh.app->scope_look));
+                if (!enter_scope(*sh.app, a[0].as_id()))
+                    return op_err(vm, "no entity with id " +
+                                          script::to_display(a[0]));
+                return Value::boolean(true);
+            });
+    env.add("scope_root", "scope_root() - the project timeline", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                enter_scope(*sh.app, sh.app->document.root_sequence);
+                return Value::boolean(true);
+            });
+    env.add("seek", "seek(frame)", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                double f = 0.0;
+                if (!arg_num(vm, a[0], "frame", &f)) return Value::nil();
+                sh.app->player.seek_frame(
+                    static_cast<uint32_t>(std::max(0.0, f)));
+                return Value::nil();
+            });
+    env.add("play", "play()", 0, 0, [&sh](Vm&, std::vector<Value>&) {
+        sh.app->player.play();
+        return Value::nil();
+    });
+    env.add("pause", "pause()", 0, 0, [&sh](Vm&, std::vector<Value>&) {
+        sh.app->player.pause();
+        return Value::nil();
+    });
+    env.add("playing", "playing() -> bool", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::boolean(sh.app->player.playing());
+            });
+    env.add("playhead", "playhead() -> current frame", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::number(static_cast<double>(
+                    sh.app->player.current_frame_index()));
+            });
+    env.add("frames", "frames() -> player frame count", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::number(static_cast<double>(
+                    sh.app->player.frame_count()));
+            });
+    env.add("fps", "fps() -> project rate", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::number(sh.app->player.fps());
+            });
+    env.add("set_loop", "set_loop(on)", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->loop = a[0].truthy();
+                sh.app->player.set_looping(sh.app->loop);
+                return Value::nil();
+            });
+    env.add("set_live", "set_live(on) - live mode (non-deterministic)", 1,
+            1, [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->live_mode = a[0].truthy();
+                return Value::nil();
+            });
+    env.add("set_preview_div", "set_preview_div(1|2|4)", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint32_t d = static_cast<uint32_t>(a[0].as_id());
+                if (d != 1 && d != 2 && d != 4)
+                    return op_err(vm, "set_preview_div(1|2|4)");
+                sh.app->preview_div = d;
+                return Value::nil();
+            });
+    env.add("set_still_duration",
+            "set_still_duration(frames) - the opened still asset", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                double f = 0.0;
+                if (!arg_num(vm, a[0], "frames", &f)) return Value::nil();
+                if (!set_still_frames(*sh.app,
+                                      static_cast<uint32_t>(f)))
+                    return op_err(vm, "no opened still to re-time");
+                return Value::boolean(true);
+            });
+
+    env.add("undo", "undo(n?)", 0, 1, [&sh](Vm&, std::vector<Value>& a) {
+        int n = !a.empty() && a[0].is_num()
+                    ? std::max(1, static_cast<int>(a[0].num))
+                    : 1;
+        int done = 0;
+        while (n-- > 0 && sh.app->undo.undo(sh.app->document)) ++done;
+        return Value::number(done);
+    });
+    env.add("redo", "redo(n?)", 0, 1, [&sh](Vm&, std::vector<Value>& a) {
+        int n = !a.empty() && a[0].is_num()
+                    ? std::max(1, static_cast<int>(a[0].num))
+                    : 1;
+        int done = 0;
+        while (n-- > 0 && sh.app->undo.redo(sh.app->document)) ++done;
+        return Value::number(done);
+    });
+    env.add("undo_group",
+            "undo_group(name) - batch edits into one undo step until "
+            "end_undo_group()",
+            1, 1, [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->undo.begin_group(script::to_display(a[0]));
+                ++sh.open_groups;
+                return Value::nil();
+            });
+    env.add("end_undo_group", "end_undo_group()", 0, 0,
+            [&sh](Vm& vm, std::vector<Value>&) {
+                if (sh.open_groups <= 0)
+                    return op_err(vm, "no open undo group");
+                sh.app->undo.end_group();
+                --sh.open_groups;
+                return Value::nil();
+            });
+    env.add("can_undo", "can_undo() -> bool", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::boolean(sh.app->undo.can_undo());
+            });
+    env.add("undo_depth", "undo_depth() -> entries", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::number(
+                    static_cast<double>(sh.app->undo.undo_depth()));
+            });
+    env.add("revision", "revision() -> document revision", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::number(
+                    static_cast<double>(sh.app->document.revision));
+            });
+    env.add("dirty", "dirty() -> unsaved changes", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::boolean(sh.app->document.revision !=
+                                      sh.app->saved_revision);
+            });
+
+    env.add("select", "select(node_id) - effect/layer/group/value node",
+            1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                AppState& app = *sh.app;
+                const uint64_t id = a[0].as_id();
+                doc::Look& lk = app.look();
+                size_t li = 0, fi = 0;
+                if (find_effect_by_id(lk, id, &li, &fi)) {
+                    app.sel = {SelKind::Effect, id};
+                    app.selected_layer = li;
+                    return Value::boolean(true);
+                }
+                if (layer_index_by_id(lk, id) >= 0) {
+                    app.sel = {SelKind::LayerSource, id};
+                    app.selected_layer = static_cast<size_t>(
+                        layer_index_by_id(lk, id));
+                    return Value::boolean(true);
+                }
+                if (doc::find_value_node(lk, id)) {
+                    app.sel = {SelKind::ModSource, id};
+                    return Value::boolean(true);
+                }
+                for (doc::Layer& l : lk.layers)
+                    if (doc::find_group(l, id)) {
+                        app.sel = {SelKind::Group, id};
+                        return Value::boolean(true);
+                    }
+                return op_err(vm, "nothing in the scoped look has id " +
+                                      script::to_display(a[0]));
+            });
+    env.add("select_layer", "select_layer(look, layer) - the rail target",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const int li = layer_index_by_id(*lk, a[1].as_id());
+                if (li < 0) return op_err(vm, "no such layer");
+                sh.app->selected_layer = static_cast<size_t>(li);
+                sh.app->layer_sel = true;
+                return Value::boolean(true);
+            });
+    env.add("select_block", "select_block(placement)", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->sel_placement = a[0].as_id();
+                return Value::nil();
+            });
+    env.add("deselect", "deselect()", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                sh.app->sel = {};
+                sh.app->layer_sel = false;
+                sh.app->sel_placement = 0;
+                sh.app->multi_sel.clear();
+                return Value::nil();
+            });
+    env.add("viewport", "viewport() -> {w, h} logical px", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                Value m = Value::make_map();
+                const float s = sh.window->dpi_scale();
+                map_num(m, "w", sh.window->width() / s);
+                map_num(m, "h", sh.window->height() / s);
+                return m;
+            });
+}
+
+// ---- synthetic input + probes
+
+// Click targets: (x, y) numbers, or a probe name with optional index.
+bool resolve_target(ScriptHost& sh, script::Vm& vm,
+                    std::vector<script::Value>& a, float* x, float* y,
+                    size_t* consumed) {
+    if (!a.empty() && a[0].is_num()) {
+        if (a.size() < 2 || !a[1].is_num()) {
+            vm.set_error("expected (x, y) or (probe_name, index?)");
+            return false;
+        }
+        *x = static_cast<float>(a[0].num);
+        *y = static_cast<float>(a[1].num);
+        *consumed = 2;
+        return true;
+    }
+    if (!a.empty() && a[0].is_str()) {
+        const int idx = a.size() > 1 && a[1].is_num()
+                            ? static_cast<int>(a[1].num)
+                            : 0;
+        ui::Rect r;
+        if (!ui::probe_find(a[0].as_str(), idx, &r)) {
+            vm.set_error("no probe named \"" + a[0].as_str() +
+                         "\" - probes() lists them");
+            return false;
+        }
+        *x = r.x + r.w * 0.5f;
+        *y = r.y + r.h * 0.5f;
+        *consumed = a.size() > 1 && a[1].is_num() ? 2 : 1;
+        return true;
+    }
+    vm.set_error("expected (x, y) or (probe_name, index?)");
+    return false;
+}
+
+void register_ops_input(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    using script::Value;
+    using script::Vm;
+
+    env.add("probes", "probes() -> named widget rects of the last frame",
+            0, 0, [](Vm&, std::vector<Value>&) {
+                Value out = Value::make_list();
+                for (const ui::Probe& p : ui::probe_list())
+                    out.list->push_back(Value::string(p.name));
+                return out;
+            });
+    env.add("rect", "rect(probe_name, index?) -> {x,y,w,h} or nil", 1, 2,
+            [](Vm&, std::vector<Value>& a) {
+                const int idx = a.size() > 1 && a[1].is_num()
+                                    ? static_cast<int>(a[1].num)
+                                    : 0;
+                ui::Rect r;
+                if (!ui::probe_find(a[0].as_str(), idx, &r))
+                    return Value::nil();
+                Value m = Value::make_map();
+                map_num(m, "x", r.x);
+                map_num(m, "y", r.y);
+                map_num(m, "w", r.w);
+                map_num(m, "h", r.h);
+                return m;
+            });
+    env.add("click", "click(x, y) or click(probe_name, index?)", 1, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                float x = 0.0f, y = 0.0f;
+                size_t used = 0;
+                if (!resolve_target(sh, vm, a, &x, &y, &used))
+                    return Value::nil();
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = sh.queue_click(x, y, false, false);
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("rclick", "rclick(x, y) or rclick(probe_name, index?)", 1, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                float x = 0.0f, y = 0.0f;
+                size_t used = 0;
+                if (!resolve_target(sh, vm, a, &x, &y, &used))
+                    return Value::nil();
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = sh.queue_click(x, y, true, false);
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("dblclick", "dblclick(x, y) or dblclick(probe_name, index?)",
+            1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                float x = 0.0f, y = 0.0f;
+                size_t used = 0;
+                if (!resolve_target(sh, vm, a, &x, &y, &used))
+                    return Value::nil();
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = sh.queue_click(x, y, false, true);
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("move_mouse", "move_mouse(x, y)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_num() || !a[1].is_num())
+                    return op_err(vm, "move_mouse(x, y)");
+                sh.push_ev(0, sh.mouse_ev(
+                                  platform::Event::Type::MouseMove,
+                                  static_cast<float>(a[0].num),
+                                  static_cast<float>(a[1].num)));
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = 1;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("drag", "drag(x0, y0, x1, y1, frames?)", 4, 5,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                for (int i = 0; i < 4; ++i)
+                    if (!a[static_cast<size_t>(i)].is_num())
+                        return op_err(vm, "drag(x0, y0, x1, y1, frames?)");
+                const float x0 = static_cast<float>(a[0].num);
+                const float y0 = static_cast<float>(a[1].num);
+                const float x1 = static_cast<float>(a[2].num);
+                const float y1 = static_cast<float>(a[3].num);
+                const int steps =
+                    a.size() > 4 && a[4].is_num()
+                        ? std::max(2, static_cast<int>(a[4].num))
+                        : 8;
+                sh.push_ev(0, sh.mouse_ev(
+                                  platform::Event::Type::MouseMove, x0,
+                                  y0));
+                platform::Event down = sh.mouse_ev(
+                    platform::Event::Type::MouseDown, x0, y0);
+                down.button = platform::MouseButton::Left;
+                sh.push_ev(1, down);
+                for (int i = 1; i <= steps; ++i) {
+                    const float t = static_cast<float>(i) /
+                                    static_cast<float>(steps);
+                    sh.push_ev(1 + static_cast<uint64_t>(i),
+                               sh.mouse_ev(
+                                   platform::Event::Type::MouseMove,
+                                   x0 + (x1 - x0) * t,
+                                   y0 + (y1 - y0) * t));
+                }
+                platform::Event up = sh.mouse_ev(
+                    platform::Event::Type::MouseUp, x1, y1);
+                up.button = platform::MouseButton::Left;
+                sh.push_ev(2 + static_cast<uint64_t>(steps), up);
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = steps + 3;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("wheel", "wheel(dy, x?, y?) - scroll at the cursor or (x,y)",
+            1, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_num()) return op_err(vm, "wheel(dy, x?, y?)");
+                uint64_t at = 0;
+                if (a.size() == 3 && a[1].is_num() && a[2].is_num()) {
+                    sh.push_ev(0, sh.mouse_ev(
+                                      platform::Event::Type::MouseMove,
+                                      static_cast<float>(a[1].num),
+                                      static_cast<float>(a[2].num)));
+                    at = 1;
+                }
+                platform::Event ev{};
+                ev.type = platform::Event::Type::MouseWheel;
+                ev.wheel_y = static_cast<float>(a[0].num);
+                sh.push_ev(at, ev);
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = static_cast<int>(at) + 1;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("key", "key(name, mods?) - \"f\", \"space\", \"z\"+\"ctrl\"",
+            1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                const std::string name = a[0].as_str();
+                platform::Key k = platform::Key::Unknown;
+                if (name.size() == 1) {
+                    const char c = name[0];
+                    if (c >= 'a' && c <= 'z')
+                        k = static_cast<platform::Key>(
+                            static_cast<int>(platform::Key::A) +
+                            (c - 'a'));
+                    else if (c >= '0' && c <= '9')
+                        k = static_cast<platform::Key>(
+                            static_cast<int>(platform::Key::Num0) +
+                            (c - '0'));
+                    else if (c == '[') k = platform::Key::LeftBracket;
+                    else if (c == ']') k = platform::Key::RightBracket;
+                    else if (c == '-') k = platform::Key::Minus;
+                    else if (c == '=') k = platform::Key::Equals;
+                    else if (c == ',') k = platform::Key::Comma;
+                    else if (c == '.') k = platform::Key::Period;
+                    else if (c == '/') k = platform::Key::Slash;
+                } else if (name == "space") k = platform::Key::Space;
+                else if (name == "enter") k = platform::Key::Enter;
+                else if (name == "esc") k = platform::Key::Escape;
+                else if (name == "tab") k = platform::Key::Tab;
+                else if (name == "backspace") k = platform::Key::Backspace;
+                else if (name == "delete") k = platform::Key::Delete;
+                else if (name == "home") k = platform::Key::Home;
+                else if (name == "end") k = platform::Key::End;
+                else if (name == "left") k = platform::Key::Left;
+                else if (name == "right") k = platform::Key::Right;
+                else if (name == "up") k = platform::Key::Up;
+                else if (name == "down") k = platform::Key::Down;
+                if (k == platform::Key::Unknown)
+                    return op_err(vm, "unknown key \"" + name + "\"");
+                uint32_t mods = 0;
+                if (a.size() > 1 && a[1].is_str()) {
+                    const std::string& m = a[1].as_str();
+                    if (m.find("ctrl") != std::string::npos)
+                        mods |= platform::kModCtrl;
+                    if (m.find("shift") != std::string::npos)
+                        mods |= platform::kModShift;
+                    if (m.find("alt") != std::string::npos)
+                        mods |= platform::kModAlt;
+                }
+                platform::Event down{};
+                down.type = platform::Event::Type::KeyDown;
+                down.key = k;
+                down.mods = mods;
+                platform::Event up = down;
+                up.type = platform::Event::Type::KeyUp;
+                sh.push_ev(0, down);
+                sh.push_ev(0, up);
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = 1;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("text", "text(string) - type into the focused field", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str()) return op_err(vm, "text(string)");
+                for (const char c : a[0].as_str()) {
+                    platform::Event ev{};
+                    ev.type = platform::Event::Type::Char;
+                    ev.codepoint = static_cast<uint32_t>(
+                        static_cast<unsigned char>(c));
+                    sh.push_ev(0, ev);
+                }
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = 1;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("drop_file", "drop_file(path, x?, y?)", 1, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str())
+                    return op_err(vm, "drop_file(path, x?, y?)");
+                uint64_t at = 0;
+                if (a.size() == 3 && a[1].is_num() && a[2].is_num()) {
+                    sh.push_ev(0, sh.mouse_ev(
+                                      platform::Event::Type::MouseMove,
+                                      static_cast<float>(a[1].num),
+                                      static_cast<float>(a[2].num)));
+                    at = 1;
+                }
+                platform::Event ev{};
+                ev.type = platform::Event::Type::FileDrop;
+                ev.drop_path = a[0].as_str();
+                sh.push_ev(at, ev);
+                sh.wait = ScriptHost::Wait::Frames;
+                sh.wait_frames = static_cast<int>(at) + 1;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+}
+
+// ---- entities: looks / sequences / assets / bins
+
+void register_ops_entities(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    using script::Value;
+    using script::Vm;
+
+    env.add("looks", "looks() -> look ids", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                std::vector<uint64_t> ids;
+                for (const doc::Look& l : sh.app->document.looks)
+                    ids.push_back(l.id);
+                return id_list(ids);
+            });
+    env.add("sequences", "sequences() -> sequence ids", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                std::vector<uint64_t> ids;
+                for (const doc::Sequence& s : sh.app->document.sequences)
+                    ids.push_back(s.id);
+                return id_list(ids);
+            });
+    env.add("assets", "assets() -> asset ids", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                std::vector<uint64_t> ids;
+                for (const doc::Asset& a2 : sh.app->document.assets)
+                    ids.push_back(a2.id);
+                return id_list(ids);
+            });
+    env.add("bins", "bins() -> browser bin ids", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                std::vector<uint64_t> ids;
+                for (const doc::Bin& b : sh.app->document.bins)
+                    ids.push_back(b.id);
+                return id_list(ids);
+            });
+    env.add("root", "root() -> the project timeline's id", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                return Value::number(static_cast<double>(
+                    sh.app->document.root_sequence));
+            });
+    env.add("kind", "kind(id) -> look|sequence|asset|bin|\"\"", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                const doc::Document& d = sh.app->document;
+                if (d.find_look(id)) return Value::string("look");
+                if (d.find_sequence(id)) return Value::string("sequence");
+                if (d.find_asset(id)) return Value::string("asset");
+                if (d.find_bin(id)) return Value::string("bin");
+                return Value::string("");
+            });
+    env.add("name", "name(id) -> entity/layer/group name", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                doc::Document& d = sh.app->document;
+                if (const doc::Look* l = d.find_look(id))
+                    return Value::string(l->name);
+                if (const doc::Sequence* s = d.find_sequence(id))
+                    return Value::string(s->name);
+                if (const doc::Asset* as = d.find_asset(id))
+                    return Value::string(as->name);
+                if (const doc::Bin* b = d.find_bin(id))
+                    return Value::string(b->name);
+                for (doc::Look& l : d.looks) {
+                    if (doc::Layer* lay = doc::find_layer(l, id))
+                        return Value::string(lay->name);
+                    for (doc::Layer& lay : l.layers)
+                        if (doc::Group* g = doc::find_group(lay, id))
+                            return Value::string(g->name);
+                }
+                return Value::string("");
+            });
+    env.add("rename", "rename(id, name)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                const std::string nm = script::to_display(a[1]);
+                AppState& app = *sh.app;
+                doc::Document& d = app.document;
+                if (const doc::Look* l = d.find_look(id)) {
+                    app.undo.execute(d, doc::set_look_props_command(
+                                            id, nm, l->duration));
+                    return Value::boolean(true);
+                }
+                if (const doc::Sequence* s = d.find_sequence(id)) {
+                    app.undo.execute(d, doc::set_sequence_props_command(
+                                            id, nm, s->duration));
+                    return Value::boolean(true);
+                }
+                if (const doc::Asset* as = d.find_asset(id)) {
+                    doc::Asset up = *as;
+                    up.name = nm;
+                    app.undo.execute(d, doc::set_asset_command(up));
+                    return Value::boolean(true);
+                }
+                if (const doc::Bin* b = d.find_bin(id)) {
+                    app.undo.execute(d, doc::set_bin_props_command(
+                                            id, nm, b->parent));
+                    return Value::boolean(true);
+                }
+                for (doc::Look& l : d.looks)
+                    if (doc::Layer* lay = doc::find_layer(l, id)) {
+                        doc::Layer up = *lay;
+                        up.name = nm;
+                        app.undo.execute(d, doc::set_layer_props_command(
+                                                l.id, std::move(up)));
+                        return Value::boolean(true);
+                    }
+                return op_err(vm, "nothing renamable with id " +
+                                      script::to_display(a[0]));
+            });
+    env.add("duration", "duration(id) -> frames (look/sequence/asset)", 1,
+            1, [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                const doc::Document& d = sh.app->document;
+                if (const doc::Look* l = d.find_look(id))
+                    return Value::number(static_cast<double>(
+                        doc::look_duration(d, *l)));
+                if (const doc::Sequence* s = d.find_sequence(id))
+                    return Value::number(static_cast<double>(
+                        doc::sequence_duration(d, *s)));
+                if (const doc::Asset* as = d.find_asset(id))
+                    return Value::number(
+                        static_cast<double>(as->frame_count));
+                return op_err(vm, "no entity with id " +
+                                      script::to_display(a[0]));
+            });
+    env.add("set_duration",
+            "set_duration(id, frames) - look/sequence; 0 = derived", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                double f = 0.0;
+                if (!arg_num(vm, a[1], "frames", &f)) return Value::nil();
+                const uint32_t fr =
+                    static_cast<uint32_t>(std::max(0.0, f));
+                AppState& app = *sh.app;
+                if (const doc::Look* l = app.document.find_look(id)) {
+                    app.undo.execute(app.document,
+                                     doc::set_look_props_command(
+                                         id, l->name, fr));
+                    return Value::boolean(true);
+                }
+                if (const doc::Sequence* s =
+                        app.document.find_sequence(id)) {
+                    app.undo.execute(app.document,
+                                     doc::set_sequence_props_command(
+                                         id, s->name, fr));
+                    return Value::boolean(true);
+                }
+                return op_err(vm, "no look or sequence with that id");
+            });
+    env.add("new_look", "new_look(name) -> id", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                AppState& app = *sh.app;
+                doc::Look look = doc::make_look(app.document,
+                                                script::to_display(a[0]));
+                const uint64_t id = look.id;
+                app.undo.execute(app.document,
+                                 doc::add_look_command(std::move(look)));
+                return Value::number(static_cast<double>(id));
+            });
+    env.add("new_sequence", "new_sequence(name) -> id", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                AppState& app = *sh.app;
+                doc::Sequence seq = doc::make_sequence(
+                    app.document, script::to_display(a[0]));
+                const uint64_t id = seq.id;
+                app.undo.execute(app.document,
+                                 doc::add_sequence_command(std::move(seq)));
+                return Value::number(static_cast<double>(id));
+            });
+    env.add("remove_look", "remove_look(id)", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!arg_look(sh, vm, a[0])) return Value::nil();
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::remove_look_command(a[0].as_id()));
+                return Value::boolean(true);
+            });
+    env.add("remove_sequence", "remove_sequence(id) - never the root", 1,
+            1, [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!arg_seq(sh, vm, a[0])) return Value::nil();
+                if (a[0].as_id() == sh.app->document.root_sequence)
+                    return op_err(vm, "the root sequence stays");
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::remove_sequence_command(a[0].as_id()));
+                return Value::boolean(true);
+            });
+    env.add("remove_asset", "remove_asset(id) - media layers go dormant",
+            1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!sh.app->document.find_asset(a[0].as_id()))
+                    return op_err(vm, "no asset with that id");
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::remove_asset_command(a[0].as_id()));
+                refresh_bundles(*sh.app);
+                return Value::boolean(true);
+            });
+    env.add("asset_info",
+            "asset_info(id) -> {name,path,frames,fps,w,h,bin,still}", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const doc::Asset* as =
+                    sh.app->document.find_asset(a[0].as_id());
+                if (!as) return op_err(vm, "no asset with that id");
+                Value m = Value::make_map();
+                map_num(m, "id", static_cast<double>(as->id));
+                map_str(m, "name", as->name);
+                map_str(m, "path", as->path);
+                map_num(m, "frames", as->frame_count);
+                map_num(m, "fps", as->fps);
+                map_num(m, "w", as->width);
+                map_num(m, "h", as->height);
+                map_num(m, "bin", static_cast<double>(as->bin));
+                map_num(m, "still", as->still_duration_frames);
+                return m;
+            });
+    env.add("asset_look",
+            "asset_look(asset) -> the wrapper look's id (0 = none)", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                return Value::number(static_cast<double>(
+                    find_wrapper_look(sh.app->document, a[0].as_id())));
+            });
+    env.add("bin_of", "bin_of(id) -> the entity's browser bin (0 = root)",
+            1, 1, [&sh](Vm&, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                const doc::Document& d = sh.app->document;
+                if (const doc::Look* l = d.find_look(id))
+                    return Value::number(static_cast<double>(l->bin));
+                if (const doc::Sequence* s = d.find_sequence(id))
+                    return Value::number(static_cast<double>(s->bin));
+                if (const doc::Asset* as = d.find_asset(id))
+                    return Value::number(static_cast<double>(as->bin));
+                return Value::number(0.0);
+            });
+    env.add("set_bin", "set_bin(entity, bin) - file it (0 = root)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t bin = a[1].as_id();
+                if (bin && !sh.app->document.find_bin(bin))
+                    return op_err(vm, "no bin with that id");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_entity_bin_command(
+                                         a[0].as_id(), bin));
+                return Value::boolean(true);
+            });
+    env.add("new_bin", "new_bin(name, parent?) -> id", 1, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                AppState& app = *sh.app;
+                doc::Bin bin = doc::make_bin(app.document,
+                                             script::to_display(a[0]));
+                if (a.size() > 1) {
+                    const uint64_t parent = a[1].as_id();
+                    if (parent && !app.document.find_bin(parent))
+                        return op_err(vm, "no parent bin with that id");
+                    bin.parent = parent;
+                }
+                const uint64_t id = bin.id;
+                app.undo.execute(app.document,
+                                 doc::add_bin_command(std::move(bin)));
+                return Value::number(static_cast<double>(id));
+            });
+    env.add("remove_bin", "remove_bin(id) - contents move up", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!sh.app->document.find_bin(a[0].as_id()))
+                    return op_err(vm, "no bin with that id");
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::remove_bin_command(a[0].as_id()));
+                return Value::boolean(true);
+            });
+}
+
+// ---- look graphs: layers / effects / params / wires / groups / presets
+
+void register_ops_graph(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    using script::Value;
+    using script::Vm;
+
+    env.add("layers", "layers(look) -> layer ids", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::Layer& l : lk->layers) ids.push_back(l.id);
+                return id_list(ids);
+            });
+    env.add("add_layer",
+            "add_layer(look, kind, name?) -> id; kind media|solid|"
+            "gradient|noise|pattern|osc|shape - wired to the Output",
+            2, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (lk->layers.size() >= doc::kMaxLayers)
+                    return op_err(vm, "layer limit reached");
+                const std::string kind = a[1].as_str();
+                doc::LayerSourceKind k;
+                if (kind == "media") k = doc::LayerSourceKind::Media;
+                else if (kind == "solid") k = doc::LayerSourceKind::Solid;
+                else if (kind == "gradient")
+                    k = doc::LayerSourceKind::Gradient;
+                else if (kind == "noise") k = doc::LayerSourceKind::Noise;
+                else if (kind == "pattern")
+                    k = doc::LayerSourceKind::TestPattern;
+                else if (kind == "osc")
+                    k = doc::LayerSourceKind::Oscillator;
+                else if (kind == "shape") k = doc::LayerSourceKind::Shape;
+                else
+                    return op_err(vm, "unknown source kind \"" + kind +
+                                          "\"");
+                AppState& app = *sh.app;
+                app.undo.begin_group("Add Layer");
+                app.undo.execute(app.document,
+                                 doc::materialize_links_command(lk->id));
+                doc::Layer layer = doc::make_layer(app.document, k);
+                if (a.size() > 2 && a[2].is_str())
+                    layer.name = a[2].as_str();
+                const uint64_t layer_id = layer.id;
+                app.undo.execute(app.document,
+                                 doc::add_layer_command(
+                                     lk->id, std::move(layer),
+                                     lk->layers.size()));
+                app.undo.execute(app.document,
+                                 doc::connect_command(lk->id,
+                                                      {layer_id, 0, 0}));
+                app.undo.end_group();
+                return Value::number(static_cast<double>(layer_id));
+            });
+    env.add("add_ref",
+            "add_ref(look, target) -> layer id; nests a look or sequence "
+            "as a lockstep source",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const uint64_t target = a[1].as_id();
+                const bool is_look =
+                    sh.app->document.find_look(target) != nullptr;
+                if (!is_look && !sh.app->document.find_sequence(target))
+                    return op_err(vm, "no look or sequence with id " +
+                                          script::to_display(a[1]));
+                if (doc::nest_reaches(sh.app->document, target, lk->id))
+                    return op_err(vm, "that nesting would loop");
+                if (lk->layers.size() >= doc::kMaxLayers)
+                    return op_err(vm, "layer limit reached");
+                AppState& app = *sh.app;
+                app.undo.begin_group("Place Ref");
+                app.undo.execute(app.document,
+                                 doc::materialize_links_command(lk->id));
+                doc::Layer layer = doc::make_layer(
+                    app.document, is_look
+                                      ? doc::LayerSourceKind::LookRef
+                                      : doc::LayerSourceKind::SequenceRef);
+                layer.target = target;
+                const uint64_t layer_id = layer.id;
+                app.undo.execute(app.document,
+                                 doc::add_layer_command(
+                                     lk->id, std::move(layer),
+                                     lk->layers.size()));
+                app.undo.execute(app.document,
+                                 doc::connect_command(lk->id,
+                                                      {layer_id, 0, 0}));
+                app.undo.end_group();
+                return Value::number(static_cast<double>(layer_id));
+            });
+    env.add("remove_layer", "remove_layer(look, layer)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const int li = layer_index_by_id(*lk, a[1].as_id());
+                if (li < 0) return op_err(vm, "no such layer");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::remove_layer_command(
+                                         lk->id,
+                                         static_cast<size_t>(li)));
+                return Value::boolean(true);
+            });
+    env.add("get_layer", "get_layer(look, layer) -> field map", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                doc::Layer* l = doc::find_layer(*lk, a[1].as_id());
+                if (!l) return op_err(vm, "no such layer");
+                static const char* kinds[] = {
+                    "media", "solid", "gradient", "noise", "pattern",
+                    "osc",   "shape", "look",     "sequence"};
+                Value m = Value::make_map();
+                map_num(m, "id", static_cast<double>(l->id));
+                map_str(m, "name", l->name);
+                map_str(m, "source",
+                        kinds[static_cast<size_t>(l->source)]);
+                map_num(m, "asset", static_cast<double>(l->asset));
+                map_num(m, "slip", l->slip);
+                map_bool(m, "timeline_lock", l->timeline_lock);
+                map_num(m, "target", static_cast<double>(l->target));
+                Value ca = Value::make_list(), cb = Value::make_list();
+                for (int i = 0; i < 3; ++i) {
+                    ca.list->push_back(Value::number(l->color_a[i]));
+                    cb.list->push_back(Value::number(l->color_b[i]));
+                }
+                map_put(m, "color_a", ca);
+                map_put(m, "color_b", cb);
+                map_num(m, "scale", l->gen_scale);
+                map_num(m, "angle", l->gen_angle);
+                map_num(m, "phase", l->gen_phase);
+                map_num(m, "waveform", l->osc_shape);
+                map_str(m, "blend", blend_name(l->blend));
+                map_num(m, "opacity", l->opacity);
+                map_bool(m, "visible", l->visible);
+                map_num(m, "crop_l", l->crop_l);
+                map_num(m, "crop_r", l->crop_r);
+                map_num(m, "crop_t", l->crop_t);
+                map_num(m, "crop_b", l->crop_b);
+                map_bool(m, "flip_h", l->flip_h);
+                map_bool(m, "flip_v", l->flip_v);
+                map_num(m, "xf_scale", l->xf_scale);
+                map_num(m, "xf_rotate", l->xf_rotate);
+                return m;
+            });
+    env.add("set_layer",
+            "set_layer(look, layer, {fields}) - any get_layer field but "
+            "id/source",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                doc::Layer* l = doc::find_layer(*lk, a[1].as_id());
+                if (!l) return op_err(vm, "no such layer");
+                if (a[2].kind != Value::Kind::Map)
+                    return op_err(vm, "set_layer needs a field map");
+                doc::Layer up = *l;
+                const Value& m = a[2];
+                double n = 0.0;
+                bool b = false;
+                std::string s;
+                if (map_get_str(m, "name", &s)) up.name = s;
+                if (map_get_num(m, "asset", &n))
+                    up.asset = static_cast<uint64_t>(n);
+                if (map_get_num(m, "slip", &n))
+                    up.slip = static_cast<uint32_t>(std::max(0.0, n));
+                if (map_get_bool(m, "timeline_lock", &b))
+                    up.timeline_lock = b;
+                if (map_get_num(m, "target", &n)) {
+                    const uint64_t t = static_cast<uint64_t>(n);
+                    if (t && doc::nest_reaches(sh.app->document, t,
+                                               lk->id))
+                        return op_err(vm, "that nesting would loop");
+                    up.target = t;
+                }
+                auto color3 = [&](const char* key, float out[3]) {
+                    const auto it = m.map->find(key);
+                    if (it == m.map->end() ||
+                        it->second.kind != Value::Kind::List ||
+                        it->second.list->size() != 3)
+                        return;
+                    for (int i = 0; i < 3; ++i) {
+                        const Value& c = (*it->second.list)[
+                            static_cast<size_t>(i)];
+                        if (c.is_num())
+                            out[i] = std::clamp(
+                                static_cast<float>(c.num), 0.0f, 1.0f);
+                    }
+                };
+                color3("color_a", up.color_a);
+                color3("color_b", up.color_b);
+                if (map_get_num(m, "scale", &n))
+                    up.gen_scale = static_cast<float>(n);
+                if (map_get_num(m, "angle", &n))
+                    up.gen_angle = static_cast<float>(n);
+                if (map_get_num(m, "phase", &n))
+                    up.gen_phase =
+                        std::max(0.0f, static_cast<float>(n));
+                if (map_get_num(m, "waveform", &n))
+                    up.osc_shape = static_cast<uint32_t>(
+                        std::max(0.0, n));
+                if (map_get_str(m, "blend", &s)) {
+                    const int bi = blend_by_name(s);
+                    if (bi < 0)
+                        return op_err(vm, "unknown blend \"" + s + "\"");
+                    up.blend = static_cast<doc::BlendMode>(bi);
+                }
+                if (map_get_num(m, "opacity", &n))
+                    up.opacity = std::clamp(static_cast<float>(n), 0.0f,
+                                            1.0f);
+                if (map_get_bool(m, "visible", &b)) up.visible = b;
+                if (map_get_num(m, "crop_l", &n))
+                    up.crop_l = static_cast<float>(n);
+                if (map_get_num(m, "crop_r", &n))
+                    up.crop_r = static_cast<float>(n);
+                if (map_get_num(m, "crop_t", &n))
+                    up.crop_t = static_cast<float>(n);
+                if (map_get_num(m, "crop_b", &n))
+                    up.crop_b = static_cast<float>(n);
+                if (map_get_bool(m, "flip_h", &b)) up.flip_h = b;
+                if (map_get_bool(m, "flip_v", &b)) up.flip_v = b;
+                if (map_get_num(m, "xf_scale", &n))
+                    up.xf_scale = static_cast<float>(n);
+                if (map_get_num(m, "xf_rotate", &n))
+                    up.xf_rotate = static_cast<float>(n);
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_layer_props_command(
+                                         lk->id, std::move(up)));
+                return Value::boolean(true);
+            });
+
+    env.add("effect_types", "effect_types() -> every effect's string id",
+            0, 0, [](Vm&, std::vector<Value>&) {
+                Value out = Value::make_list();
+                for (uint32_t t = 0;
+                     t < static_cast<uint32_t>(doc::EffectType::Count);
+                     ++t)
+                    out.list->push_back(Value::string(
+                        doc::effect_info(
+                            static_cast<doc::EffectType>(t))
+                            .id));
+                return out;
+            });
+    env.add("effects", "effects(look, layer?) -> effect ids, stack order",
+            1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::Layer& l : lk->layers) {
+                    if (a.size() > 1 && l.id != a[1].as_id()) continue;
+                    for (const doc::EffectInstance& fx : l.stack)
+                        ids.push_back(fx.id);
+                }
+                return id_list(ids);
+            });
+    env.add("effect_info",
+            "effect_info(look, fx) -> {type,layer,index,bypass,solo,wet,"
+            "opacity,blend,group,text}",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                const doc::EffectInstance& fx = lk->layers[li].stack[fi];
+                Value m = Value::make_map();
+                map_num(m, "id", static_cast<double>(fx.id));
+                map_str(m, "type", doc::effect_info(fx.type).id);
+                map_str(m, "label", doc::effect_info(fx.type).label);
+                map_num(m, "layer",
+                        static_cast<double>(lk->layers[li].id));
+                map_num(m, "index", static_cast<double>(fi));
+                map_bool(m, "bypass", fx.bypass);
+                map_bool(m, "solo", fx.solo);
+                map_num(m, "wet", fx.wet);
+                map_num(m, "opacity", fx.opacity);
+                map_str(m, "blend", blend_name(fx.blend));
+                map_num(m, "group", static_cast<double>(fx.group_id));
+                map_str(m, "text", fx.text);
+                return m;
+            });
+    env.add("add_effect",
+            "add_effect(look, layer, type) -> id; splices onto the "
+            "layer's chain end",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const int li = layer_index_by_id(*lk, a[1].as_id());
+                if (li < 0) return op_err(vm, "no such layer");
+                const doc::EffectType et =
+                    effect_type_by_id(a[2].as_str());
+                if (et == doc::EffectType::Count)
+                    return op_err(vm, "unknown effect \"" + a[2].as_str() +
+                                          "\" - effect_types() lists "
+                                          "them");
+                AppState& app = *sh.app;
+                doc::EffectInstance fx =
+                    doc::make_effect(app.document, et);
+                const uint64_t fx_id = fx.id;
+                const bool wired = !lk->links.empty();
+                doc::NodeLink tail_out{};
+                bool tail_feeds = false;
+                const uint64_t tail =
+                    wired ? chain_tail(*lk, a[1].as_id(), &tail_out,
+                                       &tail_feeds)
+                          : 0;
+                app.undo.begin_group("Add Effect");
+                app.undo.execute(
+                    app.document,
+                    doc::add_effect_command(
+                        lk->id, static_cast<size_t>(li), std::move(fx),
+                        lk->layers[static_cast<size_t>(li)].stack.size()));
+                if (wired) {
+                    if (tail_feeds)
+                        app.undo.execute(app.document,
+                                         doc::disconnect_command(lk->id,
+                                                                 tail_out));
+                    app.undo.execute(app.document,
+                                     doc::connect_command(
+                                         lk->id, {tail, fx_id, 0}));
+                    if (tail_feeds)
+                        app.undo.execute(
+                            app.document,
+                            doc::connect_command(lk->id,
+                                                 {fx_id, tail_out.to,
+                                                  tail_out.to_port}));
+                }
+                app.undo.end_group();
+                return Value::number(static_cast<double>(fx_id));
+            });
+    env.add("insert_effect",
+            "insert_effect(look, type, before_fx) -> id; splices into "
+            "the feed of before_fx",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[2].as_id(), &li, &fi))
+                    return op_err(vm, "no effect with id " +
+                                          script::to_display(a[2]));
+                const doc::EffectType et =
+                    effect_type_by_id(a[1].as_str());
+                if (et == doc::EffectType::Count)
+                    return op_err(vm, "unknown effect \"" + a[1].as_str() +
+                                          "\"");
+                AppState& app = *sh.app;
+                doc::EffectInstance fx =
+                    doc::make_effect(app.document, et);
+                const uint64_t fx_id = fx.id;
+                const uint64_t before = a[2].as_id();
+                const bool wired = !lk->links.empty();
+                app.undo.begin_group("Insert Effect");
+                app.undo.execute(
+                    app.document,
+                    doc::add_effect_command(
+                        lk->id, li, std::move(fx),
+                        wired ? lk->layers[li].stack.size() : fi));
+                if (wired) {
+                    const doc::NodeLink* feed = nullptr;
+                    for (const doc::NodeLink& l : lk->links)
+                        if (!doc::link_is_tombstone(l) &&
+                            l.to == before && l.to_port == 0)
+                            feed = &l;
+                    if (feed) {
+                        const doc::NodeLink old = *feed;
+                        app.undo.execute(app.document,
+                                         doc::disconnect_command(lk->id,
+                                                                 old));
+                        app.undo.execute(app.document,
+                                         doc::connect_command(
+                                             lk->id,
+                                             {old.from, fx_id, 0}));
+                    }
+                    app.undo.execute(app.document,
+                                     doc::connect_command(
+                                         lk->id, {fx_id, before, 0}));
+                }
+                app.undo.end_group();
+                return Value::number(static_cast<double>(fx_id));
+            });
+    env.add("remove_effect", "remove_effect(look, fx)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::remove_effect_command(lk->id, li, fi));
+                return Value::boolean(true);
+            });
+    env.add("move_effect", "move_effect(look, fx, to_index)", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                double to = 0.0;
+                if (!arg_num(vm, a[2], "to_index", &to))
+                    return Value::nil();
+                const size_t ti = static_cast<size_t>(std::clamp(
+                    to, 0.0,
+                    static_cast<double>(lk->layers[li].stack.size() -
+                                        1)));
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::move_effect_command(lk->id, li, fi, ti));
+                return Value::boolean(true);
+            });
+    env.add("params",
+            "params(look, fx) -> [{id,label,min,max,value,visible,"
+            "options?}]",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                const doc::EffectInstance& fx = lk->layers[li].stack[fi];
+                const doc::EffectInfo& info = doc::effect_info(fx.type);
+                Value out = Value::make_list();
+                for (uint32_t i = 0; i < info.param_count; ++i) {
+                    const doc::ParamDesc& d = info.params[i];
+                    Value m = Value::make_map();
+                    map_str(m, "id", d.id);
+                    map_str(m, "label", d.label);
+                    map_num(m, "min", d.min_value);
+                    map_num(m, "max", d.max_value);
+                    map_num(m, "value",
+                            i < fx.params.size() ? fx.params[i]
+                                                 : d.default_value);
+                    map_bool(m, "visible", doc::param_visible(fx, d));
+                    if (d.options) map_str(m, "options", d.options);
+                    out.list->push_back(std::move(m));
+                }
+                return out;
+            });
+    env.add("get_param",
+            "get_param(look, fx, param) - name, \"wet\" or \"opacity\"",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                const doc::EffectInstance& fx = lk->layers[li].stack[fi];
+                const int pi = param_index_of(fx, a[2]);
+                if (pi == INT_MIN ||
+                    (pi >= 0 &&
+                     pi >= static_cast<int>(fx.params.size())))
+                    return op_err(vm, "no param " +
+                                          script::to_display(a[2]));
+                return Value::number(mod::param_value(fx, pi));
+            });
+    env.add("set_param",
+            "set_param(look, fx, param, value) - clamped to the param's "
+            "range",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                const doc::EffectInstance& fx = lk->layers[li].stack[fi];
+                const int pi = param_index_of(fx, a[2]);
+                if (pi == INT_MIN ||
+                    (pi >= 0 &&
+                     pi >= static_cast<int>(fx.params.size())))
+                    return op_err(vm, "no param " +
+                                          script::to_display(a[2]));
+                double v = 0.0;
+                if (!arg_num(vm, a[3], "value", &v)) return Value::nil();
+                float mn = 0.0f, mx = 1.0f;
+                mod::param_range(fx.type, pi, &mn, &mx);
+                const float cv =
+                    std::clamp(static_cast<float>(v), mn, mx);
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_param_command(
+                                         lk->id, li, fi, pi, cv));
+                return Value::number(cv);
+            });
+    env.add("set_bypass", "set_bypass(look, fx, on)", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_bypass_command(
+                                         lk->id, li, fi,
+                                         a[2].truthy()));
+                return Value::boolean(true);
+            });
+    env.add("set_solo", "set_solo(look, fx, on)", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_solo_command(
+                                         lk->id, li, fi, a[2].truthy()));
+                return Value::boolean(true);
+            });
+    env.add("set_blend",
+            "set_blend(look, fx, mode) - normal|add|multiply|screen|"
+            "difference",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                const int bi = blend_by_name(a[2].as_str());
+                if (bi < 0)
+                    return op_err(vm, "unknown blend \"" + a[2].as_str() +
+                                          "\"");
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_effect_blend_command(
+                        lk->id, li, fi,
+                        static_cast<doc::BlendMode>(bi)));
+                return Value::boolean(true);
+            });
+    env.add("set_text", "set_text(look, fx, string) - the Text effect", 3,
+            3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li = 0, fi = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
+                    return op_err(vm, "no such effect");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_effect_text_command(
+                                         lk->id, li, fi,
+                                         script::to_display(a[2])));
+                return Value::boolean(true);
+            });
+    env.add("randomize",
+            "randomize(look, fx_or_layer, intensity?) - one effect, or a "
+            "layer's whole stack",
+            2, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const float intensity =
+                    a.size() > 2 && a[2].is_num()
+                        ? std::clamp(static_cast<float>(a[2].num), 0.0f,
+                                     1.0f)
+                        : 0.5f;
+                AppState& app = *sh.app;
+                size_t li = 0, fi = 0;
+                if (find_effect_by_id(*lk, a[1].as_id(), &li, &fi)) {
+                    doc::randomize_effect(app.document, app.undo, lk->id,
+                                          li, fi, intensity,
+                                          app.rng_counter++);
+                    return Value::boolean(true);
+                }
+                const int lidx = layer_index_by_id(*lk, a[1].as_id());
+                if (lidx < 0)
+                    return op_err(vm, "no effect or layer with that id");
+                doc::randomize_stack(app.document, app.undo, lk->id,
+                                     static_cast<size_t>(lidx), intensity,
+                                     app.rng_counter++);
+                return Value::boolean(true);
+            });
+
+    env.add("links", "links(look) -> [{from,to,port}] (0 = Output)", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const std::vector<doc::NodeLink> links =
+                    lk->links.empty() ? doc::synthesize_links(*lk)
+                                      : lk->links;
+                Value out = Value::make_list();
+                for (const doc::NodeLink& l : links) {
+                    if (doc::link_is_tombstone(l)) continue;
+                    Value m = Value::make_map();
+                    map_num(m, "from", static_cast<double>(l.from));
+                    map_num(m, "to", static_cast<double>(l.to));
+                    map_num(m, "port", l.to_port);
+                    out.list->push_back(std::move(m));
+                }
+                return out;
+            });
+    env.add("connect",
+            "connect(look, from, to, port?) - to 0 = the Output", 3, 4,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const uint64_t from = a[1].as_id();
+                const uint64_t to = a[2].as_id();
+                const uint32_t port =
+                    a.size() > 3 ? static_cast<uint32_t>(a[3].as_id())
+                                 : 0;
+                if (doc::link_would_cycle(*lk, from, to))
+                    return op_err(vm, "that wire would cycle");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::connect_command(
+                                         lk->id, {from, to, port}));
+                return Value::boolean(true);
+            });
+    env.add("disconnect", "disconnect(look, from, to, port?)", 3, 4,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::disconnect_command(
+                        lk->id,
+                        {a[1].as_id(), a[2].as_id(),
+                         a.size() > 3
+                             ? static_cast<uint32_t>(a[3].as_id())
+                             : 0}));
+                return Value::boolean(true);
+            });
+
+    env.add("groups", "groups(look) -> group ids", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::Layer& l : lk->layers)
+                    for (const doc::Group& g : l.groups)
+                        ids.push_back(g.id);
+                return id_list(ids);
+            });
+    env.add("group_info",
+            "group_info(look, group) -> {name,layer,bypass,folded,"
+            "members}",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                for (doc::Layer& l : lk->layers)
+                    if (doc::Group* g =
+                            doc::find_group(l, a[1].as_id())) {
+                        Value m = Value::make_map();
+                        map_num(m, "id", static_cast<double>(g->id));
+                        map_str(m, "name", g->name);
+                        map_num(m, "layer", static_cast<double>(l.id));
+                        map_bool(m, "bypass", g->bypass);
+                        map_bool(m, "folded", g->folded);
+                        std::vector<uint64_t> members;
+                        for (const doc::EffectInstance& fx : l.stack)
+                            if (fx.group_id == g->id)
+                                members.push_back(fx.id);
+                        map_put(m, "members", id_list(members));
+                        return m;
+                    }
+                return op_err(vm, "no such group");
+            });
+    env.add("group_effects",
+            "group_effects(look, from_fx, to_fx, name) -> group id; a "
+            "contiguous stack span",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                size_t li0 = 0, fi0 = 0, li1 = 0, fi1 = 0;
+                if (!find_effect_by_id(*lk, a[1].as_id(), &li0, &fi0) ||
+                    !find_effect_by_id(*lk, a[2].as_id(), &li1, &fi1))
+                    return op_err(vm, "no such effect");
+                if (li0 != li1)
+                    return op_err(vm, "both effects must share a layer");
+                AppState& app = *sh.app;
+                doc::Group g = doc::make_group(
+                    app.document, script::to_display(a[3]));
+                const uint64_t gid = g.id;
+                app.undo.execute(app.document,
+                                 doc::group_effects_command(
+                                     lk->id, li0, std::move(g),
+                                     std::min(fi0, fi1),
+                                     std::max(fi0, fi1)));
+                return Value::number(static_cast<double>(gid));
+            });
+    env.add("ungroup", "ungroup(look, group)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                for (size_t li = 0; li < lk->layers.size(); ++li)
+                    if (doc::find_group(lk->layers[li], a[1].as_id())) {
+                        sh.app->undo.execute(
+                            sh.app->document,
+                            doc::ungroup_command(lk->id, li,
+                                                 a[1].as_id()));
+                        return Value::boolean(true);
+                    }
+                return op_err(vm, "no such group");
+            });
+    env.add("set_group",
+            "set_group(look, group, {name?, bypass?, folded?})", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (a[2].kind != Value::Kind::Map)
+                    return op_err(vm, "set_group needs a field map");
+                for (size_t li = 0; li < lk->layers.size(); ++li)
+                    if (doc::Group* g = doc::find_group(
+                            lk->layers[li], a[1].as_id())) {
+                        doc::Group up = *g;
+                        std::string s;
+                        bool b = false;
+                        if (map_get_str(a[2], "name", &s)) up.name = s;
+                        if (map_get_bool(a[2], "bypass", &b))
+                            up.bypass = b;
+                        if (map_get_bool(a[2], "folded", &b))
+                            up.folded = b;
+                        sh.app->undo.execute(
+                            sh.app->document,
+                            doc::set_group_props_command(lk->id, li,
+                                                         std::move(up)));
+                        return Value::boolean(true);
+                    }
+                return op_err(vm, "no such group");
+            });
+
+    env.add("presets", "presets() -> browser preset names", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                Value out = Value::make_list();
+                for (const doc::Preset& p : sh.app->presets)
+                    out.list->push_back(Value::string(p.name));
+                return out;
+            });
+    env.add("insert_preset",
+            "insert_preset(look, layer, name) -> group id; splices onto "
+            "the layer's chain end",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const int li = layer_index_by_id(*lk, a[1].as_id());
+                if (li < 0) return op_err(vm, "no such layer");
+                const doc::Preset* preset = nullptr;
+                for (const doc::Preset& p : sh.app->presets)
+                    if (p.name == a[2].as_str()) preset = &p;
+                if (!preset)
+                    return op_err(vm, "no preset named \"" +
+                                          a[2].as_str() +
+                                          "\" - presets() lists them");
+                AppState& app = *sh.app;
+                doc::Group group;
+                std::vector<doc::EffectInstance> effects;
+                doc::instantiate_preset(app.document, *preset, &group,
+                                        &effects);
+                const uint64_t gid = group.id;
+                const uint64_t face_in = group.face_in;
+                const uint64_t face_out = group.face_out;
+                const bool wired = !lk->links.empty();
+                doc::NodeLink tail_out{};
+                bool tail_feeds = false;
+                const uint64_t tail =
+                    wired ? chain_tail(*lk, a[1].as_id(), &tail_out,
+                                       &tail_feeds)
+                          : 0;
+                app.undo.begin_group("Add Preset");
+                app.undo.execute(app.document,
+                                 doc::insert_group_command(
+                                     lk->id, static_cast<size_t>(li),
+                                     std::move(group),
+                                     std::move(effects)));
+                if (wired && face_in && face_out &&
+                    !doc::link_would_cycle(*lk, tail, face_in)) {
+                    if (tail_feeds)
+                        app.undo.execute(app.document,
+                                         doc::disconnect_command(lk->id,
+                                                                 tail_out));
+                    app.undo.execute(app.document,
+                                     doc::connect_command(
+                                         lk->id, {tail, face_in, 0}));
+                    if (tail_feeds &&
+                        !doc::link_would_cycle(*lk, face_out,
+                                               tail_out.to))
+                        app.undo.execute(
+                            app.document,
+                            doc::connect_command(lk->id,
+                                                 {face_out, tail_out.to,
+                                                  tail_out.to_port}));
+                }
+                app.undo.end_group();
+                return Value::number(static_cast<double>(gid));
+            });
+    env.add("save_preset_file",
+            "save_preset_file(look, group, path) - capture to a preset "
+            "json",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (!a[2].is_str())
+                    return op_err(vm, "save_preset_file needs a path");
+                for (size_t li = 0; li < lk->layers.size(); ++li)
+                    if (doc::find_group(lk->layers[li], a[1].as_id())) {
+                        doc::Preset p = doc::make_preset_from_group(
+                            *lk, li, a[1].as_id());
+                        std::filesystem::path out(a[2].as_str());
+                        if (out.extension() != ".json")
+                            out.replace_extension(".json");
+                        p.name = out.stem().string();
+                        if (p.tags.empty()) p.tags.push_back("user");
+                        std::error_code ec;
+                        std::filesystem::create_directories(
+                            out.parent_path(), ec);
+                        if (!doc::save_preset(out, p))
+                            return op_err(vm, "preset save failed");
+                        rescan_presets(*sh.app);
+                        return Value::boolean(true);
+                    }
+                return op_err(vm, "no such group");
+            });
+}
+
+// ---- modulation: value graph / routes / lanes / snapshots
+
+const char* kModKindNames[] = {
+    "lfo",    "drift",  "audio_low", "audio_mid", "audio_high",
+    "onset",  "motion", "brightness", "lfo_beat", "envelope",
+    "cut",    "beat",   "sample",    "region",    "math",
+    "normalise"};
+
+// A ParamKey from (target_id, param name): effects use ParamDesc ids +
+// wet/opacity, layers use the param-table slot ids under kLayerParamBit.
+bool resolve_param_key(ScriptHost& sh, script::Vm& vm,
+                       const doc::Look& lk, const script::Value& target,
+                       const script::Value& param, doc::ParamKey* out) {
+    const uint64_t id = target.as_id();
+    size_t li = 0, fi = 0;
+    if (find_effect_by_id(const_cast<doc::Look&>(lk), id, &li, &fi)) {
+        const int pi =
+            param_index_of(lk.layers[li].stack[fi], param);
+        if (pi == INT_MIN) {
+            vm.set_error("no param " + script::to_display(param));
+            return false;
+        }
+        out->effect_id = id;
+        out->param_index = pi;
+        return true;
+    }
+    if (layer_index_by_id(const_cast<doc::Look&>(lk), id) >= 0) {
+        if (!param.is_str()) {
+            vm.set_error("layer params go by name");
+            return false;
+        }
+        const int pi = layer_param_index_of(param.as_str());
+        if (pi == INT_MIN) {
+            vm.set_error("no layer param \"" + param.as_str() + "\"");
+            return false;
+        }
+        out->effect_id = id | doc::kLayerParamBit;
+        out->param_index = pi;
+        return true;
+    }
+    vm.set_error("no effect or layer with id " +
+                 script::to_display(target));
+    return false;
+}
+
+void register_ops_mod(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    using script::Value;
+    using script::Vm;
+
+    env.add("mod_kinds", "mod_kinds() -> value-node kind names", 0, 0,
+            [](Vm&, std::vector<Value>&) {
+                Value out = Value::make_list();
+                for (const char* n : kModKindNames)
+                    out.list->push_back(Value::string(n));
+                return out;
+            });
+    env.add("mods", "mods(look) -> value node ids", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::ValueNode& n : lk->value_nodes)
+                    ids.push_back(n.id);
+                return id_list(ids);
+            });
+    env.add("add_mod", "add_mod(look, kind) -> node id", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                int kind = -1;
+                for (int i = 0;
+                     i < static_cast<int>(doc::ModSourceType::Count); ++i)
+                    if (a[1].as_str() == kModKindNames[i]) kind = i;
+                if (kind < 0)
+                    return op_err(vm, "unknown mod kind \"" +
+                                          a[1].as_str() +
+                                          "\" - mod_kinds() lists them");
+                AppState& app = *sh.app;
+                doc::ValueNode node;
+                node.id = app.document.next_route_id++;
+                node.source.type =
+                    static_cast<doc::ModSourceType>(kind);
+                const uint64_t nid = node.id;
+                app.undo.execute(app.document,
+                                 doc::add_value_node_command(lk->id,
+                                                             node));
+                return Value::number(static_cast<double>(nid));
+            });
+    env.add("get_mod", "get_mod(look, node) -> field map", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const doc::ValueNode* n =
+                    doc::find_value_node(*lk, a[1].as_id());
+                if (!n) return op_err(vm, "no such value node");
+                Value m = Value::make_map();
+                map_num(m, "id", static_cast<double>(n->id));
+                map_str(m, "kind",
+                        kModKindNames[static_cast<size_t>(
+                            n->source.type)]);
+                map_num(m, "rate", n->source.rate_hz);
+                map_num(m, "phase", n->source.phase);
+                map_num(m, "shape",
+                        static_cast<double>(n->source.shape));
+                map_num(m, "attack", n->source.attack);
+                map_num(m, "decay", n->source.decay);
+                map_num(m, "trigger", n->source.trigger);
+                map_num(m, "px", n->source.px);
+                map_num(m, "py", n->source.py);
+                map_num(m, "pw", n->source.pw);
+                map_num(m, "ph", n->source.ph);
+                map_num(m, "channel", n->source.channel);
+                map_num(m, "op", static_cast<double>(n->op));
+                map_num(m, "in_a", static_cast<double>(n->in_a));
+                map_num(m, "in_b", static_cast<double>(n->in_b));
+                map_num(m, "const_a", n->const_a);
+                map_num(m, "const_b", n->const_b);
+                map_num(m, "in_min", n->in_min);
+                map_num(m, "in_max", n->in_max);
+                map_num(m, "audio_src",
+                        static_cast<double>(n->audio_src));
+                return m;
+            });
+    env.add("set_mod", "set_mod(look, node, {fields}) - get_mod's fields",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const doc::ValueNode* n =
+                    doc::find_value_node(*lk, a[1].as_id());
+                if (!n) return op_err(vm, "no such value node");
+                if (a[2].kind != Value::Kind::Map)
+                    return op_err(vm, "set_mod needs a field map");
+                doc::ValueNode up = *n;
+                const Value& m = a[2];
+                double v = 0.0;
+                if (map_get_num(m, "rate", &v))
+                    up.source.rate_hz = static_cast<float>(v);
+                if (map_get_num(m, "phase", &v))
+                    up.source.phase = static_cast<float>(v);
+                if (map_get_num(m, "shape", &v))
+                    up.source.shape = static_cast<doc::LfoShape>(
+                        std::clamp(static_cast<int>(v), 0, 3));
+                if (map_get_num(m, "attack", &v))
+                    up.source.attack = static_cast<float>(v);
+                if (map_get_num(m, "decay", &v))
+                    up.source.decay = static_cast<float>(v);
+                if (map_get_num(m, "trigger", &v))
+                    up.source.trigger = static_cast<uint32_t>(
+                        std::clamp(static_cast<int>(v), 0, 3));
+                if (map_get_num(m, "px", &v))
+                    up.source.px = static_cast<float>(v);
+                if (map_get_num(m, "py", &v))
+                    up.source.py = static_cast<float>(v);
+                if (map_get_num(m, "pw", &v))
+                    up.source.pw = static_cast<float>(v);
+                if (map_get_num(m, "ph", &v))
+                    up.source.ph = static_cast<float>(v);
+                if (map_get_num(m, "channel", &v))
+                    up.source.channel = static_cast<uint32_t>(
+                        std::clamp(static_cast<int>(v), 0, 3));
+                if (map_get_num(m, "op", &v))
+                    up.op = static_cast<doc::ValueOp>(std::clamp(
+                        static_cast<int>(v), 0,
+                        static_cast<int>(doc::ValueOp::Count) - 1));
+                if (map_get_num(m, "const_a", &v))
+                    up.const_a = static_cast<float>(v);
+                if (map_get_num(m, "const_b", &v))
+                    up.const_b = static_cast<float>(v);
+                if (map_get_num(m, "in_min", &v))
+                    up.in_min = static_cast<float>(v);
+                if (map_get_num(m, "in_max", &v))
+                    up.in_max = static_cast<float>(v);
+                if (map_get_num(m, "audio_src", &v))
+                    up.audio_src = static_cast<uint64_t>(v);
+                if (map_get_num(m, "seed", &v))
+                    up.source.seed = static_cast<uint64_t>(v);
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_value_node_command(lk->id,
+                                                                 up));
+                return Value::boolean(true);
+            });
+    env.add("remove_mod",
+            "remove_mod(look, node) - routes it feeds go too", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (!doc::find_value_node(*lk, a[1].as_id()))
+                    return op_err(vm, "no such value node");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::remove_value_node_command(
+                                         lk->id, a[1].as_id()));
+                return Value::boolean(true);
+            });
+    env.add("wire_mod",
+            "wire_mod(look, node, \"a\"|\"b\", from) - helper input; "
+            "from 0 unwires",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (!doc::find_value_node(*lk, a[1].as_id()))
+                    return op_err(vm, "no such value node");
+                const int which = a[2].as_str() == "a"   ? 0
+                                  : a[2].as_str() == "b" ? 1
+                                                         : -1;
+                if (which < 0)
+                    return op_err(vm, "which must be \"a\" or \"b\"");
+                const uint64_t from = a[3].as_id();
+                if (from &&
+                    doc::value_reaches(*lk, from, a[1].as_id()))
+                    return op_err(vm, "that wire would cycle");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::wire_value_input_command(
+                                         lk->id, a[1].as_id(), which,
+                                         from));
+                return Value::boolean(true);
+            });
+    env.add("routes", "routes(look) -> [{id,node,target,param,curve}]", 1,
+            1, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                Value out = Value::make_list();
+                for (const doc::ModRoute& r : lk->mod_routes) {
+                    Value m = Value::make_map();
+                    map_num(m, "id", static_cast<double>(r.id));
+                    map_num(m, "node", static_cast<double>(r.node));
+                    map_num(m, "target",
+                            static_cast<double>(r.target.effect_id &
+                                                ~doc::kLayerParamBit));
+                    map_bool(m, "layer_param",
+                             (r.target.effect_id &
+                              doc::kLayerParamBit) != 0);
+                    map_num(m, "param", r.target.param_index);
+                    map_num(m, "curve",
+                            static_cast<double>(r.curve));
+                    out.list->push_back(std::move(m));
+                }
+                return out;
+            });
+    env.add("route",
+            "route(look, node, target, param, curve?) - wire a value "
+            "node onto an effect or layer param; replaces any wire there",
+            4, 5, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (!doc::find_value_node(*lk, a[1].as_id()))
+                    return op_err(vm, "no such value node");
+                doc::ParamKey key;
+                if (!resolve_param_key(sh, vm, *lk, a[2], a[3], &key))
+                    return Value::nil();
+                doc::ModRoute route;
+                route.id = sh.app->document.next_route_id++;
+                route.node = a[1].as_id();
+                route.target = key;
+                if (a.size() > 4 && a[4].is_str()) {
+                    const std::string& c = a[4].as_str();
+                    if (c == "linear")
+                        route.curve = doc::ResponseCurve::Linear;
+                    else if (c == "exp")
+                        route.curve = doc::ResponseCurve::Exp;
+                    else if (c == "scurve")
+                        route.curve = doc::ResponseCurve::SCurve;
+                    else if (c == "inverted")
+                        route.curve = doc::ResponseCurve::Inverted;
+                    else
+                        return op_err(vm,
+                                      "curve is linear|exp|scurve|"
+                                      "inverted");
+                }
+                const uint64_t rid = route.id;
+                sh.app->undo.execute(sh.app->document,
+                                     doc::add_route_command(lk->id,
+                                                            route));
+                return Value::number(static_cast<double>(rid));
+            });
+    env.add("unroute", "unroute(look, route_id)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                sh.app->undo.execute(sh.app->document,
+                                     doc::remove_route_command(
+                                         lk->id, a[1].as_id()));
+                return Value::boolean(true);
+            });
+    env.add("get_lane",
+            "get_lane(look, target, param) -> [{frame,value,hold}]", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                doc::ParamKey key;
+                if (!resolve_param_key(sh, vm, *lk, a[1], a[2], &key))
+                    return Value::nil();
+                Value out = Value::make_list();
+                for (const doc::KeyframeLane& lane : lk->lanes) {
+                    if (!(lane.target == key)) continue;
+                    for (const doc::Keyframe& k : lane.keys) {
+                        Value m = Value::make_map();
+                        map_num(m, "frame", k.frame);
+                        map_num(m, "value", k.value);
+                        map_bool(m, "hold", k.hold);
+                        out.list->push_back(std::move(m));
+                    }
+                }
+                return out;
+            });
+    env.add("set_lane",
+            "set_lane(look, target, param, [{frame,value,hold?}]) - "
+            "empty list removes the lane",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                doc::ParamKey key;
+                if (!resolve_param_key(sh, vm, *lk, a[1], a[2], &key))
+                    return Value::nil();
+                if (a[3].kind != Value::Kind::List)
+                    return op_err(vm, "keys must be a list of maps");
+                std::vector<doc::Keyframe> keys;
+                for (const Value& kv : *a[3].list) {
+                    if (kv.kind != Value::Kind::Map)
+                        return op_err(vm, "each key is a map");
+                    doc::Keyframe k;
+                    double v = 0.0;
+                    bool b = false;
+                    if (map_get_num(kv, "frame", &v)) k.frame = v;
+                    if (map_get_num(kv, "value", &v))
+                        k.value = static_cast<float>(v);
+                    if (map_get_bool(kv, "hold", &b)) k.hold = b;
+                    keys.push_back(k);
+                }
+                std::stable_sort(keys.begin(), keys.end(),
+                                 [](const doc::Keyframe& x,
+                                    const doc::Keyframe& y) {
+                                     return x.frame < y.frame;
+                                 });
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_lane_command(
+                                         lk->id, key, std::move(keys)));
+                return Value::boolean(true);
+            });
+    env.add("set_lane_flags",
+            "set_lane_flags(look, target, param, loop, mute)", 5, 5,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                doc::ParamKey key;
+                if (!resolve_param_key(sh, vm, *lk, a[1], a[2], &key))
+                    return Value::nil();
+                AppState& app = *sh.app;
+                app.undo.begin_group("Lane Flags");
+                app.undo.execute(app.document,
+                                 doc::set_lane_loop_command(
+                                     lk->id, key, a[3].truthy()));
+                app.undo.execute(app.document,
+                                 doc::set_lane_mute_command(
+                                     lk->id, key, a[4].truthy()));
+                app.undo.end_group();
+                return Value::boolean(true);
+            });
+    env.add("store_snapshot", "store_snapshot(look, slot 0-2)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const int slot = static_cast<int>(a[1].as_id());
+                if (slot < 0 || slot > 2)
+                    return op_err(vm, "slot is 0-2");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::store_snapshot_command(lk->id,
+                                                                 slot));
+                return Value::boolean(true);
+            });
+    env.add("apply_snapshot", "apply_snapshot(look, slot 0-2)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const int slot = static_cast<int>(a[1].as_id());
+                if (slot < 0 || slot > 2)
+                    return op_err(vm, "slot is 0-2");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::apply_snapshot_command(lk->id,
+                                                                 slot));
+                return Value::boolean(true);
+            });
+    env.add("set_morph", "set_morph(look, from_slot, to_slot, pos 0-1)",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                double pos = 0.0;
+                if (!arg_num(vm, a[3], "pos", &pos)) return Value::nil();
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_morph_command(
+                        lk->id, static_cast<int>(a[1].as_id()),
+                        static_cast<int>(a[2].as_id()),
+                        std::clamp(static_cast<float>(pos), 0.0f,
+                                   1.0f)));
+                return Value::boolean(true);
+            });
+    env.add("set_audio_split",
+            "set_audio_split(look, on) - the Output's dedicated audio-in",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_look_audio_split_command(
+                                         lk->id, a[1].truthy()));
+                return Value::boolean(true);
+            });
+}
+
+// ---- sequences: lanes / placements / regions + project settings
+
+void register_ops_sequence(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    using script::Value;
+    using script::Vm;
+
+    env.add("tracks", "tracks(seq) -> video lane ids, bottom first", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::SeqTrack& t : s->tracks)
+                    ids.push_back(t.id);
+                return id_list(ids);
+            });
+    env.add("audio_tracks", "audio_tracks(seq) -> audio track ids", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::AudioTrack& t : s->audio)
+                    ids.push_back(t.id);
+                return id_list(ids);
+            });
+    env.add("add_track", "add_track(seq) -> new top lane's id", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                AppState& app = *sh.app;
+                doc::SeqTrack t = doc::make_track(app.document, *s);
+                const uint64_t id = t.id;
+                app.undo.execute(app.document,
+                                 doc::add_track_command(
+                                     s->id, std::move(t),
+                                     s->tracks.size()));
+                return Value::number(static_cast<double>(id));
+            });
+    env.add("remove_track",
+            "remove_track(seq, track) - never the last video lane", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                auto cmd = doc::remove_track_command(sh.app->document,
+                                                     s->id, a[1].as_id());
+                if (!cmd)
+                    return op_err(vm,
+                                  "cannot remove that lane (last one, or "
+                                  "unknown id)");
+                sh.app->undo.execute(sh.app->document, std::move(cmd));
+                return Value::boolean(true);
+            });
+    env.add("add_audio_track", "add_audio_track(seq) -> id", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                AppState& app = *sh.app;
+                doc::AudioTrack t =
+                    doc::make_audio_track(app.document, *s);
+                const uint64_t id = t.id;
+                app.undo.execute(app.document,
+                                 doc::add_audio_track_command(
+                                     s->id, std::move(t)));
+                return Value::number(static_cast<double>(id));
+            });
+    env.add("remove_audio_track", "remove_audio_track(seq, track)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                auto cmd = doc::remove_audio_track_command(s->id,
+                                                           a[1].as_id());
+                if (!cmd) return op_err(vm, "no such audio track");
+                sh.app->undo.execute(sh.app->document, std::move(cmd));
+                return Value::boolean(true);
+            });
+    env.add("set_audio_track",
+            "set_audio_track(seq, track, {name?, gain?, mute?})", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                const doc::AudioTrack* tr = nullptr;
+                for (const doc::AudioTrack& t : s->audio)
+                    if (t.id == a[1].as_id()) tr = &t;
+                if (!tr) return op_err(vm, "no such audio track");
+                if (a[2].kind != Value::Kind::Map)
+                    return op_err(vm, "set_audio_track needs a map");
+                std::string name = tr->name;
+                double gain = tr->gain;
+                bool mute = tr->mute;
+                map_get_str(a[2], "name", &name);
+                map_get_num(a[2], "gain", &gain);
+                map_get_bool(a[2], "mute", &mute);
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_audio_track_props_command(
+                        s->id, tr->id, name,
+                        std::clamp(static_cast<float>(gain), 0.0f, 2.0f),
+                        mute));
+                return Value::boolean(true);
+            });
+    env.add("placements",
+            "placements(seq, track?) -> placement ids (video + audio)", 1,
+            2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                std::vector<uint64_t> ids;
+                for (const doc::SeqTrack& t : s->tracks) {
+                    if (a.size() > 1 && t.id != a[1].as_id()) continue;
+                    for (const doc::Placement& p : t.placements)
+                        ids.push_back(p.id);
+                }
+                for (const doc::AudioTrack& t : s->audio) {
+                    if (a.size() > 1 && t.id != a[1].as_id()) continue;
+                    for (const doc::Placement& p : t.placements)
+                        ids.push_back(p.id);
+                }
+                return id_list(ids);
+            });
+    env.add("get_placement", "get_placement(seq, placement) -> field map",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                const doc::Placement* p =
+                    doc::find_placement(*s, a[1].as_id());
+                if (!p) return op_err(vm, "no such placement");
+                uint64_t track = 0;
+                bool is_audio = false;
+                for (const doc::SeqTrack& t : s->tracks)
+                    for (const doc::Placement& q : t.placements)
+                        if (q.id == p->id) track = t.id;
+                for (const doc::AudioTrack& t : s->audio)
+                    for (const doc::Placement& q : t.placements)
+                        if (q.id == p->id) {
+                            track = t.id;
+                            is_audio = true;
+                        }
+                Value m = Value::make_map();
+                map_num(m, "id", static_cast<double>(p->id));
+                map_num(m, "track", static_cast<double>(track));
+                map_bool(m, "audio", is_audio);
+                map_num(m, "target", static_cast<double>(p->target));
+                map_num(m, "t_in", p->t_in);
+                map_num(m, "t_out", p->t_out);
+                map_num(m, "source_in", p->source_in);
+                map_num(m, "speed", p->speed);
+                map_num(m, "link", static_cast<double>(p->link));
+                map_num(m, "gain", p->audio_gain);
+                map_bool(m, "mute", p->audio_mute);
+                map_num(m, "pos_x", p->pos_x);
+                map_num(m, "pos_y", p->pos_y);
+                map_num(m, "scale", p->scale);
+                map_num(m, "rotate", p->rotate);
+                map_num(m, "opacity", p->opacity);
+                return m;
+            });
+    env.add("set_placement",
+            "set_placement(seq, placement, {fields}) - timing edits "
+            "apply to the whole link group",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                const doc::Placement* p =
+                    doc::find_placement(*s, a[1].as_id());
+                if (!p) return op_err(vm, "no such placement");
+                if (a[2].kind != Value::Kind::Map)
+                    return op_err(vm, "set_placement needs a field map");
+                doc::Placement up = *p;
+                const Value& m = a[2];
+                double v = 0.0;
+                bool b = false;
+                if (map_get_num(m, "target", &v)) {
+                    const uint64_t t = static_cast<uint64_t>(v);
+                    if (t && doc::nest_reaches(sh.app->document, t,
+                                               s->id))
+                        return op_err(vm, "that target would loop");
+                    up.target = t;
+                }
+                if (map_get_num(m, "t_in", &v))
+                    up.t_in = static_cast<uint32_t>(std::max(0.0, v));
+                if (map_get_num(m, "t_out", &v))
+                    up.t_out = static_cast<uint32_t>(std::max(0.0, v));
+                if (map_get_num(m, "source_in", &v))
+                    up.source_in =
+                        static_cast<uint32_t>(std::max(0.0, v));
+                if (map_get_num(m, "speed", &v))
+                    up.speed = std::clamp(static_cast<float>(v), 0.0f,
+                                          doc::kMaxSpeed);
+                if (map_get_num(m, "gain", &v))
+                    up.audio_gain = std::clamp(static_cast<float>(v),
+                                               0.0f, 2.0f);
+                if (map_get_bool(m, "mute", &b)) up.audio_mute = b;
+                if (map_get_num(m, "pos_x", &v))
+                    up.pos_x = static_cast<float>(v);
+                if (map_get_num(m, "pos_y", &v))
+                    up.pos_y = static_cast<float>(v);
+                if (map_get_num(m, "scale", &v))
+                    up.scale = static_cast<float>(v);
+                if (map_get_num(m, "rotate", &v))
+                    up.rotate = static_cast<float>(v);
+                if (map_get_num(m, "opacity", &v))
+                    up.opacity = std::clamp(static_cast<float>(v), 0.0f,
+                                            1.0f);
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_placement_command(s->id,
+                                                                up));
+                return Value::boolean(true);
+            });
+    env.add("place",
+            "place(seq, track, target, at_frame) -> placement id; lays "
+            "the linked audio pair and overwrites the span",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                const uint64_t target = a[2].as_id();
+                if (!sh.app->document.find_look(target) &&
+                    !sh.app->document.find_sequence(target))
+                    return op_err(vm, "no look or sequence with id " +
+                                          script::to_display(a[2]));
+                if (doc::nest_reaches(sh.app->document, target, s->id))
+                    return op_err(vm, "that placement would loop");
+                double at = 0.0;
+                if (!arg_num(vm, a[3], "at_frame", &at))
+                    return Value::nil();
+                const uint64_t pid = lay_block(
+                    *sh.app, s->id, a[1].as_id(), target,
+                    static_cast<uint32_t>(std::max(0.0, at)));
+                if (!pid) return op_err(vm, "lane is full or missing");
+                return Value::number(static_cast<double>(pid));
+            });
+    env.add("razor",
+            "razor(seq, track, frame) -> the right half's id (0 = no cut "
+            "landed)",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                double at = 0.0;
+                if (!arg_num(vm, a[2], "frame", &at)) return Value::nil();
+                const uint32_t frame =
+                    static_cast<uint32_t>(std::max(0.0, at));
+                const uint64_t track = a[1].as_id();
+                bool is_audio = false;
+                for (const doc::AudioTrack& t : s->audio)
+                    if (t.id == track) is_audio = true;
+                std::vector<uint64_t> before;
+                for (const doc::SeqTrack& t : s->tracks)
+                    for (const doc::Placement& p : t.placements)
+                        before.push_back(p.id);
+                for (const doc::AudioTrack& t : s->audio)
+                    for (const doc::Placement& p : t.placements)
+                        before.push_back(p.id);
+                auto cmd = is_audio
+                               ? doc::razor_audio_command(
+                                     sh.app->document, s->id, track,
+                                     frame)
+                               : doc::razor_track_command(
+                                     sh.app->document, s->id, track,
+                                     frame);
+                if (!cmd) return Value::number(0.0);
+                sh.app->undo.execute(sh.app->document, std::move(cmd));
+                // The fresh right half is the placement that was not
+                // there before the cut.
+                for (const doc::SeqTrack& t : s->tracks)
+                    for (const doc::Placement& p : t.placements)
+                        if (std::find(before.begin(), before.end(),
+                                      p.id) == before.end())
+                            return Value::number(
+                                static_cast<double>(p.id));
+                for (const doc::AudioTrack& t : s->audio)
+                    for (const doc::Placement& p : t.placements)
+                        if (std::find(before.begin(), before.end(),
+                                      p.id) == before.end())
+                            return Value::number(
+                                static_cast<double>(p.id));
+                return Value::number(0.0);
+            });
+    env.add("remove_placement",
+            "remove_placement(seq, placement) - takes its link group", 2,
+            2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                if (!doc::find_placement(*s, a[1].as_id()))
+                    return op_err(vm, "no such placement");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::remove_placement_command(
+                                         s->id, a[1].as_id()));
+                return Value::boolean(true);
+            });
+    env.add("unlink_placement",
+            "unlink_placement(seq, placement) - the J/L cut", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                if (!doc::find_placement(*s, a[1].as_id()))
+                    return op_err(vm, "no such placement");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::unlink_placement_command(
+                                         s->id, a[1].as_id()));
+                return Value::boolean(true);
+            });
+    env.add("make_unique",
+            "make_unique(seq, placement) -> the fork's id; deep-copies "
+            "the target for THIS block",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                auto cmd = doc::make_unique_command(sh.app->document,
+                                                    s->id, a[1].as_id());
+                if (!cmd)
+                    return op_err(vm,
+                                  "nothing to fork (dormant target, or "
+                                  "at the entity bound)");
+                sh.app->undo.execute(sh.app->document, std::move(cmd));
+                const doc::Placement* p =
+                    doc::find_placement(*s, a[1].as_id());
+                return Value::number(
+                    p ? static_cast<double>(p->target) : 0.0);
+            });
+    env.add("set_region",
+            "set_region(seq, trim_in, trim_out, loop_in?, loop_out?) - 0 "
+            "= full / off",
+            3, 5, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                double ti = 0.0, to = 0.0, li = 0.0, lo = 0.0;
+                if (!arg_num(vm, a[1], "trim_in", &ti) ||
+                    !arg_num(vm, a[2], "trim_out", &to))
+                    return Value::nil();
+                if (a.size() > 3) li = a[3].is_num() ? a[3].num : 0.0;
+                if (a.size() > 4) lo = a[4].is_num() ? a[4].num : 0.0;
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_timeline_region_command(
+                        s->id, static_cast<uint32_t>(std::max(0.0, ti)),
+                        static_cast<uint32_t>(std::max(0.0, to)),
+                        static_cast<uint32_t>(std::max(0.0, li)),
+                        static_cast<uint32_t>(std::max(0.0, lo))));
+                return Value::boolean(true);
+            });
+    env.add("markers", "markers(seq) -> frame list", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                Value out = Value::make_list();
+                for (const uint32_t f : s->markers)
+                    out.list->push_back(Value::number(f));
+                return out;
+            });
+    env.add("toggle_marker", "toggle_marker(seq, frame)", 2, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                double f = 0.0;
+                if (!arg_num(vm, a[1], "frame", &f)) return Value::nil();
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::toggle_marker_command(
+                        s->id,
+                        static_cast<uint32_t>(std::max(0.0, f))));
+                return Value::boolean(true);
+            });
+
+    env.add("set_format",
+            "set_format(fps, w, h) - 0 = derive from the first asset", 3,
+            3, [&sh](Vm& vm, std::vector<Value>& a) {
+                double fps = 0.0, w = 0.0, h = 0.0;
+                if (!arg_num(vm, a[0], "fps", &fps) ||
+                    !arg_num(vm, a[1], "w", &w) ||
+                    !arg_num(vm, a[2], "h", &h))
+                    return Value::nil();
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_project_format_command(
+                        fps, static_cast<uint32_t>(std::max(0.0, w)),
+                        static_cast<uint32_t>(std::max(0.0, h))));
+                return Value::boolean(true);
+            });
+    env.add("set_speed",
+            "set_speed(speed, mode?) - 0 forward, 1 reverse, 2 ping-pong",
+            1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                double sp = 1.0;
+                if (!arg_num(vm, a[0], "speed", &sp)) return Value::nil();
+                const uint32_t mode =
+                    a.size() > 1 ? static_cast<uint32_t>(std::clamp(
+                                       static_cast<int>(a[1].num), 0, 2))
+                                 : sh.app->document.time_mode;
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_time_remap_command(
+                        std::clamp(static_cast<float>(sp), 0.0f,
+                                   doc::kMaxSpeed),
+                        mode));
+                return Value::boolean(true);
+            });
+    env.add("set_export_config",
+            "set_export_config(bitrate_mbps, scale 1|2|4, audio)", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                double br = 8.0;
+                if (!arg_num(vm, a[0], "bitrate", &br))
+                    return Value::nil();
+                const uint32_t sc = static_cast<uint32_t>(a[1].as_id());
+                if (sc != 1 && sc != 2 && sc != 4)
+                    return op_err(vm, "scale is 1, 2 or 4");
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_export_config_command(
+                                         static_cast<float>(br), sc,
+                                         a[2].truthy()));
+                return Value::boolean(true);
+            });
+    env.add("set_audio_config",
+            "set_audio_config(sidechain_path, mux, offset_ms)", 3, 3,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                double off = 0.0;
+                if (!arg_num(vm, a[2], "offset_ms", &off))
+                    return Value::nil();
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_audio_config_command(
+                                         a[0].as_str(), a[1].truthy(),
+                                         static_cast<float>(off)));
+                return Value::boolean(true);
+            });
+    env.add("set_proxy", "set_proxy(on) - half-res preview decode", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->undo.execute(sh.app->document,
+                                     doc::set_use_proxy_command(
+                                         a[0].truthy()));
+                return Value::boolean(true);
+            });
+}
+
+void register_script_ops(ScriptHost& sh) {
+    script::add_core_natives(sh.env);
+    register_ops_app(sh);
+    register_ops_input(sh);
+    register_ops_entities(sh);
+    register_ops_graph(sh);
+    register_ops_mod(sh);
+    register_ops_sequence(sh);
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
@@ -10791,6 +15981,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     ui::LayoutArena arena;
     ui::UiInput input;
     AppState app;
+    ScriptHost script_host;
+    register_script_ops(script_host);
 
     // Preset browser: shipped era presets next to the exe, user saves in
     // ./presets (created on first save).
@@ -10839,6 +16031,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         return 1;
     }
     app.render_worker = &render_worker;
+    // Library thumbnails render on their own thread with a private
+    // engine (built on that thread) - playback never shares a cycle
+    // with gallery fill.
+    ThumbWorker thumb_worker(renderer->device(), shader_dir);
+    if (!thumb_worker.start()) {
+        fatal_dialog(L"Thumbnail thread startup failed.");
+        return 1;
+    }
+    app.thumb_worker = &thumb_worker;
 
     // Viewport sampling state for the UI thread (the engine's descriptor
     // arena and sampler moved to the worker with it).
@@ -10866,7 +16067,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     // and the add menu build from there.
 
     // `looks.exe <media|project.json>` opens it at startup (projects load
-    // their bound media themselves).
+    // their bound media themselves). `--script <file.lks>` runs an
+    // automation script from the first frame; `--script-exit` quits when
+    // it finishes (exit code = script failures) - the headless test mode.
+    std::filesystem::path script_path;
     if (cmdline && cmdline[0]) {
         std::wstring arg = cmdline;
         // Launchers pad the command line (Start-Process appends a trailing
@@ -10877,17 +16081,63 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             while (!s.empty() && (s.front() == L' ' || s.front() == L'\t'))
                 s.erase(s.begin());
         };
+        // Flags strip out first; the remainder stays one path (possibly
+        // space-bearing, exactly as before).
+        const auto take_flag = [&](const std::wstring& flag,
+                                   std::wstring* value) {
+            const size_t at = arg.find(flag);
+            if (at == std::wstring::npos) return false;
+            size_t end = at + flag.size();
+            if (value) {
+                while (end < arg.size() && arg[end] == L' ') ++end;
+                size_t vend;
+                if (end < arg.size() && arg[end] == L'"') {
+                    vend = arg.find(L'"', end + 1);
+                    if (vend == std::wstring::npos) vend = arg.size();
+                    *value = arg.substr(end + 1, vend - end - 1);
+                    vend = std::min(vend + 1, arg.size());
+                } else {
+                    vend = arg.find(L' ', end);
+                    if (vend == std::wstring::npos) vend = arg.size();
+                    *value = arg.substr(end, vend - end);
+                }
+                end = vend;
+            }
+            arg.erase(at, end - at);
+            return true;
+        };
+        std::wstring script_arg;
+        if (take_flag(L"--script-exit", nullptr))
+            script_host.exit_when_done = true;
+        if (take_flag(L"--script", &script_arg))
+            script_path = script_arg;
         trim(arg);
         if (arg.size() >= 2 && arg.front() == L'"' && arg.back() == L'"')
             arg = arg.substr(1, arg.size() - 2);
         trim(arg);
         std::filesystem::path source(arg);
-        if (std::filesystem::exists(source)) {
-            if (source.extension() == L".json")
-                open_project(app, source, window.get());
-            else
-                open_source(app, source);
+        // `project.json#<id>` opens scoped to that entity - the smoke
+        // harness cannot double-click its way into a look.
+        uint64_t scope_id = 0;
+        if (!std::filesystem::exists(source)) {
+            const size_t hash = arg.rfind(L'#');
+            if (hash != std::wstring::npos) {
+                scope_id = std::wcstoull(arg.c_str() + hash + 1, nullptr, 10);
+                source = arg.substr(0, hash);
+            }
         }
+        if (std::filesystem::exists(source)) {
+            if (source.extension() == L".json") {
+                open_project(app, source, window.get());
+                if (scope_id) enter_scope(app, scope_id);
+            } else {
+                open_source(app, source);
+            }
+        }
+        if (!script_path.empty() &&
+            !script_host.start_file(script_path) &&
+            script_host.exit_when_done)
+            return 2;
     } else {
         // Crash recovery for untitled sessions: work that only ever
         // lived in cache/untitled.autosave.json is offered back on the
@@ -10918,6 +16168,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     while (running) {
         events.clear();
         if (!window->pump_events(events)) break;
+        // Script step: console keys strip out, due synthetic input lands
+        // in this frame's queue, the VM advances (edits post through the
+        // same commands the UI uses).
+        script_host.app = &app;
+        script_host.window = window.get();
+        script_host.renderer = renderer.get();
+        script_host.worker = &render_worker;
+        script_host.events = &events;
+        script_host.shader_dir = &shader_dir;
+        script_host.running = &running;
+        script_host.pump();
         bool toggle_play = false;
         bool do_undo = false, do_redo = false;
         bool do_save = false, do_save_as = false, do_open_project = false;
@@ -11039,6 +16300,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         e.codepoint < 127)
                         app.browser_rename_buf.push_back(
                             static_cast<char>(e.codepoint));
+                    // Preset inline rename: printable ASCII only.
+                    if (app.preset_rename_key && e.codepoint >= 32 &&
+                        e.codepoint < 127)
+                        app.preset_rename_buf.push_back(
+                            static_cast<char>(e.codepoint));
                     // Browser search typing: printable ASCII only.
                     if (app.browser_search_focus && e.codepoint >= 32 &&
                         e.codepoint < 127)
@@ -11067,6 +16333,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             app.browser_rename_commit = true;
                         else if (e.key == platform::Key::Escape)
                             app.browser_rename_id = 0;
+                        break;
+                    }
+                    if (app.preset_rename_key) {
+                        if (e.key == platform::Key::Backspace &&
+                            !app.preset_rename_buf.empty())
+                            app.preset_rename_buf.pop_back();
+                        else if (e.key == platform::Key::Enter)
+                            app.preset_rename_commit = true;
+                        else if (e.key == platform::Key::Escape)
+                            app.preset_rename_key = 0;
                         break;
                     }
                     if (app.browser_search_focus) {
@@ -11298,6 +16574,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             if (app.inspector_tab == 3 && app.browser_sel) {
                                 request_browser_delete(app,
                                                        app.browser_sel);
+                            } else if (app.inspector_tab == 2 &&
+                                       app.preset_sel) {
+                                request_preset_delete(app, app.preset_sel);
                             } else if (app.sel_placement && !app.scope_is_look() &&
                                 doc::find_placement(app.sequence(),
                                                     app.sel_placement)) {
@@ -11630,11 +16909,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 (job->progress.ready.load() || (done && job->result.ok))) {
                 job->announced = true;
                 render_worker.pause();
+                thumb_worker.pause();
                 render_worker.invalidate();
                 struct ResumeGuard {
                     RenderWorker& w;
-                    ~ResumeGuard() { w.resume(); }
-                } import_resume{render_worker};
+                    ThumbWorker& t;
+                    ~ResumeGuard() {
+                        t.resume();
+                        w.resume();
+                    }
+                } import_resume{render_worker, thumb_worker};
                 if (job->import_only) {
                     // Generic import: the asset joins the browser and
                     // an asking media node binds - nothing placed,
@@ -11683,17 +16967,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.pcm_path = paths.pcm;
                     refresh_bundles(app);
                     ensure_media_placed(app, job->source);
-                    load_media_analysis(app);
+                    reset_media_env(app);
                     app.player.set_looping(app.loop);
                     app.player.play();
                     app.status.clear();
                     // A rebuilt still bundle (cache cleared, new
                     // machine) comes back at the import default; the
                     // document's persisted duration wins.
-                    if (primary_still_duration(app.document) > 0 &&
+                    const doc::Asset* oa = opened_asset(app);
+                    if (oa && oa->still_duration_frames > 0 &&
                         is_still_source(job->source))
-                        set_still_frames(
-                            app, primary_still_duration(app.document));
+                        set_still_frames(app, oa->still_duration_frames);
                 }
             }
             if (done) {
@@ -11701,28 +16985,99 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (owned->thread.joinable()) owned->thread.join();
                 if (!owned->result.ok) {
                     app.status =
-                        "import failed: " + owned->result.error;
+                        std::string(owned->consolidate ? "consolidate failed: "
+                                    : owned->video_pass_only
+                                        ? "analysis failed: "
+                                        : "import failed: ") +
+                        owned->result.error;
                 } else if (owned->announced) {
-                    // The video pass may have landed curves and thumbs
-                    // after the announce; reload them for the primary.
+                    // The video pass lands curves and thumbs AFTER the
+                    // announce: drop the caches that captured their
+                    // absence so strips, gallery cards and mod curves
+                    // pick them up.
+                    for (const doc::Asset& a : app.document.assets)
+                        if (a.path == owned->source.string()) {
+                            app.asset_strips.erase(a.id);
+                            app.asset_analysis.erase(a.id);
+                        }
+                    app.analysis_revision = ~0ull;
+                    refresh_bundles(app);
                     if (!app.bundle_base.empty() &&
                         resolve_bundle(owned->source).base ==
                             app.bundle_base)
-                        load_media_analysis(app);
+                        reset_media_env(app);
+                    if (owned->video_pass_only)
+                        app.status =
+                            "curves/thumbnails rebuilt: " +
+                            owned->source.filename().string();
+                    else if (owned->consolidate)
+                        app.status = "consolidated: " +
+                                     owned->source.filename().string();
                 }
             }
         }
 
-        // Audio Scope: keep the engine's mono PCM copy in sync with the
-        // current media — every open path funnels through app.pcm_path, so
-        // one poll covers them all (empty path = silent, flat line).
-        if (!app.scope_pcm_init || app.scope_pcm_loaded != app.pcm_path) {
-            app.scope_pcm_init = true;
-            app.scope_pcm_loaded = app.pcm_path;
-            uint32_t scope_rate = 0;
-            auto scope_mono = load_scope_audio(app.pcm_path, &scope_rate);
-            render_worker.post_scope_audio(std::move(scope_mono),
-                                           scope_rate);
+        // Ingest killed mid-video-pass (app closed, smoke run, cancel):
+        // the asset stayed usable but its curves are audio-only and its
+        // thumbs are missing. Rescan when the bundle table moves and
+        // resume one source at a time through the import slot.
+        if (app.video_pass_scan_stamp != app.bundle_stamp) {
+            app.video_pass_scan_stamp = app.bundle_stamp;
+            app.video_pass_pending.clear();
+            for (const doc::Asset& a : app.document.assets) {
+                if (a.path.empty()) continue;
+                const std::filesystem::path src(a.path);
+                std::wstring key = src.native();
+                for (wchar_t& c : key) c = static_cast<wchar_t>(towlower(c));
+                if (app.video_pass_attempted.count(key)) continue;
+                if (video_pass_incomplete(src))
+                    app.video_pass_pending.push_back(src);
+            }
+        }
+        if (!app.import && !app.video_pass_pending.empty()) {
+            const std::filesystem::path src = app.video_pass_pending.back();
+            app.video_pass_pending.pop_back();
+            std::wstring key = src.native();
+            for (wchar_t& c : key) c = static_cast<wchar_t>(towlower(c));
+            app.video_pass_attempted.insert(key);
+            if (video_pass_incomplete(src)) {
+                app.import =
+                    start_video_pass_resume(src, bundle_dir_for(src));
+                app.status = "rebuilding curves/thumbnails: " +
+                             src.filename().string();
+            }
+        }
+
+        // Audio Scope: rebuild the mono strip whenever the published mix
+        // re-keys. The render runs on a helper thread (a long timeline
+        // takes a beat) and lands atomically; a key that moved mid-render
+        // relaunches next frame.
+        {
+            const uint64_t scope_key = hash_combine(
+                hash_combine(app.mix_revision, app.mix_stamp),
+                app.mix_look);
+            if (app.scope_job && app.scope_job->done.load()) {
+                auto owned = std::move(app.scope_job);
+                if (owned->thread.joinable()) owned->thread.join();
+                if (owned->key == scope_key) {
+                    render_worker.post_scope_audio(std::move(owned->mono),
+                                                   owned->rate);
+                    app.scope_pushed_key = owned->key;
+                }
+            }
+            if (!app.scope_job && app.scope_pushed_key != scope_key &&
+                app.scope_mix) {
+                auto job = std::make_unique<AppState::ScopeJob>();
+                job->key = scope_key;
+                auto mix = app.scope_mix;
+                AppState::ScopeJob* raw = job.get();
+                job->thread = std::thread([raw, mix] {
+                    raw->mono =
+                        scope_audio_from_mix(*mix, &raw->rate, &raw->cancel);
+                    raw->done = true;
+                });
+                app.scope_job = std::move(job);
+            }
         }
 
         // Finished export → report, then start the next queued job.
@@ -11768,6 +17123,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.ui_frame_counter > gfx::kFramesInFlight
                 ? app.ui_frame_counter - gfx::kFramesInFlight
                 : 0);
+        thumb_worker.set_completed_ui_frame(
+            app.ui_frame_counter > gfx::kFramesInFlight
+                ? app.ui_frame_counter - gfx::kFramesInFlight
+                : 0);
 
         const float scale = window->dpi_scale();
         const ui::Rect viewport{0, 0,
@@ -11786,6 +17145,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             input.buttons_released = 0;
             input.wheel_x = input.wheel_y = 0.0f;
             input.typed.clear();
+            input.backspace_pressed = false;
+            input.enter_pressed = false;
             input.mouse = {-4096.0f, -4096.0f};
             input.mouse_delta = {};
             input.consumed = true;
@@ -11796,6 +17157,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         app.tl_rect_accum = {};
         timeline_zoom_wheel(app, input, app.player.frame_count());
         canvas.begin_frame(scale, {viewport.w, viewport.h});
+        ui::probe_frame_begin();
         arena.reset();
 
         FrameUi frame_ui;
@@ -11881,6 +17243,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                           .first;
             thumb_tex = reg->second;
         }
+        // Library gallery atlas: same registration path as the node
+        // thumb atlas (keyed on the published image's view).
+        const ThumbWorker::View gal_view =
+            thumb_worker.acquire(app.ui_frame_counter);
+        const ui::UiTexture* gallery_tex = nullptr;
+        if (gal_view.img) {
+            auto reg = app.thumb_registry.find(gal_view.img->view());
+            if (reg == app.thumb_registry.end())
+                reg = app.thumb_registry
+                          .emplace(gal_view.img->view(),
+                                   ui_renderer->register_external(
+                                       gal_view.img->view(),
+                                       gal_view.img->width(),
+                                       gal_view.img->height()))
+                          .first;
+            gallery_tex = reg->second;
+        }
         // Node canvas: graph + events built before
         // the panels so the rail and the canvas share one selection.
         FlowBuild flow_ui = build_flow(arena, app, frame_ui, thumb_tex,
@@ -11900,7 +17279,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         ui::LayoutNode* browser_panel = nullptr;
         build_side_panels(arena, app, frame_ui, 1.0f / smoothed_dt,
                           &left_panel, &right_panel, &preset_panel,
-                          &browser_panel);
+                          &browser_panel, gallery_tex,
+                          gal_view.img ? &gal_view.cells : nullptr);
 
         // Menu bar: every file/edit/view action stays reachable without
         // the old rail buttons; picks dispatch after RunPopup below.
@@ -12281,6 +17661,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 ctx_item("new look from this", kActNewLookFromAsset);
                 ctx_item("place at playhead", kActPlaceAtPlayhead);
                 ctx_item("rename", kActRename);
+                // CONSOLIDATE for ready native video: all-intra
+                // transcode preview scrubs through; "re-" when one
+                // already exists (source overwritten, or redo).
+                if (const doc::Asset* ca = app.document.find_asset(ba.id);
+                    ca && !ca->path.empty()) {
+                    const std::filesystem::path src(ca->path);
+                    std::wstring cext = src.extension().wstring();
+                    for (wchar_t& c : cext)
+                        c = static_cast<wchar_t>(towlower(c));
+                    if (cext == L".mp4" || cext == L".mov") {
+                        const BundlePaths cp = resolve_bundle(src);
+                        if (cp.ready && !cp.native.empty())
+                            ctx_item(cp.native != src
+                                         ? "re-consolidate (all-intra)"
+                                         : "consolidate (all-intra)",
+                                     kActConsolidate);
+                    }
+                }
                 for (const doc::Asset& a2 : app.document.assets)
                     if (a2.id == ba.id && a2.bin) {
                         ctx_item("move to root", kActMoveToRoot);
@@ -12305,6 +17703,36 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 ctx_item("delete (del, keeps contents)", kActRemoveBin);
                 break;
             }
+            for (const FrameUi::BrowserAction& pa : frame_ui.preset_items) {
+                if (!pa.ctx || !*pa.ctx) continue;
+                auto& m = ctx_open(kCtxPreset);
+                m.a = pa.id;
+                app.preset_sel = pa.id;   // the menu marks its row
+                ctx_item("apply (double-click)", kActOpenTarget);
+                const int cpi = preset_index_of(app, pa.id);
+                const bool shipped =
+                    cpi >= 0 &&
+                    app.preset_info[static_cast<size_t>(cpi)].shipped;
+                if (!shipped) {
+                    ctx_item("rename", kActRename);
+                    if (cpi >= 0 &&
+                        !app.preset_info[static_cast<size_t>(cpi)]
+                             .bin.empty())
+                        ctx_item("move to root", kActMoveToRoot);
+                    ctx_item("delete (del)", kActRemoveEntity);
+                }
+                break;
+            }
+            for (const FrameUi::BinRow& pb : frame_ui.preset_bin_rows) {
+                if (!pb.ctx || !*pb.ctx) continue;
+                if (!preset_bin_of(app, pb.id)) break;   // shipped: none
+                auto& m = ctx_open(kCtxPresetBin);
+                m.a = pb.id;
+                app.preset_sel = pb.id;
+                ctx_item("rename", kActRename);
+                ctx_item("delete (del, keeps contents)", kActRemoveEntity);
+                break;
+            }
             // Browser background (no row under the cursor): creation.
             if (!app.ctx_menu.kind && input.right_pressed() &&
                 frame_ui.browser_panel &&
@@ -12312,7 +17740,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 bool on_row = false;
                 for (const FrameUi::BrowserNode& bn :
                      frame_ui.browser_nodes)
-                    if (bn.node->rect.contains(input.mouse)) on_row = true;
+                    if (bn.rect->contains(input.mouse)) on_row = true;
                 if (!on_row) {
                     ctx_open(kCtxBrowserBg);
                     ctx_item("new look", kActNewLook);
@@ -12330,7 +17758,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 bool on_row = false;
                 for (const FrameUi::BrowserNode& bn :
                      frame_ui.browser_nodes)
-                    if (bn.node->rect.contains(input.mouse)) on_row = true;
+                    if (bn.rect->contains(input.mouse)) on_row = true;
                 if (!on_row) app.browser_sel = 0;
             }
             if (!app.ctx_menu.kind && input.right_pressed() &&
@@ -12411,7 +17839,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                      frame_ui.browser_nodes) {
                     if (!bn.is_bin || bn.id == app.browser_drag_id)
                         continue;
-                    if (!bn.node->rect.contains(input.mouse)) continue;
+                    if (!bn.rect->contains(input.mouse)) continue;
                     if (app.browser_drag_is_bin) {
                         if (!doc::bin_reaches(app.document, bn.id,
                                               app.browser_drag_id)) {
@@ -12521,7 +17949,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (input.left_pressed() && !app.browser_drag_id &&
             !(app.ctx_menu.kind && app.ctx_menu_dd.open)) {
             for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes)
-                if (bn.node->rect.contains(input.mouse)) {
+                if (bn.rect->contains(input.mouse)) {
                     app.browser_drag_id = bn.id;
                     app.browser_drag_is_bin = bn.is_bin;
                     app.browser_drag_from = input.mouse;
@@ -12533,14 +17961,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             // trails a small chip so the gesture reads as a carry.
             for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes) {
                 if (!bn.is_bin || bn.id == app.browser_drag_id) continue;
-                if (!bn.node->rect.contains(input.mouse)) continue;
+                if (!bn.rect->contains(input.mouse)) continue;
                 const bool ok =
                     !app.browser_drag_is_bin ||
                     !doc::bin_reaches(app.document, bn.id,
                                       app.browser_drag_id);
                 if (ok)
                     canvas.draw_sdf_rect_outline(
-                        bn.node->rect, 3.0f, 1.5f,
+                        *bn.rect, 3.0f, 1.5f,
                         ui::active_theme().accent);
                 break;
             }
@@ -12579,7 +18007,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             };
             switch (act) {
                 case kActOpenTarget: {
-                    if (m.kind == kCtxBlockVideo) {
+                    if (m.kind == kCtxPreset) {
+                        const int cpi = preset_index_of(app, m.a);
+                        if (cpi >= 0 && frame_ui.preset_items.size()) {
+                            // Route through the row's own apply flag so
+                            // the one spawn path (and its structure
+                            // guard) serves clicks and menus alike.
+                            for (const FrameUi::BrowserAction& pa :
+                                 frame_ui.preset_items)
+                                if (pa.id == m.a && pa.open)
+                                    *pa.open = true;
+                        }
+                    } else if (m.kind == kCtxBlockVideo) {
                         if (const doc::Placement* p = doc::find_placement(
                                 app.sequence(), m.b))
                             scope_into(p->target);
@@ -12814,8 +18253,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
                 }
                 case kActRemoveEntity:
-                    request_browser_delete(app, m.a);
+                    if (m.kind == kCtxPreset || m.kind == kCtxPresetBin)
+                        request_preset_delete(app, m.a);
+                    else
+                        request_browser_delete(app, m.a);
                     break;
+                case kActConsolidate: {
+                    const doc::Asset* a = app.document.find_asset(m.a);
+                    if (!a || a->path.empty()) break;
+                    if (!import_slot_free(app)) {
+                        app.status = "an import is already running";
+                        break;
+                    }
+                    const std::filesystem::path src(a->path);
+                    app.import =
+                        start_consolidate(src, bundle_dir_for(src));
+                    app.status =
+                        "consolidating: " + src.filename().string();
+                    break;
+                }
                 case kActNewLookFromAsset: {
                     const doc::Asset* a = nullptr;
                     for (const doc::Asset& it : app.document.assets)
@@ -12969,6 +18425,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     request_browser_delete(app, m.a);
                     break;
                 case kActRename: {
+                    if (m.kind == kCtxPreset || m.kind == kCtxPresetBin) {
+                        std::string cur;
+                        if (const std::string* bin =
+                                preset_bin_of(app, m.a)) {
+                            const size_t slash = bin->rfind('/');
+                            cur = slash == std::string::npos
+                                ? *bin
+                                : bin->substr(slash + 1);
+                        } else if (const int cpi =
+                                       preset_index_of(app, m.a);
+                                   cpi >= 0) {
+                            cur = app.presets[static_cast<size_t>(cpi)]
+                                      .name;
+                        }
+                        app.preset_rename_key = m.a;
+                        app.preset_rename_buf = cur;
+                        app.preset_rename_commit = false;
+                        app.browser_rename_id = 0;
+                        app.fx_search_focus = false;
+                        app.preset_search_focus = false;
+                        app.duration_focus = false;
+                        break;
+                    }
                     std::string cur;
                     if (const doc::Bin* b = app.document.find_bin(m.a))
                         cur = b->name;
@@ -12992,14 +18471,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
                 }
                 case kActMoveToRoot:
-                    if (const doc::Bin* b = app.document.find_bin(m.a))
+                    if (m.kind == kCtxPreset) {
+                        preset_move_file(app, m.a, "");
+                    } else if (const doc::Bin* b =
+                                   app.document.find_bin(m.a)) {
                         app.undo.execute(app.document,
                                          doc::set_bin_props_command(
                                              m.a, b->name, 0));
-                    else
+                    } else {
                         app.undo.execute(
                             app.document,
                             doc::set_entity_bin_command(m.a, 0));
+                    }
                     break;
                 default:
                     break;
@@ -14074,39 +19557,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
             }
 
-            // Splice-on-drop (texed): a single unfed effect card released
-            // over a wire splices into it, cycle-guarded on both new
-            // connections.
+            // Splice-on-drop (texed): a single unfed effect OR GROUP
+            // card released over a wire splices into it, cycle-guarded
+            // on both new connections. A group splices through its
+            // boundary members (the link table stores members, never
+            // the card); a preset lands as a group, so preset cards
+            // ride this same path.
             if (fe.node_splice_requested && !structure_done &&
-                tag_kind(fe.splice_node) == flow::NodeKind::Effect) {
-                const uint64_t nid = tag_doc(fe.splice_node);
-                // Group wire ends resolve to their boundary members —
-                // the link table stores members, not the card.
+                (tag_kind(fe.splice_node) == flow::NodeKind::Effect ||
+                 tag_kind(fe.splice_node) == flow::NodeKind::Group)) {
+                uint64_t nid_in = 0, nid_out = 0;
+                if (tag_kind(fe.splice_node) == flow::NodeKind::Effect) {
+                    nid_in = nid_out = tag_doc(fe.splice_node);
+                } else {
+                    const uint64_t gid = tag_doc(fe.splice_node);
+                    nid_in =
+                        group_boundary_member(app.look(), gid, false);
+                    nid_out =
+                        group_boundary_member(app.look(), gid, true);
+                }
                 auto splice_end = [&](uint64_t cid,
                                       bool is_from) -> uint64_t {
                     if (cid == flow::kOutNodeId) return 0;
                     if (tag_kind(cid) != flow::NodeKind::Group)
                         return tag_doc(cid);
-                    const uint64_t gid = tag_doc(cid);
-                    size_t gli = 0;
-                    if (!find_group_by_id(app.look(), gid, &gli))
-                        return 0;
-                    uint64_t first = 0, last_id = 0, bind = 0;
-                    const doc::Group* gr2 = nullptr;
-                    for (const doc::Group& g :
-                         app.look().layers[gli].groups)
-                        if (g.id == gid) gr2 = &g;
-                    for (const doc::EffectInstance& e :
-                         app.look().layers[gli].stack)
-                        if (e.group_id == gid) {
-                            if (!first) first = e.id;
-                            last_id = e.id;
-                            if (gr2 &&
-                                e.id == (is_from ? gr2->face_out
-                                                 : gr2->face_in))
-                                bind = e.id;
-                        }
-                    return bind ? bind : (is_from ? last_id : first);
+                    return group_boundary_member(app.look(),
+                                                 tag_doc(cid), is_from);
                 };
                 auto bkind = [&](uint64_t cid) {
                     return cid != flow::kOutNodeId &&
@@ -14120,10 +19596,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     bkind(fe.splice_wire_to)) {
                     app.status =
                         "boundary wires re-route via the in/out nodes";
-                } else if (!wf) {
+                } else if (!wf || !nid_in || !nid_out) {
                     app.status = "that group has no members";
-                } else if (doc::link_would_cycle(app.look(), wf, nid) ||
-                           doc::link_would_cycle(app.look(), nid, wt)) {
+                } else if (doc::link_would_cycle(app.look(), wf, nid_in) ||
+                           doc::link_would_cycle(app.look(), nid_out,
+                                                 wt)) {
                     app.status = "refused: that splice would loop";
                 } else {
                     app.undo.begin_group("Splice Node");
@@ -14134,12 +19611,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.undo.execute(app.document,
                                      doc::disconnect_command(app.scope_look,
                                          {wf, wt, fe.splice_wire_port}));
-                    app.undo.execute(app.document,
-                                     doc::connect_command(app.scope_look,{wf, nid, 0}));
                     app.undo.execute(
                         app.document,
                         doc::connect_command(app.scope_look,
-                            {nid, wt, fe.splice_wire_port}));
+                                             {wf, nid_in, 0}));
+                    app.undo.execute(
+                        app.document,
+                        doc::connect_command(app.scope_look,
+                            {nid_out, wt, fe.splice_wire_port}));
                     app.undo.end_group();
                     structure_done = true;
                 }
@@ -14328,11 +19807,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     if (fe.value_edit_row >= 0 &&
                         fe.value_edit_row < nd.row_count &&
                         nd.rows[fe.value_edit_row].staged) {
+                        const flow::ParamRow& vr =
+                            nd.rows[fe.value_edit_row];
+                        const float vds = vr.display_scale != 0.0f
+                                              ? vr.display_scale
+                                              : 1.0f;
                         char vb[32];
-                        std::snprintf(
-                            vb, sizeof(vb), "%.4g",
-                            static_cast<double>(
-                                *nd.rows[fe.value_edit_row].staged));
+                        std::snprintf(vb, sizeof(vb), "%.4g",
+                                      static_cast<double>(*vr.staged *
+                                                          vds));
                         app.value_edit_buf = vb;
                     }
                     break;
@@ -14354,10 +19837,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         !app.value_edit_buf.empty()) {
                         const flow::ParamRow& row =
                             nd.rows[app.value_edit_row];
+                        // Typed values honor the row's HARD range: some
+                        // params legitimately run past the slider (the
+                        // kernel wraps or the range is open-ended). They
+                        // stay faithful to the input - only drags snap.
+                        // Display-scaled rows (deg) type display units.
+                        const float vds = row.display_scale != 0.0f
+                                              ? row.display_scale
+                                              : 1.0f;
                         const float v = std::clamp(
                             static_cast<float>(
-                                std::atof(app.value_edit_buf.c_str())),
-                            row.min_v, row.max_v);
+                                std::atof(app.value_edit_buf.c_str())) /
+                                vds,
+                            row.min_v,
+                            row.hard_max > row.max_v ? row.hard_max
+                                                     : row.max_v);
                         // Effect rows commit DIRECTLY: the generic staged
                         // path is applied before this handler runs, so a
                         // staged write here evaporated on the next frame
@@ -15868,44 +21362,96 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 group.node_y = gy - 60.0f;
             }
             const uint64_t new_gid = group.id;
+            const uint64_t face_in = group.face_in;
+            const uint64_t face_out = group.face_out;
+            // Dropped ON A WIRE: splice the preset chain into it. The
+            // members already chain internally (insert wires them), so
+            // the gesture is boundary wiring — wf → face_in,
+            // face_out → wt — resolved and cycle-guarded exactly like
+            // the canvas node splice.
+            uint64_t swf = 0, swt = 0;
+            uint32_t sport = 0;
+            const bool over_wire =
+                at_cursor && frame_ui.canvas_node && flow_ui.graph &&
+                flow::pick_wire(*flow_ui.graph, app.canvas_state,
+                                frame_ui.canvas_node->rect, input.mouse,
+                                &swf, &swt, &sport);
             app.undo.execute(app.document,
                              doc::insert_group_command(app.scope_look,
                                  target_layer, std::move(group),
                                  std::move(effects)));
+            if (over_wire && face_in && face_out) {
+                auto wire_end_doc = [&](uint64_t cid,
+                                        bool is_from) -> uint64_t {
+                    if (cid == flow::kOutNodeId) return 0;
+                    const auto k =
+                        static_cast<flow::NodeKind>((cid >> 56) - 1);
+                    const uint64_t did = cid & 0x00FFFFFFFFFFFFFFull;
+                    return k == flow::NodeKind::Group
+                               ? group_boundary_member(app.look(), did,
+                                                       is_from)
+                               : did;
+                };
+                const uint64_t wf = wire_end_doc(swf, true);
+                const uint64_t wt = wire_end_doc(swt, false);
+                if (wf &&
+                    !doc::link_would_cycle(app.look(), wf, face_in) &&
+                    !doc::link_would_cycle(app.look(), face_out, wt)) {
+                    app.undo.execute(
+                        app.document,
+                        doc::disconnect_command(app.scope_look,
+                                                {wf, wt, sport}));
+                    app.undo.execute(
+                        app.document,
+                        doc::connect_command(app.scope_look,
+                                             {wf, face_in, 0}));
+                    app.undo.execute(
+                        app.document,
+                        doc::connect_command(app.scope_look,
+                                             {face_out, wt, sport}));
+                }
+            }
             app.undo.end_group();
             // Select the dropped group: its face lands in the inspector
             // and the canvas highlights the new card.
             app.sel = {SelKind::Group, new_gid};
             structure_done = true;
         };
-        // Drag a preset out of the browser onto the canvas (texed
-        // palette drag): press arms, slop starts the drag, release over
-        // the canvas drops at the cursor. A still click on the button
-        // keeps firing preset_clicks below (centered spawn).
-        if (input.left_pressed() && app.preset_drag < 0) {
-            for (const FrameUi::PresetNode& pn : frame_ui.preset_nodes) {
-                ui::Rect r = pn.node->rect;
-                if (!pn.node->clip.empty()) r = r.intersect(pn.node->clip);
-                if (r.w > 0.0f && r.contains(input.mouse)) {
-                    app.preset_drag = static_cast<int>(pn.index);
+        // Drag a preset out of the browser (both view modes): press
+        // arms, slop starts the drag. Release over the canvas applies
+        // at the cursor; over a USER bin row it files the preset there;
+        // over the panel background it files back at the root. A still
+        // click never crosses the slop, so select/apply is untouched.
+        if (input.left_pressed() && !app.preset_drag_key) {
+            for (const FrameUi::BrowserNode& pn : frame_ui.preset_nodes_r)
+                if (!pn.is_bin && pn.rect->contains(input.mouse)) {
+                    app.preset_drag_key = pn.id;
                     app.preset_press = input.mouse;
                     app.preset_drag_live = false;
+                    break;
                 }
-            }
         }
-        if (app.preset_drag >= 0 && input.left_down()) {
+        if (app.preset_drag_key && input.left_down()) {
             const float dd =
                 std::fabs(input.mouse.x - app.preset_press.x) +
                 std::fabs(input.mouse.y - app.preset_press.y);
             if (dd > 6.0f) app.preset_drag_live = true;
-            if (app.preset_drag_live &&
-                static_cast<size_t>(app.preset_drag) <
-                    app.presets.size()) {
-                // Ghost label under the cursor while the drag is live.
+            const int dpi = preset_index_of(app, app.preset_drag_key);
+            if (app.preset_drag_live && dpi >= 0) {
+                // Ghost label under the cursor; a valid bin target
+                // under it wears the accent.
                 const char* pname =
-                    app.presets[static_cast<size_t>(app.preset_drag)]
-                        .name.c_str();
+                    app.presets[static_cast<size_t>(dpi)].name.c_str();
                 const ui::Theme& th = ui::active_theme();
+                for (const FrameUi::BrowserNode& pn :
+                     frame_ui.preset_nodes_r) {
+                    if (!pn.is_bin || !pn.rect->contains(input.mouse))
+                        continue;
+                    if (preset_bin_of(app, pn.id))
+                        canvas.draw_sdf_rect_outline(*pn.rect, 3.0f, 1.5f,
+                                                     th.accent);
+                    break;
+                }
                 const Vec2 ts = ui::measure_text(font, pname, 11.0f);
                 const ui::Rect gr{input.mouse.x + 12.0f,
                                   input.mouse.y + 10.0f, ts.x + 14.0f,
@@ -15916,20 +21462,74 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                               {gr.x + 7.0f, gr.y + 4.5f}, 11.0f, th.text);
             }
         }
-        if (app.preset_drag >= 0 && !input.left_down()) {
+        if (app.preset_drag_key && !input.left_down()) {
             const bool live = app.preset_drag_live;
-            const size_t pi = static_cast<size_t>(app.preset_drag);
-            app.preset_drag = -1;
+            const uint64_t key = app.preset_drag_key;
+            app.preset_drag_key = 0;
             app.preset_drag_live = false;
-            if (live && frame_ui.canvas_node &&
-                frame_ui.canvas_node->rect.contains(input.mouse))
-                spawn_preset(pi, /*at_cursor=*/true);
+            const int pi = preset_index_of(app, key);
+            if (live && pi >= 0) {
+                bool dropped = false;
+                for (const FrameUi::BrowserNode& pn :
+                     frame_ui.preset_nodes_r) {
+                    if (!pn.is_bin || !pn.rect->contains(input.mouse))
+                        continue;
+                    if (const std::string* bin =
+                            preset_bin_of(app, pn.id)) {
+                        preset_move_file(app, key, *bin);
+                        app.preset_bin_closed.erase(pn.id);   // reveal
+                    }
+                    dropped = true;
+                    break;
+                }
+                if (!dropped && frame_ui.canvas_node &&
+                    frame_ui.canvas_node->rect.contains(input.mouse)) {
+                    spawn_preset(static_cast<size_t>(pi),
+                                 /*at_cursor=*/true);
+                    dropped = true;
+                }
+                if (!dropped && frame_ui.preset_panel_node &&
+                    frame_ui.preset_panel_node->rect.contains(
+                        input.mouse) &&
+                    !app.preset_info[static_cast<size_t>(pi)].shipped &&
+                    !app.preset_info[static_cast<size_t>(pi)].bin.empty())
+                    preset_move_file(app, key, "");
+            }
         }
-        for (const auto& pc : frame_ui.preset_clicks) {
-            if (!*pc.second || structure_done) continue;
-            spawn_preset(pc.first, /*at_cursor=*/false);
-            break;
+        // Row/card actions: click selects, double-click applies onto
+        // the selected layer's stack; bin rows fold on click.
+        for (const FrameUi::BrowserAction& pa : frame_ui.preset_items) {
+            if (pa.select && *pa.select) app.preset_sel = pa.id;
+            if (pa.open && *pa.open && !structure_done) {
+                const int pi = preset_index_of(app, pa.id);
+                if (pi >= 0)
+                    spawn_preset(static_cast<size_t>(pi),
+                                 /*at_cursor=*/false);
+            }
         }
+        for (const FrameUi::BinRow& pb : frame_ui.preset_bin_rows) {
+            if (!pb.toggled || !*pb.toggled) continue;
+            app.preset_sel = pb.id;
+            if (app.preset_bin_closed.count(pb.id))
+                app.preset_bin_closed.erase(pb.id);
+            else
+                app.preset_bin_closed.insert(pb.id);
+        }
+        if (frame_ui.preset_new_bin_clicked &&
+            *frame_ui.preset_new_bin_clicked)
+            preset_new_bin(app);
+        // Click-away releases the preset selection and an uncommitted
+        // rename, mirroring the project browser.
+        if (input.left_pressed() && !app.ctx_menu.kind &&
+            !app.confirm.open()) {
+            bool on_row = false;
+            for (const FrameUi::BrowserNode& pn : frame_ui.preset_nodes_r)
+                if (pn.rect->contains(input.mouse)) on_row = true;
+            if (!on_row && app.preset_sel) app.preset_sel = 0;
+            if (app.preset_rename_key && !app.preset_rename_commit)
+                app.preset_rename_key = 0;
+        }
+        if (app.preset_rename_commit) preset_rename_apply(app);
         if (frame_ui.tag_selected && *frame_ui.tag_selected >= 0)
             app.preset_tag_index = *frame_ui.tag_selected - 1;   // 0 = all
         if (frame_ui.preset_search_clicked && *frame_ui.preset_search_clicked) {
@@ -16146,14 +21746,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.lane_release) app.undo.break_coalescing();
         // Rail type-in opens: a click on a slider's value text.
+        bool rail_opened = false;
         for (const FrameUi::RailEdit& re : frame_ui.rail_edits) {
             if (!re.clicked || !*re.clicked) continue;
             app.rail_edit_key = re.key;
             app.rail_edit_scale = re.scale;
             app.rail_edit_buf = re.seed ? re.seed : "";
             app.rail_edit_commit = false;
+            rail_opened = true;
             break;
         }
+        // Click-away commits the open rail editor (blur commit, same
+        // contract as the canvas value editor): any left press that did
+        // not open one this frame lands the typed value.
+        if (!rail_opened && app.rail_edit_key.effect_id != 0 &&
+            input.left_pressed())
+            app.rail_edit_commit = true;
 
         if (frame_ui.add_layer_open && *frame_ui.add_layer_open)
             app.sel = {SelKind::AddLayer, 0};
@@ -16505,7 +22113,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         break;
                     case LF::OscShape:
                         edited.osc_shape = static_cast<uint32_t>(
-                            std::clamp(v, 0.0f, 3.0f) + 0.5f);
+                            std::clamp(v, 0.0f, 4.0f) + 0.5f);
+                        break;
+                    case LF::Phase:
+                        edited.gen_phase = std::max(v, 0.0f);
                         break;
                 }
                 app.undo.execute(app.document,
@@ -16695,7 +22306,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
 
         // ---- transport
-        if (frame_ui.open_clicked && *frame_ui.open_clicked && !app.import) {
+        if (frame_ui.open_clicked && *frame_ui.open_clicked &&
+            import_slot_free(app)) {
             auto picked = platform::show_open_dialog(
                 window.get(),
                 {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
@@ -16703,7 +22315,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (picked) open_source(app, *picked);
         }
         if (frame_ui.import_media_clicked &&
-            *frame_ui.import_media_clicked && !app.import) {
+            *frame_ui.import_media_clicked && import_slot_free(app)) {
             auto picked = platform::show_open_dialog(
                 window.get(),
                 {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
@@ -16866,7 +22478,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         // Drag-and-drop: video files open like the dialog would; preset
         // files import into the browser; other .json loads as a project;
         // a PNG installs a custom glyph set.
-        if (!dropped_file.empty() && !app.import) {
+        if (!dropped_file.empty() && import_slot_free(app)) {
             const std::filesystem::path p(dropped_file);
             const auto ext = p.extension();
             if (ext == ".json") {
@@ -17133,20 +22745,58 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.document.use_proxy && app.proxy_probe_has;
             if (want != app.proxy_active) {
                 render_worker.pause();
+                thumb_worker.pause();
                 app.proxy_active = want;
                 refresh_bundles(app);
+                thumb_worker.resume();
                 render_worker.resume();
             }
         }
-        // Thumbnail strip: register the staged RGBA once.
-        if (app.thumbs_dirty) {
-            app.thumbs_dirty = false;
-            if (app.thumbs_count > 0)
-                app.thumbs_tex = ui_renderer->register_image(
-                    app.thumbs_rgba.data(), app.thumbs_w * app.thumbs_count,
-                    app.thumbs_h);
-            app.thumbs_rgba.clear();
-            app.thumbs_rgba.shrink_to_fit();
+        // Per-asset strips: register the pair staged this frame.
+        if (app.strip_stage_asset) {
+            AppState::AssetStrip& s =
+                app.asset_strips[app.strip_stage_asset];
+            if (app.strip_stage_count > 0)
+                s.tex = ui_renderer->register_image(
+                    app.strip_stage_rgba.data(),
+                    app.strip_stage_w * app.strip_stage_count,
+                    app.strip_stage_h);
+            if (app.strip_stage_card_w > 0)
+                s.card = ui_renderer->register_image(
+                    app.strip_stage_card_rgba.data(),
+                    app.strip_stage_card_w, app.strip_stage_card_h);
+            s.w = app.strip_stage_w;
+            s.h = app.strip_stage_h;
+            s.count = app.strip_stage_count;
+            s.tried = true;
+            app.strip_stage_asset = 0;
+            app.strip_stage_card_w = 0;
+            app.strip_stage_rgba.clear();
+            app.strip_stage_rgba.shrink_to_fit();
+            app.strip_stage_card_rgba.clear();
+            app.strip_stage_card_rgba.shrink_to_fit();
+        }
+        // Library view toggles, persisted like every other pref.
+        {
+            int bw = -1, pw = -1;
+            if (frame_ui.browser_view_pick[0] &&
+                *frame_ui.browser_view_pick[0])
+                bw = 0;
+            if (frame_ui.browser_view_pick[1] &&
+                *frame_ui.browser_view_pick[1])
+                bw = 1;
+            if (frame_ui.preset_view_pick[0] &&
+                *frame_ui.preset_view_pick[0])
+                pw = 0;
+            if (frame_ui.preset_view_pick[1] &&
+                *frame_ui.preset_view_pick[1])
+                pw = 1;
+            if ((bw >= 0 && bw != app.browser_view) ||
+                (pw >= 0 && pw != app.preset_view)) {
+                if (bw >= 0) app.browser_view = bw;
+                if (pw >= 0) app.preset_view = pw;
+                save_ui_prefs(app);
+            }
         }
         if (frame_ui.loop_clicked && *frame_ui.loop_clicked) {
             app.loop = !app.loop;
@@ -17200,15 +22850,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 window.get(), {{"MP4 video", "*.mp4"}}, ename + ".mp4");
             if (out) {
                 if (out->extension() != ".mp4") out->replace_extension(".mp4");
-                // Sidechain mux: the Audio Scope reads the sidechain's PCM
-                // instead of the media's when asked (and available).
+                // The Audio Scope strips the export's own mix; only a
+                // sidechain mux swaps it onto the sidechain's PCM (that
+                // is what the file will carry).
                 const std::filesystem::path scope_pcm =
                     app.document.sidechain_mux && app.sc_ok
                         ? app.sc_pcm_path
-                        : app.pcm_path;
+                        : std::filesystem::path();
+                // Export resolves ORIGINALS: never the preview's proxy
+                // mez, never a consolidated intra transcode.
                 if (!app.export_job) {
                     app.export_job = start_export(
-                        renderer->device(), shader_dir, app.bundles,
+                        renderer->device(), shader_dir,
+                        build_bundle_table(app.document, false),
                         app.pcm_cache, scope_pcm, app.document,
                         app.scope_look,
                         app.has_analysis ? &app.analysis : nullptr,
@@ -17222,7 +22876,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     q.has_analysis = app.has_analysis;
                     if (app.has_analysis) q.analysis = app.analysis;
                     q.node_audio = app.node_audio_map;
-                    q.bundles = app.bundles;
+                    q.bundles = build_bundle_table(app.document, false);
                     q.pcm = app.pcm_cache;
                     q.scope_pcm = scope_pcm;
                     app.export_queue.push_back(std::move(q));
@@ -17242,10 +22896,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         // modulation resolve, and the whole graph evaluation happen on the
         // worker — a heavy stack never stalls this loop.
         push_render_job(render_worker, app);
+        push_thumb_job(thumb_worker, render_worker, app);
         const RenderWorker::View rview =
             render_worker.acquire(app.ui_frame_counter);
         gfx::GpuImage* final_image = rview.final_img;
         gfx::GpuImage* source_image = rview.source_img;
+        script_host.view_seq = rview.publish_seq;
+        script_host.view_rev = rview.doc_revision;
 
         // Window clear = the active theme's background (stored linear).
         const ui::Color wbg = ui::active_theme().window_bg;
@@ -17322,13 +22979,41 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 header_font ? &*header_font : nullptr,
                                 viewport, app, dt);
 
+        // Script console: topmost - it is the surface that inspects
+        // everything else.
+        draw_console(script_host, canvas, font, viewport);
+
         ui_renderer->record(frame.cmd, frame.frame_index, frame.extent, canvas);
         renderer->end_frame(frame);
     }
 
-    // Stop the render thread before its device resources unwind.
+    // Stop the render + thumbnail threads before their device
+    // resources unwind; background jobs (import/resume, scope strip,
+    // export) join first. Each stage logs on COMPLETION, so a hang
+    // leaves the last finished stage as looks.log's final line and the
+    // missing one is the culprit.
+    auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t)
+            .count();
+    };
+    log_info("shutdown: closing");
+    auto sd = std::chrono::steady_clock::now();
     app.render_worker = nullptr;
+    app.thumb_worker = nullptr;
+    app.import.reset();
+    app.scope_job.reset();
+    app.export_job.reset();
+    log_info("shutdown: jobs %.0f ms", ms_since(sd));
+    sd = std::chrono::steady_clock::now();
+    thumb_worker.stop();
+    log_info("shutdown: thumb worker %.0f ms", ms_since(sd));
+    sd = std::chrono::steady_clock::now();
     render_worker.stop();
+    log_info("shutdown: render worker %.0f ms", ms_since(sd));
     vkDestroySampler(renderer->device().device(), ui_view_sampler, nullptr);
-    return 0;
+    // Whatever runs past this line is app-state frees plus device/UI
+    // teardown (debug validation makes that part slow by nature).
+    log_info("shutdown: complete");
+    return script_host.exit_code;
 }

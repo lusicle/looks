@@ -84,6 +84,11 @@ public:
     // are re-injected). Also the way back in after a drain() hit the end.
     void flush();
 
+    // Releases the transform and any D3D device (the session's memory
+    // and handles); the object returns to freshly constructed and may
+    // create() again.
+    void destroy();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -25,6 +25,11 @@ std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
                                            int param_index, float new_value);
 std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
                                             size_t effect_index, bool bypass);
+// The effect's own blend mode (the canonical composition's blend()).
+std::unique_ptr<Command> set_effect_blend_command(uint64_t look,
+                                                  size_t layer_index,
+                                                  size_t effect_index,
+                                                  BlendMode blend);
 // The Text effect's string — the one non-float param.
 std::unique_ptr<Command> set_effect_text_command(uint64_t look,
                                                  size_t layer_index,
