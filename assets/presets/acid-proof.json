@@ -1,0 +1,144 @@
+{
+  "looks_preset": 1,
+  "name": "acid proof",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 174,
+    "name": "acid proof",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 164,
+        "param": 1
+      },
+      {
+        "effect": 171,
+        "param": 1
+      },
+      {
+        "effect": 170,
+        "param": 0
+      },
+      {
+        "effect": 155,
+        "param": 0
+      }
+    ],
+    "face_in": 164,
+    "face_out": 156
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 164,
+      "params": [
+        0.0030000000260770321,
+        0.012000000104308128,
+        0.80000001192092896,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    },
+    {
+      "type": "hue_sat",
+      "id": 152,
+      "params": [
+        0,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    },
+    {
+      "type": "invert",
+      "id": 153,
+      "params": [
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    },
+    {
+      "type": "posterize",
+      "id": 170,
+      "params": [
+        3,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    },
+    {
+      "type": "colorizer",
+      "id": 171,
+      "params": [
+        0.20999999344348907,
+        0.20999999344348907,
+        0.20999999344348907,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    },
+    {
+      "type": "blur",
+      "id": 155,
+      "params": [
+        26,
+        4,
+        0,
+        0.44999998807907104,
+        0.14000000059604645
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    },
+    {
+      "type": "grain",
+      "id": 156,
+      "params": [
+        0.25,
+        1.5,
+        0.30000001192092896,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 174
+    }
+  ]
+}

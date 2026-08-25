@@ -20,10 +20,16 @@ cbuffer Push
                        // 4 static; pattern: 0 checker, 1 stripes,
                        // 2 grid, 3 dots, 4 smpte bars; oscillator:
                        // 0 sine bars, 1 rings, 2 plasma, 3 lissajous;
-                       // shape node: 0 circle, 1 box, 2 diamond
+                       // shape node: 0 circle, 1 box, 2 diamond,
+                       // 3 custom path (SDF texture)
     float phase;       // oscillator: percent of one period; wraps, so
                        // 0 and 100 are identical
 };
+
+// Custom-shape SDF (gfx/shape_sdf): canvas uv, 0.5 = on the curve,
+// distances span +-0.25 canvas heights. Dummy-bound for every other
+// generator kind.
+[[vk::binding(0, 0)]] Sampler2D shape_sdf;
 
 // Value noise at integer lattice p with smooth (quintic-free) fade.
 float gen_value_noise(float2 p, uint seed, uint t)
@@ -84,7 +90,7 @@ float gen_worley(float2 p, uint seed, uint t)
     return saturate(sqrt(md));
 }
 
-[[vk::binding(0, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -271,7 +277,17 @@ void main(uint3 tid : SV_DispatchThreadID)
                          float2(float(width) / float(height), 1.0);
         const float r = clamp(scale * 0.05, 0.02, 1.5);
         float d;
-        if (shape == 1u)
+        if (shape == 3u)
+        {
+            // Custom path: the CPU raster's SDF, size scaling about the
+            // canvas center (sample at uv/s, distance times s). scale 6
+            // = drawn size.
+            const float s = clamp(scale, 0.5, 30.0) * (1.0 / 6.0);
+            const float2 suv = (uv - 0.5) / s + 0.5;
+            d = (shape_sdf.SampleLevel(clamp(suv, 0.0, 1.0), 0).r - 0.5) *
+                0.5 * s;
+        }
+        else if (shape == 1u)
             d = max(abs(p.x), abs(p.y)) - r;          // box
         else if (shape == 2u)
             d = (abs(p.x) + abs(p.y)) * 0.7071 - r;   // diamond

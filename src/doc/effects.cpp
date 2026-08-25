@@ -841,13 +841,24 @@ constexpr ParamDesc kWetPlateParams[] = {
     {"vign", "plate vignette", 0.0f, 1.0f, 0.5f, "%.2f"},
 };
 
-constexpr ParamDesc kReededGlassParams[] = {
-    // Fluted bathroom-window glass: each flute compresses its slice of the
-    // image toward its center, blurring and darkening at the boundaries.
-    {"flutes", "flute width", 8.0f, 160.0f, 48.0f, "%.0f px"},
+constexpr ParamDesc kGlassParams[] = {
+    // Architectural glass: lens = cylinder flutes (dome tiles once cell
+    // height is set), prism = linear facets, wave = rolled antique
+    // ripple, hammered = seeded dimple per cell, frosted = noise
+    // scatter. cell_h under 6 px means full-height cells, so lens plus
+    // cell width alone is classic reeded glass.
+    {"type", "type", 0.0f, 4.0f, 0.0f, "%.0f",
+     "lens|prism|wave|hammered|frosted"},
+    {"cell_w", "cell width", 6.0f, 400.0f, 48.0f, "%.0f px"},
+    {"cell_h", "cell height (0=full)", 0.0f, 400.0f, 0.0f, "%.0f px",
+     nullptr, false, 0, 0xB},
     {"refract", "refraction", 0.0f, 1.0f, 0.6f, "%.2f"},
+    {"dispersion", "dispersion", 0.0f, 1.0f, 0.15f, "%.2f"},
     {"soften", "soften", 0.0f, 1.0f, 0.3f, "%.2f"},
-    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "vertical|horizontal"},
+    {"edge", "edge shade", 0.0f, 1.0f, 0.4f, "%.2f", nullptr, false,
+     0, 0xB},
+    {"glint", "glint", 0.0f, 1.0f, 0.3f, "%.2f", nullptr, false, 0, 0xB},
+    {"wobble", "wobble", 0.0f, 1.0f, 0.15f, "%.2f"},
 };
 
 constexpr ParamDesc kWatercolorParams[] = {
@@ -1073,6 +1084,26 @@ constexpr ParamDesc kAudioFilterParams[] = {
 // ---- offset: the time shim. Applies only wired directly onto a source
 // node; the shift is static (not a mod target - it rekeys decode
 // streams, so the flatten snapshots it like audio params).
+constexpr ParamDesc kTrackPinParams[] = {
+    // Attach draws the B input on the tracked plane; stabilize warps
+    // the frame so the plane holds still. The region is the plane's
+    // seed rect at the solve's start frame (draggable on the monitor);
+    // offset/scale/rotate adjust the pinned content inside it.
+    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "attach|stabilize"},
+    {"region_x", "region x", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"region_y", "region y", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"region_w", "region w", 0.05f, 1.0f, 0.25f, "%.2f"},
+    {"region_h", "region h", 0.05f, 1.0f, 0.25f, "%.2f"},
+    {"offset_x", "offset x", -1.0f, 1.0f, 0.0f, "%+.2f", nullptr, false,
+     0, 0x1},
+    {"offset_y", "offset y", -1.0f, 1.0f, 0.0f, "%+.2f", nullptr, false,
+     0, 0x1},
+    {"pin_scale", "scale", 0.1f, 4.0f, 1.0f, "%.2f", nullptr, false, 0,
+     0x1},
+    {"angle", "rotate", -3.1416f, 3.1416f, 0.0f, "%.2f", nullptr, false,
+     0, 0x1, true},
+};
+
 constexpr ParamDesc kOffsetParams[] = {
     {"offset", "offset", -600.0f, 600.0f, 0.0f, "%.0f fr"},
     {"target", "target", 0.0f, 2.0f, 2.0f, "%.0f", "video|audio|both"},
@@ -1198,8 +1229,7 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::PaintPrint},
     {"wet_plate", "Wet Plate", kWetPlateParams, 5,
      FxCategory::PaintPrint},
-    {"reeded_glass", "Reeded Glass", kReededGlassParams, 4,
-     FxCategory::Warp},
+    {"glass", "Glass", kGlassParams, 9, FxCategory::Warp},
     {"watercolor", "Watercolor", kWatercolorParams, 4,
      FxCategory::PaintPrint},
     {"wire_terrain", "Wire Terrain", kWireTerrainParams, 7,
@@ -1240,6 +1270,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"audio_delay", "Delay", kAudioDelayParams, 2, FxCategory::Audio},
     {"audio_filter", "Filter", kAudioFilterParams, 2, FxCategory::Audio},
     {"offset", "Offset", kOffsetParams, 2, FxCategory::Time},
+    {"track_pin", "Track Pin", kTrackPinParams, 9, FxCategory::Warp},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));

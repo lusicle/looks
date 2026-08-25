@@ -214,3 +214,84 @@ TEST(stack_connect_output_replaces_same_layer_end) {
     CHECK(std::find(ends.begin(), ends.end(), fx1) != ends.end());
     CHECK(std::find(ends.begin(), ends.end(), fx0) == ends.end());
 }
+
+TEST(stack_param_gesture_coalesces_mixed) {
+    // A gizmo drag writes an x/y pair per frame, one axis keyed: every
+    // frame is one command, the whole drag merges to ONE undo entry, and
+    // that entry restores base param and lane together.
+    Document doc;
+    UndoStack undo;
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Spherize));
+    Look& look = doc.looks[0];
+    const uint64_t fx_id = look.layers[0].stack[0].id;
+    KeyframeLane lane;
+    lane.target = {fx_id, 3};
+    lane.keys.push_back({0.0, 0.25f});
+    lane.loop = true;
+    look.lanes.push_back(lane);
+
+    auto write = [&](float x, float y) {
+        std::vector<ParamWrite> base{{2, x}};
+        std::vector<KeyframeLane> lw(1);
+        lw[0].target = {fx_id, 3};
+        lw[0].keys.push_back({0.0, y});
+        undo.execute(doc,
+                     set_param_gesture_command(look.id, 0, 0,
+                                               std::move(base),
+                                               std::move(lw)),
+                     /*coalesce=*/true);
+    };
+    write(0.6f, 0.60f);
+    write(0.7f, 0.70f);
+    write(0.8f, 0.80f);
+    undo.break_coalescing();
+
+    CHECK_EQ(look.layers[0].stack[0].params[2], 0.8f);
+    CHECK_EQ(look.lanes.size(), size_t{1});
+    CHECK_EQ(look.lanes[0].keys[0].value, 0.8f);
+    CHECK(look.lanes[0].loop);   // lane replace keeps loop/mute
+
+    CHECK(undo.undo(doc));
+    CHECK_EQ(look.layers[0].stack[0].params[2], 0.5f);
+    CHECK_EQ(look.lanes[0].keys[0].value, 0.25f);
+    CHECK(!undo.can_undo());   // the drag was ONE entry
+
+    CHECK(undo.redo(doc));
+    CHECK_EQ(look.layers[0].stack[0].params[2], 0.8f);
+    CHECK_EQ(look.lanes[0].keys[0].value, 0.8f);
+}
+
+TEST(stack_param_gesture_shape_guard) {
+    // Different write shapes never merge (a base-only frame cannot fold
+    // into a base+lane entry), and reverting a command that CREATED a
+    // lane removes it again.
+    Document doc;
+    UndoStack undo;
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Spherize));
+    Look& look = doc.looks[0];
+    const uint64_t fx_id = look.layers[0].stack[0].id;
+
+    std::vector<ParamWrite> b1{{2, 0.6f}};
+    undo.execute(doc,
+                 set_param_gesture_command(look.id, 0, 0, std::move(b1), {}),
+                 /*coalesce=*/true);
+
+    std::vector<ParamWrite> b2{{2, 0.65f}};
+    std::vector<KeyframeLane> lw(1);
+    lw[0].target = {fx_id, 3};
+    lw[0].keys.push_back({0.0, 0.9f});
+    undo.execute(doc,
+                 set_param_gesture_command(look.id, 0, 0, std::move(b2),
+                                           std::move(lw)),
+                 /*coalesce=*/true);
+    CHECK_EQ(look.layers[0].stack[0].params[2], 0.65f);
+    CHECK_EQ(look.lanes.size(), size_t{1});
+
+    CHECK(undo.undo(doc));   // second entry: base back, created lane gone
+    CHECK_EQ(look.layers[0].stack[0].params[2], 0.6f);
+    CHECK_EQ(look.lanes.size(), size_t{0});
+    CHECK(undo.undo(doc));   // first entry existed separately
+    CHECK_EQ(look.layers[0].stack[0].params[2], 0.5f);
+}

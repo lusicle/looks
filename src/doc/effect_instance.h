@@ -99,7 +99,7 @@ enum class EffectType : uint32_t {
     Photocopy,         // contrast collapse + toner speckle, N generations
     Risograph,         // tone-separated ink layers, misregistered
     WetPlate,          // collodion tintype: ortho response + chemistry
-    ReededGlass,       // fluted-glass refraction (bathroom window)
+    Glass,             // architectural glass refraction (5 profiles)
     Watercolor,        // washes, edge pooling, pigment granulation
     WireTerrain,       // perspective luma-heightfield wireframe
     Ridgeline,         // stacked occluded luma waveforms (joyplot)
@@ -148,6 +148,11 @@ enum class EffectType : uint32_t {
     // shift folds into the source's stream key, so fan-out through
     // different offsets decodes separate streams.
     Offset,
+    // TRACK PIN: attaches its B input onto the tracked plane of the
+    // chain's media (or stabilizes the frame against it). The plane is
+    // the effect's own region params solved through the media's .track
+    // sidecar; the engine composes the per-frame homography CPU-side.
+    TrackPin,
     Count,
 };
 
@@ -174,6 +179,7 @@ inline const char* effect_aux_port(EffectType type) {
         case EffectType::BlendNode: return "b";
         case EffectType::Displace: return "map";
         case EffectType::TimeDisplace: return "map";
+        case EffectType::TrackPin: return "b";
         default: return nullptr;
     }
 }

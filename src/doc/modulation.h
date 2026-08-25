@@ -69,6 +69,9 @@ enum class ModSourceType : uint32_t {
     VideoRegion,       // mean color/luma over a rect of the source frame
     Math,              // helper: op(a, b) over upstream nodes / constants
     Normalise,         // helper: map the scaled window onto [0, 1], clamped
+    Camera,            // motion-solve channels of the wired media (track
+                       // sidecar; generate on the card): channel picks
+                       // stab x/y/rot/scale or an anchor projection
     Count,
 };
 
@@ -82,6 +85,13 @@ inline bool value_kind_wants_audio(ModSourceType t) {
            t == ModSourceType::AudioHigh || t == ModSourceType::AudioOnset ||
            t == ModSourceType::Beat || t == ModSourceType::LfoBeat ||
            t == ModSourceType::Envelope;
+}
+
+// Kinds whose card grows the media-In pin (audio_src is the wired media
+// input, whatever the analysis): the audio family reads processed-audio
+// curves, the Camera node reads the wired media's motion solve.
+inline bool value_kind_wants_media(ModSourceType t) {
+    return value_kind_wants_audio(t) || t == ModSourceType::Camera;
 }
 
 enum class LfoShape : uint32_t { Sine = 0, Triangle, Square, SampleHold, Count };
@@ -111,6 +121,9 @@ struct ModSource {
     float px = 0.5f, py = 0.5f;
     float pw = 0.25f, ph = 0.25f;
     uint32_t channel = 0;
+    // Camera: the locked 3D anchor - a solved feature-track id picked
+    // on the monitor overlay; 0 = none (anchor channels read 0).
+    uint32_t anchor = 0;
 };
 
 // A node of the value graph. source.type is the node kind; generator

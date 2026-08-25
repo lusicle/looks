@@ -833,6 +833,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         pr.swatch->field_edit = -1;
                         pr.swatch->edit_len = 0;
                         frame.ctx.set_popup_owner(pr.swatch);
+                    } else if (pr.kind == 4 && pr.changed) {
+                        // Button row: the click IS the action.
+                        *pr.changed = true;
                     }
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 1 &&
@@ -1669,6 +1672,41 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                   kRowH * z - 3.0f * z};
                     const bool field_hot =
                         row_hot && (rh.zone == 1 || rh.zone == 2);
+                    if (pr.kind == 5) {
+                        // Status label: text only, no field chrome, no
+                        // interaction.
+                        canvas.push_clip({fx0, ry,
+                                          (cr.right() - 8.0f * z) - fx0,
+                                          kRowH * z});
+                        ui::draw_text(canvas, frame.font,
+                                      pr.text ? pr.text : "",
+                                      {fx0, ry + (kRowH * z - rs) * 0.4f},
+                                      rs, theme.text_dim);
+                        canvas.pop_clip();
+                        continue;
+                    }
+                    if (pr.kind == 4) {
+                        // Button row: one full-width action, probed by
+                        // its label for scripted clicks.
+                        canvas.draw_sdf_rect(fr, 2.0f * z,
+                                             field_hot
+                                                 ? theme.control_bg_hover
+                                                 : theme.control_bg);
+                        canvas.draw_sdf_rect_outline(
+                            fr, 2.0f * z, 1.0f,
+                            field_hot ? theme.accent : theme.hairline);
+                        const char* blabel = pr.text ? pr.text : pr.label;
+                        const Vec2 bsz =
+                            ui::measure_text(frame.font, blabel, rs);
+                        ui::draw_text(canvas, frame.font, blabel,
+                                      {fr.x + (fr.w - bsz.x) * 0.5f,
+                                       ry + (kRowH * z - rs) * 0.4f},
+                                      rs,
+                                      field_hot ? theme.text
+                                                : theme.text_dim);
+                        ui::probe_add(blabel, fr);
+                        continue;
+                    }
                     if (pr.kind == 3 && pr.staged) {
                         // Swatch: the field IS the color; a click opens
                         // the shared picker popup.

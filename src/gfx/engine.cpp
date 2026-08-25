@@ -12,6 +12,7 @@
 #include "doc/effects.h"
 #include "gfx/error_diffusion.h"
 #include "gfx/graph.h"
+#include "gfx/shape_sdf.h"
 #include "gfx/vk_device.h"
 #include "util/color.h"
 #include "util/file.h"
@@ -150,7 +151,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_photocopy.comp.spv", 1},
     {"fx_risograph.comp.spv", 1},
     {"fx_wet_plate.comp.spv", 1},
-    {"fx_reeded_glass.comp.spv", 1},
+    {"fx_glass.comp.spv", 1},
     {"fx_watercolor.comp.spv", 1},
     {"fx_wire_terrain.comp.spv", 1},
     {"fx_ridgeline.comp.spv", 1},
@@ -186,6 +187,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     // Offset: a time shim - the compiler replaces it with a shifted
     // source read (or routes through it); it never dispatches.
     {nullptr, 0},
+    {"fx_track_pin.comp.spv", 2},       // input + pinned B
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -365,6 +367,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         // motion-extract appends four (the reference source's fit rect -
         // its luma planes are native while the frame is the canvas).
         const auto type_i = static_cast<doc::EffectType>(i);
+        // Track Pin appends nine (the composed 3x3 homography).
         const uint32_t extra =
             (type_i == doc::EffectType::SlitScan ||
              type_i == doc::EffectType::TimeDisplace ||
@@ -375,7 +378,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                            type_i == doc::EffectType::Text ||
                            type_i == doc::EffectType::MotionExtract
                        ? 4u
-                       : 0u);
+                       : (type_i == doc::EffectType::TrackPin ? 9u : 0u));
         desc.push_bytes = static_cast<uint32_t>(
             (kFxPreludeWords + info.param_count + extra) * sizeof(uint32_t));
         fx_[i] = ComputePipeline::create(device_, shader_dir, desc);
@@ -518,7 +521,9 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     // Compositing: layer generators + blend.
     ComputePipelineDesc gen_desc;
     gen_desc.spv_name = "gen.comp.spv";
-    gen_desc.sampled_inputs = 0;
+    // One sampled input: the custom-shape SDF (dummy-bound for every
+    // other generator kind).
+    gen_desc.sampled_inputs = 1;
     gen_desc.storage_outputs = 1;
     gen_desc.push_bytes = 15 * sizeof(uint32_t);
     generator_ = ComputePipeline::create(device_, shader_dir, gen_desc);
@@ -839,6 +844,22 @@ bool Engine::ensure_prev_ref(uint32_t width, uint32_t height) {
                                VK_IMAGE_USAGE_SAMPLED_BIT |
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     return prev_y_ != nullptr;
+}
+
+uint64_t Engine::pin_plane_key(uint64_t asset, float rx, float ry, float rw,
+                               float rh) {
+    // Millifraction quantization matches ensure_plane's match epsilon,
+    // so slider noise folds onto one plane.
+    auto q = [](float v) {
+        return static_cast<uint64_t>(
+            static_cast<int64_t>(std::lround(v * 1000.0f)) + 100000);
+    };
+    uint64_t h = hash_combine(0x504C4Eull, asset);
+    h = hash_combine(h, q(rx));
+    h = hash_combine(h, q(ry));
+    h = hash_combine(h, q(rw));
+    h = hash_combine(h, q(rh));
+    return h;
 }
 
 bool Engine::upload_gray_oneshot(GpuImage& dst, const uint8_t* gray,
@@ -1445,7 +1466,7 @@ void Engine::record_gallery_tap(VkCommandBuffer rec, uint32_t frame_index,
     if (cell >= kGalleryCols * kGalleryRows) return;
     if (!gallery_atlas_) {
         gallery_atlas_ = GpuImage::create(
-            device_, VK_FORMAT_R8G8B8A8_UNORM,
+            device_, VK_FORMAT_R16G16B16A16_SFLOAT,
             kGalleryCellW * kGalleryCols, kGalleryCellH * kGalleryRows,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -1842,7 +1863,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // reads them.
     if (thumb_tap_ && !thumb_atlas_)
         thumb_atlas_ = GpuImage::create(
-            device_, VK_FORMAT_R8G8B8A8_UNORM, kThumbCellW * kThumbGridCols,
+            device_, VK_FORMAT_R16G16B16A16_SFLOAT,
+            kThumbCellW * kThumbGridCols,
             kThumbCellH * kThumbGridRows,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -1969,6 +1991,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 uint32_t push[15] = {};
                 push[0] = w;
                 push[1] = h;
+                const GpuImage* sdf_tex = dummy_flow_.get();
                 if (node.layer_index >= 0) {
                     const doc::Layer& layer =
                         look.layers[static_cast<size_t>(node.layer_index)];
@@ -1984,6 +2007,61 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[12] = as_bits(layer.gen_angle);
                     push[13] = layer.osc_shape;
                     push[14] = as_bits(layer.gen_phase);
+                    if (layer.source == doc::LayerSourceKind::Shape &&
+                        layer.osc_shape == 3u && !layer.path.empty()) {
+                        // Custom path: CPU SDF raster at quarter target
+                        // res, re-run only when the path bytes or the
+                        // raster size change (gfx/shape_sdf).
+                        const uint32_t rw =
+                            std::clamp(w / 4u, 64u, 960u);
+                        const uint32_t rh =
+                            std::clamp(h / 4u, 64u, 960u);
+                        uint64_t phash = hash_combine(
+                            0x5DFull,
+                            (static_cast<uint64_t>(rw) << 32) | rh);
+                        phash = hash_combine(
+                            phash, layer.path_closed ? 1ull : 0ull);
+                        for (const doc::PathPoint& p : layer.path) {
+                            const float f[6] = {p.ax, p.ay, p.in_dx,
+                                                p.in_dy, p.out_dx,
+                                                p.out_dy};
+                            for (float c : f)
+                                phash = hash_combine(phash, as_bits(c));
+                        }
+                        ShapeSlot& slot = shape_state_[layer.id];
+                        if (slot.hash != phash || !slot.tex) {
+                            if (slot.tex && (slot.w != rw || slot.h != rh)) {
+                                // The old raster may be in flight.
+                                device_.wait_idle();
+                                slot.tex.reset();
+                            }
+                            const float aspect =
+                                static_cast<float>(w) /
+                                std::max(1.0f, static_cast<float>(h));
+                            std::vector<uint8_t> sdf;
+                            shape_sdf_raster(layer.path,
+                                             layer.path_closed, aspect, rw,
+                                             rh, &sdf);
+                            if (!slot.tex) {
+                                slot.tex = GpuImage::create(
+                                    device_, VK_FORMAT_R8_UNORM, rw, rh,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                                if (!slot.tex) return nullptr;
+                            }
+                            if (!staging.upload_image(rec, sdf.data(),
+                                                      sdf.size(), rw,
+                                                      *slot.tex))
+                                return nullptr;
+                            slot.tex->transition(
+                                rec,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                            slot.hash = phash;
+                            slot.w = rw;
+                            slot.h = rh;
+                        }
+                        sdf_tex = slot.tex.get();
+                    }
                 } else {
                     // Unwired Output: a solid with zeroed colors —
                     // an empty composite renders black, never the source.
@@ -1992,7 +2070,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[4] = timeline_frame;
                     push[11] = as_bits(24.0f);
                 }
-                generator_->dispatch(rec, arena_, frame_index, nullptr, 0,
+                const GpuImage* sampled[1] = {sdf_tex};
+                generator_->dispatch(rec, arena_, frame_index, sampled, 1,
                                      &dst, 1, push, sizeof(push), w, h,
                                      linear_sampler_);
                 break;
@@ -2353,7 +2432,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 // fps, params (seeded counter-based randomness).
                 const uint64_t seed64 = hash_combine(
                     hash_combine(doc.master_seed, fx.id), fx.seed);
-                uint32_t push[kFxPreludeWords + 16] = {};
+                // 32 words = the 128-byte push floor: prelude + the
+                // largest param block + the largest extra tail (Track
+                // Pin's 9-float homography) must all fit.
+                uint32_t push[32] = {};
+                static_assert(kFxPreludeWords + 16 + 9 <= 32,
+                              "push buffer covers params + extras");
                 push[0] = w;
                 push[1] = h;
                 push[2] = as_bits(fx.wet);
@@ -3292,6 +3376,110 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 2, &dst, 1,
                         push, push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::TrackPin) {
+                    // Compose (user adjust) x (inverse plane motion)
+                    // into one 3x3, CPU-side in double; the kernel does
+                    // a single homogeneous transform per pixel. Rotation
+                    // happens in aspect-corrected metric space so a
+                    // pinned card turns instead of shearing.
+                    const doc::Layer& own =
+                        look.layers[static_cast<size_t>(node.layer_index)];
+                    double H[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+                    if (pin_planes_ && own.asset) {
+                        const uint64_t key = pin_plane_key(
+                            own.asset, fx.params[1], fx.params[2],
+                            fx.params[3], fx.params[4]);
+                        const auto it = pin_planes_->find(key);
+                        if (it != pin_planes_->end() &&
+                            !it->second.h.empty()) {
+                            const uint32_t media_frame =
+                                timeline_frame + own.slip;
+                            const uint32_t n = static_cast<uint32_t>(
+                                it->second.h.size() / 9);
+                            const uint32_t idx =
+                                media_frame <= it->second.start
+                                    ? 0u
+                                    : std::min(media_frame -
+                                                   it->second.start,
+                                               n - 1);
+                            const float* hf =
+                                it->second.h.data() +
+                                static_cast<size_t>(idx) * 9;
+                            for (int k = 0; k < 9; ++k) H[k] = hf[k];
+                        }
+                    }
+                    auto mul3 = [](const double* a, const double* b,
+                                   double* o) {
+                        for (int r = 0; r < 3; ++r)
+                            for (int c = 0; c < 3; ++c)
+                                o[r * 3 + c] = a[r * 3] * b[c] +
+                                               a[r * 3 + 1] * b[3 + c] +
+                                               a[r * 3 + 2] * b[6 + c];
+                    };
+                    double M[9];
+                    const bool stabilize = fx.params[0] >= 0.5f;
+                    if (stabilize) {
+                        std::memcpy(M, H, sizeof(M));
+                    } else {
+                        // Invert H (adjugate over determinant).
+                        const double a = H[0], b = H[1], c = H[2];
+                        const double d = H[3], e = H[4], f = H[5];
+                        const double g = H[6], i = H[7], j = H[8];
+                        double Hi[9] = {e * j - f * i, c * i - b * j,
+                                        b * f - c * e, f * g - d * j,
+                                        a * j - c * g, c * d - a * f,
+                                        d * i - e * g, b * g - a * i,
+                                        a * e - b * d};
+                        const double det =
+                            a * Hi[0] + b * Hi[3] + c * Hi[6];
+                        if (std::fabs(det) > 1.0e-12)
+                            for (double& v : Hi) v /= det;
+                        // A: reference uv -> B uv. Placed content =
+                        // c + off + s*R(angle)*((B - 0.5) * (rw, rh)),
+                        // rotation metric-corrected; A is its inverse.
+                        const double aspect =
+                            h > 0 ? static_cast<double>(w) / h : 1.0;
+                        const double cx = fx.params[1], cy = fx.params[2];
+                        const double rw2 = std::max(0.01f, fx.params[3]);
+                        const double rh2 = std::max(0.01f, fx.params[4]);
+                        const double ox = fx.params[5] * rw2;
+                        const double oy = fx.params[6] * rh2;
+                        const double s =
+                            std::max(0.05f, fx.params[7]);
+                        const double ang = fx.params[8];
+                        const double ca = std::cos(-ang);
+                        const double sa = std::sin(-ang);
+                        // T(-c-off), metric rotate, 1/s, 1/(rw,rh), +0.5
+                        const double t1[9] = {1, 0, -(cx + ox),
+                                              0, 1, -(cy + oy),
+                                              0, 0, 1};
+                        // Metric rotate: S(aspect,1), R(-ang),
+                        // S(1/aspect,1) folded into one matrix.
+                        const double r2[9] = {ca, -sa / aspect, 0,
+                                              sa * aspect, ca, 0,
+                                              0, 0, 1};
+                        // Scale into B space, then recentre on 0.5.
+                        const double s3[9] = {1.0 / (s * rw2), 0, 0.5,
+                                              0, 1.0 / (s * rh2), 0.5,
+                                              0, 0, 1};
+                        double tmp[9], A[9];
+                        mul3(r2, t1, tmp);
+                        mul3(s3, tmp, A);
+                        mul3(A, Hi, M);
+                    }
+                    uint32_t* extra = &push[kFxPreludeWords + param_count];
+                    for (int k = 0; k < 9; ++k)
+                        extra[k] = as_bits(static_cast<float>(M[k]));
+                    const GpuImage* b_img = node.inputs.size() > 1
+                                                ? input_image(1)
+                                                : input_image(0);
+                    const GpuImage* sampled[2] = {input_image(0), b_img};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1,
+                        push,
+                        push_bytes +
+                            9u * static_cast<uint32_t>(sizeof(uint32_t)),
+                        w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::BlendNode) {
                     // Graph merge: B rides input 1; unwired B falls
                     // back to In (the blend becomes identity-ish).

@@ -1,0 +1,122 @@
+{
+  "looks_preset": 1,
+  "name": "resin print",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 172,
+    "name": "resin print",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 137,
+        "param": 1
+      },
+      {
+        "effect": 169,
+        "param": 2
+      },
+      {
+        "effect": 138,
+        "param": 1
+      },
+      {
+        "effect": 138,
+        "param": 2
+      }
+    ],
+    "face_in": 137,
+    "face_out": 142
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 137,
+      "params": [
+        0.0040000001899898052,
+        0.2199999988079071,
+        0.89999997615814209,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 172
+    },
+    {
+      "type": "dither",
+      "id": 169,
+      "params": [
+        3,
+        3,
+        1,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 172
+    },
+    {
+      "type": "colorizer",
+      "id": 138,
+      "params": [
+        0.5,
+        0.5,
+        0.019999999552965164,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 172
+    },
+    {
+      "type": "grain",
+      "id": 141,
+      "params": [
+        0.25,
+        2,
+        0.30000001192092896,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 172
+    },
+    {
+      "type": "levels",
+      "id": 142,
+      "params": [
+        0.0099999997764825821,
+        1,
+        1,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 172
+    }
+  ]
+}

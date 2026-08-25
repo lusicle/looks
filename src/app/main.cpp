@@ -37,6 +37,7 @@
 #include "gfx/engine.h"
 #include "gfx/graph.h"
 #include "gfx/readback.h"
+#include "gfx/shape_sdf.h"
 #include "gfx/renderer.h"
 #include "gfx/viewport_pass.h"
 #include "doc/instances.h"
@@ -47,6 +48,7 @@
 #include "media/frame_index.h"
 #include "media/import.h"
 #include "media/pcm.h"
+#include "media/track.h"
 #include "media/player.h"
 #include "media/sample_clock.h"
 #include "media/thumbs.h"
@@ -61,6 +63,7 @@
 #include "doc/randomize.h"
 #include "doc/serialize.h"
 #include "util/hash.h"
+#include "util/numerics.h"
 #include "mod/analysis.h"
 #include "mod/eval.h"
 #include "mod/param_table.h"
@@ -114,6 +117,27 @@ struct ImportJob {
 
     ~ImportJob() {
         progress.cancel = true;
+        if (thread.joinable()) thread.join();
+    }
+};
+
+// Background motion solve (the camera node's generate button): decodes
+// the asset's frames once, runs media/track_run, writes the <stem>.track
+// sidecar. One at a time, same guard family as import; the cache makes
+// a re-generate on unchanged media a no-op.
+struct TrackJob {
+    std::thread thread;
+    std::atomic<uint32_t> frames_done{0};
+    std::atomic<uint32_t> frames_total{0};
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> done{false};
+    bool ok = false;
+    uint64_t asset = 0;
+    std::string error;
+    media::TrackData result;
+
+    ~TrackJob() {
+        cancel = true;
         if (thread.joinable()) thread.join();
     }
 };
@@ -617,6 +641,8 @@ struct RenderWorker {
         // Wired analysis nodes' runtime curves (immutable snapshot,
         // republished by pointer each push).
         std::shared_ptr<const mod::NodeAudioMap> node_audio;
+        std::shared_ptr<const mod::NodeCameraMap> node_camera;
+        std::shared_ptr<const gfx::Engine::PinPlaneMap> pin_planes;
         // Where every asset's media lives (media/bundle.h): the decode
         // pool resolves placements through this, not through the document.
         std::vector<media::AssetBundle> bundles;
@@ -881,6 +907,7 @@ private:
     media::DecodePool* pool_ptr_ = nullptr;
     std::vector<Published> published_;
     int latest_ = -1;
+    uint64_t published_seq_high_ = 0;
     std::atomic<uint64_t> completed_ui_frame_{0};
     std::atomic<uint64_t> frames_advanced_{0};
     std::atomic<uint32_t> cycle_ms_x100_{0};
@@ -955,7 +982,7 @@ bool RenderWorker::ensure_published(Published& p, uint32_t w, uint32_t h,
     }
     if (!p.thumb_img) {
         p.thumb_img = gfx::GpuImage::create(
-            device, VK_FORMAT_R8G8B8A8_UNORM,
+            device, VK_FORMAT_R16G16B16A16_SFLOAT,
             gfx::Engine::kThumbCellW * gfx::Engine::kThumbGridCols,
             gfx::Engine::kThumbCellH * gfx::Engine::kThumbGridRows, usage);
         if (!p.thumb_img) return false;
@@ -1061,6 +1088,8 @@ void RenderWorker::run() {
     bool has_analysis = false;
     uint64_t analysis_stamp = ~0ull;
     std::shared_ptr<const mod::NodeAudioMap> node_audio;
+    std::shared_ptr<const mod::NodeCameraMap> node_camera;
+    std::shared_ptr<const gfx::Engine::PinPlaneMap> pin_planes;
     uint64_t cache_doc_hash = 0;
     bool cache_doc_history = false;
     uint64_t cache_hash_revision = ~0ull;
@@ -1099,7 +1128,14 @@ void RenderWorker::run() {
             if (mb_ok)
                 for (int i = 0; i < 4; ++i) fpub.bounds[i] = mb[i];
             fpub.ready = true;
-            latest_ = fl.target;
+            // Slots can retire out of submission order (the idle drain
+            // walks slot indices, not ages): latest_ only moves FORWARD
+            // in cycle order or a late old frame would shadow a newer
+            // one on the paused monitor.
+            if (fl.cycle_seq >= published_seq_high_) {
+                published_seq_high_ = fl.cycle_seq;
+                latest_ = fl.target;
+            }
         }
         return wait_ms;
     };
@@ -1176,6 +1212,15 @@ void RenderWorker::run() {
             }
             if (job_.node_audio != node_audio) {
                 node_audio = job_.node_audio;
+                doc_changed = true;
+            }
+            if (job_.node_camera != node_camera) {
+                node_camera = job_.node_camera;
+                doc_changed = true;
+            }
+            if (job_.pin_planes != pin_planes) {
+                pin_planes = job_.pin_planes;
+                engine->set_track_planes(pin_planes);
                 doc_changed = true;
             }
             if (job_.bundle_stamp != bundle_stamp) {
@@ -1290,7 +1335,8 @@ void RenderWorker::run() {
         const doc::Document resolved = mod::resolve(
             doc, mod_frame, mod_fps, has_analysis ? &analysis : nullptr,
             live_mode ? app_seconds : -1.0, live_mode ? env_key_time : -1.0,
-            &sfv, node_audio ? node_audio.get() : nullptr);
+            &sfv, node_audio ? node_audio.get() : nullptr,
+            node_camera ? node_camera.get() : nullptr);
         const auto tp2 = std::chrono::steady_clock::now();
         engine->set_preview_divisor(preview_div);
         engine->cache().set_budget(static_cast<size_t>(doc.cache_mb) << 20);
@@ -1378,10 +1424,18 @@ void RenderWorker::run() {
             }
             if (target >= 0 &&
                 !ensure_published(published_[static_cast<size_t>(target)],
-                                  pw, ph, want_source, completed))
+                                  pw, ph, want_source, completed)) {
+                log_error("render: ensure_published failed %ux%u", pw, ph);
                 target = -1;
+            }
         }
-        if (target < 0) continue;   // UI briefly holds all slots — retry
+        if (target < 0) {
+            static uint32_t s_starve = 0;
+            if (++s_starve % 240 == 0)
+                log_error("render: publish slots starved (%u retries)",
+                          s_starve);
+            continue;   // UI briefly holds all slots — retry
+        }
         Published& pub = published_[static_cast<size_t>(target)];
 
         vkResetFences(device.device(), 1, &fence_[slot]);
@@ -1404,6 +1458,12 @@ void RenderWorker::run() {
             /*cache_store=*/!player.playing() && !scrubbing);
 
         bool published_ok = false;
+        if (!final_image)
+            log_error("render: NULL frame (look %llu frame %u)",
+                      static_cast<unsigned long long>(look_id), play_frame);
+        else if (final_image->width() != fw || final_image->height() != fh)
+            log_error("render: size mismatch %ux%u vs %ux%u",
+                      final_image->width(), final_image->height(), fw, fh);
         if (final_image && final_image->width() == fw &&
             final_image->height() == fh) {
             // Blit, not copy: the publish may downscale (viewport res).
@@ -2002,7 +2062,8 @@ void ThumbWorker::publish() {
     Published& p = published_[static_cast<size_t>(target)];
     if (!p.img)
         p.img = gfx::GpuImage::create(
-            device, VK_FORMAT_R8G8B8A8_UNORM, ga->width(), ga->height(),
+            device, VK_FORMAT_R16G16B16A16_SFLOAT, ga->width(),
+            ga->height(),
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (!p.img) return;
     // The copy runs on the GRAPHICS queue: the atlas renders completed
@@ -2136,6 +2197,8 @@ std::unique_ptr<ExportJob> start_export(
     const std::filesystem::path& scope_pcm, const doc::Document& doc,
     uint64_t export_look_id, const mod::AnalysisCurves* analysis,
     std::shared_ptr<const mod::NodeAudioMap> node_audio,
+    std::shared_ptr<const mod::NodeCameraMap> node_camera,
+    std::shared_ptr<const gfx::Engine::PinPlaneMap> pin_planes,
     const std::filesystem::path& out_path) {
     auto job = std::make_unique<ExportJob>();
     job->out_path = out_path;
@@ -2152,6 +2215,8 @@ std::unique_ptr<ExportJob> start_export(
                                doc_copy = std::move(doc_copy),
                                curves_copy = std::move(curves_copy),
                                node_audio = std::move(node_audio),
+                               node_camera = std::move(node_camera),
+                               pin_planes = std::move(pin_planes),
                                has_analysis, raw, out_path,
                                export_look_id] {
         auto engine = gfx::Engine::create(device, shader_dir);
@@ -2164,6 +2229,7 @@ std::unique_ptr<ExportJob> start_export(
         // Output scale: the export engine rides the same proxy
         // divisor preview uses — kernels sample by uv, so working targets
         // and the NV12 readback shrink cleanly together.
+        engine->set_track_planes(pin_planes);
         engine->set_preview_divisor(doc_copy.export_scale);
         uint32_t canvas_w = 0, canvas_h = 0;
         doc::canvas_size(doc_copy, &canvas_w, &canvas_h);
@@ -2231,7 +2297,8 @@ std::unique_ptr<ExportJob> start_export(
             const doc::Document resolved = mod::resolve(
                 doc_copy, abs_f, fps, has_analysis ? &curves_copy : nullptr,
                 -1.0, -1.0, &sfv,
-                node_audio ? node_audio.get() : nullptr);
+                node_audio ? node_audio.get() : nullptr,
+                node_camera ? node_camera.get() : nullptr);
             return readback->render(*engine, resolved, export_look_id,
                                     play_frame, fps, canvas_w, canvas_h, nv12,
                                     0, abs_f,
@@ -2465,6 +2532,15 @@ struct AppState {
 
     media::Player player;
     std::unique_ptr<ImportJob> import;
+    std::unique_ptr<TrackJob> track_job;
+    // Loaded motion solves by asset id (the .track sidecars), the env
+    // map the camera nodes sample, and the flat plane table the engine's
+    // Track Pin dispatch reads. Mutable data: plane solves append
+    // lazily (ensure_plane) and re-save their sidecar.
+    std::unordered_map<uint64_t, std::shared_ptr<media::TrackData>>
+        track_cache;
+    std::shared_ptr<const mod::NodeCameraMap> node_camera_map;
+    std::shared_ptr<const gfx::Engine::PinPlaneMap> pin_plane_map;
     std::unique_ptr<ExportJob> export_job;
     // PRIMARY media bundle: `bundle_base` anchors the sidecar names
     // (swap its extension for .analysis/.thumbs); for mez-backed media
@@ -2855,6 +2931,8 @@ struct AppState {
         bool has_analysis = false;
         mod::AnalysisCurves analysis;
         std::shared_ptr<const mod::NodeAudioMap> node_audio;
+        std::shared_ptr<const mod::NodeCameraMap> node_camera;
+        std::shared_ptr<const gfx::Engine::PinPlaneMap> pin_planes;
         std::vector<media::AssetBundle> bundles;
         PcmCache pcm;
         std::filesystem::path scope_pcm;
@@ -3002,6 +3080,41 @@ struct AppState {
     // Displayed image aspect (published dims, else canvas): the overlay,
     // the blit and click-uv mapping must share one fit.
     float mon_canvas_aspect = 16.0f / 9.0f;
+    // Look-scope monitor gizmos: the selected effect's canvas-space
+    // params (centers, text pos, pin corners, angle stubs) drag directly
+    // on the preview. The drag stages writes at draw time; the command
+    // pass lands them as ONE coalesced gesture command per frame, auto-
+    // keying keyed params exactly like the sliders.
+    int giz_mode = 0;     // 0 idle, 1 point drag, 2 angle drag
+    uint64_t giz_fx = 0;  // effect instance id (survives reorder)
+    int giz_slot = -1;    // index into the descriptor's point/angle list
+    Vec2 giz_anchor{};
+    float giz_orig[2] = {0.0f, 0.0f};
+    struct GizmoWrite {
+        size_t layer;
+        size_t fx;
+        int param;
+        float value;
+    };
+    GizmoWrite giz_writes[2] = {};
+    int giz_write_n = 0;
+    bool giz_released = false;
+    // Custom-shape path editor (LayerSource selection, shape "custom"):
+    // giz_mode 3 drags an anchor, 4/5 its in/out tangent. Creation is
+    // doc state, not UI state: an OPEN custom path appends on click and
+    // the first-anchor click closes it. Structural edits (append,
+    // insert, close, delete) execute un-coalesced; drags stage a whole
+    // layer per frame and coalesce per layer id.
+    int giz_path_sel = -1;         // selected control point
+    uint64_t giz_path_layer = 0;   // resets the selection on layer change
+    bool giz_layer_staged = false;
+    bool giz_layer_coalesce = false;
+    doc::Layer giz_layer_write;
+    // Camera-node anchor pick staged by the monitor's point-cloud
+    // overlay: a whole-node command, structural (never coalesced).
+    bool giz_anchor_staged = false;
+    uint64_t giz_anchor_node = 0;
+    uint32_t giz_anchor_track = 0;   // 0 = clear the anchor
     RulerState ruler;
 
     // App-wide context menu (right-click on any non-canvas surface): one
@@ -3198,6 +3311,409 @@ void refresh_node_audio(AppState& app) {
         }
     app.node_audio_cache = std::move(keep);   // unreferenced entries drop
     app.node_audio_map = std::move(map);
+}
+
+// One solved 3D point through its segment's camera at an absolute
+// media frame, back to uv. False outside the segment or behind the
+// camera. Shared by the anchor curves, the monitor overlay, and the
+// anchor_pick op so every consumer projects identically.
+bool sfm_point_uv(const media::SfmSegment& seg, const media::SfmPoint& pt,
+                  uint32_t media_frame, float track_aspect, float* u,
+                  float* v) {
+    if (media_frame < seg.start || media_frame >= seg.end) return false;
+    const media::SfmCamera& cam = seg.cams[media_frame - seg.start];
+    double r[9];
+    util::rodrigues(cam.aa, r);
+    double c[3];
+    for (int k = 0; k < 3; ++k)
+        c[k] = r[k * 3] * pt.x + r[k * 3 + 1] * pt.y +
+               r[k * 3 + 2] * pt.z + cam.t[k];
+    if (c[2] < 1.0e-6) return false;
+    *u = static_cast<float>((seg.focal * c[0] / c[2]) /
+                                std::max(0.01f, track_aspect) +
+                            0.5);
+    *v = static_cast<float>(seg.focal * c[1] / c[2] + 0.5);
+    return true;
+}
+
+// Camera-node env map: for every camera node with a wired media input,
+// resolve the chain to its asset and hand the node that asset's motion
+// solve (slip + Offset shims included, same contract as the audio
+// nodes). Cheap - the solves live in app.track_cache; this only rewires
+// pointers, so it runs beside refresh_node_audio.
+void refresh_node_camera(AppState& app) {
+    auto map = std::make_shared<mod::NodeCameraMap>();
+    std::unordered_map<uint64_t,
+                       std::shared_ptr<const mod::CameraCurves>> conv;
+    for (const doc::Look& look : app.document.looks)
+        for (const doc::ValueNode& vn : look.value_nodes) {
+            if (vn.source.type != doc::ModSourceType::Camera ||
+                !vn.audio_src)
+                continue;
+            const doc::AudioChain chain =
+                doc::resolve_audio_chain(app.document, look, vn.audio_src);
+            if (!chain.asset) continue;
+            const auto tit = app.track_cache.find(chain.asset);
+            if (tit == app.track_cache.end() || !tit->second) continue;
+            // Region- or anchor-bearing nodes get their OWN curve set
+            // (corners and anchors are per-node); plain nodes share one
+            // conversion per asset.
+            const bool has_region = vn.source.pw > 0.0f;
+            const bool has_anchor = vn.source.anchor != 0;
+            std::shared_ptr<const mod::CameraCurves> curves;
+            if (!has_region && !has_anchor) {
+                if (auto cit = conv.find(chain.asset); cit != conv.end())
+                    curves = cit->second;
+            }
+            if (!curves) {
+                media::TrackData& td = *tit->second;
+                auto owned = std::make_shared<mod::CameraCurves>();
+                owned->start = td.start;
+                owned->tx.reserve(td.solve.size());
+                for (const media::SolveFrame& s : td.solve) {
+                    owned->tx.push_back(s.tx);
+                    owned->ty.push_back(s.ty);
+                    owned->rot.push_back(s.rot);
+                    owned->scale.push_back(s.scale);
+                }
+                if (has_region) {
+                    if (const media::PlaneSolve* p = media::ensure_plane(
+                            &td, vn.source.px, vn.source.py,
+                            vn.source.pw, vn.source.ph)) {
+                        const float hw = p->rw * 0.5f, hh = p->rh * 0.5f;
+                        const float cx4[4] = {p->rx - hw, p->rx + hw,
+                                              p->rx - hw, p->rx + hw};
+                        const float cy4[4] = {p->ry - hh, p->ry - hh,
+                                              p->ry + hh, p->ry + hh};
+                        const size_t nf = p->h.size() / 9;
+                        for (int ch2 = 0; ch2 < 8; ++ch2)
+                            owned->corner[ch2].resize(nf);
+                        for (size_t f = 0; f < nf; ++f) {
+                            const float* h9 = p->h.data() + f * 9;
+                            for (int c4 = 0; c4 < 4; ++c4) {
+                                const float wq = h9[6] * cx4[c4] +
+                                                 h9[7] * cy4[c4] + h9[8];
+                                const float iw =
+                                    std::fabs(wq) > 1.0e-12f
+                                        ? 1.0f / wq
+                                        : 0.0f;
+                                owned->corner[c4 * 2][f] =
+                                    (h9[0] * cx4[c4] + h9[1] * cy4[c4] +
+                                     h9[2]) * iw;
+                                owned->corner[c4 * 2 + 1][f] =
+                                    (h9[3] * cx4[c4] + h9[4] * cy4[c4] +
+                                     h9[5]) * iw;
+                            }
+                        }
+                    }
+                }
+                if (has_anchor) {
+                    // The anchor's uv through the per-frame cameras of
+                    // its (single) solved shot; frames outside hold the
+                    // nearest in-shot value. No valid projection at all
+                    // leaves the curves empty (reads 0, like unwired).
+                    const uint32_t nfr =
+                        static_cast<uint32_t>(td.solve.size());
+                    std::vector<float> axv(nfr, 0.0f), ayv(nfr, 0.0f);
+                    std::vector<uint8_t> valid(nfr, 0);
+                    bool anyv = false;
+                    for (const media::SfmSegment& sg : td.sfm) {
+                        if (sg.status != media::kSfmSolved) continue;
+                        const media::SfmPoint* pt = nullptr;
+                        for (const media::SfmPoint& p : sg.points)
+                            if (p.track == vn.source.anchor) {
+                                pt = &p;
+                                break;
+                            }
+                        if (!pt) continue;
+                        for (uint32_t f = sg.start; f < sg.end; ++f) {
+                            const uint32_t idx = f - td.start;
+                            if (idx >= nfr) break;
+                            float u, v;
+                            if (!sfm_point_uv(sg, *pt, f, td.aspect, &u,
+                                              &v))
+                                continue;
+                            axv[idx] = u;
+                            ayv[idx] = v;
+                            valid[idx] = 1;
+                            anyv = true;
+                        }
+                    }
+                    if (anyv) {
+                        float hu = 0.0f, hv = 0.0f;
+                        bool have = false;
+                        for (uint32_t i = 0; i < nfr; ++i) {
+                            if (valid[i]) {
+                                hu = axv[i];
+                                hv = ayv[i];
+                                have = true;
+                            } else if (have) {
+                                axv[i] = hu;
+                                ayv[i] = hv;
+                            }
+                        }
+                        for (uint32_t i = nfr; i-- > 0;) {
+                            if (valid[i]) {
+                                hu = axv[i];
+                                hv = ayv[i];
+                            } else {
+                                axv[i] = hu;
+                                ayv[i] = hv;
+                            }
+                        }
+                        owned->anchor_x = std::move(axv);
+                        owned->anchor_y = std::move(ayv);
+                    }
+                }
+                curves = owned;
+                if (!has_region && !has_anchor)
+                    conv.emplace(chain.asset, curves);
+            }
+            (*map)[vn.id] = {curves, chain.slip, chain.offset};
+        }
+    app.node_camera_map = std::move(map);
+}
+
+// Loads an asset's .track sidecar into the cache (no-op when absent or
+// already loaded). Returns true when a solve is available.
+bool load_track_sidecar(AppState& app, uint64_t asset_id) {
+    if (app.track_cache.count(asset_id)) return true;
+    const doc::Asset* a = app.document.find_asset(asset_id);
+    if (!a || a->path.empty()) return false;
+    const std::filesystem::path src = std::filesystem::u8path(a->path);
+    const media::SidecarPaths sc =
+        media::sidecars_for(bundle_dir_for(src), src);
+    auto data = std::make_shared<media::TrackData>();
+    if (!media::track_load(sc.track, data.get())) return false;
+    app.track_cache[asset_id] = std::move(data);
+    return true;
+}
+
+// The engine's Track Pin plane table: scan every pin effect (and every
+// camera node with a region), solve missing planes from the cached
+// tracks (milliseconds - no decode), persist new solves into the
+// sidecar, and publish the flat map the dispatch reads.
+void refresh_pin_planes(AppState& app) {
+    auto pmap = std::make_shared<gfx::Engine::PinPlaneMap>();
+    std::unordered_map<uint64_t, bool> resave;
+    auto add_plane = [&](uint64_t asset, float rx, float ry, float rw,
+                         float rh) {
+        if (!asset) return;
+        if (!load_track_sidecar(app, asset)) return;
+        auto it = app.track_cache.find(asset);
+        if (it == app.track_cache.end() || !it->second) return;
+        const uint64_t key =
+            gfx::Engine::pin_plane_key(asset, rx, ry, rw, rh);
+        if (pmap->count(key)) return;
+        const size_t before = it->second->planes.size();
+        const media::PlaneSolve* p =
+            media::ensure_plane(it->second.get(), rx, ry, rw, rh);
+        if (it->second->planes.size() != before) resave[asset] = true;
+        if (!p) return;
+        gfx::Engine::PinPlane out;
+        out.start = it->second->start;
+        out.h = p->h;
+        (*pmap)[key] = std::move(out);
+    };
+    for (const doc::Look& look : app.document.looks) {
+        for (const doc::Layer& layer : look.layers) {
+            if (!doc::layer_is_media(layer) || !layer.asset) continue;
+            for (const doc::EffectInstance& fx : layer.stack)
+                if (fx.type == doc::EffectType::TrackPin &&
+                    fx.params.size() >= 5)
+                    add_plane(layer.asset, fx.params[1], fx.params[2],
+                              fx.params[3], fx.params[4]);
+        }
+        for (const doc::ValueNode& vn : look.value_nodes) {
+            if (vn.source.type != doc::ModSourceType::Camera ||
+                !vn.audio_src || vn.source.pw <= 0.0f)
+                continue;
+            const doc::AudioChain ch = doc::resolve_audio_chain(
+                app.document, look, vn.audio_src);
+            add_plane(ch.asset, vn.source.px, vn.source.py, vn.source.pw,
+                      vn.source.ph);
+        }
+    }
+    for (const auto& [asset, dirty] : resave) {
+        if (!dirty) continue;
+        const doc::Asset* a = app.document.find_asset(asset);
+        if (!a) continue;
+        const std::filesystem::path src = std::filesystem::u8path(a->path);
+        const media::SidecarPaths sc =
+            media::sidecars_for(bundle_dir_for(src), src);
+        media::track_save(sc.track, *app.track_cache[asset]);
+    }
+    app.pin_plane_map = std::move(pmap);
+}
+
+// Tracker identity: a bumped version re-solves everything; media
+// identity rides the frame count and dimensions.
+uint64_t track_settings_hash(const doc::Asset& a) {
+    uint64_t h = hash_combine(3ull /*tracker version*/, a.frame_count);
+    h = hash_combine(h, (static_cast<uint64_t>(a.width) << 32) | a.height);
+    return h;
+}
+
+// The generate button / generate_track op: solve the asset behind the
+// camera node's wire on a background thread, write the sidecar, adopt
+// the result. A matching cache makes this a no-op; a running job or
+// missing media sets the status the card shows.
+void start_track_job(AppState& app, uint64_t asset_id,
+                     uint32_t range_start = 0, uint32_t range_end = 0) {
+    if (app.track_job && !app.track_job->done) {
+        app.status = "a track solve is already running";
+        return;
+    }
+    app.track_job.reset();
+    const doc::Asset* a = app.document.find_asset(asset_id);
+    if (!a || a->frame_count < 2) {
+        app.status = "nothing to track (no frames)";
+        return;
+    }
+    const media::AssetBundle* b = media::find_bundle(app.bundles, asset_id);
+    if (!b || (b->native.empty() && b->mez.empty())) {
+        app.status = "nothing to track (no video)";
+        return;
+    }
+    const std::filesystem::path src = std::filesystem::u8path(a->path);
+    const media::SidecarPaths sc =
+        media::sidecars_for(bundle_dir_for(src), src);
+    const uint64_t want_hash = track_settings_hash(*a);
+    // Explicit range bounds long-clip solves (script/API); the card
+    // button solves the whole asset.
+    const uint32_t start = std::min(range_start, a->frame_count - 1);
+    const uint32_t end =
+        range_end > start ? std::min(range_end, a->frame_count)
+                          : a->frame_count;
+    if (load_track_sidecar(app, asset_id)) {
+        const media::TrackData& td = *app.track_cache[asset_id];
+        if (td.settings_hash == want_hash && td.start == start &&
+            td.end == end) {
+            refresh_node_camera(app);
+            app.status = "track solve up to date";
+            return;   // regenerate on a matching cache is a no-op
+        }
+        app.track_cache.erase(asset_id);
+    }
+    auto job = std::make_unique<TrackJob>();
+    job->asset = asset_id;
+    job->frames_total = end - start;
+    TrackJob* jp = job.get();
+    const std::filesystem::path native = b->native;
+    const std::filesystem::path mezp = b->mez;
+    const std::filesystem::path track_path = sc.track;
+    // Scene cuts from the import analysis curve: each flagged frame
+    // begins a new shot, re-anchoring every chain in the tracker.
+    std::vector<uint32_t> cuts;
+    {
+        mod::AnalysisData ad;
+        if (mod::load_analysis(sc.analysis, &ad))
+            for (uint32_t f = 0; f < ad.cut.size(); ++f)
+                if (ad.cut[f] > 0.5f) cuts.push_back(f);
+    }
+    job->thread = std::thread([jp, native, mezp, track_path, want_hash,
+                               start, end, cuts = std::move(cuts)] {
+        auto progress = [jp](uint32_t n) { jp->frames_done = n; };
+        auto cancelled = [jp] { return jp->cancel.load(); };
+        bool ok = false;
+        if (!native.empty()) {
+            // Native H.264: one software decode over the range, the
+            // import video pass's pattern, adapted to the tracker's
+            // pull. Frames arrive in presentation order.
+            media::BmffFile file;
+            std::string err;
+            const media::TrackInfo* track = nullptr;
+            if (file.open(native, &err))
+                track = file.movie().first_video();
+            platform::H264Decoder decoder;
+            if (track &&
+                decoder.create(track->avcc, track->width, track->height,
+                               &err, /*allow_d3d=*/false)) {
+                size_t si = 0;
+                uint32_t received = 0;
+                bool drained = false;
+                std::vector<uint8_t> sample_bytes;
+                platform::VideoFrameNV12 nv12;
+                bool have = false;
+                const double to_100ns = 1.0e7 / track->timescale;
+                auto next = [&](uint32_t frame,
+                                media::GrayFrame* g) -> bool {
+                    while (!have || received - 1 < frame) {
+                        if (decoder.receive(nv12)) {
+                            ++received;
+                            have = true;
+                            continue;
+                        }
+                        have = false;
+                        if (si < track->samples.size()) {
+                            const media::SampleInfo& s =
+                                track->samples[si++];
+                            if (!file.read_sample(s, sample_bytes))
+                                return false;
+                            const int64_t pts = static_cast<int64_t>(
+                                static_cast<double>(
+                                    static_cast<int64_t>(s.dts) +
+                                    s.cts_offset) *
+                                to_100ns);
+                            if (!decoder.feed(sample_bytes.data(),
+                                              sample_bytes.size(), pts,
+                                              static_cast<int64_t>(
+                                                  s.duration * to_100ns),
+                                              s.keyframe))
+                                return false;
+                        } else if (!drained) {
+                            decoder.drain();
+                            drained = true;
+                        } else {
+                            return false;   // ran out of frames
+                        }
+                    }
+                    g->data = nv12.data.data();
+                    g->width = nv12.width;
+                    g->height = nv12.height;
+                    g->stride = nv12.stride;
+                    return true;
+                };
+                ok = media::track_run(start, end, next, &jp->result,
+                                      cuts, progress, cancelled);
+            } else if (!err.empty()) {
+                jp->error = err;
+            }
+        } else if (!mezp.empty()) {
+            codec::MezReader reader;
+            std::string err;
+            codec::DecodedFrame df;
+            if (reader.open(mezp, &err)) {
+                auto next = [&](uint32_t frame,
+                                media::GrayFrame* g) -> bool {
+                    if (!reader.decode(frame, df)) return false;
+                    g->data = df.y.data();
+                    g->width = df.width;
+                    g->height = df.height;
+                    g->stride = static_cast<uint32_t>(df.y_stride);
+                    return true;
+                };
+                ok = media::track_run(start, end, next, &jp->result,
+                                      cuts, progress, cancelled);
+            } else {
+                jp->error = err;
+            }
+        }
+        if (ok) {
+            // 3D pass over the stored tracks (per shot, pure CPU); the
+            // card shows "solving 3d" while frames_done sits at total.
+            if (!jp->cancel.load()) media::sfm_solve(&jp->result);
+            jp->result.settings_hash = want_hash;
+            if (!media::track_save(track_path, jp->result))
+                log_warn("track: sidecar write failed (non-fatal)");
+        } else if (jp->error.empty()) {
+            jp->error = jp->cancel.load() ? "cancelled" : "decode failed";
+        }
+        jp->ok = ok;
+        jp->done = true;
+    });
+    app.track_job = std::move(job);
+    app.status = "solving motion...";
 }
 
 // Media-environment reset when the transport's media rebinds: sidechain
@@ -5006,6 +5522,7 @@ void draw_confirm_dialog(ui::Canvas2D& canvas, const ui::Font& font,
             ui::lerp(th.control_bg, th.control_bg_hover, bs.hover_t);
         if (bs.pressed) bg = th.control_bg_active;
         const ui::Rect& r = cl.button[i];
+        ui::probe_add(*cl.labels[i], r);
         canvas.draw_sdf_rect(r, th.corner_radius, bg);
         canvas.draw_sdf_rect_outline(
             r, th.corner_radius, th.stroke_width,
@@ -5043,8 +5560,37 @@ void push_render_job(RenderWorker& w, AppState& app) {
          app.node_audio_stamp != app.bundle_stamp) &&
         !app.undo.coalescing_active()) {
         refresh_node_audio(app);
+        // Camera nodes rewire on the same cadence: their env map is a
+        // pointer rebuild over the loaded solves. Sidecars for newly
+        // wired assets load lazily here too.
+        for (const doc::Look& lk2 : app.document.looks)
+            for (const doc::ValueNode& vn2 : lk2.value_nodes)
+                if (vn2.source.type == doc::ModSourceType::Camera &&
+                    vn2.audio_src) {
+                    const doc::AudioChain c2 = doc::resolve_audio_chain(
+                        app.document, lk2, vn2.audio_src);
+                    if (c2.asset) load_track_sidecar(app, c2.asset);
+                }
+        refresh_node_camera(app);
+        refresh_pin_planes(app);
         app.node_audio_revision = app.document.revision;
         app.node_audio_stamp = app.bundle_stamp;
+    }
+    // A finished track solve adopts its result and rewires the camera
+    // env; failures surface on the status line.
+    if (app.track_job && app.track_job->done) {
+        if (app.track_job->ok) {
+            app.track_cache[app.track_job->asset] =
+                std::make_shared<media::TrackData>(
+                    std::move(app.track_job->result));
+            refresh_node_camera(app);
+            refresh_pin_planes(app);
+            app.status = "motion solve done";
+        } else {
+            app.status = "track solve failed: " + app.track_job->error;
+        }
+        if (app.track_job->thread.joinable()) app.track_job->thread.join();
+        app.track_job.reset();
     }
     // One document copy per revision, built OUTSIDE the lock; the worker
     // retains the pointer without copying. A revision that IS the
@@ -5088,6 +5634,14 @@ void push_render_job(RenderWorker& w, AppState& app) {
         }
         if (j.node_audio != app.node_audio_map) {
             j.node_audio = app.node_audio_map;
+            changed = true;
+        }
+        if (j.node_camera != app.node_camera_map) {
+            j.node_camera = app.node_camera_map;
+            changed = true;
+        }
+        if (j.pin_planes != app.pin_plane_map) {
+            j.pin_planes = app.pin_plane_map;
             changed = true;
         }
         const bool want_source = app.ab_wipe || app.bypass_all;
@@ -5280,6 +5834,7 @@ struct FrameUi {
         bool* slot_released[4] = {};
         float slot_original[4] = {};
         bool* remove = nullptr;
+        bool* generate = nullptr;     // camera node: start the solve
     };
     std::vector<NodeRow> node_rows;
 
@@ -6151,6 +6706,631 @@ void monitor_click_pick(AppState& app, const ui::Rect& r, Vec2 m) {
     }
 }
 
+// ---- look-scope monitor gizmos. Selection decides what the monitor
+// edits; a handle is a second hand on the params the sliders already
+// drive, so nothing new is stored and keyframes, wires and scripts keep
+// working. Point handles map param pairs living in canvas uv (plus a
+// fixed natural anchor for offset params like the pin corners); angle
+// stubs map a single radian param and point where the kernel points.
+// Handles probe as "gizmo:<label>" for scripted drags.
+struct GizmoPoint {
+    int px, py;    // param indices of the x/y pair
+    float ax, ay;  // natural anchor the values offset (0 = absolute uv)
+    const char* label;
+};
+struct GizmoAngle {
+    int pa;  // radian param index
+    const char* label;
+};
+struct GizmoDesc {
+    doc::EffectType type;
+    int npt;
+    GizmoPoint pt[4];
+    int nang;
+    GizmoAngle ang[1];
+    bool outline;  // connect the 4 points (corner pin quad)
+    // Region rect: pt[0] is the center, these params its w/h (0 = no
+    // rect). Draws the outline + a bottom-right size handle.
+    int rw_param;
+    int rh_param;
+};
+
+constexpr GizmoDesc kGizmoDescs[] = {
+    {doc::EffectType::Spherize, 1, {{2, 3, 0.0f, 0.0f, "center"}}, 0, {},
+     false},
+    {doc::EffectType::Twirl, 1, {{2, 3, 0.0f, 0.0f, "center"}}, 0, {},
+     false},
+    {doc::EffectType::Kaleido, 1, {{2, 3, 0.0f, 0.0f, "center"}}, 0, {},
+     false},
+    {doc::EffectType::Text, 1, {{2, 3, 0.0f, 0.0f, "pos"}}, 0, {}, false},
+    {doc::EffectType::Blur, 0, {}, 1, {{2, "angle"}}, false},
+    {doc::EffectType::Displace, 0, {}, 1, {{1, "angle"}}, false},
+    {doc::EffectType::CornerPin, 4,
+     {{0, 1, 0.0f, 0.0f, "tl"},
+      {2, 3, 1.0f, 0.0f, "tr"},
+      {4, 5, 0.0f, 1.0f, "bl"},
+      {6, 7, 1.0f, 1.0f, "br"}},
+     0, {}, true, 0, 0},
+    {doc::EffectType::TrackPin, 1, {{1, 2, 0.0f, 0.0f, "region"}}, 0, {},
+     false, 3, 4},
+};
+
+const GizmoDesc* gizmo_desc_for(doc::EffectType type) {
+    for (const GizmoDesc& d : kGizmoDescs)
+        if (d.type == type) return &d;
+    return nullptr;
+}
+
+// Custom-shape path editor: the selected shape node's path edits
+// directly on the monitor. Anchors drag (their tangents ride), the
+// selected anchor exposes tangent handles, a click on a segment splits
+// the cubic in place (de Casteljau, shape-preserving), and an OPEN path
+// appends on click until a click on the first anchor closes it -
+// creation is document state, so a reselected half-built path resumes
+// exactly where it stopped. Structural clicks execute un-coalesced;
+// drags stage the whole layer and coalesce per layer id.
+void draw_path_editor(AppState& app, ui::LayoutNode& node,
+                      ui::LayoutFrame& frame, ui::Rect r,
+                      bool fit_clicked) {
+    doc::Layer* lay = doc::find_layer(app.look(), app.sel.id);
+    const bool editable = lay &&
+                          lay->source == doc::LayerSourceKind::Shape &&
+                          lay->osc_shape == 3u;
+    if (!editable) {
+        if (app.giz_mode != 0) {
+            app.giz_mode = 0;
+            app.giz_released = true;
+            frame.ctx.clear_capture();
+        }
+        return;
+    }
+    if (app.giz_path_layer != lay->id) {
+        app.giz_path_layer = lay->id;
+        app.giz_path_sel = -1;
+    }
+    const Vec2 mouse = frame.input.mouse;
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    if (app.giz_mode != 0 &&
+        (app.giz_mode < 3 || !frame.input.left_down() ||
+         app.giz_fx != lay->id ||
+         app.giz_slot >= static_cast<int>(lay->path.size()))) {
+        app.giz_mode = 0;
+        app.giz_released = true;
+        frame.ctx.clear_capture();
+    }
+
+    auto to_px = [&](float ux, float uy) -> Vec2 {
+        return {r.x + ux * r.w, r.y + uy * r.h};
+    };
+    auto near_px = [&](Vec2 p) {
+        return std::fabs(mouse.x - p.x) <= 6.0f &&
+               std::fabs(mouse.y - p.y) <= 6.0f;
+    };
+
+    // Drag in flight: rebuild the dragged element from the gesture
+    // origin, stage the whole layer when it changed. (Modes 3-5 are the
+    // path editor's; 6 is the effect region handle.)
+    if (app.giz_mode >= 3 && app.giz_mode <= 5) {
+        doc::Layer up = *lay;
+        doc::PathPoint& p = up.path[static_cast<size_t>(app.giz_slot)];
+        const float du = (mouse.x - app.giz_anchor.x) / r.w;
+        const float dv = (mouse.y - app.giz_anchor.y) / r.h;
+        if (app.giz_mode == 3) {
+            p.ax = app.giz_orig[0] + du;
+            p.ay = app.giz_orig[1] + dv;
+        } else if (app.giz_mode == 4) {
+            p.in_dx = app.giz_orig[0] + du;
+            p.in_dy = app.giz_orig[1] + dv;
+        } else {
+            p.out_dx = app.giz_orig[0] + du;
+            p.out_dy = app.giz_orig[1] + dv;
+        }
+        const doc::PathPoint& cur =
+            lay->path[static_cast<size_t>(app.giz_slot)];
+        if (std::memcmp(&p, &cur, sizeof(p)) != 0) {
+            app.giz_layer_write = std::move(up);
+            app.giz_layer_staged = true;
+            app.giz_layer_coalesce = true;
+        }
+    }
+    // Draw from the staged layer while a write is pending so handles
+    // track the mouse, not the one-frame-behind document.
+    const doc::Layer& view =
+        app.giz_layer_staged ? app.giz_layer_write : *lay;
+    const std::vector<doc::PathPoint>& path = view.path;
+
+    std::vector<float> poly;
+    gfx::shape_flatten(path, view.path_closed, 1.0f, &poly);
+
+    const ui::Color ac = frame.theme.accent;
+    const ui::Color dimc = frame.theme.text_dim;
+    frame.canvas.push_clip(node.rect);
+    for (size_t i = 0; i + 3 < poly.size(); i += 2)
+        frame.canvas.draw_line(to_px(poly[i], poly[i + 1]),
+                               to_px(poly[i + 2], poly[i + 3]), 1.5f, ac);
+    if (!view.path_closed && !path.empty())
+        frame.canvas.draw_line(to_px(path.back().ax, path.back().ay),
+                               mouse, 1.0f, dimc);
+    for (size_t i = 0; i < path.size(); ++i) {
+        const Vec2 ap = to_px(path[i].ax, path[i].ay);
+        const bool selp = static_cast<int>(i) == app.giz_path_sel;
+        const float hs = selp ? 5.0f : 4.0f;
+        frame.canvas.draw_sdf_rect(
+            {ap.x - hs, ap.y - hs, hs * 2.0f, hs * 2.0f}, 2.0f,
+            selp ? ac : dimc);
+        ui::probe_add("gizmo:pt" + std::to_string(i),
+                      {ap.x - 6.0f, ap.y - 6.0f, 12.0f, 12.0f});
+    }
+    Vec2 tin{}, tout{};
+    bool have_t = false;
+    if (app.giz_path_sel >= 0 &&
+        app.giz_path_sel < static_cast<int>(path.size())) {
+        const doc::PathPoint& sp =
+            path[static_cast<size_t>(app.giz_path_sel)];
+        const Vec2 ap = to_px(sp.ax, sp.ay);
+        tin = to_px(sp.ax + sp.in_dx, sp.ay + sp.in_dy);
+        tout = to_px(sp.ax + sp.out_dx, sp.ay + sp.out_dy);
+        have_t = true;
+        frame.canvas.draw_line(ap, tin, 1.0f, dimc);
+        frame.canvas.draw_line(ap, tout, 1.0f, dimc);
+        frame.canvas.draw_sdf_rect({tin.x - 3.5f, tin.y - 3.5f, 7.0f, 7.0f},
+                                   3.5f, ac);
+        frame.canvas.draw_sdf_rect(
+            {tout.x - 3.5f, tout.y - 3.5f, 7.0f, 7.0f}, 3.5f, ac);
+        const std::string tp =
+            "gizmo:pt" + std::to_string(app.giz_path_sel);
+        ui::probe_add(tp + "/in",
+                      {tin.x - 6.0f, tin.y - 6.0f, 12.0f, 12.0f});
+        ui::probe_add(tp + "/out",
+                      {tout.x - 6.0f, tout.y - 6.0f, 12.0f, 12.0f});
+    }
+    frame.canvas.pop_clip();
+
+    if (!(frame.input.left_pressed() && owns && app.giz_mode == 0 &&
+          !fit_clicked))
+        return;
+    const float mu = (mouse.x - r.x) / r.w;
+    const float mv = (mouse.y - r.y) / r.h;
+    if (!lay->path_closed) {
+        // Creation: a click on the first anchor closes; anywhere else
+        // appends (corner point - tangents shape afterwards).
+        if (lay->path.size() >= 3 &&
+            near_px(to_px(lay->path[0].ax, lay->path[0].ay))) {
+            doc::Layer up = *lay;
+            up.path_closed = true;
+            app.giz_layer_write = std::move(up);
+            app.giz_layer_staged = true;
+            app.giz_layer_coalesce = false;
+        } else if (lay->path.size() < 64) {
+            doc::Layer up = *lay;
+            doc::PathPoint np;
+            np.ax = mu;
+            np.ay = mv;
+            up.path.push_back(np);
+            app.giz_path_sel = static_cast<int>(up.path.size()) - 1;
+            app.giz_layer_write = std::move(up);
+            app.giz_layer_staged = true;
+            app.giz_layer_coalesce = false;
+        }
+        return;
+    }
+    auto start_drag = [&](int mode, int slot, float ox, float oy) {
+        app.giz_mode = mode;
+        app.giz_fx = lay->id;
+        app.giz_slot = slot;
+        app.giz_anchor = mouse;
+        app.giz_orig[0] = ox;
+        app.giz_orig[1] = oy;
+        frame.ctx.set_capture(id);
+    };
+    if (have_t && near_px(tout)) {
+        const doc::PathPoint& sp =
+            lay->path[static_cast<size_t>(app.giz_path_sel)];
+        start_drag(5, app.giz_path_sel, sp.out_dx, sp.out_dy);
+        return;
+    }
+    if (have_t && near_px(tin)) {
+        const doc::PathPoint& sp =
+            lay->path[static_cast<size_t>(app.giz_path_sel)];
+        start_drag(4, app.giz_path_sel, sp.in_dx, sp.in_dy);
+        return;
+    }
+    for (size_t i = 0; i < lay->path.size(); ++i)
+        if (near_px(to_px(lay->path[i].ax, lay->path[i].ay))) {
+            app.giz_path_sel = static_cast<int>(i);
+            start_drag(3, static_cast<int>(i), lay->path[i].ax,
+                       lay->path[i].ay);
+            return;
+        }
+    // Segment insert: nearest flattened segment within grab range maps
+    // back to (span, t); de Casteljau splits the cubic there so the
+    // curve does not move.
+    if (lay->path.size() >= 2 && lay->path.size() < 64 &&
+        poly.size() >= 4) {
+        float best_d = 6.0f;
+        size_t best_k = SIZE_MAX;
+        float best_t = 0.0f;
+        for (size_t k = 0; k + 3 < poly.size(); k += 2) {
+            const Vec2 a = to_px(poly[k], poly[k + 1]);
+            const Vec2 b = to_px(poly[k + 2], poly[k + 3]);
+            const float dx = b.x - a.x, dy = b.y - a.y;
+            const float len2 = dx * dx + dy * dy;
+            float t = 0.0f;
+            if (len2 > 1.0e-6f)
+                t = std::clamp(((mouse.x - a.x) * dx +
+                                (mouse.y - a.y) * dy) /
+                                   len2,
+                               0.0f, 1.0f);
+            const float px2 = a.x + dx * t, py2 = a.y + dy * t;
+            const float d2 = std::hypot(mouse.x - px2, mouse.y - py2);
+            if (d2 < best_d) {
+                best_d = d2;
+                best_k = k / 2;
+                best_t = t;
+            }
+        }
+        if (best_k != SIZE_MAX) {
+            const size_t span = best_k / gfx::kShapeSubdiv;
+            const float t =
+                (static_cast<float>(best_k % gfx::kShapeSubdiv) + best_t) /
+                static_cast<float>(gfx::kShapeSubdiv);
+            const size_t n = lay->path.size();
+            if (span < (lay->path_closed ? n : n - 1)) {
+                doc::Layer up = *lay;
+                doc::PathPoint& p0 = up.path[span];
+                doc::PathPoint& p1 = up.path[(span + 1) % n];
+                const float c0x = p0.ax, c0y = p0.ay;
+                const float c1x = p0.ax + p0.out_dx,
+                            c1y = p0.ay + p0.out_dy;
+                const float c2x = p1.ax + p1.in_dx,
+                            c2y = p1.ay + p1.in_dy;
+                const float c3x = p1.ax, c3y = p1.ay;
+                auto lerpf = [](float a2, float b2, float tt) {
+                    return a2 + (b2 - a2) * tt;
+                };
+                const float q0x = lerpf(c0x, c1x, t),
+                            q0y = lerpf(c0y, c1y, t);
+                const float q1x = lerpf(c1x, c2x, t),
+                            q1y = lerpf(c1y, c2y, t);
+                const float q2x = lerpf(c2x, c3x, t),
+                            q2y = lerpf(c2y, c3y, t);
+                const float r0x = lerpf(q0x, q1x, t),
+                            r0y = lerpf(q0y, q1y, t);
+                const float r1x = lerpf(q1x, q2x, t),
+                            r1y = lerpf(q1y, q2y, t);
+                const float sxp = lerpf(r0x, r1x, t),
+                            syp = lerpf(r0y, r1y, t);
+                doc::PathPoint np;
+                np.ax = sxp;
+                np.ay = syp;
+                np.in_dx = r0x - sxp;
+                np.in_dy = r0y - syp;
+                np.out_dx = r1x - sxp;
+                np.out_dy = r1y - syp;
+                p0.out_dx = q0x - c0x;
+                p0.out_dy = q0y - c0y;
+                p1.in_dx = q2x - c3x;
+                p1.in_dy = q2y - c3y;
+                up.path.insert(up.path.begin() +
+                                   static_cast<ptrdiff_t>(span) + 1,
+                               np);
+                app.giz_path_sel = static_cast<int>(span) + 1;
+                app.giz_layer_write = std::move(up);
+                app.giz_layer_staged = true;
+                app.giz_layer_coalesce = false;
+            }
+        }
+    }
+}
+
+// Point-cloud overlay: a selected camera node whose media frame sits
+// in a solved 3D shot draws the solved points projected at the
+// playhead. A click on a point stores it as the node's anchor (the
+// anchor channels project it per frame); clicking the anchor again
+// clears it. Selection decides what the monitor edits, exactly like
+// the effect gizmos.
+void draw_camera_overlay(AppState& app, ui::LayoutNode& node,
+                         ui::LayoutFrame& frame, const ui::Rect& r,
+                         bool fit_clicked) {
+    const doc::Look& look = app.look();
+    const doc::ValueNode* vn = nullptr;
+    for (const doc::ValueNode& n : look.value_nodes)
+        if (n.id == app.sel.id) vn = &n;
+    if (!vn || vn->source.type != doc::ModSourceType::Camera ||
+        !vn->audio_src)
+        return;
+    const doc::AudioChain chain =
+        doc::resolve_audio_chain(app.document, look, vn->audio_src);
+    if (!chain.asset) return;
+    const auto it = app.track_cache.find(chain.asset);
+    if (it == app.track_cache.end() || !it->second) return;
+    const media::TrackData& td = *it->second;
+    const double ph =
+        app.has_timeline() ? app.player.current_frame_index() : 0.0;
+    const int64_t pos = static_cast<int64_t>(ph) +
+                        static_cast<int64_t>(chain.slip) + chain.offset;
+    const uint32_t mf = pos < 0 ? 0u : static_cast<uint32_t>(pos);
+    const media::SfmSegment* seg = nullptr;
+    for (const media::SfmSegment& sg : td.sfm)
+        if (sg.status == media::kSfmSolved && mf >= sg.start &&
+            mf < sg.end)
+            seg = &sg;
+    if (!seg) return;
+    const ui::Color ac = frame.theme.accent;
+    const Vec2 mouse = frame.input.mouse;
+    float best_d2 = 12.0f * 12.0f;
+    uint32_t best_track = 0;
+    Vec2 anchor_px{};
+    bool have_anchor_px = false;
+    frame.canvas.push_clip(node.rect);
+    for (const media::SfmPoint& sp : seg->points) {
+        float u, v;
+        if (!sfm_point_uv(*seg, sp, mf, td.aspect, &u, &v)) continue;
+        const Vec2 p{r.x + u * r.w, r.y + v * r.h};
+        if (!node.rect.contains(p)) continue;
+        if (vn->source.anchor == sp.track) {
+            frame.canvas.draw_sdf_rect(
+                {p.x - 4.0f, p.y - 4.0f, 8.0f, 8.0f}, 4.0f, ac);
+            frame.canvas.draw_sdf_rect_outline(
+                {p.x - 7.0f, p.y - 7.0f, 14.0f, 14.0f}, 7.0f, 1.5f, ac);
+            anchor_px = p;
+            have_anchor_px = true;
+        } else {
+            frame.canvas.draw_sdf_rect(
+                {p.x - 2.0f, p.y - 2.0f, 4.0f, 4.0f}, 2.0f,
+                frame.theme.text_dim);
+        }
+        const float dx = mouse.x - p.x, dy = mouse.y - p.y;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_track = sp.track;
+        }
+    }
+    frame.canvas.pop_clip();
+    if (have_anchor_px)
+        ui::probe_add("gizmo:anchor", {anchor_px.x - 6.0f,
+                                       anchor_px.y - 6.0f, 12.0f, 12.0f});
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
+    if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id) &&
+        !fit_clicked && best_track) {
+        app.giz_anchor_staged = true;
+        app.giz_anchor_node = vn->id;
+        // Clicking the current anchor clears it.
+        app.giz_anchor_track =
+            vn->source.anchor == best_track ? 0u : best_track;
+    }
+}
+
+void draw_look_gizmos(AppState& app, ui::LayoutNode& node,
+                      ui::LayoutFrame& frame, bool fit_clicked) {
+    app.giz_write_n = 0;
+    ui::Rect r = node.rect.inset(1.0f);
+    if (r.w < 8.0f || r.h < 8.0f) return;
+    r = monitor_content_rect(app, r);
+    if (app.sel.kind == SelKind::LayerSource) {
+        draw_path_editor(app, node, frame, r, fit_clicked);
+        return;
+    }
+    if (app.sel.kind == SelKind::ModSource) {
+        draw_camera_overlay(app, node, frame, r, fit_clicked);
+        return;
+    }
+    const doc::Look& look = app.look();
+    size_t li = 0, fi = 0;
+    const doc::EffectInstance* fx = nullptr;
+    const GizmoDesc* gd = nullptr;
+    if (app.sel.kind == SelKind::Effect &&
+        find_effect_by_id(look, app.sel.id, &li, &fi)) {
+        fx = &look.layers[li].stack[fi];
+        gd = gizmo_desc_for(fx->type);
+    }
+    if (!fx || !gd) {
+        if (app.giz_mode != 0) {
+            app.giz_mode = 0;
+            app.giz_released = true;
+            frame.ctx.clear_capture();
+        }
+        return;
+    }
+    const doc::EffectInfo& info = doc::effect_info(fx->type);
+    const Vec2 mouse = frame.input.mouse;
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
+
+    if (app.giz_mode != 0 &&
+        (!frame.input.left_down() || app.giz_fx != fx->id)) {
+        app.giz_mode = 0;
+        app.giz_released = true;
+        frame.ctx.clear_capture();
+    }
+
+    // Point drag in flight: absolute from the gesture origin, clamped to
+    // the param range. Handles draw from the live values so they track
+    // the mouse; the document catches up through the staged command this
+    // same frame.
+    float drag_v[2] = {0.0f, 0.0f};
+    if (app.giz_mode == 1) {
+        const GizmoPoint& gp = gd->pt[app.giz_slot];
+        float mn = 0.0f, mx = 1.0f;
+        mod::param_range(fx->type, gp.px, &mn, &mx);
+        drag_v[0] = std::clamp(
+            app.giz_orig[0] + (mouse.x - app.giz_anchor.x) / r.w, mn, mx);
+        mod::param_range(fx->type, gp.py, &mn, &mx);
+        drag_v[1] = std::clamp(
+            app.giz_orig[1] + (mouse.y - app.giz_anchor.y) / r.h, mn, mx);
+        if (drag_v[0] != fx->params[static_cast<size_t>(gp.px)] ||
+            drag_v[1] != fx->params[static_cast<size_t>(gp.py)]) {
+            app.giz_writes[0] = {li, fi, gp.px, drag_v[0]};
+            app.giz_writes[1] = {li, fi, gp.py, drag_v[1]};
+            app.giz_write_n = 2;
+        }
+    }
+    if (app.giz_mode == 6 && gd->rw_param > 0) {
+        // Region size drag: the bottom-right handle sets w/h about the
+        // (undragged) center.
+        const GizmoPoint& gp = gd->pt[0];
+        const float cxp =
+            r.x + (gp.ax + fx->params[static_cast<size_t>(gp.px)]) * r.w;
+        const float cyp =
+            r.y + (gp.ay + fx->params[static_cast<size_t>(gp.py)]) * r.h;
+        float mn = 0.0f, mx = 1.0f;
+        mod::param_range(fx->type, gd->rw_param, &mn, &mx);
+        drag_v[0] = std::clamp(2.0f * std::fabs(mouse.x - cxp) / r.w, mn,
+                               mx);
+        mod::param_range(fx->type, gd->rh_param, &mn, &mx);
+        drag_v[1] = std::clamp(2.0f * std::fabs(mouse.y - cyp) / r.h, mn,
+                               mx);
+        if (drag_v[0] != fx->params[static_cast<size_t>(gd->rw_param)] ||
+            drag_v[1] != fx->params[static_cast<size_t>(gd->rh_param)]) {
+            app.giz_writes[0] = {li, fi, gd->rw_param, drag_v[0]};
+            app.giz_writes[1] = {li, fi, gd->rh_param, drag_v[1]};
+            app.giz_write_n = 2;
+        }
+    }
+    auto pval = [&](int idx) -> float {
+        if (app.giz_mode == 1) {
+            const GizmoPoint& gp = gd->pt[app.giz_slot];
+            if (idx == gp.px) return drag_v[0];
+            if (idx == gp.py) return drag_v[1];
+        }
+        if (app.giz_mode == 6 &&
+            (idx == gd->rw_param || idx == gd->rh_param))
+            return idx == gd->rw_param ? drag_v[0] : drag_v[1];
+        return fx->params[static_cast<size_t>(idx)];
+    };
+
+    // Screen positions, hidden params culled with their rows (a blur in
+    // gaussian mode has no angle to point).
+    Vec2 ppos[4];
+    int pslot[4];
+    int npt = 0;
+    for (int i = 0; i < gd->npt; ++i) {
+        const GizmoPoint& gp = gd->pt[i];
+        if (!doc::param_visible(*fx, info.params[gp.px])) continue;
+        const float u = gp.ax + pval(gp.px);
+        const float v = gp.ay + pval(gp.py);
+        ppos[npt] = {r.x + u * r.w, r.y + v * r.h};
+        pslot[npt] = i;
+        ++npt;
+    }
+    // Angle stubs anchor on the effect's first point when it has one,
+    // else the canvas center.
+    const Vec2 aanchor =
+        npt > 0 ? ppos[0]
+                : Vec2{r.x + 0.5f * r.w, r.y + 0.5f * r.h};
+    const float alen =
+        std::clamp(std::min(r.w, r.h) * 0.18f, 24.0f, 120.0f);
+    Vec2 atip[1];
+    int aslot[1];
+    int nang = 0;
+    for (int i = 0; i < gd->nang; ++i) {
+        const GizmoAngle& ga = gd->ang[i];
+        if (!doc::param_visible(*fx, info.params[ga.pa])) continue;
+        float a = fx->params[static_cast<size_t>(ga.pa)];
+        if (app.giz_mode == 2 && app.giz_slot == i) {
+            float mn = 0.0f, mx = 1.0f;
+            mod::param_range(fx->type, ga.pa, &mn, &mx);
+            a = std::clamp(
+                std::atan2(mouse.y - aanchor.y, mouse.x - aanchor.x), mn,
+                mx);
+            if (a != fx->params[static_cast<size_t>(ga.pa)]) {
+                app.giz_writes[0] = {li, fi, ga.pa, a};
+                app.giz_write_n = 1;
+            }
+        }
+        atip[nang] = {aanchor.x + std::cos(a) * alen,
+                      aanchor.y + std::sin(a) * alen};
+        aslot[nang] = i;
+        ++nang;
+    }
+
+    const ui::Color ac = frame.theme.accent;
+    frame.canvas.push_clip(node.rect);
+    if (gd->outline && npt == 4) {
+        frame.canvas.draw_line(ppos[0], ppos[1], 1.5f, ac);
+        frame.canvas.draw_line(ppos[1], ppos[3], 1.5f, ac);
+        frame.canvas.draw_line(ppos[3], ppos[2], 1.5f, ac);
+        frame.canvas.draw_line(ppos[2], ppos[0], 1.5f, ac);
+    }
+    for (int i = 0; i < npt; ++i) {
+        frame.canvas.draw_sdf_rect(
+            {ppos[i].x - 4.0f, ppos[i].y - 4.0f, 8.0f, 8.0f}, 2.0f, ac);
+        ui::probe_add(std::string("gizmo:") + gd->pt[pslot[i]].label,
+                      {ppos[i].x - 6.0f, ppos[i].y - 6.0f, 12.0f, 12.0f});
+    }
+    // Region rect: outline about the center point + a size handle at
+    // the bottom-right corner.
+    Vec2 region_br{};
+    bool have_region = false;
+    if (gd->rw_param > 0 && npt >= 1) {
+        const float rww = pval(gd->rw_param) * r.w;
+        const float rhh = pval(gd->rh_param) * r.h;
+        const ui::Rect rr{ppos[0].x - rww * 0.5f, ppos[0].y - rhh * 0.5f,
+                          rww, rhh};
+        frame.canvas.draw_sdf_rect_outline(rr, 2.0f, 1.5f, ac);
+        region_br = {rr.right(), rr.bottom()};
+        have_region = true;
+        frame.canvas.draw_sdf_rect({region_br.x - 4.0f,
+                                    region_br.y - 4.0f, 8.0f, 8.0f},
+                                   2.0f, ac);
+        ui::probe_add("gizmo:region_br",
+                      {region_br.x - 6.0f, region_br.y - 6.0f, 12.0f,
+                       12.0f});
+    }
+    for (int i = 0; i < nang; ++i) {
+        frame.canvas.draw_line(aanchor, atip[i], 1.5f, ac);
+        frame.canvas.draw_sdf_rect(
+            {atip[i].x - 4.0f, atip[i].y - 4.0f, 8.0f, 8.0f}, 4.0f, ac);
+        ui::probe_add(std::string("gizmo:") + gd->ang[aslot[i]].label,
+                      {atip[i].x - 6.0f, atip[i].y - 6.0f, 12.0f, 12.0f});
+    }
+    frame.canvas.pop_clip();
+
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    auto near_hd = [&](Vec2 p) {
+        return std::fabs(mouse.x - p.x) <= 6.0f &&
+               std::fabs(mouse.y - p.y) <= 6.0f;
+    };
+    if (frame.input.left_pressed() && owns && app.giz_mode == 0 &&
+        !fit_clicked) {
+        if (have_region && near_hd(region_br)) {
+            app.giz_mode = 6;
+            app.giz_fx = fx->id;
+            app.giz_slot = 0;
+            app.giz_anchor = mouse;
+            app.giz_orig[0] =
+                fx->params[static_cast<size_t>(gd->rw_param)];
+            app.giz_orig[1] =
+                fx->params[static_cast<size_t>(gd->rh_param)];
+            frame.ctx.set_capture(id);
+            return;
+        }
+        for (int i = 0; i < npt; ++i) {
+            if (!near_hd(ppos[i])) continue;
+            const GizmoPoint& gp = gd->pt[pslot[i]];
+            app.giz_mode = 1;
+            app.giz_fx = fx->id;
+            app.giz_slot = pslot[i];
+            app.giz_anchor = mouse;
+            app.giz_orig[0] = fx->params[static_cast<size_t>(gp.px)];
+            app.giz_orig[1] = fx->params[static_cast<size_t>(gp.py)];
+            frame.ctx.set_capture(id);
+            break;
+        }
+        if (app.giz_mode == 0)
+            for (int i = 0; i < nang; ++i) {
+                if (!near_hd(atip[i])) continue;
+                app.giz_mode = 2;
+                app.giz_fx = fx->id;
+                app.giz_slot = aslot[i];
+                app.giz_anchor = mouse;
+                frame.ctx.set_capture(id);
+                break;
+            }
+    }
+}
+
 // ---- program monitor: the preview leaf. At look scope it is a plain
 // frame; at SEQUENCE scope it is the program monitor and the selected
 // block manipulates directly on it - body moves, corners scale, the
@@ -6172,8 +7352,9 @@ void hit_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.add_hit(app_ctx_menu_rect(a, frame.font),
                           frame.ctx.acquire_widget_id(&a.ctx_menu_dd),
                           ui::HitLayer::Popup);
-    if (!a.scope_is_look())
-        ui::register_rect_hit(node, frame, &a.monitor_ws);
+    // Both scopes: sequence scope for block manipulation, look scope for
+    // the effect gizmos.
+    ui::register_rect_hit(node, frame, &a.monitor_ws);
 }
 
 void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
@@ -6275,7 +7456,10 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             fit_clicked = true;
         }
     }
-    if (app.scope_is_look()) return;
+    if (app.scope_is_look()) {
+        draw_look_gizmos(app, node, frame, fit_clicked);
+        return;
+    }
     ui::Rect r = node.rect.inset(1.0f);
     if (r.w < 8.0f || r.h < 8.0f) return;
     // The image sits letterboxed+zoomed+panned inside the leaf; the
@@ -8730,7 +9914,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                       "motion", "bright", "lfo.bpm",
                                       "env",    "cut",    "beat",
                                       "sample", "region", "math",
-                                      "norm"};
+                                      "norm",   "camera"};
     constexpr size_t kModNameCount =
         sizeof(kModNames) / sizeof(kModNames[0]);
     static_assert(kModNameCount ==
@@ -8774,7 +9958,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     doc::Look resolved = d;
     mod::resolve_look(d, resolved, live_frame, live_fps, live_analysis,
                       live_audio_off, -1.0, -1.0, nullptr,
-                      app.node_audio_map.get());
+                      app.node_audio_map.get(),
+                      app.node_camera_map.get());
     mod::ValueEnv venv;
     venv.look = &d;
     venv.t = live_frame / live_fps;
@@ -8783,6 +9968,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     venv.fps = live_fps;
     venv.audio_off = live_audio_off;
     venv.node_audio = app.node_audio_map.get();
+    venv.node_camera = app.node_camera_map.get();
     auto resolved_fx_value = [&](uint64_t eid, int pi, float* out_v) {
         size_t rli = 0, rfi = 0;
         if (!find_effect_by_id(resolved, eid, &rli, &rfi)) return false;
@@ -8958,9 +10144,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                           "%.1f");
                 layer_row(LFs::Angle, "feather", 0.0f, 3.1416f,
                           layer.gen_angle, "%.2f");
-                layer_row(LFs::OscShape, "shape", 0.0f, 2.0f,
-                          static_cast<float>(layer.osc_shape % 3), "%.0f",
-                          "circle|box|diamond");
+                layer_row(LFs::OscShape, "shape", 0.0f, 3.0f,
+                          static_cast<float>(layer.osc_shape % 4), "%.0f",
+                          "circle|box|diamond|custom");
             }
             if (doc::layer_is_media(layer) && srow < 12) {
                 // MEDIA on the card: "(none)", every asset, then
@@ -9486,7 +10672,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         nr.id = vn.id;
         nr.remove = arena.alloc<bool>();
 
-        flow::ParamRow* rows = arena.alloc<flow::ParamRow>(6);
+        flow::ParamRow* rows = arena.alloc<flow::ParamRow>(8);
         int slot = 0;
         auto pick_row = [&](int which, const char* label,
                             const char* options, int current) {
@@ -9555,6 +10741,70 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             pick_row(1, "op",
                      "add|subtract|multiply|divide|min|max|floor|abs",
                      static_cast<int>(vn.op));
+        else if (vn.source.type == doc::ModSourceType::Camera)
+            pick_row(1, "channel",
+                     "stab x|stab y|stab rot|stab scale|anchor x|"
+                     "anchor y|tl x|tl y|tr x|tr y|bl x|bl y|br x|br y",
+                     static_cast<int>(vn.source.channel % 14));
+        if (vn.source.type == doc::ModSourceType::Camera) {
+            // Plane region (uv rect; w 0 = no plane, corner channels
+            // read 0), then generate + status.
+            static const char* kRegLabels[4] = {"rg x", "rg y", "rg w",
+                                                "rg h"};
+            const float rcur[4] = {vn.source.px, vn.source.py,
+                                   vn.source.pw, vn.source.ph};
+            for (int ri = 0; ri < 4; ++ri)
+                slider_row(ri, kRegLabels[ri], 0.0f, 1.0f, rcur[ri],
+                           "%.2f");
+            // Generate button + solve status. The status resolves the
+            // wired chain to its asset and reads job/cache state.
+            nr.generate = arena.alloc<bool>();
+            rows[slot].label = "generate";
+            rows[slot].kind = 4;
+            rows[slot].text = "generate";
+            rows[slot].changed = nr.generate;
+            ++slot;
+            std::string cs = "wire a media input";
+            if (vn.audio_src) {
+                const doc::AudioChain ch = doc::resolve_audio_chain(
+                    app.document, d, vn.audio_src);
+                if (!ch.asset) {
+                    cs = "no media on the wire";
+                } else if (app.track_job && !app.track_job->done &&
+                           app.track_job->asset == ch.asset) {
+                    const uint32_t total =
+                        std::max(1u, app.track_job->frames_total.load());
+                    const uint32_t done =
+                        app.track_job->frames_done.load();
+                    // Decode/KLT reports percent; the 3D pass runs
+                    // after the last frame lands.
+                    cs = done >= total
+                             ? "solving 3d"
+                             : "solving " +
+                                   std::to_string(done * 100u / total) +
+                                   "%";
+                } else if (auto it = app.track_cache.find(ch.asset);
+                           it != app.track_cache.end() && it->second) {
+                    uint32_t solved3d = 0;
+                    for (const media::SfmSegment& sg : it->second->sfm)
+                        if (sg.status == media::kSfmSolved) ++solved3d;
+                    char sbuf[96];
+                    std::snprintf(
+                        sbuf, sizeof(sbuf),
+                        "solved: %u f, err %.4f, 3d %u/%zu",
+                        it->second->end - it->second->start,
+                        it->second->mean_error, solved3d,
+                        it->second->sfm.size());
+                    cs = sbuf;
+                } else {
+                    cs = "untracked";
+                }
+            }
+            rows[slot].label = "status";
+            rows[slot].kind = 5;
+            rows[slot].text = arena.dup(cs.c_str(), cs.size());
+            ++slot;
+        }
         if (has_rate)
             slider_row(0, is_pulse ? "decay" : "rate", 0.05f, 8.0f,
                        is_pulse ? vn.source.decay : vn.source.rate_hz,
@@ -9642,10 +10892,12 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             app.look().value_nodes[ni].node_x = rn.x;
             app.look().value_nodes[ni].node_y = rn.y;
         }
-        // Audio-driven kinds REQUIRE a media input: the card grows an
-        // In pin, and the wired connection draws as a plain media wire.
+        // Media-driven kinds REQUIRE their input: the card grows an
+        // In pin, and the wired connection draws as a plain media wire
+        // (audio family reads processed-audio curves, the camera node
+        // reads the wired media's motion solve).
         const bool analysis_kind =
-            doc::value_kind_wants_audio(vn.source.type);
+            doc::value_kind_wants_media(vn.source.type);
         rn.has_in = analysis_kind;
         aux_x += kAutoPitch;
         nodes.push_back(rn);
@@ -10944,13 +12196,13 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             layer_slider(LF::Angle, "feather", 0.0f, 3.1416f,
                          layer.gen_angle, "%.2f");
             static const char* kShapeKinds[] = {"circle", "box",
-                                                "diamond"};
+                                                "diamond", "custom"};
             lrow.osc_shape_selected = arena.alloc<int>();
             *lrow.osc_shape_selected = -1;
             layer_rows_ui.push_back(value_row(
                 arena, "shape",
-                Dropdown(arena, kShapeKinds, 3,
-                         static_cast<int>(layer.osc_shape) % 3, &ls.osc_dd,
+                Dropdown(arena, kShapeKinds, 4,
+                         static_cast<int>(layer.osc_shape) % 4, &ls.osc_dd,
                          lrow.osc_shape_selected, SizeSpec::fill(),
                          "matte geometry")));
         }
@@ -11649,7 +12901,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                          "motion", "bright", "lfo.bpm",
                                          "env",    "cut",    "beat",
                                          "sample", "region", "math",
-                                         "norm"};
+                                         "norm",   "camera"};
     static_assert(sizeof(kSourceNames) / sizeof(kSourceNames[0]) ==
                       static_cast<size_t>(doc::ModSourceType::Count),
                   "route-panel source names track the enum");
@@ -12802,7 +14054,7 @@ struct ScriptHost {
     int failures = 0;
     int open_groups = 0;   // undo groups the script opened and owes
 
-    enum class Wait { None, Frames, Idle, Export, Import, Capture };
+    enum class Wait { None, Frames, Idle, Export, Import, Capture, Track };
     Wait wait = Wait::None;
     int wait_frames = 0;
     uint64_t wait_seq0 = 0;
@@ -13084,6 +14336,11 @@ struct ScriptHost {
                     break;
                 case Wait::Import:
                     ready = app->import == nullptr;
+                    break;
+                case Wait::Track:
+                    // The main loop adopts + resets the finished job;
+                    // "no job" is the settled state either way.
+                    ready = app->track_job == nullptr;
                     break;
                 case Wait::Capture: {
                     std::vector<uint8_t> rgba;
@@ -13509,7 +14766,8 @@ void register_ops_app(ScriptHost& sh) {
                         app.pcm_cache, scope_pcm, app.document,
                         app.scope_look,
                         app.has_analysis ? &app.analysis : nullptr,
-                        app.node_audio_map, out);
+                        app.node_audio_map, app.node_camera_map,
+                        app.pin_plane_map, out);
                 } else {
                     AppState::QueuedExport q;
                     q.out_path = out;
@@ -13518,6 +14776,8 @@ void register_ops_app(ScriptHost& sh) {
                     q.has_analysis = app.has_analysis;
                     if (app.has_analysis) q.analysis = app.analysis;
                     q.node_audio = app.node_audio_map;
+                    q.node_camera = app.node_camera_map;
+                    q.pin_planes = app.pin_plane_map;
                     q.bundles = build_bundle_table(app.document, false);
                     q.pcm = app.pcm_cache;
                     q.scope_pcm = scope_pcm;
@@ -13579,6 +14839,13 @@ void register_ops_app(ScriptHost& sh) {
             [&sh](Vm&, std::vector<Value>& a) {
                 sh.app->loop = a[0].truthy();
                 sh.app->player.set_looping(sh.app->loop);
+                return Value::nil();
+            });
+    // Session-only: the per-frame gain apply picks it up; never written
+    // to ui prefs, so a scripted mute cannot change the user's setting.
+    env.add("set_mute", "set_mute(on) - monitor audio, this session", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                sh.app->audio_muted = a[0].truthy();
                 return Value::nil();
             });
     env.add("set_live", "set_live(on) - live mode (non-deterministic)", 1,
@@ -14384,6 +15651,19 @@ void register_ops_graph(ScriptHost& sh) {
                 map_num(m, "angle", l->gen_angle);
                 map_num(m, "phase", l->gen_phase);
                 map_num(m, "waveform", l->osc_shape);
+                if (!l->path.empty()) {
+                    Value pts = Value::make_list();
+                    for (const doc::PathPoint& p : l->path) {
+                        Value pt = Value::make_list();
+                        const float f[6] = {p.ax, p.ay, p.in_dx, p.in_dy,
+                                            p.out_dx, p.out_dy};
+                        for (float c : f)
+                            pt.list->push_back(Value::number(c));
+                        pts.list->push_back(pt);
+                    }
+                    map_put(m, "path", pts);
+                    map_bool(m, "path_closed", l->path_closed);
+                }
                 map_str(m, "blend", blend_name(l->blend));
                 map_num(m, "opacity", l->opacity);
                 map_bool(m, "visible", l->visible);
@@ -14452,6 +15732,29 @@ void register_ops_graph(ScriptHost& sh) {
                 if (map_get_num(m, "waveform", &n))
                     up.osc_shape = static_cast<uint32_t>(
                         std::max(0.0, n));
+                if (const auto pit = m.map->find("path");
+                    pit != m.map->end() &&
+                    pit->second.kind == Value::Kind::List) {
+                    up.path.clear();
+                    for (const Value& ptv : *pit->second.list) {
+                        if (ptv.kind != Value::Kind::List) continue;
+                        const auto& c = *ptv.list;
+                        doc::PathPoint p;
+                        auto fnum = [&](size_t i, float* out) {
+                            if (i < c.size() && c[i].is_num())
+                                *out = static_cast<float>(c[i].num);
+                        };
+                        fnum(0, &p.ax);
+                        fnum(1, &p.ay);
+                        fnum(2, &p.in_dx);
+                        fnum(3, &p.in_dy);
+                        fnum(4, &p.out_dx);
+                        fnum(5, &p.out_dy);
+                        up.path.push_back(p);
+                    }
+                }
+                if (map_get_bool(m, "path_closed", &b))
+                    up.path_closed = b;
                 if (map_get_str(m, "blend", &s)) {
                     const int bi = blend_by_name(s);
                     if (bi < 0)
@@ -14631,16 +15934,48 @@ void register_ops_graph(ScriptHost& sh) {
                 app.undo.end_group();
                 return Value::number(static_cast<double>(fx_id));
             });
-    env.add("remove_effect", "remove_effect(look, fx)", 2, 2,
-            [&sh](Vm& vm, std::vector<Value>& a) {
+    env.add("remove_effect",
+            "remove_effect(look, fx) - splices the chain back around it",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
                 doc::Look* lk = arg_look(sh, vm, a[0]);
                 if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
                 if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
                     return op_err(vm, "no such effect");
-                sh.app->undo.execute(
-                    sh.app->document,
+                const uint64_t id = a[1].as_id();
+                AppState& app = *sh.app;
+                // Splice-out: the inverse of add_effect's splice-in.
+                // Every wire touching the node goes; the port-0 feeder
+                // reconnects to each downstream consumer.
+                std::vector<doc::NodeLink> touching;
+                for (const doc::NodeLink& l : lk->links)
+                    if (l.from == id || l.to == id) touching.push_back(l);
+                doc::NodeLink feed{};
+                bool has_feed = false;
+                std::vector<doc::NodeLink> outs;
+                for (const doc::NodeLink& l : touching) {
+                    if (l.to == id && l.to_port == 0) {
+                        feed = l;
+                        has_feed = true;
+                    }
+                    if (l.from == id) outs.push_back(l);
+                }
+                app.undo.begin_group("Remove Effect");
+                for (const doc::NodeLink& l : touching)
+                    app.undo.execute(app.document,
+                                     doc::disconnect_command(lk->id, l));
+                app.undo.execute(
+                    app.document,
                     doc::remove_effect_command(lk->id, li, fi));
+                if (has_feed)
+                    for (const doc::NodeLink& o : outs)
+                        if (!doc::link_would_cycle(*lk, feed.from, o.to))
+                            app.undo.execute(
+                                app.document,
+                                doc::connect_command(
+                                    lk->id,
+                                    {feed.from, o.to, o.to_port}));
+                app.undo.end_group();
                 return Value::boolean(true);
             });
     env.add("move_effect", "move_effect(look, fx, to_index)", 3, 3,
@@ -14967,6 +16302,42 @@ void register_ops_graph(ScriptHost& sh) {
                     }
                 return op_err(vm, "no such group");
             });
+    env.add("expose_param",
+            "expose_param(look, group, fx, param, on?) - member param "
+            "on/off the group face",
+            4, 5, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                for (size_t li = 0; li < lk->layers.size(); ++li) {
+                    doc::Group* g =
+                        doc::find_group(lk->layers[li], a[1].as_id());
+                    if (!g) continue;
+                    size_t eli = 0, fi = 0;
+                    if (!find_effect_by_id(*lk, a[2].as_id(), &eli, &fi) ||
+                        eli != li)
+                        return op_err(vm, "no such effect in the layer");
+                    const doc::EffectInstance& fx =
+                        lk->layers[li].stack[fi];
+                    if (fx.group_id != g->id)
+                        return op_err(vm, "effect is not a group member");
+                    const int pi = param_index_of(fx, a[3]);
+                    if (pi == INT_MIN)
+                        return op_err(vm,
+                                      "no param " +
+                                          script::to_display(a[3]));
+                    if (pi < 0)
+                        return op_err(
+                            vm, "wet/opacity cannot go on the face");
+                    const bool on = a.size() < 5 || a[4].truthy();
+                    sh.app->undo.execute(
+                        sh.app->document,
+                        doc::set_group_exposed_command(
+                            lk->id, li, g->id,
+                            {a[2].as_id(), pi}, on));
+                    return Value::boolean(true);
+                }
+                return op_err(vm, "no such group");
+            });
 
     env.add("presets", "presets() -> browser preset names", 0, 0,
             [&sh](Vm&, std::vector<Value>&) {
@@ -15033,9 +16404,9 @@ void register_ops_graph(ScriptHost& sh) {
                 return Value::number(static_cast<double>(gid));
             });
     env.add("save_preset_file",
-            "save_preset_file(look, group, path) - capture to a preset "
-            "json",
-            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+            "save_preset_file(look, group, path, tag?) - capture to a "
+            "preset json",
+            3, 4, [&sh](Vm& vm, std::vector<Value>& a) {
                 doc::Look* lk = arg_look(sh, vm, a[0]);
                 if (!lk) return Value::nil();
                 if (!a[2].is_str())
@@ -15047,7 +16418,12 @@ void register_ops_graph(ScriptHost& sh) {
                         std::filesystem::path out(a[2].as_str());
                         if (out.extension() != ".json")
                             out.replace_extension(".json");
-                        p.name = out.stem().string();
+                        // The group's name is the display name; the stem
+                        // only fills in for unnamed groups.
+                        if (p.name.empty() || p.name == "preset")
+                            p.name = out.stem().string();
+                        if (a.size() > 3 && a[3].is_str())
+                            p.tags.push_back(a[3].as_str());
                         if (p.tags.empty()) p.tags.push_back("user");
                         std::error_code ec;
                         std::filesystem::create_directories(
@@ -15067,7 +16443,7 @@ const char* kModKindNames[] = {
     "lfo",    "drift",  "audio_low", "audio_mid", "audio_high",
     "onset",  "motion", "brightness", "lfo_beat", "envelope",
     "cut",    "beat",   "sample",    "region",    "math",
-    "normalise"};
+    "normalise", "camera"};
 
 // A ParamKey from (target_id, param name): effects use ParamDesc ids +
 // wet/opacity, layers use the param-table slot ids under kLayerParamBit.
@@ -15117,6 +16493,198 @@ void register_ops_mod(ScriptHost& sh) {
                 for (const char* n : kModKindNames)
                     out.list->push_back(Value::string(n));
                 return out;
+            });
+    env.add("generate_track",
+            "generate_track(look, node, start?, end?) - solve the camera "
+            "node's wired media (cache makes a repeat a no-op)",
+            2, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const doc::ValueNode* n =
+                    doc::find_value_node(*lk, a[1].as_id());
+                if (!n) return op_err(vm, "no such value node");
+                if (n->source.type != doc::ModSourceType::Camera)
+                    return op_err(vm, "not a camera node");
+                if (!n->audio_src)
+                    return op_err(vm, "camera node has no media wired");
+                const doc::AudioChain ch = doc::resolve_audio_chain(
+                    sh.app->document, *lk, n->audio_src);
+                if (!ch.asset)
+                    return op_err(vm, "the wire reaches no media");
+                const uint32_t rs =
+                    a.size() > 2 && a[2].is_num()
+                        ? static_cast<uint32_t>(std::max(0.0, a[2].num))
+                        : 0u;
+                const uint32_t re =
+                    a.size() > 3 && a[3].is_num()
+                        ? static_cast<uint32_t>(std::max(0.0, a[3].num))
+                        : 0u;
+                start_track_job(*sh.app, ch.asset, rs, re);
+                return Value::boolean(true);
+            });
+    env.add("wait_track", "wait_track(timeout_s?) - until the solve lands",
+            0, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                const double t = !a.empty() && a[0].is_num()
+                                     ? std::max(1.0, a[0].num)
+                                     : 120.0;
+                sh.wait = ScriptHost::Wait::Track;
+                sh.wait_deadline = sh.app->app_seconds + t;
+                vm.mark_suspend();
+                return Value::nil();
+            });
+    env.add("track_info",
+            "track_info(look, node) -> {status, frames, error, start, "
+            "end}",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const doc::ValueNode* n =
+                    doc::find_value_node(*lk, a[1].as_id());
+                if (!n) return op_err(vm, "no such value node");
+                Value m = Value::make_map();
+                std::string status = "unwired";
+                if (n->audio_src) {
+                    const doc::AudioChain ch = doc::resolve_audio_chain(
+                        sh.app->document, *lk, n->audio_src);
+                    if (!ch.asset) {
+                        status = "no media";
+                    } else if (sh.app->track_job &&
+                               !sh.app->track_job->done &&
+                               sh.app->track_job->asset == ch.asset) {
+                        status = "solving";
+                    } else if (auto it =
+                                   sh.app->track_cache.find(ch.asset);
+                               it != sh.app->track_cache.end() &&
+                               it->second) {
+                        status = "solved";
+                        map_num(m, "start", it->second->start);
+                        map_num(m, "end", it->second->end);
+                        map_num(m, "frames",
+                                it->second->end - it->second->start);
+                        map_num(m, "error", it->second->mean_error);
+                        map_num(m, "cuts", it->second->cuts.size());
+                        map_num(m, "segments", it->second->sfm.size());
+                        uint32_t solved3d = 0;
+                        Value segs = Value::make_list();
+                        for (const media::SfmSegment& sg :
+                             it->second->sfm) {
+                            if (sg.status == media::kSfmSolved)
+                                ++solved3d;
+                            const char* nm =
+                                sg.status == media::kSfmSolved
+                                    ? "solved"
+                                : sg.status == media::kSfmLowParallax
+                                    ? "low-parallax"
+                                : sg.status == media::kSfmTooShort
+                                    ? "too-short"
+                                    : "unsolved";
+                            segs.list->push_back(Value::string(nm));
+                        }
+                        map_num(m, "solved3d", solved3d);
+                        map_put(m, "sfm", std::move(segs));
+                        map_num(m, "anchor", n->source.anchor);
+                    } else {
+                        status = "untracked";
+                    }
+                }
+                map_str(m, "status", status);
+                return m;
+            });
+    env.add("anchor_pick",
+            "anchor_pick(look, node, x, y) - lock the camera node's "
+            "anchor to the solved 3D point nearest uv(x, y) at the "
+            "playhead; returns its track id (0 = none in range)",
+            4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                const doc::ValueNode* n =
+                    doc::find_value_node(*lk, a[1].as_id());
+                if (!n) return op_err(vm, "no such value node");
+                if (n->source.type != doc::ModSourceType::Camera)
+                    return op_err(vm, "not a camera node");
+                if (!n->audio_src)
+                    return op_err(vm, "camera node has no media wired");
+                AppState& app = *sh.app;
+                const doc::AudioChain ch = doc::resolve_audio_chain(
+                    app.document, *lk, n->audio_src);
+                if (!ch.asset)
+                    return op_err(vm, "the wire reaches no media");
+                const auto it = app.track_cache.find(ch.asset);
+                if (it == app.track_cache.end() || !it->second)
+                    return op_err(vm, "no motion solve (generate first)");
+                const media::TrackData& td = *it->second;
+                const uint32_t frame =
+                    app.has_timeline()
+                        ? app.player.current_frame_index()
+                        : 0u;
+                const int64_t pos = static_cast<int64_t>(frame) +
+                                    static_cast<int64_t>(ch.slip) +
+                                    ch.offset;
+                const uint32_t mf =
+                    pos < 0 ? 0u : static_cast<uint32_t>(pos);
+                const float qx = static_cast<float>(
+                    a[2].is_num() ? a[2].num : 0.5);
+                const float qy = static_cast<float>(
+                    a[3].is_num() ? a[3].num : 0.5);
+                uint32_t best = 0;
+                float best_d2 = 1.0e9f;
+                for (const media::SfmSegment& sg : td.sfm) {
+                    if (sg.status != media::kSfmSolved ||
+                        mf < sg.start || mf >= sg.end)
+                        continue;
+                    for (const media::SfmPoint& sp : sg.points) {
+                        float u, v;
+                        if (!sfm_point_uv(sg, sp, mf, td.aspect, &u,
+                                          &v))
+                            continue;
+                        const float dx = u - qx, dy = v - qy;
+                        const float d2 = dx * dx + dy * dy;
+                        if (d2 < best_d2) {
+                            best_d2 = d2;
+                            best = sp.track;
+                        }
+                    }
+                }
+                if (best) {
+                    doc::ValueNode n2 = *n;
+                    n2.source.anchor = best;
+                    app.undo.execute(app.document,
+                                     doc::set_value_node_command(
+                                         lk->id, std::move(n2)));
+                    // Same-tick reads (node_value right after) need the
+                    // env map rebuilt now, not next frame.
+                    refresh_node_camera(app);
+                }
+                return Value::number(static_cast<double>(best));
+            });
+    env.add("node_value",
+            "node_value(look, node) -> the value node's output at the "
+            "playhead",
+            2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Look* lk = arg_look(sh, vm, a[0]);
+                if (!lk) return Value::nil();
+                if (!doc::find_value_node(*lk, a[1].as_id()))
+                    return op_err(vm, "no such value node");
+                AppState& app = *sh.app;
+                const double fps = app.player.fps();
+                const uint32_t frame =
+                    app.has_timeline()
+                        ? app.player.current_frame_index()
+                        : 0u;
+                mod::ValueEnv env2;
+                env2.look = lk;
+                env2.t = fps > 0.0 ? frame / fps : 0.0;
+                env2.frame = frame;
+                env2.analysis =
+                    app.has_analysis ? &app.analysis : nullptr;
+                env2.fps = fps;
+                env2.audio_off =
+                    static_cast<double>(app.document.audio_offset_ms) *
+                    0.001;
+                env2.node_audio = app.node_audio_map.get();
+                env2.node_camera = app.node_camera_map.get();
+                return Value::number(
+                    mod::eval_value_node(env2, a[1].as_id()));
             });
     env.add("mods", "mods(look) -> value node ids", 1, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
@@ -15220,8 +16788,10 @@ void register_ops_mod(ScriptHost& sh) {
                 if (map_get_num(m, "ph", &v))
                     up.source.ph = static_cast<float>(v);
                 if (map_get_num(m, "channel", &v))
-                    up.source.channel = static_cast<uint32_t>(
-                        std::clamp(static_cast<int>(v), 0, 3));
+                    up.source.channel = static_cast<uint32_t>(std::clamp(
+                        static_cast<int>(v), 0,
+                        up.source.type == doc::ModSourceType::Camera ? 13
+                                                                     : 3));
                 if (map_get_num(m, "op", &v))
                     up.op = static_cast<doc::ValueOp>(std::clamp(
                         static_cast<int>(v), 0,
@@ -16586,6 +18156,33 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                         app.sequence().id,
                                         app.sel_placement));
                                 app.sel_placement = 0;
+                            } else if (app.scope_is_look() &&
+                                       app.sel.kind ==
+                                           SelKind::LayerSource &&
+                                       app.giz_path_sel >= 0) {
+                                // Path editor: Delete removes the
+                                // selected CONTROL POINT, never the
+                                // layer under it.
+                                doc::Layer* pl = doc::find_layer(
+                                    app.look(), app.sel.id);
+                                if (pl &&
+                                    pl->source ==
+                                        doc::LayerSourceKind::Shape &&
+                                    pl->osc_shape == 3u &&
+                                    app.giz_path_sel <
+                                        static_cast<int>(
+                                            pl->path.size())) {
+                                    doc::Layer up = *pl;
+                                    up.path.erase(
+                                        up.path.begin() +
+                                        app.giz_path_sel);
+                                    app.undo.execute(
+                                        app.document,
+                                        doc::set_layer_props_command(
+                                            app.scope_look,
+                                            std::move(up)));
+                                    app.giz_path_sel = -1;
+                                }
                             } else {
                                 do_delete_sel = true;
                             }
@@ -17099,7 +18696,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     renderer->device(), shader_dir, next.bundles, next.pcm,
                     next.scope_pcm, next.doc, next.look_id,
                     next.has_analysis ? &next.analysis : nullptr,
-                    next.node_audio, next.out_path);
+                    next.node_audio, next.node_camera, next.pin_planes,
+                    next.out_path);
             }
         }
 
@@ -18612,6 +20210,93 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.undo.break_coalescing();
                 did_break = true;
             }
+        }
+
+        // Look-scope gizmo drag: the pair staged at draw time lands as
+        // ONE gesture command (base writes + auto-keyed lanes), so a
+        // whole drag stays one undo step even when an axis is keyed.
+        if (app.giz_write_n > 0 && app.scope_is_look()) {
+            std::vector<doc::ParamWrite> base_writes;
+            std::vector<doc::KeyframeLane> lane_writes;
+            size_t glayer = 0, gfx = 0;
+            bool gvalid = true;
+            for (int i = 0; i < app.giz_write_n && gvalid; ++i) {
+                const AppState::GizmoWrite& w = app.giz_writes[i];
+                if (w.layer >= app.look().layers.size() ||
+                    w.fx >= app.look().layers[w.layer].stack.size()) {
+                    gvalid = false;
+                    break;
+                }
+                glayer = w.layer;
+                gfx = w.fx;
+                const doc::ParamKey pk{
+                    app.look().layers[w.layer].stack[w.fx].id, w.param};
+                const doc::KeyframeLane* keyed_lane = nullptr;
+                for (const doc::KeyframeLane& lane : app.look().lanes)
+                    if (lane.target == pk && !lane.keys.empty())
+                        keyed_lane = &lane;
+                if (keyed_lane) {
+                    const double ph = app.has_timeline()
+                        ? app.player.current_frame_index()
+                        : 0.0;
+                    std::vector<doc::Keyframe> keys2 = keyed_lane->keys;
+                    for (size_t k = 0; k < keys2.size(); ++k)
+                        if (std::fabs(keys2[k].frame - ph) < 0.5) {
+                            keys2.erase(keys2.begin() + k);
+                            break;
+                        }
+                    doc::Keyframe nk;
+                    nk.frame = ph;
+                    nk.value = w.value;
+                    keys2.push_back(nk);
+                    doc::KeyframeLane lw;
+                    lw.target = pk;
+                    lw.keys = std::move(keys2);
+                    lane_writes.push_back(std::move(lw));
+                } else {
+                    base_writes.push_back({w.param, w.value});
+                }
+            }
+            if (gvalid && (!base_writes.empty() || !lane_writes.empty()))
+                app.undo.execute(app.document,
+                                 doc::set_param_gesture_command(
+                                     app.scope_look, glayer, gfx,
+                                     std::move(base_writes),
+                                     std::move(lane_writes)),
+                                 /*coalesce=*/true);
+            app.giz_write_n = 0;
+        }
+        // Path editor edits: a whole-layer write staged at draw time.
+        // Drag frames coalesce per layer id; structural clicks (append,
+        // insert, close) land as their own steps.
+        if (app.giz_layer_staged && app.scope_is_look()) {
+            app.undo.execute(app.document,
+                             doc::set_layer_props_command(
+                                 app.scope_look,
+                                 std::move(app.giz_layer_write)),
+                             app.giz_layer_coalesce);
+            app.giz_layer_staged = false;
+        }
+        // Anchor pick from the camera overlay: whole-node replace,
+        // un-coalesced (a click, not a drag).
+        if (app.giz_anchor_staged && app.scope_is_look()) {
+            for (const doc::ValueNode& vn : app.look().value_nodes)
+                if (vn.id == app.giz_anchor_node) {
+                    doc::ValueNode n2 = vn;
+                    n2.source.anchor = app.giz_anchor_track;
+                    app.undo.execute(app.document,
+                                     doc::set_value_node_command(
+                                         app.scope_look, std::move(n2)));
+                    break;
+                }
+            app.giz_anchor_staged = false;
+        }
+        if (app.giz_released) {
+            if (!did_break) {
+                app.undo.break_coalescing();
+                did_break = true;
+            }
+            app.giz_released = false;
         }
 
         // Structural edits: at most one per frame keeps indices coherent.
@@ -21614,6 +23299,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 else if (n.source.type == MST::VideoSample ||
                          n.source.type == MST::VideoRegion)
                     n.source.channel = static_cast<uint32_t>(sel % 4);
+                else if (n.source.type == MST::Camera)
+                    n.source.channel = static_cast<uint32_t>(sel % 6);
                 else if (n.source.type == MST::Math)
                     n.op = static_cast<doc::ValueOp>(
                         sel % static_cast<int>(doc::ValueOp::Count));
@@ -21643,7 +23330,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                      : si == 2 ? n.in_max
                                : n.const_b) = val;
                 } else if (n.source.type == MST::VideoSample ||
-                           n.source.type == MST::VideoRegion) {
+                           n.source.type == MST::VideoRegion ||
+                           n.source.type == MST::Camera) {
                     (si == 0 ? n.source.px
                      : si == 1 ? n.source.py
                      : si == 2 ? n.source.pw
@@ -21661,6 +23349,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (slot_released && !did_break) {
                 app.undo.break_coalescing();
                 did_break = true;
+            }
+            if (row.generate && *row.generate) {
+                // Camera card: solve the wired media (or say why not).
+                const doc::ValueNode* gn =
+                    doc::find_value_node(app.look(), row.id);
+                if (gn && gn->audio_src) {
+                    const doc::AudioChain ch = doc::resolve_audio_chain(
+                        app.document, app.look(), gn->audio_src);
+                    if (ch.asset)
+                        start_track_job(app, ch.asset);
+                    else
+                        app.status = "wire a media input first";
+                } else {
+                    app.status = "wire a media input first";
+                }
             }
             if (row.remove && *row.remove) {
                 app.undo.execute(app.document,
@@ -22866,7 +24569,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.pcm_cache, scope_pcm, app.document,
                         app.scope_look,
                         app.has_analysis ? &app.analysis : nullptr,
-                        app.node_audio_map, *out);
+                        app.node_audio_map, app.node_camera_map,
+                        app.pin_plane_map, *out);
                 } else {
                     // Render queue: snapshot now, render later.
                     AppState::QueuedExport q;
@@ -22876,6 +24580,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     q.has_analysis = app.has_analysis;
                     if (app.has_analysis) q.analysis = app.analysis;
                     q.node_audio = app.node_audio_map;
+                    q.node_camera = app.node_camera_map;
+                    q.pin_planes = app.pin_plane_map;
                     q.bundles = build_bundle_table(app.document, false);
                     q.pcm = app.pcm_cache;
                     q.scope_pcm = scope_pcm;

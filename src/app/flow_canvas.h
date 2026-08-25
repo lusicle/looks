@@ -58,7 +58,9 @@ struct ParamRow {
     // a click emits Output::text_edit (the shared inline editor draws in
     // the field while active); 3 swatch — `staged` points at THREE
     // floats (rgb), `swatch` holds the picker state, a click opens the
-    // shared color popup. Same geometry as slider rows.
+    // shared color popup; 4 button — `text` is the label, a click sets
+    // *changed (probed by the label); 5 status label — `text` drawn
+    // dim, inert. Same geometry as slider rows.
     uint8_t kind = 0;
     const char* options = nullptr;
     const char* text = nullptr;

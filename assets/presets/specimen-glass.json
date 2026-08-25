@@ -1,0 +1,143 @@
+{
+  "looks_preset": 1,
+  "name": "specimen glass",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 133,
+    "name": "specimen glass",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 120,
+        "param": 0
+      },
+      {
+        "effect": 120,
+        "param": 1
+      },
+      {
+        "effect": 120,
+        "param": 2
+      },
+      {
+        "effect": 120,
+        "param": 3
+      },
+      {
+        "effect": 119,
+        "param": 1
+      },
+      {
+        "effect": 118,
+        "param": 1
+      },
+      {
+        "effect": 121,
+        "param": 0
+      }
+    ],
+    "face_in": 118,
+    "face_out": 122
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 118,
+      "params": [
+        0.0040000001899898052,
+        0.090000003576278687,
+        0.85000002384185791,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 133,
+      "node_x": 330,
+      "node_y": 40
+    },
+    {
+      "type": "colorizer",
+      "id": 119,
+      "params": [
+        0.98000001907348633,
+        0.98000001907348633,
+        0.039999999105930328,
+        0.85000002384185791
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 133,
+      "node_x": 600,
+      "node_y": 40
+    },
+    {
+      "type": "glass",
+      "id": 120,
+      "params": [
+        0,
+        90,
+        240,
+        0.60000002384185791,
+        0.30000001192092896,
+        0.30000001192092896,
+        0.5,
+        0.5,
+        0.10000000149011612
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 133,
+      "node_x": 870,
+      "node_y": 40
+    },
+    {
+      "type": "glow",
+      "id": 121,
+      "params": [
+        1.7000000476837158,
+        20,
+        0.5,
+        1,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 133,
+      "node_x": 1140,
+      "node_y": 40
+    },
+    {
+      "type": "vignette",
+      "id": 122,
+      "params": [
+        0.55000001192092896,
+        0.60000002384185791,
+        0.40000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 133,
+      "node_x": 1410,
+      "node_y": 40
+    }
+  ]
+}

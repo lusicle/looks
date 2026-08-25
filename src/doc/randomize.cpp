@@ -17,7 +17,7 @@ bool param_randomizable(const ParamDesc& desc) {
     static const char* const kFrozenExact[] = {
         "op",     "channels", "counter", "pattern", "flip",
         "r_from", "g_from",   "b_from",  "font",    "drop_i",
-        "output", "offset",   "target"};
+        "output", "offset",   "target",  "type"};
     for (const char* f : kFrozenExact)
         if (std::strcmp(desc.id, f) == 0) return false;
     return true;

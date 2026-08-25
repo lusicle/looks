@@ -23,6 +23,19 @@ inline constexpr int kOpacityParam = -2;
 std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
                                            size_t effect_index,
                                            int param_index, float new_value);
+// One monitor-gizmo gesture's writes to a single effect: base params and
+// auto-keyed lane replacements land together, so an x/y pair whose axes
+// are independently keyed still coalesces into one undo step. Lane
+// entries replace keys only (loop/mute survive). Merges while the look,
+// effect address and the write shape all match.
+struct ParamWrite {
+    int param_index;
+    float value;
+};
+std::unique_ptr<Command> set_param_gesture_command(
+    uint64_t look, size_t layer_index, size_t effect_index,
+    std::vector<ParamWrite> base_writes,
+    std::vector<KeyframeLane> lane_writes);
 std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
                                             size_t effect_index, bool bypass);
 // The effect's own blend mode (the canonical composition's blend()).

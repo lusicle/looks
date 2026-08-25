@@ -174,6 +174,61 @@ TEST(serialize_placement_transform_roundtrip) {
     CHECK_EQ(q->opacity, 0.7f);
 }
 
+TEST(serialize_shape_path_roundtrip) {
+    Document d;
+    doc::Layer& l = d.looks[0].layers[0];
+    l.source = doc::LayerSourceKind::Shape;
+    l.osc_shape = 3;
+    doc::PathPoint p0, p1, p2;
+    p0.ax = 0.5f;
+    p0.ay = 0.2f;
+    p0.out_dx = 0.1f;
+    p0.out_dy = 0.05f;
+    p1.ax = 0.8f;
+    p1.ay = 0.8f;
+    p1.in_dx = -0.03f;
+    p2.ax = 0.2f;
+    p2.ay = 0.8f;
+    l.path = {p0, p1, p2};
+    l.path_closed = false;
+    json::Value a = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(a);
+    CHECK(doc::doc_to_json(d2) == a);   // byte-stable
+    const doc::Layer& l2 = d2.looks[0].layers[0];
+    CHECK_EQ(l2.path.size(), size_t{3});
+    CHECK_EQ(l2.path[0].ax, 0.5f);
+    CHECK_EQ(l2.path[0].out_dx, 0.1f);
+    CHECK_EQ(l2.path[0].out_dy, 0.05f);
+    CHECK_EQ(l2.path[1].in_dx, -0.03f);
+    CHECK_EQ(l2.path[2].ay, 0.8f);
+    CHECK(!l2.path_closed);
+    // Pathless layers stay pathless (and closed by default) on reload.
+    Document d3;
+    Document d4 = doc::doc_from_json(doc::doc_to_json(d3));
+    CHECK(d4.looks[0].layers[0].path.empty());
+    CHECK(d4.looks[0].layers[0].path_closed);
+}
+
+TEST(serialize_camera_node_roundtrip) {
+    Document d;
+    doc::ValueNode n;
+    n.id = d.next_route_id++;
+    n.source.type = doc::ModSourceType::Camera;
+    n.source.channel = 2;   // stab rot
+    n.source.anchor = 417u; // locked 3D feature-track id
+    n.audio_src = d.looks[0].layers[0].id;
+    d.looks[0].value_nodes.push_back(n);
+    json::Value a = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(a);
+    CHECK(doc::doc_to_json(d2) == a);
+    const doc::ValueNode* n2 = doc::find_value_node(d2.looks[0], n.id);
+    CHECK(n2 != nullptr);
+    CHECK(n2->source.type == doc::ModSourceType::Camera);
+    CHECK_EQ(n2->source.channel, 2u);
+    CHECK_EQ(n2->source.anchor, 417u);
+    CHECK_EQ(n2->audio_src, d.looks[0].layers[0].id);
+}
+
 TEST(serialize_bins_roundtrip_and_heal) {
     Document d;
     doc::Bin media = doc::make_bin(d, "media");
@@ -638,14 +693,13 @@ TEST(morph_interpolates_snapshots) {
 }
 
 TEST(era_presets_ship_valid) {
-    // The shipped presets in assets/presets (the five era looks
-    // plus the wave-2 style set) must load, carry effects, and have every
-    // exposed face param resolve to a member effect (the group
-    // face is exposed params — direct aliases, no macro offsets).
+    // Every shipped preset in assets/presets must load, carry effects,
+    // and have every exposed face param resolve to a member effect (the
+    // group face is exposed params - direct aliases, no macro offsets).
     const std::filesystem::path dir =
         std::filesystem::path(LOOKS_REPO_ROOT) / "assets" / "presets";
     std::vector<doc::Preset> presets = doc::scan_presets(dir);
-    CHECK_EQ(presets.size(), size_t{15});
+    CHECK_EQ(presets.size(), size_t{24});
     for (const doc::Preset& p : presets) {
         CHECK(!p.effects.empty());
         CHECK(!p.tags.empty());

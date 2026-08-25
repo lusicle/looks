@@ -1,0 +1,115 @@
+{
+  "looks_preset": 1,
+  "name": "starmap",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 173,
+    "name": "starmap",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 145,
+        "param": 1
+      },
+      {
+        "effect": 146,
+        "param": 0
+      },
+      {
+        "effect": 147,
+        "param": 0
+      },
+      {
+        "effect": 148,
+        "param": 1
+      }
+    ],
+    "face_in": 145,
+    "face_out": 149
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 145,
+      "params": [
+        0.05000000074505806,
+        0.34999999403953552,
+        1.3500000238418579,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 173
+    },
+    {
+      "type": "white_balance",
+      "id": 146,
+      "params": [
+        -0.55000001192092896,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 173
+    },
+    {
+      "type": "glow",
+      "id": 147,
+      "params": [
+        2.2000000476837158,
+        30,
+        0.25,
+        2,
+        0.15000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 173
+    },
+    {
+      "type": "crt_sim",
+      "id": 148,
+      "params": [
+        0.05000000074505806,
+        0.34999999403953552,
+        0.18000000715255737,
+        3,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 173
+    },
+    {
+      "type": "fringe",
+      "id": 149,
+      "params": [
+        2.5,
+        0,
+        0.69999998807907104
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 173
+    }
+  ]
+}

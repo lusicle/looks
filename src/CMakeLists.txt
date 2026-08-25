@@ -6,6 +6,7 @@ add_library(looks_util STATIC
     util/log.cpp
     util/file.cpp
     util/inflate.cpp
+    util/numerics.cpp
     util/image.cpp)
 target_include_directories(looks_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # Pixel/byte loops (image decode, inflate, the doc-hash JSON writer) are
@@ -96,6 +97,7 @@ add_library(looks_media STATIC
     media/player.cpp
     media/audio_mix.cpp
     media/decode_pool.cpp
+    media/track.cpp
     media/miniaudio_impl.cpp)
 target_include_directories(looks_media PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(looks_media SYSTEM PUBLIC
@@ -125,6 +127,7 @@ add_library(looks_gfx STATIC
     gfx/render_cache.cpp
     gfx/engine.cpp
     gfx/error_diffusion.cpp
+    gfx/shape_sdf.cpp
     gfx/viewport_pass.cpp
     gfx/readback.cpp
     gfx/vma_impl.cpp)

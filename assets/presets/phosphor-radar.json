@@ -1,0 +1,128 @@
+{
+  "looks_preset": 1,
+  "name": "phosphor radar",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 126,
+    "name": "phosphor radar",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 100,
+        "param": 1
+      },
+      {
+        "effect": 101,
+        "param": 0
+      },
+      {
+        "effect": 102,
+        "param": 1
+      },
+      {
+        "effect": 103,
+        "param": 0
+      }
+    ],
+    "face_in": 100,
+    "face_out": 123
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 100,
+      "params": [
+        0.10000000149011612,
+        0.85000002384185791,
+        1.2000000476837158,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 126,
+      "node_x": 330,
+      "node_y": 40
+    },
+    {
+      "type": "glyph",
+      "id": 101,
+      "params": [
+        8,
+        3,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 126,
+      "node_x": 600,
+      "node_y": 40
+    },
+    {
+      "type": "colorizer",
+      "id": 102,
+      "params": [
+        0.37999999523162842,
+        0.33000001311302185,
+        0.30000001192092896,
+        0.89999997615814209
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 126,
+      "node_x": 870,
+      "node_y": 40
+    },
+    {
+      "type": "glow",
+      "id": 103,
+      "params": [
+        1.6000000238418579,
+        24,
+        0.34999999403953552,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 126,
+      "node_x": 1140,
+      "node_y": 40
+    },
+    {
+      "type": "levels",
+      "id": 123,
+      "params": [
+        0.11999999731779099,
+        1,
+        1,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 126,
+      "node_x": 1410,
+      "node_y": 40
+    }
+  ]
+}

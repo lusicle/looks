@@ -23,6 +23,10 @@ add_executable(looks_tests
     test_refdump.cpp
     test_truetype.cpp
     test_error_diffusion.cpp
+    test_shape_sdf.cpp
+    test_track.cpp
+    test_numerics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/shape_sdf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/render_cache.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gfx/error_diffusion.cpp)

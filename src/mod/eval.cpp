@@ -302,6 +302,35 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
             if (std::fabs(span) < 1e-6f) return 0.0f;
             return std::clamp((a - n->in_min * m) / span, 0.0f, 1.0f);
         }
+        case doc::ModSourceType::Camera: {
+            // Same wired-media contract as the audio family: the solve
+            // is media-frame indexed, slip + Offset shims map the look
+            // clock in, unwired or unsolved reads 0. channel picks
+            // stab x / y / rot / scale, the 3D anchor projection, or a
+            // plane corner.
+            if (!n->audio_src || !env.node_camera) return 0.0f;
+            const auto it = env.node_camera->find(n->id);
+            if (it == env.node_camera->end() || !it->second.curves)
+                return 0.0f;
+            const CameraCurves& c = *it->second.curves;
+            const int64_t pos = static_cast<int64_t>(env.frame) +
+                                static_cast<int64_t>(it->second.slip) +
+                                it->second.offset;
+            const uint32_t mf =
+                pos < 0 ? 0u : static_cast<uint32_t>(pos);
+            switch (n->source.channel % 14u) {
+                case 0: return c.sample(c.tx, mf);
+                case 1: return c.sample(c.ty, mf);
+                case 2: return c.sample(c.rot, mf);
+                case 3: return c.sample(c.scale, mf);
+                case 4: return c.sample(c.anchor_x, mf);
+                case 5: return c.sample(c.anchor_y, mf);
+                default:
+                    // 6..13: plane corner projections (region solve).
+                    return c.sample(c.corner[(n->source.channel - 6u) % 8u],
+                                    mf);
+            }
+        }
         case doc::ModSourceType::AudioLow:
         case doc::ModSourceType::AudioMid:
         case doc::ModSourceType::AudioHigh:
@@ -408,7 +437,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                   const AnalysisCurves* analysis, double audio_off,
                   double live_seconds, double key_time,
                   const SourceFrameView* video,
-                  const NodeAudioMap* node_audio) {
+                  const NodeAudioMap* node_audio,
+                  const NodeCameraMap* node_camera) {
     const uint32_t frame_index = local_frame;
     const double t = live_seconds >= 0.0
                          ? live_seconds
@@ -417,7 +447,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
     // themselves mod targets, so the copy-in-progress never feeds back.
     const ValueEnv env{&look, t,         frame_index, analysis,
                        fps,   audio_off, key_time,    video,
-                       node_audio};
+                       node_audio, node_camera};
 
     auto param_slot = [](doc::EffectInstance& fx, int param_index) -> float* {
         if (param_index == doc::kWetParam) return &fx.wet;
@@ -536,7 +566,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
                       double live_seconds, double key_time,
                       const SourceFrameView* video,
-                      const NodeAudioMap* node_audio) {
+                      const NodeAudioMap* node_audio,
+                      const NodeCameraMap* node_camera) {
     doc::Document out = doc;
     const double audio_off =
         static_cast<double>(doc.audio_offset_ms) * 0.001;
@@ -546,7 +577,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     // above takes the frame explicitly.
     for (size_t i = 0; i < out.looks.size(); ++i)
         resolve_look(doc.looks[i], out.looks[i], frame_index, fps, analysis,
-                     audio_off, live_seconds, key_time, video, node_audio);
+                     audio_off, live_seconds, key_time, video, node_audio,
+                     node_camera);
     return out;
 }
 

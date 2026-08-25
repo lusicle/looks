@@ -1,0 +1,134 @@
+{
+  "looks_preset": 1,
+  "name": "intrusion",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 129,
+    "name": "intrusion",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 125,
+        "param": 1
+      },
+      {
+        "effect": 114,
+        "param": 0
+      },
+      {
+        "effect": 115,
+        "param": 0
+      },
+      {
+        "effect": 116,
+        "param": 0
+      }
+    ],
+    "face_in": 125,
+    "face_out": 117
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 125,
+      "params": [
+        0.0099999997764825821,
+        0.34999999403953552,
+        1.1000000238418579,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 129,
+      "node_x": 1410,
+      "node_y": 40
+    },
+    {
+      "type": "pixel_sort",
+      "id": 114,
+      "params": [
+        0.30000001192092896,
+        0.40000000596046448,
+        120,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 129,
+      "node_x": 330,
+      "node_y": 40
+    },
+    {
+      "type": "quantize",
+      "id": 115,
+      "params": [
+        4,
+        0,
+        15,
+        0.94999998807907104,
+        8,
+        0,
+        0,
+        1,
+        0,
+        0,
+        3,
+        0.079999998211860657,
+        0.55000001192092896
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 129,
+      "node_x": 600,
+      "node_y": 40
+    },
+    {
+      "type": "anaglyph",
+      "id": 116,
+      "params": [
+        12,
+        0.5,
+        2
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 129,
+      "node_x": 870,
+      "node_y": 40
+    },
+    {
+      "type": "buffer_glitch",
+      "id": 117,
+      "params": [
+        2,
+        0.30000001192092896,
+        0.20000000298023224,
+        4
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 129,
+      "node_x": 1140,
+      "node_y": 40
+    }
+  ]
+}

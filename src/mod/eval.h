@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -53,6 +54,36 @@ struct NodeAudio {
     int64_t offset = 0;
 };
 using NodeAudioMap = std::unordered_map<uint64_t, NodeAudio>;
+
+// Camera-node solve channels, media-frame indexed from `start` (the
+// tracked range's first frame; frames outside clamp). The app converts
+// the asset's .track sidecar into this view; same slip/offset contract
+// as NodeAudio. tx/ty are uv fractions, rot radians, scale a ratio -
+// the RAW camera path (invert to stabilize).
+struct CameraCurves {
+    uint32_t start = 0;
+    std::vector<float> tx, ty, rot, scale;
+    // Plane-corner projections (uv) when the node carries a region:
+    // the region quad pushed through the per-frame plane homography.
+    std::vector<float> corner[8];   // tlx tly trx try blx bly brx bry
+    // The locked 3D anchor's uv projection through the per-frame solved
+    // cameras (node.anchor set + shot solved); frames outside the
+    // anchor's shot hold the nearest in-shot value. Empty = no anchor.
+    std::vector<float> anchor_x, anchor_y;
+    float sample(const std::vector<float>& c, uint32_t media_frame) const {
+        if (c.empty()) return 0.0f;
+        const size_t i = media_frame <= start
+            ? 0
+            : std::min<size_t>(media_frame - start, c.size() - 1);
+        return c[i];
+    }
+};
+struct NodeCamera {
+    std::shared_ptr<const CameraCurves> curves;
+    uint32_t slip = 0;
+    int64_t offset = 0;
+};
+using NodeCameraMap = std::unordered_map<uint64_t, NodeCamera>;
 
 // CPU view of the decoded source frame (I420) for the video-sampling
 // sources (sample-at-point / region-average).
@@ -100,6 +131,7 @@ struct ValueEnv {
     double key_time = -1.0;
     const SourceFrameView* video = nullptr;
     const NodeAudioMap* node_audio = nullptr;
+    const NodeCameraMap* node_camera = nullptr;
 };
 
 // One value node's output at the env's frame: generators via
@@ -123,7 +155,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                   const AnalysisCurves* analysis, double audio_off,
                   double live_seconds = -1.0, double key_time = -1.0,
                   const SourceFrameView* video = nullptr,
-                  const NodeAudioMap* node_audio = nullptr);
+                  const NodeAudioMap* node_audio = nullptr,
+                  const NodeCameraMap* node_camera = nullptr);
 
 // Bakes modulation into a document copy for one frame. live_seconds >= 0
 // switches LFO/drift onto that clock instead of frame/fps (live mode,
@@ -133,7 +166,8 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
                       double fps, const AnalysisCurves* analysis,
                       double live_seconds = -1.0, double key_time = -1.0,
                       const SourceFrameView* video = nullptr,
-                      const NodeAudioMap* node_audio = nullptr);
+                      const NodeAudioMap* node_audio = nullptr,
+                      const NodeCameraMap* node_camera = nullptr);
 
 // Playback speed of the root timeline: the project scalar, clamped to
 // [0, doc::kMaxSpeed]. Sequences carry no keyframes or routes; ramps

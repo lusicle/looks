@@ -27,7 +27,8 @@ const char* const kModSourceNames[] = {
     "lfo",         "drift",       "audio_low",    "audio_mid",
     "audio_high",  "audio_onset", "video_motion", "video_brightness",
     "lfo_beat",    "envelope",    "video_cut",    "beat",
-    "video_sample", "video_region", "math",       "normalise"};
+    "video_sample", "video_region", "math",       "normalise",
+    "camera"};
 static_assert(sizeof(kModSourceNames) / sizeof(kModSourceNames[0]) ==
                   static_cast<size_t>(ModSourceType::Count),
               "mod source names track the enum");
@@ -113,7 +114,8 @@ Value mod_source_to_json(const ModSource& s) {
     v.set("decay", static_cast<double>(s.decay));
     v.set("trigger", static_cast<int64_t>(s.trigger));
     // Sampling geometry only for the video-sampling types — older files
-    // stay byte-identical through a load/save roundtrip.
+    // stay byte-identical through a load/save roundtrip. The camera
+    // node's channel selector rides the same field.
     if (s.type == ModSourceType::VideoSample ||
         s.type == ModSourceType::VideoRegion) {
         v.set("px", static_cast<double>(s.px));
@@ -121,6 +123,14 @@ Value mod_source_to_json(const ModSource& s) {
         v.set("pw", static_cast<double>(s.pw));
         v.set("ph", static_cast<double>(s.ph));
         v.set("channel", static_cast<int64_t>(s.channel));
+    } else if (s.type == ModSourceType::Camera) {
+        v.set("channel", static_cast<int64_t>(s.channel));
+        // The plane region rides the sampling-geometry fields.
+        v.set("px", static_cast<double>(s.px));
+        v.set("py", static_cast<double>(s.py));
+        v.set("pw", static_cast<double>(s.pw));
+        v.set("ph", static_cast<double>(s.ph));
+        if (s.anchor) v.set("anchor", static_cast<int64_t>(s.anchor));
     }
     return v;
 }
@@ -142,6 +152,7 @@ ModSource mod_source_from_json(const Value& v) {
     s.pw = num(v, "pw", 0.25f);
     s.ph = num(v, "ph", 0.25f);
     s.channel = static_cast<uint32_t>(v.get("channel").as_int(0));
+    s.anchor = static_cast<uint32_t>(v.get("anchor").as_int(0));
     return s;
 }
 
@@ -348,6 +359,19 @@ Value layer_to_json(const Layer& l) {
         v.set("gen_phase", static_cast<double>(l.gen_phase));
     if (l.osc_shape)
         v.set("osc_shape", static_cast<int64_t>(l.osc_shape));
+    if (!l.path.empty()) {
+        // Custom shape path: [ax,ay,in_dx,in_dy,out_dx,out_dy] per point.
+        Value pts = Value::make_array();
+        for (const PathPoint& p : l.path) {
+            Value pt = Value::make_array();
+            const float f[6] = {p.ax, p.ay, p.in_dx, p.in_dy,
+                                p.out_dx, p.out_dy};
+            for (float c : f) pt.push(static_cast<double>(c));
+            pts.push(std::move(pt));
+        }
+        v.set("path", std::move(pts));
+        if (!l.path_closed) v.set("path_open", true);
+    }
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
@@ -396,6 +420,25 @@ Layer layer_from_json(const Value& v) {
     l.gen_angle = num(v, "gen_angle", 0.0f);
     l.gen_phase = num(v, "gen_phase", 0.0f);
     l.osc_shape = static_cast<uint32_t>(v.get("osc_shape").as_int(0));
+    if (const Value& pv = v.get("path"); pv.is_array()) {
+        for (const Value& ptv : pv.array()) {
+            if (!ptv.is_array()) continue;
+            const Array& c = ptv.array();
+            PathPoint p;
+            if (c.size() >= 2) {
+                p.ax = static_cast<float>(c[0].as_number(0.0));
+                p.ay = static_cast<float>(c[1].as_number(0.0));
+            }
+            if (c.size() >= 6) {
+                p.in_dx = static_cast<float>(c[2].as_number(0.0));
+                p.in_dy = static_cast<float>(c[3].as_number(0.0));
+                p.out_dx = static_cast<float>(c[4].as_number(0.0));
+                p.out_dy = static_cast<float>(c[5].as_number(0.0));
+            }
+            l.path.push_back(p);
+        }
+        l.path_closed = !v.get("path_open").as_bool(false);
+    }
     l.blend = static_cast<BlendMode>(
         enum_index(kBlendNames, v.get("blend").as_string()));
     l.opacity = num(v, "opacity", 1.0f);

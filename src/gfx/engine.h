@@ -161,6 +161,23 @@ public:
     // Empty vector = no audio (the scope draws a flat line).
     void set_scope_audio(std::vector<int16_t> mono, uint32_t sample_rate);
 
+    // Track Pin plane solves, keyed by hash(asset, quantized region) —
+    // the app resolves planes from the .track sidecars and hands the
+    // flat table over (same thread contract as set_scope_audio). A pin
+    // with no entry renders with the identity homography.
+    struct PinPlane {
+        uint32_t start = 0;
+        std::vector<float> h;   // 9 floats per frame from `start`
+    };
+    using PinPlaneMap = std::unordered_map<uint64_t, PinPlane>;
+    void set_track_planes(std::shared_ptr<const PinPlaneMap> planes) {
+        pin_planes_ = std::move(planes);
+    }
+    // The dispatch's lookup key; the app builds the map with the same
+    // quantization so both sides agree.
+    static uint64_t pin_plane_key(uint64_t asset, float rx, float ry,
+                                  float rw, float rh);
+
     // Preview proxy: 1 = full, 2 = half, 4 = quarter. The source
     // planes stay full-res; the working targets shrink (kernels sample by
     // uv, so everything scales). Export uses its own Engine at 1.
@@ -363,6 +380,17 @@ private:
         TextRaster buckets[6];
     };
     std::unordered_map<uint64_t, TextSlot> text_state_;
+
+    // Custom shape SDF per layer id: CPU raster (gfx/shape_sdf) keyed on
+    // (path bytes, closed, raster dims); a path edit or size change
+    // re-rasterizes once, everything else reuses the texture.
+    struct ShapeSlot {
+        uint64_t hash = 0;
+        std::unique_ptr<GpuImage> tex;
+        uint32_t w = 0, h = 0;
+    };
+    std::unordered_map<uint64_t, ShapeSlot> shape_state_;
+    std::shared_ptr<const PinPlaneMap> pin_planes_;
 
     // Blue-noise / STBN dither LUT (build-time asset; procedural fallback).
     std::unique_ptr<GpuImage> noise_lut_;

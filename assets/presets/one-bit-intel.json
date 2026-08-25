@@ -1,0 +1,147 @@
+{
+  "looks_preset": 1,
+  "name": "one-bit intel",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 127,
+    "name": "one-bit intel",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 104,
+        "param": 1
+      },
+      {
+        "effect": 106,
+        "param": 0
+      },
+      {
+        "effect": 107,
+        "param": 1
+      },
+      {
+        "effect": 108,
+        "param": 0
+      }
+    ],
+    "face_in": 104,
+    "face_out": 124
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 104,
+      "params": [
+        0.0020000000949949026,
+        0.10000000149011612,
+        0.80000001192092896,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 127,
+      "node_x": 330,
+      "node_y": 40
+    },
+    {
+      "type": "wave_warp",
+      "id": 105,
+      "params": [
+        6,
+        9,
+        0.40000000596046448,
+        2
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 127,
+      "node_x": 600,
+      "node_y": 40
+    },
+    {
+      "type": "error_diffusion",
+      "id": 106,
+      "params": [
+        2,
+        0,
+        1,
+        0.15000000596046448,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 127,
+      "node_x": 870,
+      "node_y": 40
+    },
+    {
+      "type": "colorizer",
+      "id": 107,
+      "params": [
+        0.33000001311302185,
+        0.33000001311302185,
+        0.33000001311302185,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 127,
+      "node_x": 1140,
+      "node_y": 40
+    },
+    {
+      "type": "glow",
+      "id": 108,
+      "params": [
+        0.69999998807907104,
+        8,
+        0.5,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 127,
+      "node_x": 1410,
+      "node_y": 40
+    },
+    {
+      "type": "levels",
+      "id": 124,
+      "params": [
+        0.019999999552965164,
+        1,
+        1,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 127,
+      "node_x": 1680,
+      "node_y": 40
+    }
+  ]
+}

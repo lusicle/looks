@@ -51,6 +51,7 @@ struct SidecarPaths {
     std::filesystem::path pcm;       // <stem>.pcm
     std::filesystem::path analysis;  // <stem>.analysis
     std::filesystem::path thumbs;    // <stem>.thumbs
+    std::filesystem::path track;     // <stem>.track (motion solve)
 };
 
 inline SidecarPaths sidecars_for_stem(const std::filesystem::path& dir,
@@ -62,6 +63,7 @@ inline SidecarPaths sidecars_for_stem(const std::filesystem::path& dir,
     s.pcm = dir / (stem + L".pcm");
     s.analysis = dir / (stem + L".analysis");
     s.thumbs = dir / (stem + L".thumbs");
+    s.track = dir / (stem + L".track");
     return s;
 }
 

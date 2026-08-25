@@ -67,6 +67,97 @@ private:
     float old_value_ = 0.0f;
 };
 
+// A gizmo drag writes an x/y pair per frame; issuing two singles would
+// defeat back-of-stack merging (alternating params never match), so the
+// whole per-frame write set travels as one command. Keyed params arrive
+// as lane replacements (the auto-key path), unkeyed ones as base writes.
+class SetParamGestureCommand final : public LookCommand {
+public:
+    SetParamGestureCommand(uint64_t look, size_t layer_index,
+                           size_t effect_index,
+                           std::vector<ParamWrite> base_writes,
+                           std::vector<KeyframeLane> lane_writes)
+        : LookCommand(look), layer_index_(layer_index),
+          effect_index_(effect_index), base_writes_(std::move(base_writes)),
+          lane_writes_(std::move(lane_writes)) {}
+
+    std::string name() const override { return "Edit Parameter"; }
+
+    void apply(Document& doc) override {
+        Look& look = look_of(doc);
+        old_base_.clear();
+        for (const ParamWrite& w : base_writes_) {
+            float& p = param_ref(look, layer_index_, effect_index_,
+                                 w.param_index);
+            old_base_.push_back(p);
+            p = w.value;
+        }
+        old_lanes_.clear();
+        for (const KeyframeLane& lw : lane_writes_) {
+            bool found = false;
+            for (KeyframeLane& lane : look.lanes) {
+                if (lane.target == lw.target) {
+                    old_lanes_.push_back({true, lane.keys});
+                    lane.keys = lw.keys;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                old_lanes_.push_back({false, {}});
+                look.lanes.push_back({lw.target, lw.keys});
+            }
+        }
+    }
+
+    void revert(Document& doc) override {
+        Look& look = look_of(doc);
+        for (size_t i = lane_writes_.size(); i-- > 0;) {
+            for (size_t li = 0; li < look.lanes.size(); ++li) {
+                if (look.lanes[li].target == lane_writes_[i].target) {
+                    if (old_lanes_[i].first)
+                        look.lanes[li].keys = old_lanes_[i].second;
+                    else
+                        look.lanes.erase(look.lanes.begin() + li);
+                    break;
+                }
+            }
+        }
+        for (size_t i = base_writes_.size(); i-- > 0;)
+            param_ref(look, layer_index_, effect_index_,
+                      base_writes_[i].param_index) = old_base_[i];
+    }
+
+    bool merge(const Command& next) override {
+        const auto* o = dynamic_cast<const SetParamGestureCommand*>(&next);
+        if (!o || !same_look(*o) || o->layer_index_ != layer_index_ ||
+            o->effect_index_ != effect_index_ ||
+            o->base_writes_.size() != base_writes_.size() ||
+            o->lane_writes_.size() != lane_writes_.size())
+            return false;
+        for (size_t i = 0; i < base_writes_.size(); ++i)
+            if (o->base_writes_[i].param_index != base_writes_[i].param_index)
+                return false;
+        for (size_t i = 0; i < lane_writes_.size(); ++i)
+            if (!(o->lane_writes_[i].target == lane_writes_[i].target))
+                return false;
+        for (size_t i = 0; i < base_writes_.size(); ++i)
+            base_writes_[i].value = o->base_writes_[i].value;
+        for (size_t i = 0; i < lane_writes_.size(); ++i)
+            lane_writes_[i].keys = o->lane_writes_[i].keys;
+        return true;   // our old_* stashes stay the gesture origin
+    }
+
+private:
+    size_t layer_index_;
+    size_t effect_index_;
+    std::vector<ParamWrite> base_writes_;
+    std::vector<KeyframeLane> lane_writes_;
+    std::vector<float> old_base_;
+    // {lane existed, its keys before}; parallel to lane_writes_.
+    std::vector<std::pair<bool, std::vector<Keyframe>>> old_lanes_;
+};
+
 class SetBypassCommand final : public LookCommand {
 public:
     SetBypassCommand(uint64_t look, size_t layer_index, size_t effect_index,
@@ -715,6 +806,15 @@ std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
                                            int param_index, float new_value) {
     return std::make_unique<SetParamCommand>(look, layer_index, effect_index,
                                              param_index, new_value);
+}
+
+std::unique_ptr<Command> set_param_gesture_command(
+    uint64_t look, size_t layer_index, size_t effect_index,
+    std::vector<ParamWrite> base_writes,
+    std::vector<KeyframeLane> lane_writes) {
+    return std::make_unique<SetParamGestureCommand>(
+        look, layer_index, effect_index, std::move(base_writes),
+        std::move(lane_writes));
 }
 
 std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,

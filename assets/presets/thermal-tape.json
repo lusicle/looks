@@ -1,0 +1,134 @@
+{
+  "looks_preset": 1,
+  "name": "thermal tape",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 175,
+    "name": "thermal tape",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 165,
+        "param": 2
+      },
+      {
+        "effect": 160,
+        "param": 1
+      },
+      {
+        "effect": 160,
+        "param": 2
+      },
+      {
+        "effect": 159,
+        "param": 0
+      }
+    ],
+    "face_in": 165,
+    "face_out": 163
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 165,
+      "params": [
+        0.004999999888241291,
+        0.34999999403953552,
+        1.6000000238418579,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 175
+    },
+    {
+      "type": "blur",
+      "id": 159,
+      "params": [
+        24,
+        3,
+        0,
+        0.5,
+        0.15000000596046448
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 175
+    },
+    {
+      "type": "colorizer",
+      "id": 160,
+      "params": [
+        0.6600000262260437,
+        0.75,
+        0.0099999997764825821,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 175
+    },
+    {
+      "type": "composite_artifacts",
+      "id": 161,
+      "params": [
+        0.69999998807907104,
+        0.85000002384185791,
+        9
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 175
+    },
+    {
+      "type": "crt_sim",
+      "id": 162,
+      "params": [
+        0.34999999403953552,
+        0.30000001192092896,
+        0.64999997615814209,
+        4,
+        1
+      ],
+      "wet": 0.55000001192092896,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 175
+    },
+    {
+      "type": "levels",
+      "id": 163,
+      "params": [
+        0.0030000000260770321,
+        0.85000002384185791,
+        1,
+        0,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 175
+    }
+  ]
+}

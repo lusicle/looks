@@ -109,7 +109,7 @@ add_slang_shaders(looks_shaders
         fx_photocopy.comp.slang
         fx_risograph.comp.slang
         fx_wet_plate.comp.slang
-        fx_reeded_glass.comp.slang
+        fx_glass.comp.slang
         fx_watercolor.comp.slang
         fx_wire_terrain.comp.slang
         fx_ridgeline.comp.slang
@@ -137,6 +137,7 @@ add_slang_shaders(looks_shaders
         mod_integrate.comp.slang
         thumb_tap.comp.slang
         gallery_tap.comp.slang
+        fx_track_pin.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang

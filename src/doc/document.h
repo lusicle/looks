@@ -207,6 +207,16 @@ struct Group {
     float out_x = 0.0f, out_y = 0.0f;
 };
 
+// One custom-shape control point, canvas fractions: the anchor plus two
+// cubic tangent handles stored as OFFSETS from it (zero offsets = a
+// corner point). The shape node rasterizes the cubic through these into
+// an SDF (gfx/shape_sdf); the monitor path editor drags them.
+struct PathPoint {
+    float ax = 0.0f, ay = 0.0f;
+    float in_dx = 0.0f, in_dy = 0.0f;
+    float out_dx = 0.0f, out_dy = 0.0f;
+};
+
 struct Layer {
     uint64_t id = 0;
     std::string name;
@@ -239,6 +249,10 @@ struct Layer {
     float gen_phase = 0.0f;
     // Oscillator waveform: 0 sine bars, 1 concentric rings, 2 plasma.
     uint32_t osc_shape = 0;
+    // Custom shape path (shape node, osc_shape 3): closed = a filled
+    // matte, open = a feathered stroke. Empty custom draws nothing.
+    std::vector<PathPoint> path;
+    bool path_closed = true;
     BlendMode blend = BlendMode::Normal;
     float opacity = 1.0f;
     bool visible = true;

@@ -898,3 +898,67 @@ TEST(graph_razor_identity_is_structural) {
     const auto stacked = state_fingerprint(doc, doc.root_sequence, 39);
     CHECK_EQ(stacked.size(), uncut[0].size() * 2);
 }
+
+TEST(graph_source_matte_on_multipass_effect) {
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
+
+    // Exact repro of the monitor matte smoke: gradient -> Glow -> out,
+    // a custom-path shape layer feeding ONLY Glow's port-1 matte, in a
+    // look that is not looks[0]. The gate must compile exactly like the
+    // single-pass case: extract from the shape's generator, apply as
+    // the chain output, every node's inputs already emitted.
+    Document doc;
+    doc.looks[0].layers[0].asset = bind_asset(doc);
+    looks::doc::Look lab;
+    lab.id = doc.next_effect_id++;
+    lab.name = "matte lab";
+    Layer grad;
+    grad.id = doc.next_effect_id++;
+    grad.source = LayerSourceKind::Gradient;
+    lab.layers.push_back(grad);
+    lab.layers[0].stack.push_back(make_effect(doc, EffectType::Glow));
+    const uint64_t glow_id = lab.layers[0].stack[0].id;
+    Layer shape;
+    shape.id = doc.next_effect_id++;
+    shape.source = LayerSourceKind::Shape;
+    shape.osc_shape = 3;
+    shape.path.resize(3);
+    shape.path[0] = {0.5f, 0.2f, 0, 0, 0, 0};
+    shape.path[1] = {0.8f, 0.8f, 0, 0, 0, 0};
+    shape.path[2] = {0.2f, 0.8f, 0, 0, 0, 0};
+    lab.layers.push_back(shape);
+    lab.links.push_back({grad.id, glow_id, 0});
+    lab.links.push_back({glow_id, 0, 0});
+    lab.links.push_back({shape.id, glow_id, 1});
+    doc.looks.push_back(lab);
+
+    RenderGraph g = compile_graph(doc, lab.id, 0);
+    CHECK(g.valid);
+    int extract = -1, apply = -1;
+    int generators = 0;
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        const GraphNode& n = g.nodes[i];
+        for (int in : n.inputs) {
+            CHECK(in >= 0);
+            CHECK(in < static_cast<int>(i));   // inputs already emitted
+        }
+        if (n.kind == GraphNode::Kind::MatteExtract)
+            extract = static_cast<int>(i);
+        if (n.kind == GraphNode::Kind::MatteApply)
+            apply = static_cast<int>(i);
+        if (n.kind == GraphNode::Kind::Generator) ++generators;
+    }
+    CHECK(extract >= 0);
+    CHECK(apply >= 0);
+    CHECK_EQ(generators, 2);   // gradient + shape, nothing fabricated
+    // The extract reads the SHAPE's generator node.
+    const GraphNode& ex = g.nodes[static_cast<size_t>(extract)];
+    CHECK_EQ(ex.inputs.size(), size_t{1});
+    CHECK(g.nodes[static_cast<size_t>(ex.inputs[0])].kind ==
+          GraphNode::Kind::Generator);
+    // The apply joins (dry in, glow chain, gate).
+    const GraphNode& ap = g.nodes[static_cast<size_t>(apply)];
+    CHECK_EQ(ap.inputs.size(), size_t{3});
+    CHECK_EQ(ap.inputs[2], extract);
+}

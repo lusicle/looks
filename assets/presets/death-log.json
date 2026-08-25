@@ -1,0 +1,133 @@
+{
+  "looks_preset": 1,
+  "name": "death log",
+  "tags": [
+    "digital"
+  ],
+  "group": {
+    "id": 128,
+    "name": "death log",
+    "folded": false,
+    "bypass": false,
+    "exposed": [
+      {
+        "effect": 109,
+        "param": 1
+      },
+      {
+        "effect": 110,
+        "param": 1
+      },
+      {
+        "effect": 110,
+        "param": 2
+      },
+      {
+        "effect": 111,
+        "param": 0
+      }
+    ],
+    "face_in": 109,
+    "face_out": 113
+  },
+  "effects": [
+    {
+      "type": "levels",
+      "id": 109,
+      "params": [
+        0.004999999888241291,
+        0.20000000298023224,
+        0.89999997615814209,
+        0.05000000074505806,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 128,
+      "node_x": 330,
+      "node_y": 40
+    },
+    {
+      "type": "colorizer",
+      "id": 110,
+      "params": [
+        0.6600000262260437,
+        0.62999999523162842,
+        0.97000002861022949,
+        1
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 128,
+      "node_x": 600,
+      "node_y": 40
+    },
+    {
+      "type": "glyph",
+      "id": 111,
+      "params": [
+        8,
+        3,
+        1,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 128,
+      "node_x": 870,
+      "node_y": 40
+    },
+    {
+      "type": "glow",
+      "id": 112,
+      "params": [
+        1.2000000476837158,
+        18,
+        0.5,
+        0,
+        0
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 128,
+      "node_x": 1140,
+      "node_y": 40
+    },
+    {
+      "type": "text",
+      "id": 113,
+      "params": [
+        1,
+        42,
+        0.30000001192092896,
+        0.62000000476837158,
+        0,
+        0.97000002861022949,
+        0.85000002384185791,
+        1,
+        0.25
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 128,
+      "text": "DEATH LOG #1568",
+      "node_x": 1410,
+      "node_y": 40
+    }
+  ]
+}
