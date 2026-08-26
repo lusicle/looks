@@ -144,11 +144,16 @@ LayoutNode* Segmented(LayoutArena& arena, const char* const* labels,
 // Solo/SoloOn = stack solo (accent when active), Copy = duplicate.
 enum class Icon : uint8_t {
     Play, Pause, Up, Down, Close, Wave, Key, Knob, Eye, EyeOff, Dice, Link,
-    Solo, SoloOn, Copy,
+    Solo, SoloOn, Copy, Lock, Magnet,
 };
 
 LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
                        bool* out_clicked, const ButtonOpts& opts = {});
+
+// The bare icon strokes at a center point — shared by IconButton and
+// custom-drawn surfaces (the canvas popups). No hover, hit, or probe.
+void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
+                     Vec2 center, Color color, float font_size);
 
 // Timeline scrubber: thin track + playhead line. Reads as transport, not
 // as a parameter slider.

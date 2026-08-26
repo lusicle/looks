@@ -913,7 +913,9 @@ int homography_inliers(const std::vector<float>& pax,
 // adjust the first kSfmBaWindow cameras and localize the tail against
 // that structure, so poses stay in one gauge at bounded memory.
 void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
+                   const std::function<bool()>& cancelled,
                    SfmSegment* seg) {
+    auto stop = [&] { return cancelled && cancelled(); };
     seg->start = s;
     seg->end = e;
     seg->status = kSfmUnsolved;
@@ -957,6 +959,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     bool saw_pair = false;
     std::vector<double> disp;
     for (uint32_t i = s; i + 3 < s + ba_nf; i += 6) {
+        if (stop()) return;
         const uint32_t j_end = std::min(s + ba_nf, i + 121);
         for (uint32_t j = i + 3; j < j_end; ++j) {
             int shared = 0;
@@ -1027,6 +1030,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     size_t best_ninl = 0;
     const uint64_t ess_seed = hash_combine(0xE55Eull, s);
     for (double fc : kFocals) {
+        if (stop()) return;
         std::vector<double> nax(np), nay(np), nbx(np), nby(np);
         for (size_t k = 0; k < np; ++k) {
             nax[k] = pax[k] / fc;
@@ -1244,9 +1248,12 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
                       &rs_cache[lf * 9], cams[lf].t, gu, gv);
         }
     };
-    for (uint32_t lf = li + 1; lf < lj; ++lf) resect(lf, lf - 1);
-    for (uint32_t lf = lj + 1; lf < ba_nf; ++lf) resect(lf, lf - 1);
-    for (uint32_t lf = li; lf-- > 0;) resect(lf, lf + 1);
+    for (uint32_t lf = li + 1; lf < lj && !stop(); ++lf)
+        resect(lf, lf - 1);
+    for (uint32_t lf = lj + 1; lf < ba_nf && !stop(); ++lf)
+        resect(lf, lf - 1);
+    for (uint32_t lf = li; lf-- > 0 && !stop();) resect(lf, lf + 1);
+    if (stop()) return;
 
     // ---- bundle adjustment over the window: free cameras (all but
     // the gauge) + shared focal on the reduced side, point blocks
@@ -1315,6 +1322,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
         double lambda = 1.0e-3;
         double err = full_err(cams, pts, focal);
         for (int it = 0; it < kSfmBaIters; ++it) {
+            if (stop()) return;
             for (uint32_t c2 = 0; c2 < ba_nf; ++c2)
                 rodrigues_jac(cams[c2].aa, &rsj[c2 * 9], &jrs[c2 * 27]);
             std::fill(S.begin(), S.end(), 0.0);
@@ -1592,6 +1600,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
 
     for (int rd = 0; rd < kSfmBaRounds; ++rd) {
         lm_round();
+        if (stop()) return;
         if (rd + 1 < kSfmBaRounds) prune();
     }
 
@@ -1599,7 +1608,9 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     // structure, triangulating fresh points as the view moves on.
     for (uint32_t c2 = 0; c2 < ba_nf; ++c2)
         rodrigues(cams[c2].aa, &rs_cache[c2 * 9]);
-    for (uint32_t lf = ba_nf; lf < nf; ++lf) resect(lf, lf - 1);
+    for (uint32_t lf = ba_nf; lf < nf && !stop(); ++lf)
+        resect(lf, lf - 1);
+    if (stop()) return;
 
     // Final stats over the adjusted window.
     double mean = 0.0;
@@ -1762,7 +1773,7 @@ bool plane_from_sfm(const TrackData& data, float rx, float ry, float rw,
 
 }  // namespace
 
-bool sfm_solve(TrackData* data) {
+bool sfm_solve(TrackData* data, const std::function<bool()>& cancelled) {
     if (!data) return false;
     data->sfm.clear();
     if (data->end <= data->start) return false;
@@ -1772,8 +1783,9 @@ bool sfm_solve(TrackData* data) {
     bounds.push_back(data->end);
     bool any = false;
     for (size_t k = 0; k + 1 < bounds.size(); ++k) {
+        if (cancelled && cancelled()) return any;
         SfmSegment seg;
-        solve_segment(*data, bounds[k], bounds[k + 1], &seg);
+        solve_segment(*data, bounds[k], bounds[k + 1], cancelled, &seg);
         if (seg.status == kSfmSolved) any = true;
         data->sfm.push_back(std::move(seg));
     }

@@ -267,6 +267,15 @@ MfSession::~MfSession() {
     if (com_) CoUninitialize();
 }
 
+MfLifetime::MfLifetime() {
+    mf_ = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+    if (!mf_) log_error("mf: lifetime startup failed");
+}
+
+MfLifetime::~MfLifetime() {
+    if (mf_) MFShutdown();
+}
+
 // ----------------------------------------------------------- H264Decoder
 
 struct H264Decoder::Impl {

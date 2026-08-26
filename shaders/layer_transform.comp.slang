@@ -13,8 +13,10 @@ cbuffer Push
     float crop_t;
     float crop_b;
     uint flips;        // bit 0 = horizontal, bit 1 = vertical
-    float scale;       // about frame center, > 0
+    float scale;       // about the anchor, > 0
     float rotate_rad;
+    float anchor_x;    // scale/rotate pivot, uv; 0.5 = frame center
+    float anchor_y;
 };
 
 [[vk::binding(0, 0)]] Sampler2D source;
@@ -22,11 +24,14 @@ cbuffer Push
 
 float2 xform_source_uv(float2 uv, float aspect)
 {
-    float2 p = (uv - 0.5) * float2(aspect, 1.0);
+    // Inverse of out = a + S*R*(src - a): the anchor is the fixed
+    // point of the scale/rotate. Flips stay frame mirrors.
+    const float2 anchor = float2(anchor_x, anchor_y);
+    float2 p = (uv - anchor) * float2(aspect, 1.0);
     const float s = sin(-rotate_rad), c = cos(-rotate_rad);
     p = float2(p.x * c - p.y * s, p.x * s + p.y * c);
     p /= max(scale, 1e-4);
-    float2 suv = p / float2(aspect, 1.0) + 0.5;
+    float2 suv = p / float2(aspect, 1.0) + anchor;
     if ((flips & 1u) != 0u) suv.x = 1.0 - suv.x;
     if ((flips & 2u) != 0u) suv.y = 1.0 - suv.y;
     return suv;

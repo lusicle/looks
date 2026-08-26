@@ -18,8 +18,14 @@ inline constexpr uint8_t kMouseRight = 1u << 1;
 inline constexpr uint8_t kMouseMiddle = 1u << 2;
 
 struct UiInput {
-    Vec2 mouse{};          // logical px
+    Vec2 mouse{};          // logical px; modals may deaden it per frame
     Vec2 mouse_delta{};
+    // Authoritative pointer position - only begin_frame writes it, and
+    // `mouse` rebuilds from it every frame. A modal that deadens
+    // `mouse` for one frame cannot poison the next: the pointer may
+    // rest (no MouseMove arrives) while hover and wheel gates must
+    // still see where it sits.
+    Vec2 mouse_raw{};
     uint8_t buttons_down = 0;
     uint8_t buttons_pressed = 0;    // edges this frame
     uint8_t buttons_released = 0;

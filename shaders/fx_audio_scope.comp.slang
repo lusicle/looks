@@ -76,7 +76,9 @@ void main(uint3 tid : SV_DispatchThreadID)
              saturate(color));
     const float3 col = base.rgb + tc * trace * saturate(glow) * 1.2;
 
-    const float4 result = float4(col, base.a);
+    // The drawn trace carries its own coverage.
+    const float4 result =
+        float4(col, max(base.a, saturate(trace * saturate(glow) * 1.2)));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

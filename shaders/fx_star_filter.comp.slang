@@ -49,7 +49,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     spike *= 1.6 / (16.0 * float(n));
 
-    const float4 result = float4(base.rgb + spike, base.a);
+    const float4 result =
+        float4(base.rgb + spike, max(base.a, saturate(fx_luma(spike))));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -123,9 +123,16 @@ struct Player::Impl {
     }
 
     uint32_t cursor_to_frame(uint64_t c) const {
-        const double seconds = static_cast<double>(c) / clock_rate;
-        const uint32_t frame = static_cast<uint32_t>(
-            seconds * fps.load(std::memory_order_relaxed));
+        // Multiply before dividing and floor with an epsilon: a cursor
+        // sitting exactly on a frame boundary must read as that frame,
+        // and the bare quotient can land a few ulps under the integer
+        // (385920/48000*25 = 200.99999...). 1e-6 frames is far below
+        // one sample (>= 1e-4 frames at any supported rate), so only
+        // rounding noise is absorbed, never a real sample offset.
+        const double frames_f =
+            static_cast<double>(c) * fps.load(std::memory_order_relaxed) /
+            clock_rate;
+        const uint32_t frame = static_cast<uint32_t>(frames_f + 1e-6);
         const uint32_t out = trim_out.load();
         return frame >= out ? (out ? out - 1 : 0) : frame;
     }

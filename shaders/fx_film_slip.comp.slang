@@ -34,12 +34,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float offset = frac(slip + t * speed);
 
     const float2 suv = float2(uv.x, frac(uv.y + offset));
-    float3 col = input.SampleLevel(suv, 0).rgb;
+    const float4 rolled = input.SampleLevel(suv, 0);
+    float3 col = rolled.rgb;
+    float col_a = rolled.a;
 
     if (blend > 0.001) {
         const float2 guv = float2(uv.x, frac(uv.y + offset + 0.5));
-        col = lerp(col, col + input.SampleLevel(guv, 0).rgb * 0.6,
-                   blend * 0.6);
+        const float4 ghost = input.SampleLevel(guv, 0);
+        col = lerp(col, col + ghost.rgb * 0.6, blend * 0.6);
+        col_a = max(col_a, ghost.a * blend * 0.6);
     }
 
     // The black frame line rides the wrap seam.
@@ -53,7 +56,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col *= 1.0 - bar * 0.92;
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

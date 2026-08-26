@@ -69,6 +69,7 @@
 #include "mod/param_table.h"
 #include "platform/dialog.h"
 #include "platform/window.h"
+#include "platform/win/mf_codec.h"
 #include "ui/canvas2d.h"
 #include "ui/font.h"
 #include "ui/layout.h"
@@ -356,6 +357,12 @@ std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
         if (lossless) options.quality = 0;   // lossless mode
         raw->result =
             media::import_media(source, dest, options, &raw->progress);
+        // Fast paths (wav/mp3/still cover art) announce at done: give
+        // them the same job-thread pcm preload the video fast stage
+        // does before `ready`.
+        if (!raw->progress.pcm && !raw->result.pcm_path.empty() &&
+            !raw->progress.cancel.load())
+            raw->progress.pcm = media::load_pcm(raw->result.pcm_path);
         raw->done = true;
     });
     return job;
@@ -417,7 +424,7 @@ inline void bind_primary_media(doc::Document& doc, const std::string& path) {
         doc::Asset a;
         a.id = doc.next_effect_id++;
         a.path = path;
-        a.name = std::filesystem::path(path).filename().string();
+        a.name = path_to_u8(u8_to_path(path).filename());
         asset_id = a.id;
         doc.assets.push_back(std::move(a));
     }
@@ -499,12 +506,16 @@ inline uint32_t timeline_buffer_frames(double fps) {
     return static_cast<uint32_t>(std::max(60.0, (fps > 0.0 ? fps : 30.0) * 2.0));
 }
 
-// The project's frame rate: its own setting, else the first asset that
-// knows one. One clock for every look, so nested local times stay
-// commensurable.
+// The project's frame rate: doc::project_fps (setting, else the first
+// asset that knows one), with the probed bundles filling the gap while
+// an asset's cached fps has not landed yet. Must agree with the doc-side
+// derivation whenever any asset knows its rate - the flatten's conform
+// ratios come from there.
 inline double project_fps(const doc::Document& doc,
                           const std::vector<media::AssetBundle>& bundles) {
     if (doc.fps > 0.0) return doc.fps;
+    for (const doc::Asset& a : doc.assets)
+        if (a.fps > 0.0) return a.fps;
     for (const media::AssetBundle& b : bundles)
         if (b.fps > 0.0) return b.fps;
     return 30.0;
@@ -592,7 +603,14 @@ inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
         src.pcm = it->second;
         src.t_in = c.t_in;
         src.t_out = std::min(c.t_out, horizon);
-        src.source_in = c.source_in;
+        // The mix maps by SECONDS on the clock (frames / mix fps), so
+        // audio conforms naturally and must not double-conform; the
+        // media-frame-exact shift converts through the rate (shift/rate
+        // clock frames = shift/asset_fps seconds into the media).
+        src.source_in =
+            c.source_in + (c.rate > 0.0
+                               ? static_cast<double>(c.shift) / c.rate
+                               : static_cast<double>(c.shift));
         src.speed = c.speed;
         src.gain = c.gain;
         for (uint32_t oi = 0; oi < c.op_count; ++oi) {
@@ -735,6 +753,9 @@ struct RenderWorker {
     }
 
     void stop() {
+        if (stopped_) return;   // the destructor re-enters after main's stop
+        stopped_ = true;
+        log_info("shutdown: render worker stopping");
         {
             std::lock_guard<std::mutex> lock(m_);
             quit_ = true;
@@ -743,11 +764,16 @@ struct RenderWorker {
             if (pool_ptr_) pool_ptr_->abort();
         }
         cv_.notify_all();
+        // Sub-stage logs, same contract as the outer shutdown stages: a
+        // stall's culprit is the line that never printed.
         if (thread_.joinable()) thread_.join();
+        log_info("shutdown: render worker joined");
         device.wait_idle();
+        log_info("shutdown: render device idle");
         published_.clear();
         graveyard_.clear();
         engine.reset();
+        log_info("shutdown: render engine freed");
         for (uint32_t i = 0; i < gfx::kFramesInFlight; ++i) {
             if (fence_[i]) vkDestroyFence(device.device(), fence_[i], nullptr);
             fence_[i] = VK_NULL_HANDLE;
@@ -900,6 +926,7 @@ private:
                           bool want_source, uint64_t completed);
 
     bool quit_ = false;
+    bool stopped_ = false;   // stop() ran (the destructor re-enters)
     bool idle_ = false;
     int pause_count_ = 0;
     // The run()-local decode pool, published under m_ so stop() can
@@ -1866,7 +1893,7 @@ const media::ThumbStripData* ThumbWorker::strip_for(
     if (const doc::Asset* a = rdoc.find_asset(asset)) {
         if (!a->path.empty()) {
             const BundlePaths paths =
-                resolve_bundle(std::filesystem::path(a->path));
+                resolve_bundle(u8_to_path(a->path));
             if (!paths.base.empty()) {
                 std::filesystem::path tpath = paths.base;
                 tpath.replace_extension(".thumbs");
@@ -1949,7 +1976,8 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
             if (const doc::Asset* a = rdoc.find_asset(mi.asset))
                 frames = a->frame_count;
             uint32_t ci = 0;
-            const double sf = std::max(0.0, mi.source_in);
+            const double sf =
+                std::max(0.0, doc::media_asset_frame(mi, 0.0));
             if (frames > 1 && strip->count > 1)
                 ci = std::min<uint32_t>(
                     strip->count - 1,
@@ -2242,7 +2270,15 @@ std::unique_ptr<ExportJob> start_export(
         media::DecodePool pool;
         pool.set_document(doc_copy, export_look_id, bundle_copy, 1);
         mod::TimeRemap remap;
-        const double fps = project_fps(doc_copy, bundle_copy);
+        // The exported entity runs its OWN clock: a pinned fps exports
+        // at that rate, the root at the project's.
+        double fps = project_fps(doc_copy, bundle_copy);
+        if (const doc::Look* fl = doc_copy.find_look(export_look_id)) {
+            if (doc::format_has_fps(fl->format)) fps = fl->format.fps;
+        } else if (const doc::Sequence* fs =
+                       doc_copy.find_sequence(export_look_id)) {
+            if (doc::format_has_fps(fs->format)) fps = fs->format.fps;
+        }
         // The exported entity's mix, built exactly as the monitor builds
         // it: the soundtrack when audio exports, and the Audio Scope's
         // strip either way. A sidechain mux swaps the scope onto the
@@ -2397,8 +2433,9 @@ struct LayerUiState {
     // Transform + trim, folded by default.
     bool xf_open = false;
     ui::ButtonState xf_header, flip_h_btn, flip_v_btn, lock_btn;
-    ui::SliderState xf_sliders[8];
-    ui::ButtonState xf_route_buttons[8], xf_key_buttons[8];
+    ui::ButtonState anchor_centre_btn;
+    ui::SliderState xf_sliders[10];
+    ui::ButtonState xf_route_buttons[10], xf_key_buttons[10];
 };
 
 struct LaneUiState {
@@ -2450,6 +2487,173 @@ struct Selection {
     uint64_t id = 0;   // effect / group / layer / route id by kind
 };
 
+// ---- keybinds: chord strings ("ctrl+shift+k") -> bindings. A binding
+// targets one of three tiers: a registry ACTION (built-in verb), a MACRO
+// (named ordered action-id list, pure data), or a SCRIPT (.lks file run
+// through the console VM). One binding per chord - assigning a taken
+// chord steals it; several chords may point at the same target
+// (delete/backspace both delete). Escape and ` stay hardwired.
+
+struct KeyBinding {
+    enum class Kind : uint8_t { Action, Macro, Script };
+    Kind kind = Kind::Action;
+    std::string value;   // action id / macro name / script path (utf8)
+    bool operator==(const KeyBinding& o) const {
+        return kind == o.kind && value == o.value;
+    }
+};
+
+// Chord vocabulary matches the script key() op: single characters for
+// letters/digits/punctuation, lowercase names for the rest. Null = the
+// key cannot anchor a chord (Escape, the console grave, modifiers).
+const char* key_chord_name(platform::Key k) {
+    using K = platform::Key;
+    static const char* kLetters[] = {"a", "b", "c", "d", "e", "f", "g",
+                                     "h", "i", "j", "k", "l", "m", "n",
+                                     "o", "p", "q", "r", "s", "t", "u",
+                                     "v", "w", "x", "y", "z"};
+    static const char* kDigits[] = {"0", "1", "2", "3", "4",
+                                    "5", "6", "7", "8", "9"};
+    static const char* kFns[] = {"f1", "f2", "f3", "f4",  "f5",  "f6",
+                                 "f7", "f8", "f9", "f10", "f11", "f12"};
+    if (k >= K::A && k <= K::Z)
+        return kLetters[static_cast<int>(k) - static_cast<int>(K::A)];
+    if (k >= K::Num0 && k <= K::Num9)
+        return kDigits[static_cast<int>(k) - static_cast<int>(K::Num0)];
+    if (k >= K::F1 && k <= K::F12)
+        return kFns[static_cast<int>(k) - static_cast<int>(K::F1)];
+    switch (k) {
+        case K::Space: return "space";
+        case K::Enter: return "enter";
+        case K::Tab: return "tab";
+        case K::Backspace: return "backspace";
+        case K::Insert: return "insert";
+        case K::Delete: return "delete";
+        case K::Home: return "home";
+        case K::End: return "end";
+        case K::PageUp: return "pageup";
+        case K::PageDown: return "pagedown";
+        case K::Left: return "left";
+        case K::Right: return "right";
+        case K::Up: return "up";
+        case K::Down: return "down";
+        case K::Minus: return "-";
+        case K::Equals: return "=";
+        case K::LeftBracket: return "[";
+        case K::RightBracket: return "]";
+        case K::Backslash: return "\\";
+        case K::Semicolon: return ";";
+        case K::Apostrophe: return "'";
+        case K::Comma: return ",";
+        case K::Period: return ".";
+        case K::Slash: return "/";
+        default: return nullptr;
+    }
+}
+
+// Canonical chord string: modifiers prefix in ctrl, shift, alt order.
+// Empty = not chordable.
+std::string chord_of(platform::Key k, uint32_t mods) {
+    const char* name = key_chord_name(k);
+    if (!name) return {};
+    std::string s;
+    if (mods & platform::kModCtrl) s += "ctrl+";
+    if (mods & platform::kModShift) s += "shift+";
+    if (mods & platform::kModAlt) s += "alt+";
+    s += name;
+    return s;
+}
+
+// Reverse of key_chord_name; Count = no producible key has that name.
+platform::Key key_from_chord_name(std::string_view name) {
+    for (int k = 0; k < static_cast<int>(platform::Key::Count); ++k) {
+        const char* n = key_chord_name(static_cast<platform::Key>(k));
+        if (n && name == n) return static_cast<platform::Key>(k);
+    }
+    return platform::Key::Count;
+}
+
+// Canonical form of a chord string, empty when no keypress can produce
+// it: modifiers may only PREFIX - bare modifiers are never bindable -
+// and the base key must be in the chord vocabulary. Case and modifier
+// order are forgiven ("Shift+Ctrl+K" -> "ctrl+shift+k"). Every entry
+// point (the set_keybind op, the ui.json load) funnels through here;
+// the capture path builds canonical chords by construction.
+std::string normalize_chord(std::string_view chord) {
+    std::string low(chord);
+    for (char& c : low)
+        c = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c)));
+    uint32_t mods = 0;
+    std::string_view s = low;
+    for (;;) {
+        const size_t plus = s.find('+');
+        if (plus == std::string_view::npos) break;
+        const std::string_view head = s.substr(0, plus);
+        if (head == "ctrl") mods |= platform::kModCtrl;
+        else if (head == "shift") mods |= platform::kModShift;
+        else if (head == "alt") mods |= platform::kModAlt;
+        else return {};
+        s = s.substr(plus + 1);
+    }
+    const platform::Key k = key_from_chord_name(s);
+    if (k == platform::Key::Count) return {};
+    return chord_of(k, mods);
+}
+
+// Registry access, defined with the action table (which needs the whole
+// app); the prefs writer and loader only need these.
+struct AppState;
+struct KeyIntents;
+bool action_exists(std::string_view id);
+bool run_action_id(AppState& app, KeyIntents& ki, std::string_view id);
+std::map<std::string, KeyBinding> default_keybinds();
+void save_ui_prefs(const AppState& app);
+
+// Settings popup (edit > settings): modal on the ConfirmDialog pattern,
+// category tabs on the left. View state only - never in the project.
+struct SettingsUi {
+    bool open = false;
+    int tab = 0;              // 0 = keybinds (the only category yet)
+    float scroll = 0.0f;
+    std::string filter;       // one box narrows every section
+    // Chord capture: the row listening for the next keypress -
+    // "action:<id>" / "macro:<name>" / "script:<path>"; empty = none.
+    std::string capture;
+    std::string macro_open;   // unfolded macro (inline step editor)
+    // Text-entry states are MUTUALLY EXCLUSIVE - exactly one field may
+    // own the caret (settings_end_entry clears them all before any
+    // opens, and a click elsewhere cancels like the app's other inline
+    // editors). Name entry: renaming a macro or naming a new one.
+    std::string rename_macro;
+    std::string name_buf;
+    bool adding = false;
+    // STEP editing: a step is one statement typed as text;
+    // step_edit_index == the macro's step count appends on commit
+    // ("+ add step" opens that).
+    std::string step_edit_macro;
+    int step_edit_index = -1;
+    std::string step_buf;
+    // Autocomplete popup selection (arrows move it, tab/click
+    // completes); resets whenever the typed identifier changes.
+    int complete_sel = 0;
+    std::string hover;        // interaction pass -> draw pass highlight
+};
+
+// One caret rule: every text-entry state cancels before another opens
+// (and on click-away). Capture counts - a listening chord button must
+// not share the keyboard with a field.
+void settings_end_entry(SettingsUi& s) {
+    s.capture.clear();
+    s.adding = false;
+    s.rename_macro.clear();
+    s.name_buf.clear();
+    s.step_edit_macro.clear();
+    s.step_edit_index = -1;
+    s.step_buf.clear();
+    s.complete_sel = 0;
+}
+
 // In-app modal confirm — replaces the native MessageBox guards (silent,
 // theme-matched, no system chrome). One dialog at a time; while open it
 // owns the keyboard and the pointer, and everything under the scrim gets
@@ -2469,6 +2673,7 @@ struct ConfirmDialog {
         DeleteBrowserItem,         // yes: remove entity/bin `id`, undoable
         DeletePresetFile,          // yes: remove preset file `path`
         DeletePresetBin,           // yes: contents climb, dir `path` goes
+        DeleteMacro,               // yes: macro `name` and its binds go
     };
     Kind kind = Kind::None;
     Action action = Action::None;
@@ -2477,6 +2682,7 @@ struct ConfirmDialog {
     std::string primary;           // affirmative label ("save" / "restore")
     std::string secondary;         // negative label ("discard")
     std::filesystem::path path, path2;
+    std::string name;              // DeleteMacro target
     uint64_t id = 0;               // DeleteBrowserItem target
     ui::ButtonState buttons[3];    // primary / secondary / cancel
     int hovered = -1;              // interaction pass -> draw pass
@@ -2521,6 +2727,15 @@ struct AppState {
         if (scope_is_look()) return doc::look_duration(document, look());
         return doc::sequence_duration(document, sequence());
     }
+    // The SCOPED entity's clock: its pinned rate, else the project's
+    // (bundle-probed fallback included) - the transport, the mix and
+    // the timeline all tick this.
+    double scoped_fps() const {
+        const doc::EntityFormat& f =
+            scope_is_look() ? look().format : sequence().format;
+        return doc::format_has_fps(f) ? f.fps
+                                      : project_fps(document, bundles);
+    }
 
     // Two different questions the UI used to ask the player. A TIMELINE
     // exists whenever the scoped look has length - generators alone are
@@ -2552,6 +2767,19 @@ struct AppState {
     std::vector<media::AssetBundle> bundles;
     PcmCache pcm_cache;
     uint64_t bundle_stamp = 1;
+    // Media drops beyond the one the import slot can take queue here
+    // and feed the slot as it frees - a multi-file drop imports every
+    // file, none silently swallowed.
+    std::vector<std::filesystem::path> media_import_queue;
+    // opened_asset() memo: resolving every asset's bundle costs
+    // filesystem metadata calls that CONTEND with an active ingest
+    // writing the cache directory - repeated per frame they stall the
+    // whole interface. Recomputed only when the bundle table, the
+    // document or the opened base moves.
+    uint64_t opened_memo_stamp = ~0ull;
+    uint64_t opened_memo_revision = ~0ull;
+    std::filesystem::path opened_memo_base;
+    uint64_t opened_memo_asset = 0;
     // The mix published to the transport, rebuilt when the document or the
     // bundles move (gain, mute, placement and nesting all feed it).
     uint64_t mix_revision = ~0ull;
@@ -2638,6 +2866,22 @@ struct AppState {
     std::string media_name;      // empty = test pattern
     std::string status;         // transient message line
     ConfirmDialog confirm;      // in-app modal guard (unsaved / restore)
+    // Keybinds: chord -> binding, seeded from the registry defaults at
+    // startup; ui.json persists deviations only. Macros are named
+    // ordered action-id lists - prefs data, not files.
+    std::map<std::string, KeyBinding> keybinds;
+    std::map<std::string, std::vector<std::string>> macros;
+    // action() steps queue here and land one per frame so each sees
+    // the previous one settle; Escape drains it, modals pause it.
+    std::deque<std::string> action_queue;
+    // Settings "run" stages the macro; the frame loop fires it on the
+    // macro host (defined later in the file) once the popup closes.
+    std::string pending_macro;
+    // The op catalog (name, signature) snapshotted from the script Env
+    // at startup, name-sorted: the macro step picker and the step
+    // editor's hint row teach the vocabulary from it.
+    std::vector<std::pair<std::string, std::string>> op_help;
+    SettingsUi settings;
     // Timeline audio-strip acceleration: per-frame combined amplitude plus
     // 64-frame block maxima, rebuilt when the analysis stamp moves. The
     // strip's per-column max scan otherwise touches every frame in the
@@ -2863,6 +3107,15 @@ struct AppState {
     int blk_drag_mode = 0;
     double blk_drag_anchor = 0.0;
     doc::Placement blk_drag_orig;
+    // Vertical drag: the container the drag started on, the same-kind
+    // lane under the cursor now (0 = none), the ghost span it previews,
+    // and the move staged for the post-frame handler on release.
+    uint64_t blk_drag_track = 0;
+    bool blk_drag_audio = false;
+    uint64_t blk_hover_track = 0;
+    double blk_ghost_t0 = 0.0, blk_ghost_t1 = 0.0;
+    uint64_t blk_move_placement = 0;
+    uint64_t blk_move_track = 0;
     float frame_dt = 1.0f / 60.0f;   // seconds, for rate-based drags
     // One anchor per lane row: video lanes then audio lanes.
     char tl_lane_ids[doc::kMaxLayers * 2 + 1] = {};
@@ -2945,13 +3198,29 @@ struct AppState {
 
     // Widget state
     std::unordered_map<uint64_t, LayerUiState> layer_ui;
-    // Audio lane label controls: per-track gain + mute -
-    // the per-track half of the mixer.
+    // Audio lane label controls: mute + lock.
     struct AudioLaneUi {
-        ui::SliderState gain;
         ui::ButtonState mute;
+        ui::ButtonState lockb;
     };
     std::unordered_map<uint64_t, AudioLaneUi> audio_ui;
+    // Video lane label controls: visibility eye + lock.
+    struct VideoLaneUi {
+        ui::ButtonState eye;
+        ui::ButtonState lockb;
+    };
+    std::unordered_map<uint64_t, VideoLaneUi> track_ui;
+    // Timeline entity TABS: every look/sequence opened for editing this
+    // session, in open order - the active one is the scope. View state
+    // (never serialized); dead ids prune at build, an absent scope
+    // re-registers itself.
+    std::vector<uint64_t> open_tabs;
+    struct TabUi {
+        ui::ButtonState chip;
+        ui::ButtonState close;
+    };
+    std::unordered_map<uint64_t, TabUi> tab_ui;
+    ui::ButtonState snap_button;
     // Browser rows (sequences + assets) on the project tab.
     struct BrowserRowUi {
         ui::ButtonState open, place;
@@ -3043,7 +3312,8 @@ struct AppState {
     int mon_mode = 0;   // 0 idle, 1 move, 2 scale, 3 rotate
     Vec2 mon_anchor{};
     doc::Placement mon_orig{};
-    ui::SliderState block_xf_sliders[5];
+    ui::SliderState block_xf_sliders[7];
+    ui::ButtonState block_anchor_media_btn, block_anchor_screen_btn;
     // The displayed frame's provenance: which doc revision it rendered
     // and the measured content box of the selected block (canvas
     // fractions). The overlay draws GLUED to the displayed frame -
@@ -3064,11 +3334,6 @@ struct AppState {
     uint64_t gesture_revision = 0;
     uint64_t gesture_seq = 0;
     doc::Placement gesture_place{};
-    // The content box FROZEN at gesture start (source-uv offsets): the
-    // scale/rotate pivot and re-anchor math use this, never the live
-    // measured box - on animated content the live box moves every frame
-    // and a pivot chasing it reads as drift.
-    float mon_box[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
     // Program monitor zoom/pan: 1 = aspect-fit; wheel over the preview
     // scales about the cursor, middle-drag pans (the canvas gesture).
     // View state, both scopes.
@@ -3105,7 +3370,13 @@ struct AppState {
     // the first-anchor click closes it. Structural edits (append,
     // insert, close, delete) execute un-coalesced; drags stage a whole
     // layer per frame and coalesce per layer id.
-    int giz_path_sel = -1;         // selected control point
+    int giz_path_sel = -1;         // primary control point (tangent UI)
+    // Multi-selection as a bitmask (paths cap at 64 points): marquee
+    // fills it, shift-click toggles, moves and Delete act on the set.
+    uint64_t giz_path_mask = 0;
+    // Path snapshot at group-drag start - every masked anchor offsets
+    // from here so the set moves rigidly.
+    std::vector<doc::PathPoint> giz_path_orig;
     uint64_t giz_path_layer = 0;   // resets the selection on layer change
     bool giz_layer_staged = false;
     bool giz_layer_coalesce = false;
@@ -3263,9 +3534,14 @@ void refresh_node_audio(AppState& app) {
             const auto pit = app.pcm_cache.find(chain.asset);
             if (pit == app.pcm_cache.end() || !pit->second) continue;
             const media::PcmBuffer& pcm = *pit->second;
+            // Curves are MEDIA-frame indexed (eval maps the look clock
+            // in through the chain's conform rate), so the analysis
+            // grid is the ASSET's own rate, not the project's.
+            const doc::Asset* a = app.document.find_asset(chain.asset);
+            const double afps = a && a->fps > 0.0 ? a->fps : fps;
             uint64_t key = hash_combine(chain.asset, pcm.frames());
             uint64_t bits = 0;
-            std::memcpy(&bits, &fps, 8);
+            std::memcpy(&bits, &afps, 8);
             key = hash_combine(key, bits);
             for (uint32_t i = 0; i < chain.op_count; ++i) {
                 const doc::AudioOp& op = chain.ops[i];
@@ -3290,24 +3566,23 @@ void refresh_node_audio(AppState& app) {
                 }
                 media::PcmBuffer processed;
                 media::render_processed_pcm(pcm, ops, &processed);
-                const doc::Asset* a = app.document.find_asset(chain.asset);
                 const double secs =
                     pcm.rate ? static_cast<double>(pcm.frames()) / pcm.rate
                              : 0.0;
                 const uint32_t media_frames = std::max<uint32_t>(
                     a ? a->frame_count : 0,
-                    static_cast<uint32_t>(secs * fps) + 1);
+                    static_cast<uint32_t>(secs * afps) + 1);
                 mod::AnalysisData data;
                 mod::analyze_audio(processed.samples.data(),
                                    processed.frames(), processed.channels,
-                                   processed.rate, fps, media_frames,
+                                   processed.rate, afps, media_frames,
                                    &data);
                 auto owned = std::make_shared<mod::AnalysisCurves>();
                 *owned = data.curves();
                 curves = owned;
             }
             keep.emplace(key, curves);
-            (*map)[vn.id] = {curves, chain.slip, chain.offset};
+            (*map)[vn.id] = {curves, chain.slip, chain.offset, chain.rate};
         }
     app.node_audio_cache = std::move(keep);   // unreferenced entries drop
     app.node_audio_map = std::move(map);
@@ -3469,7 +3744,7 @@ void refresh_node_camera(AppState& app) {
                 if (!has_region && !has_anchor)
                     conv.emplace(chain.asset, curves);
             }
-            (*map)[vn.id] = {curves, chain.slip, chain.offset};
+            (*map)[vn.id] = {curves, chain.slip, chain.offset, chain.rate};
         }
     app.node_camera_map = std::move(map);
 }
@@ -3480,7 +3755,7 @@ bool load_track_sidecar(AppState& app, uint64_t asset_id) {
     if (app.track_cache.count(asset_id)) return true;
     const doc::Asset* a = app.document.find_asset(asset_id);
     if (!a || a->path.empty()) return false;
-    const std::filesystem::path src = std::filesystem::u8path(a->path);
+    const std::filesystem::path src = u8_to_path(a->path);
     const media::SidecarPaths sc =
         media::sidecars_for(bundle_dir_for(src), src);
     auto data = std::make_shared<media::TrackData>();
@@ -3538,7 +3813,7 @@ void refresh_pin_planes(AppState& app) {
         if (!dirty) continue;
         const doc::Asset* a = app.document.find_asset(asset);
         if (!a) continue;
-        const std::filesystem::path src = std::filesystem::u8path(a->path);
+        const std::filesystem::path src = u8_to_path(a->path);
         const media::SidecarPaths sc =
             media::sidecars_for(bundle_dir_for(src), src);
         media::track_save(sc.track, *app.track_cache[asset]);
@@ -3575,7 +3850,7 @@ void start_track_job(AppState& app, uint64_t asset_id,
         app.status = "nothing to track (no video)";
         return;
     }
-    const std::filesystem::path src = std::filesystem::u8path(a->path);
+    const std::filesystem::path src = u8_to_path(a->path);
     const media::SidecarPaths sc =
         media::sidecars_for(bundle_dir_for(src), src);
     const uint64_t want_hash = track_settings_hash(*a);
@@ -3702,11 +3977,18 @@ void start_track_job(AppState& app, uint64_t asset_id,
         if (ok) {
             // 3D pass over the stored tracks (per shot, pure CPU); the
             // card shows "solving 3d" while frames_done sits at total.
-            if (!jp->cancel.load()) media::sfm_solve(&jp->result);
-            jp->result.settings_hash = want_hash;
-            if (!media::track_save(track_path, jp->result))
-                log_warn("track: sidecar write failed (non-fatal)");
-        } else if (jp->error.empty()) {
+            media::sfm_solve(&jp->result, cancelled);
+            if (jp->cancel.load()) {
+                // Cancelled mid-3D: cache NOTHING - a saved partial
+                // verdict would read as final through the no-op check.
+                ok = false;
+            } else {
+                jp->result.settings_hash = want_hash;
+                if (!media::track_save(track_path, jp->result))
+                    log_warn("track: sidecar write failed (non-fatal)");
+            }
+        }
+        if (!ok && jp->error.empty()) {
             jp->error = jp->cancel.load() ? "cancelled" : "decode failed";
         }
         jp->ok = ok;
@@ -3775,13 +4057,17 @@ void refresh_scope_analysis(AppState& app) {
             for (size_t s = 0; s < nsets; ++s)
                 longest = std::max(longest, src[s]->size());
             if (!longest) continue;
-            // Root span where the instance plays INSIDE its curves.
+            // Root span where the instance plays INSIDE its curves
+            // (sidecar curves are MEDIA-frame indexed; the conform rate
+            // maps their end back onto the clock).
             const double speed = c.speed > 1e-9 ? c.speed : 1.0;
+            const double rate = c.rate > 0.0 ? c.rate : 1.0;
             const double lo_f = std::max(0.0, c.t_in);
             const double hi_f = std::min(
                 {c.t_out,
-                 c.t_in +
-                     (static_cast<double>(longest) - c.source_in) / speed,
+                 c.t_in + ((static_cast<double>(longest) -
+                            static_cast<double>(c.shift)) / rate -
+                           c.source_in) / speed,
                  kMaxFrames});
             if (hi_f <= lo_f) continue;
             const uint32_t lo = static_cast<uint32_t>(std::ceil(lo_f));
@@ -3790,7 +4076,7 @@ void refresh_scope_analysis(AppState& app) {
                 if (src[s]->empty()) continue;
                 if (dst[s]->size() < hi) dst[s]->resize(hi, 0.0f);
                 for (uint32_t f = lo; f < hi; ++f) {
-                    const double mf = doc::media_source_frame(c, f);
+                    const double mf = doc::media_asset_frame(c, f);
                     if (mf < 0.0) continue;
                     size_t m = static_cast<size_t>(mf);
                     if (m >= src[s]->size()) m = src[s]->size() - 1;
@@ -3822,10 +4108,10 @@ void sync_sidechain(AppState& app) {
     app.sc_pcm_path.clear();
     if (want.empty()) return;
 
-    const std::filesystem::path src(want);
+    const std::filesystem::path src = u8_to_path(want);
     std::error_code ec;
     if (!std::filesystem::exists(src, ec)) {
-        app.status = "sidechain missing: " + src.filename().string();
+        app.status = "sidechain missing: " + path_to_u8(src.filename());
         return;
     }
     std::filesystem::path dest = app.bundle_base;
@@ -3838,7 +4124,7 @@ void sync_sidechain(AppState& app) {
     }
     app.sc_pcm_path = dest;
     app.sc_ok = true;
-    app.status = "sidechain: " + src.filename().string();
+    app.status = "sidechain: " + path_to_u8(src.filename());
 }
 
 // ---- UI preferences (theme + section folds): tiny exe-relative ui.json,
@@ -3865,6 +4151,35 @@ void save_ui_prefs(const AppState& app) {
         json::Value recents = json::Value::make_array();
         for (const std::string& r : app.recent_projects) recents.push(r);
         v.set("recent", std::move(recents));
+    }
+    // Keybinds: deviations from the registry defaults only; a default
+    // chord the user cleared writes {} (explicit unbind).
+    {
+        const std::map<std::string, KeyBinding> defs = default_keybinds();
+        json::Value kb = json::Value::make_object();
+        for (const auto& [chord, bind] : app.keybinds) {
+            const auto d = defs.find(chord);
+            if (d != defs.end() && d->second == bind) continue;
+            json::Value e = json::Value::make_object();
+            e.set(bind.kind == KeyBinding::Kind::Action  ? "action"
+                  : bind.kind == KeyBinding::Kind::Macro ? "macro"
+                                                         : "script",
+                  bind.value);
+            kb.set(chord, std::move(e));
+        }
+        for (const auto& [chord, bind] : defs)
+            if (!app.keybinds.count(chord))
+                kb.set(chord, json::Value::make_object());
+        if (kb.size()) v.set("keybinds", std::move(kb));
+    }
+    if (!app.macros.empty()) {
+        json::Value ms = json::Value::make_object();
+        for (const auto& [name, steps] : app.macros) {
+            json::Value list = json::Value::make_array();
+            for (const std::string& s : steps) list.push(s);
+            ms.set(name, std::move(list));
+        }
+        v.set("macros", std::move(ms));
     }
     const std::string text = json::write(v, true);
     write_file_bytes(executable_dir() / "ui.json", text.data(), text.size());
@@ -3909,6 +4224,40 @@ void load_ui_prefs(AppState& app) {
         std::string p = rv.as_string();
         if (!p.empty()) app.recent_projects.push_back(std::move(p));
     }
+    // Macros before keybinds so macro binds can validate. Steps load
+    // verbatim - they are statements, validated at edit and fire time
+    // (a renamed action surfaces as a fire-time error, never a
+    // silently shortened macro).
+    for (const json::Member& m : parsed.value->get("macros").object()) {
+        if (m.first.empty() || !m.second.is_array()) continue;
+        std::vector<std::string> steps;
+        for (const json::Value& sv : m.second.array())
+            steps.push_back(sv.as_string());
+        app.macros[m.first] = std::move(steps);
+    }
+    // Deviations apply over the seeded defaults: chords no keypress
+    // can produce and unknown targets drop (the default stands, and a
+    // stale file heals on the next save), {} unbinds a default chord,
+    // script binds keep even when the file is missing (shown dimmed).
+    for (const json::Member& m : parsed.value->get("keybinds").object()) {
+        if (!m.second.is_object()) continue;
+        const std::string chord = normalize_chord(m.first);
+        if (chord.empty()) continue;
+        const std::string& act = m.second.get("action").as_string();
+        const std::string& mac = m.second.get("macro").as_string();
+        const std::string& scr = m.second.get("script").as_string();
+        if (!act.empty()) {
+            if (action_exists(act))
+                app.keybinds[chord] = {KeyBinding::Kind::Action, act};
+        } else if (!mac.empty()) {
+            if (app.macros.count(mac))
+                app.keybinds[chord] = {KeyBinding::Kind::Macro, mac};
+        } else if (!scr.empty()) {
+            app.keybinds[chord] = {KeyBinding::Kind::Script, scr};
+        } else {
+            app.keybinds.erase(chord);
+        }
+    }
     ui::set_active_theme(app.theme_index);
 }
 
@@ -3932,8 +4281,8 @@ std::vector<media::AssetBundle> build_bundle_table(const doc::Document& doc,
         media::AssetBundle bundle;
         bundle.asset = asset.id;
         if (!asset.path.empty()) {
-            const BundlePaths paths = resolve_bundle(
-                std::filesystem::path(asset.path), preview);
+            const BundlePaths paths =
+                resolve_bundle(u8_to_path(asset.path), preview);
             if (paths.ready) {
                 if (!paths.native.empty()) {
                     // Native video: facts straight from the container -
@@ -3988,23 +4337,38 @@ void refresh_bundles(AppState& app) {
         const media::AssetBundle& bundle = table[i];
         // The document caches what looks need before any decode opens.
         // Direct write, like the media binding: media facts, not edits.
+        const bool still =
+            !asset.path.empty() && is_still_source(u8_to_path(asset.path));
         if (asset.frame_count != bundle.frames || asset.fps != bundle.fps ||
-            asset.width != bundle.width || asset.height != bundle.height) {
+            asset.width != bundle.width || asset.height != bundle.height ||
+            asset.still != still) {
             asset.frame_count = bundle.frames;
             asset.fps = bundle.fps;
             asset.width = bundle.width;
             asset.height = bundle.height;
+            asset.still = still;
             doc_changed = true;
         }
-        if (!bundle.pcm.empty() && !app.pcm_cache.count(asset.id))
-            app.pcm_cache[asset.id] = media::load_pcm(bundle.pcm);
+        if (!bundle.pcm.empty() && !app.pcm_cache.count(asset.id)) {
+            // The import job preloads the pcm it wrote on ITS thread;
+            // a fresh import seeds from that handoff instead of
+            // re-reading a file this thread must not stall on.
+            std::shared_ptr<const media::PcmBuffer> pre;
+            if (app.import &&
+                (app.import->progress.ready.load() ||
+                 app.import->done.load()) &&
+                asset.path == path_to_u8(app.import->source))
+                pre = app.import->progress.pcm;   // ordered by ready/done
+            app.pcm_cache[asset.id] =
+                pre ? pre : media::load_pcm(bundle.pcm);
+        }
         // Import-time curves per asset, the composite's inputs. A null
         // entry means probed-and-absent; the import-done path erases the
         // entry when a pass lands new curves.
         if (!asset.path.empty() && !app.asset_analysis.count(asset.id) &&
             (bundle.frames || !bundle.pcm.empty())) {
             std::filesystem::path ap =
-                resolve_bundle(std::filesystem::path(asset.path)).base;
+                resolve_bundle(u8_to_path(asset.path)).base;
             if (!ap.empty()) {
                 ap.replace_extension(".analysis");
                 mod::AnalysisData data;
@@ -4058,7 +4422,7 @@ const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
         return &s;
     }
     const BundlePaths paths =
-        resolve_bundle(std::filesystem::path(a->path));
+        resolve_bundle(u8_to_path(a->path));
     std::filesystem::path tpath = paths.base;
     tpath.replace_extension(".thumbs");
     media::ThumbStripData strip;
@@ -4156,9 +4520,8 @@ void refresh_mix(AppState& app) {
     app.mix_stamp = app.bundle_stamp;
     app.mix_look = app.scope_look;
     auto mix = std::make_shared<media::MixState>(build_mix(
-        app.document, app.scope_look, app.pcm_cache,
-        project_fps(app.document, app.bundles), app.player.audio_sample_rate(),
-        app.player.audio_channels()));
+        app.document, app.scope_look, app.pcm_cache, app.scoped_fps(),
+        app.player.audio_sample_rate(), app.player.audio_channels()));
     app.scope_mix = mix;   // the Audio Scope strips from the same mix
     app.player.set_mix(std::move(mix));
 }
@@ -4212,6 +4575,82 @@ uint64_t find_wrapper_look(const doc::Document& doc, uint64_t asset_id) {
     return 0;
 }
 
+// Track MIRRORING for the pair rule: a drop's audio half lands on the
+// audio track at the SAME INDEX as its video lane (a2 under v2) - and
+// the reverse maps an audio track to its same-index video lane. A short
+// side mints exactly ONE next track and lands there (v4 over two audio
+// tracks mints a3, never a bulk fill to a4). A locked mirror falls to
+// the first unlocked track, else a fresh one (lanes cap at kMaxLayers).
+// Both execute through the undo stack: callers hold a group so the mint
+// collapses into the placement's step.
+uint64_t mirror_audio_track(AppState& app, uint64_t sequence,
+                            uint64_t video_lane_id) {
+    doc::Sequence& seq = app.document.sequence(sequence);
+    size_t index = 0;
+    for (size_t i = 0; i < seq.tracks.size(); ++i)
+        if (seq.tracks[i].id == video_lane_id) index = i;
+    if (seq.audio.size() <= index &&
+        seq.audio.size() < doc::kMaxLayers)
+        app.undo.execute(app.document,
+                         doc::add_audio_track_command(
+                             seq.id,
+                             doc::make_audio_track(app.document, seq)));
+    if (seq.audio.empty()) return 0;   // the pair lay mints on demand
+    size_t pick = std::min(index, seq.audio.size() - 1);
+    if (seq.audio[pick].lock) {
+        size_t found = seq.audio.size();
+        for (size_t i = 0; i < seq.audio.size(); ++i)
+            if (!seq.audio[i].lock) {
+                found = i;
+                break;
+            }
+        if (found == seq.audio.size() &&
+            seq.audio.size() < doc::kMaxLayers) {
+            app.undo.execute(app.document,
+                             doc::add_audio_track_command(
+                                 seq.id, doc::make_audio_track(
+                                             app.document, seq)));
+            found = seq.audio.size() - 1;
+        }
+        if (found < seq.audio.size()) pick = found;
+    }
+    return seq.audio[pick].id;
+}
+
+uint64_t mirror_video_lane(AppState& app, uint64_t sequence,
+                           uint64_t audio_track_id) {
+    doc::Sequence& seq = app.document.sequence(sequence);
+    size_t index = 0;
+    for (size_t i = 0; i < seq.audio.size(); ++i)
+        if (seq.audio[i].id == audio_track_id) index = i;
+    if (seq.tracks.size() <= index &&
+        seq.tracks.size() < doc::kMaxLayers)
+        app.undo.execute(app.document,
+                         doc::add_track_command(
+                             seq.id, doc::make_track(app.document, seq),
+                             seq.tracks.size()));
+    size_t pick = std::min(index, seq.tracks.size() - 1);
+    if (seq.tracks[pick].lock) {
+        size_t found = seq.tracks.size();
+        for (size_t i = 0; i < seq.tracks.size(); ++i)
+            if (!seq.tracks[i].lock) {
+                found = i;
+                break;
+            }
+        if (found == seq.tracks.size() &&
+            seq.tracks.size() < doc::kMaxLayers) {
+            app.undo.execute(app.document,
+                             doc::add_track_command(
+                                 seq.id,
+                                 doc::make_track(app.document, seq),
+                                 seq.tracks.size()));
+            found = seq.tracks.size() - 1;
+        }
+        if (found < seq.tracks.size()) pick = found;
+    }
+    return seq.tracks[pick].id;
+}
+
 // Adds `picked` to the project as an ASSET and places it at `at_frame`:
 // at sequence scope the media arrives WRAPPED IN A LOOK and lands as a
 // block on the first lane (with its linked audio pair when the media has
@@ -4227,7 +4666,7 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
 
     uint64_t asset_id = 0;
     for (const doc::Asset& a : app.document.assets)
-        if (a.path == picked.string()) asset_id = a.id;
+        if (a.path == path_to_u8(picked)) asset_id = a.id;
 
     if (app.scope_is_look()) {
         // Graph drop: a media node, in lockstep like every source.
@@ -4237,9 +4676,9 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
         }
         app.undo.begin_group("Add Media");
         if (!asset_id) {
-            doc::Asset asset = doc::make_asset(app.document,
-                                               picked.filename().string(),
-                                               picked.string());
+            doc::Asset asset = doc::make_asset(
+                app.document, path_to_u8(picked.filename()),
+                path_to_u8(picked));
             asset_id = asset.id;
             app.undo.execute(app.document,
                              doc::add_asset_command(std::move(asset)));
@@ -4248,7 +4687,7 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
                          doc::materialize_links_command(app.look().id));
         doc::Layer layer =
             doc::make_layer(app.document, doc::LayerSourceKind::Media);
-        layer.name = picked.stem().string();
+        layer.name = path_to_u8(picked.stem());
         layer.asset = asset_id;
         const uint64_t layer_id = layer.id;
         app.undo.execute(app.document,
@@ -4262,7 +4701,7 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
         refresh_bundles(app);
         app.selected_layer = app.look().layers.size() - 1;
         app.layer_sel = false;
-        app.status = "added " + picked.filename().string();
+        app.status = "added " + path_to_u8(picked.filename());
         return true;
     }
 
@@ -4280,19 +4719,19 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
     const uint64_t lane_id = lane->id;
     app.undo.begin_group("Add Media");
     if (!asset_id) {
-        doc::Asset asset = doc::make_asset(app.document,
-                                           picked.filename().string(),
-                                           picked.string());
+        doc::Asset asset = doc::make_asset(
+            app.document, path_to_u8(picked.filename()),
+            path_to_u8(picked));
         asset_id = asset.id;
         app.undo.execute(app.document,
                          doc::add_asset_command(std::move(asset)));
     }
     uint64_t wrapper = find_wrapper_look(app.document, asset_id);
     if (!wrapper) {
-        doc::Look look = doc::make_look(app.document, picked.stem().string());
+        doc::Look look = doc::make_look(app.document, path_to_u8(picked.stem()));
         doc::Layer media =
             doc::make_layer(app.document, doc::LayerSourceKind::Media);
-        media.name = picked.stem().string();
+        media.name = path_to_u8(picked.stem());
         media.asset = asset_id;
         look.layers.push_back(std::move(media));
         wrapper = look.id;
@@ -4317,28 +4756,27 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
     // Media WITH sound lays a linked audio placement beside the video
     // one: audio presence is a placement that exists, never an inference
     // from the asset. Silent media lays none.
+    uint64_t audio_place_id = 0;
     if (!paths.pcm.empty()) {
         doc::Placement ap;
+        ap.id = app.document.next_effect_id++;
         ap.target = wrapper;
         ap.t_in = at_frame;
         ap.t_out = 0;
+        audio_place_id = ap.id;
         const uint64_t audio_track =
-            seq.audio.empty() ? 0 : seq.audio.front().id;
+            mirror_audio_track(app, seq.id, lane_id);
         app.undo.execute(app.document,
                          doc::add_audio_placement_command(
                              app.document, seq.id, audio_track, ap,
                              video_place_id));
     }
-    // The landed block OVERWRITES whatever its span covers on the lane.
-    if (const doc::Placement* landed = video_place_id
-            ? doc::find_placement(app.sequence(), video_place_id)
-            : nullptr) {
-        const uint32_t end = doc::placement_end(
-            *landed, doc::source_length(app.document, *landed));
-        doc::overwrite_lane_span(app.document, app.undo, seq.id, lane_id,
-                                 video_place_id, landed->link, at_frame,
-                                 end);
-    }
+    // The landing OVERWRITES what it covers - the video block AND its
+    // linked audio partner each claim their own lane's span.
+    if (video_place_id || audio_place_id)
+        doc::overwrite_group_spans(app.document, app.undo, seq.id,
+                                   video_place_id ? video_place_id
+                                                  : audio_place_id);
     app.undo.end_group();
 
     // The asset's length and size are media facts, not edits: probe them
@@ -4349,18 +4787,21 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
     app.selected_layer = 0;
     app.layer_sel = false;
     app.sel_placement = 0;
-    app.status = "placed " + picked.filename().string();
+    app.status = "placed " + path_to_u8(picked.filename());
     return true;
 }
 
 // Lays entity `target_id` as a block on `track_id` of `sequence` at
-// `at_frame`: the placement, its linked audio pair when the target has
-// any sound under it, and the lane-span overwrite - one undo step. The
-// UI drop path and the script's place op share this. track_id 0 = the
-// front lane. Returns the video placement id, 0 when the lane is full
-// or missing. Callers guard cycles with nest_reaches FIRST.
+// `at_frame`: the placement, its linked audio pair on the MIRROR track
+// (same index, minted when short) when the target has any sound under
+// it, and the lane-span overwrite - one undo step. The UI drop path and
+// the script's place op share this. track_id 0 = the front lane;
+// audio_track overrides the mirror (the audio-lane drop names its own).
+// Returns the video placement id, 0 when the lane is full or missing.
+// Callers guard cycles with nest_reaches FIRST.
 uint64_t lay_block(AppState& app, uint64_t sequence, uint64_t track_id,
-                   uint64_t target_id, uint32_t at_frame) {
+                   uint64_t target_id, uint32_t at_frame,
+                   uint64_t audio_track = 0) {
     doc::Sequence& seq = app.document.sequence(sequence);
     const doc::SeqTrack* lane = nullptr;
     for (const doc::SeqTrack& t : seq.tracks)
@@ -4383,22 +4824,16 @@ uint64_t lay_block(AppState& app, uint64_t sequence, uint64_t track_id,
         doc::Placement ap;
         ap.target = target_id;
         ap.t_in = at_frame;
-        const uint64_t audio_track =
-            seq.audio.empty() ? 0 : seq.audio.front().id;
+        if (!audio_track)
+            audio_track = mirror_audio_track(app, seq.id, lane_id);
         app.undo.execute(app.document,
                          doc::add_audio_placement_command(
                              app.document, seq.id, audio_track, ap,
                              video_place_id));
     }
-    // The landed block OVERWRITES whatever its span covers on the lane.
-    if (const doc::Placement* landed = doc::find_placement(
-            app.document.sequence(sequence), video_place_id)) {
-        const uint32_t end = doc::placement_end(
-            *landed, doc::source_length(app.document, *landed));
-        doc::overwrite_lane_span(app.document, app.undo, seq.id, lane_id,
-                                 video_place_id, landed->link, at_frame,
-                                 end);
-    }
+    // The landing OVERWRITES what it covers on BOTH lanes of the pair.
+    doc::overwrite_group_spans(app.document, app.undo, seq.id,
+                               video_place_id);
     app.undo.end_group();
     return video_place_id;
 }
@@ -4480,7 +4915,7 @@ void ensure_media_placed(AppState& app,
     if (!app.scope_is_look()) {
         uint64_t asset_id = 0;
         for (const doc::Asset& a : app.document.assets)
-            if (a.path == picked.string()) asset_id = a.id;
+            if (a.path == path_to_u8(picked)) asset_id = a.id;
         if (asset_id) {
             const uint64_t wrapper =
                 find_wrapper_look(app.document, asset_id);
@@ -4498,19 +4933,19 @@ void ensure_media_placed(AppState& app,
 // Media without a bundle runs the import job flagged import_only.
 void import_media(AppState& app, const std::filesystem::path& picked) {
     for (const doc::Asset& a : app.document.assets)
-        if (a.path == picked.string()) {
+        if (a.path == path_to_u8(picked)) {
             app.status =
-                "already imported: " + picked.filename().string();
+                "already imported: " + path_to_u8(picked.filename());
             return;
         }
     const BundlePaths paths = resolve_bundle(picked);
     if (paths.ready) {
         doc::Asset asset = doc::make_asset(
-            app.document, picked.filename().string(), picked.string());
+            app.document, path_to_u8(picked.filename()), path_to_u8(picked));
         app.undo.execute(app.document,
                          doc::add_asset_command(std::move(asset)));
         refresh_bundles(app);
-        app.status = "imported " + picked.filename().string();
+        app.status = "imported " + path_to_u8(picked.filename());
         return;
     }
     if (!import_slot_free(app)) {
@@ -4540,7 +4975,7 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
     if (!picked) return;
     uint64_t asset_id = 0;
     for (const doc::Asset& a : app.document.assets)
-        if (a.path == picked->string()) asset_id = a.id;
+        if (a.path == path_to_u8(*picked)) asset_id = a.id;
     const BundlePaths paths = resolve_bundle(*picked);
     if (asset_id || paths.ready) {
         doc::Look* look = app.document.find_look(look_id);
@@ -4552,8 +4987,8 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
         app.undo.begin_group("Bind Media");
         if (!asset_id) {
             doc::Asset asset = doc::make_asset(
-                app.document, picked->filename().string(),
-                picked->string());
+                app.document, path_to_u8(picked->filename()),
+                path_to_u8(*picked));
             asset_id = asset.id;
             app.undo.execute(app.document,
                              doc::add_asset_command(std::move(asset)));
@@ -4565,7 +5000,7 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
             doc::set_layer_props_command(look_id, std::move(edited)));
         app.undo.end_group();
         refresh_bundles(app);
-        app.status = "bound " + picked->filename().string();
+        app.status = "bound " + path_to_u8(picked->filename());
         return;
     }
     const std::filesystem::path dest = bundle_dir_for(*picked);
@@ -4581,7 +5016,7 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
 void open_source(AppState& app, const std::filesystem::path& picked) {
     // Bind the media to the document so save/open restores it. Direct write,
     // not a command: the media binding is environment, not an undoable edit.
-    bind_primary_media(app.document, picked.string());
+    bind_primary_media(app.document, path_to_u8(picked));
     app.duration_focus = false;
     app.duration_edit.clear();
     // The render worker must not touch the decode pool's files while the
@@ -4605,7 +5040,7 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
     // app never dumps files into footage folders.
     const BundlePaths paths = resolve_bundle(picked);
     if (paths.ready) {
-        app.media_name = picked.filename().string();
+        app.media_name = path_to_u8(picked.filename());
         app.bundle_base = paths.base;
         app.pcm_path = paths.pcm;
         refresh_bundles(app);
@@ -4637,13 +5072,29 @@ void open_source(AppState& app, const std::filesystem::path& picked) {
 // bundle). Duration edits and their reconciliation act on IT — keying
 // them on assets.front() rewrote one asset's file while stamping
 // another's record whenever the opened media was not asset zero.
+// Memoized: the resolve walks every asset through filesystem metadata,
+// and this runs from per-frame UI - it must not repeat while nothing
+// moved (an active ingest writing the cache directory makes those
+// calls stall for tens of ms each).
 doc::Asset* opened_asset(AppState& app) {
     if (app.bundle_base.empty()) return nullptr;
+    if (app.opened_memo_stamp == app.bundle_stamp &&
+        app.opened_memo_revision == app.document.revision &&
+        app.opened_memo_base == app.bundle_base)
+        return app.opened_memo_asset
+                   ? app.document.find_asset(app.opened_memo_asset)
+                   : nullptr;
+    app.opened_memo_stamp = app.bundle_stamp;
+    app.opened_memo_revision = app.document.revision;
+    app.opened_memo_base = app.bundle_base;
+    app.opened_memo_asset = 0;
     for (doc::Asset& a : app.document.assets)
         if (!a.path.empty() &&
-            resolve_bundle(std::filesystem::path(a.path)).base ==
-                app.bundle_base)
+            resolve_bundle(u8_to_path(a.path)).base ==
+                app.bundle_base) {
+            app.opened_memo_asset = a.id;
             return &a;
+        }
     return nullptr;
 }
 
@@ -4851,7 +5302,7 @@ void preset_new_bin(AppState& app) {
             return;
         }
         rescan_presets(app);
-        const std::string rel = dir.filename().string();
+        const std::string rel = path_to_u8(dir.filename());
         // A fresh "bin N" is a placeholder: straight into rename.
         app.preset_sel = preset_bin_key(rel);
         app.preset_rename_key = app.preset_sel;
@@ -4924,7 +5375,7 @@ uint64_t scan_cache_bytes() {
 // with the ui prefs and listed on the project tab.
 void remember_recent_project(AppState& app,
                              const std::filesystem::path& path) {
-    const std::string s = path.string();
+    const std::string s = path_to_u8(path);
     auto& recents = app.recent_projects;
     recents.erase(std::remove(recents.begin(), recents.end(), s),
                   recents.end());
@@ -4961,6 +5412,11 @@ bool enter_scope(AppState& app, uint64_t target) {
         tl ? nullptr : app.document.find_sequence(target);
     if (!tl && !ts) return false;
     app.scope_look = target;
+    // Every opened entity keeps a timeline TAB for the session; the
+    // active tab IS the scope. Re-entering an open one just activates.
+    if (std::find(app.open_tabs.begin(), app.open_tabs.end(), target) ==
+        app.open_tabs.end())
+        app.open_tabs.push_back(target);
     app.open_group = 0;
     app.sel = {};
     app.selected_layer = 0;
@@ -4998,13 +5454,13 @@ void save_project(AppState& app, const std::filesystem::path& path) {
             path, version_path(1),
             std::filesystem::copy_options::overwrite_existing, ec);
     }
-    app.document.name = path.stem().string();
+    app.document.name = path_to_u8(path.stem());
     if (doc::save_document(path, app.document)) {
         const bool was_untitled = app.project_path.empty();
         app.project_path = path;
         app.saved_revision = app.document.revision;
         app.autosaved_revision = app.document.revision;
-        app.status = "saved " + path.filename().string();
+        app.status = "saved " + path_to_u8(path.filename());
         remember_recent_project(app, path);
         // The work now lives in a real file — retire the autosaves that
         // covered it.
@@ -5013,7 +5469,7 @@ void save_project(AppState& app, const std::filesystem::path& path) {
             std::filesystem::remove(
                 executable_dir() / "cache" / "untitled.autosave.json", ec);
     } else {
-        app.status = "save failed: " + path.string();
+        app.status = "save failed: " + path_to_u8(path);
     }
 }
 
@@ -5044,6 +5500,21 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
     app.analysis_revision = ~0ull;
     app.asset_analysis.clear();
     app.mix_revision = ~0ull;
+    // Every cache keyed by ASSET ID drops with the document: ids
+    // restart low in each project, so stale entries do not dangle -
+    // they COLLIDE and serve the previous project's data (audio,
+    // motion solves, filmstrips) under the new project's assets.
+    app.pcm_cache.clear();
+    app.track_cache.clear();
+    app.asset_strips.clear();
+    // Running background jobs belong to the OLD document: an import's
+    // completion would plant its asset here, a track solve would adopt
+    // into the cleared cache under a colliding id. Cancel both (joins
+    // are bounded - every stage polls) and drop queued media with them.
+    app.import.reset();
+    app.media_import_queue.clear();
+    if (app.track_job) app.track_job->cancel = true;
+    app.track_job.reset();
     // The gesture overlay belongs to the OLD document; its revision
     // would outrank the restarted counter and its placement id resolves
     // to an unrelated real placement in the new project.
@@ -5056,6 +5527,7 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
     // self-repairs when the id is gone entirely.
     app.scope_look = app.document.root_sequence;
     app.open_group = 0;
+    app.open_tabs.clear();   // tabs are session state of the OLD project
     app.tl_v0 = app.tl_v1 = 0.0;   // re-resolve the view to the new span
     app.selected_layer = 0;
     app.layer_sel = false;
@@ -5071,7 +5543,7 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
     if (!path.empty()) remember_recent_project(app, path);
     std::string note = path.empty()
         ? "restored unsaved session"
-        : "opened " + path.filename().string();
+        : "opened " + path_to_u8(path.filename());
     // Media is environment, not document: whatever the project names gets
     // resolved fresh, and a look of generators opens perfectly well
     // without any.
@@ -5089,7 +5561,8 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
         if (app.thumb_worker) app.thumb_worker->resume();
         if (app.render_worker) app.render_worker->resume();
     };
-    const std::filesystem::path media = primary_media_path(app.document);
+    const std::filesystem::path media =
+        u8_to_path(primary_media_path(app.document));
     std::error_code ec;
     if (!media.empty() && std::filesystem::exists(media, ec)) {
         open_source(app, media);   // may report its own failure
@@ -5114,7 +5587,7 @@ void open_project(AppState& app, const std::filesystem::path& path,
         d.kind = ConfirmDialog::Kind::YesNo;
         d.action = ConfirmDialog::Action::RestoreProjectAutosave;
         d.title = "crash recovery";
-        d.text = "a newer autosave of " + path.filename().string() +
+        d.text = "a newer autosave of " + path_to_u8(path.filename()) +
                  " exists - restore it?";
         d.primary = "restore";
         d.secondary = "discard";
@@ -5142,7 +5615,7 @@ bool guard_unsaved_changes(AppState& app, ConfirmDialog::Action action,
     if (app.confirm.open()) return false;
     const std::string name = app.project_path.empty()
         ? std::string("untitled")
-        : app.project_path.filename().string();
+        : path_to_u8(app.project_path.filename());
     ConfirmDialog d;
     d.kind = ConfirmDialog::Kind::SaveDiscard;
     d.action = action;
@@ -5180,7 +5653,7 @@ void request_browser_delete(AppState& app, uint64_t id) {
         kind = "sequence";
     } else if (const doc::Asset* a = app.document.find_asset(id)) {
         name = a->name.empty()
-            ? std::filesystem::path(a->path).filename().string()
+            ? path_to_u8(u8_to_path(a->path).filename())
             : a->name;
         kind = "media";
     } else {
@@ -5371,7 +5844,7 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
             if (pick == 1) {
                 std::filesystem::remove(d.path, ec);
                 app.status = ec ? "preset delete failed"
-                                : "deleted " + d.path.filename().string();
+                                : "deleted " + path_to_u8(d.path.filename());
                 rescan_presets(app);
                 app.preset_sel = 0;
             }
@@ -5393,9 +5866,27 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
                 std::filesystem::remove(d.path, ec);
                 app.status = ec ? "bin delete failed"
                                 : "deleted bin " +
-                                      d.path.filename().string();
+                                      path_to_u8(d.path.filename());
                 rescan_presets(app);
                 app.preset_sel = 0;
+            }
+            break;
+        case ConfirmDialog::Action::DeleteMacro:
+            if (pick == 1) {
+                app.macros.erase(d.name);
+                for (auto it = app.keybinds.begin();
+                     it != app.keybinds.end();)
+                    if (it->second.kind == KeyBinding::Kind::Macro &&
+                        it->second.value == d.name)
+                        it = app.keybinds.erase(it);
+                    else
+                        ++it;
+                if (app.settings.macro_open == d.name)
+                    app.settings.macro_open.clear();
+                if (app.settings.step_edit_macro == d.name)
+                    settings_end_entry(app.settings);
+                save_ui_prefs(app);
+                app.status = "deleted macro " + d.name;
             }
             break;
         default:
@@ -5919,6 +6410,8 @@ struct FrameUi {
         // Oscillator phase (percent of one period; wraps in the kernel,
         // so typed and keyed values may run past 100).
         Phase,
+        // Transform scale/rotate pivot (frame fractions, 0.5 = centre).
+        AnchorX, AnchorY,
     };
     struct LayerStage {
         uint64_t layer_id;
@@ -6036,16 +6529,29 @@ struct FrameUi {
     };
     std::vector<LaneNode> lane_nodes;
 
-    // Audio track label controls: gain slider + mute chip per lane.
+    // Audio track label controls: mute chip + lock per lane. Track gain
+    // is document state without a head fader (script/set_audio_track).
     struct AudioTrackStage {
         uint64_t track_id;
-        float* gain_staged;
-        float original;
-        bool* gain_changed;
-        bool* gain_released;
         bool* mute_clicked;
+        bool* lock_clicked;
     };
     std::vector<AudioTrackStage> audio_tracks;
+    // Video lane label controls: visibility eye + lock.
+    struct VideoTrackStage {
+        uint64_t track_id;
+        bool* eye_clicked;
+        bool* lock_clicked;
+    };
+    std::vector<VideoTrackStage> video_tracks;
+    // Timeline entity tabs: click activates (scopes into), x closes.
+    struct TlTab {
+        uint64_t id;
+        bool* activate;
+        bool* close;
+    };
+    std::vector<TlTab> tl_tabs;
+    bool* tl_snap_clicked = nullptr;   // the magnet toggle
     // A picker edit stages the whole rgb triplet at once — one coalesced
     // layer command instead of three channel commands.
     struct ColorStage {
@@ -6071,6 +6577,9 @@ struct FrameUi {
         bool* xf_toggle = nullptr;   // fold/unfold the transform section
         bool* flip_h = nullptr;      // toggle clicks (transform)
         bool* flip_v = nullptr;
+        // Snap the transform anchor back to the frame centre (0.5, 0.5)
+        // - one un-coalesced click, like the flips.
+        bool* anchor_centre = nullptr;
         bool* clock_lock = nullptr;  // media: lockstep <-> timeline clock
         bool* audio_mute = nullptr;  // silence this source in the mix
     };
@@ -6201,6 +6710,11 @@ struct FrameUi {
         doc::Placement* staged;
         bool* changed;
         bool* released;
+        // Anchor snap buttons: each click applies as ONE un-coalesced
+        // command (its own undo step). media = (0.5, 0.5); screen
+        // solves a + shift = centre (the anchor is the fixed point).
+        bool* snap_media = nullptr;
+        bool* snap_screen = nullptr;
     };
     std::vector<PlacementXf> placement_xfs;
 };
@@ -6263,6 +6777,8 @@ enum CtxItemAct : int {
     kActAddLaneBelow,
     kActAddAudioTrack,
     kActRemoveLane,
+    kActToggleLaneLock,
+    kActToggleLaneHide,
     kActNewLook,
     kActNewSequence,
     kActImportMedia,
@@ -6274,8 +6790,9 @@ enum CtxItemAct : int {
 
 // Project format presets (index 0 = derive from the first asset). The
 // dropdown builder and the pick handler share these one-to-one.
-inline constexpr double kProjectFpsValues[] = {0.0,  24.0, 25.0, 30.0,
-                                               48.0, 50.0, 60.0};
+inline constexpr double kProjectFpsValues[] = {0.0,  24.0, 25.0,  30.0,
+                                               48.0, 50.0, 60.0,  90.0,
+                                               120.0};
 inline constexpr uint32_t kProjectResW[] = {0, 1280, 1920, 1080, 2560,
                                             3840};
 inline constexpr uint32_t kProjectResH[] = {0, 720, 1080, 1920, 1440,
@@ -6297,6 +6814,10 @@ bool layer_field_reset(FrameUi::LayerField f, float* def) {
         case LF::CropT:
         case LF::CropB:
             *def = 0.0f;
+            return true;
+        case LF::AnchorX:
+        case LF::AnchorY:
+            *def = 0.5f;
             return true;
         default:
             return false;
@@ -6642,6 +7163,38 @@ ui::Rect app_ctx_menu_rect(const AppState& app, const ui::Font& font) {
     return r;
 }
 
+// The Output fan-in position of a layer's chain end: the index among
+// the (to 0, port 0) links whose FROM belongs to this layer, -1 when
+// the chain does not feed the composite. Stacking order IS the link
+// order, so this is what the layer arrows permute.
+int output_feed_index(const doc::Look& look, uint64_t layer_id) {
+    const std::vector<doc::NodeLink> links =
+        look.links.empty() ? doc::synthesize_links(look) : look.links;
+    auto owner_of = [&](uint64_t id) -> uint64_t {
+        if (doc::find_layer(look, id)) return id;
+        const doc::Layer* owner = nullptr;
+        if (doc::find_effect(look, id, &owner)) return owner->id;
+        return 0;
+    };
+    int idx = 0;
+    for (const doc::NodeLink& l : links) {
+        if (l.to != 0 || l.to_port != 0) continue;
+        if (owner_of(l.from) == layer_id) return idx;
+        ++idx;
+    }
+    return -1;
+}
+
+// The count of Output feeds, for the arrow disables.
+int output_feed_count(const doc::Look& look) {
+    const std::vector<doc::NodeLink> links =
+        look.links.empty() ? doc::synthesize_links(look) : look.links;
+    int n = 0;
+    for (const doc::NodeLink& l : links)
+        if (l.to == 0 && l.to_port == 0) ++n;
+    return n;
+}
+
 // The selected placement when it sits on a VIDEO lane (audio blocks
 // carry no canvas geometry).
 const doc::Placement* video_placement_of(const doc::Sequence& seq,
@@ -6681,7 +7234,8 @@ void monitor_click_pick(AppState& app, const ui::Rect& r, Vec2 m) {
     size_t hit_lane = 0;
     for (size_t ti = sq.tracks.size(); ti-- > 0;) {
         const doc::Placement* best = doc::placement_winner(
-            app.document, sq.tracks[ti].placements, f);
+            app.document, sq.tracks[ti].placements, f,
+            doc::effective_fps(app.document, sq));
         if (!best) continue;
         // Inverse of the composite affine: is the click inside this
         // block's frame?
@@ -6787,18 +7341,11 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
     if (app.giz_path_layer != lay->id) {
         app.giz_path_layer = lay->id;
         app.giz_path_sel = -1;
+        app.giz_path_mask = 0;
     }
     const Vec2 mouse = frame.input.mouse;
     const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
     const bool owns = frame.ctx.widget_owns_mouse(id);
-    if (app.giz_mode != 0 &&
-        (app.giz_mode < 3 || !frame.input.left_down() ||
-         app.giz_fx != lay->id ||
-         app.giz_slot >= static_cast<int>(lay->path.size()))) {
-        app.giz_mode = 0;
-        app.giz_released = true;
-        frame.ctx.clear_capture();
-    }
 
     auto to_px = [&](float ux, float uy) -> Vec2 {
         return {r.x + ux * r.w, r.y + uy * r.h};
@@ -6808,27 +7355,83 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
                std::fabs(mouse.y - p.y) <= 6.0f;
     };
 
+    // Marquee release resolves BEFORE the generic mode exit: the
+    // selection lands exactly when the button lifts (a sub-4px rect is
+    // a plain background click and clears it).
+    if (app.giz_mode == 7 && !frame.input.left_down()) {
+        const float x0 = std::min(app.giz_anchor.x, mouse.x);
+        const float x1 = std::max(app.giz_anchor.x, mouse.x);
+        const float y0 = std::min(app.giz_anchor.y, mouse.y);
+        const float y1 = std::max(app.giz_anchor.y, mouse.y);
+        app.giz_path_mask = 0;
+        app.giz_path_sel = -1;
+        if (x1 - x0 > 4.0f || y1 - y0 > 4.0f)
+            for (size_t i = 0; i < lay->path.size() && i < 64; ++i) {
+                const Vec2 ap = to_px(lay->path[i].ax, lay->path[i].ay);
+                if (ap.x >= x0 && ap.x <= x1 && ap.y >= y0 &&
+                    ap.y <= y1) {
+                    app.giz_path_mask |= 1ull << i;
+                    if (app.giz_path_sel < 0)
+                        app.giz_path_sel = static_cast<int>(i);
+                }
+            }
+        app.giz_mode = 0;
+        frame.ctx.clear_capture();
+    }
+    if (app.giz_mode != 0 &&
+        (app.giz_mode < 3 || !frame.input.left_down() ||
+         app.giz_fx != lay->id ||
+         (app.giz_mode != 7 &&
+          app.giz_slot >= static_cast<int>(lay->path.size())))) {
+        app.giz_mode = 0;
+        app.giz_released = true;
+        frame.ctx.clear_capture();
+    }
+
     // Drag in flight: rebuild the dragged element from the gesture
-    // origin, stage the whole layer when it changed. (Modes 3-5 are the
-    // path editor's; 6 is the effect region handle.)
-    if (app.giz_mode >= 3 && app.giz_mode <= 5) {
+    // origin, stage the whole layer when it changed. Mode 3 moves the
+    // whole selected SET from its drag-start snapshot; 4/5 drag one
+    // tangent; 9 pulls SYMMETRIC tangents about the anchor (the pen
+    // gesture - creation drag-out and ctrl-drag share it). 6/7 stage
+    // nothing (effect region / marquee).
+    if ((app.giz_mode >= 3 && app.giz_mode <= 5) || app.giz_mode == 9) {
         doc::Layer up = *lay;
-        doc::PathPoint& p = up.path[static_cast<size_t>(app.giz_slot)];
         const float du = (mouse.x - app.giz_anchor.x) / r.w;
         const float dv = (mouse.y - app.giz_anchor.y) / r.h;
         if (app.giz_mode == 3) {
-            p.ax = app.giz_orig[0] + du;
-            p.ay = app.giz_orig[1] + dv;
+            if (app.giz_path_orig.size() == up.path.size())
+                for (size_t i = 0; i < up.path.size() && i < 64; ++i)
+                    if (app.giz_path_mask >> i & 1) {
+                        up.path[i].ax = app.giz_path_orig[i].ax + du;
+                        up.path[i].ay = app.giz_path_orig[i].ay + dv;
+                    }
         } else if (app.giz_mode == 4) {
+            doc::PathPoint& p =
+                up.path[static_cast<size_t>(app.giz_slot)];
             p.in_dx = app.giz_orig[0] + du;
             p.in_dy = app.giz_orig[1] + dv;
-        } else {
+        } else if (app.giz_mode == 5) {
+            doc::PathPoint& p =
+                up.path[static_cast<size_t>(app.giz_slot)];
             p.out_dx = app.giz_orig[0] + du;
             p.out_dy = app.giz_orig[1] + dv;
+        } else {
+            // Symmetric pull: past a small dead zone the drag becomes
+            // the out tangent, mirrored into the in side - releasing
+            // inside the dead zone leaves a corner point.
+            doc::PathPoint& p =
+                up.path[static_cast<size_t>(app.giz_slot)];
+            const Vec2 ap = to_px(p.ax, p.ay);
+            if (std::hypot(mouse.x - ap.x, mouse.y - ap.y) > 3.0f) {
+                p.out_dx = (mouse.x - ap.x) / r.w;
+                p.out_dy = (mouse.y - ap.y) / r.h;
+                p.in_dx = -p.out_dx;
+                p.in_dy = -p.out_dy;
+            }
         }
-        const doc::PathPoint& cur =
-            lay->path[static_cast<size_t>(app.giz_slot)];
-        if (std::memcmp(&p, &cur, sizeof(p)) != 0) {
+        if (up.path.size() == lay->path.size() &&
+            std::memcmp(up.path.data(), lay->path.data(),
+                        up.path.size() * sizeof(doc::PathPoint)) != 0) {
             app.giz_layer_write = std::move(up);
             app.giz_layer_staged = true;
             app.giz_layer_coalesce = true;
@@ -6845,25 +7448,46 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
 
     const ui::Color ac = frame.theme.accent;
     const ui::Color dimc = frame.theme.text_dim;
+    const bool creating = !view.path_closed || path.empty();
+    // Close affordance: with three or more points down, the first
+    // anchor is the closing target - ringed always, accent-armed when
+    // the cursor is in range, and the rubber line snaps onto it.
+    const bool close_armed =
+        creating && path.size() >= 3 &&
+        near_px(to_px(path[0].ax, path[0].ay));
     frame.canvas.push_clip(node.rect);
     for (size_t i = 0; i + 3 < poly.size(); i += 2)
         frame.canvas.draw_line(to_px(poly[i], poly[i + 1]),
                                to_px(poly[i + 2], poly[i + 3]), 1.5f, ac);
-    if (!view.path_closed && !path.empty())
-        frame.canvas.draw_line(to_px(path.back().ax, path.back().ay),
-                               mouse, 1.0f, dimc);
+    if (creating && !path.empty())
+        frame.canvas.draw_line(
+            to_px(path.back().ax, path.back().ay),
+            close_armed ? to_px(path[0].ax, path[0].ay) : mouse, 1.0f,
+            close_armed ? ac : dimc);
     for (size_t i = 0; i < path.size(); ++i) {
         const Vec2 ap = to_px(path[i].ax, path[i].ay);
+        const bool masked =
+            i < 64 && (app.giz_path_mask >> i & 1) != 0;
         const bool selp = static_cast<int>(i) == app.giz_path_sel;
         const float hs = selp ? 5.0f : 4.0f;
         frame.canvas.draw_sdf_rect(
             {ap.x - hs, ap.y - hs, hs * 2.0f, hs * 2.0f}, 2.0f,
-            selp ? ac : dimc);
+            masked || selp ? ac : dimc);
+        if (creating && i == 0 && !path.empty()) {
+            const float rr = close_armed ? 9.0f : 7.0f;
+            frame.canvas.draw_sdf_rect_outline(
+                {ap.x - rr, ap.y - rr, rr * 2.0f, rr * 2.0f}, rr, 1.5f,
+                close_armed ? ac : dimc);
+        }
         ui::probe_add("gizmo:pt" + std::to_string(i),
                       {ap.x - 6.0f, ap.y - 6.0f, 12.0f, 12.0f});
     }
+    // Tangent handles for the primary point - drawn and grabbable only
+    // when the tangent is pulled out (a zero tangent sits ON the
+    // anchor and must not steal its click; pull one out with
+    // ctrl-drag).
     Vec2 tin{}, tout{};
-    bool have_t = false;
+    bool have_tin = false, have_tout = false;
     if (app.giz_path_sel >= 0 &&
         app.giz_path_sel < static_cast<int>(path.size())) {
         const doc::PathPoint& sp =
@@ -6871,19 +7495,32 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
         const Vec2 ap = to_px(sp.ax, sp.ay);
         tin = to_px(sp.ax + sp.in_dx, sp.ay + sp.in_dy);
         tout = to_px(sp.ax + sp.out_dx, sp.ay + sp.out_dy);
-        have_t = true;
-        frame.canvas.draw_line(ap, tin, 1.0f, dimc);
-        frame.canvas.draw_line(ap, tout, 1.0f, dimc);
-        frame.canvas.draw_sdf_rect({tin.x - 3.5f, tin.y - 3.5f, 7.0f, 7.0f},
-                                   3.5f, ac);
-        frame.canvas.draw_sdf_rect(
-            {tout.x - 3.5f, tout.y - 3.5f, 7.0f, 7.0f}, 3.5f, ac);
+        have_tin = std::hypot(tin.x - ap.x, tin.y - ap.y) > 2.0f;
+        have_tout = std::hypot(tout.x - ap.x, tout.y - ap.y) > 2.0f;
         const std::string tp =
             "gizmo:pt" + std::to_string(app.giz_path_sel);
-        ui::probe_add(tp + "/in",
-                      {tin.x - 6.0f, tin.y - 6.0f, 12.0f, 12.0f});
-        ui::probe_add(tp + "/out",
-                      {tout.x - 6.0f, tout.y - 6.0f, 12.0f, 12.0f});
+        if (have_tin) {
+            frame.canvas.draw_line(ap, tin, 1.0f, dimc);
+            frame.canvas.draw_sdf_rect(
+                {tin.x - 3.5f, tin.y - 3.5f, 7.0f, 7.0f}, 3.5f, ac);
+            ui::probe_add(tp + "/in",
+                          {tin.x - 6.0f, tin.y - 6.0f, 12.0f, 12.0f});
+        }
+        if (have_tout) {
+            frame.canvas.draw_line(ap, tout, 1.0f, dimc);
+            frame.canvas.draw_sdf_rect(
+                {tout.x - 3.5f, tout.y - 3.5f, 7.0f, 7.0f}, 3.5f, ac);
+            ui::probe_add(tp + "/out",
+                          {tout.x - 6.0f, tout.y - 6.0f, 12.0f, 12.0f});
+        }
+    }
+    if (app.giz_mode == 7) {
+        const float x0 = std::min(app.giz_anchor.x, mouse.x);
+        const float y0 = std::min(app.giz_anchor.y, mouse.y);
+        frame.canvas.draw_sdf_rect_outline(
+            {x0, y0, std::fabs(mouse.x - app.giz_anchor.x),
+             std::fabs(mouse.y - app.giz_anchor.y)},
+            1.0f, 1.0f, dimc);
     }
     frame.canvas.pop_clip();
 
@@ -6892,11 +7529,24 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
         return;
     const float mu = (mouse.x - r.x) / r.w;
     const float mv = (mouse.y - r.y) / r.h;
-    if (!lay->path_closed) {
-        // Creation: a click on the first anchor closes; anywhere else
-        // appends (corner point - tangents shape afterwards).
-        if (lay->path.size() >= 3 &&
-            near_px(to_px(lay->path[0].ax, lay->path[0].ay))) {
+    auto start_drag = [&](int mode, int slot, float ox, float oy) {
+        app.giz_mode = mode;
+        app.giz_fx = lay->id;
+        app.giz_slot = slot;
+        app.giz_anchor = mouse;
+        app.giz_orig[0] = ox;
+        app.giz_orig[1] = oy;
+        frame.ctx.set_capture(id);
+    };
+    // An EMPTY path is creation too: path_closed defaults true, so the
+    // first click after picking "custom" must open the path itself -
+    // there is no other entry into creation mode.
+    if (!lay->path_closed || lay->path.empty()) {
+        // Creation: a click on the ringed first anchor closes; anywhere
+        // else appends. Keep the button down and drag to pull symmetric
+        // tangents out of the new point (the pen gesture); a plain
+        // click leaves a corner.
+        if (close_armed) {
             doc::Layer up = *lay;
             up.path_closed = true;
             app.giz_layer_write = std::move(up);
@@ -6908,29 +7558,24 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
             np.ax = mu;
             np.ay = mv;
             up.path.push_back(np);
-            app.giz_path_sel = static_cast<int>(up.path.size()) - 1;
+            up.path_closed = false;
+            const int ni = static_cast<int>(up.path.size()) - 1;
+            app.giz_path_sel = ni;
+            app.giz_path_mask = 1ull << ni;
             app.giz_layer_write = std::move(up);
             app.giz_layer_staged = true;
             app.giz_layer_coalesce = false;
+            start_drag(9, ni, 0.0f, 0.0f);
         }
         return;
     }
-    auto start_drag = [&](int mode, int slot, float ox, float oy) {
-        app.giz_mode = mode;
-        app.giz_fx = lay->id;
-        app.giz_slot = slot;
-        app.giz_anchor = mouse;
-        app.giz_orig[0] = ox;
-        app.giz_orig[1] = oy;
-        frame.ctx.set_capture(id);
-    };
-    if (have_t && near_px(tout)) {
+    if (have_tout && near_px(tout)) {
         const doc::PathPoint& sp =
             lay->path[static_cast<size_t>(app.giz_path_sel)];
         start_drag(5, app.giz_path_sel, sp.out_dx, sp.out_dy);
         return;
     }
-    if (have_t && near_px(tin)) {
+    if (have_tin && near_px(tin)) {
         const doc::PathPoint& sp =
             lay->path[static_cast<size_t>(app.giz_path_sel)];
         start_drag(4, app.giz_path_sel, sp.in_dx, sp.in_dy);
@@ -6938,7 +7583,31 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
     }
     for (size_t i = 0; i < lay->path.size(); ++i)
         if (near_px(to_px(lay->path[i].ax, lay->path[i].ay))) {
-            app.giz_path_sel = static_cast<int>(i);
+            const uint64_t bit = i < 64 ? 1ull << i : 0;
+            if (frame.input.mods & platform::kModShift) {
+                // Toggle membership; no drag on a shift click.
+                app.giz_path_mask ^= bit;
+                app.giz_path_sel =
+                    (app.giz_path_mask & bit) ? static_cast<int>(i)
+                                              : app.giz_path_sel;
+                return;
+            }
+            if (frame.input.mods & platform::kModCtrl) {
+                // Pull symmetric tangents out of this anchor.
+                app.giz_path_sel = static_cast<int>(i);
+                app.giz_path_mask = bit;
+                start_drag(9, static_cast<int>(i), 0.0f, 0.0f);
+                return;
+            }
+            // Dragging a point already in a multi-selection moves the
+            // whole set; otherwise the click selects just this one.
+            if (!(app.giz_path_mask & bit)) {
+                app.giz_path_mask = bit;
+                app.giz_path_sel = static_cast<int>(i);
+            } else {
+                app.giz_path_sel = static_cast<int>(i);
+            }
+            app.giz_path_orig = lay->path;
             start_drag(3, static_cast<int>(i), lay->path[i].ax,
                        lay->path[i].ay);
             return;
@@ -7016,12 +7685,18 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
                                    static_cast<ptrdiff_t>(span) + 1,
                                np);
                 app.giz_path_sel = static_cast<int>(span) + 1;
+                app.giz_path_mask = 1ull << (span + 1);
                 app.giz_layer_write = std::move(up);
                 app.giz_layer_staged = true;
                 app.giz_layer_coalesce = false;
+                return;
             }
         }
+        if (best_k != SIZE_MAX) return;
     }
+    // Background press: marquee-select. Release resolves it (a tiny
+    // rect clears the selection).
+    start_drag(7, 0, 0.0f, 0.0f);
 }
 
 // Point-cloud overlay: a selected camera node whose media frame sits
@@ -7048,8 +7723,9 @@ void draw_camera_overlay(AppState& app, ui::LayoutNode& node,
     const media::TrackData& td = *it->second;
     const double ph =
         app.has_timeline() ? app.player.current_frame_index() : 0.0;
-    const int64_t pos = static_cast<int64_t>(ph) +
-                        static_cast<int64_t>(chain.slip) + chain.offset;
+    const int64_t pos =
+        static_cast<int64_t>(std::floor(ph * chain.rate)) +
+        static_cast<int64_t>(chain.slip) + chain.offset;
     const uint32_t mf = pos < 0 ? 0u : static_cast<uint32_t>(pos);
     const media::SfmSegment* seg = nullptr;
     for (const media::SfmSegment& sg : td.sfm)
@@ -7497,14 +8173,17 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
     const float bcx = (b0 + b2) * 0.5f, bcy = (b1 + b3) * 0.5f;
     // Forward map, the inverse of the transform kernel's sampling math:
-    // source-uv offsets -> canvas fractions -> monitor pixels.
+    // source-uv offsets -> canvas fractions -> monitor pixels. The
+    // anchor is the fixed point: out = a + shift + S*R*(src - a).
     auto xf_frac = [&](const doc::Placement& p, float sx, float sy) -> Vec2 {
         const float rad = p.rotate * doc::kDeg2Rad;
         const float cs = std::cos(rad), sn = std::sin(rad);
-        const float qx = sx * aspect, qy = sy;
+        const float ex = p.anchor_x - 0.5f, ey = p.anchor_y - 0.5f;
+        const float qx = (sx - ex) * aspect, qy = sy - ey;
         const float rx = qx * cs - qy * sn;
         const float ry = qx * sn + qy * cs;
-        return {rx * p.scale / aspect + p.pos_x, ry * p.scale + p.pos_y};
+        return {rx * p.scale / aspect + ex + p.pos_x,
+                ry * p.scale + ey + p.pos_y};
     };
     auto fwd = [&](const doc::Placement& p, float sx, float sy) -> Vec2 {
         const Vec2 f = xf_frac(p, sx, sy);
@@ -7538,6 +8217,19 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     frame.canvas.draw_line(tm, rot, 1.5f, ac);
     frame.canvas.draw_sdf_rect({rot.x - 4.0f, rot.y - 4.0f, 8.0f, 8.0f},
                                4.0f, ac);
+    // The ANCHOR crosshair at its post-motion position (out(a) =
+    // a + shift): the scale/rotate pivot, draggable to re-pin it
+    // without moving the picture.
+    const Vec2 anc =
+        fwd(bx, bx.anchor_x - 0.5f, bx.anchor_y - 0.5f);
+    frame.canvas.draw_line({anc.x - 7.0f, anc.y}, {anc.x + 7.0f, anc.y},
+                           1.5f, ac);
+    frame.canvas.draw_line({anc.x, anc.y - 7.0f}, {anc.x, anc.y + 7.0f},
+                           1.5f, ac);
+    frame.canvas.draw_sdf_rect({anc.x - 3.0f, anc.y - 3.0f, 6.0f, 6.0f},
+                               3.0f, ac);
+    ui::probe_add("gizmo:anchor_pt",
+                  {anc.x - 6.0f, anc.y - 6.0f, 12.0f, 12.0f});
     frame.canvas.pop_clip();
 
     const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
@@ -7552,7 +8244,8 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         float sx = 0.0f, sy = 0.0f;
         inv(mouse, &sx, &sy);
         int mode = 0;
-        if (near_pt(rot)) mode = 3;
+        if (near_pt(anc)) mode = 4;
+        else if (near_pt(rot)) mode = 3;
         else if (near_pt(c00) || near_pt(c10) || near_pt(c11) ||
                  near_pt(c01))
             mode = 2;
@@ -7562,10 +8255,6 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             app.mon_mode = mode;
             app.mon_anchor = mouse;
             app.mon_orig = st;
-            app.mon_box[0] = b0;
-            app.mon_box[1] = b1;
-            app.mon_box[2] = b2;
-            app.mon_box[3] = b3;
             frame.ctx.set_capture(id);
         } else {
             // The press missed the box and every handle: same click
@@ -7581,17 +8270,33 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
     if (app.mon_mode != 0 && u->changed) {
         const doc::Placement& o = app.mon_orig;
-        // Scale/rotate pivot on the CONTENT box center (mask crops move
-        // it off canvas center) as FROZEN at the press - a live measured
-        // box moves with animated content and a pivot chasing it drifts.
-        // Transform about it, then re-anchor pos so the pivot holds
-        // still. All absolute from the gesture origin.
-        const float fcx = (app.mon_box[0] + app.mon_box[2]) * 0.5f;
-        const float fcy = (app.mon_box[1] + app.mon_box[3]) * 0.5f;
-        const Vec2 pvt = fwd(o, fcx, fcy);
+        // Scale/rotate pivot on the ANCHOR - the transform's fixed
+        // point, so pos never needs re-anchoring and the gesture is the
+        // sliders' exact twin. All absolute from the gesture origin.
+        const Vec2 pvt =
+            fwd(o, o.anchor_x - 0.5f, o.anchor_y - 0.5f);
         if (app.mon_mode == 1) {
             st.pos_x = o.pos_x + (mouse.x - app.mon_anchor.x) / r.w;
             st.pos_y = o.pos_y + (mouse.y - app.mon_anchor.y) / r.h;
+        } else if (app.mon_mode == 4) {
+            // Re-pin the anchor WITHOUT moving the picture: the
+            // crosshair follows the mouse, and shift absorbs
+            // (S*R - I) * da so out(src) holds for every src.
+            const float rad = o.rotate * doc::kDeg2Rad;
+            const float cs = std::cos(rad), sn = std::sin(rad);
+            const float s = std::max(o.scale, 1e-4f);
+            const float dfx = (mouse.x - pvt.x) / r.w;
+            const float dfy = (mouse.y - pvt.y) / r.h;
+            const float qx = dfx * aspect, qy = dfy;
+            const float dax = (qx * cs + qy * sn) / s / aspect;
+            const float day = (-qx * sn + qy * cs) / s;
+            st.anchor_x = std::clamp(o.anchor_x + dax, -1.0f, 2.0f);
+            st.anchor_y = std::clamp(o.anchor_y + day, -1.0f, 2.0f);
+            const float cax = st.anchor_x - o.anchor_x;
+            const float cay = st.anchor_y - o.anchor_y;
+            const float sqx = cax * aspect, sqy = cay;
+            st.pos_x = o.pos_x + (sqx * cs - sqy * sn) * s / aspect - cax;
+            st.pos_y = o.pos_y + (sqx * sn + sqy * cs) * s - cay;
         } else {
             if (app.mon_mode == 2) {
                 const float d0 = std::hypot(app.mon_anchor.x - pvt.x,
@@ -7611,10 +8316,6 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
             st.pos_x = o.pos_x;
             st.pos_y = o.pos_y;
-            const Vec2 c_o = xf_frac(o, fcx, fcy);
-            const Vec2 c_n = xf_frac(st, fcx, fcy);
-            st.pos_x = o.pos_x + (c_o.x - c_n.x);
-            st.pos_y = o.pos_y + (c_o.y - c_n.y);
         }
         *u->changed = true;
     }
@@ -7662,6 +8363,8 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
     *px.staged = *p;
     px.changed = arena.alloc<bool>();
     px.released = arena.alloc<bool>();
+    px.snap_media = arena.alloc<bool>();
+    px.snap_screen = arena.alloc<bool>();
     out.placement_xfs.push_back(px);
     int si = 0;
     auto row = [&](const char* label, float* value, float min_v,
@@ -7699,9 +8402,38 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
     row("scale", &px.staged->scale, 0.02f, 8.0f, "%.0f%%", 100.0f);
     row("rotation", &px.staged->rotate, -360.0f, 360.0f, "%.0f deg");
     row("opacity", &px.staged->opacity, 0.0f, 1.0f, "%.0f%%", 100.0f);
+    // The scale/rotate pivot, in block-local canvas fractions; the two
+    // snaps land it on the media centre or on the screen centre (the
+    // anchor is the fixed point of the transform, so out(a) = a + shift
+    // and screen centre solves a = centre - shift).
+    row("anchor x", &px.staged->anchor_x, 0.0f, 1.0f, "%.2f");
+    row("anchor y", &px.staged->anchor_y, 0.0f, 1.0f, "%.2f");
+    {
+        const bool at_media =
+            p->anchor_x == 0.5f && p->anchor_y == 0.5f;
+        const bool at_screen =
+            p->anchor_x == 0.5f - p->pos_x &&
+            p->anchor_y == 0.5f - p->pos_y;
+        StackOpts hs;
+        hs.gap = 6.0f;
+        hs.cross_align = AlignMode::Center;
+        hs.width = SizeSpec::fill();
+        rows.push_back(HStack(
+            arena, hs,
+            {SizedBox(arena, SizeSpec::fixed(64),
+                      SizeSpec::fixed(active_theme().control_height),
+                      Label(arena, "snap", dim)),
+             Chip(arena, "media centre", at_media,
+                  &app.block_anchor_media_btn, px.snap_media,
+                  "anchor onto the block's own centre"),
+             Chip(arena, "screen centre", at_screen,
+                  &app.block_anchor_screen_btn, px.snap_screen,
+                  "anchor onto the canvas centre")}));
+    }
     rows.push_back(Label(arena,
                          "drag the block on the monitor: body moves, "
-                         "corners scale, the stub rotates",
+                         "corners scale, the stub rotates, the "
+                         "crosshair re-pins the anchor",
                          dim));
     return Panel(arena, VStackDyn(arena, col, rows),
                  PanelOpts{Edges::all(0), -1.0f});
@@ -7772,6 +8504,7 @@ ui::LayoutNode* MenuButton(ui::LayoutArena& arena, const char* label,
         if (hover || st.open)
             frame.canvas.draw_sdf_rect(r, 3.0f,
                                        frame.theme.control_bg_hover);
+        ui::probe_add(mu->label, r);
         ui::draw_text(frame.canvas, frame.font, mu->label,
                       {r.x + 10.0f,
                        r.y + (r.h - frame.font.line_height() *
@@ -8299,17 +9032,29 @@ struct TlAmpSrc {
     doc::MediaInstance inner;
     bool nested = false;
     float gain = 1.0f;
+    // The block's hop ratio (target frames per lane frame) and the
+    // target-clock -> amp-bucket rescale (project fps / target fps).
+    double ratio = 1.0;
+    double amp_scale = 1.0;
 };
 
 inline float tl_amp_sample(const TlAmpSrc& s, double local) {
     double af;
     if (s.nested) {
-        const double rl = doc::placement_source_frame(s.outer, local);
+        const double rl =
+            doc::placement_source_frame(s.outer, local, s.ratio);
         if (!doc::media_active(s.inner, rl)) return 0.0f;
-        af = doc::media_source_frame(s.inner, rl);
+        // Amp buckets are PROJECT-CLOCK-indexed over the asset's audio,
+        // so the media-frame shift converts through the rate and the
+        // target's own clock rescales onto the bucket grid.
+        af = doc::media_source_frame(s.inner, rl) +
+             (s.inner.rate > 0.0
+                  ? static_cast<double>(s.inner.shift) / s.inner.rate
+                  : static_cast<double>(s.inner.shift));
     } else {
-        af = doc::placement_source_frame(s.outer, local);
+        af = doc::placement_source_frame(s.outer, local, s.ratio);
     }
+    af *= s.amp_scale;
     if (af < 0.0 || s.amp->empty()) return 0.0f;
     const size_t idx = std::min(static_cast<size_t>(af), s.amp->size() - 1);
     return (*s.amp)[idx] * s.gain;
@@ -8324,12 +9069,18 @@ struct TlBlock {
     int kind = 0;                 // 0 media, 2 look
     bool selected = false;
     doc::Placement place;
-    uint32_t src_len = 0;         // 0 = unbounded
+    uint32_t src_len = 0;         // 0 = unbounded (TARGET frames)
+    // The nesting hop's clock ratio (target frames per lane frame):
+    // every end/trim computation converts through it.
+    double hop_ratio = 1.0;
     TlAmpSrc* srcs = nullptr;     // arena; empty = the block is silent
     size_t src_count = 0;
     // Filmstrip: the asset's thumbnail strip mapped through source frames.
     const ui::UiTexture* thumbs = nullptr;
     uint32_t asset_frames = 0;
+    // Conform ratio of the wrapped asset: block-local clock frames map
+    // to strip (media) frames through this.
+    double strip_rate = 1.0;
     doc::Placement* staged = nullptr;   // block drags write through these
     bool* changed = nullptr;
     bool* released = nullptr;
@@ -8345,6 +9096,10 @@ struct BlockLaneUser {
     size_t count = 0;
     size_t lane_index = 0;
     size_t layer_index = SIZE_MAX;   // doc layer; SIZE_MAX = audio lane
+    uint64_t track_id = 0;           // the doc container this row shows
+    bool audio = false;
+    bool locked = false;             // edit guard: gestures refuse
+    bool hidden = false;             // video: dropped from the composite
     uint32_t frame_count = 0;
     uint32_t play_end = 0;   // content ends here; past it is buffer
     uint32_t playhead = 0;
@@ -8389,10 +9144,15 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const ui::Rect br{x0, r.y + 1.0f, x1 - x0, r.h - 2.0f};
         ui::probe_add("block:" + std::to_string(b.place.id), br);
         frame.canvas.draw_sdf_rect(br, 3.0f, theme.control_bg_active);
-        // Filmstrip: the visible span maps to the SOURCE frames it plays.
+        // Filmstrip: the visible span maps to the MEDIA frames it plays
+        // (target-local clock frames through the conform rate).
         if (b.thumbs && b.asset_frames > 0) {
-            const double s0 = doc::placement_source_frame(b.place, b.t0);
-            const double s1 = doc::placement_source_frame(b.place, b.t1);
+            const double s0 =
+                doc::placement_source_frame(b.place, b.t0, b.hop_ratio) *
+                b.strip_rate;
+            const double s1 =
+                doc::placement_source_frame(b.place, b.t1, b.hop_ratio) *
+                b.strip_rate;
             const float tu0 = static_cast<float>(
                 std::clamp(s0 / b.asset_frames, 0.0, 1.0));
             const float tu1 = static_cast<float>(
@@ -8456,6 +9216,16 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 2.0f, dim);
         }
     }
+    // A HIDDEN lane's content left the composite: the whole strip dims.
+    if (u->hidden)
+        frame.canvas.draw_sdf_rect(r, 2.0f, theme.window_bg.with_alpha(0.55f));
+    // A LOCKED lane wears a diagonal hatch: visible, inert.
+    if (u->locked) {
+        const float step = 14.0f;
+        for (float hx = r.x - r.h; hx < r.right(); hx += step)
+            frame.canvas.draw_line({hx, r.bottom()}, {hx + r.h, r.y}, 1.0f,
+                                   theme.hairline);
+    }
     // Playhead over the lane.
     const float px = frame_x(u->playhead + 0.5);
     frame.canvas.draw_line({px, r.y}, {px, r.bottom()}, 1.0f,
@@ -8467,6 +9237,22 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.canvas.draw_line({sx, r.y}, {sx, r.bottom()}, 1.0f,
                                theme.accent);
     }
+    // Vertical drag: while a slide rides over ANOTHER same-kind lane,
+    // this row reports itself as the target and previews the landing as
+    // a ghost outline. Locked lanes never volunteer.
+    if (app.blk_drag_mode == 1 && app.blk_drag_placement &&
+        u->audio == app.blk_drag_audio && !u->locked &&
+        frame.input.mouse.y >= r.y && frame.input.mouse.y < r.bottom())
+        app.blk_hover_track = u->track_id;
+    if (app.blk_drag_mode == 1 && app.blk_hover_track == u->track_id &&
+        u->track_id != app.blk_drag_track &&
+        app.blk_ghost_t1 > app.blk_ghost_t0) {
+        const float g0 = frame_x(app.blk_ghost_t0);
+        const float g1 = std::max(frame_x(app.blk_ghost_t1), g0 + 3.0f);
+        frame.canvas.draw_sdf_rect_outline(
+            {g0, r.y + 1.0f, g1 - g0, r.h - 2.0f}, 3.0f, 1.5f,
+            theme.accent);
+    }
     frame.canvas.pop_clip();
 
     // Interaction: edges trim, body slides, press selects. One drag at a
@@ -8475,15 +9261,22 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.acquire_widget_id(&app.tl_lane_ids[u->lane_index]);
     // A drag whose block vanished under it (razor, undo, scope change)
     // would otherwise hold the capture forever: the button is up, so the
-    // drag is over whether or not anyone is left to end it.
-    if (app.blk_drag_mode != 0 && !frame.input.left_down()) {
+    // drag is over whether or not anyone is left to end it. The RELEASE
+    // frame itself is exempt - lanes draw top-down and the owner may sit
+    // below, so eating the drag here would swallow its release (the
+    // land-overwrite and the vertical move both ride it).
+    if (app.blk_drag_mode != 0 && !frame.input.left_down() &&
+        !frame.input.left_released()) {
         app.blk_drag_mode = 0;
         app.blk_drag_layer = 0;
         app.blk_drag_placement = 0;
+        app.blk_drag_track = 0;
+        app.blk_hover_track = 0;
         app.tl_snap_frame = -1.0;
         frame.ctx.clear_capture();
     }
-    if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id)) {
+    if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id) &&
+        !u->locked) {
         const float mx = frame.input.mouse.x;
         bool on_block = false;
         for (size_t i = 0; i < u->count; ++i) {
@@ -8497,6 +9290,11 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             app.blk_drag_placement = b.placement_id;
             app.blk_drag_anchor = mouse_frame();
             app.blk_drag_orig = b.place;
+            app.blk_drag_track = u->track_id;
+            app.blk_drag_audio = u->audio;
+            app.blk_hover_track = 0;
+            app.blk_ghost_t0 = b.t0;
+            app.blk_ghost_t1 = b.t1;
             if (std::abs(mx - x0) <= 4.0f) app.blk_drag_mode = 2;
             else if (std::abs(mx - x1) <= 4.0f) app.blk_drag_mode = 3;
             else app.blk_drag_mode = 1;
@@ -8608,7 +9406,8 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     // Either end may snap; the nearer target wins.
                     int64_t nt =
                         std::max<int64_t>(0, static_cast<int64_t>(o.t_in) + d);
-                    const uint32_t oend = doc::placement_end(o, b.src_len);
+                    const uint32_t oend =
+                        doc::placement_end(o, b.src_len, b.hop_ratio);
                     const int64_t len =
                         oend ? static_cast<int64_t>(oend) -
                                    static_cast<int64_t>(o.t_in)
@@ -8628,7 +9427,8 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 case 2: {
                     // Trim in: the start moves, the CONTENT stays put —
                     // source_in compensates through the speed.
-                    const uint32_t end = doc::placement_end(o, b.src_len);
+                    const uint32_t end =
+                        doc::placement_end(o, b.src_len, b.hop_ratio);
                     int64_t nt =
                         std::max<int64_t>(0, static_cast<int64_t>(o.t_in) + d);
                     nt = std::max<int64_t>(
@@ -8639,13 +9439,14 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         nt = std::min<int64_t>(nt,
                                                static_cast<int64_t>(end) - 1);
                     const double src = doc::placement_source_frame(
-                        o, static_cast<double>(nt));
+                        o, static_cast<double>(nt), b.hop_ratio);
                     if (src < 0.0 && o.speed > 0.0f)
                         nt = static_cast<int64_t>(
                             o.t_in -
                             static_cast<double>(o.source_in) / o.speed);
                     doc::trim_placement_head(
-                        p, static_cast<uint32_t>(std::max<int64_t>(0, nt)));
+                        p, static_cast<uint32_t>(std::max<int64_t>(0, nt)),
+                        b.hop_ratio);
                     if (o.t_out == 0 && b.src_len)
                         p.t_out = end;   // keep the end where it was
                     break;
@@ -8664,7 +9465,8 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         doc::Placement natural = o;
                         natural.t_out = 0;
                         if (p.t_out >=
-                            doc::placement_end(natural, b.src_len))
+                            doc::placement_end(natural, b.src_len,
+                                               b.hop_ratio))
                             p.t_out = 0;
                     }
                     break;
@@ -8672,11 +9474,34 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
             *b.staged = p;
             *b.changed = true;
+            // The ghost preview on the hovered lane tracks the staged
+            // span (a slide keeps its length; end 0 = runs out).
+            if (app.blk_drag_mode == 1) {
+                const uint32_t gend =
+                    doc::placement_end(p, b.src_len, b.hop_ratio);
+                app.blk_ghost_t0 = static_cast<double>(p.t_in);
+                app.blk_ghost_t1 = gend
+                    ? static_cast<double>(gend)
+                    : static_cast<double>(u->play_end);
+                if (app.blk_ghost_t1 <= app.blk_ghost_t0)
+                    app.blk_ghost_t1 = app.blk_ghost_t0 + 1.0;
+            }
             if (frame.input.left_released()) {
                 *b.released = true;
+                // Released over ANOTHER same-kind lane: stage the
+                // vertical move for the post-frame handler (it runs
+                // before the overwrite, so the landing claims the
+                // DESTINATION lane's span).
+                if (app.blk_drag_mode == 1 && app.blk_hover_track &&
+                    app.blk_hover_track != u->track_id) {
+                    app.blk_move_placement = b.placement_id;
+                    app.blk_move_track = app.blk_hover_track;
+                }
                 app.blk_drag_mode = 0;
                 app.blk_drag_layer = 0;
                 app.blk_drag_placement = 0;
+                app.blk_drag_track = 0;
+                app.blk_hover_track = 0;
                 app.tl_snap_frame = -1.0;
                 frame.ctx.clear_capture();
             }
@@ -11630,18 +12455,25 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     // decides). Editable before any media exists - a generator-only
     // project still needs its rate and size.
     {
-        static const char* kFpsItems[] = {"auto", "24", "25", "30",
-                                          "48",   "50", "60"};
+        static const char* kFpsItems[] = {"auto", "24", "25", "30", "48",
+                                          "50",   "60", "90", "120"};
+        static_assert(sizeof(kFpsItems) / sizeof(kFpsItems[0]) ==
+                          sizeof(kProjectFpsValues) /
+                              sizeof(kProjectFpsValues[0]),
+                      "fps labels track the value table");
+        constexpr int kFpsCount = static_cast<int>(
+            sizeof(kProjectFpsValues) / sizeof(kProjectFpsValues[0]));
         int fps_cur = 0;
-        for (int i = 1; i < 7; ++i)
+        for (int i = 1; i < kFpsCount; ++i)
             if (std::abs(app.document.fps - kProjectFpsValues[i]) < 0.01)
                 fps_cur = i;
         out.project_fps_selected = arena.alloc<int>();
         *out.project_fps_selected = -1;
         rows.push_back(value_row(
             arena, "fps",
-            Dropdown(arena, kFpsItems, 7, fps_cur, &app.project_fps_dd,
-                     out.project_fps_selected, SizeSpec::fill(),
+            Dropdown(arena, kFpsItems, kFpsCount, fps_cur,
+                     &app.project_fps_dd, out.project_fps_selected,
+                     SizeSpec::fill(),
                      "timeline frame rate (auto = first asset)")));
         static const char* kResItems[] = {"auto",        "1280 x 720",
                                           "1920 x 1080", "1080 x 1920",
@@ -11724,10 +12556,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             int current = 0;
             items[n++] = "media audio";
             if (has_sc) {
-                const std::string file =
-                    std::filesystem::path(app.document.sidechain_path)
-                        .filename()
-                        .string();
+                const std::string file = path_to_u8(
+                    u8_to_path(app.document.sidechain_path).filename());
                 items[n] = arena.dup(file.c_str(), file.size());
                 current = n;
                 ++n;
@@ -11791,7 +12621,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         const bool dirty = app.document.revision != app.saved_revision;
         std::string proj = app.project_path.empty()
             ? std::string("untitled")
-            : app.project_path.filename().string();
+            : path_to_u8(app.project_path.filename());
         if (dirty) proj += " *";
         ButtonOpts small_act;
         small_act.width = SizeSpec::fixed(56);
@@ -11812,7 +12642,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     // Recent projects: newest first, click to open (dirty-guarded
     // in the handler).
     for (size_t r = 0; r < app.recent_projects.size() && r < 6; ++r) {
-        const std::filesystem::path rp = app.recent_projects[r];
+        const std::filesystem::path rp =
+            u8_to_path(app.recent_projects[r]);
         if (rp == app.project_path) continue;
         FrameUi::RecentRow rrow{r, arena.alloc<bool>()};
         out.recent_rows.push_back(rrow);
@@ -11821,7 +12652,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         ropts.align_left = true;
         ropts.width = SizeSpec::fill();
         ropts.tooltip = "open this recent project";
-        const std::string rname = rp.filename().string();
+        const std::string rname = path_to_u8(rp.filename());
         rows.push_back(Button(arena,
                               arena.dup(rname.c_str(), rname.size()),
                               &app.recent_buttons[r], rrow.clicked, ropts));
@@ -11916,15 +12747,19 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         name_opts.flat = true;
         name_opts.align_left = true;
         name_opts.tooltip = "select layer (the stack panel edits it)";
-        // v/^ swap with the neighbour: layers composite bottom-up, so
-        // "down" in the list is later in the composite.
+        // ^/v swap with the composite neighbour: the arrows permute the
+        // Output port's LINK ORDER (the stacking truth; up = drawn
+        // later = more visible) - a chain that does not feed the
+        // composite has nothing to reorder.
+        const int feed_idx = output_feed_index(app.look(), layer.id);
+        const int feed_n = output_feed_count(app.look());
         ButtonOpts up_opts;
         up_opts.width = SizeSpec::fixed(20);
-        up_opts.disabled = li == 0;
-        up_opts.tooltip = "move layer up";
+        up_opts.disabled = feed_idx < 0 || feed_idx + 1 >= feed_n;
+        up_opts.tooltip = "raise the chain in the composite";
         ButtonOpts down_opts = up_opts;
-        down_opts.disabled = li + 1 >= app.look().layers.size();
-        down_opts.tooltip = "move layer down";
+        down_opts.disabled = feed_idx <= 0;
+        down_opts.tooltip = "lower the chain in the composite";
         ButtonOpts x_opts;
         x_opts.width = SizeSpec::fixed(20);
         x_opts.tooltip = "remove layer";
@@ -12220,7 +13055,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             auto xf_slider = [&](FrameUi::LayerField field, const char* label,
                                  float min_v, float max_v, float value,
                                  const char* format) {
-                if (xslider >= 8) return;
+                if (xslider >= 10) return;
                 FrameUi::LayerStage stage{};
                 stage.layer_id = layer.id;
                 stage.field = field;
@@ -12270,6 +13105,20 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                       "%.2f x");
             xf_slider(LF::Rotate, "rotate", -180.0f, 180.0f,
                       layer.xf_rotate, "%.0f deg");
+            xf_slider(LF::AnchorX, "anchor x", 0.0f, 1.0f,
+                      layer.xf_anchor_x, "%.2f");
+            xf_slider(LF::AnchorY, "anchor y", 0.0f, 1.0f,
+                      layer.xf_anchor_y, "%.2f");
+            lrow.anchor_centre = arena.alloc<bool>();
+            layer_rows_ui.push_back(value_row(
+                arena, "anchor",
+                HStack(arena, {6.0f},
+                       {Chip(arena, "centre",
+                             layer.xf_anchor_x == 0.5f &&
+                                 layer.xf_anchor_y == 0.5f,
+                             &ls.anchor_centre_btn, lrow.anchor_centre,
+                             "snap the scale/rotate pivot to the frame "
+                             "centre")})));
             lrow.flip_h = arena.alloc<bool>();
             lrow.flip_v = arena.alloc<bool>();
             layer_rows_ui.push_back(value_row(
@@ -13061,7 +13910,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         const uint32_t total = app.export_job->progress.frames_total.load();
         const uint32_t done = app.export_job->progress.frames_done.load();
         std::snprintf(line, sizeof(line), "exporting %s %u%%",
-                      app.export_job->out_path.filename().string().c_str(),
+                      path_to_u8(app.export_job->out_path.filename()).c_str(),
                       total ? done * 100 / total : 0);
         out.export_cancel_clicked = arena.alloc<bool>();
         ButtonOpts cancel_opts;
@@ -13118,7 +13967,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     for (size_t q = 0; q < app.export_queue.size(); ++q) {
         FrameUi::QueueRow qrow{q, arena.alloc<bool>()};
         std::snprintf(line, sizeof(line), "%zu. %s", q + 1,
-                      app.export_queue[q].out_path.filename().string().c_str());
+                      path_to_u8(app.export_queue[q].out_path.filename())
+                          .c_str());
         ButtonOpts tiny_x;
         tiny_x.width = SizeSpec::fixed(24);
         std::vector<LayoutNode*> qr{
@@ -13445,6 +14295,111 @@ bool timeline_paste_keys(AppState& app) {
     return false;
 }
 
+// RAZOR at the playhead (R / Ctrl+K): the picked lane when its block
+// sits under the playhead, else every block under it, one undo step.
+// Locked lanes never cut. Sequence structure: inert inside a look.
+void timeline_razor_at_playhead(AppState& app) {
+    if (app.scope_is_look()) return;
+    const doc::Sequence& rseq = app.sequence();
+    const uint32_t ph = app.player.current_frame_index();
+    auto inside = [&](const doc::SeqTrack& t) {
+        for (const doc::Placement& place : t.placements) {
+            const uint32_t len = doc::source_length(app.document, place);
+            const uint32_t end = doc::placement_end(
+                place, len,
+                doc::placement_ratio(app.document, place,
+                                     doc::effective_fps(app.document,
+                                                        rseq)));
+            if (ph > place.t_in && (!end || ph < end)) return true;
+        }
+        return false;
+    };
+    // The pick narrows the cut: the picked LANE (block clicks set it).
+    // No pick cuts everything under the playhead.
+    std::vector<uint64_t> targets;
+    bool narrowed = false;
+    if (app.layer_sel && app.selected_layer < rseq.tracks.size()) {
+        const doc::SeqTrack& t = rseq.tracks[app.selected_layer];
+        if (!t.lock && inside(t)) {
+            targets.push_back(t.id);
+            narrowed = true;
+        }
+    }
+    if (targets.empty() && !narrowed)
+        for (const doc::SeqTrack& t : rseq.tracks)
+            if (!t.lock && inside(t)) targets.push_back(t.id);
+    // Audio lanes cut too - linked partners already split with their
+    // video half (the group), and a half-open placement refuses a second
+    // cut, so running every track is idempotent. A narrowed cut stays on
+    // its lane; locked tracks never cut.
+    std::vector<uint64_t> audio_targets;
+    if (!narrowed)
+        for (const doc::AudioTrack& t : rseq.audio)
+            if (!t.lock) audio_targets.push_back(t.id);
+    app.undo.begin_group("Razor");
+    for (const uint64_t lid : targets)
+        if (auto cmd = doc::razor_track_command(app.document, rseq.id, lid,
+                                                ph))
+            app.undo.execute(app.document, std::move(cmd));
+    for (const uint64_t tid : audio_targets)
+        if (auto cmd = doc::razor_audio_command(app.document, rseq.id, tid,
+                                                ph))
+            app.undo.execute(app.document, std::move(cmd));
+    app.undo.end_group();
+}
+
+// Q / W: trim what sits under the playhead TO the playhead - head (Q)
+// or tail (W). The picked block narrows it; else every block strictly
+// containing the playhead on unlocked lanes trims, one per link group
+// (timing propagates group-wide). No ripple - the gap stays.
+bool timeline_trim_to_playhead(AppState& app, bool head) {
+    if (app.scope_is_look()) return false;
+    const doc::Sequence& seq = app.sequence();
+    const uint32_t ph = app.player.current_frame_index();
+    struct Cut {
+        doc::Placement place;
+        uint32_t end;
+        double ratio;
+    };
+    std::vector<Cut> cuts;
+    std::vector<uint64_t> seen_links;
+    auto consider = [&](const doc::Placement& p, bool locked) {
+        if (locked) return;
+        if (app.sel_placement && p.id != app.sel_placement) return;
+        if (p.link) {
+            for (const uint64_t l : seen_links)
+                if (l == p.link) return;
+        }
+        const double ratio = doc::placement_ratio(
+            app.document, p, doc::effective_fps(app.document, seq));
+        const uint32_t end = doc::placement_end(
+            p, doc::source_length(app.document, p), ratio);
+        if (ph <= p.t_in || (end && ph >= end)) return;
+        if (!end && !head) return;   // no tail to trim on an open block
+        if (p.link) seen_links.push_back(p.link);
+        cuts.push_back({p, end, ratio});
+    };
+    for (const doc::SeqTrack& t : seq.tracks)
+        for (const doc::Placement& p : t.placements) consider(p, t.lock);
+    for (const doc::AudioTrack& t : seq.audio)
+        for (const doc::Placement& p : t.placements) consider(p, t.lock);
+    if (cuts.empty()) return false;
+    app.undo.begin_group(head ? "Trim Head" : "Trim Tail");
+    for (const Cut& c : cuts) {
+        doc::Placement np = c.place;
+        if (head) {
+            doc::trim_placement_head(np, ph, c.ratio);
+            if (c.place.t_out == 0 && c.end) np.t_out = c.end;
+        } else {
+            np.t_out = ph;
+        }
+        app.undo.execute(app.document,
+                         doc::set_placement_command(seq.id, np));
+    }
+    app.undo.end_group();
+    return true;
+}
+
 // Nearest key or marker strictly before/after the playhead ([ and ]).
 double timeline_adjacent_mark(AppState& app, bool forward) {
     const double at = app.player.current_frame_index();
@@ -13460,6 +14415,1405 @@ double timeline_adjacent_mark(AppState& app, bool forward) {
     else
         for (const uint32_t m : app.sequence().markers) consider(m);
     return best;
+}
+
+// ---- action registry: every keyboard/menu verb as data. One table
+// drives dispatch, the settings list, macro steps and the default
+// chords. Context gating lives INSIDE the handlers - an action that
+// does not apply right now does nothing.
+
+// Frame-local intents an action raises; the frame body consumes them
+// after layout (the same flags the menu bar and rail buttons share).
+struct KeyIntents {
+    bool toggle_play = false;
+    bool do_undo = false, do_redo = false;
+    bool do_save = false, do_save_as = false, do_open_project = false;
+    bool do_delete_sel = false;
+    bool do_add_first = false;   // Enter in the cursor add menu
+    bool do_duplicate = false;   // texed duplicateSelection
+    bool do_group = false;       // fold selection into a group
+    bool do_ungroup = false;     // dissolve it
+    bool do_select_all = false;  // texed selectAll
+    bool do_copy = false;        // copy / first half of cut
+    bool do_cut = false;         // delete after the copy
+    bool do_paste = false;       // at the canvas cursor
+    bool open_media = false, import_media = false;
+    bool import_preset = false, do_export = false;
+    float nudge_dx = 0.0f, nudge_dy = 0.0f;   // arrow-key node nudge
+    float key_seek = -1.0f;      // keyboard playhead move (frames)
+    // I / O set the trim band at the playhead (NLE in/out points);
+    // they land in the ruler handles' channel post-frame.
+    float key_trim_in = -1.0f, key_trim_out = -1.0f;
+    // Timeline keyboard routing: delete/copy/paste act on keys when the
+    // mouse sits over the timeline region (last frame's rect).
+    bool tl_hovered = false;
+};
+
+namespace act {
+
+void play(AppState&, KeyIntents& k) { k.toggle_play = true; }
+
+void frame_back(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline()) return;
+    const uint32_t at = a.player.current_frame_index();
+    a.player.pause();
+    k.key_seek = static_cast<float>(at > 0 ? at - 1 : 0u);
+}
+
+void frame_forward(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline()) return;
+    const uint32_t fc = a.player.frame_count();
+    const uint32_t at = a.player.current_frame_index();
+    a.player.pause();
+    k.key_seek = static_cast<float>(std::min(at + 1, fc ? fc - 1 : 0u));
+}
+
+void go_start(AppState& a, KeyIntents& k) {
+    if (a.has_timeline()) k.key_seek = 0.0f;
+}
+
+void go_end(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline()) return;
+    const uint32_t fc = a.player.frame_count();
+    k.key_seek = static_cast<float>(fc ? fc - 1 : 0u);
+}
+
+// [ / ] snap the playhead across keys + markers.
+void mark_prev(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline()) return;
+    const double f = timeline_adjacent_mark(a, false);
+    if (f >= 0.0) k.key_seek = static_cast<float>(f);
+}
+
+void mark_next(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline()) return;
+    const double f = timeline_adjacent_mark(a, true);
+    if (f >= 0.0) k.key_seek = static_cast<float>(f);
+}
+
+// I / O drop the in/out point at the playhead - the same trim band the
+// ruler handles drag, ordered the same way they keep it. Sequence
+// structure: inert inside a look.
+void set_in(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline() || a.scope_is_look()) return;
+    const uint32_t ph = a.player.current_frame_index();
+    const uint32_t fc = a.player.frame_count();
+    const uint32_t cur_out =
+        a.sequence().trim_out ? a.sequence().trim_out : fc;
+    k.key_trim_in =
+        static_cast<float>(std::min(ph, cur_out ? cur_out - 1 : 0u));
+}
+
+void set_out(AppState& a, KeyIntents& k) {
+    if (!a.has_timeline() || a.scope_is_look()) return;
+    const uint32_t ph = a.player.current_frame_index();
+    const uint32_t fc = a.player.frame_count();
+    const uint32_t cur_in = a.sequence().trim_in;
+    k.key_trim_out =
+        static_cast<float>(std::max(std::min(ph + 1, fc), cur_in + 1));
+}
+
+// Marker at the playhead (sequence structure: inert inside a look).
+void marker(AppState& a, KeyIntents&) {
+    if (!a.has_timeline() || a.scope_is_look()) return;
+    a.undo.execute(a.document,
+                   doc::toggle_marker_command(
+                       a.sequence().id, a.player.current_frame_index()));
+}
+
+void undo(AppState&, KeyIntents& k) { k.do_undo = true; }
+void redo(AppState&, KeyIntents& k) { k.do_redo = true; }
+void group(AppState&, KeyIntents& k) { k.do_group = true; }
+void ungroup(AppState&, KeyIntents& k) { k.do_ungroup = true; }
+void duplicate(AppState&, KeyIntents& k) { k.do_duplicate = true; }
+void save(AppState&, KeyIntents& k) { k.do_save = true; }
+void save_as(AppState&, KeyIntents& k) { k.do_save_as = true; }
+void open_project(AppState&, KeyIntents& k) { k.do_open_project = true; }
+void select_all(AppState&, KeyIntents& k) { k.do_select_all = true; }
+void open_media(AppState&, KeyIntents& k) { k.open_media = true; }
+void import_media(AppState&, KeyIntents& k) { k.import_media = true; }
+void import_preset(AppState&, KeyIntents& k) { k.import_preset = true; }
+void export_out(AppState&, KeyIntents& k) { k.do_export = true; }
+
+// Find / jump-to-node popup (the cursor add menu in find mode).
+// Sequence scope has no nodes to find - the popup stays shut.
+void find_node(AppState& a, KeyIntents&) {
+    if (!a.scope_is_look()) return;
+    a.find_mode = true;
+    a.fx_filter.clear();
+    a.fx_search_focus = true;
+    a.canvas_state.add_open = true;
+    a.canvas_state.add_anchor = a.canvas_state.last_mouse;
+    a.canvas_state.add_scroll = 0.0f;
+    a.canvas_state.splice_from = 0;
+    a.canvas_state.splice_to = 0;
+    a.canvas_state.splice_port = 0;
+}
+
+// Fit view (texed F): re-trigger the first-frame content fit.
+void fit_view(AppState& a, KeyIntents&) {
+    a.canvas_state.view_inited = false;
+}
+
+// Over the timeline, copy/paste act on selected keys (look scope -
+// keys are look-local); otherwise the canvas clipboard (texed).
+void copy(AppState& a, KeyIntents& k) {
+    if (k.tl_hovered && a.scope_is_look() &&
+        timeline_copy_selected_keys(a))
+        return;
+    k.do_copy = true;
+}
+
+void cut(AppState&, KeyIntents& k) {
+    k.do_copy = true;
+    k.do_cut = true;
+}
+
+void paste(AppState& a, KeyIntents& k) {
+    if (k.tl_hovered && a.scope_is_look() && timeline_paste_keys(a))
+        return;
+    k.do_paste = true;
+}
+
+void ab_wipe(AppState& a, KeyIntents&) { a.ab_wipe = !a.ab_wipe; }
+
+// Bypass the SELECTION when one exists; bare = the app-wide fx toggle.
+void bypass(AppState& a, KeyIntents&) {
+    bool any = false;
+    for (const uint64_t cid : a.multi_sel) {
+        const uint64_t did = cid & 0x00FFFFFFFFFFFFFFull;
+        const auto kind = static_cast<flow::NodeKind>((cid >> 56) - 1);
+        size_t li = 0, fi = 0;
+        if (kind == flow::NodeKind::Effect &&
+            find_effect_by_id(a.look(), did, &li, &fi)) {
+            if (!any) a.undo.begin_group("Bypass");
+            any = true;
+            a.undo.execute(
+                a.document,
+                doc::set_bypass_command(
+                    a.scope_look, li, fi,
+                    !a.look().layers[li].stack[fi].bypass));
+        } else if (kind == flow::NodeKind::Group &&
+                   find_group_by_id(a.look(), did, &li)) {
+            for (const doc::Group& gr : a.look().layers[li].groups)
+                if (gr.id == did) {
+                    if (!any) a.undo.begin_group("Bypass");
+                    any = true;
+                    doc::Group edited = gr;
+                    edited.bypass = !edited.bypass;
+                    a.undo.execute(a.document,
+                                   doc::set_group_props_command(
+                                       a.scope_look, li, edited));
+                    break;
+                }
+        }
+    }
+    if (any) a.undo.end_group();
+    else a.bypass_all = !a.bypass_all;
+}
+
+// Drag snapping (the NLE magnet).
+void snap(AppState& a, KeyIntents&) {
+    a.tl_snap = !a.tl_snap;
+    a.status = a.tl_snap ? "snap on" : "snap off";
+}
+
+void razor(AppState& a, KeyIntents&) { timeline_razor_at_playhead(a); }
+
+// Trim head/tail of what is under the playhead to the playhead
+// (no ripple).
+void trim_head(AppState& a, KeyIntents&) {
+    if (a.scope_is_look()) return;
+    if (timeline_trim_to_playhead(a, true))
+        a.status = "trimmed head to playhead";
+}
+
+void trim_tail(AppState& a, KeyIntents&) {
+    if (a.scope_is_look()) return;
+    if (timeline_trim_to_playhead(a, false))
+        a.status = "trimmed tail to playhead";
+}
+
+void cycle_theme(AppState& a, KeyIntents&) {
+    a.theme_index = (a.theme_index + 1) % ui::theme_count();
+    ui::set_active_theme(a.theme_index);
+    save_ui_prefs(a);
+}
+
+// Envelope keypress trigger: live-mode only — wall-clock triggers are
+// exempt from determinism there and only there.
+void envelope_trigger(AppState& a, KeyIntents&) {
+    if (a.live_mode) a.env_key_time = a.app_seconds;
+}
+
+void alpha_checker(AppState& a, KeyIntents&) {
+    a.alpha_checker = !a.alpha_checker;
+}
+
+void settings(AppState& a, KeyIntents&) { a.settings.open = true; }
+
+// Over the timeline, delete removes selected keys; else a live browser
+// selection goes (behind the modal confirm - a click off any row
+// released it, so it means the browser was the last thing touched);
+// else the picked BLOCK (with its whole link group - picture and sound
+// leave together); else the canvas selection (texed). Key edits are
+// LOOK-LOCAL - at sequence scope they must not land on the fallback
+// look (or swallow the block delete).
+void delete_selected(AppState& a, KeyIntents& k) {
+    if (k.tl_hovered && a.scope_is_look() &&
+        timeline_delete_selected_keys(a))
+        return;
+    if (a.inspector_tab == 3 && a.browser_sel) {
+        request_browser_delete(a, a.browser_sel);
+    } else if (a.inspector_tab == 2 && a.preset_sel) {
+        request_preset_delete(a, a.preset_sel);
+    } else if (a.sel_placement && !a.scope_is_look() &&
+               doc::find_placement(a.sequence(), a.sel_placement)) {
+        a.undo.execute(a.document,
+                       doc::remove_placement_command(a.sequence().id,
+                                                     a.sel_placement));
+        a.sel_placement = 0;
+    } else if (a.scope_is_look() && a.sel.kind == SelKind::LayerSource &&
+               a.giz_path_sel >= 0) {
+        // Path editor: delete removes the selected CONTROL POINTS (the
+        // whole marquee/shift set in one undo step), never the layer
+        // under them.
+        doc::Layer* pl = doc::find_layer(a.look(), a.sel.id);
+        if (pl && pl->source == doc::LayerSourceKind::Shape &&
+            pl->osc_shape == 3u) {
+            uint64_t mask = a.giz_path_mask;
+            if (!mask &&
+                a.giz_path_sel < static_cast<int>(pl->path.size()))
+                mask = 1ull << a.giz_path_sel;
+            doc::Layer up = *pl;
+            up.path.clear();
+            for (size_t pi = 0; pi < pl->path.size(); ++pi)
+                if (pi >= 64 || !(mask >> pi & 1))
+                    up.path.push_back(pl->path[pi]);
+            if (up.path.size() != pl->path.size()) {
+                a.undo.execute(a.document,
+                               doc::set_layer_props_command(
+                                   a.scope_look, std::move(up)));
+                a.giz_path_sel = -1;
+                a.giz_path_mask = 0;
+            }
+        }
+    } else {
+        k.do_delete_sel = true;
+    }
+}
+
+// Arrows: with a canvas selection they nudge it (texed, graph units);
+// without one, horizontal arrows step the PLAYHEAD (the transport
+// arrows). The x10 variants are the shift chords.
+void arrow(AppState& a, KeyIntents& k, float dx, float dy, float step) {
+    const bool nudges =
+        !a.multi_sel.empty() || a.sel.kind != SelKind::None;
+    if (nudges) {
+        k.nudge_dx += dx * step;
+        k.nudge_dy += dy * step;
+    } else if (dx != 0.0f && a.has_timeline()) {
+        const uint32_t fc = a.player.frame_count();
+        const uint32_t at = a.player.current_frame_index();
+        const uint32_t d = static_cast<uint32_t>(step);
+        a.player.pause();
+        k.key_seek = static_cast<float>(
+            dx < 0.0f ? (at > d ? at - d : 0u)
+                      : std::min(at + d, fc ? fc - 1 : 0u));
+    }
+}
+
+void step_back(AppState& a, KeyIntents& k) { arrow(a, k, -1, 0, 1); }
+void step_forward(AppState& a, KeyIntents& k) { arrow(a, k, 1, 0, 1); }
+void step_back_big(AppState& a, KeyIntents& k) { arrow(a, k, -1, 0, 10); }
+void step_forward_big(AppState& a, KeyIntents& k) {
+    arrow(a, k, 1, 0, 10);
+}
+void nudge_up(AppState& a, KeyIntents& k) { arrow(a, k, 0, -1, 1); }
+void nudge_down(AppState& a, KeyIntents& k) { arrow(a, k, 0, 1, 1); }
+void nudge_up_big(AppState& a, KeyIntents& k) { arrow(a, k, 0, -1, 10); }
+void nudge_down_big(AppState& a, KeyIntents& k) { arrow(a, k, 0, 1, 10); }
+
+}  // namespace act
+
+struct ActionDef {
+    const char* id;
+    const char* name;      // settings row label; the page sorts on this
+    const char* chords;    // default chords, space-separated; "" = unbound
+    bool repeats;          // fires on key auto-repeat
+    void (*run)(AppState&, KeyIntents&);
+};
+
+const std::vector<ActionDef>& action_registry() {
+    static const std::vector<ActionDef> table = {
+        {"ab_wipe", "a/b wipe", "a", false, act::ab_wipe},
+        {"alpha_checker", "alpha checker", "", false, act::alpha_checker},
+        {"bypass", "bypass fx", "b", false, act::bypass},
+        {"copy", "copy", "ctrl+c", false, act::copy},
+        {"cut", "cut", "ctrl+x", false, act::cut},
+        {"cycle_theme", "cycle theme", "t", false, act::cycle_theme},
+        {"delete_selected", "delete selected", "delete backspace", false,
+         act::delete_selected},
+        {"duplicate", "duplicate", "ctrl+d", false, act::duplicate},
+        {"envelope_trigger", "envelope trigger (live)", "g", false,
+         act::envelope_trigger},
+        {"export", "export...", "", false, act::export_out},
+        {"find_node", "find node", "ctrl+f", false, act::find_node},
+        {"fit_view", "fit view", "f", false, act::fit_view},
+        {"frame_back", "frame back", ",", true, act::frame_back},
+        {"frame_forward", "frame forward", ".", true, act::frame_forward},
+        {"go_end", "go to end", "end", true, act::go_end},
+        {"go_start", "go to start", "home", true, act::go_start},
+        {"group", "group selection", "ctrl+g", false, act::group},
+        {"import_media", "import media...", "", false, act::import_media},
+        {"import_preset", "import preset...", "", false,
+         act::import_preset},
+        {"mark_next", "next mark", "]", true, act::mark_next},
+        {"mark_prev", "previous mark", "[", true, act::mark_prev},
+        {"marker", "toggle marker", "m", false, act::marker},
+        {"nudge_down", "nudge down", "down", true, act::nudge_down},
+        {"nudge_down_big", "nudge down x10", "shift+down", true,
+         act::nudge_down_big},
+        {"nudge_up", "nudge up", "up", true, act::nudge_up},
+        {"nudge_up_big", "nudge up x10", "shift+up", true,
+         act::nudge_up_big},
+        {"open_media", "open media...", "", false, act::open_media},
+        {"open_project", "open project...", "ctrl+o", true,
+         act::open_project},
+        {"paste", "paste", "ctrl+v", false, act::paste},
+        {"razor", "razor at playhead", "r ctrl+k", false, act::razor},
+        {"redo", "redo", "ctrl+shift+z ctrl+y", true, act::redo},
+        {"save_project", "save project", "ctrl+s", true, act::save},
+        {"save_project_as", "save project as...", "ctrl+shift+s", true,
+         act::save_as},
+        {"select_all", "select all", "ctrl+a", false, act::select_all},
+        {"set_in", "set in point", "i", false, act::set_in},
+        {"set_out", "set out point", "o", false, act::set_out},
+        {"settings", "settings", "", false, act::settings},
+        {"step_back", "step back / nudge left", "left", true,
+         act::step_back},
+        {"step_back_big", "step back x10", "shift+left", true,
+         act::step_back_big},
+        {"step_forward", "step forward / nudge right", "right", true,
+         act::step_forward},
+        {"step_forward_big", "step forward x10", "shift+right", true,
+         act::step_forward_big},
+        {"toggle_play", "play / pause", "space", false, act::play},
+        {"toggle_snap", "toggle snapping", "s", false, act::snap},
+        {"trim_head", "trim head to playhead", "q", false, act::trim_head},
+        {"trim_tail", "trim tail to playhead", "w", false,
+         act::trim_tail},
+        {"undo", "undo", "ctrl+z", true, act::undo},
+    };
+    return table;
+}
+
+const ActionDef* find_action(std::string_view id) {
+    for (const ActionDef& a : action_registry())
+        if (id == a.id) return &a;
+    return nullptr;
+}
+
+bool action_exists(std::string_view id) {
+    return find_action(id) != nullptr;
+}
+
+bool run_action_id(AppState& app, KeyIntents& ki, std::string_view id) {
+    const ActionDef* a = find_action(id);
+    if (!a) return false;
+    a->run(app, ki);
+    return true;
+}
+
+std::map<std::string, KeyBinding> default_keybinds() {
+    std::map<std::string, KeyBinding> out;
+    for (const ActionDef& a : action_registry()) {
+        std::string_view s = a.chords;
+        while (!s.empty()) {
+            const size_t sp = s.find(' ');
+            const std::string_view one = s.substr(0, sp);
+            if (!one.empty())
+                out[std::string(one)] = {KeyBinding::Kind::Action, a.id};
+            s = sp == std::string_view::npos ? std::string_view{}
+                                            : s.substr(sp + 1);
+        }
+    }
+    return out;
+}
+
+// Macro steps are SINGLE SEQUENTIAL STATEMENTS (user decision): a bare
+// action id or one op call with arguments - never control flow,
+// declarations, or multiple statements. The scan skips string literals
+// so log("while waiting") stays legal; everything else runs through
+// the compiler at fire time.
+std::string macro_step_error(std::string_view step) {
+    if (step.empty()) return "empty step";
+    if (step.find('\n') != std::string_view::npos ||
+        step.find('\r') != std::string_view::npos)
+        return "one statement per step";
+    static const char* kForbidden[] = {"let", "if", "else", "while",
+                                       "for", "in", "fn", "return",
+                                       "break", "continue"};
+    bool in_string = false;
+    std::string word;
+    auto check_word = [&]() -> const char* {
+        for (const char* kw : kForbidden)
+            if (word == kw) return kw;
+        return nullptr;
+    };
+    for (size_t i = 0; i < step.size(); ++i) {
+        const char c = step[i];
+        if (in_string) {
+            if (c == '\\') ++i;
+            else if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            word.clear();
+            continue;
+        }
+        if (c == ';') return "one statement per step";
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            c == '_' || (c >= '0' && c <= '9' && !word.empty())) {
+            word.push_back(c);
+            continue;
+        }
+        if (const char* kw = check_word())
+            return std::string("control flow is script-tier (\"") + kw +
+                   "\")";
+        word.clear();
+    }
+    if (const char* kw = check_word())
+        return std::string("control flow is script-tier (\"") + kw +
+               "\")";
+    return {};
+}
+
+// A bare registry action id is editor sugar for action("id"); anything
+// else is the statement verbatim.
+std::string macro_step_source(const std::string& step) {
+    if (step.find('(') == std::string::npos && action_exists(step))
+        return "action(\"" + step + "\")";
+    return step;
+}
+
+void pump_action_queue(AppState& app, KeyIntents& ki) {
+    if (app.action_queue.empty()) return;
+    if (app.confirm.open() || app.settings.open) return;
+    const std::string id = app.action_queue.front();
+    app.action_queue.pop_front();
+    if (!run_action_id(app, ki, id)) app.status = "unknown action " + id;
+}
+
+// ---- settings popup (edit > settings): modal on the ConfirmDialog
+// pattern - the interaction pass runs on live input at frame start and
+// the caller deadens everything underneath; the draw pass rebuilds the
+// same layout at frame end (state may have moved between them).
+
+struct SettingsRow {
+    enum class Kind : uint8_t {
+        Heading, MacroRow, StepRow, AddStep, NewMacro, ScriptRow,
+        BindScript, ActionRow
+    };
+    Kind kind{};
+    std::string label;   // display text
+    std::string key;     // action id / macro name / script path
+    int index = -1;      // step position inside the open macro
+    bool dim = false;    // unknown action / missing script file
+    ui::Rect rect;       // view space, already scrolled
+};
+
+struct SettingsLayout {
+    ui::Rect panel, tabs, tab_keys, filter, view;
+    std::vector<SettingsRow> rows;
+    float content_h = 0.0f;
+    // The row being step-edited: the autocomplete POPUP anchors under
+    // it and OVERLAYS the list - typing never reflows the rows.
+    ui::Rect edit_anchor;
+    bool edit_active = false;
+};
+
+constexpr float kSetRowH = 22.0f;
+constexpr float kSetHeadH = 30.0f;
+constexpr float kSetChordW = 170.0f;
+constexpr float kSetBtnH = 18.0f;
+
+// Autocomplete for the macro step editor: prefix matches on the
+// identifier being typed at the buffer's end - actions first, then
+// ops. An EMPTY buffer offers the whole catalog, so a blank custom
+// step is a browsable list, not a knowledge test.
+struct StepCompletion {
+    std::string display;   // op signature / "id  action: name"
+    std::string insert;    // replacement identifier ("(" appended for ops)
+};
+
+inline constexpr int kCompleteShown = 12;
+
+std::string step_trailing_word(const std::string& buf) {
+    size_t start = buf.size();
+    while (start > 0) {
+        const char c = buf[start - 1];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_')
+            --start;
+        else
+            break;
+    }
+    // A leading digit means a number literal, not an identifier.
+    if (start < buf.size() && buf[start] >= '0' && buf[start] <= '9')
+        return {};
+    return buf.substr(start);
+}
+
+std::vector<StepCompletion> step_completions(const AppState& app,
+                                             const std::string& buf) {
+    std::vector<StepCompletion> out;
+    const std::string word = step_trailing_word(buf);
+    if (word.empty() && !buf.empty()) return out;
+    const auto starts = [&](std::string_view name) {
+        return name.size() >= word.size() &&
+               name.compare(0, word.size(), word) == 0;
+    };
+    for (const ActionDef& a : action_registry())
+        if (starts(a.id))
+            out.push_back({std::string(a.id) + "  action: " + a.name,
+                           a.id});
+    for (const auto& [n, sig] : app.op_help)
+        if (starts(n)) out.push_back({sig, n + "("});
+    return out;
+}
+
+void settings_apply_completion(AppState& app, size_t index) {
+    SettingsUi& s = app.settings;
+    const auto comps = step_completions(app, s.step_buf);
+    if (index >= comps.size()) return;
+    const std::string word = step_trailing_word(s.step_buf);
+    s.step_buf.resize(s.step_buf.size() - word.size());
+    s.step_buf += comps[index].insert;
+    s.complete_sel = 0;
+}
+
+// Registry sorted by display name - the action section and the
+// add-step picker both list this order.
+std::vector<const ActionDef*> actions_by_name() {
+    std::vector<const ActionDef*> v;
+    for (const ActionDef& a : action_registry()) v.push_back(&a);
+    std::sort(v.begin(), v.end(),
+              [](const ActionDef* x, const ActionDef* y) {
+                  return std::string_view(x->name) <
+                         std::string_view(y->name);
+              });
+    return v;
+}
+
+// Every chord bound to one target, display-joined ("r, ctrl+k").
+std::string chords_of(const AppState& app, KeyBinding::Kind kind,
+                      const std::string& value) {
+    std::string out;
+    for (const auto& [chord, b] : app.keybinds)
+        if (b.kind == kind && b.value == value) {
+            if (!out.empty()) out += ", ";
+            out += chord;
+        }
+    return out;
+}
+
+bool settings_filter_hits(const AppState& app, std::string_view name) {
+    return app.settings.filter.empty() ||
+           name.find(app.settings.filter) != std::string_view::npos;
+}
+
+SettingsLayout settings_layout(const AppState& app, const ui::Font&,
+                               const ui::Rect& viewport) {
+    const SettingsUi& s = app.settings;
+    SettingsLayout sl;
+    const float pw = std::min(720.0f, viewport.w - 80.0f);
+    const float ph = std::min(viewport.h * 0.78f, viewport.h - 64.0f);
+    sl.panel = {std::round((viewport.w - pw) * 0.5f),
+                std::round((viewport.h - ph) * 0.42f), pw, ph};
+    const float pad = 14.0f;
+    sl.tabs = {sl.panel.x, sl.panel.y, 118.0f, sl.panel.h};
+    sl.tab_keys = {sl.tabs.x + 8.0f, sl.tabs.y + 44.0f, sl.tabs.w - 16.0f,
+                   24.0f};
+    const float cx = sl.tabs.right() + pad;
+    const float cw = sl.panel.right() - pad - cx;
+    sl.filter = {cx, sl.panel.y + 40.0f, cw, kSetRowH};
+    sl.view = {cx, sl.filter.bottom() + 8.0f, cw,
+               sl.panel.bottom() - pad - (sl.filter.bottom() + 8.0f)};
+
+    auto row = [&](SettingsRow::Kind k, std::string label, std::string key,
+                   int index, bool dim, float h) {
+        SettingsRow r;
+        r.kind = k;
+        r.label = std::move(label);
+        r.key = std::move(key);
+        r.index = index;
+        r.dim = dim;
+        r.rect = {sl.view.x, sl.view.y - s.scroll + sl.content_h,
+                  sl.view.w, h};
+        sl.content_h += h;
+        sl.rows.push_back(std::move(r));
+    };
+
+    row(SettingsRow::Kind::Heading, "macro", "", -1, false, kSetHeadH);
+    for (const auto& [name, steps] : app.macros) {
+        if (!settings_filter_hits(app, name)) continue;
+        row(SettingsRow::Kind::MacroRow, name, name, -1, false, kSetRowH);
+        if (s.macro_open != name) continue;
+        int i = 0;
+        for (const std::string& step : steps) {
+            const bool editing =
+                s.step_edit_macro == name && s.step_edit_index == i;
+            row(SettingsRow::Kind::StepRow,
+                editing ? s.step_buf + "_" : step, step, i,
+                !editing && !macro_step_error(step).empty(), kSetRowH);
+            if (editing) {
+                sl.edit_anchor = sl.rows.back().rect;
+                sl.edit_active = true;
+            }
+            ++i;
+        }
+        // Appending: an extra row holds the typed line ("+ add step"
+        // opened it); the autocomplete popup anchors on it and
+        // OVERLAYS - the rows beneath never move while typing.
+        if (s.step_edit_macro == name &&
+            s.step_edit_index == static_cast<int>(steps.size())) {
+            row(SettingsRow::Kind::StepRow, s.step_buf + "_", "", i,
+                false, kSetRowH);
+            sl.edit_anchor = sl.rows.back().rect;
+            sl.edit_active = true;
+        }
+        row(SettingsRow::Kind::AddStep, "+ add step", name, -1, false,
+            kSetRowH);
+    }
+    row(SettingsRow::Kind::NewMacro,
+        s.adding ? "name: " + s.name_buf + "_" : "+ new macro", "", -1,
+        false, kSetRowH);
+
+    row(SettingsRow::Kind::Heading, "script", "", -1, false, kSetHeadH);
+    std::set<std::string> script_paths;
+    for (const auto& [chord, b] : app.keybinds)
+        if (b.kind == KeyBinding::Kind::Script)
+            script_paths.insert(b.value);
+    for (const std::string& path : script_paths) {
+        const std::string fname = path_to_u8(u8_to_path(path).filename());
+        if (!settings_filter_hits(app, fname)) continue;
+        std::error_code ec;
+        const bool missing = !std::filesystem::exists(u8_to_path(path), ec);
+        row(SettingsRow::Kind::ScriptRow, fname, path, -1, missing,
+            kSetRowH);
+    }
+    row(SettingsRow::Kind::BindScript, "+ bind script...", "", -1, false,
+        kSetRowH);
+
+    row(SettingsRow::Kind::Heading, "action", "", -1, false, kSetHeadH);
+    for (const ActionDef* a : actions_by_name())
+        if (settings_filter_hits(app, a->name))
+            row(SettingsRow::Kind::ActionRow, a->name, a->id, -1, false,
+                kSetRowH);
+    return sl;
+}
+
+// The autocomplete POPUP: anchored under the edited step row, drawn
+// and hit-tested ABOVE the list - it never inserts rows, so typing
+// never reflows the settings menu. Completions while an identifier is
+// being typed (or the whole catalog on an empty line), else the
+// exact-matched signature as a non-interactive argument hint.
+struct SettingsOverlay {
+    ui::Rect rect;
+    std::vector<std::string> rows;   // display lines
+    int shown = 0;                   // interactive completion count
+    float pad = 4.0f;
+    bool open() const { return !rows.empty(); }
+    ui::Rect row_rect(int i) const {
+        return {rect.x, rect.y + pad + static_cast<float>(i) * kSetRowH,
+                rect.w, kSetRowH};
+    }
+};
+
+SettingsOverlay settings_overlay(const AppState& app,
+                                 const SettingsLayout& sl) {
+    SettingsOverlay ov;
+    const SettingsUi& s = app.settings;
+    if (s.step_edit_index < 0 || !sl.edit_active) return ov;
+    // A scrolled-away anchor takes its popup with it.
+    if (sl.edit_anchor.bottom() <= sl.view.y ||
+        sl.edit_anchor.y >= sl.view.bottom())
+        return ov;
+    const auto comps = step_completions(app, s.step_buf);
+    if (!comps.empty()) {
+        ov.shown = std::min<int>(kCompleteShown,
+                                 static_cast<int>(comps.size()));
+        for (int i = 0; i < ov.shown; ++i)
+            ov.rows.push_back(comps[i].display);
+        if (static_cast<int>(comps.size()) > ov.shown)
+            ov.rows.push_back(
+                "(" + std::to_string(comps.size() - ov.shown) +
+                " more - keep typing)");
+    } else {
+        std::string word;
+        for (const char c : s.step_buf) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                c == '_' || (!word.empty() && c >= '0' && c <= '9'))
+                word.push_back(c);
+            else
+                break;
+        }
+        if (!word.empty()) {
+            for (const auto& [n, sig] : app.op_help)
+                if (n == word) {
+                    ov.rows.push_back(sig);
+                    break;
+                }
+            if (ov.rows.empty())
+                if (const ActionDef* a = find_action(word))
+                    ov.rows.push_back(std::string("action: ") + a->name);
+        }
+    }
+    if (ov.rows.empty()) return ov;
+    const float w = std::min(480.0f, sl.view.w - 40.0f);
+    const float h =
+        static_cast<float>(ov.rows.size()) * kSetRowH + ov.pad * 2.0f;
+    const float x = std::min(sl.edit_anchor.x + 20.0f,
+                             sl.view.right() - w - 4.0f);
+    float y = sl.edit_anchor.bottom() + 2.0f;
+    if (y + h > sl.panel.bottom() - 6.0f)
+        y = sl.edit_anchor.y - 2.0f - h;   // flip above the line
+    ov.rect = {x, y, w, h};
+    return ov;
+}
+
+// Right-aligned control cluster per row kind; index 0 is the rightmost.
+// MacroRow: [delete][rename][edit][run][chord]; StepRow: [down][up][x];
+// ScriptRow: [x][chord]; ActionRow: [chord].
+ui::Rect settings_btn(const SettingsRow& r, int slot, float w) {
+    float right = r.rect.right() - 4.0f;
+    static const float kMacroW[] = {50.0f, 56.0f, 40.0f, 36.0f, kSetChordW};
+    static const float kStepW[] = {20.0f, 20.0f, 20.0f};
+    static const float kScriptW[] = {20.0f, kSetChordW};
+    const float* widths = nullptr;
+    int count = 0;
+    switch (r.kind) {
+        case SettingsRow::Kind::MacroRow: widths = kMacroW; count = 5; break;
+        case SettingsRow::Kind::StepRow: widths = kStepW; count = 3; break;
+        case SettingsRow::Kind::ScriptRow: widths = kScriptW; count = 2; break;
+        case SettingsRow::Kind::ActionRow: {
+            static const float kActW[] = {kSetChordW};
+            widths = kActW;
+            count = 1;
+            break;
+        }
+        default: return {right - w, r.rect.y + 2.0f, w, kSetBtnH};
+    }
+    for (int i = 0; i < count && i <= slot; ++i) {
+        right -= widths[i];
+        if (i == slot)
+            return {right, r.rect.y + 2.0f, widths[i], kSetBtnH};
+        right -= 4.0f;
+    }
+    return {right, r.rect.y + 2.0f, w, kSetBtnH};
+}
+
+void settings_close(AppState& app) {
+    app.settings.open = false;
+    settings_end_entry(app.settings);
+}
+
+// Enter commits the pending name entry (rename or new macro).
+void settings_commit_name(AppState& app) {
+    SettingsUi& s = app.settings;
+    const std::string name = s.name_buf;
+    if (s.adding) {
+        s.adding = false;
+        s.name_buf.clear();
+        if (name.empty()) return;
+        if (app.macros.count(name)) {
+            app.status = "macro name taken";
+            return;
+        }
+        app.macros[name] = {};
+        s.macro_open = name;
+        save_ui_prefs(app);
+        return;
+    }
+    if (s.rename_macro.empty()) return;
+    const std::string old = s.rename_macro;
+    s.rename_macro.clear();
+    s.name_buf.clear();
+    if (name.empty() || name == old) return;
+    if (app.macros.count(name)) {
+        app.status = "macro name taken";
+        return;
+    }
+    auto node = app.macros.extract(old);
+    if (node.empty()) return;
+    node.key() = name;
+    app.macros.insert(std::move(node));
+    for (auto& [chord, b] : app.keybinds)
+        if (b.kind == KeyBinding::Kind::Macro && b.value == old)
+            b.value = name;
+    if (s.macro_open == old) s.macro_open = name;
+    save_ui_prefs(app);
+}
+
+// Enter commits the edited step. An invalid statement reports on the
+// status line and the editor stays open for fixing; an index at the
+// step count appends (the "custom step..." path).
+void settings_commit_step(AppState& app) {
+    SettingsUi& s = app.settings;
+    const auto it = app.macros.find(s.step_edit_macro);
+    if (it != app.macros.end()) {
+        const std::string err = macro_step_error(s.step_buf);
+        if (!err.empty()) {
+            app.status = err;
+            return;
+        }
+        const size_t i = static_cast<size_t>(s.step_edit_index);
+        if (i < it->second.size())
+            it->second[i] = s.step_buf;
+        else
+            it->second.push_back(s.step_buf);
+        save_ui_prefs(app);
+    }
+    s.step_edit_macro.clear();
+    s.step_edit_index = -1;
+    s.step_buf.clear();
+    s.complete_sel = 0;
+}
+
+// Keyboard while the popup owns it: capture first, then the focused
+// text buffer (picker filter / name entry / section filter), then the
+// escape ladder. Escape and ` never capture.
+void settings_key_event(AppState& app, const platform::Event& e) {
+    SettingsUi& s = app.settings;
+    if (!s.capture.empty()) {
+        if (e.key == platform::Key::Escape) {
+            s.capture.clear();
+            return;
+        }
+        if (e.key == platform::Key::Shift ||
+            e.key == platform::Key::Ctrl ||
+            e.key == platform::Key::Alt ||
+            e.key == platform::Key::CapsLock)
+            return;   // modifiers alone never finish a chord
+        const std::string chord = chord_of(e.key, e.mods);
+        if (chord.empty()) return;
+        const std::string target = s.capture;
+        s.capture.clear();
+        const size_t colon = target.find(':');
+        if (colon == std::string::npos) return;
+        const std::string kind_s = target.substr(0, colon);
+        KeyBinding b;
+        b.kind = kind_s == "macro"    ? KeyBinding::Kind::Macro
+                 : kind_s == "script" ? KeyBinding::Kind::Script
+                                      : KeyBinding::Kind::Action;
+        b.value = target.substr(colon + 1);
+        for (auto it = app.keybinds.begin(); it != app.keybinds.end();)
+            if (it->second == b)
+                it = app.keybinds.erase(it);
+            else
+                ++it;
+        app.keybinds[chord] = std::move(b);
+        save_ui_prefs(app);
+        return;
+    }
+    // Autocomplete owns arrows and tab while the dropdown has rows.
+    if (s.step_edit_index >= 0) {
+        const auto comps = step_completions(app, s.step_buf);
+        if (!comps.empty()) {
+            const int count = std::min<int>(
+                kCompleteShown, static_cast<int>(comps.size()));
+            if (e.key == platform::Key::Down) {
+                s.complete_sel = std::min(count - 1, s.complete_sel + 1);
+                return;
+            }
+            if (e.key == platform::Key::Up) {
+                s.complete_sel = std::max(0, s.complete_sel - 1);
+                return;
+            }
+            if (e.key == platform::Key::Tab) {
+                settings_apply_completion(
+                    app, static_cast<size_t>(
+                             std::min(s.complete_sel, count - 1)));
+                return;
+            }
+        }
+    }
+    std::string* dst = s.step_edit_index >= 0 ? &s.step_buf
+                       : (s.adding || !s.rename_macro.empty())
+                           ? &s.name_buf
+                           : &s.filter;
+    if (e.key == platform::Key::Backspace) {
+        if (!dst->empty()) dst->pop_back();
+        if (s.step_edit_index >= 0) s.complete_sel = 0;
+        return;
+    }
+    if (e.key == platform::Key::Enter) {
+        if (s.step_edit_index >= 0) settings_commit_step(app);
+        else settings_commit_name(app);
+        return;
+    }
+    if (e.key == platform::Key::Escape) {
+        if (s.step_edit_index >= 0 || s.adding ||
+            !s.rename_macro.empty()) {
+            settings_end_entry(s);
+        } else if (!s.filter.empty()) {
+            s.filter.clear();
+        } else {
+            settings_close(app);
+        }
+    }
+}
+
+void settings_char_event(AppState& app, uint32_t cp) {
+    SettingsUi& s = app.settings;
+    if (!s.capture.empty()) return;
+    if (cp < 32 || cp >= 127) return;
+    if (s.step_edit_index >= 0) {
+        // Statements run long ("set_param(scope(), fx, ...)").
+        if (s.step_buf.size() < 160) {
+            s.step_buf.push_back(static_cast<char>(cp));
+            s.complete_sel = 0;
+        }
+        return;
+    }
+    std::string* dst = (s.adding || !s.rename_macro.empty())
+                           ? &s.name_buf
+                           : &s.filter;
+    if (dst->size() < 40) dst->push_back(static_cast<char>(cp));
+}
+
+// Pointer pass against the LIVE input; the caller deadens the frame
+// underneath afterwards. Clicks act on press.
+void settings_interact(AppState& app, const ui::UiInput& input,
+                       const ui::Font& font, const ui::Rect& viewport,
+                       platform::Window* window) {
+    SettingsUi& s = app.settings;
+    SettingsLayout sl = settings_layout(app, font, viewport);
+    s.hover.clear();
+    const Vec2 m = input.mouse;
+    if (input.wheel_y != 0.0f && sl.panel.contains(m)) {
+        const float span = std::max(0.0f, sl.content_h - sl.view.h);
+        s.scroll = std::clamp(s.scroll - input.wheel_y * 48.0f, 0.0f, span);
+    }
+    s.scroll = std::clamp(
+        s.scroll, 0.0f, std::max(0.0f, sl.content_h - sl.view.h));
+
+    // Hover names double as probe ids; the draw pass highlights them.
+    auto over = [&](const ui::Rect& r, const std::string& name) {
+        const bool in = r.contains(m) && sl.view.contains(m);
+        if (in) s.hover = name;
+        return in;
+    };
+    const bool clicked = input.left_pressed();
+    if (clicked && !sl.panel.contains(m)) {
+        settings_close(app);
+        return;
+    }
+    // The autocomplete popup OVERLAYS the list: while the pointer is
+    // inside it nothing beneath reacts, and a click on a completion
+    // row applies to the live edit.
+    const SettingsOverlay ov = settings_overlay(app, sl);
+    if (ov.open() && ov.rect.contains(m)) {
+        for (int ci = 0; ci < ov.shown; ++ci)
+            if (ov.row_rect(ci).contains(m)) {
+                s.hover = "complete:" + std::to_string(ci);
+                if (clicked)
+                    settings_apply_completion(app,
+                                              static_cast<size_t>(ci));
+            }
+        return;
+    }
+    // One caret: a click anywhere else cancels the open entry (same
+    // click-away rule as the app's inline editors); the handlers
+    // below reopen their own.
+    if (clicked) settings_end_entry(s);
+    if (sl.tab_keys.contains(m)) {
+        s.hover = "tab:keybinds";
+        if (clicked) s.tab = 0;
+    }
+    for (const SettingsRow& r : sl.rows) {
+        if (r.rect.bottom() <= sl.view.y || r.rect.y >= sl.view.bottom())
+            continue;
+        switch (r.kind) {
+            case SettingsRow::Kind::Heading:
+                break;
+            case SettingsRow::Kind::MacroRow: {
+                const ui::Rect chord = settings_btn(r, 4, 0);
+                const ui::Rect run = settings_btn(r, 3, 0);
+                const ui::Rect edit = settings_btn(r, 2, 0);
+                const ui::Rect ren = settings_btn(r, 1, 0);
+                const ui::Rect del = settings_btn(r, 0, 0);
+                if (over(chord, "set:macro:" + r.key)) {
+                    if (clicked) s.capture = "macro:" + r.key;
+                } else if (over(run, "macro-run:" + r.key)) {
+                    if (clicked) {
+                        settings_close(app);
+                        app.pending_macro = r.key;
+                    }
+                } else if (over(edit, "macro-edit:" + r.key)) {
+                    if (clicked)
+                        s.macro_open = s.macro_open == r.key ? "" : r.key;
+                } else if (over(ren, "macro-ren:" + r.key)) {
+                    if (clicked) {
+                        s.rename_macro = r.key;
+                        s.name_buf = r.key;
+                    }
+                } else if (over(del, "macro-del:" + r.key)) {
+                    if (clicked) {
+                        ConfirmDialog d;
+                        d.kind = ConfirmDialog::Kind::YesNo;
+                        d.action = ConfirmDialog::Action::DeleteMacro;
+                        d.title = "delete macro";
+                        d.text = "delete macro \"" + r.key +
+                                 "\" and its key binds?";
+                        d.primary = "delete";
+                        d.secondary = "keep";
+                        d.name = r.key;
+                        app.confirm = std::move(d);
+                    }
+                } else if (over(r.rect, "macro:" + r.key)) {
+                    if (clicked)
+                        s.macro_open = s.macro_open == r.key ? "" : r.key;
+                }
+                break;
+            }
+            case SettingsRow::Kind::StepRow: {
+                auto steps = app.macros.find(s.macro_open);
+                if (steps == app.macros.end()) break;
+                const ui::Rect down = settings_btn(r, 0, 0);
+                const ui::Rect up = settings_btn(r, 1, 0);
+                const ui::Rect x = settings_btn(r, 2, 0);
+                const std::string si = std::to_string(r.index);
+                const size_t n = steps->second.size();
+                const size_t i = static_cast<size_t>(r.index);
+                if (over(x, "step-del:" + si)) {
+                    if (clicked && i < n) {
+                        steps->second.erase(steps->second.begin() +
+                                            static_cast<ptrdiff_t>(i));
+                        save_ui_prefs(app);
+                    }
+                } else if (over(up, "step-up:" + si)) {
+                    if (clicked && i > 0 && i < n) {
+                        std::swap(steps->second[i - 1], steps->second[i]);
+                        save_ui_prefs(app);
+                    }
+                } else if (over(down, "step-down:" + si)) {
+                    if (clicked && i + 1 < n) {
+                        std::swap(steps->second[i], steps->second[i + 1]);
+                        save_ui_prefs(app);
+                    }
+                } else if (over(r.rect, "step-edit:" + si)) {
+                    // The step text is the editable truth: click to
+                    // rewrite the statement in place.
+                    if (clicked && i < n) {
+                        s.step_edit_macro = s.macro_open;
+                        s.step_edit_index = r.index;
+                        s.step_buf = steps->second[i];
+                    }
+                }
+                break;
+            }
+            case SettingsRow::Kind::AddStep:
+                // Opens an empty appending step edit: the popup shows
+                // the whole catalog and narrows as they type.
+                if (over(r.rect, "add-step")) {
+                    if (clicked) {
+                        const auto it = app.macros.find(r.key);
+                        if (it != app.macros.end()) {
+                            s.step_edit_macro = r.key;
+                            s.step_edit_index =
+                                static_cast<int>(it->second.size());
+                        }
+                    }
+                }
+                break;
+            case SettingsRow::Kind::NewMacro:
+                if (over(r.rect, "new-macro")) {
+                    if (clicked) s.adding = true;
+                }
+                break;
+            case SettingsRow::Kind::ScriptRow: {
+                const ui::Rect chord = settings_btn(r, 1, 0);
+                const ui::Rect x = settings_btn(r, 0, 0);
+                if (over(chord, "set:script:" + r.key)) {
+                    if (clicked) s.capture = "script:" + r.key;
+                } else if (over(x, "script-del:" + r.label)) {
+                    if (clicked) {
+                        for (auto it = app.keybinds.begin();
+                             it != app.keybinds.end();)
+                            if (it->second.kind ==
+                                    KeyBinding::Kind::Script &&
+                                it->second.value == r.key)
+                                it = app.keybinds.erase(it);
+                            else
+                                ++it;
+                        save_ui_prefs(app);
+                    }
+                }
+                break;
+            }
+            case SettingsRow::Kind::BindScript:
+                if (over(r.rect, "bind-script")) {
+                    if (clicked) {
+                        auto picked = platform::show_open_dialog(
+                            window, {{"lookscript", "*.lks"}});
+                        if (picked)
+                            s.capture = "script:" + path_to_u8(*picked);
+                    }
+                }
+                break;
+            case SettingsRow::Kind::ActionRow: {
+                const ui::Rect chord = settings_btn(r, 0, 0);
+                if (over(chord, "set:action:" + r.key)) {
+                    if (clicked) s.capture = "action:" + r.key;
+                }
+                break;
+            }
+        }
+    }
+}
+
+void draw_settings(ui::Canvas2D& canvas, const ui::Font& font,
+                   const ui::Font* header_font, const ui::Rect& viewport,
+                   AppState& app) {
+    const ui::Theme& th = ui::active_theme();
+    const SettingsUi& s = app.settings;
+    const SettingsLayout sl = settings_layout(app, font, viewport);
+    const float fs = th.font_size;
+    const float text_dy = (kSetRowH - font.line_height() * fs) * 0.5f;
+    canvas.draw_sdf_rect(viewport, 0.0f,
+                         ui::Color{0.0f, 0.0f, 0.0f, 0.45f});
+    const float radius = th.corner_radius * 2.0f;
+    canvas.draw_sdf_rect(sl.panel, radius, th.panel_bg);
+    canvas.draw_sdf_rect_outline(sl.panel, radius, th.stroke_width,
+                                 th.hairline);
+    canvas.draw_rect({sl.tabs.right(), sl.panel.y + 8.0f, 1.0f,
+                      sl.panel.h - 16.0f},
+                     th.hairline);
+    ui::draw_text(canvas, header_font ? *header_font : font, "settings",
+                  {sl.tabs.x + 12.0f, sl.panel.y + 12.0f},
+                  th.font_size_heading, th.text);
+
+    // Category tabs (one so far).
+    {
+        const bool hov = s.hover == "tab:keybinds";
+        ui::Color bg = th.control_bg;
+        if (s.tab == 0) bg = th.control_bg_active;
+        else if (hov) bg = th.control_bg_hover;
+        canvas.draw_sdf_rect(sl.tab_keys, th.corner_radius, bg);
+        ui::probe_add("tab:keybinds", sl.tab_keys);
+        ui::draw_text(canvas, font, "keybinds",
+                      {sl.tab_keys.x + 8.0f, sl.tab_keys.y + 4.0f}, fs,
+                      s.tab == 0 ? th.text : th.text_dim);
+    }
+
+    // Filter line: always typing-focused while nothing else captures.
+    canvas.draw_sdf_rect_outline(sl.filter, th.corner_radius,
+                                 th.stroke_width, th.hairline);
+    // ONE caret across the popup: the filter is the fallback typing
+    // target, so its underscore yields whenever capture or any entry
+    // field owns the keyboard.
+    const bool filter_live = s.capture.empty() &&
+                             s.step_edit_index < 0 && !s.adding &&
+                             s.rename_macro.empty();
+    ui::draw_text(canvas, font,
+                  "filter: " + s.filter + (filter_live ? "_" : ""),
+                  {sl.filter.x + 6.0f, sl.filter.y + text_dy}, fs,
+                  s.filter.empty() ? th.text_dim : th.text);
+
+    canvas.push_clip(sl.view);
+    auto btn = [&](const ui::Rect& r, const std::string& label,
+                   const std::string& probe, bool accent, bool dim) {
+        const bool hov = s.hover == probe;
+        canvas.draw_sdf_rect(r, th.corner_radius,
+                             hov ? th.control_bg_hover : th.control_bg);
+        canvas.draw_sdf_rect_outline(r, th.corner_radius, th.stroke_width,
+                                     accent ? th.accent_dim : th.hairline);
+        ui::probe_add(probe, r);
+        canvas.push_clip(r);
+        ui::draw_text(canvas, font, label,
+                      {r.x + 5.0f,
+                       r.y + (r.h - font.line_height() * fs) * 0.5f},
+                      fs,
+                      accent ? th.accent : (dim ? th.text_dim : th.text));
+        canvas.pop_clip();
+    };
+    auto glyph_btn = [&](const ui::Rect& r, ui::Icon icon,
+                         const std::string& probe) {
+        const bool hov = s.hover == probe;
+        if (hov)
+            canvas.draw_sdf_rect(r, th.corner_radius, th.control_bg_hover);
+        ui::probe_add(probe, r);
+        ui::draw_icon_glyph(canvas, font, icon,
+                            {r.x + r.w * 0.5f, r.y + r.h * 0.5f},
+                            hov ? th.text : th.text_dim, fs);
+    };
+    auto chord_btn = [&](const SettingsRow& r, int slot,
+                         const std::string& target,
+                         const std::string& probe) {
+        const bool capturing = s.capture == target;
+        KeyBinding::Kind kind = KeyBinding::Kind::Action;
+        if (target.rfind("macro:", 0) == 0) kind = KeyBinding::Kind::Macro;
+        if (target.rfind("script:", 0) == 0)
+            kind = KeyBinding::Kind::Script;
+        const std::string bound =
+            chords_of(app, kind, target.substr(target.find(':') + 1));
+        btn(settings_btn(r, slot, 0),
+            capturing ? "press keys..." : bound.empty() ? "unbound" : bound,
+            probe, capturing, bound.empty());
+    };
+    for (const SettingsRow& r : sl.rows) {
+        if (r.rect.bottom() <= sl.view.y || r.rect.y >= sl.view.bottom())
+            continue;
+        switch (r.kind) {
+            case SettingsRow::Kind::Heading:
+                ui::draw_text(canvas, header_font ? *header_font : font,
+                              r.label,
+                              {r.rect.x, r.rect.y + 8.0f}, fs + 2.0f,
+                              th.text);
+                break;
+            case SettingsRow::Kind::MacroRow: {
+                const bool open_row = s.macro_open == r.key;
+                const bool renaming = s.rename_macro == r.key;
+                if (s.hover == "macro:" + r.key)
+                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
+                ui::probe_add("macro:" + r.key, r.rect);
+                ui::draw_text(canvas, font,
+                              renaming ? s.name_buf + "_" : r.label,
+                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
+                              open_row || renaming ? th.accent : th.text);
+                chord_btn(r, 4, "macro:" + r.key, "set:macro:" + r.key);
+                btn(settings_btn(r, 3, 0), "run", "macro-run:" + r.key,
+                    false, false);
+                btn(settings_btn(r, 2, 0), "edit", "macro-edit:" + r.key,
+                    open_row, false);
+                btn(settings_btn(r, 1, 0), "rename",
+                    "macro-ren:" + r.key, renaming, false);
+                btn(settings_btn(r, 0, 0), "delete",
+                    "macro-del:" + r.key, false, false);
+                break;
+            }
+            case SettingsRow::Kind::StepRow: {
+                const std::string si = std::to_string(r.index);
+                const bool editing =
+                    s.step_edit_macro == s.macro_open &&
+                    s.step_edit_index == r.index;
+                const ui::Rect text_rect = {
+                    r.rect.x, r.rect.y,
+                    settings_btn(r, 2, 0).x - 4.0f - r.rect.x, r.rect.h};
+                if (s.hover == "step-edit:" + si && !editing)
+                    canvas.draw_sdf_rect(text_rect, 0.0f, th.control_bg);
+                ui::probe_add("step-edit:" + si, text_rect);
+                canvas.push_clip(text_rect);
+                ui::draw_text(canvas, font,
+                              std::to_string(r.index + 1) + ". " + r.label,
+                              {r.rect.x + 20.0f, r.rect.y + text_dy}, fs,
+                              editing  ? th.accent
+                              : r.dim  ? th.text_dim
+                                       : th.text);
+                canvas.pop_clip();
+                glyph_btn(settings_btn(r, 2, 0), ui::Icon::Close,
+                          "step-del:" + si);
+                glyph_btn(settings_btn(r, 1, 0), ui::Icon::Up,
+                          "step-up:" + si);
+                glyph_btn(settings_btn(r, 0, 0), ui::Icon::Down,
+                          "step-down:" + si);
+                break;
+            }
+            case SettingsRow::Kind::AddStep:
+                if (s.hover == "add-step")
+                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
+                ui::probe_add("add-step", r.rect);
+                ui::draw_text(canvas, font, r.label,
+                              {r.rect.x + 20.0f, r.rect.y + text_dy}, fs,
+                              th.text_dim);
+                break;
+            case SettingsRow::Kind::NewMacro:
+                if (s.hover == "new-macro")
+                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
+                ui::probe_add("new-macro", r.rect);
+                ui::draw_text(canvas, font, r.label,
+                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
+                              s.adding ? th.text : th.text_dim);
+                break;
+            case SettingsRow::Kind::ScriptRow: {
+                ui::draw_text(canvas, font, r.label,
+                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
+                              r.dim ? th.text_dim : th.text);
+                const float name_w =
+                    ui::measure_text(font, r.label, fs).x;
+                const ui::Rect chord = settings_btn(r, 1, 0);
+                const float px = r.rect.x + 4.0f + name_w + 10.0f;
+                canvas.push_clip({px, r.rect.y,
+                                  std::max(0.0f, chord.x - 8.0f - px),
+                                  r.rect.h});
+                ui::draw_text(canvas, font, r.key,
+                              {px, r.rect.y + text_dy},
+                              th.font_size_small, th.text_dim);
+                canvas.pop_clip();
+                chord_btn(r, 1, "script:" + r.key,
+                          "set:script:" + r.key);
+                glyph_btn(settings_btn(r, 0, 0), ui::Icon::Close,
+                          "script-del:" + r.label);
+                break;
+            }
+            case SettingsRow::Kind::BindScript:
+                if (s.hover == "bind-script")
+                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
+                ui::probe_add("bind-script", r.rect);
+                ui::draw_text(canvas, font, r.label,
+                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
+                              th.text_dim);
+                break;
+            case SettingsRow::Kind::ActionRow:
+                ui::draw_text(canvas, font, r.label,
+                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
+                              th.text);
+                chord_btn(r, 0, "action:" + r.key,
+                          "set:action:" + r.key);
+                break;
+        }
+    }
+    canvas.pop_clip();
+    // Scrollbar hint when the list overflows.
+    if (sl.content_h > sl.view.h) {
+        const float frac = sl.view.h / sl.content_h;
+        const float top = s.scroll / sl.content_h;
+        canvas.draw_sdf_rect({sl.view.right() - 3.0f,
+                              sl.view.y + top * sl.view.h, 3.0f,
+                              std::max(16.0f, frac * sl.view.h)},
+                             1.5f, th.hairline);
+    }
+    // The autocomplete popup floats ABOVE the list, anchored under the
+    // edited step - typing never reflows the rows beneath it.
+    const SettingsOverlay ov = settings_overlay(app, sl);
+    if (ov.open()) {
+        canvas.draw_sdf_rect(ov.rect, th.corner_radius, th.control_bg);
+        canvas.draw_sdf_rect_outline(ov.rect, th.corner_radius,
+                                     th.stroke_width, th.hairline);
+        for (int ci = 0; ci < static_cast<int>(ov.rows.size()); ++ci) {
+            const ui::Rect rr = ov.row_rect(ci);
+            const bool inter = ci < ov.shown;
+            const std::string probe = "complete:" + std::to_string(ci);
+            const bool selected = inter && ci == s.complete_sel;
+            if (selected)
+                canvas.draw_sdf_rect(rr, 0.0f, th.control_bg_active);
+            else if (inter && s.hover == probe)
+                canvas.draw_sdf_rect(rr, 0.0f, th.control_bg_hover);
+            if (inter) ui::probe_add(probe, rr);
+            canvas.push_clip(rr);
+            ui::draw_text(canvas, font, ov.rows[static_cast<size_t>(ci)],
+                          {rr.x + 8.0f,
+                           rr.y + (rr.h - font.line_height() *
+                                              th.font_size_small) *
+                                      0.5f},
+                          th.font_size_small,
+                          selected ? th.text : th.text_dim);
+            canvas.pop_clip();
+        }
+    }
 }
 
 ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
@@ -13487,6 +15841,54 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     out.tl_deselect = arena.alloc<bool>();
     out.ruler_ctx = arena.alloc<bool>();
     out.ruler_ctx_frame = arena.alloc<float>();
+
+    // Cleared every frame; the lane draws below re-elect the target
+    // under the cursor while a vertical drag is live.
+    app.blk_hover_track = 0;
+
+    // ---- ENTITY TABS: every opened look/sequence, the active one is
+    // the scope. Dead ids prune here; the scope re-registers itself so
+    // the row always shows where you are (script scoping included).
+    {
+        std::vector<uint64_t> live;
+        for (const uint64_t id : app.open_tabs)
+            if (app.document.find_look(id) ||
+                app.document.find_sequence(id))
+                live.push_back(id);
+        app.open_tabs = std::move(live);
+        const uint64_t active = app.scope_is_look()
+            ? app.scope_look
+            : app.sequence().id;
+        if (std::find(app.open_tabs.begin(), app.open_tabs.end(),
+                      active) == app.open_tabs.end())
+            app.open_tabs.push_back(active);
+        std::vector<LayoutNode*> tab_cells;
+        for (const uint64_t id : app.open_tabs) {
+            const doc::Look* tl = app.document.find_look(id);
+            const doc::Sequence* ts =
+                tl ? nullptr : app.document.find_sequence(id);
+            const std::string& nm = tl ? tl->name : ts->name;
+            AppState::TabUi& tui = app.tab_ui[id];
+            FrameUi::TlTab tab{id, arena.alloc<bool>(),
+                               arena.alloc<bool>()};
+            out.tl_tabs.push_back(tab);
+            tab_cells.push_back(Chip(
+                arena, arena.dup(nm.c_str(), nm.size()), id == active,
+                &tui.chip, tab.activate,
+                tl ? "edit this look" : "edit this sequence"));
+            ButtonOpts xopts;
+            xopts.flat = true;
+            xopts.width = SizeSpec::fixed(16);
+            xopts.tooltip = "close tab";
+            tab_cells.push_back(
+                IconButton(arena, Icon::Close, &tui.close, tab.close,
+                           xopts));
+        }
+        StackOpts tab_row;
+        tab_row.gap = 2.0f;
+        tab_row.cross_align = AlignMode::Center;
+        rows.push_back(HStackDyn(arena, tab_row, tab_cells));
+    }
 
     auto* ruler_user = arena.alloc<RulerUser>();
     ruler_user->app = &app;
@@ -13536,21 +15938,37 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     ruler->user = ruler_user;
     ruler->draw_fn = draw_ruler;
     ruler->hit_fn = hit_ruler;
-    // The label column names the SCOPE, so whose local time is on
-    // screen is never a guess (the canvas breadcrumb says the same thing).
-    const char* scope_label = "project";
-    if (app.scope_look != app.document.root_sequence) {
-        const std::string& sname =
-            app.scope_is_look() ? app.look().name : app.sequence().name;
-        const std::string crumb =
-            "> " + (sname.empty() ? std::string("scope") : sname);
-        scope_label = arena.dup(crumb.c_str(), crumb.size());
-    }
-    rows.push_back(HStack(arena, {6.0f},
-                          {SizedBox(arena, SizeSpec::fixed(150),
-                                    SizeSpec::fixed(ruler_h),
-                                    Label(arena, scope_label, small_dim)),
-                           ruler}));
+    // The label column names the ACTIVE ENTITY (the tab row above
+    // highlights the same one), plus the snap magnet - drag snapping's
+    // visible switch (S toggles it too).
+    const std::string& active_name =
+        app.scope_is_look() ? app.look().name : app.sequence().name;
+    const char* scope_label = active_name.empty()
+        ? "scope"
+        : arena.dup(active_name.c_str(), active_name.size());
+    // Lane-head geometry, shared by every row in the label column: the
+    // name sits left, the controls right-justify into fixed-width
+    // columns (lock rightmost), so the icons align top to bottom.
+    const float head_btn_w = 20.0f;
+    StackOpts head_row;
+    head_row.gap = 2.0f;
+    head_row.cross_align = AlignMode::Center;
+    out.tl_snap_clicked = arena.alloc<bool>();
+    ButtonOpts snap_opts;
+    snap_opts.flat = true;
+    snap_opts.active = app.tl_snap;
+    snap_opts.width = SizeSpec::fixed(head_btn_w);
+    snap_opts.tooltip = "drag snapping (s)";
+    rows.push_back(HStack(
+        arena, {6.0f},
+        {SizedBox(arena, SizeSpec::fixed(150), SizeSpec::fixed(ruler_h),
+                  HStackDyn(arena, head_row,
+                            {Label(arena, scope_label, small_dim),
+                             Spacer(arena),
+                             IconButton(arena, Icon::Magnet,
+                                        &app.snap_button,
+                                        out.tl_snap_clicked, snap_opts)})),
+         ruler}));
 
     // ---- BLOCK LANES: the scoped sequence's video lanes, one row per
     // lane, topmost lane composites last. A scoped LOOK is timeless -
@@ -13586,7 +16004,11 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.placement_id = place.id;
                 b.place = place;
                 b.src_len = doc::source_length(app.document, place);
-                const uint32_t end = doc::placement_end(place, b.src_len);
+                b.hop_ratio = doc::placement_ratio(
+                    app.document, place,
+                    doc::effective_fps(app.document, seq));
+                const uint32_t end =
+                    doc::placement_end(place, b.src_len, b.hop_ratio);
                 b.t0 = static_cast<double>(place.t_in);
                 // An unbounded block runs as long as the film does, not
                 // into the buffer past it.
@@ -13633,6 +16055,12 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                     if (bd && bd->frames && s->tex && s->count > 0) {
                         b.thumbs = s->tex;
                         b.asset_frames = bd->frames;
+                        if (const doc::Asset* sa =
+                                app.document.find_asset(strip_asset))
+                            b.strip_rate = doc::media_conform_rate(
+                                app.document, *sa,
+                                doc::entity_fps(app.document,
+                                                place.target));
                     }
                 }
                 b.staged = arena.alloc<doc::Placement>();
@@ -13654,11 +16082,16 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         // Topmost layers composite last — draw their lanes on top.
         const float lane_h = 30.0f;
         for (size_t lane = lanes.size(); lane-- > 0;) {
+            const doc::SeqTrack& track = seq.tracks[lane];
             auto* user = arena.alloc<BlockLaneUser>();
             user->app = &app;
             user->out = &out;
             user->count = lanes[lane].blocks.size();
             user->layer_index = lanes[lane].layer_index;
+            user->track_id = track.id;
+            user->audio = false;
+            user->locked = track.lock;
+            user->hidden = track.hidden;
             user->blocks = arena.alloc<TlBlock>(user->count);
             for (size_t i = 0; i < user->count; ++i)
                 user->blocks[i] = lanes[lane].blocks[i];
@@ -13679,15 +16112,41 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             widget->hit_fn = hit_block_lane;
             out.lane_nodes.push_back(
                 {lanes[lane].track_id, false, widget});
+            // The label cell carries the lane's controls: visibility
+            // eye + lock, right-justified into the shared columns.
+            auto& vui = app.track_ui[track.id];
+            FrameUi::VideoTrackStage vstage{track.id, arena.alloc<bool>(),
+                                            arena.alloc<bool>()};
+            out.video_tracks.push_back(vstage);
+            ButtonOpts eye_opts;
+            eye_opts.flat = true;
+            eye_opts.width = SizeSpec::fixed(head_btn_w);
+            eye_opts.tooltip = "lane output on/off";
+            ButtonOpts lock_opts;
+            lock_opts.flat = true;
+            lock_opts.active = track.lock;
+            lock_opts.width = SizeSpec::fixed(head_btn_w);
+            lock_opts.tooltip = "lock this lane";
             char lane_name[16];
             std::snprintf(lane_name, sizeof(lane_name), "v%zu", lane + 1);
             rows.push_back(HStack(
                 arena, {6.0f},
-                {SizedBox(arena, SizeSpec::fixed(150),
-                          SizeSpec::fixed(lane_h),
-                          Label(arena,
-                                arena.dup(lane_name, std::strlen(lane_name)),
-                                small_dim)),
+                {SizedBox(
+                     arena, SizeSpec::fixed(150), SizeSpec::fixed(lane_h),
+                     HStackDyn(
+                         arena, head_row,
+                         {Label(arena,
+                                arena.dup(lane_name,
+                                          std::strlen(lane_name)),
+                                small_dim),
+                          Spacer(arena),
+                          IconButton(arena,
+                                     track.hidden ? Icon::EyeOff
+                                                  : Icon::Eye,
+                                     &vui.eye, vstage.eye_clicked,
+                                     eye_opts),
+                          IconButton(arena, Icon::Lock, &vui.lockb,
+                                     vstage.lock_clicked, lock_opts)})),
                  widget}));
         }
 
@@ -13704,8 +16163,11 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.placement_id = place.id;
                 b.place = place;
                 b.src_len = doc::source_length(app.document, place);
+                b.hop_ratio = doc::placement_ratio(
+                    app.document, place,
+                    doc::effective_fps(app.document, seq));
                 const uint32_t end =
-                    doc::placement_end(place, b.src_len);
+                    doc::placement_end(place, b.src_len, b.hop_ratio);
                 b.t0 = static_cast<double>(place.t_in);
                 b.t1 = end ? static_cast<double>(end)
                            : static_cast<double>(ruler_user->trim_out);
@@ -13752,6 +16214,14 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                         s.inner = c;
                         s.nested = true;
                         s.gain = c.gain * pgain;
+                        s.ratio = b.hop_ratio;
+                        const double tfps = doc::entity_fps(
+                            app.document, place.target);
+                        s.amp_scale =
+                            tfps > 0.0
+                                ? project_fps(app.document, app.bundles) /
+                                      tfps
+                                : 1.0;
                         srcs.push_back(s);
                     }
                 }
@@ -13786,6 +16256,9 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 user->blocks[i] = ablocks[i];
             user->lane_index =
                 std::min(lanes.size() + ai, sizeof(app.tl_lane_ids) - 1);
+            user->track_id = track.id;
+            user->audio = true;
+            user->locked = track.lock;
             user->frame_count = frame_count;
             user->play_end = ruler_user->trim_out;
             user->playhead = playhead;
@@ -13801,34 +16274,38 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             widget->hit_fn = hit_block_lane;
             out.lane_nodes.push_back({track.id, true, widget});
 
-            // The lane label carries the per-track mixer: gain + mute.
+            // The lane label carries mute + lock, right-justified into
+            // the same columns as the video heads (mute sits in the eye
+            // column, lock rightmost). Track gain stays document state
+            // (set_audio_track); no per-track fader rides the head.
             auto& aui = app.audio_ui[track.id];
             FrameUi::AudioTrackStage stage{};
             stage.track_id = track.id;
-            stage.gain_staged = arena.alloc<float>();
-            *stage.gain_staged = track.gain;
-            stage.original = track.gain;
-            stage.gain_changed = arena.alloc<bool>();
-            stage.gain_released = arena.alloc<bool>();
             stage.mute_clicked = arena.alloc<bool>();
-            SliderOpts gopts;
-            gopts.format = "";
-            gopts.out_changed = stage.gain_changed;
-            gopts.out_released = stage.gain_released;
+            stage.lock_clicked = arena.alloc<bool>();
             out.audio_tracks.push_back(stage);
+            ButtonOpts alock_opts;
+            alock_opts.flat = true;
+            alock_opts.active = track.lock;
+            alock_opts.width = SizeSpec::fixed(head_btn_w);
+            alock_opts.tooltip = "lock this track";
             const char* alabel =
                 arena.dup(track.name.c_str(), track.name.size());
             rows.push_back(HStack(
                 arena, {6.0f},
                 {SizedBox(
                      arena, SizeSpec::fixed(150), SizeSpec::fixed(lane_h),
-                     HStack(arena, {4.0f},
-                            {Label(arena, alabel, small_dim),
-                             SliderF(arena, stage.gain_staged, 0.0f, 2.0f,
-                                     &aui.gain, gopts),
-                             Chip(arena, "m", track.mute, &aui.mute,
-                                  stage.mute_clicked,
-                                  "mute this track")})),
+                     HStackDyn(
+                         arena, head_row,
+                         {Label(arena, alabel, small_dim),
+                          Spacer(arena),
+                          SizedBox(arena, SizeSpec::fixed(head_btn_w),
+                                   SizeSpec::fixed(18.0f),
+                                   Chip(arena, "m", track.mute, &aui.mute,
+                                        stage.mute_clicked,
+                                        "mute this track")),
+                          IconButton(arena, Icon::Lock, &aui.lockb,
+                                     stage.lock_clicked, alock_opts)})),
                  widget}));
         }
     }
@@ -14053,8 +16530,19 @@ struct ScriptHost {
     int exit_code = 0;
     int failures = 0;
     int open_groups = 0;   // undo groups the script opened and owes
+    // MACROS run on a second, dedicated host: same ops, own VM slot and
+    // wait state, no console, own log. The MAIN host points at it (the
+    // macro() op and macro keybinds fire through the pointer); the
+    // macro host's own pointer stays null, so a macro firing a macro
+    // is structurally impossible.
+    ScriptHost* macro_host = nullptr;
+    bool console_enabled = true;
+    const wchar_t* log_path = L"temp/script_log.txt";
 
-    enum class Wait { None, Frames, Idle, Export, Import, Capture, Track };
+    enum class Wait {
+        None, Frames, Idle, Export, Import, Capture, Track, Actions,
+        Macro
+    };
     Wait wait = Wait::None;
     int wait_frames = 0;
     uint64_t wait_seq0 = 0;
@@ -14095,7 +16583,7 @@ struct ScriptHost {
         if (!log_file) {
             std::error_code ec;
             std::filesystem::create_directories("temp", ec);
-            log_file = _wfopen(L"temp/script_log.txt", L"wb");
+            log_file = _wfopen(log_path, L"wb");
         }
         if (log_file) {
             std::fputs(line.c_str(), log_file);
@@ -14137,14 +16625,14 @@ struct ScriptHost {
     bool start_file(const std::filesystem::path& path) {
         auto bytes = read_file_bytes(path);
         if (!bytes) {
-            log("[error] cannot read " + path.string());
+            log("[error] cannot read " + path_to_u8(path));
             ++failures;
             return false;
         }
         return start_source(
             std::string(reinterpret_cast<const char*>(bytes->data()),
                         bytes->size()),
-            path.filename().string());
+            path_to_u8(path.filename()));
     }
 
     // Synthetic event helpers. Coordinates arrive in LOGICAL px and
@@ -14301,7 +16789,7 @@ struct ScriptHost {
     // VM progress (resume a satisfied wait / step the budget).
     void pump() {
         ++frame_no;
-        console_events(*events);
+        if (console_enabled) console_events(*events);
         // Due synthetic events append after the real ones, folding
         // through the identical input path this same frame.
         for (size_t i = 0; i < synth.size();) {
@@ -14342,6 +16830,15 @@ struct ScriptHost {
                     // "no job" is the settled state either way.
                     ready = app->track_job == nullptr;
                     break;
+                case Wait::Actions:
+                    // action() resumes once the queue drains (one
+                    // action lands per frame).
+                    ready = app->action_queue.empty();
+                    break;
+                case Wait::Macro:
+                    // macro() resumes when the macro host's VM idles.
+                    ready = !macro_host || !macro_host->active();
+                    break;
                 case Wait::Capture: {
                     std::vector<uint8_t> rgba;
                     uint32_t w = 0, h = 0;
@@ -14349,11 +16846,11 @@ struct ScriptHost {
                         const bool ok = write_png(capture_path,
                                                   rgba.data(), w, h);
                         if (ok)
-                            log("[shot] " + capture_path.string() + " " +
+                            log("[shot] " + path_to_u8(capture_path) + " " +
                                 std::to_string(w) + "x" +
                                 std::to_string(h));
                         else
-                            log("[shot failed] " + capture_path.string());
+                            log("[shot failed] " + path_to_u8(capture_path));
                         resume_v = script::Value::boolean(ok);
                         ready = true;
                     }
@@ -14402,6 +16899,61 @@ struct ScriptHost {
         }
     }
 };
+
+// Macro playback: the steps join into ONE straight-line script (the
+// validator refused control flow at edit time and refuses again here)
+// and run on the DEDICATED macro host - scripts and smokes can watch
+// it live, Escape kills it, one macro at a time.
+void run_macro(AppState& app, ScriptHost& mh, const std::string& name) {
+    const auto it = app.macros.find(name);
+    if (it == app.macros.end()) {
+        app.status = "no macro named " + name;
+        return;
+    }
+    if (mh.active()) {
+        app.status = "macro busy";
+        return;
+    }
+    std::string src;
+    for (const std::string& step : it->second) {
+        const std::string err = macro_step_error(step);
+        if (!err.empty()) {
+            app.status = "macro " + name + ": " + err;
+            return;
+        }
+        src += macro_step_source(step);
+        src += '\n';
+    }
+    if (mh.start_source(src, "macro:" + name))
+        app.status = "macro: " + name;
+}
+
+// Chord dispatch: the inline editors and the escape ladder consume
+// first; what reaches here resolves through the binding map. Scripts
+// run through the same VM as console lines ([busy] logs and drops);
+// macro binds fire on the macro host.
+void dispatch_key_binding(AppState& app, ScriptHost& sh, KeyIntents& ki,
+                          const platform::Event& e) {
+    const std::string chord = chord_of(e.key, e.mods);
+    if (chord.empty()) return;
+    const auto it = app.keybinds.find(chord);
+    if (it == app.keybinds.end()) return;
+    const KeyBinding& b = it->second;
+    switch (b.kind) {
+        case KeyBinding::Kind::Action: {
+            const ActionDef* a = find_action(b.value);
+            if (a && (!e.repeat || a->repeats)) a->run(app, ki);
+            break;
+        }
+        case KeyBinding::Kind::Macro:
+            if (!e.repeat && sh.macro_host)
+                run_macro(app, *sh.macro_host, b.value);
+            break;
+        case KeyBinding::Kind::Script:
+            if (!e.repeat) sh.start_file(u8_to_path(b.value));
+            break;
+    }
+}
 
 // Console overlay: log tail + input line along the viewport bottom.
 // Drawn last, straight onto the canvas - no layout, no hit targets
@@ -14649,6 +17201,15 @@ void register_ops_app(ScriptHost& sh) {
                     sh.exit_code = static_cast<int>(a[0].num);
                 return Value::nil();
             });
+    env.add("request_close",
+            "request_close() - the window-close path (the unsaved-changes "
+            "guard runs, exactly like the title-bar X)",
+            0, 0, [&sh](Vm&, std::vector<Value>&) {
+                platform::Event e{};
+                e.type = platform::Event::Type::CloseRequested;
+                sh.push_ev(0, e);
+                return Value::nil();
+            });
 
     env.add("wait", "wait(frames?) - suspend for n frames (default 1)", 0,
             1, [&sh](Vm& vm, std::vector<Value>& a) {
@@ -14698,7 +17259,7 @@ void register_ops_app(ScriptHost& sh) {
                 if (!a[0].is_str())
                     return op_err(vm, "screenshot(path)");
                 sh.renderer->request_capture();
-                sh.capture_path = std::filesystem::path(a[0].as_str());
+                sh.capture_path = u8_to_path(a[0].as_str());
                 sh.wait = ScriptHost::Wait::Capture;
                 sh.wait_deadline = sh.app->app_seconds + 5.0;
                 vm.mark_suspend();
@@ -14707,10 +17268,10 @@ void register_ops_app(ScriptHost& sh) {
 
     env.add("open", "open(path) - project json or media", 1, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                const std::filesystem::path p(a[0].as_str());
+                const std::filesystem::path p = u8_to_path(a[0].as_str());
                 std::error_code ec;
                 if (!std::filesystem::exists(p, ec))
-                    return op_err(vm, "no file " + p.string());
+                    return op_err(vm, "no file " + path_to_u8(p));
                 if (p.extension() == ".json")
                     open_project(*sh.app, p, sh.window);
                 else
@@ -14719,10 +17280,10 @@ void register_ops_app(ScriptHost& sh) {
             });
     env.add("import", "import(path) - media into the project", 1, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                const std::filesystem::path p(a[0].as_str());
+                const std::filesystem::path p = u8_to_path(a[0].as_str());
                 std::error_code ec;
                 if (!std::filesystem::exists(p, ec))
-                    return op_err(vm, "no file " + p.string());
+                    return op_err(vm, "no file " + path_to_u8(p));
                 if (sh.app->import)
                     return op_err(vm, "an import is already running");
                 open_source(*sh.app, p);
@@ -14739,7 +17300,7 @@ void register_ops_app(ScriptHost& sh) {
     env.add("save_as", "save_as(path)", 1, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
                 if (!a[0].is_str()) return op_err(vm, "save_as(path)");
-                std::filesystem::path p(a[0].as_str());
+                std::filesystem::path p = u8_to_path(a[0].as_str());
                 if (p.extension() != ".json")
                     p.replace_extension(".json");
                 save_project(*sh.app, p);
@@ -14752,7 +17313,7 @@ void register_ops_app(ScriptHost& sh) {
                 AppState& app = *sh.app;
                 if (!app.has_timeline())
                     return op_err(vm, "nothing to export");
-                std::filesystem::path out(a[0].as_str());
+                std::filesystem::path out = u8_to_path(a[0].as_str());
                 if (out.extension() != ".mp4")
                     out.replace_extension(".mp4");
                 const std::filesystem::path scope_pcm =
@@ -15675,6 +18236,8 @@ void register_ops_graph(ScriptHost& sh) {
                 map_bool(m, "flip_v", l->flip_v);
                 map_num(m, "xf_scale", l->xf_scale);
                 map_num(m, "xf_rotate", l->xf_rotate);
+                map_num(m, "xf_anchor_x", l->xf_anchor_x);
+                map_num(m, "xf_anchor_y", l->xf_anchor_y);
                 return m;
             });
     env.add("set_layer",
@@ -15779,6 +18342,10 @@ void register_ops_graph(ScriptHost& sh) {
                     up.xf_scale = static_cast<float>(n);
                 if (map_get_num(m, "xf_rotate", &n))
                     up.xf_rotate = static_cast<float>(n);
+                if (map_get_num(m, "xf_anchor_x", &n))
+                    up.xf_anchor_x = static_cast<float>(n);
+                if (map_get_num(m, "xf_anchor_y", &n))
+                    up.xf_anchor_y = static_cast<float>(n);
                 sh.app->undo.execute(sh.app->document,
                                      doc::set_layer_props_command(
                                          lk->id, std::move(up)));
@@ -15867,19 +18434,17 @@ void register_ops_graph(ScriptHost& sh) {
                         lk->id, static_cast<size_t>(li), std::move(fx),
                         lk->layers[static_cast<size_t>(li)].stack.size()));
                 if (wired) {
-                    if (tail_feeds)
-                        app.undo.execute(app.document,
-                                         doc::disconnect_command(lk->id,
-                                                                 tail_out));
-                    app.undo.execute(app.document,
-                                     doc::connect_command(
-                                         lk->id, {tail, fx_id, 0}));
+                    // The chain re-terminates IN PLACE: the spliced
+                    // wire keeps the old end's stacking position.
                     if (tail_feeds)
                         app.undo.execute(
                             app.document,
-                            doc::connect_command(lk->id,
-                                                 {fx_id, tail_out.to,
-                                                  tail_out.to_port}));
+                            doc::reconnect_command(lk->id, tail_out,
+                                                   {fx_id, tail_out.to,
+                                                    tail_out.to_port}));
+                    app.undo.execute(app.document,
+                                     doc::connect_command(
+                                         lk->id, {tail, fx_id, 0}));
                 }
                 app.undo.end_group();
                 return Value::number(static_cast<double>(fx_id));
@@ -15918,18 +18483,21 @@ void register_ops_graph(ScriptHost& sh) {
                             l.to == before && l.to_port == 0)
                             feed = &l;
                     if (feed) {
+                        // Take the old feed's place in before's fan-in.
                         const doc::NodeLink old = *feed;
-                        app.undo.execute(app.document,
-                                         doc::disconnect_command(lk->id,
-                                                                 old));
+                        app.undo.execute(
+                            app.document,
+                            doc::reconnect_command(lk->id, old,
+                                                   {fx_id, before, 0}));
                         app.undo.execute(app.document,
                                          doc::connect_command(
                                              lk->id,
                                              {old.from, fx_id, 0}));
+                    } else {
+                        app.undo.execute(app.document,
+                                         doc::connect_command(
+                                             lk->id, {fx_id, before, 0}));
                     }
-                    app.undo.execute(app.document,
-                                     doc::connect_command(
-                                         lk->id, {fx_id, before, 0}));
                 }
                 app.undo.end_group();
                 return Value::number(static_cast<double>(fx_id));
@@ -15962,19 +18530,28 @@ void register_ops_graph(ScriptHost& sh) {
                 }
                 app.undo.begin_group("Remove Effect");
                 for (const doc::NodeLink& l : touching)
-                    app.undo.execute(app.document,
-                                     doc::disconnect_command(lk->id, l));
+                    if (l.to == id)
+                        app.undo.execute(
+                            app.document,
+                            doc::disconnect_command(lk->id, l));
+                // Each downstream wire heals IN PLACE, so the chain
+                // keeps its stacking position in every consumer port.
+                for (const doc::NodeLink& o : outs) {
+                    if (has_feed &&
+                        !doc::link_would_cycle(*lk, feed.from, o.to))
+                        app.undo.execute(
+                            app.document,
+                            doc::reconnect_command(
+                                lk->id, o,
+                                {feed.from, o.to, o.to_port}));
+                    else
+                        app.undo.execute(
+                            app.document,
+                            doc::disconnect_command(lk->id, o));
+                }
                 app.undo.execute(
                     app.document,
                     doc::remove_effect_command(lk->id, li, fi));
-                if (has_feed)
-                    for (const doc::NodeLink& o : outs)
-                        if (!doc::link_would_cycle(*lk, feed.from, o.to))
-                            app.undo.execute(
-                                app.document,
-                                doc::connect_command(
-                                    lk->id,
-                                    {feed.from, o.to, o.to_port}));
                 app.undo.end_group();
                 return Value::boolean(true);
             });
@@ -16384,21 +18961,22 @@ void register_ops_graph(ScriptHost& sh) {
                                      std::move(effects)));
                 if (wired && face_in && face_out &&
                     !doc::link_would_cycle(*lk, tail, face_in)) {
-                    if (tail_feeds)
+                    if (tail_feeds &&
+                        !doc::link_would_cycle(*lk, face_out,
+                                               tail_out.to))
+                        app.undo.execute(
+                            app.document,
+                            doc::reconnect_command(
+                                lk->id, tail_out,
+                                {face_out, tail_out.to,
+                                 tail_out.to_port}));
+                    else if (tail_feeds)
                         app.undo.execute(app.document,
                                          doc::disconnect_command(lk->id,
                                                                  tail_out));
                     app.undo.execute(app.document,
                                      doc::connect_command(
                                          lk->id, {tail, face_in, 0}));
-                    if (tail_feeds &&
-                        !doc::link_would_cycle(*lk, face_out,
-                                               tail_out.to))
-                        app.undo.execute(
-                            app.document,
-                            doc::connect_command(lk->id,
-                                                 {face_out, tail_out.to,
-                                                  tail_out.to_port}));
                 }
                 app.undo.end_group();
                 return Value::number(static_cast<double>(gid));
@@ -16415,13 +18993,13 @@ void register_ops_graph(ScriptHost& sh) {
                     if (doc::find_group(lk->layers[li], a[1].as_id())) {
                         doc::Preset p = doc::make_preset_from_group(
                             *lk, li, a[1].as_id());
-                        std::filesystem::path out(a[2].as_str());
+                        std::filesystem::path out = u8_to_path(a[2].as_str());
                         if (out.extension() != ".json")
                             out.replace_extension(".json");
                         // The group's name is the display name; the stem
                         // only fills in for unnamed groups.
                         if (p.name.empty() || p.name == "preset")
-                            p.name = out.stem().string();
+                            p.name = path_to_u8(out.stem());
                         if (a.size() > 3 && a[3].is_str())
                             p.tags.push_back(a[3].as_str());
                         if (p.tags.empty()) p.tags.push_back("user");
@@ -16617,9 +19195,10 @@ void register_ops_mod(ScriptHost& sh) {
                     app.has_timeline()
                         ? app.player.current_frame_index()
                         : 0u;
-                const int64_t pos = static_cast<int64_t>(frame) +
-                                    static_cast<int64_t>(ch.slip) +
-                                    ch.offset;
+                const int64_t pos =
+                    static_cast<int64_t>(std::floor(
+                        static_cast<double>(frame) * ch.rate)) +
+                    static_cast<int64_t>(ch.slip) + ch.offset;
                 const uint32_t mf =
                     pos < 0 ? 0u : static_cast<uint32_t>(pos);
                 const float qx = static_cast<float>(
@@ -17116,8 +19695,8 @@ void register_ops_sequence(ScriptHost& sh) {
                 return Value::boolean(true);
             });
     env.add("set_audio_track",
-            "set_audio_track(seq, track, {name?, gain?, mute?})", 3, 3,
-            [&sh](Vm& vm, std::vector<Value>& a) {
+            "set_audio_track(seq, track, {name?, gain?, mute?, lock?})",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
                 doc::Sequence* s = arg_seq(sh, vm, a[0]);
                 if (!s) return Value::nil();
                 const doc::AudioTrack* tr = nullptr;
@@ -17129,15 +19708,56 @@ void register_ops_sequence(ScriptHost& sh) {
                 std::string name = tr->name;
                 double gain = tr->gain;
                 bool mute = tr->mute;
+                bool lock = tr->lock;
                 map_get_str(a[2], "name", &name);
                 map_get_num(a[2], "gain", &gain);
                 map_get_bool(a[2], "mute", &mute);
+                map_get_bool(a[2], "lock", &lock);
                 sh.app->undo.execute(
                     sh.app->document,
                     doc::set_audio_track_props_command(
                         s->id, tr->id, name,
                         std::clamp(static_cast<float>(gain), 0.0f, 2.0f),
-                        mute));
+                        mute, lock));
+                return Value::boolean(true);
+            });
+    env.add("set_track",
+            "set_track(seq, track, {name?, hidden?, lock?}) - video lane",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                const doc::SeqTrack* tr = nullptr;
+                for (const doc::SeqTrack& t : s->tracks)
+                    if (t.id == a[1].as_id()) tr = &t;
+                if (!tr) return op_err(vm, "no such lane");
+                if (a[2].kind != Value::Kind::Map)
+                    return op_err(vm, "set_track needs a map");
+                std::string name = tr->name;
+                bool hidden = tr->hidden;
+                bool lock = tr->lock;
+                map_get_str(a[2], "name", &name);
+                map_get_bool(a[2], "hidden", &hidden);
+                map_get_bool(a[2], "lock", &lock);
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_track_props_command(s->id, tr->id, name,
+                                                 hidden, lock));
+                return Value::boolean(true);
+            });
+    env.add("move_placement",
+            "move_placement(seq, placement, track) - same-kind lane",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                doc::Sequence* s = arg_seq(sh, vm, a[0]);
+                if (!s) return Value::nil();
+                auto cmd = doc::move_placement_command(
+                    sh.app->document, s->id, a[1].as_id(), a[2].as_id());
+                if (!cmd)
+                    return op_err(vm, "cannot move there (kind/id)");
+                sh.app->undo.begin_group("Move Block");
+                sh.app->undo.execute(sh.app->document, std::move(cmd));
+                doc::overwrite_group_spans(sh.app->document, sh.app->undo,
+                                           s->id, a[1].as_id());
+                sh.app->undo.end_group();
                 return Value::boolean(true);
             });
     env.add("placements",
@@ -17193,6 +19813,8 @@ void register_ops_sequence(ScriptHost& sh) {
                 map_num(m, "scale", p->scale);
                 map_num(m, "rotate", p->rotate);
                 map_num(m, "opacity", p->opacity);
+                map_num(m, "anchor_x", p->anchor_x);
+                map_num(m, "anchor_y", p->anchor_y);
                 return m;
             });
     env.add("set_placement",
@@ -17242,14 +19864,19 @@ void register_ops_sequence(ScriptHost& sh) {
                 if (map_get_num(m, "opacity", &v))
                     up.opacity = std::clamp(static_cast<float>(v), 0.0f,
                                             1.0f);
+                if (map_get_num(m, "anchor_x", &v))
+                    up.anchor_x = static_cast<float>(v);
+                if (map_get_num(m, "anchor_y", &v))
+                    up.anchor_y = static_cast<float>(v);
                 sh.app->undo.execute(sh.app->document,
                                      doc::set_placement_command(s->id,
                                                                 up));
                 return Value::boolean(true);
             });
     env.add("place",
-            "place(seq, track, target, at_frame) -> placement id; lays "
-            "the linked audio pair and overwrites the span",
+            "place(seq, track, target, at_frame) -> placement id; the "
+            "linked audio pair lands on the same-index audio track (one "
+            "minted when short) and the spans overwrite",
             4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
                 doc::Sequence* s = arg_seq(sh, vm, a[0]);
                 if (!s) return Value::nil();
@@ -17416,6 +20043,27 @@ void register_ops_sequence(ScriptHost& sh) {
                         static_cast<uint32_t>(std::max(0.0, h))));
                 return Value::boolean(true);
             });
+    env.add("set_entity_format",
+            "set_entity_format(id, fps, w?, h?) - a look or sequence's "
+            "own format; 0 = inherit the project",
+            2, 4, [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                if (!sh.app->document.find_look(id) &&
+                    !sh.app->document.find_sequence(id))
+                    return op_err(vm, "no look or sequence with that id");
+                double fps = 0.0, w = 0.0, h = 0.0;
+                if (!arg_num(vm, a[1], "fps", &fps)) return Value::nil();
+                if (a.size() > 2 && a[2].is_num()) w = a[2].num;
+                if (a.size() > 3 && a[3].is_num()) h = a[3].num;
+                doc::EntityFormat f;
+                f.fps = std::max(0.0, fps);
+                f.w = static_cast<uint32_t>(std::max(0.0, w));
+                f.h = static_cast<uint32_t>(std::max(0.0, h));
+                sh.app->undo.execute(
+                    sh.app->document,
+                    doc::set_entity_format_command(id, f));
+                return Value::boolean(true);
+            });
     env.add("set_speed",
             "set_speed(speed, mode?) - 0 forward, 1 reverse, 2 ping-pong",
             1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
@@ -17469,6 +20117,154 @@ void register_ops_sequence(ScriptHost& sh) {
             });
 }
 
+// ---- actions / macros / keybinds: the registry is scriptable end to
+// end, so smokes can drive and assert every tier.
+
+void register_ops_keys(ScriptHost& sh) {
+    script::Env& env = sh.env;
+    env.add("actions", "actions() - registry action ids", 0, 0,
+            [](script::Vm&, std::vector<script::Value>&) {
+                script::Value out = script::Value::make_list();
+                for (const ActionDef& a : action_registry())
+                    out.list->push_back(script::Value::string(a.id));
+                return out;
+            });
+    env.add("action", "action(\"id\") - run a registry action; resumes "
+            "after it lands", 1, 1,
+            [&sh](script::Vm& vm, std::vector<script::Value>& a) {
+                const std::string id = a[0].as_str();
+                if (!action_exists(id))
+                    return op_err(vm, "unknown action \"" + id + "\"");
+                sh.app->action_queue.push_back(id);
+                sh.wait = ScriptHost::Wait::Actions;
+                sh.wait_deadline = sh.app->app_seconds + 30.0;
+                vm.mark_suspend();
+                return script::Value::nil();
+            });
+    env.add("macro", "macro(\"name\") - fire a macro on the macro "
+            "host; resumes when it finishes", 1, 1,
+            [&sh](script::Vm& vm, std::vector<script::Value>& a) {
+                const std::string name = a[0].as_str();
+                if (!sh.macro_host)
+                    return op_err(vm, "macros cannot fire macros");
+                if (!sh.app->macros.count(name))
+                    return op_err(vm, "no macro named \"" + name + "\"");
+                if (sh.macro_host->active())
+                    return op_err(vm, "macro busy");
+                run_macro(*sh.app, *sh.macro_host, name);
+                if (!sh.macro_host->active())
+                    return op_err(vm, "macro failed: " + sh.app->status);
+                sh.wait = ScriptHost::Wait::Macro;
+                sh.wait_deadline = sh.app->app_seconds + 60.0;
+                vm.mark_suspend();
+                return script::Value::nil();
+            });
+    env.add("macros", "macros() - name -> step list", 0, 0,
+            [&sh](script::Vm&, std::vector<script::Value>&) {
+                script::Value out = script::Value::make_map();
+                for (const auto& [name, steps] : sh.app->macros) {
+                    script::Value list = script::Value::make_list();
+                    for (const std::string& id : steps)
+                        list.list->push_back(script::Value::string(id));
+                    (*out.map)[name] = std::move(list);
+                }
+                return out;
+            });
+    env.add("set_macro", "set_macro(\"name\", [\"step\", ...]) - steps "
+            "are single statements (action ids or op calls); nil "
+            "deletes the macro and its binds", 2, 2,
+            [&sh](script::Vm& vm, std::vector<script::Value>& a) {
+                const std::string name = a[0].as_str();
+                if (name.empty())
+                    return op_err(vm, "macro name must be non-empty");
+                if (a[1].kind == script::Value::Kind::Nil) {
+                    sh.app->macros.erase(name);
+                    for (auto it = sh.app->keybinds.begin();
+                         it != sh.app->keybinds.end();)
+                        if (it->second.kind == KeyBinding::Kind::Macro &&
+                            it->second.value == name)
+                            it = sh.app->keybinds.erase(it);
+                        else
+                            ++it;
+                    save_ui_prefs(*sh.app);
+                    return script::Value::nil();
+                }
+                if (a[1].kind != script::Value::Kind::List)
+                    return op_err(vm,
+                                  "set_macro(name, [steps] | nil)");
+                std::vector<std::string> steps;
+                for (const script::Value& sv : *a[1].list) {
+                    const std::string step = sv.as_str();
+                    const std::string err = macro_step_error(step);
+                    if (!err.empty())
+                        return op_err(vm,
+                                      "step \"" + step + "\": " + err);
+                    steps.push_back(step);
+                }
+                sh.app->macros[name] = std::move(steps);
+                save_ui_prefs(*sh.app);
+                return script::Value::nil();
+            });
+    env.add("keybinds", "keybinds() - chord -> \"kind:value\"", 0, 0,
+            [&sh](script::Vm&, std::vector<script::Value>&) {
+                script::Value out = script::Value::make_map();
+                for (const auto& [chord, b] : sh.app->keybinds) {
+                    const char* kind =
+                        b.kind == KeyBinding::Kind::Action  ? "action:"
+                        : b.kind == KeyBinding::Kind::Macro ? "macro:"
+                                                            : "script:";
+                    (*out.map)[chord] =
+                        script::Value::string(kind + b.value);
+                }
+                return out;
+            });
+    env.add("set_keybind", "set_keybind(\"chord\", \"action:id\" | "
+            "\"macro:name\" | \"script:path\" | nil) - nil unbinds; a "
+            "taken chord is stolen", 2, 2,
+            [&sh](script::Vm& vm, std::vector<script::Value>& a) {
+                // Only producible chords enter the map - an entry no
+                // keypress can fire is refused, not stored.
+                const std::string chord = normalize_chord(a[0].as_str());
+                if (chord.empty())
+                    return op_err(vm,
+                                  "\"" + a[0].as_str() +
+                                      "\" is not a bindable chord "
+                                      "(modifiers only prefix; escape "
+                                      "and ` are fixed)");
+                if (a[1].kind == script::Value::Kind::Nil) {
+                    sh.app->keybinds.erase(chord);
+                    save_ui_prefs(*sh.app);
+                    return script::Value::nil();
+                }
+                const std::string spec = a[1].as_str();
+                const size_t colon = spec.find(':');
+                if (colon == std::string::npos)
+                    return op_err(vm, "binding must be \"kind:value\"");
+                const std::string kind = spec.substr(0, colon);
+                const std::string value = spec.substr(colon + 1);
+                KeyBinding b;
+                if (kind == "action") {
+                    if (!action_exists(value))
+                        return op_err(
+                            vm, "unknown action \"" + value + "\"");
+                    b = {KeyBinding::Kind::Action, value};
+                } else if (kind == "macro") {
+                    if (!sh.app->macros.count(value))
+                        return op_err(
+                            vm, "no macro named \"" + value + "\"");
+                    b = {KeyBinding::Kind::Macro, value};
+                } else if (kind == "script") {
+                    b = {KeyBinding::Kind::Script, value};
+                } else {
+                    return op_err(vm, "binding kind must be action, "
+                                      "macro or script");
+                }
+                sh.app->keybinds[chord] = std::move(b);
+                save_ui_prefs(*sh.app);
+                return script::Value::nil();
+            });
+}
+
 void register_script_ops(ScriptHost& sh) {
     script::add_core_natives(sh.env);
     register_ops_app(sh);
@@ -17477,12 +20273,25 @@ void register_script_ops(ScriptHost& sh) {
     register_ops_graph(sh);
     register_ops_mod(sh);
     register_ops_sequence(sh);
+    register_ops_keys(sh);
 }
 
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     platform::init();
+    // Media Foundation lifetime PIN: every MF-touching thread holds a
+    // thread_local MfSession whose destructor runs MFShutdown at thread
+    // exit. Without this process-lifetime pin, the FINAL MFShutdown
+    // lands on whichever worker exits last - while other threads'
+    // decoder MFTs are still alive, which MF forbids (all objects must
+    // be released before the final shutdown) and answers with a hang or
+    // a silent process death inside the shutdown joins. Held here, every
+    // worker's MFShutdown is a plain refcount decrement and the real
+    // one runs at the very end of main, after every pool and stream is
+    // gone. MF only - the pin must not touch COM, or it would flip the
+    // main thread MTA and hang the STA shell file dialogs.
+    platform::MfLifetime mf_guard;
     // Fatal failures (device loss, allocation) tell the user before the
     // process dies — the reason also persists to looks.log.
     set_fatal_sink(platform::show_fatal);
@@ -17553,6 +20362,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     AppState app;
     ScriptHost script_host;
     register_script_ops(script_host);
+    // The macro host: same op surface, own VM slot and wait state, no
+    // console, own log. Its macro_host pointer stays null - a macro
+    // firing a macro is structurally impossible.
+    ScriptHost macro_host;
+    macro_host.console_enabled = false;
+    macro_host.log_path = L"temp/macro_log.txt";
+    register_script_ops(macro_host);
+    script_host.macro_host = &macro_host;
+    // Op catalog for the macro step picker + hint row, name-sorted.
+    for (const script::NativeDef& d : script_host.env.defs())
+        app.op_help.emplace_back(d.name, d.sig);
+    std::sort(app.op_help.begin(), app.op_help.end());
 
     // Preset browser: shipped era presets next to the exe, user saves in
     // ./presets (created on first save).
@@ -17570,7 +20391,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 c = static_cast<char>(
                     std::tolower(static_cast<unsigned char>(c)));
             if (ext == ".ttf")
-                stems.push_back(fit->path().stem().string());
+                stems.push_back(path_to_u8(fit->path().stem()));
         }
         std::sort(stems.begin(), stems.end(),
                   [](std::string a, std::string b) {
@@ -17588,6 +20409,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
     }
     app.user_preset_dir = executable_dir() / "presets";
+    // Registry defaults seed first; the prefs then apply deviations.
+    app.keybinds = default_keybinds();
     load_ui_prefs(app);
     rescan_presets(app);
     app.cache_bytes = scan_cache_bytes();
@@ -17749,33 +20572,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         script_host.shader_dir = &shader_dir;
         script_host.running = &running;
         script_host.pump();
-        bool toggle_play = false;
-        bool do_undo = false, do_redo = false;
-        bool do_save = false, do_save_as = false, do_open_project = false;
-        bool do_delete_sel = false;
-        bool do_add_first = false;   // Enter in the cursor add menu
-        bool do_duplicate = false;   // Ctrl+D (texed duplicateSelection)
-        bool do_group = false;       // Ctrl+G: fold selection into a group
-        bool do_ungroup = false;     // Ctrl+Shift+G: dissolve it
-        bool do_select_all = false;  // Ctrl+A (texed selectAll)
-        bool do_copy = false;        // Ctrl+C / first half of Ctrl+X
-        bool do_cut = false;         // Ctrl+X: delete after the copy
-        bool do_paste = false;       // Ctrl+V at the canvas cursor
-        float nudge_dx = 0.0f, nudge_dy = 0.0f;   // arrow-key node nudge
-        std::string dropped_file;
-        Vec2 dropped_at{};   // physical client px (see FileDrop)
-        // Timeline keyboard routing: Delete / Ctrl+C / Ctrl+V act
-        // on keys when the mouse sits over the timeline region (last
-        // frame's rect — layout has not run yet).
-        const bool tl_hovered =
+        // The macro VM advances after the script VM so a macro() fired
+        // this frame starts this frame; synthetic input a macro queues
+        // folds through the same event path.
+        macro_host.app = &app;
+        macro_host.window = window.get();
+        macro_host.renderer = renderer.get();
+        macro_host.worker = &render_worker;
+        macro_host.events = &events;
+        macro_host.shader_dir = &shader_dir;
+        macro_host.running = &running;
+        macro_host.pump();
+        // Frame intents: the flags actions raise (from keys, menu items
+        // or the macro queue); consumed after layout. The timeline
+        // hover routing keys on LAST frame's rect — layout has not run.
+        KeyIntents ki;
+        ki.tl_hovered =
             app.tl_rect.w > 0.0f && input.mouse.x >= app.tl_rect.x &&
             input.mouse.x < app.tl_rect.right() &&
             input.mouse.y >= app.tl_rect.y &&
             input.mouse.y < app.tl_rect.bottom();
-        float key_seek = -1.0f;   // keyboard playhead move (frames)
-        // I / O set the trim band at the playhead (NLE in/out points);
-        // they land in the ruler handles' channel post-frame.
-        float key_trim_in = -1.0f, key_trim_out = -1.0f;
+        // Every file of the drop, in delivery order (see FileDrop);
+        // the Vec2 is physical client px.
+        std::vector<std::pair<std::string, Vec2>> dropped_files;
         int confirm_pick = 0;     // modal keyboard: 1 enter, 2/3 escape
         for (const platform::Event& e : events) {
             // Modal confirm owns the keyboard: enter affirms, escape backs
@@ -17804,6 +20623,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         running = false;
                     break;
                 case platform::Event::Type::Char:
+                    if (app.settings.open) {
+                        settings_char_event(app, e.codepoint);
+                        break;
+                    }
                     // Still duration typing: digits and one decimal point.
                     if (app.duration_focus) {
                         if ((e.codepoint >= '0' && e.codepoint <= '9') ||
@@ -17892,6 +20715,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             static_cast<char>(e.codepoint));
                     break;
                 case platform::Event::Type::KeyDown:
+                    // Settings modal owns the keyboard (chord capture
+                    // needs every key); binding dispatch suspends.
+                    if (app.settings.open) {
+                        settings_key_event(app, e);
+                        break;
+                    }
                     if (app.browser_rename_id) {
                         // Same swallow-the-keyboard contract as the other
                         // inline fields: backspace edits, Enter commits,
@@ -18080,7 +20909,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             app.fx_filter.pop_back();
                         } else if (e.key == platform::Key::Enter) {
                             if (app.canvas_state.add_open)
-                                do_add_first = true;
+                                ki.do_add_first = true;
                             app.fx_search_focus = false;
                         } else if (e.key == platform::Key::Escape) {
                             app.fx_search_focus = false;
@@ -18089,10 +20918,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                         break;
                     }
-                    // Escape deselects first; a bare
-                    // Escape with nothing selected keeps the old quit.
+                    // Escape stays hardwired: it deselects down the
+                    // ladder, and a running macro dies first (its VM
+                    // and any queued action steps together).
                     if (e.key == platform::Key::Escape) {
-                        if (app.ctx_menu.kind) {
+                        if (macro_host.active() ||
+                            !app.action_queue.empty()) {
+                            macro_host.finish();
+                            app.action_queue.clear();
+                            app.status = "macro stopped";
+                        } else if (app.ctx_menu.kind) {
                             app.ctx_menu = {};
                             app.ctx_menu_dd.open = false;
                         } else if (app.canvas_state.dd_open) {
@@ -18126,356 +20961,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                         // Esc never quits — closing goes through
                         // the window X / Alt+F4 and the dirty guard.
-                    } else if ((e.key == platform::Key::Delete ||
-                                e.key == platform::Key::Backspace) &&
-                               !e.repeat) {
-                        // Over the timeline, Delete removes selected
-                        // keys; else a live browser selection goes
-                        // (behind the modal confirm - a click off any
-                        // row released it, so it means the browser was
-                        // the last thing touched); else the picked
-                        // BLOCK (with its whole link group - picture
-                        // and sound leave together); else the canvas
-                        // selection (texed). Key edits are LOOK-LOCAL -
-                        // at sequence scope they must not land on the
-                        // fallback look (or swallow the block delete).
-                        if (!(tl_hovered && app.scope_is_look() &&
-                              timeline_delete_selected_keys(app))) {
-                            if (app.inspector_tab == 3 && app.browser_sel) {
-                                request_browser_delete(app,
-                                                       app.browser_sel);
-                            } else if (app.inspector_tab == 2 &&
-                                       app.preset_sel) {
-                                request_preset_delete(app, app.preset_sel);
-                            } else if (app.sel_placement && !app.scope_is_look() &&
-                                doc::find_placement(app.sequence(),
-                                                    app.sel_placement)) {
-                                app.undo.execute(
-                                    app.document,
-                                    doc::remove_placement_command(
-                                        app.sequence().id,
-                                        app.sel_placement));
-                                app.sel_placement = 0;
-                            } else if (app.scope_is_look() &&
-                                       app.sel.kind ==
-                                           SelKind::LayerSource &&
-                                       app.giz_path_sel >= 0) {
-                                // Path editor: Delete removes the
-                                // selected CONTROL POINT, never the
-                                // layer under it.
-                                doc::Layer* pl = doc::find_layer(
-                                    app.look(), app.sel.id);
-                                if (pl &&
-                                    pl->source ==
-                                        doc::LayerSourceKind::Shape &&
-                                    pl->osc_shape == 3u &&
-                                    app.giz_path_sel <
-                                        static_cast<int>(
-                                            pl->path.size())) {
-                                    doc::Layer up = *pl;
-                                    up.path.erase(
-                                        up.path.begin() +
-                                        app.giz_path_sel);
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::set_layer_props_command(
-                                            app.scope_look,
-                                            std::move(up)));
-                                    app.giz_path_sel = -1;
-                                }
-                            } else {
-                                do_delete_sel = true;
-                            }
-                        }
-                    }
-                    else if (e.key == platform::Key::Space && !e.repeat)
-                        toggle_play = true;
-                    else if ((e.key == platform::Key::Comma ||
-                              e.key == platform::Key::Period) &&
-                             app.has_timeline()) {
-                        // Frame step: , / . nudge the paused
-                        // playhead one frame.
-                        const uint32_t fc = app.player.frame_count();
-                        const uint32_t at =
-                            app.player.current_frame_index();
-                        app.player.pause();
-                        key_seek = static_cast<float>(
-                            e.key == platform::Key::Comma
-                                ? (at > 0 ? at - 1 : 0u)
-                                : std::min(at + 1, fc ? fc - 1 : 0u));
-                    } else if (e.key == platform::Key::Home &&
-                               app.has_timeline()) {
-                        key_seek = 0.0f;
-                    } else if (e.key == platform::Key::End &&
-                               app.has_timeline()) {
-                        const uint32_t fc = app.player.frame_count();
-                        key_seek = static_cast<float>(fc ? fc - 1 : 0u);
-                    } else if ((e.key == platform::Key::LeftBracket ||
-                                e.key == platform::Key::RightBracket) &&
-                               app.has_timeline()) {
-                        // [ / ] snap the playhead across keys + markers.
-                        const double f = timeline_adjacent_mark(
-                            app, e.key == platform::Key::RightBracket);
-                        if (f >= 0.0) key_seek = static_cast<float>(f);
-                    } else if ((e.key == platform::Key::I ||
-                                e.key == platform::Key::O) &&
-                               !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt |
-                                          platform::kModShift)) == 0 &&
-                               app.has_timeline()) {
-                        // I / O drop the in/out point at the playhead -
-                        // the same trim band the ruler handles drag,
-                        // ordered the same way they keep it. Sequence
-                        // structure: inert inside a look.
-                        if (!app.scope_is_look()) {
-                            const uint32_t ph =
-                                app.player.current_frame_index();
-                            const uint32_t fc = app.player.frame_count();
-                            const uint32_t cur_in =
-                                app.sequence().trim_in;
-                            const uint32_t cur_out =
-                                app.sequence().trim_out
-                                    ? app.sequence().trim_out
-                                    : fc;
-                            if (e.key == platform::Key::I)
-                                key_trim_in = static_cast<float>(std::min(
-                                    ph, cur_out ? cur_out - 1 : 0u));
-                            else
-                                key_trim_out =
-                                    static_cast<float>(std::max(
-                                        std::min(ph + 1, fc), cur_in + 1));
-                        }
-                    } else if (e.key == platform::Key::M && !e.repeat &&
-                               !(e.mods & (platform::kModCtrl |
-                                           platform::kModAlt |
-                                           platform::kModShift)) &&
-                               app.has_timeline()) {
-                        // M toggles a marker at the playhead (sequence
-                        // structure: inert inside a look).
-                        if (!app.scope_is_look())
-                            app.undo.execute(
-                                app.document,
-                                doc::toggle_marker_command(
-                                    app.sequence().id,
-                                    app.player.current_frame_index()));
-                    }
-                    else if (e.key == platform::Key::Z &&
-                             (e.mods & platform::kModCtrl)) {
-                        if (e.mods & platform::kModShift) do_redo = true;
-                        else do_undo = true;
-                    } else if (e.key == platform::Key::Y &&
-                               (e.mods & platform::kModCtrl)) {
-                        do_redo = true;
-                    } else if (e.key == platform::Key::G && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
-                        // texed Ctrl+G / Ctrl+Shift+G (subgraphs).
-                        if (e.mods & platform::kModShift) do_ungroup = true;
-                        else do_group = true;
-                    } else if (e.key == platform::Key::D && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
-                        do_duplicate = true;   // texed Ctrl+D
-                    } else if (e.key == platform::Key::Left ||
-                               e.key == platform::Key::Right ||
-                               e.key == platform::Key::Up ||
-                               e.key == platform::Key::Down) {
-                        // Arrow nudge (texed): selection moves 1 graph
-                        // unit, shift = 10; repeats coalesce via the
-                        // position command's merge.
-                        const float step =
-                            (e.mods & platform::kModShift) ? 10.0f : 1.0f;
-                        if (e.key == platform::Key::Left) nudge_dx -= step;
-                        if (e.key == platform::Key::Right) nudge_dx += step;
-                        if (e.key == platform::Key::Up) nudge_dy -= step;
-                        if (e.key == platform::Key::Down) nudge_dy += step;
-                    } else if (e.key == platform::Key::S &&
-                               (e.mods & platform::kModCtrl)) {
-                        if (e.mods & platform::kModShift) do_save_as = true;
-                        else do_save = true;
-                    } else if (e.key == platform::Key::O &&
-                               (e.mods & platform::kModCtrl)) {
-                        do_open_project = true;
-                    } else if (e.key == platform::Key::A && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
-                        do_select_all = true;   // texed Ctrl+A
-                    } else if (e.key == platform::Key::F && !e.repeat &&
-                               (e.mods & platform::kModCtrl) &&
-                               app.scope_is_look()) {
-                        // texed Ctrl+F: find / jump-to-node popup (the
-                        // cursor add menu in find mode). Sequence scope
-                        // has no nodes to find - the popup stays shut.
-                        app.find_mode = true;
-                        app.fx_filter.clear();
-                        app.fx_search_focus = true;
-                        app.canvas_state.add_open = true;
-                        app.canvas_state.add_anchor =
-                            app.canvas_state.last_mouse;
-                        app.canvas_state.add_scroll = 0.0f;
-                        app.canvas_state.splice_from = 0;
-                        app.canvas_state.splice_to = 0;
-                        app.canvas_state.splice_port = 0;
-                    } else if (e.key == platform::Key::F && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        // Fit view (texed F): re-trigger the first-frame
-                        // content fit.
-                        app.canvas_state.view_inited = false;
-                    } else if (e.key == platform::Key::C && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
-                        // Over the timeline Ctrl+C copies keys
-                        // (look scope - keys are look-local).
-                        if (!(tl_hovered && app.scope_is_look() &&
-                              timeline_copy_selected_keys(app)))
-                            do_copy = true;    // texed Ctrl+C
-                    } else if (e.key == platform::Key::X && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
-                        do_copy = true;    // texed Ctrl+X = copy + delete
-                        do_cut = true;
-                    } else if (e.key == platform::Key::V && !e.repeat &&
-                               (e.mods & platform::kModCtrl)) {
-                        if (!(tl_hovered && app.scope_is_look() &&
-                              timeline_paste_keys(app)))
-                            do_paste = true;   // texed Ctrl+V
-                    } else if (e.key == platform::Key::A && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        app.ab_wipe = !app.ab_wipe;   // A/B wipe
-                    } else if (e.key == platform::Key::B && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        // texed B: bypass the SELECTION when one exists;
-                        // a bare B keeps the app-wide fx toggle.
-                        bool any = false;
-                        for (const uint64_t cid : app.multi_sel) {
-                            const uint64_t did =
-                                cid & 0x00FFFFFFFFFFFFFFull;
-                            const auto kind =
-                                static_cast<flow::NodeKind>(
-                                    (cid >> 56) - 1);
-                            size_t li = 0, fi = 0;
-                            if (kind == flow::NodeKind::Effect &&
-                                find_effect_by_id(app.look(), did, &li,
-                                                  &fi)) {
-                                if (!any)
-                                    app.undo.begin_group("Bypass");
-                                any = true;
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_bypass_command(app.scope_look,
-                                        li, fi,
-                                        !app.look().layers[li]
-                                             .stack[fi].bypass));
-                            } else if (kind == flow::NodeKind::Group &&
-                                       find_group_by_id(app.look(), did,
-                                                        &li)) {
-                                for (const doc::Group& gr :
-                                     app.look().layers[li].groups)
-                                    if (gr.id == did) {
-                                        if (!any)
-                                            app.undo.begin_group(
-                                                "Bypass");
-                                        any = true;
-                                        doc::Group edited = gr;
-                                        edited.bypass = !edited.bypass;
-                                        app.undo.execute(
-                                            app.document,
-                                            doc::set_group_props_command(app.scope_look,
-                                                li, edited));
-                                        break;
-                                    }
-                            }
-                        }
-                        if (any) app.undo.end_group();
-                        else app.bypass_all = !app.bypass_all;
-                    } else if (e.key == platform::Key::S && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt |
-                                          platform::kModShift)) == 0) {
-                        // S toggles drag snapping (the NLE magnet).
-                        app.tl_snap = !app.tl_snap;
-                        app.status =
-                            app.tl_snap ? "snap on" : "snap off";
-                    } else if (e.key == platform::Key::R && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        // RAZOR: cut at the playhead — the picked lane
-                        // when its block sits under it, else every block
-                        // under the playhead, one undo step. Sequence
-                        // structure: inert inside a look (timeless).
-                        if (app.scope_is_look()) break;
-                        const doc::Sequence& rseq = app.sequence();
-                        const uint32_t ph =
-                            app.player.current_frame_index();
-                        auto inside = [&](const doc::SeqTrack& t) {
-                            for (const doc::Placement& place :
-                                 t.placements) {
-                                const uint32_t len = doc::source_length(
-                                    app.document, place);
-                                const uint32_t end =
-                                    doc::placement_end(place, len);
-                                if (ph > place.t_in && (!end || ph < end))
-                                    return true;
-                            }
-                            return false;
-                        };
-                        // The pick narrows the cut: the picked LANE
-                        // (block clicks set it). No pick cuts everything
-                        // under the playhead.
-                        std::vector<uint64_t> targets;
-                        bool narrowed = false;
-                        if (app.layer_sel &&
-                            app.selected_layer < rseq.tracks.size()) {
-                            const doc::SeqTrack& t =
-                                rseq.tracks[app.selected_layer];
-                            if (inside(t)) {
-                                targets.push_back(t.id);
-                                narrowed = true;
-                            }
-                        }
-                        if (targets.empty() && !narrowed)
-                            for (const doc::SeqTrack& t : rseq.tracks)
-                                if (inside(t)) targets.push_back(t.id);
-                        // Audio lanes cut too - linked partners already
-                        // split with their video half (the group), and a
-                        // half-open placement refuses a second cut, so
-                        // running every track is idempotent. A narrowed
-                        // cut stays on its lane.
-                        std::vector<uint64_t> audio_targets;
-                        if (!narrowed)
-                            for (const doc::AudioTrack& t : rseq.audio)
-                                audio_targets.push_back(t.id);
-                        app.undo.begin_group("Razor");
-                        for (const uint64_t lid : targets)
-                            if (auto cmd = doc::razor_track_command(
-                                    app.document, rseq.id, lid, ph))
-                                app.undo.execute(app.document,
-                                                 std::move(cmd));
-                        for (const uint64_t tid : audio_targets)
-                            if (auto cmd = doc::razor_audio_command(
-                                    app.document, rseq.id, tid, ph))
-                                app.undo.execute(app.document,
-                                                 std::move(cmd));
-                        app.undo.end_group();
-                    } else if (e.key == platform::Key::T && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        // Cycle the UI theme (also the sidebar button).
-                        app.theme_index =
-                            (app.theme_index + 1) % ui::theme_count();
-                        ui::set_active_theme(app.theme_index);
-                        save_ui_prefs(app);
-                    } else if (e.key == platform::Key::G && !e.repeat &&
-                               (e.mods & (platform::kModCtrl |
-                                          platform::kModAlt)) == 0) {
-                        // Envelope keypress trigger: live-mode
-                        // only — wall-clock triggers are exempt from
-                        // determinism there and only there.
-                        if (app.live_mode) app.env_key_time = app.app_seconds;
+                    } else {
+                        // Everything else resolves through the binding
+                        // map: action, macro or script.
+                        dispatch_key_binding(app, script_host, ki, e);
                     }
                     break;
                 case platform::Event::Type::FileDrop:
-                    dropped_file = e.drop_path;
-                    dropped_at = {e.mouse_x, e.mouse_y};
+                    // Modal settings scrim: a drop cannot land edits on
+                    // surfaces it visually covers.
+                    if (!app.settings.open)
+                        dropped_files.emplace_back(
+                            e.drop_path, Vec2{e.mouse_x, e.mouse_y});
                     break;
                 case platform::Event::Type::Resize:
                     renderer->notify_resize(static_cast<uint32_t>(e.width),
@@ -18485,6 +20982,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
             }
         }
+        // Macro playback: one queued action per frame, after real input
+        // so a step sees the previous one settle; modals pause it.
+        pump_action_queue(app, ki);
         if (!running) {
             window->request_close();
             break;
@@ -18522,14 +21022,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     // nothing plays, no primary rebinding.
                     uint64_t asset_id = 0;
                     for (const doc::Asset& a : app.document.assets)
-                        if (a.path == job->source.string())
+                        if (a.path == path_to_u8(job->source))
                             asset_id = a.id;
                     app.undo.begin_group("Import");
                     if (!asset_id) {
                         doc::Asset asset = doc::make_asset(
                             app.document,
-                            job->source.filename().string(),
-                            job->source.string());
+                            path_to_u8(job->source.filename()),
+                            path_to_u8(job->source));
                         asset_id = asset.id;
                         app.undo.execute(
                             app.document,
@@ -18554,12 +21054,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.undo.end_group();
                     refresh_bundles(app);
                     app.status =
-                        "imported " + job->source.filename().string();
+                        "imported " + path_to_u8(job->source.filename());
                 } else {
                     // Mid-job the result struct is still the worker's;
                     // everything the bind needs re-derives from disk.
                     const BundlePaths paths = resolve_bundle(job->source);
-                    app.media_name = job->source.filename().string();
+                    app.media_name = path_to_u8(job->source.filename());
                     app.bundle_base = paths.base;
                     app.pcm_path = paths.pcm;
                     refresh_bundles(app);
@@ -18593,7 +21093,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     // absence so strips, gallery cards and mod curves
                     // pick them up.
                     for (const doc::Asset& a : app.document.assets)
-                        if (a.path == owned->source.string()) {
+                        if (a.path == path_to_u8(owned->source)) {
                             app.asset_strips.erase(a.id);
                             app.asset_analysis.erase(a.id);
                         }
@@ -18606,12 +21106,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     if (owned->video_pass_only)
                         app.status =
                             "curves/thumbnails rebuilt: " +
-                            owned->source.filename().string();
+                            path_to_u8(owned->source.filename());
                     else if (owned->consolidate)
                         app.status = "consolidated: " +
-                                     owned->source.filename().string();
+                                     path_to_u8(owned->source.filename());
                 }
             }
+        }
+
+        // Queued media drops feed the import slot as it frees, ahead of
+        // any background resume - user files first, one at a time.
+        if (!app.import && !app.media_import_queue.empty()) {
+            const std::filesystem::path next =
+                std::move(app.media_import_queue.front());
+            app.media_import_queue.erase(app.media_import_queue.begin());
+            import_media(app, next);
         }
 
         // Ingest killed mid-video-pass (app closed, smoke run, cancel):
@@ -18623,7 +21132,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.video_pass_pending.clear();
             for (const doc::Asset& a : app.document.assets) {
                 if (a.path.empty()) continue;
-                const std::filesystem::path src(a.path);
+                const std::filesystem::path src = u8_to_path(a.path);
                 std::wstring key = src.native();
                 for (wchar_t& c : key) c = static_cast<wchar_t>(towlower(c));
                 if (app.video_pass_attempted.count(key)) continue;
@@ -18641,7 +21150,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.import =
                     start_video_pass_resume(src, bundle_dir_for(src));
                 app.status = "rebuilding curves/thumbnails: " +
-                             src.filename().string();
+                             path_to_u8(src.filename());
             }
         }
 
@@ -18683,10 +21192,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (job->thread.joinable()) job->thread.join();
             if (job->progress.cancel.load())
                 app.status =
-                    "export cancelled: " + job->out_path.filename().string();
+                    "export cancelled: " +
+                    path_to_u8(job->out_path.filename());
             else
                 app.status = job->result.ok
-                    ? "exported " + job->out_path.filename().string()
+                    ? "exported " + path_to_u8(job->out_path.filename())
                     : "export failed: " + job->result.error;
             if (!app.export_queue.empty()) {
                 AppState::QueuedExport next =
@@ -18748,6 +21258,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             input.mouse = {-4096.0f, -4096.0f};
             input.mouse_delta = {};
             input.consumed = true;
+        } else if (app.settings.open) {
+            // Settings modal: same live-interact-then-deaden contract.
+            settings_interact(app, input, font, viewport, window.get());
+            input.buttons_down = 0;
+            input.buttons_pressed = 0;
+            input.buttons_released = 0;
+            input.wheel_x = input.wheel_y = 0.0f;
+            input.typed.clear();
+            input.backspace_pressed = false;
+            input.enter_pressed = false;
+            input.mouse = {-4096.0f, -4096.0f};
+            input.mouse_delta = {};
+            input.consumed = true;
+        }
+        // Settings "run" staged a macro; it fires here, after the popup
+        // closed, on the macro host.
+        if (!app.pending_macro.empty()) {
+            run_macro(app, macro_host, app.pending_macro);
+            app.pending_macro.clear();
         }
         // Timeline zoom/pan: pre-routed against LAST frame's region
         // rect so the lane scroll area cannot swallow the wheel first.
@@ -18760,7 +21289,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         FrameUi frame_ui;
         // Keyboard playhead moves (frame step, Home/End, [ ]).
-        if (key_seek >= 0.0f) frame_ui.seek_to = key_seek;
+        if (ki.key_seek >= 0.0f) frame_ui.seek_to = ki.key_seek;
 
         ui::LayoutNode* preview = ui::make_node(arena, ui::NodeKind::Leaf);
         preview->width = ui::SizeSpec::fill();
@@ -18890,7 +21419,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         static const char* kEditItems[] = {
             "undo  (ctrl+z)",      "redo  (ctrl+y)",
             "duplicate  (ctrl+d)", "group  (ctrl+g)",
-            "ungroup  (ctrl+shift+g)", "select all  (ctrl+a)"};
+            "ungroup  (ctrl+shift+g)", "select all  (ctrl+a)",
+            "settings..."};
         static const char* kViewItems[] = {
             "fit graph  (f)",   "find node...  (ctrl+f)",
             "cycle theme  (t)", "a/b wipe  (a)",
@@ -18932,7 +21462,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             arena, bar,
             {MenuButton(arena, "file", kFileItems, 7,
                         &app.menu_states[0], &menu_picks[0]),
-             MenuButton(arena, "edit", kEditItems, 6,
+             MenuButton(arena, "edit", kEditItems, 7,
                         &app.menu_states[1], &menu_picks[1]),
              MenuButton(arena, "view", kViewItems, 6,
                         &app.menu_states[2], &menu_picks[2]),
@@ -19169,22 +21699,63 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 ctx_item("remove (del)", kActRemoveBlock);
                 break;
             }
-            for (const FrameUi::LaneCtx& lc : frame_ui.lane_ctxs) {
-                if (!*lc.clicked || app.scope_is_look()) continue;
-                auto& m = ctx_open(lc.audio ? kCtxLaneAudio : kCtxLaneVideo);
-                m.a = lc.track_id;
-                if (!lc.audio) {
+            // The lane LABEL column opens the same menu as empty lane
+            // space: right-click over the 150px head left of a lane
+            // widget stages that lane's ctx.
+            bool label_ctx = false;
+            uint64_t label_track = 0;
+            bool label_audio = false;
+            if (input.right_pressed() && !app.scope_is_look())
+                for (const FrameUi::LaneNode& ln : frame_ui.lane_nodes) {
+                    const ui::Rect& lr = ln.node->rect;
+                    if (lr.w <= 0.0f) continue;
+                    if (input.mouse.y < lr.y ||
+                        input.mouse.y >= lr.bottom())
+                        continue;
+                    if (input.mouse.x >= lr.x ||
+                        input.mouse.x < lr.x - 156.0f)
+                        continue;
+                    label_ctx = true;
+                    label_track = ln.track_id;
+                    label_audio = ln.audio;
+                    break;
+                }
+            auto open_lane_ctx = [&](uint64_t track_id, bool audio) {
+                auto& m = ctx_open(audio ? kCtxLaneAudio : kCtxLaneVideo);
+                m.a = track_id;
+                if (!audio) {
+                    const doc::SeqTrack* tr = nullptr;
+                    for (const doc::SeqTrack& t : app.sequence().tracks)
+                        if (t.id == track_id) tr = &t;
                     ctx_item("add lane above", kActAddLaneAbove);
                     ctx_item("add lane below", kActAddLaneBelow);
                     ctx_item("add audio track", kActAddAudioTrack);
+                    if (tr)
+                        ctx_item(tr->hidden ? "show lane" : "hide lane",
+                                 kActToggleLaneHide);
+                    if (tr)
+                        ctx_item(tr->lock ? "unlock lane" : "lock lane",
+                                 kActToggleLaneLock);
                     if (app.sequence().tracks.size() > 1)
                         ctx_item("remove this lane", kActRemoveLane);
                 } else {
+                    const doc::AudioTrack* tr = nullptr;
+                    for (const doc::AudioTrack& t : app.sequence().audio)
+                        if (t.id == track_id) tr = &t;
                     ctx_item("add audio track", kActAddAudioTrack);
+                    if (tr)
+                        ctx_item(tr->lock ? "unlock track" : "lock track",
+                                 kActToggleLaneLock);
                     ctx_item("remove this track", kActRemoveLane);
                 }
+            };
+            for (const FrameUi::LaneCtx& lc : frame_ui.lane_ctxs) {
+                if (!*lc.clicked || app.scope_is_look()) continue;
+                open_lane_ctx(lc.track_id, lc.audio);
                 break;
             }
+            if (!app.ctx_menu.kind && label_ctx)
+                open_lane_ctx(label_track, label_audio);
             if (frame_ui.ruler_ctx && *frame_ui.ruler_ctx &&
                 !app.scope_is_look()) {
                 auto& m = ctx_open(kCtxRuler);
@@ -19465,6 +22036,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                          frame_ui.lane_nodes) {
                         if (!ln.node->rect.contains(input.mouse))
                             continue;
+                        // Locked lanes refuse drops outright.
+                        bool lane_locked = false;
+                        if (ln.audio) {
+                            for (const doc::AudioTrack& t :
+                                 app.sequence().audio)
+                                if (t.id == ln.track_id)
+                                    lane_locked = t.lock;
+                        } else {
+                            for (const doc::SeqTrack& t :
+                                 app.sequence().tracks)
+                                if (t.id == ln.track_id)
+                                    lane_locked = t.lock;
+                        }
+                        if (lane_locked) {
+                            app.status = "that lane is locked";
+                            dropped = true;
+                            break;
+                        }
                         const ui::Rect& lr = ln.node->rect;
                         const double vspan =
                             std::max(1.0, app.tl_v1 - app.tl_v0);
@@ -19490,14 +22079,23 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             place_look_block(app, did, at, ln.track_id);
                         } else if (app.document.find_look(did) ||
                                    app.document.find_sequence(did)) {
-                            doc::Placement ap;
-                            ap.target = did;
-                            ap.t_in = at;
-                            app.undo.execute(
-                                app.document,
-                                doc::add_audio_placement_command(
-                                    app.document, app.sequence().id,
-                                    ln.track_id, ap, 0));
+                            // A drop ON an audio track mirrors the other
+                            // way: the video half lands on the
+                            // same-index lane (minted when short), the
+                            // audio pair on this very track.
+                            if (doc::nest_reaches(app.document, did,
+                                                  app.sequence().id)) {
+                                app.status =
+                                    "that would loop - it cannot "
+                                    "reach itself";
+                            } else {
+                                app.undo.begin_group("Place Block");
+                                const uint64_t vlane = mirror_video_lane(
+                                    app, app.sequence().id, ln.track_id);
+                                lay_block(app, app.sequence().id, vlane,
+                                          did, at, ln.track_id);
+                                app.undo.end_group();
+                            }
                         }
                         dropped = true;
                         break;
@@ -19665,7 +22263,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     const doc::Placement orig = *p;
                     const uint32_t len =
                         doc::source_length(app.document, orig);
-                    const uint32_t end = doc::placement_end(orig, len);
+                    const uint32_t end = doc::placement_end(
+                        orig, len,
+                        doc::placement_ratio(
+                            app.document, orig,
+                            doc::effective_fps(app.document,
+                                               app.sequence())));
                     const uint32_t span =
                         end > orig.t_in ? end - orig.t_in : 60u;
                     // Collect the linked audio partners BEFORE executing:
@@ -19703,15 +22306,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             doc::add_audio_placement_command(
                                 app.document, app.sequence().id, pr.track,
                                 pr.place, np.id));
-                    if (const doc::Placement* landed = doc::find_placement(
-                            app.sequence(), np.id)) {
-                        const uint32_t nend = doc::placement_end(
-                            *landed,
-                            doc::source_length(app.document, *landed));
-                        doc::overwrite_lane_span(
-                            app.document, app.undo, app.sequence().id, m.a,
-                            np.id, landed->link, landed->t_in, nend);
-                    }
+                    doc::overwrite_group_spans(app.document, app.undo,
+                                               app.sequence().id, np.id);
                     app.undo.end_group();
                     break;
                 }
@@ -19863,11 +22459,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.status = "an import is already running";
                         break;
                     }
-                    const std::filesystem::path src(a->path);
+                    const std::filesystem::path src = u8_to_path(a->path);
                     app.import =
                         start_consolidate(src, bundle_dir_for(src));
                     app.status =
-                        "consolidating: " + src.filename().string();
+                        "consolidating: " + path_to_u8(src.filename());
                     break;
                 }
                 case kActNewLookFromAsset: {
@@ -19987,6 +22583,33 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.undo.execute(app.document, std::move(cmd));
                     }
                     break;
+                case kActToggleLaneLock:
+                case kActToggleLaneHide: {
+                    const doc::Sequence& sq = app.sequence();
+                    if (m.kind == kCtxLaneAudio) {
+                        for (const doc::AudioTrack& t : sq.audio)
+                            if (t.id == m.a)
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_audio_track_props_command(
+                                        sq.id, t.id, t.name, t.gain,
+                                        t.mute, !t.lock));
+                    } else {
+                        for (const doc::SeqTrack& t : sq.tracks)
+                            if (t.id == m.a)
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_track_props_command(
+                                        sq.id, t.id, t.name,
+                                        act == kActToggleLaneHide
+                                            ? !t.hidden
+                                            : t.hidden,
+                                        act == kActToggleLaneLock
+                                            ? !t.lock
+                                            : t.lock));
+                    }
+                    break;
+                }
                 case kActNewLook: {
                     doc::Look nl = doc::make_look(app.document, "");
                     nl.bin = m.b;
@@ -20087,64 +22710,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
 
-        // Menu-bar picks: each item routes through the SAME flag or frame
-        // local its button/hotkey twin uses — one code path per action.
-        if (menu_picks[0] >= 0) switch (menu_picks[0]) {
-            case 0:
-                if (frame_ui.open_clicked) *frame_ui.open_clicked = true;
-                break;
-            case 1:
-                if (frame_ui.import_media_clicked)
-                    *frame_ui.import_media_clicked = true;
-                break;
-            case 2: do_open_project = true; break;
-            case 3: do_save = true; break;
-            case 4: do_save_as = true; break;
-            case 5:
-                if (frame_ui.preset_import_clicked)
-                    *frame_ui.preset_import_clicked = true;
-                break;
-            case 6:
-                if (frame_ui.export_clicked)
-                    *frame_ui.export_clicked = true;
-                break;
-        }
-        if (menu_picks[1] >= 0) switch (menu_picks[1]) {
-            case 0:
-                if (frame_ui.undo_clicked) *frame_ui.undo_clicked = true;
-                break;
-            case 1:
-                if (frame_ui.redo_clicked) *frame_ui.redo_clicked = true;
-                break;
-            case 2: do_duplicate = true; break;
-            case 3: do_group = true; break;
-            case 4: do_ungroup = true; break;
-            case 5: do_select_all = true; break;
-        }
-        if (menu_picks[2] >= 0) switch (menu_picks[2]) {
-            case 0: app.canvas_state.view_inited = false; break;
-            case 1:
-                // Find/jump popup — the Ctrl+F path.
-                app.find_mode = true;
-                app.fx_filter.clear();
-                app.fx_search_focus = true;
-                app.canvas_state.add_open = true;
-                app.canvas_state.add_anchor = app.canvas_state.last_mouse;
-                app.canvas_state.add_scroll = 0.0f;
-                app.canvas_state.splice_from = 0;
-                app.canvas_state.splice_to = 0;
-                app.canvas_state.splice_port = 0;
-                break;
-            case 2:
-                app.theme_index =
-                    (app.theme_index + 1) % ui::theme_count();
-                ui::set_active_theme(app.theme_index);
-                save_ui_prefs(app);
-                break;
-            case 3: app.ab_wipe = !app.ab_wipe; break;
-            case 4: app.bypass_all = !app.bypass_all; break;
-            case 5: app.alpha_checker = !app.alpha_checker; break;
-        }
+        // Menu-bar picks route through the SAME action registry as the
+        // keyboard — one code path per verb.
+        static const char* kFileActs[] = {
+            "open_media",   "import_media",    "open_project",
+            "save_project", "save_project_as", "import_preset",
+            "export"};
+        static const char* kEditActs[] = {
+            "undo",    "redo",       "duplicate", "group",
+            "ungroup", "select_all", "settings"};
+        static const char* kViewActs[] = {
+            "fit_view", "find_node", "cycle_theme",
+            "ab_wipe",  "bypass",    "alpha_checker"};
+        if (menu_picks[0] >= 0)
+            run_action_id(app, ki, kFileActs[menu_picks[0]]);
+        if (menu_picks[1] >= 0)
+            run_action_id(app, ki, kEditActs[menu_picks[1]]);
+        if (menu_picks[2] >= 0)
+            run_action_id(app, ki, kViewActs[menu_picks[2]]);
         // Inspector tab switch.
         if (*tab_node) app.inspector_tab = 0;
         if (*tab_project) app.inspector_tab = 1;
@@ -20452,7 +23035,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             // Ctrl+C / Ctrl+X (texed clipboard): copy the selection's
             // payloads plus the links AMONG copied effects; runs before
             // the delete handlers so cut copies first.
-            if (do_copy && !app.multi_sel.empty()) {
+            if (ki.do_copy && !app.multi_sel.empty()) {
                 auto& cb = app.clipboard;
                 cb = {};
                 std::unordered_set<uint64_t> cb_fx;
@@ -20502,9 +23085,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     cb.origin_x = ox < 1e9f ? ox : 0.0f;
                     cb.origin_y = oy < 1e9f ? oy : 0.0f;
                     cb.valid = true;
-                    app.status = do_cut ? "cut to clipboard"
+                    app.status = ki.do_cut ? "cut to clipboard"
                                         : "copied to clipboard";
-                    if (do_cut) do_delete_sel = true;
+                    if (ki.do_cut) ki.do_delete_sel = true;
                 } else {
                     app.status = "nothing copyable selected";
                 }
@@ -20627,13 +23210,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     true;
                         break;
                     case CtxAction::Duplicate:
-                        do_duplicate = true;
+                        ki.do_duplicate = true;
                         break;
                     case CtxAction::Group:
-                        do_group = true;
+                        ki.do_group = true;
                         break;
                     case CtxAction::Ungroup:
-                        do_ungroup = true;
+                        ki.do_ungroup = true;
                         break;
                     case CtxAction::OpenGroup:
                         ctx_open_group = target;
@@ -20668,7 +23251,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             out_path->replace_extension(".json");
                         doc::Preset preset = doc::make_preset_from_group(
                             app.look(), gli, did);
-                        preset.name = out_path->stem().string();
+                        preset.name = path_to_u8(out_path->stem());
                         if (preset.tags.empty())
                             preset.tags.push_back("user");
                         std::error_code ec;
@@ -20676,7 +23259,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             out_path->parent_path(), ec);
                         if (doc::save_preset(*out_path, preset)) {
                             app.status = "saved preset " +
-                                         out_path->filename().string();
+                                         path_to_u8(out_path->filename());
                             rescan_presets(app);
                         } else {
                             app.status = "preset save failed";
@@ -20695,7 +23278,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         break;
                     }
                     case CtxAction::Delete:
-                        do_delete_sel = true;
+                        ki.do_delete_sel = true;
                         break;
                     case CtxAction::ResetParams: {
                         // Back to table defaults, one undo step.
@@ -21070,7 +23653,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 app.document,
                                 doc::set_group_props_command(app.scope_look,bgli,
                                                              edited));
-                            // The outer producer's link follows.
+                            // The outer producer's link follows, in
+                            // place.
                             for (const doc::NodeLink& l :
                                  boundary_links())
                                 if (l.to_port == 0 &&
@@ -21078,10 +23662,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     !scope_members.count(l.from)) {
                                     app.undo.execute(
                                         app.document,
-                                        doc::disconnect_command(app.scope_look,l));
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::connect_command(app.scope_look,
+                                        doc::reconnect_command(
+                                            app.scope_look, l,
                                             {l.from, to2, 0}));
                                     break;
                                 }
@@ -21100,7 +23682,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 doc::set_group_props_command(app.scope_look,bgli,
                                                              edited));
                             // Every outer consumer's link follows (the
-                            // composite link included).
+                            // composite link included), in place.
                             for (const doc::NodeLink& l :
                                  boundary_links())
                                 if (l.to_port == 0 &&
@@ -21108,10 +23690,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     !scope_members.count(l.to)) {
                                     app.undo.execute(
                                         app.document,
-                                        doc::disconnect_command(app.scope_look,l));
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::connect_command(app.scope_look,
+                                        doc::reconnect_command(
+                                            app.scope_look, l,
                                             {from2, l.to, 0}));
                                 }
                         }
@@ -21293,18 +23873,45 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.undo.execute(
                             app.document,
                             doc::disconnect_command(app.scope_look,{0, 0, 9999}));
-                    app.undo.execute(app.document,
-                                     doc::disconnect_command(app.scope_look,
-                                         {wf, wt, fe.splice_wire_port}));
+                    // The spliced feed takes the old wire's stacking
+                    // position in (wt, port)'s fan-in.
+                    app.undo.execute(
+                        app.document,
+                        doc::reconnect_command(app.scope_look,
+                            {wf, wt, fe.splice_wire_port},
+                            {nid_out, wt, fe.splice_wire_port}));
                     app.undo.execute(
                         app.document,
                         doc::connect_command(app.scope_look,
                                              {wf, nid_in, 0}));
+                    app.undo.end_group();
+                    structure_done = true;
+                }
+            }
+
+            // Port stack reorder (the double-click popup): permute the
+            // link vector, one un-coalesced step per arrow click.
+            if (fe.port_reorder && !structure_done &&
+                fe.reorder_index >= 0) {
+                uint64_t to = 0;
+                bool ok = true;
+                if (fe.reorder_node == flow::kOutNodeId) {
+                    to = 0;
+                } else if (tag_kind(fe.reorder_node) ==
+                           flow::NodeKind::Group) {
+                    to = group_boundary_member(
+                        app.look(), tag_doc(fe.reorder_node), false);
+                    ok = to != 0;
+                } else {
+                    to = tag_doc(fe.reorder_node);
+                }
+                if (ok) {
                     app.undo.execute(
                         app.document,
-                        doc::connect_command(app.scope_look,
-                            {nid_out, wt, fe.splice_wire_port}));
-                    app.undo.end_group();
+                        doc::move_port_link_command(
+                            app.scope_look, to, fe.reorder_port,
+                            static_cast<size_t>(fe.reorder_index),
+                            fe.reorder_delta));
                     structure_done = true;
                 }
             }
@@ -21671,7 +24278,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 const int pick =
                     !app.canvas_state.add_open ? -1
                     : fe.add_pick >= 0         ? fe.add_pick
-                    : do_add_first             ? 0
+                    : ki.do_add_first             ? 0
                                                : -1;
                 if (pick >= 0 && !structure_done) {
                     // Resolve through the BUILD-TIME action array (one
@@ -21680,7 +24287,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     // advances past leading headers to the first real
                     // item.
                     int ridx = pick;
-                    while (do_add_first && flow_ui.graph->add_headers &&
+                    while (ki.do_add_first && flow_ui.graph->add_headers &&
                            ridx <
                                static_cast<int>(
                                    flow_ui.graph->add_count) &&
@@ -21959,7 +24566,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             // Duplicate (texed Ctrl+D): the primary selection, offset
             // +26/+26, params copied, the copy selected. Sources stay
             // single (layer semantics are explicit).
-            if (do_duplicate && !structure_done) {
+            if (ki.do_duplicate && !structure_done) {
                 float px = 0.0f, py = 0.0f;
                 if (app.sel.kind == SelKind::Effect) {
                     size_t li = 0, fi = 0;
@@ -22025,7 +24632,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
 
             // Ctrl+A (texed selectAll): every card joins the set.
-            if (do_select_all) {
+            if (ki.do_select_all) {
                 app.multi_sel.clear();
                 for (size_t i = 0; i < flow_ui.graph->node_count; ++i)
                     app.multi_sel.push_back(flow_ui.graph->nodes[i].id);
@@ -22089,16 +24696,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             // Ctrl+G (texed groupSelection → subgraph): wrap the span of
             // selected effects in one layer into a FOLDED group — it
             // lands as a single card with its exposed face as knobs.
-            if (do_group && app.open_group) {
+            if (ki.do_group && app.open_group) {
                 app.status = "groups don't nest - exit to the main graph "
                              "first";
-                do_group = false;
+                ki.do_group = false;
             }
             // NEST: Ctrl+G over selected SOURCES is the
             // one-level-up sibling of grouping effects — the blocks leave
             // this look and become one, with a single instance in their
             // place. Effects group; blocks nest.
-            if (do_group && !structure_done) {
+            if (ki.do_group && !structure_done) {
                 std::vector<uint64_t> block_ids;
                 for (const uint64_t cid : app.multi_sel) {
                     if (tag_kind(cid) != flow::NodeKind::Source) continue;
@@ -22134,7 +24741,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     structure_done = true;
                 }
             }
-            if (do_group && !structure_done) {
+            if (ki.do_group && !structure_done) {
                 size_t gli = SIZE_MAX, lo = SIZE_MAX, hi = 0;
                 int count = 0;
                 for (const uint64_t cid : app.multi_sel) {
@@ -22174,7 +24781,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             // Ctrl+Shift+G: dissolve the selected group (or the group of
             // the selected effect); members keep their cards.
-            if (do_ungroup && !structure_done) {
+            if (ki.do_ungroup && !structure_done) {
                 uint64_t gid = 0;
                 if (app.sel.kind == SelKind::Group) {
                     gid = app.sel.id;
@@ -22197,11 +24804,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
             // Ctrl+V (texed paste): remap ids, land at the canvas cursor,
             // recreate the internal links — one undo group.
-            if (do_paste && app.open_group) {
+            if (ki.do_paste && app.open_group) {
                 app.status = "exit the group (breadcrumb) to paste";
-                do_paste = false;
+                ki.do_paste = false;
             }
-            if (do_paste && app.clipboard.valid && !structure_done) {
+            if (ki.do_paste && app.clipboard.valid && !structure_done) {
                 const auto& cb = app.clipboard;
                 const float px0 = app.canvas_state.last_gx;
                 const float py0 = app.canvas_state.last_gy;
@@ -22286,7 +24893,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
             // Arrow-key nudge (texed): the whole selection shifts; the
             // per-node position command's merge coalesces held keys.
-            if ((nudge_dx != 0.0f || nudge_dy != 0.0f) &&
+            if ((ki.nudge_dx != 0.0f || ki.nudge_dy != 0.0f) &&
                 !app.multi_sel.empty()) {
                 for (const uint64_t cid : app.multi_sel) {
                     doc::NodeRef ref;
@@ -22296,8 +24903,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     if (!node_pos_of(cid, &nx, &ny)) continue;
                     app.undo.execute(app.document,
                                      doc::set_node_pos_command(app.scope_look,
-                                         ref, rid, nx + nudge_dx,
-                                         ny + nudge_dy),
+                                         ref, rid, nx + ki.nudge_dx,
+                                         ny + ki.nudge_dy),
                                      /*coalesce=*/true);
                 }
             }
@@ -22388,7 +24995,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (app.open_group == gid) app.open_group = 0;
                 return true;
             };
-            if (do_delete_sel && !structure_done &&
+            if (ki.do_delete_sel && !structure_done &&
                 (!app.sel_wires.empty() || app.multi_sel.size() > 1)) {
                 auto is_cid_kind = [&](uint64_t cid, flow::NodeKind k) {
                     return cid != 0 && cid != flow::kOutNodeId &&
@@ -22653,7 +25260,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             // Delete removes the selected effect (layer removal stays
             // behind its inspector button).
-            if (do_delete_sel && !structure_done) {
+            if (ki.do_delete_sel && !structure_done) {
                 if (app.sel.kind == SelKind::Effect) {
                     size_t li = 0, fi = 0;
                     if (find_effect_by_id(app.look(), app.sel.id, &li,
@@ -22790,7 +25397,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.project_fps_selected &&
             *frame_ui.project_fps_selected >= 0 &&
-            *frame_ui.project_fps_selected < 7 &&
+            *frame_ui.project_fps_selected <
+                static_cast<int>(sizeof(kProjectFpsValues) /
+                                 sizeof(kProjectFpsValues[0])) &&
             app.document.fps !=
                 kProjectFpsValues[*frame_ui.project_fps_selected]) {
             app.undo.execute(
@@ -22829,7 +25438,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (picked)
                     app.undo.execute(app.document,
                                      doc::set_audio_config_command(
-                                         picked->string(),
+                                         path_to_u8(*picked),
                                          app.document.sidechain_mux,
                                          app.document.audio_offset_ms));
             }
@@ -22980,14 +25589,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         out_path->replace_extension(".json");
                     doc::Preset preset = doc::make_preset_from_group(
                         app.look(), ga_layer, ga.group_id);
-                    preset.name = out_path->stem().string();
+                    preset.name = path_to_u8(out_path->stem());
                     if (preset.tags.empty()) preset.tags.push_back("user");
                     std::error_code ec;
                     std::filesystem::create_directories(
                         out_path->parent_path(), ec);
                     if (doc::save_preset(*out_path, preset)) {
                         app.status =
-                            "saved preset " + out_path->filename().string();
+                            "saved preset " + path_to_u8(out_path->filename());
                         rescan_presets(app);
                     } else {
                         app.status = "preset save failed";
@@ -23082,18 +25691,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (wf &&
                     !doc::link_would_cycle(app.look(), wf, face_in) &&
                     !doc::link_would_cycle(app.look(), face_out, wt)) {
+                    // The spliced feed keeps the old wire's stacking
+                    // position in (wt, port)'s fan-in.
                     app.undo.execute(
                         app.document,
-                        doc::disconnect_command(app.scope_look,
-                                                {wf, wt, sport}));
+                        doc::reconnect_command(app.scope_look,
+                                               {wf, wt, sport},
+                                               {face_out, wt, sport}));
                     app.undo.execute(
                         app.document,
                         doc::connect_command(app.scope_look,
                                              {wf, face_in, 0}));
-                    app.undo.execute(
-                        app.document,
-                        doc::connect_command(app.scope_look,
-                                             {face_out, wt, sport}));
                 }
             }
             app.undo.end_group();
@@ -23232,8 +25840,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.duration_edit.clear();
             if (app.duration_focus) app.preset_search_focus = false;
         }
-        if (frame_ui.preset_import_clicked &&
-            *frame_ui.preset_import_clicked) {
+        if ((frame_ui.preset_import_clicked &&
+             *frame_ui.preset_import_clicked) ||
+            ki.import_preset) {
             auto picked = platform::show_open_dialog(
                 window.get(),
                 {{"looks preset", "*.json"}, {"all files", "*.*"}});
@@ -23258,7 +25867,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     if (!ec) {
                         rescan_presets(app);
                         app.status = "imported preset " +
-                                     picked->filename().string();
+                                     path_to_u8(picked->filename());
                     } else {
                         app.status = "preset import failed";
                     }
@@ -23560,6 +26169,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 edited.timeline_lock = !edited.timeline_lock;
                 app.undo.execute(app.document,
                                  doc::set_layer_props_command(app.scope_look,edited));
+            } else if (lrow.anchor_centre && *lrow.anchor_centre) {
+                doc::Layer edited = *layer;
+                edited.xf_anchor_x = 0.5f;
+                edited.xf_anchor_y = 0.5f;
+                app.undo.execute(app.document,
+                                 doc::set_layer_props_command(app.scope_look,edited));
             } else if (lrow.flip_h && *lrow.flip_h) {
                 doc::Layer edited = *layer;
                 edited.flip_h = !edited.flip_h;
@@ -23579,22 +26194,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.selected_layer >= app.look().layers.size())
                     app.selected_layer = app.look().layers.size() - 1;
                 break;
-            } else if (lrow.up && *lrow.up && lrow.index > 0) {
-                app.undo.execute(app.document,
-                                 doc::move_layer_command(app.scope_look,lrow.index, -1));
-                if (app.selected_layer == lrow.index)
-                    app.selected_layer = lrow.index - 1;
-                else if (app.selected_layer == lrow.index - 1)
-                    app.selected_layer = lrow.index;
+            } else if (lrow.up && *lrow.up) {
+                // The arrows permute the OUTPUT port's link order (the
+                // stacking truth; up = drawn later = more visible);
+                // the layer array is storage only.
+                const int fi = output_feed_index(app.look(), lrow.id);
+                if (fi >= 0)
+                    app.undo.execute(
+                        app.document,
+                        doc::move_port_link_command(
+                            app.scope_look, 0, 0,
+                            static_cast<size_t>(fi), 1));
                 break;
-            } else if (lrow.down && *lrow.down &&
-                       lrow.index + 1 < app.look().layers.size()) {
-                app.undo.execute(app.document,
-                                 doc::move_layer_command(app.scope_look,lrow.index, 1));
-                if (app.selected_layer == lrow.index)
-                    app.selected_layer = lrow.index + 1;
-                else if (app.selected_layer == lrow.index + 1)
-                    app.selected_layer = lrow.index;
+            } else if (lrow.down && *lrow.down) {
+                const int fi = output_feed_index(app.look(), lrow.id);
+                if (fi > 0)
+                    app.undo.execute(
+                        app.document,
+                        doc::move_port_link_command(
+                            app.scope_look, 0, 0,
+                            static_cast<size_t>(fi), -1));
                 break;
             }
         }
@@ -23723,27 +26342,26 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             if (*bs.released) {
                 app.undo.break_coalescing();
-                // The drag has landed: the block OVERWRITES whatever its
-                // final span covers on its video lane (audio sums).
+                // The drag has landed: a staged vertical move first (the
+                // landing must claim the DESTINATION lane), then the
+                // block and its link partners OVERWRITE their spans -
+                // video and audio lanes alike, overlaps never persist.
                 if (!app.scope_is_look()) {
                     const doc::Sequence& sq = app.sequence();
-                    for (const doc::SeqTrack& t : sq.tracks) {
-                        const doc::Placement* p = nullptr;
-                        for (const doc::Placement& q : t.placements)
-                            if (q.id == bs.placement_id) p = &q;
-                        if (!p) continue;
-                        const doc::Placement moved = *p;
-                        const uint32_t end = doc::placement_end(
-                            moved,
-                            doc::source_length(app.document, moved));
-                        app.undo.begin_group("Overwrite");
-                        doc::overwrite_lane_span(
-                            app.document, app.undo, sq.id, t.id, moved.id,
-                            moved.link, moved.t_in, end);
-                        app.undo.end_group();
-                        break;
+                    app.undo.begin_group("Overwrite");
+                    if (app.blk_move_placement == bs.placement_id &&
+                        app.blk_move_track) {
+                        if (auto mv = doc::move_placement_command(
+                                app.document, sq.id, bs.placement_id,
+                                app.blk_move_track))
+                            app.undo.execute(app.document, std::move(mv));
                     }
+                    doc::overwrite_group_spans(app.document, app.undo,
+                                               sq.id, bs.placement_id);
+                    app.undo.end_group();
                 }
+                app.blk_move_placement = 0;
+                app.blk_move_track = 0;
             }
         }
         for (const FrameUi::PlacementXf& px : frame_ui.placement_xfs) {
@@ -23763,27 +26381,94 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.xf_history.pop_front();
             }
             if (*px.released) app.undo.break_coalescing();
+            // Anchor snaps: one un-coalesced step each, bracketed so
+            // neither an in-flight gesture merges into the snap nor a
+            // later coalesced write swallows it.
+            if ((px.snap_media && *px.snap_media) ||
+                (px.snap_screen && *px.snap_screen)) {
+                doc::Placement np = *px.staged;
+                if (px.snap_media && *px.snap_media) {
+                    np.anchor_x = 0.5f;
+                    np.anchor_y = 0.5f;
+                } else {
+                    np.anchor_x = 0.5f - np.pos_x;
+                    np.anchor_y = 0.5f - np.pos_y;
+                }
+                app.undo.break_coalescing();
+                app.undo.execute(
+                    app.document,
+                    doc::set_placement_command(app.scope_look, np));
+                app.undo.break_coalescing();
+            }
         }
         for (const FrameUi::AudioTrackStage& as : frame_ui.audio_tracks) {
             const doc::AudioTrack* track = nullptr;
             for (const doc::AudioTrack& t : app.sequence().audio)
                 if (t.id == as.track_id) track = &t;
             if (!track) continue;
-            if (*as.gain_changed && *as.gain_staged != as.original)
-                app.undo.execute(
-                    app.document,
-                    doc::set_audio_track_props_command(
-                        app.scope_look, track->id, track->name,
-                        std::clamp(*as.gain_staged, 0.0f, 2.0f),
-                        track->mute),
-                    /*coalesce=*/true);
-            if (*as.gain_released) app.undo.break_coalescing();
             if (*as.mute_clicked)
                 app.undo.execute(app.document,
                                  doc::set_audio_track_props_command(
                                      app.scope_look, track->id,
                                      track->name, track->gain,
-                                     !track->mute));
+                                     !track->mute, track->lock));
+            if (*as.lock_clicked)
+                app.undo.execute(app.document,
+                                 doc::set_audio_track_props_command(
+                                     app.scope_look, track->id,
+                                     track->name, track->gain,
+                                     track->mute, !track->lock));
+        }
+        for (const FrameUi::VideoTrackStage& vs : frame_ui.video_tracks) {
+            const doc::SeqTrack* track = nullptr;
+            for (const doc::SeqTrack& t : app.sequence().tracks)
+                if (t.id == vs.track_id) track = &t;
+            if (!track) continue;
+            if (*vs.eye_clicked)
+                app.undo.execute(app.document,
+                                 doc::set_track_props_command(
+                                     app.scope_look, track->id,
+                                     track->name, !track->hidden,
+                                     track->lock));
+            if (*vs.lock_clicked)
+                app.undo.execute(app.document,
+                                 doc::set_track_props_command(
+                                     app.scope_look, track->id,
+                                     track->name, track->hidden,
+                                     !track->lock));
+        }
+        // Entity tabs: click activates (scopes into), x closes - closing
+        // the active one falls to its left neighbor, then the root.
+        if (frame_ui.tl_snap_clicked && *frame_ui.tl_snap_clicked) {
+            app.tl_snap = !app.tl_snap;
+            app.status = app.tl_snap ? "snap on" : "snap off";
+        }
+        for (const FrameUi::TlTab& tab : frame_ui.tl_tabs) {
+            if (*tab.activate && tab.id != app.scope_look) {
+                enter_scope(app, tab.id);
+                break;
+            }
+            if (*tab.close) {
+                const auto it = std::find(app.open_tabs.begin(),
+                                          app.open_tabs.end(), tab.id);
+                if (it != app.open_tabs.end()) {
+                    const size_t idx = static_cast<size_t>(
+                        it - app.open_tabs.begin());
+                    app.open_tabs.erase(it);
+                    const bool was_active =
+                        tab.id == app.scope_look ||
+                        (!app.scope_is_look() &&
+                         tab.id == app.sequence().id);
+                    if (was_active) {
+                        const uint64_t next = app.open_tabs.empty()
+                            ? app.document.root_sequence
+                            : app.open_tabs[std::min(
+                                  idx, app.open_tabs.size() - 1)];
+                        enter_scope(app, next);
+                    }
+                }
+                break;
+            }
         }
         for (const FrameUi::LayerStage& stage : frame_ui.layer_stages) {
             if (*stage.changed && *stage.staged != stage.original) {
@@ -23810,6 +26495,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case LF::CropB: edited.crop_b = v; break;
                     case LF::XfScale: edited.xf_scale = v; break;
                     case LF::Rotate: edited.xf_rotate = v; break;
+                    case LF::AnchorX: edited.xf_anchor_x = v; break;
+                    case LF::AnchorY: edited.xf_anchor_y = v; break;
                     case LF::Slip:
                         edited.slip = static_cast<uint32_t>(
                             std::max(v, 0.0f) + 0.5f);
@@ -23913,16 +26600,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.undo.execute(app.document, doc::apply_snapshot_command(app.scope_look,s));
         }
 
-        if ((frame_ui.undo_clicked && *frame_ui.undo_clicked) || do_undo)
+        if ((frame_ui.undo_clicked && *frame_ui.undo_clicked) || ki.do_undo)
             app.undo.undo(app.document);
-        if ((frame_ui.redo_clicked && *frame_ui.redo_clicked) || do_redo)
+        if ((frame_ui.redo_clicked && *frame_ui.redo_clicked) || ki.do_redo)
             app.undo.redo(app.document);
 
         // ---- project save / open
-        if ((frame_ui.save_clicked && *frame_ui.save_clicked) || do_save ||
-            do_save_as) {
+        if ((frame_ui.save_clicked && *frame_ui.save_clicked) || ki.do_save ||
+            ki.do_save_as) {
             std::filesystem::path path = app.project_path;
-            if (path.empty() || do_save_as) {
+            if (path.empty() || ki.do_save_as) {
                 auto picked = platform::show_save_dialog(
                     window.get(), {{"looks project", "*.json"}},
                     app.document.name + ".json");
@@ -23938,7 +26625,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (((frame_ui.open_project_clicked &&
               *frame_ui.open_project_clicked) ||
-             do_open_project) &&
+             ki.do_open_project) &&
             guard_unsaved_changes(
                 app, ConfirmDialog::Action::OpenProjectDialog)) {
             open_project_via_dialog(app, window.get());
@@ -23949,8 +26636,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (rrow.index < app.recent_projects.size() &&
                 guard_unsaved_changes(
                     app, ConfirmDialog::Action::OpenProjectPath,
-                    app.recent_projects[rrow.index]))
-                open_project(app, app.recent_projects[rrow.index],
+                    u8_to_path(app.recent_projects[rrow.index])))
+                open_project(app,
+                             u8_to_path(app.recent_projects[rrow.index]),
                              window.get());
             break;
         }
@@ -24009,7 +26697,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
 
         // ---- transport
-        if (frame_ui.open_clicked && *frame_ui.open_clicked &&
+        if (((frame_ui.open_clicked && *frame_ui.open_clicked) ||
+             ki.open_media) &&
             import_slot_free(app)) {
             auto picked = platform::show_open_dialog(
                 window.get(),
@@ -24017,8 +26706,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                  {"all files", "*.*"}});
             if (picked) open_source(app, *picked);
         }
-        if (frame_ui.import_media_clicked &&
-            *frame_ui.import_media_clicked && import_slot_free(app)) {
+        if (((frame_ui.import_media_clicked &&
+              *frame_ui.import_media_clicked) ||
+             ki.import_media) &&
+            import_slot_free(app)) {
             auto picked = platform::show_open_dialog(
                 window.get(),
                 {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
@@ -24178,12 +26869,50 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.break_coalescing();
             app.status = "editing " + app.document.look(look_id).name;
         }
-        // Drag-and-drop: video files open like the dialog would; preset
-        // files import into the browser; other .json loads as a project;
-        // a PNG installs a custom glyph set.
-        if (!dropped_file.empty() && import_slot_free(app)) {
-            const std::filesystem::path p(dropped_file);
+        // Drag-and-drop: the first media file opens/places like the
+        // dialog would (when the import slot can take it); every
+        // further media file QUEUES for import - a multi-select drop
+        // lands them all, nothing silently swallowed. Preset files
+        // import into the browser; other .json loads as a project; a
+        // PNG with a grid descriptor installs a custom glyph set.
+        bool drop_media_handled = false;
+        for (const auto& [dropped_file, dropped_at] : dropped_files) {
+            const std::filesystem::path p = u8_to_path(dropped_file);
             const auto ext = p.extension();
+            bool is_media = ext == ".mp4" || ext == ".mov" ||
+                            ext == ".mez" || ext == ".tga" ||
+                            ext == ".wav" || ext == ".mp3";
+            if (ext == ".png") {
+                // A bare PNG is still media; one with a sibling .json
+                // grid descriptor installs as a glyph set below.
+                std::filesystem::path desc = p;
+                desc.replace_extension(".json");
+                std::error_code dec;
+                if (!std::filesystem::exists(desc, dec)) is_media = true;
+            }
+            if (is_media) {
+                if (!drop_media_handled && import_slot_free(app)) {
+                    drop_media_handled = true;
+                    // ONTO THE TIMELINE = a new block at the drop
+                    // frame; anywhere else keeps the open meaning, and
+                    // unimported media imports first.
+                    const Vec2 at{dropped_at.x / scale,
+                                  dropped_at.y / scale};
+                    bool placed = false;
+                    if (app.tl_rect.w > 0.0f && at.x >= app.tl_rect.x &&
+                        at.x < app.tl_rect.right() &&
+                        at.y >= app.tl_rect.y &&
+                        at.y < app.tl_rect.bottom())
+                        placed = place_media_block(
+                            app, p, timeline_frame_at(app, at.x), 0);
+                    if (!placed) open_source(app, p);
+                } else {
+                    app.media_import_queue.push_back(p);
+                    app.status =
+                        "queued for import: " + path_to_u8(p.filename());
+                }
+                continue;
+            }
             if (ext == ".json") {
                 bool is_preset = false;
                 if (const auto bytes = read_file_bytes(p)) {
@@ -24205,7 +26934,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     if (!ec) {
                         rescan_presets(app);
                         app.status =
-                            "imported preset " + p.filename().string();
+                            "imported preset " + path_to_u8(p.filename());
                     } else {
                         app.status = "preset import failed";
                     }
@@ -24214,31 +26943,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                p)) {
                     open_project(app, p, window.get());
                 }
-            } else if (ext == ".mp4" || ext == ".mov" || ext == ".mez" ||
-                       ext == ".tga" || ext == ".wav" || ext == ".mp3") {
-                // ONTO THE TIMELINE = a new block at the drop frame; the
-                // project's media is not what a drop is about once there
-                // is an arrangement to drop into. Anywhere else keeps the
-                // old meaning, and unimported media imports first.
-                const Vec2 at{dropped_at.x / scale, dropped_at.y / scale};
-                bool placed = false;
-                if (app.tl_rect.w > 0.0f && at.x >= app.tl_rect.x &&
-                    at.x < app.tl_rect.right() && at.y >= app.tl_rect.y &&
-                    at.y < app.tl_rect.bottom())
-                    placed = place_media_block(
-                        app, p, timeline_frame_at(app, at.x), 0);
-                if (!placed) open_source(app, p);
             } else if (ext == ".png") {
                 // A PNG with a sibling .json grid descriptor ({"tile": 8,
                 // "cols": 16, "rows": 6}) installs as a custom glyph set
-                //; a bare PNG opens as still media.
+                // (bare PNGs took the media path above).
                 std::filesystem::path desc = p;
                 desc.replace_extension(".json");
-                std::error_code dec;
                 ImageRgba img;
-                if (!std::filesystem::exists(desc, dec)) {
-                    open_source(app, p);
-                } else if (load_image(p, &img) && img.width > 0) {
+                if (load_image(p, &img) && img.width > 0) {
                     float tile = 8.0f;
                     uint32_t cols = 16;
                     if (const auto dbytes = read_file_bytes(desc)) {
@@ -24293,7 +27005,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                        cols, rows);
                     }
                     app.status = "custom glyph set: " +
-                                 p.filename().string() +
+                                 path_to_u8(p.filename()) +
                                  (is_color ? " (set 2, color)"
                                            : " (set 2)");
                 } else {
@@ -24302,7 +27014,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
         if (((frame_ui.play_clicked && *frame_ui.play_clicked) ||
-             toggle_play) &&
+             ki.toggle_play) &&
             app.has_timeline()) {
             if (app.player.playing()) app.player.pause();
             else app.player.play();
@@ -24317,12 +27029,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 static_cast<uint32_t>(frame_ui.seek_to + 0.5f));
         // I/O keys land in the ruler handles' channel; a keypress is a
         // discrete edit, so it breaks coalescing like a released drag.
-        if (key_trim_in >= 0.0f) {
-            frame_ui.trim_in_to = key_trim_in;
+        if (ki.key_trim_in >= 0.0f) {
+            frame_ui.trim_in_to = ki.key_trim_in;
             frame_ui.region_released = true;
         }
-        if (key_trim_out >= 0.0f) {
-            frame_ui.trim_out_to = key_trim_out;
+        if (ki.key_trim_out >= 0.0f) {
+            frame_ui.trim_out_to = ki.key_trim_out;
             frame_ui.region_released = true;
         }
         // Timeline region edits: ruler trim handles + loop band.
@@ -24389,7 +27101,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         // duration whole (timeless: no region of its own). Nothing here
         // depends on media being open.
         {
-            const double rate = project_fps(app.document, app.bundles);
+            const double rate = app.scoped_fps();
             const uint32_t content = app.scope_duration();
             // BUFFER (the NLE convention): the timeline runs past the last
             // block so there is somewhere to drag a block's end OUT to, and
@@ -24435,7 +27147,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 for (const doc::Asset& a : app.document.assets) {
                     if (a.path.empty()) continue;
                     std::filesystem::path proxy =
-                        resolve_bundle(std::filesystem::path(a.path)).mez;
+                        resolve_bundle(u8_to_path(a.path)).mez;
                     proxy.replace_extension(".proxy.mez");
                     std::error_code pec;
                     if (std::filesystem::exists(proxy, pec)) {
@@ -24540,7 +27252,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 if (!app.player.playing()) app.player.play();
             }
         }
-        if (frame_ui.export_clicked && *frame_ui.export_clicked &&
+        if (((frame_ui.export_clicked && *frame_ui.export_clicked) ||
+             ki.do_export) &&
             app.has_timeline()) {
             // Export renders the SCOPED entity and is named after it -
             // never the fallback look or the last-opened media file.
@@ -24609,6 +27322,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         gfx::GpuImage* source_image = rview.source_img;
         script_host.view_seq = rview.publish_seq;
         script_host.view_rev = rview.doc_revision;
+        macro_host.view_seq = rview.publish_seq;
+        macro_host.view_rev = rview.doc_revision;
 
         // Window clear = the active theme's background (stored linear).
         const ui::Color wbg = ui::active_theme().window_bg;
@@ -24679,6 +27394,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             ctx.clear_tooltip();
         }
 
+        // Settings modal above the tooltips; the confirm dialog stacks
+        // above it (macro delete confirms over the open popup).
+        if (app.settings.open)
+            draw_settings(canvas, font,
+                          header_font ? &*header_font : nullptr, viewport,
+                          app);
+
         // Modal confirm: scrim + panel above everything, tooltips included.
         if (app.confirm.open())
             draw_confirm_dialog(canvas, font,
@@ -24704,13 +27426,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             .count();
     };
     log_info("shutdown: closing");
-    auto sd = std::chrono::steady_clock::now();
+    // Every background job gets its cancel flag FIRST, so the joins
+    // below overlap all the wind-downs instead of serializing them;
+    // each reset then logs on completion so a stall names its job.
+    if (app.import) app.import->progress.cancel = true;
+    if (app.scope_job) app.scope_job->cancel = true;
+    if (app.export_job) app.export_job->progress.cancel = true;
+    if (app.track_job) app.track_job->cancel = true;
     app.render_worker = nullptr;
     app.thumb_worker = nullptr;
+    auto sd = std::chrono::steady_clock::now();
     app.import.reset();
+    log_info("shutdown: import %.0f ms", ms_since(sd));
+    sd = std::chrono::steady_clock::now();
     app.scope_job.reset();
     app.export_job.reset();
-    log_info("shutdown: jobs %.0f ms", ms_since(sd));
+    log_info("shutdown: scope/export %.0f ms", ms_since(sd));
+    sd = std::chrono::steady_clock::now();
+    app.track_job.reset();
+    log_info("shutdown: track %.0f ms", ms_since(sd));
     sd = std::chrono::steady_clock::now();
     thumb_worker.stop();
     log_info("shutdown: thumb worker %.0f ms", ms_since(sd));

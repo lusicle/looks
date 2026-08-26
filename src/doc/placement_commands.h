@@ -49,12 +49,31 @@ std::unique_ptr<Command> add_audio_placement_command(
     Document& doc, uint64_t sequence, uint64_t track_id, Placement place,
     uint64_t video_placement);
 
-// Audio track gain/mute/name - the per-track half of the mixer.
+// Audio track gain/mute/name plus the lock edit-guard - the per-track
+// half of the mixer.
 std::unique_ptr<Command> set_audio_track_props_command(uint64_t sequence,
                                                        uint64_t track_id,
                                                        std::string name,
                                                        float gain,
-                                                       bool mute);
+                                                       bool mute,
+                                                       bool lock);
+
+// Video lane name/hidden/lock. hidden drops the lane from the
+// composite; lock is the edit guard the gesture surfaces honor.
+std::unique_ptr<Command> set_track_props_command(uint64_t sequence,
+                                                 uint64_t track_id,
+                                                 std::string name,
+                                                 bool hidden, bool lock);
+
+// Moves the placement to another container of the SAME KIND (video lane
+// to video lane, audio track to audio track) - the vertical drag. Timing
+// and identity are untouched; link partners stay where they are. Null
+// when the placement or target is missing, kinds differ, or the target
+// already holds it. Undo restores the exact source index.
+std::unique_ptr<Command> move_placement_command(const Document& doc,
+                                                uint64_t sequence,
+                                                uint64_t placement_id,
+                                                uint64_t to_track_id);
 
 // Fresh empty lanes with minted ids, named by count ("v<n>" / "a<n>").
 SeqTrack make_track(Document& doc, const Sequence& seq);
@@ -78,16 +97,22 @@ std::unique_ptr<Command> add_audio_track_command(uint64_t sequence,
 std::unique_ptr<Command> remove_audio_track_command(uint64_t sequence,
                                                     uint64_t track_id);
 
-// OVERWRITE: a landed block claims [t0, t1) on its VIDEO lane - overlaps
-// never persist past an edit. What the span covers is tail-trimmed,
-// head-trimmed (source_in slides so content holds still), split (razor +
-// head-trim) or removed whole (with its link group, the pair rule).
-// keep_id/keep_link name the incoming block and its group so it never
-// eats itself; t1 0 = unbounded. Executes through `undo` so the caller
-// can group it with the edit that landed the block. Audio tracks are
-// exempt: summing overlaps is their contract.
+// OVERWRITE: a landed block claims [t0, t1) on its lane - video and
+// audio alike, overlaps never persist past an edit. What the span
+// covers is tail-trimmed, head-trimmed (source_in slides so content
+// holds still), split (razor + head-trim) or removed whole (with its
+// link group, the pair rule). keep_id/keep_link name the incoming block
+// and its group so it never eats itself; t1 0 = unbounded. Executes
+// through `undo` so the caller can group it with the edit that landed
+// the block. track_id names a video lane OR an audio track.
 void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
                          uint64_t track_id, uint64_t keep_id,
                          uint64_t keep_link, uint32_t t0, uint32_t t1);
+
+// The whole landing in one call: the named placement AND every link
+// partner each overwrite their own container's span - one drop's
+// picture and sound claim both lanes together.
+void overwrite_group_spans(Document& doc, UndoStack& undo,
+                           uint64_t sequence, uint64_t placement_id);
 
 }  // namespace looks::doc

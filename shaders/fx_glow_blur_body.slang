@@ -40,7 +40,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float2 axis = (GLOW_DIR == 0) ? float2(1.0, 0.0) : float2(0.0, 1.0);
     const float sigma = r * 0.5;
-    float3 sum = float3(0.0, 0.0, 0.0);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
     float weight_sum = 0.0;
     [unroll]
     for (int i = -8; i <= 8; ++i)
@@ -52,8 +52,8 @@ void main(uint3 tid : SV_DispatchThreadID)
             ? 1.0 / (1.0 + abs(offset) / max(r, 1.0) * 1.5)
             : exp(-0.5 * (offset * offset) / (sigma * sigma));
         const float2 p = uv + axis * offset / size;
-        sum += input.SampleLevel(saturate(p), 0).rgb * w;
+        sum += input.SampleLevel(saturate(p), 0) * w;
         weight_sum += w;
     }
-    output[tid.xy] = float4(sum / weight_sum, 1.0);
+    output[tid.xy] = sum / weight_sum;
 }

@@ -29,7 +29,7 @@ std::vector<PathPoint> triangle() {
 
 TEST(shape_sdf_signs_and_determinism) {
     const std::vector<PathPoint> tri = triangle();
-    std::vector<uint8_t> a, b;
+    std::vector<uint16_t> a, b;
     shape_sdf_raster(tri, /*closed=*/true, 16.0f / 9.0f, 240, 135, &a);
     shape_sdf_raster(tri, /*closed=*/true, 16.0f / 9.0f, 240, 135, &b);
     CHECK_EQ(a.size(), size_t{240 * 135});
@@ -41,12 +41,39 @@ TEST(shape_sdf_signs_and_determinism) {
         return a[y * 240 + x];
     };
     // Centroid is inside (< 0.5 encoded), frame corners far outside.
-    CHECK(at(0.5f, 0.6f) < 120);
-    CHECK(at(0.02f, 0.02f) > 135);
-    CHECK(at(0.98f, 0.02f) > 135);
+    CHECK(at(0.5f, 0.6f) < 30000);
+    CHECK(at(0.02f, 0.02f) > 34000);
+    CHECK(at(0.98f, 0.02f) > 34000);
     // The boundary crosses 0.5 near an edge midpoint: probe just inside
     // vs just outside of the bottom edge (y = 0.8).
     CHECK(at(0.5f, 0.76f) < at(0.5f, 0.84f));
+}
+
+TEST(shape_sdf_euclidean_far_field) {
+    // A straight bottom edge (y = 0.8): the stored distance below it
+    // must grow LINEARLY with true perpendicular distance - the old
+    // chamfer sweep bent with direction, which fluctuated wide
+    // feathers. Encoded units: 0.5 + d / (2 * range), range 0.25.
+    const std::vector<PathPoint> tri = triangle();
+    std::vector<uint16_t> a;
+    shape_sdf_raster(tri, /*closed=*/true, 1.0f, 256, 256, &a);
+    auto dist_at = [&](float u, float v) {
+        const size_t x = static_cast<size_t>(u * 256.0f);
+        const size_t y = static_cast<size_t>(v * 256.0f);
+        const float enc = a[y * 256 + x] / 65535.0f;
+        return (enc - 0.5f) * 2.0f * looks::gfx::kShapeSdfRange;
+    };
+    for (int k = 1; k <= 4; ++k) {
+        const float off = 0.03f * static_cast<float>(k);
+        const float d = dist_at(0.5f, 0.8f + off);
+        CHECK(std::fabs(d - off) < 0.006f);
+    }
+    // And along the edge the distance stays FLAT at fixed offset.
+    const float d0 = dist_at(0.40f, 0.86f);
+    const float d1 = dist_at(0.50f, 0.86f);
+    const float d2 = dist_at(0.60f, 0.86f);
+    CHECK(std::fabs(d0 - d1) < 0.004f);
+    CHECK(std::fabs(d2 - d1) < 0.004f);
 }
 
 TEST(shape_sdf_open_stroke_and_empty) {
@@ -55,7 +82,7 @@ TEST(shape_sdf_open_stroke_and_empty) {
     line[0].ay = 0.5f;
     line[1].ax = 0.8f;
     line[1].ay = 0.5f;
-    std::vector<uint8_t> s;
+    std::vector<uint16_t> s;
     shape_sdf_raster(line, /*closed=*/false, 1.0f, 128, 128, &s);
     auto at = [&](float u, float v) {
         return s[static_cast<size_t>(v * 128.0f) * 128 +
@@ -63,13 +90,13 @@ TEST(shape_sdf_open_stroke_and_empty) {
     };
     // On the stroke the distance is ~0 (encodes ~0.5); far away it
     // saturates high. Open paths carry no inside, so nothing < 0.5-ish.
-    CHECK(at(0.5f, 0.5f) < 140);
-    CHECK(at(0.5f, 0.05f) > 200);
-    CHECK(at(0.5f, 0.95f) > 200);
+    CHECK(at(0.5f, 0.5f) < 36000);
+    CHECK(at(0.5f, 0.05f) > 52000);
+    CHECK(at(0.5f, 0.95f) > 52000);
 
-    std::vector<uint8_t> e;
+    std::vector<uint16_t> e;
     shape_sdf_raster({}, true, 1.0f, 64, 64, &e);
-    for (uint8_t v : e) CHECK_EQ(v, uint8_t{255});
+    for (uint16_t v : e) CHECK_EQ(v, uint16_t{65535});
 }
 
 TEST(shape_flatten_subdivision_contract) {

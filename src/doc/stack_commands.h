@@ -83,6 +83,15 @@ std::unique_ptr<Command> set_node_pos_command(uint64_t look, NodeRef kind,
 // commands themselves apply unconditionally.
 std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link);
 std::unique_ptr<Command> disconnect_command(uint64_t look, NodeLink link);
+// Splice rewire: new_link takes old_link's POSITION, so a chain
+// re-terminating through an inserted node keeps its stacking place.
+std::unique_ptr<Command> reconnect_command(uint64_t look, NodeLink old_link,
+                                           NodeLink new_link);
+// Swaps the index-th and (index+delta)-th feeds of (to, to_port) in
+// the link vector - the stacking-order permute.
+std::unique_ptr<Command> move_port_link_command(uint64_t look, uint64_t to,
+                                                uint32_t to_port,
+                                                size_t index, int delta);
 // Freeze the implicit stack-order wiring: run before ANY node add so
 // the newborn spawns unwired instead of being chained in by stack-order
 // synthesis. No-op when links are already materialized (or no layers).

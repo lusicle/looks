@@ -62,6 +62,9 @@ struct GraphNode {
     float p_scale = 1.0f;
     float p_rotate = 0.0f;   // radians, pre-converted at compile
     float p_opacity = 1.0f;
+    // Scale/rotate pivot in canvas fractions (the placement's anchor).
+    float p_anchor_x = 0.5f;
+    float p_anchor_y = 0.5f;
 };
 
 // One instance of an entity (look or sequence) inside the compiled

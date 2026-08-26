@@ -862,6 +862,10 @@ Sequence make_sequence(Document& doc, std::string name) {
     lane.id = doc.next_effect_id++;
     lane.name = "v1";
     seq.tracks.push_back(std::move(lane));
+    AudioTrack atrack;
+    atrack.id = doc.next_effect_id++;
+    atrack.name = "a1";
+    seq.audio.push_back(std::move(atrack));
     return seq;
 }
 

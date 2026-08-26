@@ -25,10 +25,12 @@ cbuffer Push
 
 // Mean and variance over 12 taps in an oriented ellipse half.
 void sector(float2 uv, float2 size, float2 major, float2 minor,
-            float side, out float3 mean, out float variance)
+            float side, out float3 mean, out float mean_a,
+            out float variance)
 {
     float3 acc = float3(0.0, 0.0, 0.0);
     float3 acc2 = float3(0.0, 0.0, 0.0);
+    float acc_a = 0.0;
     [unroll]
     for (int i = 0; i < 12; ++i) {
         const float fi = (float(i) + 0.5) / 12.0;
@@ -37,11 +39,13 @@ void sector(float2 uv, float2 size, float2 major, float2 minor,
         const float2 off =
             (major * cos(a) * side + minor * sin(a)) * rr;
         const float2 p = clamp(uv + off / size, 0.0, 1.0);
-        const float3 c = input.SampleLevel(p, 0).rgb;
-        acc += c;
-        acc2 += c * c;
+        const float4 c = input.SampleLevel(p, 0);
+        acc += c.rgb;
+        acc_a += c.a;
+        acc2 += c.rgb * c.rgb;
     }
     mean = acc / 12.0;
+    mean_a = acc_a / 12.0;
     const float3 var3 = max(acc2 / 12.0 - mean * mean, 0.0);
     variance = var3.x + var3.y + var3.z;
 }
@@ -68,16 +72,18 @@ void main(uint3 tid : SV_DispatchThreadID)
         float2(-dir.y, dir.x) * radius * (1.0 - aniso * 0.55);
 
     float3 m0, m1, m2;
+    float a0, a1, a2;
     float v0, v1, v2;
-    sector(uv, size, major, minor, 1.0, m0, v0);    // ahead
-    sector(uv, size, major, minor, -1.0, m1, v1);   // behind
-    sector(uv, size, minor, major * 0.4, 1.0, m2, v2);   // across
+    sector(uv, size, major, minor, 1.0, m0, a0, v0);    // ahead
+    sector(uv, size, major, minor, -1.0, m1, a1, v1);   // behind
+    sector(uv, size, minor, major * 0.4, 1.0, m2, a2, v2);   // across
     float3 outc = m0;
+    float out_a = a0;
     float best = v0;
-    if (v1 < best) { outc = m1; best = v1; }
-    if (v2 < best) { outc = m2; }
+    if (v1 < best) { outc = m1; out_a = a1; best = v1; }
+    if (v2 < best) { outc = m2; out_a = a2; }
 
-    const float4 result = float4(outc, base.a);
+    const float4 result = float4(outc, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

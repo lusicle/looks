@@ -2,8 +2,10 @@
 
 #include <algorithm>
 
+#include "doc/command.h"
 #include "doc/effects.h"
 #include "doc/layer_commands.h"
+#include "doc/stack_commands.h"
 #include "test_framework.h"
 
 using looks::doc::Asset;
@@ -568,6 +570,8 @@ TEST(graph_placement_transform_and_opacity) {
     a.scale = 0.5f;
     a.rotate = 90.0f;
     a.opacity = 0.6f;
+    a.anchor_x = 0.2f;
+    a.anchor_y = 0.7f;
     seq.tracks[0].placements.push_back(a);
 
     RenderGraph g = compile_graph(doc, doc.root_sequence, 0);
@@ -582,6 +586,8 @@ TEST(graph_placement_transform_and_opacity) {
             CHECK_EQ(n.p_scale, 0.5f);
             CHECK(std::fabs(n.p_rotate - 1.5707963f) < 1e-3f);
             CHECK_EQ(n.p_opacity, 0.6f);
+            CHECK_EQ(n.p_anchor_x, 0.2f);
+            CHECK_EQ(n.p_anchor_y, 0.7f);
         }
     }
     CHECK_EQ(blends, 1);
@@ -599,6 +605,143 @@ TEST(graph_placement_transform_and_opacity) {
         CHECK(n.kind != GraphNode::Kind::LayerTransform);
         CHECK(n.kind != GraphNode::Kind::LayerBlend);
     }
+}
+
+TEST(graph_output_stacks_in_link_order) {
+    // STACKING ORDER IS THE LINK ORDER: swapping the two Output links
+    // flips which contribution composites on top while the layer array
+    // stays put (storage order only).
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Layer second;
+    second.id = doc.next_effect_id++;
+    second.source = looks::doc::LayerSourceKind::Gradient;
+    doc.looks[0].layers.push_back(second);
+    const uint64_t l0 = doc.looks[0].layers[0].id;
+    const uint64_t l1 = doc.looks[0].layers[1].id;
+    doc.looks[0].links = {{l0, 0, 0}, {l1, 0, 0}};
+
+    auto top_layer = [&]() -> int {
+        const RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
+        int li = -2;
+        for (const GraphNode& n : g.nodes)
+            if (n.kind == GraphNode::Kind::LayerBlend) li = n.layer_index;
+        return li;   // the LAST blend's layer = the top contribution
+    };
+    CHECK_EQ(top_layer(), 1);   // l1 is the later link: on top
+    doc.looks[0].links = {{l1, 0, 0}, {l0, 0, 0}};
+    CHECK_EQ(top_layer(), 0);   // swapped: l0 composites on top
+
+    // The permute command swaps the fan-in in place, self-inverse
+    // under undo.
+    looks::doc::UndoStack undo;
+    undo.execute(doc, looks::doc::move_port_link_command(
+                          doc.looks[0].id, 0, 0, 0, 1));
+    CHECK_EQ(top_layer(), 1);
+    CHECK(undo.undo(doc));
+    CHECK_EQ(top_layer(), 0);
+}
+
+TEST(graph_effect_port_fan_in_merges_in_link_order) {
+    // Two sources wired into ONE effect In port: the effect consumes
+    // their composite (first link = bottom), each feed blending with
+    // its owner layer's attributes - the same one rule as the Output.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Layer second;
+    second.id = doc.next_effect_id++;
+    second.source = looks::doc::LayerSourceKind::Gradient;
+    doc.looks[0].layers.push_back(second);
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Blur));
+    const uint64_t l0 = doc.looks[0].layers[0].id;
+    const uint64_t l1 = doc.looks[0].layers[1].id;
+    const uint64_t fx = doc.looks[0].layers[0].stack[0].id;
+    doc.looks[0].links = {{l0, fx, 0}, {l1, fx, 0}, {fx, 0, 0}};
+
+    const RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
+    CHECK(g.valid);
+    int fx_node = -1;
+    for (size_t i = 0; i < g.nodes.size(); ++i)
+        if (g.nodes[i].kind == GraphNode::Kind::Effect)
+            fx_node = static_cast<int>(i);
+    CHECK(fx_node >= 0);
+    if (fx_node < 0) return;
+    const int in = g.nodes[static_cast<size_t>(fx_node)].inputs[0];
+    const GraphNode& merge = g.nodes[static_cast<size_t>(in)];
+    CHECK(merge.kind == GraphNode::Kind::LayerBlend);
+    CHECK_EQ(merge.layer_index, 1);   // the top feed wears l1's blend
+    // Below the blend sits the FIRST link's head: l0, the bottom.
+    const GraphNode& below = g.nodes[static_cast<size_t>(merge.inputs[0])];
+    CHECK(below.kind == GraphNode::Kind::Generator);
+    CHECK_EQ(below.layer_index, 0);
+}
+
+TEST(graph_reconnect_lands_in_place) {
+    // reconnect_command replaces a link AT ITS POSITION, so a splice
+    // never restacks a fan-in; undo restores the original in place.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Layer second;
+    second.id = doc.next_effect_id++;
+    second.source = looks::doc::LayerSourceKind::Gradient;
+    doc.looks[0].layers.push_back(second);
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Blur));
+    const uint64_t l0 = doc.looks[0].layers[0].id;
+    const uint64_t l1 = doc.looks[0].layers[1].id;
+    const uint64_t fx = doc.looks[0].layers[0].stack[0].id;
+    doc.looks[0].links = {{l0, 0, 0}, {l1, 0, 0}};
+
+    looks::doc::UndoStack undo;
+    undo.execute(doc, looks::doc::reconnect_command(
+                          doc.looks[0].id, {l0, 0, 0}, {fx, 0, 0}));
+    CHECK_EQ(doc.looks[0].links[0].from, fx);
+    CHECK_EQ(doc.looks[0].links[1].from, l1);
+    CHECK(undo.undo(doc));
+    CHECK_EQ(doc.looks[0].links[0].from, l0);
+    CHECK_EQ(doc.looks[0].links[1].from, l1);
+}
+
+TEST(graph_placement_anchor_math) {
+    // Forward map out = a + shift + S*R*(src - a): the anchor is the
+    // FIXED POINT of the scale/rotate, and the anchor alone (identity
+    // S*R, no shift) never moves a pixel. placement_uv_to_block is the
+    // exact inverse the click picker and the overlay run on.
+    const float aspect = 16.0f / 9.0f;
+    looks::doc::Placement p;
+    p.anchor_x = 0.2f;
+    p.anchor_y = 0.7f;
+    float bx = 0.0f, by = 0.0f;
+    // Identity transform: any uv inverts to itself (block-local).
+    looks::doc::placement_uv_to_block(p, 0.9f, 0.3f, aspect, &bx, &by);
+    CHECK(std::fabs(bx - 0.4f) < 1e-5f);
+    CHECK(std::fabs(by - (-0.2f)) < 1e-5f);
+
+    p.scale = 0.5f;
+    p.rotate = 33.0f;
+    p.pos_x = 0.1f;
+    p.pos_y = -0.05f;
+    // The anchor's post-motion position is a + shift, and it inverts
+    // to the anchor itself (the fixed point), at any scale/rotation.
+    looks::doc::placement_uv_to_block(p, p.anchor_x + p.pos_x,
+                                      p.anchor_y + p.pos_y, aspect, &bx,
+                                      &by);
+    CHECK(std::fabs(bx - (p.anchor_x - 0.5f)) < 1e-5f);
+    CHECK(std::fabs(by - (p.anchor_y - 0.5f)) < 1e-5f);
+
+    // Forward -> inverse roundtrip at an arbitrary source point.
+    const float sx = 0.31f, sy = -0.12f;   // block-local
+    const float rad = p.rotate * looks::doc::kDeg2Rad;
+    const float cs = std::cos(rad), sn = std::sin(rad);
+    const float ex = p.anchor_x - 0.5f, ey = p.anchor_y - 0.5f;
+    const float qx = (sx - ex) * aspect, qy = sy - ey;
+    const float u =
+        0.5f + (qx * cs - qy * sn) * p.scale / aspect + ex + p.pos_x;
+    const float v = 0.5f + (qx * sn + qy * cs) * p.scale + ey + p.pos_y;
+    looks::doc::placement_uv_to_block(p, u, v, aspect, &bx, &by);
+    CHECK(std::fabs(bx - sx) < 1e-5f);
+    CHECK(std::fabs(by - sy) < 1e-5f);
 }
 
 TEST(graph_measure_taps_selected_block_pre_motion) {
@@ -961,4 +1104,48 @@ TEST(graph_source_matte_on_multipass_effect) {
     const GraphNode& ap = g.nodes[static_cast<size_t>(apply)];
     CHECK_EQ(ap.inputs.size(), size_t{3});
     CHECK_EQ(ap.inputs[2], extract);
+}
+
+TEST(graph_hidden_lane_leaves_the_composite) {
+    // Hiding the top lane compiles as if the lane were not there: no
+    // blend, no instance - render and export read the same document
+    // flag, so what previews is what exports.
+    Document doc;
+    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    looks::doc::Look second;
+    second.id = doc.next_effect_id++;
+    looks::doc::Layer noise;
+    noise.id = doc.next_effect_id++;
+    noise.source = looks::doc::LayerSourceKind::Noise;
+    second.layers.push_back(std::move(noise));
+    const uint64_t second_id = second.id;
+    doc.looks.push_back(std::move(second));
+
+    looks::doc::Sequence& seq = doc.root();
+    looks::doc::Placement a;
+    a.id = doc.next_effect_id++;
+    a.target = doc.looks[0].id;
+    seq.tracks[0].placements.push_back(a);
+    looks::doc::SeqTrack lane2;
+    lane2.id = doc.next_effect_id++;
+    lane2.name = "v2";
+    looks::doc::Placement b;
+    b.id = doc.next_effect_id++;
+    b.target = second_id;
+    lane2.placements.push_back(b);
+    seq.tracks.push_back(std::move(lane2));
+
+    const RenderGraph both = compile_graph(doc, doc.root_sequence, 0);
+    CHECK(both.valid);
+    int overs = 0;
+    for (const GraphNode& n : both.nodes)
+        if (n.kind == GraphNode::Kind::LayerBlend) ++overs;
+    CHECK_EQ(overs, 1);
+
+    seq.tracks[1].hidden = true;
+    const RenderGraph one = compile_graph(doc, doc.root_sequence, 0);
+    CHECK(one.valid);
+    for (const GraphNode& n : one.nodes)
+        CHECK(n.kind != GraphNode::Kind::LayerBlend);
+    CHECK_EQ(one.instances.size(), size_t{2});   // root + the bottom look
 }

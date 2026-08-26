@@ -138,6 +138,7 @@ add_slang_shaders(looks_shaders
         thumb_tap.comp.slang
         gallery_tap.comp.slang
         fx_track_pin.comp.slang
+        fx_vhs.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang

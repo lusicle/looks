@@ -25,7 +25,7 @@ struct FrameIndex {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t timescale = 0;
-    uint32_t frame_duration = 0;   // first sample's duration: the CFR grid
+    uint32_t frame_duration = 0;   // MEDIAN sample duration: the CFR grid
     std::vector<uint8_t> avcc;     // decoder config for the MFT
 
     // Samples in DECODE (stbl) order - the order the decoder is fed.

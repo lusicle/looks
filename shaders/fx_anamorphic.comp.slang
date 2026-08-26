@@ -34,7 +34,9 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float sx = (uv.x - 0.5) * squeeze + 0.5;
     const float2 suv = float2(clamp(sx, 0.0, 1.0), uv.y);
-    float3 col = input.SampleLevel(suv, 0).rgb;
+    const float4 squeezed = input.SampleLevel(suv, 0);
+    float3 col = squeezed.rgb;
+    float col_a = squeezed.a;
 
     const float gate = threshold * threshold;   // approx linear-domain
     float3 flare = 0.0;
@@ -52,6 +54,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     flare /= float(kTaps);
     const float3 blue_tint = float3(0.35, 0.55, 1.0);
     col += flare * blue_tint * streak * 6.0;
+    // Streak light is content: its coverage rides its energy.
+    col_a = max(col_a, saturate(fx_luma(flare) * streak * 6.0));
 
     // 12 taps on a 2:1 tall ellipse.
     if (bokeh > 0.001) {
@@ -66,9 +70,11 @@ void main(uint3 tid : SV_DispatchThreadID)
             oval += s * max(l - gate, 0.0);
         }
         col += oval / 12.0 * bokeh * 2.0;
+        col_a = max(col_a,
+                    saturate(fx_luma(oval) / 12.0 * bokeh * 2.0));
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

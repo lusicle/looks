@@ -31,7 +31,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = dry.SampleLevel(uv, 0);
-    const float3 bloom = blurred.SampleLevel(uv, 0).rgb;
+    const float4 bloom4 = blurred.SampleLevel(uv, 0);
+    const float3 bloom = bloom4.rgb;
 
     float3 tint = float3(1.0, 1.0, 1.0);
     const int m = int(mode + 0.5);
@@ -56,7 +57,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         col_energy *= (1.0 / 24.0);
         lit += col_energy * tint * smear * 2.5;
     }
-    const float4 result = float4(lit, base.a);
+    // The halo's spread coverage joins the dry coverage - light the
+    // layer gate would otherwise clip at the old silhouette.
+    const float4 result =
+        float4(lit, max(base.a, bloom4.a * saturate(amount)));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -44,17 +44,21 @@ void main(uint3 tid : SV_DispatchThreadID)
     // Edge-stopped: taps differing too much in color barely count, so
     // the wash melts detail without crossing hard boundaries.
     float3 acc = center;
+    float acc_a = base.a;
     float wsum = 1.0;
     for (uint i = 0; i < 12; ++i) {
         const float2 o = kTaps[i] * radius_px / size;
-        const float3 s = fx_srgb_oetf(saturate(
-            input.SampleLevel(clamp(uv + o, 0.0, 1.0), 0).rgb));
+        const float4 raw =
+            input.SampleLevel(clamp(uv + o, 0.0, 1.0), 0);
+        const float3 s = fx_srgb_oetf(saturate(raw.rgb));
         const float cd = dot(abs(s - center), float3(1.0, 1.0, 1.0));
         const float wgt = exp(-cd * cd * 5.0);
         acc += s * wgt;
+        acc_a += raw.a * wgt;
         wsum += wgt;
     }
     float3 wash = acc / wsum;
+    const float wash_a = acc_a / wsum;
 
     // Pigment pools along boundaries, found by the input luma gradient.
     const float2 px = 1.5 / size;
@@ -82,7 +86,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     wash = lerp(wash, float3(1.0, 0.99, 0.95),
                 saturate(paper) * 0.3 * smoothstep(0.55, 1.0, l));
 
-    const float4 result = float4(fx_srgb_eotf(saturate(wash)), base.a);
+    const float4 result = float4(fx_srgb_eotf(saturate(wash)), wash_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

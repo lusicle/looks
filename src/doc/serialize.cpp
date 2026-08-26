@@ -317,6 +317,10 @@ Value placement_to_json(const Placement& p) {
     if (p.rotate != 0.0f) pl.set("rotate", static_cast<double>(p.rotate));
     if (p.opacity != 1.0f)
         pl.set("opacity", static_cast<double>(p.opacity));
+    if (p.anchor_x != 0.5f)
+        pl.set("anchor_x", static_cast<double>(p.anchor_x));
+    if (p.anchor_y != 0.5f)
+        pl.set("anchor_y", static_cast<double>(p.anchor_y));
     return pl;
 }
 
@@ -336,6 +340,8 @@ Placement placement_from_json(const Value& pl) {
     p.scale = num(pl, "scale", 1.0f);
     p.rotate = num(pl, "rotate", 0.0f);
     p.opacity = num(pl, "opacity", 1.0f);
+    p.anchor_x = num(pl, "anchor_x", 0.5f);
+    p.anchor_y = num(pl, "anchor_y", 0.5f);
     return p;
 }
 
@@ -375,9 +381,12 @@ Value layer_to_json(const Layer& l) {
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
-    // Transform: written only when non-default so
-    // untransformed projects stay byte-stable.
-    if (layer_has_transform(l)) {
+    // Transform: written only when non-default so untransformed
+    // projects stay byte-stable. A moved anchor persists even while the
+    // transform is otherwise identity (the pivot is set before the
+    // scale that uses it).
+    if (layer_has_transform(l) || l.xf_anchor_x != 0.5f ||
+        l.xf_anchor_y != 0.5f) {
         Value xf = Value::make_object();
         xf.set("crop_l", static_cast<double>(l.crop_l));
         xf.set("crop_r", static_cast<double>(l.crop_r));
@@ -387,6 +396,10 @@ Value layer_to_json(const Layer& l) {
         xf.set("flip_v", l.flip_v);
         xf.set("scale", static_cast<double>(l.xf_scale));
         xf.set("rotate", static_cast<double>(l.xf_rotate));
+        if (l.xf_anchor_x != 0.5f)
+            xf.set("anchor_x", static_cast<double>(l.xf_anchor_x));
+        if (l.xf_anchor_y != 0.5f)
+            xf.set("anchor_y", static_cast<double>(l.xf_anchor_y));
         v.set("transform", std::move(xf));
     }
     if (l.node_x != 0.0f || l.node_y != 0.0f) {
@@ -452,6 +465,8 @@ Layer layer_from_json(const Value& v) {
         l.flip_v = xf.get("flip_v").as_bool(false);
         l.xf_scale = num(xf, "scale", 1.0f);
         l.xf_rotate = num(xf, "rotate", 0.0f);
+        l.xf_anchor_x = num(xf, "anchor_x", 0.5f);
+        l.xf_anchor_y = num(xf, "anchor_y", 0.5f);
     }
     l.node_x = num(v, "node_x", 0.0f);
     l.node_y = num(v, "node_y", 0.0f);
@@ -479,6 +494,7 @@ Value asset_to_json(const Asset& a) {
     if (a.still_duration_frames)
         v.set("still_duration",
               static_cast<int64_t>(a.still_duration_frames));
+    if (a.still) v.set("still", true);
     if (a.bin) v.set("bin", static_cast<int64_t>(a.bin));
     return v;
 }
@@ -494,26 +510,29 @@ Asset asset_from_json(const Value& v) {
     a.height = static_cast<uint32_t>(v.get("height").as_int(0));
     a.still_duration_frames =
         static_cast<uint32_t>(v.get("still_duration").as_int(0));
+    a.still = v.get("still").as_bool(false);
     a.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
     return a;
 }
 
 // ---- looks
 
-// In ports hold ONE producer — only the Output composites fan-in (the
-// layer merge). Hand-edited files keep the LAST link per (to, port),
-// matching connect's replace-on-connect.
+// Fan-in is legal on every image port (stacking order IS the link
+// order, first = bottom), so a hand-edited file only sheds EXACT
+// duplicate wires - the FIRST occurrence (the bottom position) wins,
+// matching connect's dup-replaces-itself. The Output's split audio-in
+// stays single-feed: the last wins, matching connect's replace.
 void dedupe_links(std::vector<NodeLink>& links) {
-    for (size_t i = links.size(); i-- > 0;) {
-        const NodeLink& l = links[i];
-        if (l.to == 0) continue;
-        for (size_t j = i; j-- > 0;) {
-            if (links[j].to == l.to && links[j].to_port == l.to_port) {
+    for (size_t i = 0; i < links.size(); ++i)
+        for (size_t j = links.size(); j-- > i + 1;)
+            if (links[j].from == links[i].from &&
+                links[j].to == links[i].to &&
+                links[j].to_port == links[i].to_port)
                 links.erase(links.begin() + static_cast<ptrdiff_t>(j));
-                --i;
-            }
-        }
-    }
+    size_t audio_seen = 0;
+    for (size_t i = links.size(); i-- > 0;)
+        if (links[i].to == 0 && links[i].to_port == 1 && ++audio_seen > 1)
+            links.erase(links.begin() + static_cast<ptrdiff_t>(i));
 }
 
 Value look_to_json(const Look& look) {
@@ -522,6 +541,11 @@ Value look_to_json(const Look& look) {
     v.set("name", look.name);
     if (look.duration)
         v.set("duration", static_cast<int64_t>(look.duration));
+    if (format_has_fps(look.format)) v.set("fmt_fps", look.format.fps);
+    if (format_has_canvas(look.format)) {
+        v.set("fmt_w", static_cast<int64_t>(look.format.w));
+        v.set("fmt_h", static_cast<int64_t>(look.format.h));
+    }
     if (look.bin) v.set("bin", static_cast<int64_t>(look.bin));
     if (look.audio_split) v.set("audio_split", true);
 
@@ -591,6 +615,9 @@ Look look_from_json(const Value& v) {
     look.id = static_cast<uint64_t>(v.get("id").as_int(0));
     look.name = v.get("name").as_string();
     look.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
+    look.format.fps = v.get("fmt_fps").as_number(0.0);
+    look.format.w = static_cast<uint32_t>(v.get("fmt_w").as_int(0));
+    look.format.h = static_cast<uint32_t>(v.get("fmt_h").as_int(0));
     look.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
     look.audio_split = v.get("audio_split").as_bool(false);
 
@@ -670,6 +697,11 @@ Value sequence_to_json(const Sequence& seq) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(seq.id));
     v.set("name", seq.name);
+    if (format_has_fps(seq.format)) v.set("fmt_fps", seq.format.fps);
+    if (format_has_canvas(seq.format)) {
+        v.set("fmt_w", static_cast<int64_t>(seq.format.w));
+        v.set("fmt_h", static_cast<int64_t>(seq.format.h));
+    }
     if (seq.duration)
         v.set("duration", static_cast<int64_t>(seq.duration));
     if (seq.bin) v.set("bin", static_cast<int64_t>(seq.bin));
@@ -679,6 +711,8 @@ Value sequence_to_json(const Sequence& seq) {
         Value tv = Value::make_object();
         tv.set("id", static_cast<int64_t>(t.id));
         tv.set("name", t.name);
+        if (t.hidden) tv.set("hidden", true);
+        if (t.lock) tv.set("lock", true);
         Value places = Value::make_array();
         for (const Placement& p : t.placements)
             places.push(placement_to_json(p));
@@ -696,6 +730,7 @@ Value sequence_to_json(const Sequence& seq) {
             if (t.gain != 1.0f)
                 tv.set("gain", static_cast<double>(t.gain));
             if (t.mute) tv.set("mute", true);
+            if (t.lock) tv.set("lock", true);
             Value places = Value::make_array();
             for (const Placement& p : t.placements)
                 places.push(placement_to_json(p));
@@ -725,6 +760,9 @@ Sequence sequence_from_json(const Value& v) {
     seq.id = static_cast<uint64_t>(v.get("id").as_int(0));
     seq.name = v.get("name").as_string();
     seq.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
+    seq.format.fps = v.get("fmt_fps").as_number(0.0);
+    seq.format.w = static_cast<uint32_t>(v.get("fmt_w").as_int(0));
+    seq.format.h = static_cast<uint32_t>(v.get("fmt_h").as_int(0));
     seq.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
 
     for (const Value& tv : v.get("tracks").array()) {
@@ -732,6 +770,8 @@ Sequence sequence_from_json(const Value& v) {
         SeqTrack t;
         t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
         t.name = tv.get("name").as_string();
+        t.hidden = tv.get("hidden").as_bool(false);
+        t.lock = tv.get("lock").as_bool(false);
         for (const Value& pl : tv.get("placements").array()) {
             if (t.placements.size() >= kMaxPlacementsPerTrack) break;
             t.placements.push_back(placement_from_json(pl));
@@ -745,6 +785,7 @@ Sequence sequence_from_json(const Value& v) {
         t.name = tv.get("name").as_string();
         t.gain = num(tv, "gain", 1.0f);
         t.mute = tv.get("mute").as_bool(false);
+        t.lock = tv.get("lock").as_bool(false);
         for (const Value& pl : tv.get("placements").array()) {
             if (t.placements.size() >= kMaxPlacementsPerTrack) break;
             t.placements.push_back(placement_from_json(pl));

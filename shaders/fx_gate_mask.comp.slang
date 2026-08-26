@@ -48,7 +48,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float3 border = fx_srgb_eotf(float3(0.94, 0.92, 0.87));
         const float inset = exp(-pow(abs(d) * 80.0, 2.0)) * 0.35;
         float3 col = lerp(border * (1.0 - inset), base.rgb, gate);
-        result = float4(col, base.a);
+        // The drawn card border is opaque content around the window.
+        result = float4(col, lerp(1.0, base.a, gate));
     } else {
         const float aspect =
             g == 0 ? 1.333 : (g == 1 ? 1.37 : (g == 2 ? 1.85 : 2.39));

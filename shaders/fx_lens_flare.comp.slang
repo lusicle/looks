@@ -71,7 +71,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    const float4 result = float4(base.rgb + flare * 1.4, base.a);
+    const float4 result =
+        float4(base.rgb + flare * 1.4,
+               max(base.a, saturate(fx_luma(flare) * 1.4)));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -34,6 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float radius = t * t * amount * 14.0;
 
     float3 outc = base.rgb;
+    float out_a = base.a;
     if (radius > 0.25) {
         // Astigmatism squeezes the sampling ellipse onto the tangential
         // axis, which is what smears corners into arcs.
@@ -42,6 +43,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float tan_r = radius * (1.0 + astig * 1.2);
         const float rad_r = radius * (1.0 - astig * 0.75);
         float3 acc = base.rgb;
+        float acc_a = base.a;
         float wsum = 1.0;
         [unroll]
         for (int i = 0; i < 16; ++i) {
@@ -52,14 +54,17 @@ void main(uint3 tid : SV_DispatchThreadID)
                                 rad_dir * sin(a) * rad_r) * rr;
             const float2 p = clamp(uv + off / size, 0.0, 1.0);
             const float wgt = 1.0 - fi * 0.6;
-            acc += input.SampleLevel(p, 0).rgb * wgt;
+            const float4 s = input.SampleLevel(p, 0);
+            acc += s.rgb * wgt;
+            acc_a += s.a * wgt;
             wsum += wgt;
         }
         outc = acc / wsum;
+        out_a = acc_a / wsum;
         outc *= 1.0 - t * amount * 0.25;
     }
 
-    const float4 result = float4(outc, base.a);
+    const float4 result = float4(outc, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

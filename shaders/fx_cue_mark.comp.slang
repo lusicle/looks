@@ -52,7 +52,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 enc = fx_srgb_oetf(saturate(base.rgb));
     enc = lerp(enc, float3(0.10, 0.08, 0.07), mark * 0.9);   // punched dark
 
-    const float4 result = float4(fx_srgb_eotf(enc), base.a);
+    const float4 result =
+        float4(fx_srgb_eotf(enc), max(base.a, mark * 0.9));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

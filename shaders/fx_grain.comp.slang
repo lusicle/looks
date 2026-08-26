@@ -28,19 +28,42 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    // CCD noise is per-pixel; film grain clumps into ISO-sized cells.
+    // CCD noise is per-pixel; film grain is smooth CLUMPS, not square
+    // cells: two value-noise octaves per dye layer, the blue layer
+    // coarsest and strongest, all re-rolled every frame.
     const bool ccd = mode >= 0.5;
-    const float cell_size = ccd ? 1.0 : max(size, 1.0);
-    const uint2 cell = uint2(float2(tid.xy) / cell_size);
-
-    const uint h_mono = fx_hash4(seed, frame, cell.x, cell.y);
-    const float mono = fx_hash01(h_mono) - 0.5;
-    float3 grain = float3(mono, mono, mono);
-    const float3 chroma = float3(
-        fx_hash01(fx_hash(h_mono ^ 0x1234567u)) - 0.5,
-        fx_hash01(fx_hash(h_mono ^ 0x89ABCDEu)) - 0.5,
-        fx_hash01(fx_hash(h_mono ^ 0xF0F0F0Fu)) - 0.5);
-    grain = lerp(grain, chroma, saturate(color));
+    float3 grain;
+    if (ccd) {
+        const uint h_mono = fx_hash4(seed, frame, tid.x, tid.y);
+        const float mono = fx_hash01(h_mono) - 0.5;
+        grain = float3(mono, mono, mono);
+        const float3 chroma = float3(
+            fx_hash01(fx_hash(h_mono ^ 0x1234567u)) - 0.5,
+            fx_hash01(fx_hash(h_mono ^ 0x89ABCDEu)) - 0.5,
+            fx_hash01(fx_hash(h_mono ^ 0xF0F0F0Fu)) - 0.5);
+        grain = lerp(grain, chroma, saturate(color));
+    } else {
+        const float cell_size = max(size, 1.0);
+        const uint fs = fx_hash3(seed, frame, 0x6A1u);
+        const float2 pm = float2(tid.xy) / cell_size;
+        const float g_mono =
+            (fx_vnoise2(fs, pm) * 0.65 +
+             fx_vnoise2(fs ^ 0x2Cu, pm * 2.3) * 0.35 - 0.5) * 2.2;
+        const float3 layer_scale = float3(1.0, 1.12, 1.4);
+        const float3 layer_amp = float3(0.9, 1.0, 1.45);
+        float3 clumps;
+        [unroll]
+        for (int ch = 0; ch < 3; ++ch) {
+            const uint cs = fx_hash(fs ^ (0x51u + uint(ch) * 0x9E3u));
+            const float2 pc = pm / layer_scale[ch];
+            clumps[ch] =
+                (fx_vnoise2(cs, pc) * 0.65 +
+                 fx_vnoise2(cs ^ 0x77u, pc * 2.3) * 0.35 - 0.5) * 2.2 *
+                layer_amp[ch];
+        }
+        grain = lerp(float3(g_mono, g_mono, g_mono), clumps,
+                     saturate(color));
+    }
 
     const float3 encoded = fx_srgb_oetf(saturate(base.rgb));
     const float l = fx_luma(encoded);

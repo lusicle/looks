@@ -469,9 +469,14 @@ private:
     bool materialized_ = false;
 };
 
-// TRUE GRAPH link edits. apply/revert address
-// links by value — ids are stable, indices are not. First edit
-// materializes the synthesized legacy table (reverted symmetrically).
+// TRUE GRAPH link edits. STACKING ORDER IS THE LINK ORDER - per
+// (to node, to port) the first link is the BOTTOM of that fan-in - so
+// every edit here is position-exact: replacements land in place, undo
+// restores the removed position, and only genuinely NEW wires append
+// (newest on top, connection chronology). apply/revert address links
+// by value plus the recorded position — ids are stable, indices are
+// not. First edit materializes the synthesized legacy table (reverted
+// symmetrically).
 class ConnectCommand final : public LookCommand {
 public:
     ConnectCommand(uint64_t look, NodeLink link)
@@ -484,21 +489,28 @@ public:
         ensure_links(look);
         pruned_ = prune_tombstone(look);   // a real wire replaces it
         had_replaced_ = false;
-        if (link_.to != 0 || link_.to_port != 0) {
-            // One feed per (to, port) - the Output's audio-in included:
-            // wiring it must never touch the image feed on port 0.
-            for (auto it = look.links.begin(); it != look.links.end(); ++it)
-                if (it->to == link_.to && it->to_port == link_.to_port) {
-                    replaced_ = *it;
+        appended_ = false;
+        auto replace_first = [&](auto&& match) {
+            for (size_t i = 0; i < look.links.size(); ++i)
+                if (match(look.links[i])) {
+                    replaced_ = look.links[i];
+                    replaced_at_ = i;
                     had_replaced_ = true;
-                    look.links.erase(it);
-                    break;
+                    look.links[i] = link_;
+                    return;
                 }
-        } else {
-            // Output composites ONE contribution per owner layer (cross-
-            // layer fan-in is the layer merge); a new chain end REPLACES
-            // the same layer's old one — leaving it produced ghost wires
-            // whose contribution double-composited the chain prefix.
+        };
+        if (link_.to == 0 && link_.to_port == 1) {
+            // The Output's split audio-in holds ONE voice: replace in
+            // place, never touching the image fan-in on port 0.
+            replace_first([&](const NodeLink& l) {
+                return l.to == 0 && l.to_port == 1;
+            });
+        } else if (link_.to == 0 && link_.to_port == 0) {
+            // Output: ONE contribution per owner layer (cross-layer
+            // fan-in is the composite). A chain RE-TERMINATING replaces
+            // its old end IN PLACE, so a splice never restacks the
+            // composite; a new chain appends on top.
             auto owner_of = [&](uint64_t id) -> uint64_t {
                 if (find_layer(look, id)) return id;
                 const Layer* owner = nullptr;
@@ -507,28 +519,38 @@ public:
                 return 0;
             };
             const uint64_t own = owner_of(link_.from);
-            for (auto it = look.links.begin();
-                 own && it != look.links.end(); ++it)
-                if (it->to == 0 && it->to_port == 0 &&
-                    owner_of(it->from) == own) {
-                    replaced_ = *it;
-                    had_replaced_ = true;
-                    look.links.erase(it);
-                    break;
-                }
+            replace_first([&](const NodeLink& l) {
+                return own && l.to == 0 && l.to_port == 0 &&
+                       owner_of(l.from) == own;
+            });
+        } else {
+            // Effect ports fan in freely in link order; an exact
+            // duplicate replaces itself (a no-op that never
+            // double-feeds the port).
+            replace_first([&](const NodeLink& l) {
+                return l.from == link_.from && l.to == link_.to &&
+                       l.to_port == link_.to_port;
+            });
         }
-        look.links.push_back(link_);
+        if (!had_replaced_) {
+            look.links.push_back(link_);
+            appended_ = true;
+        }
     }
 
     void revert(Document& doc) override {
         Look& look = look_of(doc);
-        for (auto it = look.links.rbegin(); it != look.links.rend(); ++it)
-            if (it->from == link_.from && it->to == link_.to &&
-                it->to_port == link_.to_port) {
-                look.links.erase(std::next(it).base());
-                break;
-            }
-        if (had_replaced_) look.links.push_back(replaced_);
+        if (appended_) {
+            for (auto it = look.links.rbegin(); it != look.links.rend();
+                 ++it)
+                if (it->from == link_.from && it->to == link_.to &&
+                    it->to_port == link_.to_port) {
+                    look.links.erase(std::next(it).base());
+                    break;
+                }
+        } else if (had_replaced_ && replaced_at_ < look.links.size()) {
+            look.links[replaced_at_] = replaced_;
+        }
         if (pruned_) seal_links(look);
         if (materialized_) look.links.clear();
     }
@@ -536,7 +558,9 @@ public:
 private:
     NodeLink link_;
     NodeLink replaced_{};
+    size_t replaced_at_ = 0;
     bool had_replaced_ = false;
+    bool appended_ = false;
     bool materialized_ = false;
     bool pruned_ = false;
 };
@@ -552,10 +576,13 @@ public:
         materialized_ = look.links.empty();
         ensure_links(look);
         removed_ = false;
-        for (auto it = look.links.begin(); it != look.links.end(); ++it)
-            if (it->from == link_.from && it->to == link_.to &&
-                it->to_port == link_.to_port) {
-                look.links.erase(it);
+        for (size_t i = 0; i < look.links.size(); ++i)
+            if (look.links[i].from == link_.from &&
+                look.links[i].to == link_.to &&
+                look.links[i].to_port == link_.to_port) {
+                removed_at_ = i;
+                look.links.erase(look.links.begin() +
+                                 static_cast<ptrdiff_t>(i));
                 removed_ = true;
                 break;
             }
@@ -569,15 +596,145 @@ public:
     void revert(Document& doc) override {
         Look& look = look_of(doc);
         if (sealed_) prune_tombstone(look);
-        if (removed_) look.links.push_back(link_);
+        if (removed_)
+            look.links.insert(
+                look.links.begin() +
+                    static_cast<ptrdiff_t>(
+                        std::min(removed_at_, look.links.size())),
+                link_);
         if (materialized_) look.links.clear();
     }
 
 private:
     NodeLink link_;
+    size_t removed_at_ = 0;
     bool removed_ = false;
     bool materialized_ = false;
     bool sealed_ = false;
+};
+
+// Splice rewire: replaces one link with another AT ITS POSITION, so a
+// chain re-terminating through an inserted node (effect drop, preset
+// splice, removal heal, boundary rewire) keeps its place in the
+// consumer port's stacking order. Old link absent = plain append; the
+// new link already present = the old one is just removed.
+class ReconnectCommand final : public LookCommand {
+public:
+    ReconnectCommand(uint64_t look, NodeLink old_link, NodeLink new_link)
+        : LookCommand(look), old_(old_link), new_(new_link) {}
+    std::string name() const override { return "Rewire Nodes"; }
+
+    void apply(Document& doc) override {
+        Look& look = look_of(doc);
+        materialized_ = look.links.empty();
+        ensure_links(look);
+        pruned_ = prune_tombstone(look);
+        mode_ = kAppended;
+        size_t old_at = look.links.size();
+        bool have_old = false;
+        bool have_new = false;
+        for (size_t i = 0; i < look.links.size(); ++i) {
+            const NodeLink& l = look.links[i];
+            if (!have_old && l.from == old_.from && l.to == old_.to &&
+                l.to_port == old_.to_port) {
+                old_at = i;
+                have_old = true;
+            }
+            if (l.from == new_.from && l.to == new_.to &&
+                l.to_port == new_.to_port)
+                have_new = true;
+        }
+        if (have_old && have_new) {
+            at_ = old_at;
+            look.links.erase(look.links.begin() +
+                             static_cast<ptrdiff_t>(old_at));
+            mode_ = kRemovedOnly;
+        } else if (have_old) {
+            at_ = old_at;
+            look.links[old_at] = new_;
+            mode_ = kReplaced;
+        } else if (!have_new) {
+            look.links.push_back(new_);
+            mode_ = kAppended;
+        } else {
+            mode_ = kNoop;
+        }
+    }
+
+    void revert(Document& doc) override {
+        Look& look = look_of(doc);
+        switch (mode_) {
+            case kReplaced:
+                if (at_ < look.links.size()) look.links[at_] = old_;
+                break;
+            case kRemovedOnly:
+                look.links.insert(
+                    look.links.begin() +
+                        static_cast<ptrdiff_t>(
+                            std::min(at_, look.links.size())),
+                    old_);
+                break;
+            case kAppended:
+                for (auto it = look.links.rbegin();
+                     it != look.links.rend(); ++it)
+                    if (it->from == new_.from && it->to == new_.to &&
+                        it->to_port == new_.to_port) {
+                        look.links.erase(std::next(it).base());
+                        break;
+                    }
+                break;
+            case kNoop:
+                break;
+        }
+        if (pruned_) seal_links(look);
+        if (materialized_) look.links.clear();
+    }
+
+private:
+    enum Mode { kReplaced, kRemovedOnly, kAppended, kNoop };
+    NodeLink old_;
+    NodeLink new_;
+    size_t at_ = 0;
+    Mode mode_ = kNoop;
+    bool materialized_ = false;
+    bool pruned_ = false;
+};
+
+// Reorders one feed within a port's fan-in: swaps the index-th and
+// (index+delta)-th links INTO (to, to_port), leaving every other link
+// where it was. The stacking permute behind the port popup and the
+// rail arrows; self-inverse.
+class MovePortLinkCommand final : public LookCommand {
+public:
+    MovePortLinkCommand(uint64_t look, uint64_t to, uint32_t to_port,
+                        size_t index, int delta)
+        : LookCommand(look), to_(to), port_(to_port), index_(index),
+          delta_(delta) {}
+    std::string name() const override { return "Reorder Feed"; }
+
+    void apply(Document& doc) override { swap_links(doc); }
+    void revert(Document& doc) override { swap_links(doc); }
+
+private:
+    void swap_links(Document& doc) {
+        Look& look = look_of(doc);
+        ensure_links(look);
+        std::vector<size_t> pos;
+        for (size_t i = 0; i < look.links.size(); ++i)
+            if (look.links[i].to == to_ && look.links[i].to_port == port_)
+                pos.push_back(i);
+        const long other = static_cast<long>(index_) + delta_;
+        if (index_ >= pos.size() || other < 0 ||
+            static_cast<size_t>(other) >= pos.size())
+            return;
+        std::swap(look.links[pos[index_]],
+                  look.links[pos[static_cast<size_t>(other)]]);
+    }
+
+    uint64_t to_;
+    uint32_t port_;
+    size_t index_;
+    int delta_;
 };
 
 // Canvas frames: pure annotations, but still
@@ -794,6 +951,18 @@ std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link) {
 
 std::unique_ptr<Command> disconnect_command(uint64_t look, NodeLink link) {
     return std::make_unique<DisconnectCommand>(look, link);
+}
+
+std::unique_ptr<Command> reconnect_command(uint64_t look, NodeLink old_link,
+                                           NodeLink new_link) {
+    return std::make_unique<ReconnectCommand>(look, old_link, new_link);
+}
+
+std::unique_ptr<Command> move_port_link_command(uint64_t look, uint64_t to,
+                                                uint32_t to_port,
+                                                size_t index, int delta) {
+    return std::make_unique<MovePortLinkCommand>(look, to, to_port, index,
+                                                 delta);
 }
 
 std::unique_ptr<Command> set_node_pos_command(uint64_t look, NodeRef kind,

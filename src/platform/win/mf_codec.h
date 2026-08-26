@@ -42,6 +42,21 @@ private:
     bool ok_ = false;
 };
 
+// MFStartup alone, NO COM: the process-lifetime pin main holds so the
+// FINAL MFShutdown never lands on a worker thread while decoder MFTs
+// are still alive (MF forbids that; it hangs or kills the process).
+// Deliberately apartment-neutral - an MTA init on the main thread
+// would break the STA the shell file dialogs put there.
+class MfLifetime {
+public:
+    MfLifetime();
+    ~MfLifetime();
+    bool ok() const { return mf_; }
+
+private:
+    bool mf_ = false;
+};
+
 struct VideoFrameNV12 {
     std::vector<uint8_t> data;   // Y plane then interleaved UV
     uint32_t width = 0;

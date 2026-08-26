@@ -117,7 +117,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 orange = float3(1.0, 0.55, 0.12);
     const float3 burned = lerp(enc, orange, cov * 0.92);
 
-    const float4 result = float4(fx_srgb_eotf(saturate(burned)), base.a);
+    const float4 result = float4(fx_srgb_eotf(saturate(burned)),
+                                 max(base.a, cov * 0.92));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -10,10 +10,12 @@
 #include "doc/instances.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "doc/command.h"
 #include "doc/effects.h"
 #include "doc/group_commands.h"
+#include "doc/layer_commands.h"
 #include "doc/stack_commands.h"
 #include "gfx/graph.h"
 #include "test_framework.h"
@@ -84,10 +86,10 @@ TEST(flatten_composes_block_map_and_slip_in_closed_form) {
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
     CHECK_EQ(sources.size(), size_t{1});
     const MediaInstance& c = sources[0];
-    // Root 10 -> look local 4 -> media 10 (slip 6).
+    // Root 10 -> look local 4 -> media 10 (slip 6 applied post-rate).
     CHECK_EQ(c.t_in, 10.0);
-    CHECK_EQ(doc::media_source_frame(c, 10.0), 10.0);
-    CHECK_EQ(doc::media_source_frame(c, 20.0), 30.0);
+    CHECK_EQ(doc::media_asset_frame(c, 10.0), 10.0);
+    CHECK_EQ(doc::media_asset_frame(c, 20.0), 30.0);
     // Media ends at 100: playable 94 past the slip, entered at local 4,
     // so 90 local frames remain = 45 root frames at 2x from t_in 10.
     CHECK_EQ(c.t_out, 55.0);
@@ -116,6 +118,7 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
         ap.id = rig.doc.next_effect_id++;
         ap.target = rig.look;
         at.placements.push_back(ap);
+        rig.doc.root().audio.clear();
         rig.doc.root().audio.push_back(at);
     }
 
@@ -125,8 +128,8 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
     if (sources.size() < 2) return;
     const MediaInstance& base = sources[0];
     const MediaInstance& sh = sources[1];
-    CHECK_EQ(doc::media_source_frame(base, 0.0), 0.0);
-    CHECK_EQ(doc::media_source_frame(sh, 0.0), 10.0);
+    CHECK_EQ(doc::media_asset_frame(base, 0.0), 0.0);
+    CHECK_EQ(doc::media_asset_frame(sh, 0.0), 10.0);
     CHECK_EQ(sh.t_out, 90.0);   // 100-frame media, entered 10 in
     CHECK(sh.key != base.key);
 
@@ -160,7 +163,7 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
         doc::flatten_audio_sources(rig.doc, rig.doc.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});
     if (voice.empty()) return;
-    CHECK_EQ(doc::media_source_frame(voice[0], 0.0), 10.0);
+    CHECK_EQ(doc::media_asset_frame(voice[0], 0.0), 10.0);
 
     // The closed-form chain the analysis keys on carries it too.
     const doc::AudioChain chain =
@@ -197,18 +200,19 @@ TEST(flatten_offset_shim_off_the_source_is_inert) {
         ap.id = rig.doc.next_effect_id++;
         ap.target = rig.look;
         at.placements.push_back(ap);
+        rig.doc.root().audio.clear();
         rig.doc.root().audio.push_back(at);
     }
 
     const auto sources =
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
     CHECK_EQ(sources.size(), size_t{1});
-    CHECK_EQ(doc::media_source_frame(sources[0], 0.0), 0.0);
+    CHECK_EQ(doc::media_asset_frame(sources[0], 0.0), 0.0);
     const auto voice =
         doc::flatten_audio_sources(rig.doc, rig.doc.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});
     if (voice.empty()) return;
-    CHECK_EQ(doc::media_source_frame(voice[0], 0.0), 0.0);
+    CHECK_EQ(doc::media_asset_frame(voice[0], 0.0), 0.0);
 }
 
 TEST(flatten_audio_only_asset_is_image_dormant) {
@@ -223,6 +227,7 @@ TEST(flatten_audio_only_asset_is_image_dormant) {
     doc::AudioTrack at;
     at.id = rig.doc.next_effect_id++;
     at.placements.push_back(ap);
+    rig.doc.root().audio.clear();
     rig.doc.root().audio.push_back(at);
 
     CHECK(doc::flatten_media_sources(rig.doc, rig.doc.root_sequence)
@@ -263,8 +268,8 @@ TEST(flatten_timeline_lock_reads_the_root_clock) {
     CHECK_EQ(a.speed, 1.0);
     CHECK_EQ(b.speed, 1.0);
     // Identity from the root: block timing shapes only the WINDOW.
-    CHECK_EQ(doc::media_source_frame(a, 50.0), 53.0);
-    CHECK_EQ(doc::media_source_frame(b, 160.0), 163.0);
+    CHECK_EQ(doc::media_asset_frame(a, 50.0), 53.0);
+    CHECK_EQ(doc::media_asset_frame(b, 160.0), 163.0);
     CHECK_EQ(a.t_in, 40.0);
     CHECK_EQ(b.t_in, 150.0);
     // One stream: the key drops the instance path.
@@ -284,6 +289,7 @@ TEST(flatten_timeline_lock_reads_the_root_clock) {
 
 TEST(flatten_and_compiler_agree_frame_by_frame) {
     Rig rig(50);
+    rig.doc.fps = 60.0;
     rig.placement().t_in = 5;
     rig.placement().t_out = 30;
     // A second block of the same look later on the lane (a razor's
@@ -294,6 +300,30 @@ TEST(flatten_and_compiler_agree_frame_by_frame) {
     second.t_in = 40;
     second.source_in = 10;
     rig.doc.root().tracks[0].placements.push_back(second);
+    // A MISMATCHED-RATE asset (24 in 60): its conformed window must
+    // close on the same fractional bound in both walks.
+    doc::Asset slow;
+    slow.id = rig.doc.next_effect_id++;
+    slow.frame_count = 10;   // 25 clock frames at rate 0.4
+    slow.fps = 24.0;
+    rig.doc.assets.push_back(slow);
+    doc::Look wrap;
+    wrap.id = rig.doc.next_effect_id++;
+    doc::Layer media;
+    media.id = rig.doc.next_effect_id++;
+    media.asset = slow.id;
+    media.slip = 3;
+    wrap.layers.push_back(std::move(media));
+    const uint64_t wrap_id = wrap.id;
+    rig.doc.looks.push_back(std::move(wrap));
+    doc::SeqTrack lane2;
+    lane2.id = rig.doc.next_effect_id++;
+    doc::Placement third;
+    third.id = rig.doc.next_effect_id++;
+    third.target = wrap_id;
+    third.t_in = 2;
+    rig.doc.root().tracks.push_back(std::move(lane2));
+    rig.doc.root().tracks[1].placements.push_back(third);
 
     const auto sources =
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
@@ -377,6 +407,7 @@ TEST(flatten_audio_reads_audio_tracks_only) {
     ap.t_in = 10;
     ap.audio_gain = 0.5f;
     at.placements.push_back(ap);
+    rig.doc.root().audio.clear();
     rig.doc.root().audio.push_back(at);
 
     const auto mix =
@@ -402,6 +433,7 @@ static void lay_audio_block(Document& d, uint64_t target) {
     ap.id = d.next_effect_id++;
     ap.target = target;
     at.placements.push_back(ap);
+    d.root().audio.clear();
     d.root().audio.push_back(at);
 }
 
@@ -433,11 +465,11 @@ TEST(flatten_audio_voice_is_the_bottom_output_chain) {
 }
 
 TEST(flatten_audio_voice_survives_a_preset_splice) {
-    // Splicing a preset into the BOTTOM chain rewires its Output link
-    // (disconnect + connect re-append at the table's end). The voice is
-    // owner-layer-ordered, never table-ordered, so it must stay on the
-    // bottom media chain - table order would flip it to the top layer
-    // (a silent generator: the audio cuts out).
+    // Splicing a preset into the BOTTOM chain re-terminates it through
+    // the group. Stacking order IS the link order, so the splice must
+    // land IN PLACE (reconnect_command): the bottom chain stays the
+    // bottom link and the voice stays on the media - append semantics
+    // would flip it to the top layer (a silent generator).
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -457,17 +489,24 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     const uint64_t m0 = members[0].id, m1 = members[1].id;
     undo.execute(d, doc::insert_group_command(rig.look, 0, g,
                                               std::move(members)));
-    // The drop gesture's splice: disconnect the bottom chain's Output
-    // wire, then wire the group's boundary members in.
-    undo.execute(d,
-                 doc::disconnect_command(rig.look, {media_layer, 0, 0}));
+    // The drop gesture's splice: the chain end re-terminates through
+    // the group IN PLACE, then the feed wires into the group's head.
+    undo.execute(d, doc::reconnect_command(rig.look, {media_layer, 0, 0},
+                                           {m1, 0, 0}));
     undo.execute(d, doc::connect_command(rig.look, {media_layer, m0, 0}));
-    undo.execute(d, doc::connect_command(rig.look, {m1, 0, 0}));
 
     const auto voice = doc::flatten_audio_sources(d, d.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});
     CHECK_EQ(voice[0].asset, rig.asset);
     CHECK_EQ(voice[0].layer, media_layer);
+    // The spliced chain kept the BOTTOM position of the Output fan-in.
+    uint64_t bottom_out = 0;
+    for (const doc::NodeLink& l : look.links)
+        if (l.to == 0 && l.to_port == 0) {
+            bottom_out = l.from;
+            break;
+        }
+    CHECK_EQ(bottom_out, m1);
 
     // Undoing the whole splice restores the voice unchanged.
     while (undo.can_undo()) undo.undo(d);
@@ -658,6 +697,169 @@ TEST(canvas_size_derives_from_the_first_asset) {
     CHECK_EQ(h, uint32_t{720});
 }
 
+TEST(flatten_conforms_mismatched_media_rate) {
+    // 30fps media in a 60fps project: the media frame advances at half
+    // the clock (1x in TIME, each frame held twice), slip stays
+    // media-frame-exact past the rate, and derived lengths double.
+    Rig rig(100);
+    rig.doc.fps = 60.0;
+    rig.doc.assets[0].fps = 30.0;
+    rig.doc.looks[0].layers[0].slip = 10;
+
+    // 90 media frames past the slip = 180 clock frames.
+    CHECK_EQ(doc::layer_source_length(rig.doc, rig.doc.looks[0].layers[0],
+                                      60.0),
+             uint32_t{180});
+    CHECK_EQ(doc::sequence_duration(rig.doc, rig.doc.root()),
+             uint32_t{180});
+
+    const auto sources =
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
+    CHECK_EQ(sources.size(), size_t{1});
+    const MediaInstance& c = sources[0];
+    CHECK_EQ(c.rate, 0.5);
+    CHECK_EQ(c.shift, int64_t{10});
+    CHECK_EQ(c.t_in, 0.0);
+    CHECK_EQ(c.t_out, 180.0);
+    CHECK_EQ(doc::media_asset_frame(c, 0.0), 10.0);
+    CHECK_EQ(doc::media_asset_frame(c, 1.0), 10.0);
+    CHECK_EQ(doc::media_asset_frame(c, 2.0), 11.0);
+    CHECK_EQ(doc::media_asset_frame(c, 179.0), 99.0);
+    CHECK(!doc::media_active(c, 180.0));
+
+    // The compiler windows the head on the same conformed bounds.
+    const gfx::RenderGraph g_on =
+        gfx::compile_graph(rig.doc, rig.doc.root_sequence, 179);
+    bool has_src = false;
+    for (const gfx::GraphNode& n : g_on.nodes)
+        if (n.kind == gfx::GraphNode::Kind::Source) has_src = true;
+    CHECK(has_src);
+    const gfx::RenderGraph g_off =
+        gfx::compile_graph(rig.doc, rig.doc.root_sequence, 180);
+    for (const gfx::GraphNode& n : g_off.nodes)
+        CHECK(n.kind != gfx::GraphNode::Kind::Source);
+
+    // The AUDIO walk carries the same clock-domain affine (the mix maps
+    // by seconds and must not double-conform) with the media-frame
+    // shift held on the instance, not folded in.
+    doc::AudioTrack at;
+    at.id = rig.doc.next_effect_id++;
+    doc::Placement ap;
+    ap.id = rig.doc.next_effect_id++;
+    ap.target = rig.look;
+    at.placements.push_back(ap);
+    rig.doc.root().audio.clear();
+    rig.doc.root().audio.push_back(at);
+    const auto voice =
+        doc::flatten_audio_sources(rig.doc, rig.doc.root_sequence);
+    CHECK_EQ(voice.size(), size_t{1});
+    CHECK_EQ(voice[0].rate, 0.5);
+    CHECK_EQ(voice[0].shift, int64_t{10});
+    CHECK_EQ(doc::media_source_frame(voice[0], 40.0), 40.0);
+}
+
+TEST(flatten_conform_razor_identity) {
+    // Cutting a conformed block and butting the halves is bit-identical:
+    // the right half's trimmed head lands on the same media frames the
+    // whole block showed, through the same stream key.
+    Rig rig(100);
+    rig.doc.fps = 60.0;
+    rig.doc.assets[0].fps = 30.0;
+    doc::Placement& left = rig.placement();
+    left.t_out = 91;
+    doc::Placement right;
+    right.id = rig.doc.next_effect_id++;
+    right.target = rig.look;
+    right.t_in = 91;
+    right.source_in = 91;   // trim_placement_head's truncate rule
+    rig.doc.root().tracks[0].placements.push_back(right);
+
+    const auto sources =
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
+    CHECK_EQ(sources.size(), size_t{2});
+    const MediaInstance& a = sources[0];
+    const MediaInstance& b = sources[1];
+    CHECK_EQ(a.key, b.key);   // razored halves share one stream
+    for (uint32_t f = 91; f < 97; ++f)
+        CHECK_EQ(doc::media_asset_frame(b, static_cast<double>(f)),
+                 std::floor(static_cast<double>(f) * 0.5));
+}
+
+TEST(pinned_fps_look_conforms_through_the_hop) {
+    // A 30fps-PINNED look in a 60fps project: its own clock ticks 30
+    // (media at 30fps maps 1:1 inside it), the hop ratio rides the
+    // affine, and derived spans double on the parent timeline.
+    Rig rig(90);
+    rig.doc.fps = 60.0;
+    rig.doc.assets[0].fps = 30.0;
+    rig.doc.looks[0].format.fps = 30.0;
+
+    CHECK_EQ(doc::look_duration(rig.doc, rig.doc.looks[0]), uint32_t{90});
+    CHECK_EQ(doc::sequence_duration(rig.doc, rig.doc.root()),
+             uint32_t{180});
+
+    const auto sources =
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
+    CHECK_EQ(sources.size(), size_t{1});
+    const MediaInstance& c = sources[0];
+    CHECK_EQ(c.rate, 1.0);    // media matches ITS look's pinned clock
+    CHECK_EQ(c.speed, 0.5);   // the hop ratio rides the affine
+    CHECK_EQ(c.t_out, 180.0);
+    CHECK_EQ(doc::media_asset_frame(c, 3.0), 1.0);
+    CHECK_EQ(doc::media_asset_frame(c, 179.0), 89.0);
+
+    // The compiler's nested instance ticks the PINNED clock: at root
+    // frame 100 the look's local frame is 50 - lanes, value graph and
+    // stateful effects all clock on it.
+    const gfx::RenderGraph g =
+        gfx::compile_graph(rig.doc, rig.doc.root_sequence, 100);
+    bool found = false;
+    for (const gfx::LookInstance& li : g.instances)
+        if (li.look == rig.look) {
+            found = true;
+            CHECK_EQ(li.local_frame, uint32_t{50});
+        }
+    CHECK(found);
+
+    // Razor identity across the pinned hop: a cut on a child-frame
+    // boundary reproduces the uncut media frames exactly (an off-grid
+    // cut truncates source_in - the same ONE rounding rule fractional
+    // speeds follow).
+    doc::UndoStack undo;
+    if (auto cut = doc::razor_track_command(rig.doc, rig.doc.root_sequence,
+                                            rig.lane, 62))
+        undo.execute(rig.doc, std::move(cut));
+    const auto halves =
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
+    CHECK_EQ(halves.size(), size_t{2});
+    if (halves.size() < 2) return;
+    CHECK_EQ(halves[0].key, halves[1].key);
+    for (uint32_t f = 62; f < 68; ++f)
+        CHECK_EQ(doc::media_asset_frame(halves[1],
+                                        static_cast<double>(f)),
+                 std::floor(static_cast<double>(f) * 0.5));
+}
+
+TEST(still_assets_never_conform) {
+    // A true still's frame count is authored on the PROJECT clock (the
+    // duration entry), so the conform rate must stay 1 even though the
+    // mezzanine stamps its synthetic 30fps.
+    Rig rig(150);
+    rig.doc.fps = 60.0;
+    rig.doc.assets[0].fps = 30.0;
+    rig.doc.assets[0].still = true;
+    CHECK_EQ(doc::media_conform_rate(rig.doc, rig.doc.assets[0], 60.0),
+             1.0);
+    CHECK_EQ(doc::layer_source_length(rig.doc, rig.doc.looks[0].layers[0],
+                                      60.0),
+             uint32_t{150});
+    const auto sources =
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
+    CHECK_EQ(sources.size(), size_t{1});
+    CHECK_EQ(sources[0].rate, 1.0);
+    CHECK_EQ(sources[0].t_out, 150.0);
+}
+
 TEST(sequence_duration_is_the_timeline_length) {
     Rig rig(90);
     CHECK_EQ(doc::sequence_duration(rig.doc, rig.doc.root()),
@@ -673,6 +875,7 @@ TEST(sequence_duration_is_the_timeline_length) {
     ap.target = rig.look;
     ap.t_in = 100;
     at.placements.push_back(ap);
+    rig.doc.root().audio.clear();
     rig.doc.root().audio.push_back(at);
     CHECK_EQ(doc::sequence_duration(rig.doc, rig.doc.root()),
              uint32_t{190});
@@ -680,4 +883,18 @@ TEST(sequence_duration_is_the_timeline_length) {
     rig.doc.root().duration = 42;
     CHECK_EQ(doc::sequence_duration(rig.doc, rig.doc.root()),
              uint32_t{42});
+}
+
+TEST(flatten_hidden_lane_leaves_the_video_walk) {
+    // A hidden lane's blocks leave the video flatten entirely (the
+    // compiler skips them identically, so the pool never prewarms a
+    // ghost). The AUDIO walk ignores hidden - video lanes carry no
+    // sound either way.
+    Rig rig(100);
+    CHECK_EQ(
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
+        size_t{1});
+    rig.doc.root().tracks[0].hidden = true;
+    CHECK(
+        doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).empty());
 }

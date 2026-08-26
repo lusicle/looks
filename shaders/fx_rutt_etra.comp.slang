@@ -51,6 +51,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int first = int(ceil((p - wig_max - phase) / sp)) - 1;
     const int last = int(floor((p + amount + wig_max - phase) / sp)) + 1;
     float3 col = 0.0;
+    float col_a = 0.0;
     for (int s = first; s <= last; ++s) {
         const float line_p = float(s) * sp + sp * 0.5 + phase;
         if (line_p < 0.5) continue;
@@ -58,7 +59,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 suv = cols
             ? float2((line_p + 0.5) / size.x, uv.y)
             : float2(uv.x, (line_p + 0.5) / size.y);
-        const float3 src = input.SampleLevel(suv, 0).rgb;
+        const float4 src4 = input.SampleLevel(suv, 0);
+        const float3 src = src4.rgb;
         const float l = fx_luma(fx_srgb_oetf(saturate(src)));
         const float wig = wiggle > 0.001
             ? (fx_value_noise1(seed ^ uint(s + 4096) * 197u,
@@ -79,10 +81,14 @@ void main(uint3 tid : SV_DispatchThreadID)
             }
             const float glow = 1.0 - d / line_w;
             col = max(col, src * (0.35 + 0.65 * l) * (glow * glow) * 2.0);
+            // The drawn trace is the content: its coverage is the line
+            // glow gated by the source pixel's own coverage.
+            col_a = max(col_a,
+                        saturate((glow * glow) * 2.0) * src4.a);
         }
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -37,8 +37,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float defocus = af * 9.0 * hunt * hunt;
 
     float3 col = base.rgb;
+    float col_a = base.a;
     if (defocus > 0.3) {
         float3 acc = col;
+        float acc_a = col_a;
         float wsum = 1.0;
         [unroll]
         for (int i = 0; i < 12; ++i) {
@@ -47,10 +49,13 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float rr = sqrt(fi) * defocus;
             const float2 p =
                 clamp(uv + float2(cos(a), sin(a)) * rr / size, 0.0, 1.0);
-            acc += input.SampleLevel(p, 0).rgb;
+            const float4 s = input.SampleLevel(p, 0);
+            acc += s.rgb;
+            acc_a += s.a;
             wsum += 1.0;
         }
         col = acc / wsum;
+        col_a = acc_a / wsum;
     }
 
     const float target =
@@ -70,7 +75,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         (fx_value_noise1(seed ^ 0xA3Bu, t * r * 0.5) - 0.5) * 2.0 * awb;
     col *= float3(1.0 + temp * 0.28, 1.0 + temp * 0.04, 1.0 - temp * 0.30);
 
-    const float4 result = float4(max(col, 0.0), base.a);
+    const float4 result = float4(max(col, 0.0), col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -72,16 +72,20 @@ void main(uint3 tid : SV_DispatchThreadID)
         : float3(g, g, g);
 
     float3 rgb;
+    float out_a = base.a;
     const int m = int(mode + 0.5);
-    if (m == 0)
+    if (m == 0) {
         rgb = glyph_rgb;
-    else if (m == 1)
+        out_a = max(base.a, g);   // drawn ink unions its coverage in
+    } else if (m == 1) {
         rgb = atlas_color != 0u ? glyph_rgb * (0.35 + 0.65 * fx_luma(cell_rgb))
                                 : cell_rgb * g;
-    else
-        rgb = base.rgb * g;
+        out_a = max(base.a, g);
+    } else {
+        rgb = base.rgb * g;   // blackout style dims color only
+    }
 
-    const float4 result = float4(rgb, base.a);
+    const float4 result = float4(rgb, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

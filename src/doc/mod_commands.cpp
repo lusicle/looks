@@ -318,6 +318,35 @@ private:
     uint32_t old_h_ = 0;
 };
 
+// Per-entity FORMAT (look or sequence): all-zero = inherit the project.
+class SetEntityFormatCommand final : public Command {
+public:
+    SetEntityFormatCommand(uint64_t entity, EntityFormat next)
+        : entity_(entity), next_(next) {}
+    std::string name() const override { return "Entity Format"; }
+
+    void apply(Document& doc) override {
+        if (Look* l = doc.find_look(entity_)) {
+            old_ = l->format;
+            l->format = next_;
+        } else if (Sequence* s = doc.find_sequence(entity_)) {
+            old_ = s->format;
+            s->format = next_;
+        }
+    }
+
+    void revert(Document& doc) override {
+        if (Look* l = doc.find_look(entity_)) l->format = old_;
+        else if (Sequence* s = doc.find_sequence(entity_))
+            s->format = old_;
+    }
+
+private:
+    uint64_t entity_;
+    EntityFormat next_;
+    EntityFormat old_;
+};
+
 class SetTimeRemapCommand final : public Command {
 public:
     SetTimeRemapCommand(float speed, uint32_t mode)
@@ -832,6 +861,10 @@ std::unique_ptr<Command> set_time_remap_command(float speed, uint32_t mode) {
 std::unique_ptr<Command> set_project_format_command(double fps, uint32_t w,
                                                     uint32_t h) {
     return std::make_unique<SetProjectFormatCommand>(fps, w, h);
+}
+std::unique_ptr<Command> set_entity_format_command(uint64_t entity,
+                                                   EntityFormat format) {
+    return std::make_unique<SetEntityFormatCommand>(entity, format);
 }
 std::unique_ptr<Command> set_timeline_region_command(uint64_t look,
                                                      uint32_t trim_in,

@@ -16,10 +16,12 @@ cbuffer Push
     uint mode;         // doc::BlendMode
     float opacity;
     uint use_xform;
-    float xf_scale;    // about canvas center, > 0
+    float xf_scale;    // about the anchor, > 0
     float xf_rotate;   // radians
     float xf_shift_x;  // canvas fractions; +x right, +y down
     float xf_shift_y;
+    float anchor_x;    // scale/rotate pivot, uv; 0.5 = canvas center
+    float anchor_y;
 };
 
 [[vk::binding(0, 0)]] Sampler2D below;
@@ -37,16 +39,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     float4 b;
     if (use_xform != 0u)
     {
-        // Inverse of the monitor's forward map; rotation is rigid and
-        // scale uniform, so the frame edge gets a one-pixel analytic AA
-        // band like the layer transform's.
+        // Inverse of the monitor's forward map
+        // out = a + shift + S*R*(src - a); rotation is rigid and scale
+        // uniform, so the frame edge gets a one-pixel analytic AA band
+        // like the layer transform's.
         const float aspect = float(width) / float(height);
-        float2 p = (uv - 0.5 - float2(xf_shift_x, xf_shift_y))
+        const float2 anchor = float2(anchor_x, anchor_y);
+        float2 p = (uv - anchor - float2(xf_shift_x, xf_shift_y))
                  * float2(aspect, 1.0);
         const float s = sin(-xf_rotate), c = cos(-xf_rotate);
         p = float2(p.x * c - p.y * s, p.x * s + p.y * c);
         p /= max(xf_scale, 1e-4);
-        const float2 suv = p / float2(aspect, 1.0) + 0.5;
+        const float2 suv = p / float2(aspect, 1.0) + anchor;
         const float dx = min(suv.x, 1.0 - suv.x) * float(width) * xf_scale;
         const float dy = min(suv.y, 1.0 - suv.y) * float(height) * xf_scale;
         const float cov = saturate(min(dx, dy) + 0.5);

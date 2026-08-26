@@ -83,7 +83,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_displace.comp.spv", 2},        // input + displacement map
     {"fx_lens_distort.comp.spv", 1},
     {"fx_fringe.comp.spv", 1},
-    {"fx_interlace.comp.spv", 1},
+    {"fx_interlace.comp.spv", 2},       // input + previous frame (weave)
     {"fx_slice_shuffle.comp.spv", 1},
     {"fx_pixel_stretch.comp.spv", 1},
     {"fx_composite.comp.spv", 1},
@@ -188,6 +188,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     // source read (or routes through it); it never dispatches.
     {nullptr, 0},
     {"fx_track_pin.comp.spv", 2},       // input + pinned B
+    {"fx_vhs.comp.spv", 1},
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -532,14 +533,14 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     blend_desc.spv_name = "layer_blend.comp.spv";
     blend_desc.sampled_inputs = 2;
     blend_desc.storage_outputs = 1;
-    blend_desc.push_bytes = 9 * sizeof(uint32_t);
+    blend_desc.push_bytes = 11 * sizeof(uint32_t);
     layer_blend_ = ComputePipeline::create(device_, shader_dir, blend_desc);
 
     ComputePipelineDesc xf_desc;
     xf_desc.spv_name = "layer_transform.comp.spv";
     xf_desc.sampled_inputs = 1;
     xf_desc.storage_outputs = 1;
-    xf_desc.push_bytes = 9 * sizeof(uint32_t);
+    xf_desc.push_bytes = 11 * sizeof(uint32_t);
     layer_transform_ = ComputePipeline::create(device_, shader_dir, xf_desc);
     if (!generator_ || !layer_blend_ || !layer_transform_) return false;
 
@@ -1970,7 +1971,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 // the lane blend, never through a transform pass.
                 const doc::Layer& layer =
                     look.layers[static_cast<size_t>(node.layer_index)];
-                uint32_t push[9] = {};
+                uint32_t push[11] = {};
                 push[0] = w;
                 push[1] = h;
                 push[2] = as_bits(layer.crop_l);
@@ -1981,6 +1982,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                           (layer.flip_v ? 2u : 0u);
                 push[7] = as_bits(layer.xf_scale);
                 push[8] = as_bits(layer.xf_rotate * doc::kDeg2Rad);
+                push[9] = as_bits(layer.xf_anchor_x);
+                push[10] = as_bits(layer.xf_anchor_y);
                 const GpuImage* sampled[1] = {input_image(0)};
                 layer_transform_->dispatch(rec, arena_, frame_index, sampled,
                                            1, &dst, 1, push, sizeof(push), w,
@@ -1991,6 +1994,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 uint32_t push[15] = {};
                 push[0] = w;
                 push[1] = h;
+                // The dummy is created UNDEFINED and never written; the
+                // first bind must still hand the sampler a legal layout.
+                dummy_flow_->transition(
+                    rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 const GpuImage* sdf_tex = dummy_flow_.get();
                 if (node.layer_index >= 0) {
                     const doc::Layer& layer =
@@ -2009,13 +2016,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[14] = as_bits(layer.gen_phase);
                     if (layer.source == doc::LayerSourceKind::Shape &&
                         layer.osc_shape == 3u && !layer.path.empty()) {
-                        // Custom path: CPU SDF raster at quarter target
+                        // Custom path: CPU SDF raster at half target
                         // res, re-run only when the path bytes or the
                         // raster size change (gfx/shape_sdf).
                         const uint32_t rw =
-                            std::clamp(w / 4u, 64u, 960u);
+                            std::clamp(w / 2u, 64u, 1920u);
                         const uint32_t rh =
-                            std::clamp(h / 4u, 64u, 960u);
+                            std::clamp(h / 2u, 64u, 1920u);
                         uint64_t phash = hash_combine(
                             0x5DFull,
                             (static_cast<uint64_t>(rw) << 32) | rh);
@@ -2038,20 +2045,21 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             const float aspect =
                                 static_cast<float>(w) /
                                 std::max(1.0f, static_cast<float>(h));
-                            std::vector<uint8_t> sdf;
+                            std::vector<uint16_t> sdf;
                             shape_sdf_raster(layer.path,
                                              layer.path_closed, aspect, rw,
                                              rh, &sdf);
                             if (!slot.tex) {
                                 slot.tex = GpuImage::create(
-                                    device_, VK_FORMAT_R8_UNORM, rw, rh,
+                                    device_, VK_FORMAT_R16_UNORM, rw, rh,
                                     VK_IMAGE_USAGE_SAMPLED_BIT |
                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT);
                                 if (!slot.tex) return nullptr;
                             }
-                            if (!staging.upload_image(rec, sdf.data(),
-                                                      sdf.size(), rw,
-                                                      *slot.tex))
+                            if (!staging.upload_image(
+                                    rec, sdf.data(),
+                                    sdf.size() * sizeof(uint16_t), rw,
+                                    *slot.tex))
                                 return nullptr;
                             slot.tex->transition(
                                 rec,
@@ -2097,7 +2105,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             node.p_shift_x != 0.0f ||
                             node.p_shift_y != 0.0f;
                 }
-                uint32_t push[9] = {};
+                uint32_t push[11] = {};
                 push[0] = w;
                 push[1] = h;
                 push[2] = static_cast<uint32_t>(mode);
@@ -2107,6 +2115,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 push[6] = as_bits(node.p_rotate);
                 push[7] = as_bits(node.p_shift_x);
                 push[8] = as_bits(node.p_shift_y);
+                push[9] = as_bits(node.p_anchor_x);
+                push[10] = as_bits(node.p_anchor_y);
                 const GpuImage* sampled[2] = {input_image(0), input_image(1)};
                 layer_blend_->dispatch(rec, arena_, frame_index, sampled, 2,
                                        &dst, 1, push, sizeof(push), w, h,
@@ -2610,6 +2620,65 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 3, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
+                } else if (fx.type == doc::EffectType::Interlace) {
+                    // Field weave reads the previous frame (ring delay
+                    // 1); the input doubles as the past frame until the
+                    // ring holds one. Comb/lines modes ignore input 1,
+                    // but the ring still advances so a mode switch
+                    // lands on fresh history.
+                    SlitSlot& slot = slit_state_[skey];
+                    if (slot.ring[0] &&
+                        (slot.ring[0]->width() != w ||
+                         slot.ring[0]->height() != h)) {
+                        for (auto& img : slot.ring) img.reset();
+                        slot.head = slot.count = 0;
+                        slot.last_frame = 0xFFFFFFFFu;
+                    }
+                    GpuImage* in_img =
+                        const_cast<GpuImage*>(input_image(0));
+                    const GpuImage* past = in_img;
+                    if (slot.count > 0) {
+                        const uint32_t idx =
+                            (slot.head + kSlitRing - 1) % kSlitRing;
+                        if (slot.ring[idx]) past = slot.ring[idx].get();
+                    }
+                    const GpuImage* sampled[2] = {in_img, past};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
+                        push_bytes, w, h, linear_sampler_);
+                    if (slot.last_frame != timeline_frame) {
+                        std::unique_ptr<GpuImage>& target =
+                            slot.ring[slot.head];
+                        if (!target) {
+                            target = GpuImage::create(
+                                device_, VK_FORMAT_R16G16B16A16_SFLOAT, w, h,
+                                VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                            if (!target) return nullptr;
+                        }
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                        target->transition(
+                            rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkImageCopy copy{};
+                        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                               0, 1};
+                        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                               0, 1};
+                        copy.extent = {w, h, 1};
+                        vkCmdCopyImage(rec, in_img->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       target->image(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &copy);
+                        target->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        in_img->transition(
+                            rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        slot.head = (slot.head + 1) % kSlitRing;
+                        slot.count = std::min(slot.count + 1, kSlitRing);
+                        slot.last_frame = timeline_frame;
+                    }
                 } else if (fx.type == doc::EffectType::FrameDelay) {
                     // Plain N-frame delay: the slit-scan ring
                     // machinery, one slice bound as the second input.

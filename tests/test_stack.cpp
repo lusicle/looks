@@ -207,6 +207,9 @@ TEST(stack_connect_output_replaces_same_layer_end) {
     CHECK(std::find(ends.begin(), ends.end(), fx0) != ends.end());
     CHECK(std::find(ends.begin(), ends.end(), other_end) != ends.end());
     CHECK(std::find(ends.begin(), ends.end(), fx1) == ends.end());
+    // IN PLACE: stacking order is the link order, so the re-terminated
+    // chain keeps the bottom position it had.
+    CHECK_EQ(ends[0], fx0);
 
     CHECK(undo.undo(doc));
     ends = out_ends();

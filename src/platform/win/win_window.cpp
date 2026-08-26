@@ -287,27 +287,33 @@ private:
 
             case WM_DROPFILES: {
                 HDROP drop = reinterpret_cast<HDROP>(wparam);
+                // WHERE the files landed: dropping onto the timeline
+                // means something different from dropping anywhere
+                // else, and the last mouse-move is stale (dragging
+                // over another window sends us nothing). Physical
+                // client px, like every other event carries. A
+                // multi-select drop delivers ONE event per file, all
+                // at the same point - nothing is silently discarded.
+                POINT drop_pt{};
+                DragQueryPoint(drop, &drop_pt);
+                const UINT count =
+                    DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0);
                 wchar_t path[MAX_PATH] = L"";
-                if (DragQueryFileW(drop, 0, path, MAX_PATH)) {
-                    e.type = Event::Type::FileDrop;
-                    // WHERE the file landed: dropping onto the timeline
-                    // means something different from dropping anywhere
-                    // else, and the last mouse-move is stale (dragging
-                    // over another window sends us nothing). Physical
-                    // client px, like every other event carries.
-                    POINT drop_pt{};
-                    DragQueryPoint(drop, &drop_pt);
-                    e.mouse_x = static_cast<float>(drop_pt.x);
-                    e.mouse_y = static_cast<float>(drop_pt.y);
+                for (UINT i = 0; i < count; ++i) {
+                    if (!DragQueryFileW(drop, i, path, MAX_PATH)) continue;
+                    Event fe{};
+                    fe.type = Event::Type::FileDrop;
+                    fe.mouse_x = static_cast<float>(drop_pt.x);
+                    fe.mouse_y = static_cast<float>(drop_pt.y);
                     const int n = WideCharToMultiByte(CP_UTF8, 0, path, -1,
                                                       nullptr, 0, nullptr,
                                                       nullptr);
                     std::string utf8(static_cast<size_t>(n), '\0');
-                    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8.data(), n,
-                                        nullptr, nullptr);
+                    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8.data(),
+                                        n, nullptr, nullptr);
                     utf8.resize(strlen(utf8.c_str()));
-                    e.drop_path = std::move(utf8);
-                    emit(e);
+                    fe.drop_path = std::move(utf8);
+                    emit(fe);
                 }
                 DragFinish(drop);
                 return 0;

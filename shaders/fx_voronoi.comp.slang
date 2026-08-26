@@ -85,23 +85,28 @@ void main(uint3 tid : SV_DispatchThreadID)
         2.0 * shatter;
     const float border = sqrt(second) - sqrt(best);
     float3 col;
+    float col_a;
     if (style >= 0.5) {
         // Flat-shade the triangle of the three nearest seeds from its
         // centroid, and ink the bisector edges as the wireframe.
         const float2 centroid_p = (sp1 + sp2 + sp3) / 3.0;
         const float2 cuv = clamp(
             centroid_p * cell_px / size + offset / size, 0.0, 1.0);
-        col = input.SampleLevel(cuv, 0).rgb;
+        const float4 s = input.SampleLevel(cuv, 0);
+        col = s.rgb;
+        col_a = s.a;
         const float wire = 1.0 - smoothstep(0.0, 0.08, border);
         col *= 1.0 - wire * edge;
     } else {
         const float2 suv = clamp(uv + offset / size, 0.0, 1.0);
-        col = input.SampleLevel(suv, 0).rgb;
+        const float4 s = input.SampleLevel(suv, 0);
+        col = s.rgb;
+        col_a = s.a;
         const float crack = 1.0 - smoothstep(0.0, 0.12, border);
         col *= 1.0 - crack * edge;
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

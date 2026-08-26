@@ -50,6 +50,11 @@ struct Asset {
     // scratch cache is regenerable, so the one user decision baked into it
     // lives here and is re-applied whenever the asset opens.
     uint32_t still_duration_frames = 0;
+    // TRUE STILL (png/tga import): its frame count is authored on the
+    // PROJECT clock (the duration entry), so the conform rate never
+    // applies - unlike audio cover art, whose image side is sized in
+    // media frames to span the audio. Refreshed with the other facts.
+    bool still = false;
     // Browser bin this asset files under; 0 = the project root.
     uint64_t bin = 0;
 };
@@ -90,14 +95,19 @@ struct Placement {
     bool audio_mute = false;
     // Canvas composition (Motion, per block, VIDEO lanes): offset in
     // canvas fractions (+x right, +y down; 0 = centered), uniform scale
-    // about center, rotation in degrees, opacity into the lane stack.
-    // Pure stateless geometry - razored halves inherit it bit-identically
-    // and sequences still own no effects.
+    // and rotation (degrees) about the ANCHOR, opacity into the lane
+    // stack. Pure stateless geometry - razored halves inherit it
+    // bit-identically and sequences still own no effects.
     float pos_x = 0.0f;
     float pos_y = 0.0f;
     float scale = 1.0f;
     float rotate = 0.0f;
     float opacity = 1.0f;
+    // Scale/rotate pivot in BLOCK-LOCAL canvas fractions (travels with
+    // the block): forward map out = a + shift + S*R*(src - a), so 0.5
+    // is the media centre and the anchor alone never moves a pixel.
+    float anchor_x = 0.5f;
+    float anchor_y = 0.5f;
 };
 
 inline bool placement_has_transform(const Placement& p) {
@@ -107,10 +117,15 @@ inline bool placement_has_transform(const Placement& p) {
 
 // A sequence VIDEO LANE: placements in local time, topmost lane
 // composites last. Pure arrangement - it owns no effects, no state.
+// hidden drops the lane from the composite (render and export alike -
+// document state, not a view toggle); lock is an edit guard the
+// gesture surfaces honor - neither is an effect, both are arrangement.
 struct SeqTrack {
     uint64_t id = 0;
     std::string name;
     std::vector<Placement> placements;
+    bool hidden = false;
+    bool lock = false;
 };
 
 // AUDIO TRACK: sequence structure that feeds the mix, never an image.
@@ -123,6 +138,7 @@ struct AudioTrack {
     std::vector<Placement> placements;
     float gain = 1.0f;   // 0..2, linear
     bool mute = false;
+    bool lock = false;   // edit guard only; the mix ignores it
 };
 
 // Layer source: what a look-graph source node IS. Media reads an imported asset in
@@ -265,8 +281,12 @@ struct Layer {
     float crop_l = 0.0f, crop_r = 0.0f;   // fraction of frame, 0..0.45
     float crop_t = 0.0f, crop_b = 0.0f;
     bool flip_h = false, flip_v = false;
-    float xf_scale = 1.0f;                // about frame center, 0.25..4
+    float xf_scale = 1.0f;                // about the anchor, 0.25..4
     float xf_rotate = 0.0f;               // degrees, -180..180
+    // Scale/rotate pivot in frame fractions; 0.5 = frame centre (the
+    // anchor alone never moves a pixel).
+    float xf_anchor_x = 0.5f;
+    float xf_anchor_y = 0.5f;
     // Node-canvas position of the layer's SOURCE node; (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
@@ -298,6 +318,23 @@ inline constexpr size_t kMaxLooks = 256;
 inline constexpr int kMaxLookDepth = 8;   // nesting guard, both entities
 inline constexpr float kMaxSpeed = 4.0f;  // time-remap speed range 0..4
 
+// Optional per-entity FORMAT: all-zero = UNSET = inherit the PROJECT
+// format, so an unset entity behaves identically wherever it nests.
+// fps pins the entity's LOCAL CLOCK (lanes, value graph, stateful
+// effects all tick it; nesting hops conform via the composed rate);
+// w/h pin its render canvas (the consumer fits it like media).
+// Formats live on the TEMPLATE, shared by reference - MAKE UNIQUE
+// forks them; placements never carry one.
+struct EntityFormat {
+    uint32_t w = 0, h = 0;
+    double fps = 0.0;
+};
+
+inline bool format_has_fps(const EntityFormat& f) { return f.fps > 0.0; }
+inline bool format_has_canvas(const EntityFormat& f) {
+    return f.w > 0 && f.h > 0;
+}
+
 // A look: one graph, one linear local clock, no arrangement.
 struct Look {
     uint64_t id = 0;
@@ -305,6 +342,7 @@ struct Look {
     // Local length in frames; 0 = derived from the longest source
     // (look_duration). Generator-only looks derive 0 = unbounded.
     uint32_t duration = 0;
+    EntityFormat format;
     // Browser bin; 0 = the project root.
     uint64_t bin = 0;
     // Output audio routing. COMBINED (false, default): image and audio
@@ -347,6 +385,7 @@ struct Sequence {
     std::string name;
     // Local length in frames; 0 = derived from the furthest block end.
     uint32_t duration = 0;
+    EntityFormat format;
     // Browser bin; 0 = the project root.
     uint64_t bin = 0;
 
@@ -426,9 +465,9 @@ struct Document {
     uint32_t export_scale = 1;
     bool export_audio = true;
 
-    // A fresh project holds one empty sequence (one video lane) and one
-    // starter look with a single media node - the timeline to cut on and
-    // a look to build in.
+    // A fresh project holds one empty sequence (one video lane, one
+    // audio track) and one starter look with a single media node - the
+    // timeline to cut on and a look to build in.
     Document() {
         Sequence seq;
         seq.id = next_effect_id++;
@@ -437,6 +476,10 @@ struct Document {
         lane.id = next_effect_id++;
         lane.name = "v1";
         seq.tracks.push_back(std::move(lane));
+        AudioTrack atrack;
+        atrack.id = next_effect_id++;
+        atrack.name = "a1";
+        seq.audio.push_back(std::move(atrack));
         root_sequence = seq.id;
         sequences.push_back(std::move(seq));
 
@@ -548,43 +591,103 @@ inline uint32_t look_duration(const Document& doc, const Look& look,
 inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
                                   int depth);
 
-// Frame count a look-graph source can play from local 0: the media past
-// its slip for media, the nested entity's duration for refs, 0 for
-// generators and unbound sources (no when / unbounded).
+// The project's frame rate: its own setting, else the first asset that
+// knows one (asset fps is cached from the bundle, so this resolves
+// before any decode opens). One clock for every entity, so nested local
+// times stay commensurable.
+inline double project_fps(const Document& doc) {
+    if (doc.fps > 0.0) return doc.fps;
+    for (const Asset& a : doc.assets)
+        if (a.fps > 0.0) return a.fps;
+    return 30.0;
+}
+
+// The clock an entity's LOCAL frames tick at: its pinned fps, else the
+// project's. One conversion rule everywhere: a nesting hop's ratio is
+// child_effective_fps / parent_effective_fps (frames of child per
+// frame of parent).
+inline double effective_fps(const Document& doc, const Look& l) {
+    return format_has_fps(l.format) ? l.format.fps : project_fps(doc);
+}
+inline double effective_fps(const Document& doc, const Sequence& s) {
+    return format_has_fps(s.format) ? s.format.fps : project_fps(doc);
+}
+inline double entity_fps(const Document& doc, uint64_t id) {
+    if (const Look* l = doc.find_look(id)) return effective_fps(doc, *l);
+    if (const Sequence* s = doc.find_sequence(id))
+        return effective_fps(doc, *s);
+    return project_fps(doc);
+}
+
+// Media-hop conform ratio: MEDIA frames advanced per CLOCK frame (the
+// OWNING entity's effective rate), so a mismatched-rate asset holds
+// its true duration instead of playing fast or slow (audio already
+// conforms by sample rate - this is the picture's half). True stills
+// and unknown rates play 1:1 by frame.
+inline double media_conform_rate(const Document& doc, const Asset& a,
+                                 double clock_fps) {
+    (void)doc;
+    if (a.still) return 1.0;
+    return (a.fps > 0.0 && clock_fps > 0.0) ? a.fps / clock_fps : 1.0;
+}
+
+// Entity-local frames -> CLOCK frames across a hop (ratio = child
+// frames per clock frame); ceil keeps the last partial frame playable.
+inline uint32_t conform_frames(uint32_t frames, double ratio) {
+    if (frames == 0 || ratio <= 0.0) return frames;
+    return static_cast<uint32_t>(
+        std::ceil(static_cast<double>(frames) / ratio));
+}
+
+// Frame count a look-graph source can play from local 0, in the OWNING
+// look's clock frames (clock_fps): the media past its slip for media
+// (conformed onto the clock), the nested entity's duration for refs
+// (conformed through the hop ratio), 0 for generators and unbound
+// sources (no when / unbounded).
 inline uint32_t layer_source_length(const Document& doc, const Layer& l,
-                                    int depth = 0) {
+                                    double clock_fps, int depth = 0) {
     if (depth >= kMaxLookDepth) return 0;
     if (layer_is_media(l)) {
         const Asset* a = doc.find_asset(l.asset);
         if (!a || !a->frame_count) return 0;
-        return a->frame_count > l.slip ? a->frame_count - l.slip : 0;
+        const uint32_t remain =
+            a->frame_count > l.slip ? a->frame_count - l.slip : 0;
+        return conform_frames(remain, media_conform_rate(doc, *a,
+                                                         clock_fps));
     }
     if (l.source == LayerSourceKind::LookRef) {
         const Look* t = doc.find_look(l.target);
-        return t ? look_duration(doc, *t, depth + 1) : 0;
+        if (!t) return 0;
+        return conform_frames(look_duration(doc, *t, depth + 1),
+                              effective_fps(doc, *t) / clock_fps);
     }
     if (l.source == LayerSourceKind::SequenceRef) {
         const Sequence* t = doc.find_sequence(l.target);
-        return t ? sequence_duration(doc, *t, depth + 1) : 0;
+        if (!t) return 0;
+        return conform_frames(sequence_duration(doc, *t, depth + 1),
+                              effective_fps(doc, *t) / clock_fps);
     }
     return 0;
 }
 
-// Local length of a look: its explicit duration, else its longest source
-// (everything plays in lockstep from local 0). Generator-only looks
-// derive 0 = unbounded - the placing block bounds them.
+// Local length of a look IN ITS OWN clock frames: its explicit
+// duration, else its longest source (everything plays in lockstep from
+// local 0). Generator-only looks derive 0 = unbounded - the placing
+// block bounds them.
 inline uint32_t look_duration(const Document& doc, const Look& look,
                               int depth = 0) {
     if (look.duration) return look.duration;
     if (depth >= kMaxLookDepth) return 0;
+    const double eff = effective_fps(doc, look);
     uint32_t end = 0;
     for (const Layer& l : look.layers)
-        end = std::max(end, layer_source_length(doc, l, depth));
+        end = std::max(end, layer_source_length(doc, l, eff, depth));
     return end;
 }
 
-// Frame count of what a placement plays: its target entity's duration;
-// 0 for unbound targets (unbounded).
+// Frame count of what a placement plays, in the TARGET entity's OWN
+// clock frames (source_in and the ratio-aware end math live in that
+// domain); 0 for unbound targets (unbounded).
 inline uint32_t source_length(const Document& doc, const Placement& p,
                               int depth = 0) {
     if (!p.target || depth >= kMaxLookDepth) return 0;
@@ -595,10 +698,22 @@ inline uint32_t source_length(const Document& doc, const Placement& p,
     return 0;
 }
 
+// The nesting hop's clock ratio for a placement: TARGET frames per
+// PARENT frame (1 for unbound targets and matched clocks). Composes
+// with the placement speed - the affine's child advance per parent
+// frame is speed * ratio.
+inline double placement_ratio(const Document& doc, const Placement& p,
+                              double parent_fps) {
+    if (!p.target || parent_fps <= 0.0) return 1.0;
+    return entity_fps(doc, p.target) / parent_fps;
+}
+
 // Exclusive local end of a placement: its explicit out point, else what
-// REMAINS of the target (past source_in, through the speed) from t_in.
-// 0 = unbounded.
-inline uint32_t placement_end(const Placement& p, uint32_t source_len) {
+// REMAINS of the target (past source_in, through speed * hop ratio)
+// from t_in. source_len and source_in are TARGET frames; ratio converts
+// the remainder onto the parent clock. 0 = unbounded.
+inline uint32_t placement_end(const Placement& p, uint32_t source_len,
+                              double ratio = 1.0) {
     if (p.t_out) return p.t_out;
     if (!source_len) return 0;
     // What remains past source_in: a trimmed or razored placement ends
@@ -610,9 +725,9 @@ inline uint32_t placement_end(const Placement& p, uint32_t source_len) {
     // result stays a frame index instead of wrapping. kFrameCeiling is
     // far past any real timeline and well inside uint32.
     constexpr double kFrameCeiling = 1.0e9;
-    const double span = std::min(static_cast<double>(remain) /
-                                     std::max(static_cast<double>(p.speed),
-                                              1e-6),
+    const double advance = std::max(
+        static_cast<double>(p.speed) * (ratio > 0.0 ? ratio : 1.0), 1e-6);
+    const double span = std::min(static_cast<double>(remain) / advance,
                                  kFrameCeiling);
     const double end = static_cast<double>(p.t_in) +
                        std::max(1.0, std::floor(span));
@@ -626,15 +741,18 @@ inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
                                   int depth = 0) {
     if (seq.duration) return seq.duration;
     if (depth >= kMaxLookDepth) return 0;
+    const double eff = effective_fps(doc, seq);
     uint32_t end = 0;
     for (const SeqTrack& t : seq.tracks)
         for (const Placement& p : t.placements)
-            end = std::max(end,
-                           placement_end(p, source_length(doc, p, depth + 1)));
+            end = std::max(
+                end, placement_end(p, source_length(doc, p, depth + 1),
+                                   placement_ratio(doc, p, eff)));
     for (const AudioTrack& t : seq.audio)
         for (const Placement& p : t.placements)
-            end = std::max(end,
-                           placement_end(p, source_length(doc, p, depth + 1)));
+            end = std::max(
+                end, placement_end(p, source_length(doc, p, depth + 1),
+                                   placement_ratio(doc, p, eff)));
     return end;
 }
 
@@ -645,9 +763,9 @@ inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
 // through this one predicate (the razor additionally excludes the exact
 // head: a cut AT t_in is a no-op, not a zero-width left half).
 inline bool placement_active(const Placement& p, uint32_t source_len,
-                             double local) {
+                             double local, double ratio = 1.0) {
     if (local < static_cast<double>(p.t_in)) return false;
-    const uint32_t end = placement_end(p, source_len);
+    const uint32_t end = placement_end(p, source_len, ratio);
     return end == 0 || local < static_cast<double>(end);
 }
 
@@ -659,20 +777,25 @@ inline bool placement_active(const Placement& p, uint32_t source_len,
 // selects a block the render did not draw.
 inline const Placement* placement_winner(
     const Document& doc, const std::vector<Placement>& placements,
-    double local) {
+    double local, double parent_fps) {
     const Placement* best = nullptr;
     for (const Placement& p : placements) {
-        if (!placement_active(p, source_length(doc, p), local)) continue;
+        if (!placement_active(p, source_length(doc, p), local,
+                              placement_ratio(doc, p, parent_fps)))
+            continue;
         if (!best || p.t_in >= best->t_in) best = &p;
     }
     return best;
 }
 
 // Local frame -> target frame. The affine map that composes under
-// nesting; callers check placement_active first.
-inline double placement_source_frame(const Placement& p, double local) {
+// nesting - the hop's clock ratio scales the advance so a pinned
+// target's own frames tick at its own rate; callers check
+// placement_active first.
+inline double placement_source_frame(const Placement& p, double local,
+                                     double ratio = 1.0) {
     return (local - static_cast<double>(p.t_in)) *
-               static_cast<double>(p.speed) +
+               static_cast<double>(p.speed) * ratio +
            static_cast<double>(p.source_in);
 }
 
@@ -680,22 +803,23 @@ inline constexpr float kDeg2Rad = 0.01745329252f;
 
 // Inverse of the placement's canvas affine: monitor-content UV
 // (fractions of the rect) to the block's own frame, which spans
-// [-0.5, 0.5] on both axes. Mirrors layer_blend.comp.slang's forward
-// map; the click picker and the overlay drawer must both go through
-// this or the selection box detaches from the pixels - in opposite
-// directions.
+// [-0.5, 0.5] on both axes. Forward is out = a + shift + S*R*(src - a)
+// (the anchor is the fixed point of S*R). Mirrors
+// layer_blend.comp.slang's forward map; the click picker and the
+// overlay drawer must both go through this or the selection box
+// detaches from the pixels - in opposite directions.
 inline void placement_uv_to_block(const Placement& p, float u, float v,
                                   float aspect, float* bx, float* by) {
     const float rad = p.rotate * kDeg2Rad;
     const float cs = std::cos(rad), sn = std::sin(rad);
-    const float cxf = u - 0.5f - p.pos_x;
-    const float cyf = v - 0.5f - p.pos_y;
+    const float cxf = u - p.anchor_x - p.pos_x;
+    const float cyf = v - p.anchor_y - p.pos_y;
     const float qx = cxf * aspect, qy = cyf;
     const float rx = qx * cs + qy * sn;
     const float ry = -qx * sn + qy * cs;
     const float s = std::max(p.scale, 1e-4f);
-    *bx = rx / s / aspect;
-    *by = ry / s;
+    *bx = rx / s / aspect + p.anchor_x - 0.5f;
+    *by = ry / s + p.anchor_y - 0.5f;
 }
 
 // Head-trim: move the start to `at` with the surviving content held on
@@ -703,8 +827,10 @@ inline void placement_uv_to_block(const Placement& p, float u, float v,
 // for razor, trim drags and overwrite - paths rounding differently land
 // razored and overwritten heads on different source frames at
 // fractional speeds.
-inline void trim_placement_head(Placement& p, uint32_t at) {
-    const double src = placement_source_frame(p, static_cast<double>(at));
+inline void trim_placement_head(Placement& p, uint32_t at,
+                                double ratio = 1.0) {
+    const double src =
+        placement_source_frame(p, static_cast<double>(at), ratio);
     p.source_in = src <= 0.0 ? 0u : static_cast<uint32_t>(src);
     p.t_in = at;
 }

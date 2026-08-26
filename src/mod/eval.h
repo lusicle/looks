@@ -42,16 +42,19 @@ struct AnalysisCurves {
 };
 
 // Runtime analysis for audio-driven nodes (ValueNode.audio_src): curves
-// computed from the wired chain's PROCESSED audio, media-frame indexed;
-// slip + offset (Offset shims on the chain) map the look clock onto the
-// curve. Keyed by value-node id (ids are globally unique). The input is
-// REQUIRED: an unwired node or a wire with no entry reads 0 - never the
-// global curves. Beat/LfoBeat clocks anchor on the same media position,
-// so cuts of one media beat-match by construction.
+// computed from the wired chain's PROCESSED audio, MEDIA-frame indexed
+// on the asset's own rate; the media frame behind look-local L is
+// floor(L * rate) + slip + offset (rate = the chain's conform ratio,
+// slip/offset the Offset shims). Keyed by value-node id (ids are
+// globally unique). The input is REQUIRED: an unwired node or a wire
+// with no entry reads 0 - never the global curves. Beat/LfoBeat clocks
+// anchor on the same media position, so cuts of one media beat-match by
+// construction.
 struct NodeAudio {
     std::shared_ptr<const AnalysisCurves> curves;
     uint32_t slip = 0;
     int64_t offset = 0;
+    double rate = 1.0;   // media frames per look-clock frame
 };
 using NodeAudioMap = std::unordered_map<uint64_t, NodeAudio>;
 
@@ -82,6 +85,7 @@ struct NodeCamera {
     std::shared_ptr<const CameraCurves> curves;
     uint32_t slip = 0;
     int64_t offset = 0;
+    double rate = 1.0;   // media frames per look-clock frame
 };
 using NodeCameraMap = std::unordered_map<uint64_t, NodeCamera>;
 

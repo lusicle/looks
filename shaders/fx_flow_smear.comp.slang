@@ -32,7 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float2 mv = flow.SampleLevel(uv, 0).rg * amount;
 
-    float3 sum = base.rgb;
+    float4 sum = base;
     float weight_sum = 1.0;
     [unroll]
     for (int i = 1; i <= 12; ++i)
@@ -40,10 +40,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float t = float(i) / 12.0;
         const float w = 1.0 - saturate(falloff) * t;
         const float2 p = uv - mv * t / size;
-        sum += input.SampleLevel(saturate(p), 0).rgb * w;
+        sum += input.SampleLevel(saturate(p), 0) * w;
         weight_sum += w;
     }
-    const float4 result = float4(sum / weight_sum, base.a);
+    const float4 result = sum / weight_sum;
 
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

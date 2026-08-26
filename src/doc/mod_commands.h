@@ -93,9 +93,12 @@ std::unique_ptr<Command> set_lane_mute_command(uint64_t look, ParamKey target,
 std::unique_ptr<Command> set_time_remap_command(float speed, uint32_t mode);
 
 // Project format: frame rate + canvas size (0 = derive from the first
-// asset). One clock and one canvas for every entity.
+// asset). The default clock and canvas for every entity.
 std::unique_ptr<Command> set_project_format_command(double fps, uint32_t w,
                                                     uint32_t h);
+// Per-entity format (look or sequence): all-zero = inherit the project.
+std::unique_ptr<Command> set_entity_format_command(uint64_t entity,
+                                                   EntityFormat format);
 
 // Sidechain + audio nudge. Coalesces (offset drags).
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,

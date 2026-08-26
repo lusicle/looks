@@ -38,14 +38,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float rim = smoothstep(0.08, 0.15, b) - body;
 
     float3 col;
+    float col_a = base.a;
     if (ink < 0.5) {
         col = base.rgb * (1.0 - body * 0.92);
         col += rim * base.rgb * 0.8 + rim * 0.05;
     } else {
         col = base.rgb + body * (base.rgb * 2.5 + 0.08) + rim * 0.15;
+        // The pattern's own light (the non-content-gated terms) carries
+        // coverage where it crawls past the content.
+        col_a = max(col_a, saturate(body * 0.08 + rim * 0.15));
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

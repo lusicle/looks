@@ -34,10 +34,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float shift_px = depth * lerp(1.0, l, saturate(pop));
     const float2 shift = float2(shift_px / size.x, 0.0);
 
-    const float3 left =
-        input.SampleLevel(clamp(uv - shift, 0.0, 1.0), 0).rgb;
-    const float3 right =
-        input.SampleLevel(clamp(uv + shift, 0.0, 1.0), 0).rgb;
+    const float4 left4 = input.SampleLevel(clamp(uv - shift, 0.0, 1.0), 0);
+    const float4 right4 = input.SampleLevel(clamp(uv + shift, 0.0, 1.0), 0);
+    const float3 left = left4.rgb;
+    const float3 right = right4.rgb;
 
     const uint m = uint(mode + 0.5);
     float3 outc;
@@ -48,7 +48,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     else                 // red/cyan
         outc = float3(left.r, right.g, right.b);
 
-    const float4 result = float4(outc, base.a);
+    // One alpha covers both eyes: the union of the shifted coverages.
+    const float4 result = float4(outc, max(left4.a, right4.a));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

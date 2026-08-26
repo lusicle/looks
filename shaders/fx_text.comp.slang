@@ -79,7 +79,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 c = lerp(enc, float3(0.02, 0.02, 0.02), cov_out);
     c = lerp(c, fill, cov);
 
-    const float4 result = float4(fx_srgb_eotf(saturate(c)), base.a);
+    // Drawn glyphs union their coverage in - text over transparency
+    // must show through the layer gate.
+    const float4 result = float4(fx_srgb_eotf(saturate(c)),
+                                 max(base.a, cov_out));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

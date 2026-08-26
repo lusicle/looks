@@ -150,6 +150,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     ui::Canvas2D& canvas = frame.canvas;
     const size_t n = std::min(g.node_count, kMaxNodes);
 
+    // Wall-clock for the double-click windows: frame-count windows
+    // shrink with the UI rate (24 frames at 150 fps is 160 ms - under
+    // any real mouse double-click), so every detector below measures
+    // SECONDS on this accumulated clock instead.
+    st.clock += frame.dt;
+
     // ---- view transform
     if (!st.view_inited) {
         st.view_inited = true;
@@ -591,6 +597,54 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
+    // Port STACK popup: feeds of (node, port) in link order, top row =
+    // drawn last (the top of the stack). Arrow clicks emit a reorder
+    // and the popup stays open - the rows re-read the wires, so the
+    // move shows immediately. Any other click closes it.
+    auto port_feed_count = [&]() -> size_t {
+        size_t feeds = 0;
+        for (size_t w = 0; w < g.wire_count; ++w)
+            if (!g.wires[w].data && g.wires[w].to == st.port_menu_node &&
+                g.wires[w].to_port == st.port_menu_port)
+                ++feeds;
+        return feeds;
+    };
+    auto port_menu_rect = [&](size_t feeds) -> Rect {
+        return {st.port_menu_anchor.x, st.port_menu_anchor.y, 200.0f,
+                static_cast<float>(feeds) * 20.0f + 8.0f};
+    };
+    if (st.port_menu_open) {
+        const size_t feeds = port_feed_count();
+        if (feeds < 2) st.port_menu_open = false;
+        if (st.port_menu_open && frame.input.left_pressed() && owns) {
+            menu_swallowed_press = true;
+            const Rect mr = port_menu_rect(feeds);
+            if (mr.contains(mouse)) {
+                const int row =
+                    static_cast<int>((mouse.y - (mr.y + 4.0f)) / 20.0f);
+                if (row >= 0 && row < static_cast<int>(feeds)) {
+                    const int index =
+                        static_cast<int>(feeds) - 1 - row;
+                    if (mouse.x >= mr.right() - 20.0f) {
+                        out.port_reorder = true;   // v: toward bottom
+                        out.reorder_node = st.port_menu_node;
+                        out.reorder_port = st.port_menu_port;
+                        out.reorder_index = index;
+                        out.reorder_delta = -1;
+                    } else if (mouse.x >= mr.right() - 40.0f) {
+                        out.port_reorder = true;   // ^: toward top
+                        out.reorder_node = st.port_menu_node;
+                        out.reorder_port = st.port_menu_port;
+                        out.reorder_index = index;
+                        out.reorder_delta = 1;
+                    }
+                }
+            } else {
+                st.port_menu_open = false;
+            }
+        }
+    }
+
     // Param dropdown popup: resolve the open field's row each
     // frame (pointers are per-frame); a pick stages the option index
     // exactly like a slider release, so the existing param appliers and
@@ -748,10 +802,36 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
             // Input ports: a FED port picks its wire up (rewire, texed
             // pick-up-from-source); an EMPTY one extends a new wire whose
-            // fixed end is the input, seeking an Out port (kind 8).
+            // fixed end is the input, seeking an Out port (kind 8). A
+            // DOUBLE-CLICK on a port with two or more feeds opens the
+            // STACK popup instead (link-order reordering).
             auto grab_input = [&](Vec2 p,
                                   uint32_t port) {
                 if (!near2(p, 81.0f)) return;
+                size_t feeds = 0;
+                for (size_t w = 0; w < g.wire_count; ++w)
+                    if (!g.wires[w].data && g.wires[w].to == nd.id &&
+                        g.wires[w].to_port == port)
+                        ++feeds;
+                const float pdd =
+                    std::fabs(mouse.x - st.last_port_pos.x) +
+                    std::fabs(mouse.y - st.last_port_pos.y);
+                if (feeds >= 2 && st.last_port_time >= 0.0 &&
+                    st.clock - st.last_port_time < 0.4 && pdd < 8.0f &&
+                    st.last_port_node == nd.id &&
+                    st.last_port_port == port) {
+                    st.port_menu_open = true;
+                    st.port_menu_anchor = mouse;
+                    st.port_menu_node = nd.id;
+                    st.port_menu_port = port;
+                    st.last_port_time = -1.0;
+                    port_handled = true;
+                    return;
+                }
+                st.last_port_time = st.clock;
+                st.last_port_pos = mouse;
+                st.last_port_node = nd.id;
+                st.last_port_port = port;
                 for (size_t w = 0; w < g.wire_count; ++w)
                     if (!g.wires[w].data &&
                         g.wires[w].to_port == port &&
@@ -881,12 +961,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (!handled) {
                 // Body press: select now, drag moves the node. A double
                 // click on a folded Group card enters it (subgraphs).
-                const uint64_t fnum = frame.ctx.frame();
+                const bool second =
+                    st.last_click_time >= 0.0 &&
+                    st.clock - st.last_click_time < 0.4;
                 const float dd =
                     std::fabs(mouse.x - st.last_click_pos.x) +
                     std::fabs(mouse.y - st.last_click_pos.y);
-                if (nd.kind == NodeKind::Group &&
-                    fnum - st.last_click_frame < 24 && dd < 8.0f &&
+                if (nd.kind == NodeKind::Group && second && dd < 8.0f &&
                     st.last_click_id == nd.id) {
                     // Title double-click renames, body opens (texed
                     // subgraph: title = rename, body = enter).
@@ -894,24 +975,22 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         out.group_rename = nd.id;
                     else
                         out.group_open = nd.id;
-                    st.last_click_frame = 0;
-                } else if (nd.is_look &&
-                           fnum - st.last_click_frame < 24 && dd < 8.0f &&
+                    st.last_click_time = -1.0;
+                } else if (nd.is_look && second && dd < 8.0f &&
                            st.last_click_id == nd.id &&
                            mouse.y >= cr.y + kTitleH * z) {
                     // A look instance: enter the look it plays.
                     out.look_open = nd.id;
-                    st.last_click_frame = 0;
-                } else if (nd.text_edit &&
-                           fnum - st.last_click_frame < 24 && dd < 8.0f &&
+                    st.last_click_time = -1.0;
+                } else if (nd.text_edit && second && dd < 8.0f &&
                            st.last_click_id == nd.id &&
                            mouse.y < cr.y + kTitleH * z) {
                     // Text card: title double-click edits the
                     // string through the shared inline editor.
                     out.text_edit = nd.id;
-                    st.last_click_frame = 0;
+                    st.last_click_time = -1.0;
                 } else {
-                    st.last_click_frame = fnum;
+                    st.last_click_time = st.clock;
                     st.last_click_pos = mouse;
                     st.last_click_id = nd.id;
                     out.clicked = nd.id;
@@ -965,16 +1044,16 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     *fb.color_clicked = true;   // cycles the colour tag
                 } else {
                     const uint64_t fid = node_id(NodeKind::Frame, fb.id);
-                    const uint64_t fnum = frame.ctx.frame();
                     const float dd =
                         std::fabs(mouse.x - st.last_click_pos.x) +
                         std::fabs(mouse.y - st.last_click_pos.y);
-                    if (fnum - st.last_click_frame < 24 && dd < 8.0f &&
-                        st.last_click_id == fid) {
+                    if (st.last_click_time >= 0.0 &&
+                        st.clock - st.last_click_time < 0.4 &&
+                        dd < 8.0f && st.last_click_id == fid) {
                         out.frame_rename = fb.id;
-                        st.last_click_frame = 0;
+                        st.last_click_time = -1.0;
                     } else {
-                        st.last_click_frame = fnum;
+                        st.last_click_time = st.clock;
                         st.last_click_pos = mouse;
                         st.last_click_id = fid;
                         st.drag_kind = 1;
@@ -1234,14 +1313,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                    st.drag_id == kEmptyPress && owns) {
             // Still click on empty canvas: a wire under the cursor gets
             // selected (texed sel.links); else deselect; double = add.
-            const uint64_t f = frame.ctx.frame();
             const float dd =
                 std::fabs(mouse.x - st.last_click_pos.x) +
                 std::fabs(mouse.y - st.last_click_pos.y);
-            if (f - st.last_click_frame < 24 && dd < 8.0f &&
+            if (st.last_click_time >= 0.0 &&
+                st.clock - st.last_click_time < 0.4 && dd < 8.0f &&
                 st.last_click_id == kEmptyPress) {
                 open_add_menu();
-                st.last_click_frame = 0;
+                st.last_click_time = -1.0;
             } else {
                 float best = 9.0f * 9.0f;
                 int hit = -1;
@@ -1268,7 +1347,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     out.clicked_empty = true;
                     st.last_click_id = kEmptyPress;
                 }
-                st.last_click_frame = f;
+                st.last_click_time = st.clock;
                 st.last_click_pos = mouse;
             }
         }
@@ -2194,6 +2273,51 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             ui::draw_text(canvas, frame.font, g.ctx_items[i],
                           {mr.x + 10.0f, ry + 4.0f}, 11.0f,
                           hot ? theme.text : theme.text_dim);
+        }
+    }
+
+    // Port stack popup: feeder titles top-first (row 0 = the top of the
+    // stack) with ^/v arrows on the right.
+    if (st.port_menu_open) {
+        const size_t feeds = port_feed_count();
+        const Rect mr = port_menu_rect(feeds);
+        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
+        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
+        size_t seen = 0;
+        for (size_t w = 0; w < g.wire_count; ++w) {
+            const Wire& wr = g.wires[w];
+            if (wr.data || wr.to != st.port_menu_node ||
+                wr.to_port != st.port_menu_port)
+                continue;
+            // Feed index `seen` (bottom-first) draws at the mirrored row.
+            const size_t row = feeds - 1 - seen;
+            const float ry = mr.y + 4.0f + static_cast<float>(row) * 20.0f;
+            const char* title = "?";
+            for (size_t i = 0; i < g.node_count; ++i)
+                if (g.nodes[i].id == wr.from) title = g.nodes[i].title;
+            ui::probe_add("stack:" + std::string(title),
+                          {mr.x, ry, mr.w, 20.0f});
+            const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
+                             mouse.y >= ry && mouse.y < ry + 20.0f;
+            if (hot)
+                canvas.draw_rect({mr.x + 2.0f, ry, mr.w - 4.0f, 20.0f},
+                                 theme.control_bg_hover);
+            ui::draw_text(canvas, frame.font, title,
+                          {mr.x + 10.0f, ry + 4.0f}, 11.0f,
+                          hot ? theme.text : theme.text_dim);
+            const bool can_up = seen + 1 < feeds;
+            const bool can_dn = seen > 0;
+            ui::draw_icon_glyph(canvas, frame.font, ui::Icon::Up,
+                                {mr.right() - 30.0f, ry + 10.0f},
+                                can_up ? theme.text_dim
+                                       : theme.text_disabled,
+                                11.0f);
+            ui::draw_icon_glyph(canvas, frame.font, ui::Icon::Down,
+                                {mr.right() - 10.0f, ry + 10.0f},
+                                can_dn ? theme.text_dim
+                                       : theme.text_disabled,
+                                11.0f);
+            ++seen;
         }
     }
 

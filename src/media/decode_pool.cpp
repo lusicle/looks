@@ -154,7 +154,8 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
             if (a.key != b.key || a.owner != b.owner || a.layer != b.layer ||
                 a.asset != b.asset || a.t_in != b.t_in ||
                 a.t_out != b.t_out || a.source_in != b.source_in ||
-                a.speed != b.speed || a.gain != b.gain) {
+                a.speed != b.speed || a.rate != b.rate ||
+                a.shift != b.shift || a.gain != b.gain) {
                 same = false;
                 break;
             }
@@ -197,7 +198,7 @@ std::vector<DecodePool::Request> DecodePool::plan(uint32_t root_frame) const {
         if (!b || bundle_video(*b).empty() || b->frames == 0) continue;
         // A placement may outlive its media (an explicit out point past
         // the end): it holds the last frame rather than going blank.
-        const double src = std::floor(doc::media_source_frame(c, f));
+        const double src = doc::media_asset_frame(c, f);
         const double last = static_cast<double>(b->frames - 1);
         const uint32_t idx = static_cast<uint32_t>(
             std::clamp(src, 0.0, last));
@@ -877,7 +878,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         if (!b || bundle_video(*b).empty() || b->frames == 0) continue;
         const double at = std::max(
             first, std::min(first + span - 1.0, c.t_out - 1.0));
-        const double src = std::floor(doc::media_source_frame(c, at));
+        const double src = doc::media_asset_frame(c, at);
         Request req;
         req.key = c.key;
         req.source = i;

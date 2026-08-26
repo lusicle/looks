@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "codec/mez.h"
+#include "media/audio_mix.h"
 #include "media/bmff.h"
 #include "media/bundle.h"
 #include "media/export.h"
@@ -280,7 +281,7 @@ bool import_audio(BmffFile& file, const TrackInfo& track,
         while (decoder.receive(chunk)) {
             if (!writer_open) {
                 if (!writer.open(pcm_path, chunk.channels, chunk.sample_rate)) {
-                    result->error = "cannot create " + pcm_path.string();
+                    result->error = "cannot create " + path_to_u8(pcm_path);
                     return false;
                 }
                 writer_open = true;
@@ -395,7 +396,7 @@ bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
     codec::MezWriter writer;
     if (!writer.open(mez_path, frame.width, frame.height, kStillFps * 1000,
                      1000, options.quality)) {
-        result->error = "cannot create " + mez_path.string();
+        result->error = "cannot create " + path_to_u8(mez_path);
         return false;
     }
     if (!writer.add_frame(frame.view()) ||
@@ -507,7 +508,7 @@ bool import_audio_file(const std::filesystem::path& source,
     } else {
         const auto bytes = read_file_bytes(source);
         if (!bytes) {
-            result->error = "cannot open " + source.string();
+            result->error = "cannot open " + path_to_u8(source);
             return false;
         }
         if (bytes->empty()) {
@@ -533,7 +534,7 @@ bool import_audio_file(const std::filesystem::path& source,
         sidecars_for(dest_dir, source).pcm;
     PcmWriter writer;
     if (!writer.open(pcm_path, channels, rate)) {
-        result->error = "cannot create " + pcm_path.string();
+        result->error = "cannot create " + path_to_u8(pcm_path);
         return false;
     }
     if (!writer.append(samples.data(), samples.size())) {
@@ -603,7 +604,7 @@ bool extract_audio_pcm(const std::filesystem::path& source,
             return fail("wav: " + wav_error);
         PcmWriter writer;
         if (!writer.open(dest_pcm, wav.channels, wav.sample_rate))
-            return fail("cannot create " + dest_pcm.string());
+            return fail("cannot create " + path_to_u8(dest_pcm));
         if (!writer.append(wav.samples.data(), wav.samples.size()))
             return fail("pcm write failed");
         writer.finish();
@@ -616,7 +617,7 @@ bool extract_audio_pcm(const std::filesystem::path& source,
             return fail("mp3: " + mp3_error);
         PcmWriter writer;
         if (!writer.open(dest_pcm, mp3.channels, mp3.sample_rate))
-            return fail("cannot create " + dest_pcm.string());
+            return fail("cannot create " + path_to_u8(dest_pcm));
         if (!writer.append(mp3.samples.data(), mp3.samples.size()))
             return fail("pcm write failed");
         writer.finish();
@@ -741,7 +742,8 @@ ImportResult consolidate_video(const std::filesystem::path& source,
     }
     result.ok = true;
     log_info("consolidate: %s -> all-intra %ux%u, %u frames @%0.3f fps",
-             source.filename().string().c_str(), w, h, frames, result.fps);
+             path_to_u8(source.filename()).c_str(), w, h, frames,
+             result.fps);
     return result;
 }
 
@@ -914,9 +916,11 @@ ImportResult import_media(const std::filesystem::path& source,
         log_warn("ingest: analysis write failed");
 
     result.ok = true;
+    if (progress && !result.pcm_path.empty())
+        progress->pcm = load_pcm(result.pcm_path);
     if (progress) progress->ready.store(true);
     log_info("ingest: %s ready — %u frames @%0.3f fps%s",
-             source.string().c_str(), result.frame_count, result.fps,
+             path_to_u8(source).c_str(), result.frame_count, result.fps,
              result.pcm_path.empty() ? "" : " + audio");
 
     // ---- background stage, same job: the one full decode feeding the

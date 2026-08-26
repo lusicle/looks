@@ -34,9 +34,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         // way a real lens does.
         const float2 d = uv - 0.5;
         const float s = amount / (0.5 * min(size.x, size.y));
-        const float r = input.SampleLevel(0.5 + d * (1.0 + s), 0).r;
-        const float b = input.SampleLevel(0.5 + d * (1.0 - s), 0).b;
-        result = float4(r, base.g, b, base.a);
+        const float4 sr = input.SampleLevel(0.5 + d * (1.0 + s), 0);
+        const float4 sb = input.SampleLevel(0.5 + d * (1.0 - s), 0);
+        // One alpha covers the channel spread: the union of the shifts.
+        result = float4(sr.r, base.g, sb.b,
+                        max(base.a, max(sr.a, sb.a)));
     } else {
         const float2 e = max(amount, 0.5) / size;
         const float l0 = fx_luma(saturate(base.rgb));
@@ -51,7 +53,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         // Peaks just below clipping, where CCD blooming actually sits.
         const float halo = saturate(1.0 - abs(l0 - 0.55) * 2.2);
         const float3 purple = float3(0.45, 0.1, 0.6);
-        result = float4(base.rgb + purple * gate * halo, base.a);
+        result = float4(base.rgb + purple * gate * halo,
+                        max(base.a, gate * halo * 0.6));
     }
 
     const float4 wetted = lerp(base, result, saturate(wet));

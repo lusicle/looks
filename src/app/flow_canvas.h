@@ -215,8 +215,11 @@ struct CanvasState {
     Vec2 press_screen{};
     float node_grab_x = 0.0f, node_grab_y = 0.0f;   // grab offset (graph)
     bool drag_moved = false;
-    // Double-click detection (frame-count based; UI clock, not timeline).
-    uint64_t last_click_frame = 0;
+    // Double-click detection: SECONDS on the canvas's accumulated
+    // clock (a frame-count window shrinks with the UI rate and misses
+    // real mouse doubles). -1 = no armed first click.
+    double clock = 0.0;
+    double last_click_time = -1.0;
     Vec2 last_click_pos{};
     uint64_t last_click_id = 0;      // what the click landed on
     // Cursor tracking published every frame: paste-at-cursor and the
@@ -262,6 +265,20 @@ struct CanvasState {
     bool ctx_open = false;
     Vec2 ctx_anchor{};
     uint64_t ctx_target = 0;
+    // Port STACK popup: double-click on an input port with two or more
+    // feeds lists them in stacking order (link order, top row = drawn
+    // last) with reorder arrows. Rows re-read the wires every frame, so
+    // a reorder shows live while the popup stays open.
+    bool port_menu_open = false;
+    Vec2 port_menu_anchor{};
+    uint64_t port_menu_node = 0;
+    uint32_t port_menu_port = 0;
+    // Double-click detection on input ports (ports grab wires on press,
+    // so they need their own tracker). Seconds, like last_click_time.
+    double last_port_time = -1.0;
+    Vec2 last_port_pos{};
+    uint64_t last_port_node = 0;
+    uint32_t last_port_port = 0;
     // Alt held when a frame drag started: move the frame WITHOUT its
     // contained nodes (texed alt+drag).
     bool drag_alt = false;
@@ -348,6 +365,14 @@ struct Output {
     uint32_t splice_wire_port = 0;
     // Frame move with alt held: the frame moves alone.
     bool moved_alt = false;
+    // Port stack popup: one feed swapped with its neighbour
+    // (reorder_index counts from the BOTTOM of the fan-in, delta +1 =
+    // toward the top). The app permutes the link vector, un-coalesced.
+    bool port_reorder = false;
+    uint64_t reorder_node = 0;
+    uint32_t reorder_port = 0;
+    int reorder_index = -1;
+    int reorder_delta = 0;
 };
 
 ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,

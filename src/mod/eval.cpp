@@ -313,9 +313,11 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
             if (it == env.node_camera->end() || !it->second.curves)
                 return 0.0f;
             const CameraCurves& c = *it->second.curves;
-            const int64_t pos = static_cast<int64_t>(env.frame) +
-                                static_cast<int64_t>(it->second.slip) +
-                                it->second.offset;
+            const int64_t pos =
+                static_cast<int64_t>(std::floor(
+                    static_cast<double>(env.frame) * it->second.rate)) +
+                static_cast<int64_t>(it->second.slip) +
+                it->second.offset;
             const uint32_t mf =
                 pos < 0 ? 0u : static_cast<uint32_t>(pos);
             switch (n->source.channel % 14u) {
@@ -354,15 +356,18 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
             if (it == env.node_audio->end() || !it->second.curves)
                 return 0.0f;
             const AnalysisCurves& c = *it->second.curves;
-            // The same audio-nudge shift eval_source used to apply.
+            // The same audio-nudge shift eval_source used to apply
+            // (clock seconds, so it lands BEFORE the conform rate).
             const double shifted = static_cast<double>(env.frame) -
                                    env.audio_off * env.fps;
             const uint32_t local =
                 shifted <= 0.0 ? 0u
                                : static_cast<uint32_t>(shifted + 0.5);
-            const int64_t pos = static_cast<int64_t>(local) +
-                                static_cast<int64_t>(it->second.slip) +
-                                it->second.offset;
+            const int64_t pos =
+                static_cast<int64_t>(std::floor(
+                    static_cast<double>(local) * it->second.rate)) +
+                static_cast<int64_t>(it->second.slip) +
+                it->second.offset;
             const uint32_t mf =
                 pos < 0 ? 0u : static_cast<uint32_t>(pos);
             switch (n->source.type) {
@@ -375,16 +380,18 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
                 case doc::ModSourceType::AudioOnset:
                     return c.sample(c.onset, mf);
                 default: {
-                    // Beat / LfoBeat / Envelope on the chain's clock.
+                    // Beat / LfoBeat / Envelope on the chain's MEDIA
+                    // clock: the curve grid is the asset's own rate
+                    // (rate * project fps), so beat phase anchors on
+                    // media seconds at any conform ratio.
+                    const double cfps = it->second.rate * env.fps;
                     const double tm =
-                        env.fps > 0.0
-                            ? static_cast<double>(mf) / env.fps
-                            : 0.0;
+                        cfps > 0.0 ? static_cast<double>(mf) / cfps : 0.0;
                     if (n->source.type == doc::ModSourceType::LfoBeat)
                         return eval_lfo_beat(n->source, tm, &c);
                     if (n->source.type == doc::ModSourceType::Beat)
                         return eval_beat(n->source, tm, &c);
-                    return eval_envelope(n->source, mf, &c, env.fps, tm,
+                    return eval_envelope(n->source, mf, &c, cfps, tm,
                                          env.key_time);
                 }
             }

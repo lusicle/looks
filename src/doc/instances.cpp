@@ -18,8 +18,15 @@ struct Cursor {
     uint64_t entity = 0;   // a look or a sequence
     uint64_t path = 0;
     int depth = 0;
+    // local = a * root + b maps ROOT frames onto THIS entity's OWN
+    // clock: every nesting hop folds its fps ratio into the affine, so
+    // pinned entities tick their own rate and the flatten stays one
+    // closed form.
     double a = 1.0, b = 0.0;
     double r0 = 0.0, r1 = kUnbounded;
+    // The ROOT entity's effective rate: TIMELINE-LOCKED media reads the
+    // root clock, so its conform ratio is against this.
+    double root_fps = 30.0;
     float gain = 1.0f;
     // Audio walk: DSP hops accumulated OUTSIDE this instance, appended
     // after each emitted voice's own chain (inner ops run first). The
@@ -30,8 +37,9 @@ struct Cursor {
 // Clamps the cursor's root window to a child live on LOCAL [lo, hi)
 // (hi = kUnbounded for none), and composes the child clock through a
 // placement-shaped step (speed, source_in). Returns false when the
-// window closes. Both bounds are whole frames, so the continuous test
-// agrees with the compiler's floored one exactly.
+// window closes. The flatten and the compiler test the SAME real
+// bounds (conformed media windows may be fractional), so the
+// continuous test and the point test agree exactly.
 bool child_window(const Cursor& cur, double lo, double hi, double speed,
                   double source_in, Cursor* child) {
     double r0 = cur.r0, r1 = cur.r1;
@@ -118,31 +126,15 @@ struct Voice {
     int64_t audio_off = 0;         // Offset shims on the voice's source
 };
 
-// The Output's In-wire fan-in: the BOTTOM chain wins, and bottom means
-// the chain whose OWNER LAYER sits lowest in the layer list - never the
-// link table's order (wire edits and preset splices re-append links, so
-// table order shifts under gestures that must not move the voice). The
-// compiler stacks the composite by the same rule.
+// The Output's In-wire fan-in: the BOTTOM chain wins, and bottom is
+// the FIRST port-0 link - stacking order IS the link-vector order, and
+// splices/rewires replace links in place, so the voice never moves
+// under a gesture. The compiler stacks the composite by the same rule.
 uint64_t output_feed(const Look& look, const std::vector<NodeLink>& links) {
-    auto owner_index = [&](uint64_t id) -> size_t {
-        for (size_t li = 0; li < look.layers.size(); ++li) {
-            if (look.layers[li].id == id) return li;
-            for (const EffectInstance& fx : look.layers[li].stack)
-                if (fx.id == id) return li;
-        }
-        return SIZE_MAX;
-    };
-    uint64_t best = 0;
-    size_t best_li = SIZE_MAX;
-    for (const NodeLink& l : links) {
-        if (l.to != 0 || l.to_port != 0) continue;
-        const size_t li = owner_index(l.from);
-        if (li < best_li) {
-            best_li = li;
-            best = l.from;
-        }
-    }
-    return best;
+    (void)look;
+    for (const NodeLink& l : links)
+        if (l.to == 0 && l.to_port == 0) return l.from;
+    return 0;
 }
 
 Voice resolve_voice(const Look& look) {
@@ -164,6 +156,7 @@ Voice resolve_voice(const Look& look) {
 // culls by wiring itself); the audio walk emits only the voice.
 void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                bool audio, std::vector<MediaInstance>& out) {
+    const double eff = effective_fps(doc, look);
     auto emit_media = [&](const Layer& layer,
                           const std::vector<AudioOp>& chain, int64_t off) {
         if (!layer.asset) return;
@@ -178,8 +171,13 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
             return;
         const uint32_t frames = a->frame_count;
         const int64_t shift = static_cast<int64_t>(layer.slip) + off;
+        // The cursor affine already lands in this LOOK's own clock, so
+        // the media ratio is against the look's effective rate; a
+        // LOCKED node reads the ROOT clock instead.
+        const double rate = media_conform_rate(
+            doc, *a, layer.timeline_lock ? cur.root_fps : eff);
         double lo = 0.0, hi = 0.0;
-        shifted_window(static_cast<double>(frames), shift, &lo, &hi);
+        shifted_window(static_cast<double>(frames), shift, rate, &lo, &hi);
         Cursor leaf;
         if (layer.timeline_lock) {
             // The node reads the asset at the ROOT clock: identity map,
@@ -187,12 +185,11 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
             // are the same formulas read in root frames.
             leaf.depth = cur.depth + 1;
             leaf.a = 1.0;
-            leaf.b = static_cast<double>(shift);
+            leaf.b = 0.0;
             leaf.r0 = std::max(cur.r0, lo);
             leaf.r1 = std::min(cur.r1, hi);
             if (leaf.r1 <= leaf.r0) return;
-        } else if (!child_window(cur, lo, hi, 1.0,
-                                 lo + static_cast<double>(shift), &leaf)) {
+        } else if (!child_window(cur, lo, hi, 1.0, lo, &leaf)) {
             return;
         }
         MediaInstance c;
@@ -207,6 +204,8 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         c.t_in = leaf.r0;
         c.t_out = leaf.r1;
         c.source_in = leaf.r0 * leaf.a + leaf.b;
+        c.rate = rate;
+        c.shift = shift;
         c.gain = cur.gain;
         // This voice's own hops first, then every enclosing one.
         for (const AudioOp& op : chain)
@@ -222,7 +221,8 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         if (cur.depth + 1 >= kMaxLookDepth) return;
         // An explicit duration cuts the nested entity; a derived one
         // equals its content bounds, so only the explicit case clamps.
-        // A shift moves the child clock: child local = local + off.
+        // LOCKSTEP means 1:1 IN TIME: the hop's fps ratio scales the
+        // child clock; the shift (child frames) moves it.
         double dur = 0.0;
         if (const Look* t = doc.find_look(layer.target)) {
             dur = static_cast<double>(t->duration);
@@ -231,15 +231,17 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         } else {
             return;   // dangling ref: dormant
         }
+        const double ratio = entity_fps(doc, layer.target) / eff;
         double lo = 0.0, hi = 0.0;
-        shifted_window(dur, off, &lo, &hi);
+        shifted_window(dur, off, ratio, &lo, &hi);
         Cursor child;
-        if (!child_window(cur, lo, hi, 1.0,
-                          lo + static_cast<double>(off), &child))
+        if (!child_window(cur, lo, hi, ratio,
+                          lo * ratio + static_cast<double>(off), &child))
             return;
         child.entity = layer.target;
         child.path = nested_child_path(cur.path, layer.id, layer.target,
                                        off);
+        child.root_fps = cur.root_fps;
         child.gain = cur.gain;
         child.ops = chain;
         child.ops.insert(child.ops.end(), cur.ops.begin(), cur.ops.end());
@@ -309,6 +311,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
 void walk_sequence(const Document& doc, const Sequence& seq,
                    const Cursor& cur, bool audio,
                    std::vector<MediaInstance>& out) {
+    const double eff = effective_fps(doc, seq);
     auto descend = [&](const Placement& p, uint64_t container,
                        float base_gain) {
         if (out.size() >= kMaxFlattened) return;
@@ -316,10 +319,11 @@ void walk_sequence(const Document& doc, const Sequence& seq,
         if (cur.depth + 1 >= kMaxLookDepth) return;
         if (!doc.find_look(p.target) && !doc.find_sequence(p.target))
             return;   // dangling target: dormant
+        const double ratio = placement_ratio(doc, p, eff);
         const double speed =
-            p.speed > 0.0f ? static_cast<double>(p.speed) : 0.0;
+            p.speed > 0.0f ? static_cast<double>(p.speed) * ratio : 0.0;
         const uint32_t len = source_length(doc, p);
-        const uint32_t end = placement_end(p, len);
+        const uint32_t end = placement_end(p, len, ratio);
         const double lo = static_cast<double>(p.t_in);
         const double hi = end ? static_cast<double>(end) : kUnbounded;
         Cursor child;
@@ -328,6 +332,7 @@ void walk_sequence(const Document& doc, const Sequence& seq,
             return;
         child.entity = p.target;
         child.path = seq_child_path(cur.path, container, p.target);
+        child.root_fps = cur.root_fps;
         child.gain = p.audio_mute
             ? 0.0f
             : base_gain * std::max(p.audio_gain, 0.0f);
@@ -337,9 +342,13 @@ void walk_sequence(const Document& doc, const Sequence& seq,
     };
 
     if (!audio) {
-        for (const SeqTrack& t : seq.tracks)
+        // Hidden lanes leave the composite entirely - the flatten and
+        // the compiler must agree or the pool prewarms ghosts.
+        for (const SeqTrack& t : seq.tracks) {
+            if (t.hidden) continue;
             for (const Placement& p : t.placements)
                 descend(p, t.id, cur.gain);
+        }
         return;
     }
     for (const AudioTrack& t : seq.audio) {
@@ -367,6 +376,7 @@ std::vector<MediaInstance> flatten(const Document& doc, uint64_t root_id,
     Cursor root;
     root.entity = root_id;
     root.path = root_id;   // the root instance's path is its own id
+    root.root_fps = entity_fps(doc, root_id);
     walk(doc, root, audio, out);
     return out;
 }
@@ -403,6 +413,10 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
             out.asset = root->asset;
             out.slip = root->slip;
             out.offset = off;
+            // Lockstep hops are 1:1 in TIME, so the composed ratio
+            // telescopes to asset rate over the STARTING look's clock.
+            out.rate = media_conform_rate(doc, *doc.find_asset(root->asset),
+                                          effective_fps(doc, look));
             out.locked = root->timeline_lock;
             out.op_count = static_cast<uint32_t>(
                 std::min(rev.size(), kMaxVoiceOps));

@@ -34,16 +34,19 @@ void main(uint3 tid : SV_DispatchThreadID)
     float2 d = (uv - c) * float2(aspect, 1.0);
     const float r = length(d);
     float3 outc = base.rgb;
+    float out_a = base.a;
     if (r < radius) {
         const float f = 1.0 - r / max(radius, 1.0e-3);
         const float a = angle * 0.0174533 * f * f;
         const float ca = cos(a), sa = sin(a);
         d = float2(d.x * ca - d.y * sa, d.x * sa + d.y * ca);
         const float2 suv = c + d / float2(aspect, 1.0);
-        outc = input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
+        const float4 s = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
+        outc = s.rgb;
+        out_a = s.a;
     }
 
-    const float4 result = float4(outc, base.a);
+    const float4 result = float4(outc, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

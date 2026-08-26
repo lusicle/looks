@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -61,17 +62,20 @@ inline uint64_t seq_child_path(uint64_t path, uint64_t container,
 // A window whose end is the parent's end rather than its own.
 inline constexpr double kUnbounded = 1e18;
 
-// Playable window of a shifted stream in LOCAL time: local + shift must
-// stay inside [0, length); length 0 = unbounded (hi = kUnbounded). A
-// negative shift delays the start (closed gate before it), a positive
-// one shortens the tail. The flatten's intervals and the compiler's
-// point tests are this ONE formula - live means lo <= t < hi.
-inline void shifted_window(double length, int64_t shift, double* lo,
-                           double* hi) {
-    *lo = shift < 0 ? static_cast<double>(-shift) : 0.0;
+// Playable window of a shifted stream in LOCAL time: the media frame
+// floor(local * rate) + shift must stay inside [0, length); length 0 =
+// unbounded (hi = kUnbounded). rate is the media-hop conform ratio
+// (media frames per local frame; 1 at every non-media hop). A negative
+// shift delays the start (closed gate before it), a positive one
+// shortens the tail. The flatten's intervals and the compiler's point
+// tests are this ONE formula - live means lo <= t < hi.
+inline void shifted_window(double length, int64_t shift, double rate,
+                           double* lo, double* hi) {
+    const double r = rate > 0.0 ? rate : 1.0;
+    *lo = shift < 0 ? static_cast<double>(-shift) / r : 0.0;
     *hi = kUnbounded;
     if (length > 0.0) {
-        *hi = length - static_cast<double>(shift);
+        *hi = (length - static_cast<double>(shift)) / r;
         if (*hi < *lo) *hi = *lo;
     }
 }
@@ -94,11 +98,19 @@ struct MediaInstance {
     uint64_t owner = 0;  // the look or sequence holding the container
     uint64_t layer = 0;  // the layer (looks) or track (sequences) id
     uint64_t asset = 0;
+    // The media node's LOCAL CLOCK through the composed affine:
     // source = (root - t_in) * speed + source_in, live on [t_in, t_out).
+    // The MEDIA frame behind it is floor(source * rate) + shift.
     double t_in = 0.0;
     double t_out = 0.0;
     double source_in = 0.0;
     double speed = 1.0;
+    // Media-hop conform: MEDIA frames per composed clock frame
+    // (asset fps / clock fps; 1 for matched rates, stills, unknowns).
+    double rate = 1.0;
+    // Media-frame-exact in-point: slip + Offset shims, applied AFTER
+    // the rate so it never pre-divides through the floor.
+    int64_t shift = 0;
     // Composed audio gain: the placement's, scaled by every enclosing
     // track and block, and 0 when anything on the path is muted.
     float gain = 1.0f;
@@ -142,8 +154,11 @@ struct AudioChain {
     uint32_t slip = 0;
     // Summed Offset-node shift along the chain (audio-targeting nodes
     // sitting directly on their source, every nesting hop): the media
-    // frame behind local L is L + slip + offset.
+    // frame behind local L is floor(L * rate) + slip + offset.
     int64_t offset = 0;
+    // Media-hop conform ratio of the chain's asset (media frames per
+    // clock frame; 1 for matched rates, stills, unknowns).
+    double rate = 1.0;
     // True when the chain's media node is timeline-locked (reads the
     // root clock, not the look's).
     bool locked = false;
@@ -157,10 +172,19 @@ inline bool media_active(const MediaInstance& c, double root_frame) {
     return root_frame >= c.t_in && root_frame < c.t_out;
 }
 
-// The asset frame this instance shows at a root frame. Callers clamp into
-// the asset - a window may outlive its media.
+// The media node's local-clock position at a root frame - the affine
+// alone, no rate, no shift.
 inline double media_source_frame(const MediaInstance& c, double root_frame) {
     return (root_frame - c.t_in) * c.speed + c.source_in;
+}
+
+// The MEDIA frame this instance shows at a root frame: the clock
+// position conformed by rate, floored, then the media-frame-exact
+// shift - so slip lands on exact media frames at any rate. Callers
+// clamp into the asset - a window may outlive its media.
+inline double media_asset_frame(const MediaInstance& c, double root_frame) {
+    return std::floor(media_source_frame(c, root_frame) * c.rate) +
+           static_cast<double>(c.shift);
 }
 
 }  // namespace looks::doc

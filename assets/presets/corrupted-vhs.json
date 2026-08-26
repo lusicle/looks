@@ -11,7 +11,15 @@
     "bypass": false,
     "exposed": [
       {
-        "effect": 1,
+        "effect": 2,
+        "param": 4
+      },
+      {
+        "effect": 2,
+        "param": 6
+      },
+      {
+        "effect": 3,
         "param": 0
       },
       {
@@ -20,42 +28,19 @@
       },
       {
         "effect": 5,
-        "param": 0
-      },
-      {
-        "effect": 6,
         "param": 1
-      },
-      {
-        "effect": 6,
-        "param": 0
       }
     ]
   },
   "effects": [
     {
-      "type": "jitter",
-      "id": 1,
-      "params": [
-        10,
-        3.5,
-        2
-      ],
-      "wet": 1,
-      "opacity": 1,
-      "blend": "normal",
-      "bypass": false,
-      "seed": 0,
-      "group": 100
-    },
-    {
       "type": "film_stock",
-      "id": 2,
+      "id": 1,
       "params": [
         3,
         0,
         0,
-        0.30000001192092896,
+        0.3,
         0
       ],
       "wet": 1,
@@ -66,12 +51,33 @@
       "group": 100
     },
     {
-      "type": "composite_artifacts",
+      "type": "vhs",
+      "id": 2,
+      "params": [
+        2,
+        230,
+        36,
+        0.45,
+        0.35,
+        0.45,
+        0.3,
+        2.2,
+        0.25
+      ],
+      "wet": 1,
+      "opacity": 1,
+      "blend": "normal",
+      "bypass": false,
+      "seed": 0,
+      "group": 100
+    },
+    {
+      "type": "jitter",
       "id": 3,
       "params": [
-        0.60000002384185791,
-        0.5,
-        6
+        10,
+        3.5,
+        2
       ],
       "wet": 1,
       "opacity": 1,
@@ -86,7 +92,7 @@
       "params": [
         18,
         14,
-        0.70000004768371582,
+        0.7,
         2
       ],
       "wet": 1,
@@ -97,12 +103,12 @@
       "group": 100
     },
     {
-      "type": "analog_snow",
+      "type": "sync_fail",
       "id": 5,
       "params": [
-        0.34500002861022949,
-        24,
-        0.34999999403953552
+        0.108,
+        0.204,
+        0.15
       ],
       "wet": 1,
       "opacity": 1,
@@ -112,28 +118,17 @@
       "group": 100
     },
     {
-      "type": "sync_fail",
+      "type": "composite_artifacts",
       "id": 6,
       "params": [
-        0.1080000102519989,
-        0.20400001108646393,
-        0.15000000596046448
+        0,
+        560,
+        100,
+        0.55,
+        0.45,
+        5
       ],
       "wet": 1,
-      "opacity": 1,
-      "blend": "normal",
-      "bypass": false,
-      "seed": 0,
-      "group": 100
-    },
-    {
-      "type": "echo",
-      "id": 7,
-      "params": [
-        0.5,
-        0
-      ],
-      "wet": 0.40000000596046448,
       "opacity": 1,
       "blend": "normal",
       "bypass": false,

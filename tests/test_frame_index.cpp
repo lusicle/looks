@@ -103,9 +103,11 @@ TEST(frame_index_presentation_order_resolves_b_frames) {
     }
 }
 
-TEST(frame_index_vfr_grid_takes_the_first_duration) {
-    // The CFR grid is the FIRST sample's duration - later drift does not
-    // move the clock (import's definition, kept across the cutover).
+TEST(frame_index_vfr_grid_takes_the_median_duration) {
+    // The CFR grid is the MEDIAN sample duration: captures routinely
+    // flag VFR with an outlier FIRST frame (doubled while the encoder
+    // spins up), and a first-sample grid halved a 120fps probe - the
+    // clip then conformed as 60fps and played half speed.
     TrackInfo t = make_track({0, 0, 0, 0}, {0}, 512);
     t.samples[2].duration = 1024;
     t.samples[3].duration = 256;
@@ -115,6 +117,13 @@ TEST(frame_index_vfr_grid_takes_the_first_duration) {
     CHECK_EQ(idx.frame_duration, 512u);
     CHECK(idx.fps() == 25.0);
     CHECK_EQ(idx.frame_count(), 4u);
+
+    // The outlier first frame no longer halves the grid.
+    TrackInfo hfr = make_track({0, 0, 0, 0, 0}, {0}, 128);
+    hfr.samples[0].duration = 256;   // doubled spin-up frame
+    FrameIndex idx2;
+    CHECK(build_frame_index(hfr, &idx2, &error));
+    CHECK_EQ(idx2.frame_duration, 128u);
 }
 
 TEST(frame_index_refuses_non_video) {

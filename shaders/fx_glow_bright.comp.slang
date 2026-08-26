@@ -29,7 +29,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= width || tid.y >= height)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
-    const float3 rgb = input.SampleLevel(uv, 0).rgb;
+    const float4 src = input.SampleLevel(uv, 0);
+    const float3 rgb = src.rgb;
 
     const float l = fx_luma(rgb);
     // Pro-mist floors the gain, so it diffuses everything a little.
@@ -37,5 +38,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     float gain = smoothstep(knee * 0.5, knee * 1.5, l);
     if (int(mode + 0.5) == 0)
         gain = max(gain, 0.25);
-    output[tid.xy] = float4(rgb * gain, 1.0);
+    // Alpha = coverage of the light being lifted: the source pixel's
+    // coverage gated by how much of it glows. The blur spreads it, the
+    // composite unions it - a shape's halo carries real coverage.
+    output[tid.xy] = float4(rgb * gain, src.a * gain);
 }

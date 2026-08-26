@@ -212,10 +212,14 @@ constexpr ParamDesc kFringeParams[] = {
 };
 
 constexpr ParamDesc kInterlaceParams[] = {
+    // Field weave is the honest model: odd lines come from the previous
+    // frame, so combing appears exactly where motion is and nowhere
+    // else. Comb keeps the old constant shift as a deliberate artifact.
     {"shift", "comb shift", 0.0f, 16.0f, 4.0f, "%.1f px", nullptr, false,
-     2, 0x1},
+     2, 0x2},
     {"darken", "line darken", 0.0f, 1.0f, 0.15f, "%.2f"},
-    {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "comb|lines only"},
+    {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
+     "field weave|comb|lines only"},
 };
 
 constexpr ParamDesc kSliceShuffleParams[] = {
@@ -231,15 +235,45 @@ constexpr ParamDesc kPixelStretchParams[] = {
 };
 
 constexpr ParamDesc kCompositeParams[] = {
-    {"dot_crawl", "dot crawl", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"rainbow", "rainbow", 0.0f, 1.0f, 0.4f, "%.2f"},
+    // Honest NTSC path: luma plus quadrature chroma on a 4-sample
+    // subcarrier, separated imperfectly on decode. Dot crawl is the
+    // carrier residue left in Y, rainbow is luma detail demodulated as
+    // chroma - both land only where the signal puts them. S-video keeps
+    // the bandlimits but never muxes, so it has neither.
+    {"mode", "signal", 0.0f, 1.0f, 0.0f, "%.0f", "composite|s-video"},
+    {"res", "luma res", 200.0f, 1400.0f, 640.0f, "%.0f smp"},
+    {"chroma_res", "chroma res", 20.0f, 400.0f, 120.0f, "%.0f smp"},
+    {"dot_crawl", "dot crawl", 0.0f, 1.0f, 0.5f, "%.2f", nullptr, false,
+     0, 0x1},
+    {"rainbow", "rainbow", 0.0f, 1.0f, 0.4f, "%.2f", nullptr, false,
+     0, 0x1},
     {"chroma_delay", "chroma delay", 0.0f, 16.0f, 4.0f, "%.1f px"},
+};
+
+constexpr ParamDesc kVhsParams[] = {
+    // The tape itself (head_switch / jitter tracking / vhs_osd compose
+    // on top): FM luma bandwidth, color-under chroma with its 2-line
+    // delay average and per-line phase noise, pre-emphasis edge
+    // ringing, streaky luma noise, dropouts with the compensator
+    // repeating the line above, per-line time-base error, and tape-
+    // tension flagging at the frame top. Speed scales the lot.
+    {"mode", "speed", 0.0f, 2.0f, 0.0f, "%.0f", "sp|lp|ep"},
+    {"luma_res", "luma res", 120.0f, 420.0f, 240.0f, "%.0f lines"},
+    {"chroma_res", "chroma res", 10.0f, 120.0f, 40.0f, "%.0f lines"},
+    {"ringing", "edge ringing", 0.0f, 1.0f, 0.35f, "%.2f"},
+    {"noise", "luma noise", 0.0f, 1.0f, 0.25f, "%.2f"},
+    {"chroma_noise", "chroma noise", 0.0f, 1.0f, 0.3f, "%.2f"},
+    {"dropouts", "dropouts", 0.0f, 1.0f, 0.12f, "%.2f"},
+    {"tbe", "line jitter", 0.0f, 8.0f, 1.2f, "%.1f px"},
+    {"skew", "top flagging", 0.0f, 1.0f, 0.15f, "%.2f"},
 };
 
 constexpr ParamDesc kSnowParams[] = {
     {"amount", "snow", 0.0f, 1.0f, 0.25f, "%.2f"},
     {"ghost_px", "ghost offset", 0.0f, 64.0f, 24.0f, "%.0f px"},
     {"ghost", "ghost strength", 0.0f, 1.0f, 0.3f, "%.2f"},
+    // Weak-signal grain riding everywhere, under the streaking sparks.
+    {"floor_amt", "noise floor", 0.0f, 1.0f, 0.15f, "%.2f"},
 };
 
 constexpr ParamDesc kSyncFailParams[] = {
@@ -482,15 +516,27 @@ constexpr ParamDesc kWaveWarpParams[] = {
 };
 
 constexpr ParamDesc kCrtSimParams[] = {
-    // LCD panels are flat; scanline stays (it drives the row gaps there).
+    // A beam, not a stripe pattern: each virtual scanline is a Gaussian
+    // whose width grows with beam current, so highlights bloom together
+    // while dark lines stay thin. LCD is the flat screen-door geometry:
+    // no tube terms; scanline drives its row gaps instead.
     {"curvature", "curvature", 0.0f, 1.0f, 0.35f, "%.2f", nullptr, false,
-     4, 0x1},
+     4, 0x7},
     {"scanline", "scanlines", 0.0f, 1.0f, 0.5f, "%.2f"},
-    {"mask", "grille", 0.0f, 1.0f, 0.4f, "%.2f"},
+    {"lines", "scan lines", 160.0f, 1080.0f, 480.0f, "%.0f", nullptr,
+     false, 4, 0x7},
+    {"bloom", "beam bloom", 0.0f, 1.0f, 0.35f, "%.2f", nullptr, false,
+     4, 0x7},
+    {"mask_mode", "screen", 0.0f, 3.0f, 0.0f, "%.0f",
+     "aperture grille|slot mask|shadow mask|lcd"},
+    {"mask", "mask", 0.0f, 1.0f, 0.4f, "%.2f"},
     {"triad", "triad size", 2.0f, 8.0f, 3.0f, "%.0f px"},
-    // LCD panel: flat rectangular RGB stripes + row gaps, no tube
-    // curvature or scanline beam — the laptop/monitor screen-door look.
-    {"panel", "panel", 0.0f, 1.0f, 0.0f, "%.0f", "crt|lcd"},
+    // RGB beams land apart, worst toward the frame edges.
+    {"converge", "convergence", 0.0f, 3.0f, 0.6f, "%.1f px", nullptr,
+     false, 4, 0x7},
+    // Light scattered in the faceplate glass around bright content.
+    {"halation", "halation", 0.0f, 1.0f, 0.25f, "%.2f", nullptr, false,
+     4, 0x7},
 };
 
 constexpr ParamDesc kHalftoneParams[] = {
@@ -1141,9 +1187,9 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::Signal},
     {"pixel_stretch", "Pixel Stretch", kPixelStretchParams, 2,
      FxCategory::Warp},
-    {"composite_artifacts", "Composite Video", kCompositeParams, 3,
+    {"composite_artifacts", "Composite Video", kCompositeParams, 6,
      FxCategory::Signal},
-    {"analog_snow", "Analog Snow", kSnowParams, 3, FxCategory::Signal},
+    {"analog_snow", "Analog Snow", kSnowParams, 4, FxCategory::Signal},
     {"sync_fail", "Sync Failure", kSyncFailParams, 3, FxCategory::Signal},
     {"timestamp", "Timestamp", kTimestampParams, 3, FxCategory::Overlay},
     {"oversharpen", "Oversharpen", kOversharpenParams, 2,
@@ -1184,7 +1230,7 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::Texture},
     {"pixel_sort", "Pixel Sort", kPixelSortParams, 4, FxCategory::Signal},
     {"wave_warp", "Wave Warp", kWaveWarpParams, 4, FxCategory::Warp},
-    {"crt_sim", "CRT Tube", kCrtSimParams, 5, FxCategory::Signal},
+    {"crt_sim", "CRT Tube", kCrtSimParams, 9, FxCategory::Signal},
     {"halftone", "Halftone", kHalftoneParams, 7, FxCategory::PaintPrint},
     {"star_filter", "Star Filter", kStarFilterParams, 4,
      FxCategory::Optics},
@@ -1271,6 +1317,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"audio_filter", "Filter", kAudioFilterParams, 2, FxCategory::Audio},
     {"offset", "Offset", kOffsetParams, 2, FxCategory::Time},
     {"track_pin", "Track Pin", kTrackPinParams, 9, FxCategory::Warp},
+    {"vhs", "VHS Tape", kVhsParams, 9, FxCategory::Signal},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));
@@ -1349,6 +1396,11 @@ bool instance_uses_history(const EffectInstance& fx) {
         return true;
     if (fx.type == EffectType::Dither && fx.params.size() > 7 &&
         fx.params[7] >= 0.5f)
+        return true;
+    // Field weave reads the previous frame off the ring; the comb and
+    // lines-only modes stay pure.
+    if (fx.type == EffectType::Interlace && fx.params.size() > 2 &&
+        fx.params[2] < 0.5f)
         return true;
     return fx.type == EffectType::Quantize && fx.params.size() > 2 &&
            fx.params[2] >= 8.5f && fx.params[2] < 9.5f;

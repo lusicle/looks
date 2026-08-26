@@ -147,7 +147,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     enc = enc + saturate(light) * 0.7 * (1.0 - enc);
     enc = saturate(enc);
 
-    const float4 result = float4(fx_srgb_eotf(enc), base.a);
+    // Bright damage is its own light; dark damage only stains content.
+    const float4 result =
+        float4(fx_srgb_eotf(enc), max(base.a, saturate(light) * 0.7));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

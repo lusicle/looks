@@ -183,13 +183,21 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv_r = clamp(uv + duv * (1.0 - dsp), 0.0, 1.0);
     const float2 uv_b = clamp(uv + duv * (1.0 + dsp), 0.0, 1.0);
     float3 col;
-    col.r = input.SampleLevel(uv_r, 0).r;
-    col.g = input.SampleLevel(uv_g, 0).g;
-    col.b = input.SampleLevel(uv_b, 0).b;
-    const float3 s0 = input.SampleLevel(clamp(uv_g - buv, 0.0, 1.0), 0).rgb;
-    const float3 s1 = input.SampleLevel(clamp(uv_g + buv, 0.0, 1.0), 0).rgb;
-    col = lerp(col, (col + s0 + s1) * (1.0 / 3.0),
+    const float4 sr = input.SampleLevel(uv_r, 0);
+    const float4 sg = input.SampleLevel(uv_g, 0);
+    const float4 sb = input.SampleLevel(uv_b, 0);
+    col.r = sr.r;
+    col.g = sg.g;
+    col.b = sb.b;
+    // Refracted coverage: the union of the split rays - the glass moves
+    // the content, so its alpha moves with it.
+    float col_a = max(sg.a, max(sr.a, sb.a));
+    const float4 s0 = input.SampleLevel(clamp(uv_g - buv, 0.0, 1.0), 0);
+    const float4 s1 = input.SampleLevel(clamp(uv_g + buv, 0.0, 1.0), 0);
+    col = lerp(col, (col + s0.rgb + s1.rgb) * (1.0 / 3.0),
                saturate(blur_px * 0.6));
+    col_a = lerp(col_a, (col_a + s0.a + s1.a) * (1.0 / 3.0),
+                 saturate(blur_px * 0.6));
 
     // Fresnel transmission loss + relief lighting + grout, one depth
     // knob: steep glass passes less light and every facet takes the
@@ -212,7 +220,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float amp = 0.35 + 0.65 * saturate(nv.x * 0.5 + 0.5);
     col += lobe * grazing * env * amp * saturate(glint) * 1.6;
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

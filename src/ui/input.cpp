@@ -17,7 +17,7 @@ uint8_t button_bit(platform::MouseButton b) {
 
 void UiInput::begin_frame(const std::vector<platform::Event>& events,
                           float dpi_scale) {
-    const Vec2 prev_mouse = mouse;
+    const Vec2 prev_raw = mouse_raw;
     buttons_pressed = 0;
     buttons_released = 0;
     wheel_y = 0.0f;
@@ -31,11 +31,11 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
     for (const platform::Event& e : events) {
         switch (e.type) {
             case platform::Event::Type::MouseMove:
-                mouse = {e.mouse_x * inv, e.mouse_y * inv};
+                mouse_raw = {e.mouse_x * inv, e.mouse_y * inv};
                 mods = e.mods;
                 break;
             case platform::Event::Type::MouseDown: {
-                mouse = {e.mouse_x * inv, e.mouse_y * inv};
+                mouse_raw = {e.mouse_x * inv, e.mouse_y * inv};
                 const uint8_t bit = button_bit(e.button);
                 buttons_down |= bit;
                 buttons_pressed |= bit;
@@ -43,7 +43,7 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
                 break;
             }
             case platform::Event::Type::MouseUp: {
-                mouse = {e.mouse_x * inv, e.mouse_y * inv};
+                mouse_raw = {e.mouse_x * inv, e.mouse_y * inv};
                 const uint8_t bit = button_bit(e.button);
                 buttons_down &= static_cast<uint8_t>(~bit);
                 buttons_released |= bit;
@@ -75,7 +75,8 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
                 break;
         }
     }
-    mouse_delta = mouse - prev_mouse;
+    mouse = mouse_raw;
+    mouse_delta = mouse_raw - prev_raw;
 }
 
 }  // namespace looks::ui

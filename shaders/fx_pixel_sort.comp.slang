@@ -55,6 +55,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     // and this pixel's position within it.
     int back = 0;
     float3 dark = base.rgb, bright = base.rgb;
+    float dark_a = base.a, bright_a = base.a;
     float dark_l = l0, bright_l = l0;
     for (int i = 1; i <= max_walk; ++i) {
         const float2 p = uv - axis * float(i);
@@ -62,9 +63,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float l = luma_at(p);
         if (l < lo || l > hi) break;
         back = i;
-        const float3 c = input.SampleLevel(p, 0).rgb;
-        if (l < dark_l) { dark_l = l; dark = c; }
-        if (l > bright_l) { bright_l = l; bright = c; }
+        const float4 c = input.SampleLevel(p, 0);
+        if (l < dark_l) { dark_l = l; dark = c.rgb; dark_a = c.a; }
+        if (l > bright_l) { bright_l = l; bright = c.rgb; bright_a = c.a; }
     }
     int fwd = 0;
     for (int i = 1; i <= max_walk; ++i) {
@@ -73,19 +74,21 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float l = luma_at(p);
         if (l < lo || l > hi) break;
         fwd = i;
-        const float3 c = input.SampleLevel(p, 0).rgb;
-        if (l < dark_l) { dark_l = l; dark = c; }
-        if (l > bright_l) { bright_l = l; bright = c; }
+        const float4 c = input.SampleLevel(p, 0);
+        if (l < dark_l) { dark_l = l; dark = c.rgb; dark_a = c.a; }
+        if (l > bright_l) { bright_l = l; bright = c.rgb; bright_a = c.a; }
     }
 
     const float span = float(back + fwd);
     float3 col = base.rgb;
+    float col_a = base.a;
     if (span >= 2.0) {
         const float f = float(back) / span;
         col = lerp(dark, bright, f);
+        col_a = lerp(dark_a, bright_a, f);
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -116,8 +116,11 @@ bool track_run(uint32_t start, uint32_t end,
 // candidate sweep and refined in the adjustment. Homography-degenerate
 // segments (pans, statics) report kSfmLowParallax instead of a fake
 // solve. Deterministic; pure CPU over data->tracks. Returns true when
-// any segment solved.
-bool sfm_solve(TrackData* data);
+// any segment solved. `cancelled` is polled per frame / per adjustment
+// iteration - an app close never waits out a long solve; a cancelled
+// result must not be cached (partial verdicts would read as final).
+bool sfm_solve(TrackData* data,
+               const std::function<bool()>& cancelled = {});
 
 bool track_load(const std::filesystem::path& path, TrackData* out);
 bool track_save(const std::filesystem::path& path, const TrackData& data);

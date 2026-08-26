@@ -41,7 +41,7 @@ inline constexpr uint64_t kLayerParamBit = 1ull << 62;
 // Indexes into the layer param slots; 15/16 are the slip and waveform
 // FIELD ids (view rows, not modulatable slots), 17 is the oscillator
 // phase.
-inline constexpr int kLayerParamCount = 18;
+inline constexpr int kLayerParamCount = 20;
 
 struct ParamKey {
     uint64_t effect_id = 0;

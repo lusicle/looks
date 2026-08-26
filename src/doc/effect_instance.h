@@ -153,6 +153,7 @@ enum class EffectType : uint32_t {
     // the effect's own region params solved through the media's .track
     // sidecar; the engine composes the per-frame homography CPU-side.
     TrackPin,
+    Vhs,               // the tape signal path: bandwidth, chroma, dropouts
     Count,
 };
 

@@ -47,6 +47,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         sin(scan * inst_freq * kTau + l * pm * kTau * 2.0 + t);
 
     float3 outc;
+    float out_a = base.a;
     if (m == 2u) {
         const float k = saturate(depth / 64.0);
         outc = base.rgb * lerp(1.0, 0.5 + 0.5 * carrier, k * 2.0);
@@ -54,10 +55,12 @@ void main(uint3 tid : SV_DispatchThreadID)
         float2 suv = uv;
         if (m == 1u) suv.y = uv.y + carrier * depth / size.y;
         else suv.x = uv.x + carrier * depth / size.x;
-        outc = input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
+        const float4 s = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
+        outc = s.rgb;
+        out_a = s.a;
     }
 
-    const float4 result = float4(outc, base.a);
+    const float4 result = float4(outc, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

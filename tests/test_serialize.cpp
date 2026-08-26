@@ -29,10 +29,14 @@ Document make_rich_doc() {
     media.name = "test.mp4";
     media.path = "C:/clips/test.mp4";
     media.still_duration_frames = 900;
+    media.still = true;
     media.frame_count = 1200;
     d.assets.push_back(media);
     d.looks[0].layers[0].asset = media.id;
     d.looks[0].layers[0].slip = 12;
+    d.looks[0].format.fps = 24.0;
+    d.sequences[0].format.w = 1280;
+    d.sequences[0].format.h = 720;
     d.master_seed = 1234;
     d.cache_mb = 512;
     d.speed = 2.0f;
@@ -141,6 +145,7 @@ Document make_rich_doc() {
     ap.link = pair;
     ap.audio_gain = 0.5f;
     at.placements.push_back(ap);
+    d.root().audio.clear();   // the fixture's a1 replaces the default
     d.root().audio.push_back(at);
     d.root().trim_in = 4;
     d.root().trim_out = 110;
@@ -161,7 +166,12 @@ TEST(serialize_placement_transform_roundtrip) {
     p.scale = 0.5f;
     p.rotate = 45.0f;
     p.opacity = 0.7f;
+    p.anchor_x = 0.2f;
+    p.anchor_y = 0.8f;
     d.sequences[0].tracks[0].placements.push_back(p);
+    // A layer anchor with an otherwise-identity transform must persist
+    // (the pivot is set before the scale that uses it).
+    d.looks[0].layers[0].xf_anchor_x = 0.1f;
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
     CHECK(doc::doc_to_json(d2) == a);
@@ -172,6 +182,10 @@ TEST(serialize_placement_transform_roundtrip) {
     CHECK_EQ(q->scale, 0.5f);
     CHECK_EQ(q->rotate, 45.0f);
     CHECK_EQ(q->opacity, 0.7f);
+    CHECK_EQ(q->anchor_x, 0.2f);
+    CHECK_EQ(q->anchor_y, 0.8f);
+    CHECK_EQ(d2.looks[0].layers[0].xf_anchor_x, 0.1f);
+    CHECK_EQ(d2.looks[0].layers[0].xf_anchor_y, 0.5f);
 }
 
 TEST(serialize_shape_path_roundtrip) {
@@ -324,6 +338,12 @@ TEST(serialize_roundtrip_stable) {
     CHECK_EQ(d2.assets.size(), size_t{1});
     CHECK_EQ(d2.assets[0].path, "C:/clips/test.mp4");
     CHECK_EQ(d2.assets[0].still_duration_frames, uint32_t{900});
+    CHECK(d2.assets[0].still);
+    CHECK_EQ(d2.looks[0].format.fps, 24.0);
+    CHECK_EQ(d2.looks[0].format.w, uint32_t{0});
+    CHECK_EQ(d2.sequences[0].format.w, uint32_t{1280});
+    CHECK_EQ(d2.sequences[0].format.h, uint32_t{720});
+    CHECK_EQ(d2.sequences[0].format.fps, 0.0);
     CHECK_EQ(d2.looks[0].layers[0].asset, d2.assets[0].id);
     CHECK_EQ(d2.looks[0].layers[0].slip, uint32_t{12});
     CHECK_EQ(d2.master_seed, uint64_t{1234});
@@ -492,8 +512,8 @@ TEST(preset_insert_lands_dormant) {
 }
 
 TEST(serialize_dedupes_input_fanin) {
-    // In ports hold ONE producer; only the Output composites
-    // fan-in. Hand-edited files keep the LAST link per (to, port).
+    // Fan-in is legal on EVERY image port (stacking order is the link
+    // order); only EXACT duplicate wires shed, first (= bottom) kept.
     const char* text = R"({
         "looks_project": 5,
         "root_look": 100,
@@ -505,6 +525,7 @@ TEST(serialize_dedupes_input_fanin) {
         "links": [
             {"from": 1, "to": 2, "port": 0},
             {"from": 3, "to": 2, "port": 0},
+            {"from": 1, "to": 2, "port": 0},
             {"from": 1, "to": 0, "port": 0},
             {"from": 2, "to": 0, "port": 0}
         ]}]
@@ -513,16 +534,18 @@ TEST(serialize_dedupes_input_fanin) {
     CHECK(parsed.value.has_value());
     Document d = doc::doc_from_json(*parsed.value);
     int into_effect2 = 0, into_output = 0;
-    uint64_t producer = 0;
+    uint64_t bottom = 0;
+    bool first = true;
     for (const doc::NodeLink& l : d.looks[0].links) {
         if (l.to == 2 && l.to_port == 0) {
             ++into_effect2;
-            producer = l.from;
+            if (first) bottom = l.from;
+            first = false;
         }
         if (l.to == 0) ++into_output;
     }
-    CHECK_EQ(into_effect2, 1);
-    CHECK_EQ(producer, uint64_t{3});   // the LAST one wins
+    CHECK_EQ(into_effect2, 2);         // fan-in survives the load
+    CHECK_EQ(bottom, uint64_t{1});     // the exact dup shed, FIRST kept
     CHECK_EQ(into_output, 2);          // the Output merge keeps fan-in
 }
 
@@ -719,3 +742,25 @@ TEST(era_presets_ship_valid) {
 }
 
 
+
+TEST(serialize_lane_flags_roundtrip) {
+    // hidden/lock on video lanes and lock on audio tracks are document
+    // state (hidden changes what exports): they must survive the trip
+    // and default false when absent.
+    Document d;
+    d.root().tracks[0].hidden = true;
+    d.root().tracks[0].lock = true;
+    d.root().audio[0].lock = true;
+    json::Value v = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(v);
+    CHECK(d2.root().tracks[0].hidden);
+    CHECK(d2.root().tracks[0].lock);
+    CHECK(d2.root().audio[0].lock);
+    CHECK(doc::doc_to_json(d2) == v);
+
+    Document plain;
+    Document plain2 = doc::doc_from_json(doc::doc_to_json(plain));
+    CHECK(!plain2.root().tracks[0].hidden);
+    CHECK(!plain2.root().tracks[0].lock);
+    CHECK(!plain2.root().audio[0].lock);
+}

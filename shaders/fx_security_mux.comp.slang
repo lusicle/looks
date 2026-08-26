@@ -55,7 +55,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     // Tile-local uv: every monitor shows the full frame.
     const float2 luv = float2(frac(uv.x * float(nc)),
                               frac(uv.y * float(nr)));
-    float3 col = history.SampleLevel(luv, 0).rgb;
+    const float4 feed = history.SampleLevel(luv, 0);
+    float3 col = feed.rgb;
+    float col_a = feed.a;
 
     const float l = fx_luma(col);
     const float gn =
@@ -71,27 +73,33 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 tsz = size / float2(float(nc), float(nr));
         const float bd =
             min(min(tpx.x, tsz.x - tpx.x), min(tpx.y, tsz.y - tpx.y));
-        if (bd < 2.0) col = lerp(col, float3(0.02, 0.02, 0.02), o);
-        else if (bd < 3.0) col = lerp(col, float3(0.35, 0.35, 0.35), o);
+        if (bd < 2.0) { col = lerp(col, float3(0.02, 0.02, 0.02), o);
+                        col_a = max(col_a, o); }
+        else if (bd < 3.0) { col = lerp(col, float3(0.35, 0.35, 0.35), o);
+                             col_a = max(col_a, o); }
 
         const float t = fps > 0.0 ? float(frame) / fps : 0.0;
         const bool blink =
             frac(t * 1.2 + float(tile) * 0.37) < 0.55;
         const float2 dotc = float2(10.0, 10.0);
-        if (blink && length(tpx - dotc) < 3.5)
+        if (blink && length(tpx - dotc) < 3.5) {
             col = lerp(col, float3(1.0, 0.12, 0.08), o);
+            col_a = max(col_a, o);
+        }
 
         // Cam index: tile + 1 dots along the bottom edge.
         const float2 dpx = tpx - float2(8.0, tsz.y - 9.0);
         if (dpx.y >= 0.0 && dpx.y < 3.0 && dpx.x >= 0.0) {
             const float slot_f = dpx.x / 6.0;
             const uint slot_i = uint(max(slot_f, 0.0));
-            if (slot_i <= tile && frac(slot_f) < 0.5)
+            if (slot_i <= tile && frac(slot_f) < 0.5) {
                 col = lerp(col, float3(0.95, 0.95, 0.9), o);
+                col_a = max(col_a, o);
+            }
         }
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -51,6 +51,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                       : (pos <= s_now || pos > s_prev + 1.0);
 
     float3 col;
+    float col_a;
     if (in_band) {
         const float j =
             (fx_hash01(fx_hash4(seed, line_i, cycle, 0x5Cu)) - 0.5) *
@@ -58,12 +59,16 @@ void main(uint3 tid : SV_DispatchThreadID)
         float2 suv = uv;
         if (cols) suv.y = clamp(uv.y + j / size.y, 0.0, 1.0);
         else      suv.x = clamp(uv.x + j / size.x, 0.0, 1.0);
-        col = input.SampleLevel(suv, 0).rgb;
+        const float4 s = input.SampleLevel(suv, 0);
+        col = s.rgb;
+        col_a = s.a;
         const float fz =
             fx_hash01(fx_hash4(seed ^ 0xF1u, tid.x, tid.y, cycle)) - 0.5;
         col = max(col + fz * saturate(noise) * 0.25, 0.0);
     } else {
-        col = canvas.SampleLevel(uv, 0).rgb;
+        const float4 held = canvas.SampleLevel(uv, 0);
+        col = held.rgb;
+        col_a = held.a;
         if (pos > s_now)
             col *= 1.0 - saturate(dim) * 0.6;
     }
@@ -71,11 +76,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     // Glow only ahead of the write line: those pixels get overwritten
     // clean when the band reaches them, so it never burns into the canvas.
     const float ahead = (pos - s_now) * extent;
-    if (ahead > 0.0)
-        col += saturate(beam) * 0.9 * exp(-ahead * ahead * 0.08) *
-               float3(1.0, 1.0, 0.95);
+    if (ahead > 0.0) {
+        const float glow =
+            saturate(beam) * 0.9 * exp(-ahead * ahead * 0.08);
+        col += glow * float3(1.0, 1.0, 0.95);
+        col_a = max(col_a, glow);
+    }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

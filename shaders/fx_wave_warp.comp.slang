@@ -46,9 +46,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                  float2(size.y / size.x, 1.0);
     }
     const float2 suv = clamp(uv + offset * amount / size, 0.0, 1.0);
-    const float3 col = input.SampleLevel(suv, 0).rgb;
-
-    const float4 result = float4(col, base.a);
+    const float4 result = input.SampleLevel(suv, 0);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

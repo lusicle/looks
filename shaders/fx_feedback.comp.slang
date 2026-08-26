@@ -46,8 +46,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 prev_uv = p + 0.5;
 
     float3 fb = float3(0.0, 0.0, 0.0);
-    if (all(prev_uv >= 0.0) && all(prev_uv <= 1.0))
-        fb = prev_out.SampleLevel(prev_uv, 0).rgb * (1.0 - saturate(fade));
+    float fb_a = 0.0;
+    if (all(prev_uv >= 0.0) && all(prev_uv <= 1.0)) {
+        const float4 prev = prev_out.SampleLevel(prev_uv, 0);
+        fb = prev.rgb * (1.0 - saturate(fade));
+        fb_a = prev.a * (1.0 - saturate(fade));
+    }
 
     // Rodrigues rotation of the color about the luma axis.
     if (abs(hue_shift) > 0.01) {
@@ -59,7 +63,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 
     const float3 mixed = max(base.rgb, fb * saturate(amount));
-    const float4 result = float4(mixed, base.a);
+    const float4 result =
+        float4(mixed, max(base.a, fb_a * saturate(amount)));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

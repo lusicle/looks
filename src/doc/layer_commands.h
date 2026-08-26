@@ -23,10 +23,6 @@ std::unique_ptr<Command> remove_layer_command(uint64_t look,
                                               size_t layer_index);
 // Everything but the stack; matched by layer id, coalesces per layer.
 std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated);
-// Swaps a layer with a neighbour (compositing reorder). `direction` is
-// -1 (toward the bottom of the stack) or +1; caller bounds-checks.
-std::unique_ptr<Command> move_layer_command(uint64_t look, size_t index,
-                                            int direction);
 // Razor: splits a placement at a LOCAL frame into two abutting
 // placements on the SAME lane. The right half is a fresh placement of
 // the same target whose source_in lands on the cut's source frame, so

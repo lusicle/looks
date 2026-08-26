@@ -102,6 +102,144 @@ void set_active_theme(int index) {
     g_theme_index = ((index % theme_count()) + theme_count()) % theme_count();
 }
 
+void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
+                     Vec2 center, Color color, float font_size) {
+    const float cx = center.x;
+    const float cy = center.y;
+    // Glyph-drawn icons ride the MSDF text pipeline for clean AA.
+    auto glyph = [&](const char* s) {
+        const Vec2 ts = measure_text(font, s, font_size);
+        draw_text(canvas, font, s,
+                  {cx - ts.x * 0.5f,
+                   cy - font.line_height() * font_size * 0.5f},
+                  font_size, color);
+    };
+    switch (icon) {
+        case Icon::Play:
+            canvas.draw_triangle({cx - 4.0f, cy - 5.5f}, {cx + 5.5f, cy},
+                                 {cx - 4.0f, cy + 5.5f}, color);
+            break;
+        case Icon::Pause:
+            // SDF rects: anti-aliased, unlike raw triangles.
+            canvas.draw_sdf_rect({cx - 5.0f, cy - 5.0f, 3.5f, 10.0f}, 1.0f,
+                                 color);
+            canvas.draw_sdf_rect({cx + 1.5f, cy - 5.0f, 3.5f, 10.0f}, 1.0f,
+                                 color);
+            break;
+        case Icon::Up:
+            // Chevron strokes (the app's fold language), not filled
+            // triangles — 1 px lines read clean, triangles alias.
+            canvas.draw_line({cx - 4.0f, cy + 2.0f}, {cx, cy - 2.0f}, 1.0f,
+                             color);
+            canvas.draw_line({cx, cy - 2.0f}, {cx + 4.0f, cy + 2.0f}, 1.0f,
+                             color);
+            break;
+        case Icon::Down:
+            canvas.draw_line({cx - 4.0f, cy - 2.0f}, {cx, cy + 2.0f}, 1.0f,
+                             color);
+            canvas.draw_line({cx, cy + 2.0f}, {cx + 4.0f, cy - 2.0f}, 1.0f,
+                             color);
+            break;
+        case Icon::Close:
+            glyph("x");
+            break;
+        case Icon::Wave: {
+            // Two-arch sine: modulation.
+            const float a = 2.6f;
+            canvas.draw_line({cx - 5.0f, cy}, {cx - 2.5f, cy - a}, 1.0f,
+                             color);
+            canvas.draw_line({cx - 2.5f, cy - a}, {cx, cy}, 1.0f, color);
+            canvas.draw_line({cx, cy}, {cx + 2.5f, cy + a}, 1.0f, color);
+            canvas.draw_line({cx + 2.5f, cy + a}, {cx + 5.0f, cy}, 1.0f,
+                             color);
+            break;
+        }
+        case Icon::Key: {
+            // Keyframe diamond (outline strokes).
+            const float d = 3.6f;
+            canvas.draw_line({cx, cy - d}, {cx + d, cy}, 1.0f, color);
+            canvas.draw_line({cx + d, cy}, {cx, cy + d}, 1.0f, color);
+            canvas.draw_line({cx, cy + d}, {cx - d, cy}, 1.0f, color);
+            canvas.draw_line({cx - d, cy}, {cx, cy - d}, 1.0f, color);
+            break;
+        }
+        case Icon::Knob:
+            // Macro dot: SDF circle (full-radius rect).
+            canvas.draw_sdf_rect({cx - 3.5f, cy - 3.5f, 7.0f, 7.0f}, 3.5f,
+                                 color);
+            break;
+        case Icon::Eye:
+            // Capsule outline + pupil.
+            canvas.draw_sdf_rect_outline({cx - 6.0f, cy - 3.5f, 12.0f, 7.0f},
+                                         3.5f, 1.0f, color);
+            canvas.draw_sdf_rect({cx - 1.75f, cy - 1.75f, 3.5f, 3.5f}, 1.75f,
+                                 color);
+            break;
+        case Icon::EyeOff:
+            canvas.draw_sdf_rect_outline({cx - 6.0f, cy - 3.5f, 12.0f, 7.0f},
+                                         3.5f, 1.0f, color);
+            canvas.draw_line({cx - 6.0f, cy + 5.0f}, {cx + 6.0f, cy - 5.0f},
+                             1.0f, color);
+            break;
+        case Icon::Dice:
+            canvas.draw_sdf_rect_outline({cx - 5.0f, cy - 5.0f, 10.0f, 10.0f},
+                                         2.0f, 1.0f, color);
+            canvas.draw_sdf_rect({cx - 3.0f, cy - 3.0f, 2.0f, 2.0f}, 1.0f,
+                                 color);
+            canvas.draw_sdf_rect({cx - 1.0f, cy - 1.0f, 2.0f, 2.0f}, 1.0f,
+                                 color);
+            canvas.draw_sdf_rect({cx + 1.0f, cy + 1.0f, 2.0f, 2.0f}, 1.0f,
+                                 color);
+            break;
+        case Icon::Link:
+            // Two overlapping capsule links.
+            canvas.draw_sdf_rect_outline({cx - 6.5f, cy - 2.5f, 8.0f, 5.0f},
+                                         2.5f, 1.0f, color);
+            canvas.draw_sdf_rect_outline({cx - 1.5f, cy - 2.5f, 8.0f, 5.0f},
+                                         2.5f, 1.0f, color);
+            break;
+        case Icon::Solo:
+        case Icon::SoloOn:
+            glyph("s");
+            break;
+        case Icon::Lock:
+            // Padlock: filled body + shackle arch strokes.
+            canvas.draw_sdf_rect({cx - 4.0f, cy - 0.5f, 8.0f, 6.0f}, 1.5f,
+                                 color);
+            canvas.draw_line({cx - 2.5f, cy - 0.5f}, {cx - 2.5f, cy - 3.5f},
+                             1.0f, color);
+            canvas.draw_line({cx + 2.5f, cy - 0.5f}, {cx + 2.5f, cy - 3.5f},
+                             1.0f, color);
+            canvas.draw_line({cx - 2.5f, cy - 3.5f}, {cx + 2.5f, cy - 3.5f},
+                             1.0f, color);
+            break;
+        case Icon::Magnet:
+            // Horseshoe magnet: U strokes + pole tips.
+            canvas.draw_line({cx - 3.5f, cy - 5.0f}, {cx - 3.5f, cy + 1.5f},
+                             1.5f, color);
+            canvas.draw_line({cx + 3.5f, cy - 5.0f}, {cx + 3.5f, cy + 1.5f},
+                             1.5f, color);
+            canvas.draw_line({cx - 3.5f, cy + 1.5f}, {cx - 1.5f, cy + 4.0f},
+                             1.5f, color);
+            canvas.draw_line({cx + 3.5f, cy + 1.5f}, {cx + 1.5f, cy + 4.0f},
+                             1.5f, color);
+            canvas.draw_line({cx - 1.5f, cy + 4.0f}, {cx + 1.5f, cy + 4.0f},
+                             1.5f, color);
+            canvas.draw_sdf_rect({cx - 4.5f, cy - 5.5f, 2.0f, 2.0f}, 0.5f,
+                                 color);
+            canvas.draw_sdf_rect({cx + 2.5f, cy - 5.5f, 2.0f, 2.0f}, 0.5f,
+                                 color);
+            break;
+        case Icon::Copy:
+            // Two offset outline squares: duplicate.
+            canvas.draw_sdf_rect_outline({cx - 5.5f, cy - 5.5f, 8.0f, 8.0f},
+                                         1.5f, 1.0f, color);
+            canvas.draw_sdf_rect_outline({cx - 2.0f, cy - 2.0f, 8.0f, 8.0f},
+                                         1.5f, 1.0f, color);
+            break;
+    }
+}
+
 namespace {
 
 constexpr float kTransitionSeconds = 0.12f;
@@ -434,7 +572,8 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
     if (!u->disabled) {
         static const char* names[] = {
             "play", "pause", "up", "down", "close", "wave", "key", "knob",
-            "eye", "eyeoff", "dice", "link", "solo", "soloon", "copy"};
+            "eye", "eyeoff", "dice", "link", "solo", "soloon", "copy",
+            "lock", "magnet"};
         const size_t ii = static_cast<size_t>(u->icon);
         if (ii < sizeof(names) / sizeof(names[0]))
             probe_add(std::string("icon:") + names[ii], r);
@@ -458,124 +597,11 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
             : lerp(theme.text_dim, theme.text, u->state->hover_t);
     }
 
-    const float cx = r.x + r.w * 0.5f;
-    const float cy = r.y + r.h * 0.5f;
-    // Glyph-drawn icons ride the MSDF text pipeline for clean AA.
-    auto glyph = [&](const char* s) {
-        const Vec2 ts = measure_text(frame.font, s, theme.font_size);
-        draw_text(frame.canvas, frame.font, s,
-                  {cx - ts.x * 0.5f,
-                   cy - frame.font.line_height() * theme.font_size * 0.5f},
-                  theme.font_size, fg);
-    };
-    switch (u->icon) {
-        case Icon::Play:
-            frame.canvas.draw_triangle({cx - 4.0f, cy - 5.5f},
-                                       {cx + 5.5f, cy},
-                                       {cx - 4.0f, cy + 5.5f}, fg);
-            break;
-        case Icon::Pause:
-            // SDF rects: anti-aliased, unlike raw triangles.
-            frame.canvas.draw_sdf_rect({cx - 5.0f, cy - 5.0f, 3.5f, 10.0f},
-                                       1.0f, fg);
-            frame.canvas.draw_sdf_rect({cx + 1.5f, cy - 5.0f, 3.5f, 10.0f},
-                                       1.0f, fg);
-            break;
-        case Icon::Up:
-            // Chevron strokes (the app's fold language), not filled
-            // triangles — 1 px lines read clean, triangles alias.
-            frame.canvas.draw_line({cx - 4.0f, cy + 2.0f}, {cx, cy - 2.0f},
-                                   1.0f, fg);
-            frame.canvas.draw_line({cx, cy - 2.0f}, {cx + 4.0f, cy + 2.0f},
-                                   1.0f, fg);
-            break;
-        case Icon::Down:
-            frame.canvas.draw_line({cx - 4.0f, cy - 2.0f}, {cx, cy + 2.0f},
-                                   1.0f, fg);
-            frame.canvas.draw_line({cx, cy + 2.0f}, {cx + 4.0f, cy - 2.0f},
-                                   1.0f, fg);
-            break;
-        case Icon::Close:
-            glyph("x");
-            break;
-        case Icon::Wave: {
-            // Two-arch sine: modulation.
-            const float a = 2.6f;
-            frame.canvas.draw_line({cx - 5.0f, cy}, {cx - 2.5f, cy - a},
-                                   1.0f, fg);
-            frame.canvas.draw_line({cx - 2.5f, cy - a}, {cx, cy}, 1.0f, fg);
-            frame.canvas.draw_line({cx, cy}, {cx + 2.5f, cy + a}, 1.0f, fg);
-            frame.canvas.draw_line({cx + 2.5f, cy + a}, {cx + 5.0f, cy},
-                                   1.0f, fg);
-            break;
-        }
-        case Icon::Key: {
-            // Keyframe diamond (outline strokes).
-            const float d = 3.6f;
-            frame.canvas.draw_line({cx, cy - d}, {cx + d, cy}, 1.0f, fg);
-            frame.canvas.draw_line({cx + d, cy}, {cx, cy + d}, 1.0f, fg);
-            frame.canvas.draw_line({cx, cy + d}, {cx - d, cy}, 1.0f, fg);
-            frame.canvas.draw_line({cx - d, cy}, {cx, cy - d}, 1.0f, fg);
-            break;
-        }
-        case Icon::Knob:
-            // Macro dot: SDF circle (full-radius rect).
-            frame.canvas.draw_sdf_rect({cx - 3.5f, cy - 3.5f, 7.0f, 7.0f},
-                                       3.5f, fg);
-            break;
-        case Icon::Eye:
-            // Capsule outline + pupil.
-            frame.canvas.draw_sdf_rect_outline({cx - 6.0f, cy - 3.5f, 12.0f,
-                                                7.0f},
-                                               3.5f, 1.0f, fg);
-            frame.canvas.draw_sdf_rect({cx - 1.75f, cy - 1.75f, 3.5f, 3.5f},
-                                       1.75f, fg);
-            break;
-        case Icon::EyeOff:
-            frame.canvas.draw_sdf_rect_outline({cx - 6.0f, cy - 3.5f, 12.0f,
-                                                7.0f},
-                                               3.5f, 1.0f, fg);
-            frame.canvas.draw_line({cx - 6.0f, cy + 5.0f},
-                                   {cx + 6.0f, cy - 5.0f}, 1.0f, fg);
-            break;
-        case Icon::Dice:
-            frame.canvas.draw_sdf_rect_outline({cx - 5.0f, cy - 5.0f, 10.0f,
-                                                10.0f},
-                                               2.0f, 1.0f, fg);
-            frame.canvas.draw_sdf_rect({cx - 3.0f, cy - 3.0f, 2.0f, 2.0f},
-                                       1.0f, fg);
-            frame.canvas.draw_sdf_rect({cx - 1.0f, cy - 1.0f, 2.0f, 2.0f},
-                                       1.0f, fg);
-            frame.canvas.draw_sdf_rect({cx + 1.0f, cy + 1.0f, 2.0f, 2.0f},
-                                       1.0f, fg);
-            break;
-        case Icon::Link:
-            // Two overlapping capsule links.
-            frame.canvas.draw_sdf_rect_outline({cx - 6.5f, cy - 2.5f, 8.0f,
-                                                5.0f},
-                                               2.5f, 1.0f, fg);
-            frame.canvas.draw_sdf_rect_outline({cx - 1.5f, cy - 2.5f, 8.0f,
-                                                5.0f},
-                                               2.5f, 1.0f, fg);
-            break;
-        case Icon::Solo:
-            glyph("s");
-            break;
-        case Icon::SoloOn:
-            // Active solo reads accent even at rest.
-            fg = theme.accent;
-            glyph("s");
-            break;
-        case Icon::Copy:
-            // Two offset outline squares: duplicate.
-            frame.canvas.draw_sdf_rect_outline({cx - 5.5f, cy - 5.5f, 8.0f,
-                                                8.0f},
-                                               1.5f, 1.0f, fg);
-            frame.canvas.draw_sdf_rect_outline({cx - 2.0f, cy - 2.0f, 8.0f,
-                                                8.0f},
-                                               1.5f, 1.0f, fg);
-            break;
-    }
+    // Active solo reads accent even at rest.
+    if (u->icon == Icon::SoloOn && !u->disabled) fg = theme.accent;
+    draw_icon_glyph(frame.canvas, frame.font, u->icon,
+                    {r.x + r.w * 0.5f, r.y + r.h * 0.5f}, fg,
+                    theme.font_size);
 }
 
 // ---- Dropdown

@@ -29,15 +29,22 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
-    const float3 trail = prev_out.SampleLevel(uv, 0).rgb * saturate(decay);
+    const float4 prev = prev_out.SampleLevel(uv, 0);
+    const float3 trail = prev.rgb * saturate(decay);
+    const float trail_a = prev.a * saturate(decay);
 
+    // The trail is content: its coverage decays exactly like its color.
     float3 echoed;
-    if (int(mode + 0.5) == 0)
+    float echoed_a;
+    if (int(mode + 0.5) == 0) {
         echoed = max(base.rgb, trail);
-    else
+        echoed_a = max(base.a, trail_a);
+    } else {
         echoed = lerp(base.rgb, trail, saturate(decay));
+        echoed_a = lerp(base.a, trail_a, saturate(decay));
+    }
 
-    const float4 result = float4(echoed, base.a);
+    const float4 result = float4(echoed, echoed_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

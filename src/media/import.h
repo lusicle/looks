@@ -14,9 +14,12 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace looks::media {
+
+struct PcmBuffer;
 
 struct ImportOptions {
     int quality = 90;          // still/cover-art mezzanine (0 = lossless)
@@ -49,6 +52,12 @@ struct ImportProgress {
     std::atomic<uint32_t> frames_total{0};
     std::atomic<bool> ready{false};
     std::atomic<bool> cancel{false};
+    // The pcm the job wrote, preloaded on the JOB thread and assigned
+    // BEFORE `ready` flips (or before the job ends, for the fast
+    // paths) - those atomic stores order the read. Adoption seeds the
+    // app's cache from this instead of re-reading the file on the UI
+    // thread.
+    std::shared_ptr<const PcmBuffer> pcm;
 };
 
 ImportResult import_media(const std::filesystem::path& source,

@@ -175,7 +175,9 @@ TEST(sequence_track_commands_undo) {
     undo.execute(d, doc::remove_track_command(d, sid, v2));
     CHECK(doc::remove_track_command(d, sid, v1) == nullptr);
 
-    // Audio tracks add bare and remove with their placements.
+    // Audio tracks add bare and remove with their placements. (Shed the
+    // default a1 first: this exercises the bare add/remove pair.)
+    d.sequence(sid).audio.clear();
     CHECK_EQ(d.sequence(sid).audio.size(), size_t{0});
     doc::AudioTrack at = doc::make_audio_track(d, d.sequence(sid));
     const uint64_t a1 = at.id;
@@ -385,6 +387,9 @@ struct SeqRig {
     uint64_t video = 0;
 
     explicit SeqRig(uint32_t frames = 200) {
+        // Shed the default a1 so the pair lay exercises mint-on-demand
+        // and the rig's track stays audio[0].
+        d.root().audio.clear();
         doc::Asset a;
         a.id = d.next_effect_id++;
         a.frame_count = frames;
@@ -621,4 +626,157 @@ TEST(look_version_gate_refuses_older_projects) {
     auto loaded = doc::load_document(path, &error);
     CHECK(!loaded.has_value());
     CHECK(error.find("value graph") != std::string::npos);
+}
+
+TEST(fresh_sequences_carry_a_default_audio_track) {
+    // Sound needs somewhere to land from the first drop: the document's
+    // root and every minted sequence start with one audio track.
+    Document d;
+    CHECK_EQ(d.root().audio.size(), size_t{1});
+    CHECK_EQ(d.root().audio[0].name, "a1");
+    CHECK(d.root().audio[0].placements.empty());
+    doc::Sequence s = doc::make_sequence(d, "cut");
+    CHECK_EQ(s.audio.size(), size_t{1});
+    CHECK_EQ(s.audio[0].name, "a1");
+}
+
+TEST(lane_props_commands_toggle_hidden_and_lock) {
+    Document d;
+    doc::UndoStack undo;
+    const uint64_t sid = d.root_sequence;
+    const uint64_t lane = d.root().tracks[0].id;
+    const uint64_t atrack = d.root().audio[0].id;
+
+    undo.execute(d, doc::set_track_props_command(sid, lane, "v1", true,
+                                                 true));
+    CHECK(d.root().tracks[0].hidden);
+    CHECK(d.root().tracks[0].lock);
+    undo.undo(d);
+    CHECK(!d.root().tracks[0].hidden);
+    CHECK(!d.root().tracks[0].lock);
+
+    undo.execute(d, doc::set_audio_track_props_command(sid, atrack, "a1",
+                                                       1.0f, false, true));
+    CHECK(d.root().audio[0].lock);
+    undo.undo(d);
+    CHECK(!d.root().audio[0].lock);
+}
+
+TEST(move_placement_lands_on_a_same_kind_lane) {
+    Document d;
+    doc::UndoStack undo;
+    const uint64_t sid = d.root_sequence;
+    const uint64_t v1 = d.root().tracks[0].id;
+    doc::SeqTrack lane2 = doc::make_track(d, d.root());
+    const uint64_t v2 = lane2.id;
+    undo.execute(d, doc::add_track_command(sid, std::move(lane2), 1));
+    const uint64_t atrack = d.root().audio[0].id;
+
+    doc::Placement first;
+    first.id = d.next_effect_id++;
+    first.target = d.looks[0].id;
+    first.t_out = 40;
+    doc::Placement second;
+    second.id = d.next_effect_id++;
+    second.target = d.looks[0].id;
+    second.t_in = 50;
+    second.t_out = 90;
+    undo.execute(d, doc::add_placement_command(sid, v1, first));
+    undo.execute(d, doc::add_placement_command(sid, v1, second));
+
+    // Cross-kind and no-op targets refuse.
+    CHECK(doc::move_placement_command(d, sid, first.id, atrack) == nullptr);
+    CHECK(doc::move_placement_command(d, sid, first.id, v1) == nullptr);
+
+    undo.execute(d, doc::move_placement_command(d, sid, first.id, v2));
+    CHECK_EQ(d.root().tracks[0].placements.size(), size_t{1});
+    CHECK_EQ(d.root().tracks[0].placements[0].id, second.id);
+    CHECK_EQ(d.root().tracks[1].placements.size(), size_t{1});
+    CHECK_EQ(d.root().tracks[1].placements[0].id, first.id);
+
+    // Undo restores the exact source index (it was FIRST on v1).
+    undo.undo(d);
+    CHECK_EQ(d.root().tracks[0].placements.size(), size_t{2});
+    CHECK_EQ(d.root().tracks[0].placements[0].id, first.id);
+    CHECK(d.root().tracks[1].placements.empty());
+}
+
+TEST(audio_overwrite_claims_span_like_video) {
+    // Landing on an audio track trims what it covers - overlaps never
+    // persist past an edit on EITHER lane kind; summing stays the
+    // mid-gesture rendering rule only.
+    Document d;
+    doc::UndoStack undo;
+    const uint64_t sid = d.root_sequence;
+    const uint64_t atrack = d.root().audio[0].id;
+    const uint64_t target = d.looks[0].id;
+    auto lay = [&](uint32_t t_in, uint32_t t_out) {
+        doc::Placement p;
+        p.id = d.next_effect_id++;
+        p.target = target;
+        p.t_in = t_in;
+        p.t_out = t_out;
+        undo.execute(d, doc::add_audio_placement_command(d, sid, atrack,
+                                                         p, 0));
+        return p.id;
+    };
+
+    // Tail under the newcomer: cut to its start.
+    const uint64_t a = lay(0, 100);
+    const uint64_t b = lay(60, 160);
+    doc::overwrite_group_spans(d, undo, sid, b);
+    CHECK_EQ(d.root().audio[0].placements.size(), size_t{2});
+    CHECK_EQ(doc::find_placement(d.root(), a)->t_out, uint32_t{60});
+
+    // Fully covered: removed.
+    const uint64_t c = lay(0, 200);
+    doc::overwrite_group_spans(d, undo, sid, c);
+    CHECK(doc::find_placement(d.root(), a) == nullptr);
+    CHECK(doc::find_placement(d.root(), b) == nullptr);
+    CHECK_EQ(d.root().audio[0].placements.size(), size_t{1});
+
+    // Strictly inside: the survivor splits and the right half's start
+    // slides past the newcomer, content holding still.
+    const uint64_t mid = lay(80, 120);
+    doc::overwrite_group_spans(d, undo, sid, mid);
+    CHECK_EQ(d.root().audio[0].placements.size(), size_t{3});
+    const doc::Placement* left = doc::find_placement(d.root(), c);
+    CHECK(left != nullptr);
+    CHECK_EQ(left->t_out, uint32_t{80});
+    bool found_right = false;
+    for (const doc::Placement& p : d.root().audio[0].placements)
+        if (p.id != c && p.id != mid) {
+            found_right = true;
+            CHECK_EQ(p.t_in, uint32_t{120});
+            CHECK_EQ(p.source_in, uint32_t{120});
+        }
+    CHECK(found_right);
+}
+
+TEST(linked_pair_lands_claiming_both_lanes) {
+    // One drop's landing overwrites the video lane AND the audio track
+    // together: a pair laid over two older pairs trims both halves of
+    // each, group timing keeping every pair coherent.
+    SeqRig rig;
+    doc::Placement block;
+    block.id = rig.d.next_effect_id++;
+    block.target = rig.look;
+    block.t_in = 60;
+    block.t_out = 160;
+    rig.undo.execute(rig.d, doc::add_placement_command(
+                                rig.d.root_sequence,
+                                rig.d.root().tracks[0].id, block));
+    doc::Placement ap;
+    ap.target = rig.look;
+    ap.t_in = 60;
+    ap.t_out = 160;
+    rig.undo.execute(rig.d, doc::add_audio_placement_command(
+                                rig.d, rig.d.root_sequence,
+                                rig.d.root().audio[0].id, ap, block.id));
+    doc::overwrite_group_spans(rig.d, rig.undo, rig.d.root_sequence,
+                               block.id);
+    // The first pair's halves both end at 60 now.
+    CHECK_EQ(doc::find_placement(rig.d.root(), rig.video)->t_out,
+             uint32_t{60});
+    CHECK_EQ(rig.d.root().audio[0].placements[0].t_out, uint32_t{60});
 }

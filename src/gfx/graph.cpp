@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <functional>
 #include <unordered_map>
 
 #include "doc/instances.h"
@@ -30,6 +32,9 @@ struct Compiler {
     // The "before" pass: every effect compiles as bypassed while the
     // composition (sources, layer attributes, lane Motion) stays whole.
     bool strip_effects = false;
+    // The ROOT entity's effective rate: timeline-locked media conforms
+    // against it (locked nodes read the root clock).
+    double root_fps = 30.0;
     FlowSlot flow;
     int black_node = -1;
 
@@ -101,15 +106,11 @@ struct Compiler {
     // Liveness and the shown-block pick are the shared predicates in
     // doc/document.h - identical to the flatten the decode pool and the
     // audio mix run on, and to the monitor's click-pick.
-    bool active_at(const doc::Placement& place, const LookInstance& p) const {
-        return doc::placement_active(place, doc::source_length(doc, place),
-                                     p.local_time);
-    }
-
     const doc::Placement* winner_at(
         const std::vector<doc::Placement>& placements,
-        const LookInstance& p) const {
-        return doc::placement_winner(doc, placements, p.local_time);
+        const LookInstance& p, double parent_fps) const {
+        return doc::placement_winner(doc, placements, p.local_time,
+                                     parent_fps);
     }
 
     // Emits the entity behind a child instance: dispatch by kind.
@@ -129,14 +130,17 @@ struct Compiler {
 // those live in looks). Audio tracks are not images and emit nothing.
 int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
     const doc::Sequence& seq = doc.sequence(seq_id);
+    const double eff = doc::effective_fps(doc, seq);
     int below = -1;
     for (const doc::SeqTrack& track : seq.tracks) {
+        if (track.hidden) continue;
         // Refetched every lane: recursion appends instances, which may
         // reallocate.
         const LookInstance self =
             graph.instances[static_cast<size_t>(inst)];
         if (self.depth + 1 >= doc::kMaxLookDepth) break;
-        const doc::Placement* place = winner_at(track.placements, self);
+        const doc::Placement* place =
+            winner_at(track.placements, self, eff);
         if (!place || !place->target) continue;
         if (!doc.find_look(place->target) &&
             !doc.find_sequence(place->target))
@@ -146,10 +150,13 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
         child.path =
             doc::seq_child_path(self.path, track.id, place->target);
         child.depth = self.depth + 1;
-        // Composed affine map, evaluated on the parent's CONTINUOUS local
-        // time; only the frame the effects clock on is floored.
-        child.local_time =
-            doc::placement_source_frame(*place, self.local_time);
+        // Composed affine map, evaluated on the parent's CONTINUOUS
+        // local time and landing in the child's OWN clock (the hop
+        // ratio rides the map); only the frame the effects clock on is
+        // floored.
+        child.local_time = doc::placement_source_frame(
+            *place, self.local_time,
+            doc::placement_ratio(doc, *place, eff));
         child.local_frame = child.local_time <= 0.0
             ? 0u
             : static_cast<uint32_t>(std::floor(child.local_time));
@@ -182,6 +189,8 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
                 blend.p_shift_y = place->pos_y;
                 blend.p_scale = place->scale;
                 blend.p_rotate = place->rotate * doc::kDeg2Rad;
+                blend.p_anchor_x = place->anchor_x;
+                blend.p_anchor_y = place->anchor_y;
             }
             blend.inputs = {below < 0 ? black() : below, out};
             below = add(std::move(blend), inst);
@@ -192,6 +201,7 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
 
 int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     const doc::Look& look = doc.look(look_id);
+    const double eff = doc::effective_fps(doc, look);
     // By value: recursion appends instances, which may reallocate.
     const uint64_t path = graph.instances[static_cast<size_t>(inst)].path;
     auto subject_key = [&](uint64_t id) { return hash_combine(path, id); };
@@ -275,9 +285,12 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                                  : self.local_time;
             {
                 double lo = 0.0, hi = 0.0;
-                doc::shifted_window(static_cast<double>(frames),
-                                    static_cast<int64_t>(layer.slip), &lo,
-                                    &hi);
+                doc::shifted_window(
+                    static_cast<double>(frames),
+                    static_cast<int64_t>(layer.slip),
+                    doc::media_conform_rate(
+                        doc, *a, layer.timeline_lock ? root_fps : eff),
+                    &lo, &hi);
                 if (t < lo || t >= hi) {
                     time_culled[layer.id] = 1;
                     continue;
@@ -303,9 +316,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 tl ? nullptr : doc.find_sequence(layer.target);
             if (!tl && !ts) continue;
             const uint32_t dur = tl ? tl->duration : ts->duration;
+            const double ratio = doc::entity_fps(doc, layer.target) / eff;
             {
                 double lo = 0.0, hi = 0.0;
-                doc::shifted_window(static_cast<double>(dur), 0, &lo, &hi);
+                doc::shifted_window(static_cast<double>(dur), 0, ratio,
+                                    &lo, &hi);
                 if (self.local_time < lo || self.local_time >= hi) {
                     time_culled[layer.id] = 1;
                     continue;
@@ -317,8 +332,12 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             child.path = doc::nested_child_path(path, layer.id,
                                                 layer.target, 0);
             child.depth = self.depth + 1;
-            child.local_time = self.local_time;
-            child.local_frame = self.local_frame;
+            // Lockstep is 1:1 in TIME: the hop ratio scales the child's
+            // own clock.
+            child.local_time = self.local_time * ratio;
+            child.local_frame = child.local_time <= 0.0
+                ? 0u
+                : static_cast<uint32_t>(std::floor(child.local_time));
             graph.instances.push_back(child);
             const int ci = static_cast<int>(graph.instances.size()) - 1;
             const int out =
@@ -389,7 +408,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     double lo = 0.0, hi = 0.0;
                     doc::shifted_window(
                         static_cast<double>(frames),
-                        static_cast<int64_t>(sl->slip) + off, &lo, &hi);
+                        static_cast<int64_t>(sl->slip) + off,
+                        doc::media_conform_rate(
+                            doc, *a,
+                            sl->timeline_lock ? root_fps : eff),
+                        &lo, &hi);
                     if (t < lo || t >= hi) {
                         time_culled[fx.id] = 1;
                         continue;
@@ -408,11 +431,13 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                         tl ? nullptr : doc.find_sequence(sl->target);
                     if (!tl && !ts) continue;
                     const uint32_t dur = tl ? tl->duration : ts->duration;
-                    const double ct =
-                        self.local_time + static_cast<double>(off);
+                    const double ratio =
+                        doc::entity_fps(doc, sl->target) / eff;
+                    const double ct = self.local_time * ratio +
+                                      static_cast<double>(off);
                     double lo = 0.0, hi = 0.0;
-                    doc::shifted_window(static_cast<double>(dur), off, &lo,
-                                        &hi);
+                    doc::shifted_window(static_cast<double>(dur), off,
+                                        ratio, &lo, &hi);
                     if (self.local_time < lo || self.local_time >= hi) {
                         time_culled[fx.id] = 1;
                         continue;
@@ -446,34 +471,160 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         }
     }
 
-    // Effective node behind an id: follow In links THROUGH inactive
-    // effects (a bypassed node passes its input along) to a head, an
-    // active effect, a settled Offset shim, or the shared source.
-    auto effective_from = [&](uint64_t cur) -> uint64_t {
-        for (int guard = 0; guard < 512; ++guard) {
-            if (owner.find(cur) == owner.end()) return cur;   // head / 0
-            if (effect_active(cur)) return cur;
-            if (offset_terminal.count(cur)) return cur;
-            cur = link_into(cur, 0);
-        }
-        return 0;
+    // ---- link-order fan-in resolution. STACKING ORDER IS THE LINK
+    // ORDER: a port's feeds composite bottom -> top in link-vector
+    // order (first link = bottom; new wires append, so newest lands on
+    // top), each feed through its OWNER layer's blend/opacity and
+    // gated by that layer's port-1 matte. The Output's In is simply
+    // the composite's fan-in - effect ports merge by the same one
+    // rule - and an inactive effect passes its own In merge through.
+    auto links_into_port = [&](uint64_t to, uint32_t port) {
+        std::vector<uint64_t> from;
+        for (const doc::NodeLink& l : links)
+            if (l.to == to && l.to_port == port) from.push_back(l.from);
+        return from;
     };
-    auto upstream_of = [&](uint64_t id) {
-        return effective_from(link_into(id, 0));
+    auto owner_layer_index = [&](uint64_t id) -> size_t {
+        if (auto it = owner.find(id); it != owner.end()) return it->second;
+        for (size_t k = 0; k < look.layers.size(); ++k)
+            if (look.layers[k].id == id) return k;
+        return SIZE_MAX;
     };
-    // Does this feed hang from a producer that is merely OFF right now?
-    // Walks the In-chain through effects (settled or starved alike) to the
-    // head it hangs from.
-    auto feed_time_culled = [&](uint64_t id) {
-        for (int guard = 0; guard < 512 && id; ++guard) {
-            if (time_culled.count(id)) return true;
-            // A settled Offset shim is a live producer: the chain ends
-            // here, whatever the raw layer behind it is doing.
-            if (offset_terminal.count(id)) return false;
-            if (owner.find(id) == owner.end()) return false;   // live head
-            id = link_into(id, 0);
+    // Does this feed hang (possibly through effects, settled or starved
+    // alike) from a producer that is merely OFF right now? Culled reads
+    // as a CLOSED GATE (black), never as unwired.
+    std::function<bool(uint64_t, int)> id_culled =
+        [&](uint64_t id, int depth) -> bool {
+        if (time_culled.count(id)) return true;
+        if (depth > 64) return false;
+        if (offset_terminal.count(id)) return false;
+        if (owner.count(id) && !fx_out.count(id)) {
+            for (uint64_t from : links_into_port(id, 0))
+                if (id_culled(from, depth + 1)) return true;
         }
         return false;
+    };
+    auto port_culled = [&](uint64_t to, uint32_t port) {
+        for (uint64_t from : links_into_port(to, port))
+            if (id_culled(from, 0)) return true;
+        return false;
+    };
+    // Is a feed still waiting on an ACTIVE effect that has not emitted?
+    // (Dormant chains never settle and read as absent; cycles bottom
+    // out on the depth guard and resolve to nothing.)
+    std::function<bool(uint64_t, int)> id_pending =
+        [&](uint64_t id, int depth) -> bool {
+        if (depth > 64) return false;
+        if (fx_out.count(id) || offset_terminal.count(id)) return false;
+        if (auto it = owner.find(id); it != owner.end()) {
+            if (effect_active(id)) return true;
+            for (uint64_t from : links_into_port(id, 0))
+                if (id_pending(from, depth + 1)) return true;
+        }
+        return false;
+    };
+    auto port_pending = [&](uint64_t to, uint32_t port) {
+        for (uint64_t from : links_into_port(to, port))
+            if (id_pending(from, 0)) return true;
+        return false;
+    };
+    // The node producing an id's output: emitted effects and shims from
+    // fx_out, layer heads from Pass A, inactive effects as the merge of
+    // their own In fan-in. -1 = dormant / culled / unsettled: the
+    // contribution simply does not exist.
+    std::unordered_map<uint64_t, int> merge_memo;
+    std::function<int(uint64_t, int)> resolve_node;
+    std::function<int(uint64_t, uint32_t, int)> merge_port;
+    resolve_node = [&](uint64_t id, int depth) -> int {
+        if (auto it = fx_out.find(id); it != fx_out.end())
+            return it->second;
+        // A shim with no head is time-culled or dormant: the chain
+        // ends here - never fall through to the unshifted layer.
+        if (offset_terminal.count(id)) return -1;
+        if (auto it = heads.find(id); it != heads.end()) return it->second;
+        if (owner.count(id)) {
+            if (effect_active(id)) return -1;   // starved: never emitted
+            if (depth > 64) return -1;
+            return merge_port(id, 0, depth + 1);
+        }
+        return -1;
+    };
+    merge_port = [&](uint64_t to, uint32_t port, int depth) -> int {
+        // Injective key: hash_combine folds small consecutive ids onto
+        // each other ((4,1) collided with (7,0)); ports are tiny, so
+        // shifting is exact.
+        const uint64_t memo_key = (to << 8) | port;
+        if (auto it = merge_memo.find(memo_key); it != merge_memo.end())
+            return it->second;
+        if (depth > 64) return -1;
+        struct Feed {
+            int node;
+            size_t li;
+        };
+        std::vector<Feed> feeds;
+        for (uint64_t from : links_into_port(to, port)) {
+            const int n = resolve_node(from, depth + 1);
+            if (n < 0) continue;   // dormant / culled: contributes nothing
+            feeds.push_back({n, owner_layer_index(from)});
+        }
+        // The owner-layer matte gates a contribution ONCE, at the
+        // COMPOSITE - a mid-graph merge is plain wiring (mask an effect
+        // feed by wiring the mask into ITS port 1), or the same matte
+        // would re-apply at every pass-through hop of the chain.
+        const bool composite = to == 0 && port == 0;
+        int below = -1;
+        for (const Feed& feed : feeds) {
+            int cur = feed.node;
+            // The feed's owner-layer matte (its port-1 fan-in) gates
+            // the whole contribution; a mask whose media is off right
+            // now gates it OUT (cross-time masking).
+            int gate_out = -1;
+            if (composite && feed.li != SIZE_MAX) {
+                const doc::Layer& fl = look.layers[feed.li];
+                int idx = merge_port(fl.id, 1, depth + 1);
+                if (idx < 0 && !links_into_port(fl.id, 1).empty() &&
+                    port_culled(fl.id, 1))
+                    idx = black();
+                if (idx >= 0) {
+                    GraphNode ex;
+                    ex.kind = GraphNode::Kind::MatteExtract;
+                    ex.inputs.push_back(idx);
+                    gate_out = add(std::move(ex), inst);
+                }
+            }
+            if (below < 0) {
+                if (gate_out >= 0) {
+                    // Nothing below: the matte reveals TRANSPARENT
+                    // black, the premultiplied zero.
+                    GraphNode apply;
+                    apply.kind = GraphNode::Kind::MatteApply;
+                    apply.inputs = {black(), cur, gate_out};
+                    cur = add(std::move(apply), inst);
+                }
+                below = cur;
+            } else {
+                GraphNode blend;
+                blend.kind = GraphNode::Kind::LayerBlend;
+                blend.layer_index =
+                    feed.li == SIZE_MAX ? -1
+                                        : static_cast<int>(feed.li);
+                blend.inputs = {below, cur};
+                int blended =
+                    add(std::move(blend), inst,
+                        feed.li == SIZE_MAX
+                            ? 0
+                            : subject_key(look.layers[feed.li].id));
+                if (gate_out >= 0) {
+                    GraphNode apply;
+                    apply.kind = GraphNode::Kind::MatteApply;
+                    apply.inputs = {below, blended, gate_out};
+                    blended = add(std::move(apply), inst);
+                }
+                below = blended;
+            }
+        }
+        merge_memo[memo_key] = below;
+        return below;
     };
 
     // One effect emission, with the In node resolved from the links.
@@ -520,13 +671,13 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     };
 
     // Pass B: effects in link-topological order. An effect with NO
-    // in-wire (or a chain that dangles into nothing) is DORMANT: never
-    // emitted, processes nothing, and anything fed only by it starves at
-    // the fixpoint and stays dormant too — an unconnected node must not
-    // run. Cycle-stuck nodes starve the same way. Aux is optional:
-    // phase 0 waits for wired aux producers so their node index exists;
-    // phase 1 re-runs treating aux fed by dormant chains as unwired
-    // instead of starving the consumer.
+    // live in-feed (or fan-in that dangles into nothing) is DORMANT:
+    // never emitted, processes nothing, and anything fed only by it
+    // starves at the fixpoint and stays dormant too — an unconnected
+    // node must not run. Cycle-stuck nodes starve the same way. Aux and
+    // matte are optional: phase 0 waits for their wired producers so
+    // the node indices exist; phase 1 re-runs treating fan-ins fed by
+    // dormant chains as unwired instead of starving the consumer.
     std::vector<std::pair<size_t, size_t>> pending;
     for (size_t li = 0; li < look.layers.size(); ++li)
         for (size_t i = 0; i < look.layers[li].stack.size(); ++i) {
@@ -540,76 +691,38 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             for (auto it = pending.begin(); it != pending.end();) {
                 const doc::EffectInstance& fx =
                     look.layers[it->first].stack[it->second];
-                const uint64_t up_link = link_into(fx.id, 0);
-                const uint64_t up = up_link ? effective_from(up_link) : 0;
-                const bool up_is_fx = owner.find(up) != owner.end();
-                if (up_is_fx && fx_out.find(up) == fx_out.end()) {
-                    ++it;   // not settled yet — or dormant: starves out
+                if (port_pending(fx.id, 0)) {
+                    ++it;   // an in-feed not settled yet — or starved
                     continue;
                 }
-                int in_node = -1;
-                if (up_is_fx)
-                    in_node = fx_out[up];
-                else if (auto ith = heads.find(up); ith != heads.end())
-                    in_node = ith->second;
+                if (phase == 0 && (port_pending(fx.id, 2) ||
+                                   port_pending(fx.id, 1))) {
+                    ++it;
+                    continue;
+                }
+                const int in_node = merge_port(fx.id, 0, 0);
                 if (in_node < 0) {
-                    // No in-wire: dormant, drop without emitting.
+                    // No live in-feed: dormant, drop without emitting.
                     it = pending.erase(it);
                     progress = true;
                     continue;
                 }
-                const uint64_t aux_link = link_into(fx.id, 2);
-                const uint64_t aux =
-                    aux_link ? effective_from(aux_link) : 0;
-                const bool aux_is_fx = owner.find(aux) != owner.end();
-                if (phase == 0 && aux_link && aux_is_fx &&
-                    fx_out.find(aux) == fx_out.end()) {
-                    ++it;
-                    continue;
-                }
-                int aux_node = -1;
-                if (aux_link) {
-                    if (aux_is_fx) {
-                        if (auto ita = fx_out.find(aux);
-                            ita != fx_out.end())
-                            aux_node = ita->second;
-                    } else if (auto ith = heads.find(aux);
-                               ith != heads.end()) {
-                        aux_node = ith->second;
-                    }
-                    // A producer that is merely off right now feeds black
-                    // (a zero map); fed by nothing reads as unwired.
-                    if (aux_node < 0 && feed_time_culled(aux_link))
-                        aux_node = black();
-                }
-                // Port-1 matte (masks ARE images): settles exactly like
-                // aux — phase 0 waits for the wired producer, a dormant
-                // feed reads as unwired (no gate, never fabricated).
-                const uint64_t matte_link = link_into(fx.id, 1);
-                const uint64_t matte =
-                    matte_link ? effective_from(matte_link) : 0;
-                const bool matte_is_fx =
-                    owner.find(matte) != owner.end();
-                if (phase == 0 && matte_link && matte_is_fx &&
-                    fx_out.find(matte) == fx_out.end()) {
-                    ++it;
-                    continue;
-                }
-                int matte_node = -1;
-                if (matte_link) {
-                    if (matte_is_fx) {
-                        if (auto itm = fx_out.find(matte);
-                            itm != fx_out.end())
-                            matte_node = itm->second;
-                    } else if (auto ith = heads.find(matte);
-                               ith != heads.end()) {
-                        matte_node = ith->second;
-                    }
-                    // The mask's media ended: luma 0, gate CLOSED — the
-                    // effect reads dry instead of running ungated.
-                    if (matte_node < 0 && feed_time_culled(matte_link))
-                        matte_node = black();
-                }
+                // Aux (b/map) fan-in: a producer that is merely off
+                // right now feeds black (a zero map); fed by nothing
+                // reads as unwired.
+                int aux_node = merge_port(fx.id, 2, 0);
+                if (aux_node < 0 &&
+                    !links_into_port(fx.id, 2).empty() &&
+                    port_culled(fx.id, 2))
+                    aux_node = black();
+                // Port-1 matte (masks ARE images): the mask's media
+                // ended = luma 0, gate CLOSED — the effect reads dry
+                // instead of running ungated.
+                int matte_node = merge_port(fx.id, 1, 0);
+                if (matte_node < 0 &&
+                    !links_into_port(fx.id, 1).empty() &&
+                    port_culled(fx.id, 1))
+                    matte_node = black();
                 emit_one(it->first, it->second, in_node, aux_node,
                          matte_node);
                 it = pending.erase(it);
@@ -618,108 +731,17 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         }
     }
 
-    // Resolves any document node id to its graph output for compositing.
-    // Dormant / unresolvable = -1: the contribution simply does not
-    // exist (nothing is fabricated in its place). fx_out first: it holds
-    // exactly the emitted producers (active effects + Offset shims).
+    // Resolves any document node id to its graph output. Dormant /
+    // unresolvable = -1: the contribution simply does not exist
+    // (nothing is fabricated in its place).
     auto resolve = [&](uint64_t id) -> int {
-        if (auto it = fx_out.find(id); it != fx_out.end()) return it->second;
-        // A shim with no head is time-culled or dormant: the chain ends
-        // here - never fall through to the unshifted layer.
-        if (offset_terminal.count(id)) return -1;
-        const uint64_t up = owner.count(id) ? upstream_of(id) : id;
-        if (auto it = fx_out.find(up); it != fx_out.end()) return it->second;
-        if (auto it = heads.find(up); it != heads.end()) return it->second;
-        return -1;
+        return resolve_node(id, 0);
     };
 
-    // Pass C: the composite — Output contributions stack in OWNER LAYER
-    // order (bottom layer first), never link-table order: wire edits and
-    // preset splices re-append links, and a gesture that rewires one
-    // chain's end must not restack the layers or move the audio voice
-    // (the flatten's output_feed picks the voice by the same rule). Each
-    // contribution blends with its OWNER layer's mode/opacity and layer
-    // matte.
-    struct OutFeed {
-        const doc::NodeLink* l;
-        size_t li;
-    };
-    std::vector<OutFeed> feeds;
-    for (const doc::NodeLink& l : links) {
-        if (l.to != 0 || l.to_port != 0) continue;
-        size_t li = SIZE_MAX;
-        if (auto ito = owner.find(l.from); ito != owner.end()) {
-            li = ito->second;
-        } else {
-            for (size_t k = 0; k < look.layers.size(); ++k)
-                if (look.layers[k].id == l.from) li = k;
-        }
-        if (li == SIZE_MAX || !look.layers[li].visible) continue;
-        feeds.push_back({&l, li});
-    }
-    std::stable_sort(feeds.begin(), feeds.end(),
-                     [](const OutFeed& a, const OutFeed& b) {
-                         return a.li < b.li;
-                     });
-    int below = -1;
-    for (const OutFeed& feed : feeds) {
-        const doc::NodeLink& l = *feed.l;
-        const size_t li = feed.li;
-        const doc::Layer& layer = look.layers[li];
-
-        // Every contribution resolves through the links — the adjustment
-        // special case is gone (source in, output out, everything
-        // between wires freely; merges are Blend nodes).
-        // A dormant chain contributes NOTHING.
-        int cur = resolve(l.from);
-        if (cur < 0) continue;
-
-        // Layer matte: a port-1 IMAGE link on the layer gates the whole
-        // contribution — the bottom contribution reveals the raw source
-        // where the matte is black. A mask whose media is off right now
-        // gates the contribution OUT (cross-time masking).
-        int gate_out = -1;
-        if (const uint64_t lm_link = link_into(layer.id, 1)) {
-            const uint64_t lm = effective_from(lm_link);
-            int idx = -1;
-            if (auto itf = fx_out.find(lm); itf != fx_out.end())
-                idx = itf->second;
-            else if (auto ith = heads.find(lm); ith != heads.end())
-                idx = ith->second;
-            if (idx < 0 && feed_time_culled(lm_link)) idx = black();
-            if (idx >= 0) {
-                GraphNode ex;
-                ex.kind = GraphNode::Kind::MatteExtract;
-                ex.inputs.push_back(idx);
-                gate_out = add(std::move(ex), inst);
-            }
-        }
-        if (below < 0) {
-            if (gate_out >= 0) {
-                // Nothing below: the matte reveals TRANSPARENT black, the
-                // premultiplied zero. (Pre-alpha this revealed the raw
-                // source, which was chain residue.)
-                GraphNode apply;
-                apply.kind = GraphNode::Kind::MatteApply;
-                apply.inputs = {black(), cur, gate_out};
-                cur = add(std::move(apply), inst);
-            }
-            below = cur;
-        } else {
-            GraphNode blend;
-            blend.kind = GraphNode::Kind::LayerBlend;
-            blend.layer_index = static_cast<int>(li);
-            blend.inputs = {below, cur};
-            int blended = add(std::move(blend), inst, subject_key(layer.id));
-            if (gate_out >= 0) {
-                GraphNode apply;
-                apply.kind = GraphNode::Kind::MatteApply;
-                apply.inputs = {below, blended, gate_out};
-                blended = add(std::move(apply), inst);
-            }
-            below = blended;
-        }
-    }
+    // Pass C: the composite IS the Output port's fan-in - link order,
+    // bottom -> top, each contribution through its owner layer's
+    // blend/opacity/matte (merge_port's one rule).
+    int below = merge_port(0, 0, 0);
 
     // Viewport tap: the OUTPUT stays the real composite; the big preview
     // publishes graph.preview instead when set. Resolved in the root
@@ -785,6 +807,9 @@ bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order) {
     std::vector<std::vector<int>> consumers(n);
     for (size_t i = 0; i < n; ++i) {
         for (int input : nodes[i].inputs) {
+            // A dangling input index is a compiler bug; failing the
+            // sort (black frame) beats indexing out of range.
+            if (input < 0 || static_cast<size_t>(input) >= n) return false;
             indegree[i]++;
             consumers[static_cast<size_t>(input)].push_back(
                 static_cast<int>(i));
@@ -819,7 +844,7 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
     graph.instances.push_back(root);
 
     Compiler c{doc, graph, preview_node, preview_layer, measure_placement,
-               {}, -1};
+               false, doc::entity_fps(doc, root_id), {}, -1};
     const int below = c.emit_entity(root_id, 0, /*is_root=*/true);
 
     // Unwired Output (flat graph): nothing feeds the composite, so

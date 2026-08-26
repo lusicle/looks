@@ -70,7 +70,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         result_rgb += float3(1.0, 0.45, 0.1) * edge_burn +
                       float3(1.0, 0.95, 0.85) * core * core;
     }
-    const float4 result = float4(result_rgb, base.a);
+    // Leak and burn are their own light: coverage rides their energy.
+    const float4 result = float4(
+        result_rgb,
+        max(base.a, saturate(fx_luma(max(result_rgb - base.rgb, 0.0)))));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

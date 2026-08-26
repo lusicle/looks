@@ -27,6 +27,25 @@ uint32_t FrameIndex::keyframe_before(uint32_t present) const {
     return it == keyframes.begin() ? keyframes.front() : *(it - 1);
 }
 
+namespace {
+
+// The CFR grid duration: the MEDIAN sample duration. Captures are
+// routinely VFR-flagged with an outlier FIRST frame (doubled while
+// the encoder spins up), and taking samples[0] halved a 120fps
+// probe - the clip then conformed as 60fps and played half speed.
+// The median is the honest grid for near-CFR content and is immune
+// to leading/trailing outliers and occasional dropped-frame doubles.
+uint32_t grid_duration(const std::vector<SampleInfo>& samples) {
+    std::vector<uint32_t> d;
+    d.reserve(samples.size());
+    for (const SampleInfo& s : samples) d.push_back(s.duration);
+    const auto mid = d.begin() + static_cast<ptrdiff_t>(d.size() / 2);
+    std::nth_element(d.begin(), mid, d.end());
+    return std::max(1u, *mid);
+}
+
+}  // namespace
+
 bool build_frame_index(const TrackInfo& track, FrameIndex* out,
                        std::string* error) {
     if (track.kind != TrackInfo::Kind::Video || track.samples.empty() ||
@@ -38,7 +57,7 @@ bool build_frame_index(const TrackInfo& track, FrameIndex* out,
     idx.width = track.width;
     idx.height = track.height;
     idx.timescale = track.timescale;
-    idx.frame_duration = std::max(1u, track.samples[0].duration);
+    idx.frame_duration = grid_duration(track.samples);
     idx.avcc = track.avcc;
 
     const double to_100ns = 1.0e7 / track.timescale;
@@ -116,7 +135,7 @@ bool probe_video_facts(const std::filesystem::path& path, VideoFacts* out,
     f.width = video->width;
     f.height = video->height;
     f.timescale = video->timescale;
-    f.frame_duration = std::max(1u, video->samples[0].duration);
+    f.frame_duration = grid_duration(video->samples);
     f.fps = static_cast<double>(f.timescale) / f.frame_duration;
     *out = f;
     return true;

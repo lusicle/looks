@@ -34,7 +34,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     // zoom, the way a camcorder's digital zoom does.
     const float2 snapped = (floor(suv * size) + 0.5) / size;
     suv = lerp(suv, snapped, saturate(crunch));
-    float3 col = input.SampleLevel(clamp(suv, 0.0, 1.0), 0).rgb;
+    const float4 zoomed = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
+    float3 col = zoomed.rgb;
 
     if (crunch > 0.001) {
         const float2 e = z / size;   // one source pixel at this zoom
@@ -46,7 +47,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col = max(col + (col - ring * 0.25) * crunch * 1.2, 0.0);
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, zoomed.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

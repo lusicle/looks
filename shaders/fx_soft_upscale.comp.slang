@@ -17,9 +17,9 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-float3 tap(float2 grid_uv)
+float4 tap(float2 grid_uv)
 {
-    return input.SampleLevel(clamp(grid_uv, 0.0, 1.0), 0).rgb;
+    return input.SampleLevel(clamp(grid_uv, 0.0, 1.0), 0);
 }
 
 [shader("compute")]
@@ -41,15 +41,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     // softness widens the interpolation window past the texel edge, which
     // is what over-smooths beyond plain bilinear.
     const float spread = 1.0 + softness * 1.5;
-    const float3 c00 = tap((cell + 0.5) / low);
-    const float3 c10 = tap((cell + float2(1.5, 0.5)) / low);
-    const float3 c01 = tap((cell + float2(0.5, 1.5)) / low);
-    const float3 c11 = tap((cell + 1.5) / low);
+    const float4 c00 = tap((cell + 0.5) / low);
+    const float4 c10 = tap((cell + float2(1.5, 0.5)) / low);
+    const float4 c01 = tap((cell + float2(0.5, 1.5)) / low);
+    const float4 c11 = tap((cell + 1.5) / low);
     float2 tw = saturate((frac_g - 0.5) / spread + 0.5);
     tw = lerp(step(0.5, frac_g), tw, saturate(softness * 2.0));
-    const float3 up = lerp(lerp(c00, c10, tw.x), lerp(c01, c11, tw.x), tw.y);
+    const float4 up = lerp(lerp(c00, c10, tw.x), lerp(c01, c11, tw.x), tw.y);
 
-    const float4 result = float4(up, base.a);
+    const float4 result = up;
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -38,9 +38,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         if ((cell.x & 1) != 0) f.x = 1.0 - f.x;
         if ((cell.y & 1) != 0) f.y = 1.0 - f.y;
     }
-    const float3 outc = input.SampleLevel(clamp(f, 0.0, 1.0), 0).rgb;
-
-    const float4 result = float4(outc, base.a);
+    // The whole sample rides the remap - alpha is the tiled cell's
+    // coverage, never the pre-tile silhouette.
+    const float4 result = input.SampleLevel(clamp(f, 0.0, 1.0), 0);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

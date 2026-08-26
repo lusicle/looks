@@ -89,27 +89,6 @@ private:
     Layer old_;
 };
 
-class MoveLayerCommand final : public LookCommand {
-public:
-    MoveLayerCommand(uint64_t look, size_t index, int direction)
-        : LookCommand(look), index_(index), direction_(direction) {}
-    std::string name() const override { return "Move Layer"; }
-
-    void apply(Document& doc) override { swap(doc); }
-    void revert(Document& doc) override { swap(doc); }
-
-private:
-    void swap(Document& doc) {
-        Look& look = look_of(doc);
-        const size_t other = index_ + static_cast<size_t>(direction_);
-        assert(index_ < look.layers.size() && other < look.layers.size());
-        std::swap(look.layers[index_], look.layers[other]);
-    }
-
-    size_t index_;
-    int direction_;
-};
-
 // The placement list holding an id, wherever it lives - a video lane or
 // an audio track - plus the index inside it.
 std::vector<Placement>* placement_container(Sequence& seq,
@@ -190,11 +169,12 @@ namespace {
 // track shows there.
 const Placement* placement_under(const Document& doc,
                                  const std::vector<Placement>& placements,
-                                 uint32_t at) {
+                                 uint32_t at, double parent_fps) {
     const Placement* place = nullptr;
     for (const Placement& p : placements) {
         const uint32_t len = source_length(doc, p);
-        const uint32_t end = placement_end(p, len);
+        const uint32_t end =
+            placement_end(p, len, placement_ratio(doc, p, parent_fps));
         if (at <= p.t_in || (end && at >= end)) continue;
         if (!place || p.t_in >= place->t_in) place = &p;
     }
@@ -203,13 +183,14 @@ const Placement* placement_under(const Document& doc,
 
 // The split for one placement: same target, fresh id, resuming at the
 // cut's source frame so the halves are continuous.
-PlacementSplit split_of(Document& doc, const Placement& place, uint32_t at) {
+PlacementSplit split_of(Document& doc, const Placement& place, uint32_t at,
+                        double parent_fps) {
     PlacementSplit s;
     s.left_id = place.id;
     s.right = place;
     s.right.id = doc.next_effect_id++;
     s.right.t_out = place.t_out;   // 0 stays "to the source end"
-    trim_placement_head(s.right, at);
+    trim_placement_head(s.right, at, placement_ratio(doc, place, parent_fps));
     return s;
 }
 
@@ -217,16 +198,18 @@ PlacementSplit split_of(Document& doc, const Placement& place, uint32_t at) {
 // the cut lands strictly inside. Right halves link to each other.
 std::unique_ptr<Command> razor_group(Document& doc, uint64_t seq_id,
                                      const Placement& primary, uint32_t at) {
+    const double eff = effective_fps(doc, doc.sequence(seq_id));
     std::vector<PlacementSplit> splits;
-    splits.push_back(split_of(doc, primary, at));
+    splits.push_back(split_of(doc, primary, at, eff));
     if (primary.link) {
         const Sequence& seq = doc.sequence(seq_id);
         auto try_partner = [&](const Placement& p) {
             if (p.link != primary.link || p.id == primary.id) return;
             const uint32_t len = source_length(doc, p);
-            const uint32_t end = placement_end(p, len);
+            const uint32_t end =
+                placement_end(p, len, placement_ratio(doc, p, eff));
             if (at <= p.t_in || (end && at >= end)) return;
-            splits.push_back(split_of(doc, p, at));
+            splits.push_back(split_of(doc, p, at, eff));
         };
         for (const SeqTrack& t : seq.tracks)
             for (const Placement& p : t.placements) try_partner(p);
@@ -253,7 +236,8 @@ std::unique_ptr<Command> razor_track_command(Document& doc, uint64_t seq_id,
         if (t.id == track_id) src = &t;
     if (!src) return nullptr;
     if (src->placements.size() >= kMaxPlacementsPerTrack) return nullptr;
-    const Placement* place = placement_under(doc, src->placements, at);
+    const Placement* place = placement_under(
+        doc, src->placements, at, effective_fps(doc, seq));
     if (!place) return nullptr;
     return razor_group(doc, seq_id, *place, at);
 }
@@ -266,7 +250,8 @@ std::unique_ptr<Command> razor_audio_command(Document& doc, uint64_t seq_id,
         if (t.id == track_id) track = &t;
     if (!track) return nullptr;
     if (track->placements.size() >= kMaxPlacementsPerTrack) return nullptr;
-    const Placement* place = placement_under(doc, track->placements, at);
+    const Placement* place = placement_under(
+        doc, track->placements, at, effective_fps(doc, seq));
     if (!place) return nullptr;
     return razor_group(doc, seq_id, *place, at);
 }
@@ -332,11 +317,6 @@ std::unique_ptr<Command> remove_layer_command(uint64_t look,
 
 std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated) {
     return std::make_unique<SetLayerPropsCommand>(look, std::move(updated));
-}
-
-std::unique_ptr<Command> move_layer_command(uint64_t look, size_t index,
-                                            int direction) {
-    return std::make_unique<MoveLayerCommand>(look, index, direction);
 }
 
 }  // namespace looks::doc

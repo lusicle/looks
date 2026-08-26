@@ -46,7 +46,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint along = rows ? tid.x : tid.y;
     const float sweep_p = rows ? float(tid.y) + 0.5 : float(tid.x) + 0.5;
 
-    float3 col = canvas.SampleLevel(uv, 0).rgb * saturate(persist);
+    const float4 held = canvas.SampleLevel(uv, 0);
+    float3 col = held.rgb * saturate(persist);
+    float col_a = held.a * saturate(persist);
 
     const float3 src_col =
         lerp(float3(1.0, 1.0, 1.0), base.rgb * 1.4, saturate(color));
@@ -60,12 +62,13 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (d < beam_w) {
             const float glow = 1.0 - d / beam_w;
             col += src_col * glow * glow * 0.35;
+            col_a = max(col_a, glow * glow * 0.35);
         }
     }
     // Ceiling instead of blowout, so bunched stuck fronts stay readable.
     col = min(col, float3(1.6, 1.6, 1.6));
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, saturate(col_a));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

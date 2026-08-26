@@ -85,6 +85,8 @@ float* layer_param_slot(doc::Layer& layer, int param_index) {
         case 14: return &layer.xf_rotate;
         // 15 slip / 16 waveform: field ids only, never modulatable.
         case 17: return &layer.gen_phase;
+        case 18: return &layer.xf_anchor_x;
+        case 19: return &layer.xf_anchor_y;
         default: return nullptr;
     }
 }
@@ -117,13 +119,14 @@ constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
     "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
     "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
     "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
-    "slip",    "waveform",  "phase"};
+    "slip",    "waveform",  "phase",     "xf_anchor_x", "xf_anchor_y"};
 
 constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
     "opacity", "color a r", "color a g", "color a b", "color b r",
     "color b g", "color b b", "scale",   "angle",     "crop left",
     "crop right", "crop top", "crop bottom", "transform scale",
-    "transform rotate", "slip", "waveform", "phase"};
+    "transform rotate", "slip", "waveform", "phase", "anchor x",
+    "anchor y"};
 
 }  // namespace
 

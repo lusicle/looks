@@ -1,6 +1,15 @@
 // Shared kernel helpers. All randomness here is counter-based hashing
 // keyed on (seed, frame, cell): no stateful RNG anywhere, which is what
 // keeps preview and export bit-exact.
+//
+// ALPHA IS THE GATE: the layer composite reveals a pixel only through
+// its alpha (no emissive path), so every kernel must keep alpha equal
+// to the COVERAGE of its output content. Remaps carry the sampled
+// pixel's alpha, gathers gather alpha with the same weights, trails
+// and added light extend it, burn-ins union it in, full-frame redraws
+// own it; only pure color work keeps base.a. Footage is alpha-1
+// everywhere and every rule above preserves constant 1, so this only
+// matters - and matters completely - for shapes and mattes.
 
 #ifndef FX_COMMON_SLANG
 #define FX_COMMON_SLANG
@@ -216,6 +225,21 @@ float3 fx_dither_levels(float3 lin, float n, float t01)
         (lin - lin_lo) / max(lin_hi - lin_lo, 1.0e-6);
     // Strict compare: p = 0 (a pixel ON a level) must never pick up.
     return lo + step(t01 + 1.0e-6, p);
+}
+
+// Bilinear 2D value noise on an integer lattice.
+float fx_vnoise2(uint s, float2 p)
+{
+    const float2 i = floor(p);
+    const float2 f = p - i;
+    const float2 u = f * f * (3.0 - 2.0 * f);
+    const int2 ip = int2(i) + int2(4096, 4096);
+    const float a = fx_hash01(fx_hash4(s, uint(ip.x), uint(ip.y), 0u));
+    const float b = fx_hash01(fx_hash4(s, uint(ip.x + 1), uint(ip.y), 0u));
+    const float c = fx_hash01(fx_hash4(s, uint(ip.x), uint(ip.y + 1), 0u));
+    const float d = fx_hash01(fx_hash4(s, uint(ip.x + 1), uint(ip.y + 1),
+                                       0u));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
 // Smooth value noise over one dimension (deterministic wander).

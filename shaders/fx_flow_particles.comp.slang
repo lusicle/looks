@@ -45,13 +45,16 @@ void main(uint3 tid : SV_DispatchThreadID)
     mv += float2(0.4, -0.25);
 
     const float2 suv = clamp(uv - mv * advect / size, 0.0, 1.0);
-    const float3 history = prev.SampleLevel(suv, 0).rgb * decay;
+    const float4 hist4 = prev.SampleLevel(suv, 0);
+    const float3 history = hist4.rgb * decay;
+    const float hist_a = hist4.a * decay;
 
     const float gate =
         fx_hash01(fx_hash4(seed, frame, tid.x, tid.y));
     const float3 fx_rgb = gate < dissolve ? base.rgb : history;
+    const float fx_a = gate < dissolve ? base.a : hist_a;
 
-    const float4 result = float4(fx_rgb, base.a);
+    const float4 result = float4(fx_rgb, fx_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

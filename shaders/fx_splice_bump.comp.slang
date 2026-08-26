@@ -35,7 +35,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float b = saturate(bump);
     const float dy = b * jump_px / size.y;
     const float2 suv = float2(uv.x, frac(uv.y + dy));
-    float3 col = input.SampleLevel(suv, 0).rgb;
+    const float4 rolled = input.SampleLevel(suv, 0);
+    float3 col = rolled.rgb;
 
     // Dark tape bar at the wrap seam.
     if (dy > 0.0005) {
@@ -61,7 +62,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col, rolled.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

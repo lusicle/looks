@@ -27,8 +27,12 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float4 base = input.SampleLevel(uv, 0);
     float4 split = base;
-    split.r = input.SampleLevel(uv + offset, 0).r;
-    split.b = input.SampleLevel(uv - offset, 0).b;
+    const float4 sr = input.SampleLevel(uv + offset, 0);
+    const float4 sb = input.SampleLevel(uv - offset, 0);
+    split.r = sr.r;
+    split.b = sb.b;
+    // One alpha covers all three channels: the union of the shifts.
+    split.a = max(base.a, max(sr.a, sb.a));
 
     const float4 wetted = lerp(base, split, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
