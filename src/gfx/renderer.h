@@ -37,7 +37,6 @@ public:
 
     Device& device() { return *device_; }
     VkFormat swapchain_format() const { return swapchain_->format(); }
-    VkExtent2D swapchain_extent() const { return swapchain_->extent(); }
 
     // Call on every window resize; recreation happens lazily at frame start.
     void notify_resize(uint32_t width, uint32_t height);

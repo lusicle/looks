@@ -83,17 +83,38 @@ void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             ui::HitLayer::Popup);
 }
 
-void dashed_line(ui::Canvas2D& canvas, Vec2 a, Vec2 b, float thickness,
-                 Color color) {
-    const float dx = b.x - a.x, dy = b.y - a.y;
-    const float len = std::sqrt(dx * dx + dy * dy);
-    if (len < 1.0f) return;
-    const float ux = dx / len, uy = dy / len;
-    for (float t = 0.0f; t < len; t += 9.0f) {
-        const float e = std::min(t + 5.0f, len);
-        canvas.draw_line({a.x + ux * t, a.y + uy * t},
-                         {a.x + ux * e, a.y + uy * e}, thickness, color);
+// The wire bezier's control points (horizontal tangents) and its point
+// eval: the ONE derivation the stroke, the splice hit, the marquee scan
+// and the port pick share - geometry drift between draw and hit makes
+// wires unclickable where they render.
+void wire_controls(Vec2 p0, Vec2 p3, Vec2* p1, Vec2* p2) {
+    const float reach =
+        std::clamp(std::fabs(p3.x - p0.x) * 0.5f, 24.0f, 140.0f);
+    *p1 = {p0.x + reach, p0.y};
+    *p2 = {p3.x - reach, p3.y};
+}
+
+Vec2 wire_point(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, float t) {
+    const float u = 1.0f - t;
+    return {u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x +
+                t * t * t * p3.x,
+            u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y +
+                t * t * t * p3.y};
+}
+
+// Squared distance from `probe` to the wire at the hit-test sampling
+// (24 segments; the stroke itself draws finer).
+float wire_dist2(Vec2 p0, Vec2 p3, Vec2 probe) {
+    Vec2 p1, p2;
+    wire_controls(p0, p3, &p1, &p2);
+    float best = 1e9f;
+    for (int i = 0; i <= 24; ++i) {
+        const Vec2 p =
+            wire_point(p0, p1, p2, p3, static_cast<float>(i) / 24.0f);
+        const float dx = probe.x - p.x, dy = probe.y - p.y;
+        best = std::min(best, dx * dx + dy * dy);
     }
+    return best;
 }
 
 // Cubic bezier with horizontal tangents — the wire idiom. Canvas2D lines
@@ -102,21 +123,15 @@ void dashed_line(ui::Canvas2D& canvas, Vec2 a, Vec2 b, float thickness,
 // feathered edge at wire thickness.
 void draw_wire(ui::Canvas2D& canvas, Vec2 p0, Vec2 p3, float thickness,
                Color color, bool dashed) {
-    const float reach =
-        std::clamp(std::fabs(p3.x - p0.x) * 0.5f, 24.0f, 140.0f);
-    const Vec2 p1{p0.x + reach, p0.y};
-    const Vec2 p2{p3.x - reach, p3.y};
+    Vec2 p1, p2;
+    wire_controls(p0, p3, &p1, &p2);
     const float core = std::max(thickness, 2.0f);
     constexpr int kSeg = 36;
     Vec2 prev = p0;
     int dash = 0;
     for (int i = 1; i <= kSeg; ++i) {
-        const float t = static_cast<float>(i) / kSeg;
-        const float u = 1.0f - t;
-        const Vec2 p{u * u * u * p0.x + 3 * u * u * t * p1.x +
-                         3 * u * t * t * p2.x + t * t * t * p3.x,
-                     u * u * u * p0.y + 3 * u * u * t * p1.y +
-                         3 * u * t * t * p2.y + t * t * t * p3.y};
+        const Vec2 p =
+            wire_point(p0, p1, p2, p3, static_cast<float>(i) / kSeg);
         const bool skip = dashed && (dash++ & 1);
         if (!skip) {
             canvas.draw_line(prev, p, core + 2.4f,
@@ -485,22 +500,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // Distance from the cursor to a wire's bezier (sampled) — the splice
     // target for a right-click on a wire (texed contextmenu).
     auto wire_near = [&](Vec2 p0, Vec2 p3) {
-        const float reach =
-            std::clamp(std::fabs(p3.x - p0.x) * 0.5f, 24.0f, 140.0f);
-        const Vec2 p1{p0.x + reach, p0.y};
-        const Vec2 p2{p3.x - reach, p3.y};
-        float best = 1e9f;
-        for (int i = 0; i <= 24; ++i) {
-            const float t = static_cast<float>(i) / 24.0f;
-            const float u = 1.0f - t;
-            const float x = u * u * u * p0.x + 3 * u * u * t * p1.x +
-                            3 * u * t * t * p2.x + t * t * t * p3.x;
-            const float y = u * u * u * p0.y + 3 * u * u * t * p1.y +
-                            3 * u * t * t * p2.y + t * t * t * p3.y;
-            const float dx = mouse.x - x, dy = mouse.y - y;
-            best = std::min(best, dx * dx + dy * dy);
-        }
-        return best;
+        return wire_dist2(p0, p3, mouse);
     };
     auto open_add_menu = [&]() {
         // Nothing to add (sequence scope): no menu - an empty popup is
@@ -571,8 +571,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.ctx_target = target;
             // The menu applies to the selection when the card is in it;
             // otherwise the click selects the card first (texed).
-            if (target >> 56 !=
-                static_cast<uint64_t>(NodeKind::Frame) + 1)
+            if (target == kOutNodeId ||
+                node_kind_of(target) != NodeKind::Frame)
                 out.clicked = target;
         } else {
             open_add_menu();
@@ -1266,21 +1266,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                  w < g.wire_count && out.mq_wire_count < 64; ++w) {
                 Vec2 p0, p3;
                 if (!wire_ends(g.wires[w], &p0, &p3)) continue;
-                const float reach = std::clamp(
-                    std::fabs(p3.x - p0.x) * 0.5f, 24.0f, 140.0f);
-                const Vec2 p1{p0.x + reach, p0.y};
-                const Vec2 p2{p3.x - reach, p3.y};
+                Vec2 p1, p2;
+                wire_controls(p0, p3, &p1, &p2);
                 for (int s = 0; s <= 24; ++s) {
-                    const float t = static_cast<float>(s) / 24.0f;
-                    const float u = 1.0f - t;
-                    const float x = u * u * u * p0.x +
-                                    3 * u * u * t * p1.x +
-                                    3 * u * t * t * p2.x +
-                                    t * t * t * p3.x;
-                    const float y = u * u * u * p0.y +
-                                    3 * u * u * t * p1.y +
-                                    3 * u * t * t * p2.y +
-                                    t * t * t * p3.y;
+                    const Vec2 sp = wire_point(
+                        p0, p1, p2, p3, static_cast<float>(s) / 24.0f);
+                    const float x = sp.x, y = sp.y;
                     if (x >= ra.x && x <= rb.x && y >= ra.y &&
                         y <= rb.y) {
                         out.mq_wires[out.mq_wire_count++] = g.wires[w];
@@ -1540,8 +1531,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 const std::string pname =
                     nd.id == kOutNodeId
                         ? std::string("node:output")
-                        : "node:" + std::to_string(
-                                        nd.id & 0x00FFFFFFFFFFFFFFull);
+                        : "node:" + std::to_string(node_doc_id(nd.id));
                 ui::probe_add(pname, cr);
                 const float pr = 6.0f * z;
                 const Vec2 po = port_out(nd);
@@ -2426,21 +2416,7 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
                                            kRowH})
                 : to_screen({b->x, b->y + port_y(*b)});
         // Sampled bezier distance, matching the canvas's own splice hit.
-        const float reach =
-            std::clamp(std::fabs(p3.x - p0.x) * 0.5f, 24.0f, 140.0f);
-        const Vec2 p1{p0.x + reach, p0.y};
-        const Vec2 p2{p3.x - reach, p3.y};
-        float d2 = 1e9f;
-        for (int i = 0; i <= 24; ++i) {
-            const float t = static_cast<float>(i) / 24.0f;
-            const float u = 1.0f - t;
-            const float x = u * u * u * p0.x + 3 * u * u * t * p1.x +
-                            3 * u * t * t * p2.x + t * t * t * p3.x;
-            const float y = u * u * u * p0.y + 3 * u * u * t * p1.y +
-                            3 * u * t * t * p2.y + t * t * t * p3.y;
-            const float dx = screen.x - x, dy = screen.y - y;
-            d2 = std::min(d2, dx * dx + dy * dy);
-        }
+        const float d2 = wire_dist2(p0, p3, screen);
         if (d2 < best) {
             best = d2;
             *from = wr.from;

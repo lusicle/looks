@@ -255,6 +255,139 @@ bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader
     return ok;
 }
 
+bool UiRenderer::upload_texture(UiTexture& tex, VkFormat format,
+                                const uint8_t* pixels, size_t size,
+                                const UploadLabels& labels) {
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {tex.width, tex.height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    if (vmaCreateImage(device_.allocator(), &image_info, &alloc_info, &tex.image,
+                       &tex.allocation, nullptr) != VK_SUCCESS) {
+        log_error(labels.image_fail, tex.width, tex.height);
+        return false;
+    }
+
+    // Staging buffer + one-shot upload on the graphics queue (init time).
+    VkBufferCreateInfo staging_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    staging_info.size = size;
+    staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo staging_alloc_info{};
+    staging_alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    staging_alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                               VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation staging_alloc = nullptr;
+    VmaAllocationInfo staging_mapped{};
+    if (vmaCreateBuffer(device_.allocator(), &staging_info, &staging_alloc_info,
+                        &staging, &staging_alloc, &staging_mapped) != VK_SUCCESS) {
+        vmaDestroyImage(device_.allocator(), tex.image, tex.allocation);
+        return false;
+    }
+    std::memcpy(staging_mapped.pMappedData, pixels, size);
+    vmaFlushAllocation(device_.allocator(), staging_alloc, 0, VK_WHOLE_SIZE);
+
+    VkDevice dev = device_.device();
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = device_.graphics_family();
+    VkCommandPool pool = VK_NULL_HANDLE;
+    gfx::vk_check(vkCreateCommandPool(dev, &pool_info, nullptr, &pool),
+                  labels.pool);
+    VkCommandBufferAllocateInfo cb_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cb_info.commandPool = pool;
+    cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_info.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    gfx::vk_check(vkAllocateCommandBuffers(dev, &cb_info, &cmd), labels.cmd);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_dst.srcAccessMask = 0;
+    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.image = tex.image;
+    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &to_dst);
+
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {tex.width, tex.height, 1};
+    vkCmdCopyBufferToImage(cmd, staging, tex.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    VkImageMemoryBarrier to_read = to_dst;
+    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &to_read);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    {
+        std::lock_guard<std::mutex> lock(device_.queue_mutex());
+        gfx::vk_check(vkQueueSubmit(device_.graphics_queue(), 1, &submit,
+                                    VK_NULL_HANDLE),
+                      labels.submit);
+        vkQueueWaitIdle(device_.graphics_queue());
+    }
+    vkDestroyCommandPool(dev, pool, nullptr);
+    vmaDestroyBuffer(device_.allocator(), staging, staging_alloc);
+
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = tex.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    gfx::vk_check(vkCreateImageView(dev, &view_info, nullptr, &tex.view),
+                  labels.view);
+    return true;
+}
+
+UiTexture* UiRenderer::commit_texture(std::unique_ptr<UiTexture> tex,
+                                      VkSampler sampler, const char* set_label) {
+    VkDevice dev = device_.device();
+    VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    set_info.descriptorPool = descriptor_pool_;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &texture_set_layout_;
+    gfx::vk_check(vkAllocateDescriptorSets(dev, &set_info, &tex->set), set_label);
+
+    VkDescriptorImageInfo image_binding{sampler, tex->view,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = tex->set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_binding;
+    vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+
+    textures_.push_back(std::move(tex));
+    return textures_.back().get();
+}
+
 const UiTexture* UiRenderer::register_font(Font& font) {
     const uint32_t width = font.atlas_width();
     const uint32_t height = font.atlas_height();
@@ -276,135 +409,23 @@ const UiTexture* UiRenderer::register_font(Font& font) {
         tex->unit_range[1] = font.px_range() / static_cast<float>(height);
     }
 
-    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    image_info.imageType = VK_IMAGE_TYPE_2D;
-    image_info.format = msdf ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8_UNORM;
-    image_info.extent = {width, height, 1};
-    image_info.mipLevels = 1;
-    image_info.arrayLayers = 1;
-    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VmaAllocationCreateInfo alloc_info{};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    if (vmaCreateImage(device_.allocator(), &image_info, &alloc_info, &tex->image,
-                       &tex->allocation, nullptr) != VK_SUCCESS) {
-        log_error("ui: font atlas image creation failed");
-        return nullptr;
-    }
-
-    // Staging buffer + one-shot upload on the graphics queue (init time).
-    VkBufferCreateInfo staging_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    staging_info.size = pixels.size();
-    staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VmaAllocationCreateInfo staging_alloc_info{};
-    staging_alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    staging_alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                               VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VkBuffer staging = VK_NULL_HANDLE;
-    VmaAllocation staging_alloc = nullptr;
-    VmaAllocationInfo staging_mapped{};
-    if (vmaCreateBuffer(device_.allocator(), &staging_info, &staging_alloc_info,
-                        &staging, &staging_alloc, &staging_mapped) != VK_SUCCESS) {
-        vmaDestroyImage(device_.allocator(), tex->image, tex->allocation);
-        return nullptr;
-    }
-    std::memcpy(staging_mapped.pMappedData, pixels.data(), pixels.size());
-    vmaFlushAllocation(device_.allocator(), staging_alloc, 0, VK_WHOLE_SIZE);
-
-    VkDevice dev = device_.device();
-    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    pool_info.queueFamilyIndex = device_.graphics_family();
-    VkCommandPool pool = VK_NULL_HANDLE;
-    gfx::vk_check(vkCreateCommandPool(dev, &pool_info, nullptr, &pool),
-                  "vkCreateCommandPool(upload)");
-    VkCommandBufferAllocateInfo cb_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cb_info.commandPool = pool;
-    cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cb_info.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    gfx::vk_check(vkAllocateCommandBuffers(dev, &cb_info, &cmd),
-                  "vkAllocateCommandBuffers(upload)");
-    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
-
-    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    to_dst.srcAccessMask = 0;
-    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.image = tex->image;
-    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &to_dst);
-
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {width, height, 1};
-    vkCmdCopyBufferToImage(cmd, staging, tex->image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-    VkImageMemoryBarrier to_read = to_dst;
-    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
-                         0, nullptr, 1, &to_read);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    {
-        std::lock_guard<std::mutex> lock(device_.queue_mutex());
-        gfx::vk_check(vkQueueSubmit(device_.graphics_queue(), 1, &submit,
-                                    VK_NULL_HANDLE),
-                      "vkQueueSubmit(upload)");
-        vkQueueWaitIdle(device_.graphics_queue());
-    }
-    vkDestroyCommandPool(dev, pool, nullptr);
-    vmaDestroyBuffer(device_.allocator(), staging, staging_alloc);
-
     // View: replicate R into all channels so the shader's .r read works and
     // future RGBA atlases need no shader change.
-    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view_info.image = tex->image;
-    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = msdf ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8_UNORM;
-    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    gfx::vk_check(vkCreateImageView(dev, &view_info, nullptr, &tex->view),
-                  "vkCreateImageView(font atlas)");
+    if (!upload_texture(*tex,
+                        msdf ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8_UNORM,
+                        pixels.data(), pixels.size(),
+                        {.image_fail = "ui: font atlas image creation failed",
+                         .pool = "vkCreateCommandPool(upload)",
+                         .cmd = "vkAllocateCommandBuffers(upload)",
+                         .submit = "vkQueueSubmit(upload)",
+                         .view = "vkCreateImageView(font atlas)"}))
+        return nullptr;
 
-    VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    set_info.descriptorPool = descriptor_pool_;
-    set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &texture_set_layout_;
-    gfx::vk_check(vkAllocateDescriptorSets(dev, &set_info, &tex->set),
-                  "vkAllocateDescriptorSets(font atlas)");
-
-    VkDescriptorImageInfo image_binding{
-        msdf ? linear_sampler_ : nearest_sampler_, tex->view,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = tex->set;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &image_binding;
-    vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
-
-    textures_.push_back(std::move(tex));
-    font.set_texture(textures_.back().get());
-    return textures_.back().get();
+    UiTexture* result =
+        commit_texture(std::move(tex), msdf ? linear_sampler_ : nearest_sampler_,
+                       "vkAllocateDescriptorSets(font atlas)");
+    font.set_texture(result);
+    return result;
 }
 
 const UiTexture* UiRenderer::register_image(const uint8_t* rgba,
@@ -419,128 +440,16 @@ const UiTexture* UiRenderer::register_image(const uint8_t* rgba,
 
     // UNORM, not SRGB: UI colors are sRGB-encoded pass-through values (the
     // viewport blit owns the OETF), so image bytes flow through unchanged.
-    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    image_info.imageType = VK_IMAGE_TYPE_2D;
-    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    image_info.extent = {width, height, 1};
-    image_info.mipLevels = 1;
-    image_info.arrayLayers = 1;
-    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VmaAllocationCreateInfo alloc_info{};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    if (vmaCreateImage(device_.allocator(), &image_info, &alloc_info,
-                       &tex->image, &tex->allocation, nullptr) != VK_SUCCESS) {
-        log_error("ui: image texture creation failed (%ux%u)", width, height);
+    if (!upload_texture(*tex, VK_FORMAT_R8G8B8A8_UNORM, rgba, bytes,
+                        {.image_fail = "ui: image texture creation failed (%ux%u)",
+                         .pool = "vkCreateCommandPool(image upload)",
+                         .cmd = "vkAllocateCommandBuffers(image upload)",
+                         .submit = "vkQueueSubmit(image upload)",
+                         .view = "vkCreateImageView(image)"}))
         return nullptr;
-    }
 
-    VkBufferCreateInfo staging_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    staging_info.size = bytes;
-    staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VmaAllocationCreateInfo staging_alloc_info{};
-    staging_alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    staging_alloc_info.flags =
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-        VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VkBuffer staging = VK_NULL_HANDLE;
-    VmaAllocation staging_alloc = nullptr;
-    VmaAllocationInfo staging_mapped{};
-    if (vmaCreateBuffer(device_.allocator(), &staging_info,
-                        &staging_alloc_info, &staging, &staging_alloc,
-                        &staging_mapped) != VK_SUCCESS) {
-        vmaDestroyImage(device_.allocator(), tex->image, tex->allocation);
-        return nullptr;
-    }
-    std::memcpy(staging_mapped.pMappedData, rgba, bytes);
-    vmaFlushAllocation(device_.allocator(), staging_alloc, 0, VK_WHOLE_SIZE);
-
-    VkDevice dev = device_.device();
-    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    pool_info.queueFamilyIndex = device_.graphics_family();
-    VkCommandPool pool = VK_NULL_HANDLE;
-    gfx::vk_check(vkCreateCommandPool(dev, &pool_info, nullptr, &pool),
-                  "vkCreateCommandPool(image upload)");
-    VkCommandBufferAllocateInfo cb_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cb_info.commandPool = pool;
-    cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cb_info.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    gfx::vk_check(vkAllocateCommandBuffers(dev, &cb_info, &cmd),
-                  "vkAllocateCommandBuffers(image upload)");
-    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
-
-    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    to_dst.srcAccessMask = 0;
-    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.image = tex->image;
-    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &to_dst);
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {width, height, 1};
-    vkCmdCopyBufferToImage(cmd, staging, tex->image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    VkImageMemoryBarrier to_read = to_dst;
-    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
-                         0, nullptr, 1, &to_read);
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    {
-        std::lock_guard<std::mutex> lock(device_.queue_mutex());
-        gfx::vk_check(vkQueueSubmit(device_.graphics_queue(), 1, &submit,
-                                    VK_NULL_HANDLE),
-                      "vkQueueSubmit(image upload)");
-        vkQueueWaitIdle(device_.graphics_queue());
-    }
-    vkDestroyCommandPool(dev, pool, nullptr);
-    vmaDestroyBuffer(device_.allocator(), staging, staging_alloc);
-
-    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view_info.image = tex->image;
-    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    gfx::vk_check(vkCreateImageView(dev, &view_info, nullptr, &tex->view),
-                  "vkCreateImageView(image)");
-
-    VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    set_info.descriptorPool = descriptor_pool_;
-    set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &texture_set_layout_;
-    gfx::vk_check(vkAllocateDescriptorSets(dev, &set_info, &tex->set),
-                  "vkAllocateDescriptorSets(image)");
-    VkDescriptorImageInfo image_binding{linear_sampler_, tex->view,
-                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = tex->set;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &image_binding;
-    vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
-
-    textures_.push_back(std::move(tex));
-    return textures_.back().get();
+    return commit_texture(std::move(tex), linear_sampler_,
+                          "vkAllocateDescriptorSets(image)");
 }
 
 const UiTexture* UiRenderer::register_external(VkImageView view,
@@ -554,27 +463,8 @@ const UiTexture* UiRenderer::register_external(VkImageView view,
     tex->rgba_image = true;
     tex->external = true;
 
-    VkDescriptorSetAllocateInfo set_info{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    set_info.descriptorPool = descriptor_pool_;
-    set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &texture_set_layout_;
-    gfx::vk_check(
-        vkAllocateDescriptorSets(device_.device(), &set_info, &tex->set),
-        "vkAllocateDescriptorSets(external image)");
-    VkDescriptorImageInfo image_binding{
-        linear_sampler_, tex->view,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = tex->set;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &image_binding;
-    vkUpdateDescriptorSets(device_.device(), 1, &write, 0, nullptr);
-
-    textures_.push_back(std::move(tex));
-    return textures_.back().get();
+    return commit_texture(std::move(tex), linear_sampler_,
+                          "vkAllocateDescriptorSets(external image)");
 }
 
 bool UiRenderer::ensure_capacity(GeometryBuffer& buf, VkDeviceSize needed,

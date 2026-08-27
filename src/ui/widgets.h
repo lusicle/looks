@@ -19,10 +19,9 @@
 namespace looks::ui {
 
 // ---- design tokens: one spacing rhythm for every panel. 4 inside a
-// group, 8 between controls, 12 between groups; micro controls are 16 px.
+// group, 8 between controls; micro controls are 16 px.
 inline constexpr float kSpaceTight = 4.0f;
 inline constexpr float kSpaceUnit = 8.0f;
-inline constexpr float kSpaceGroup = 12.0f;
 inline constexpr float kMicroSize = 16.0f;
 
 // Stored values match displayed values: the printf format's decimal

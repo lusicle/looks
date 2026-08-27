@@ -7,7 +7,8 @@
 // by gc_widget_slots() with a generation bump, so stale captures compare
 // unequal instead of aliasing a new widget.
 //
-// Hit testing: widgets register rects during the hit pass; finalize() picks
+// Hit testing: widgets register rects during the hit pass; finalize_hits()
+// picks
 // the top entry under the cursor by (layer, registration order). Input
 // capture (drags) overrides the winner until released.
 

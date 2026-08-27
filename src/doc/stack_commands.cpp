@@ -415,8 +415,8 @@ private:
             case NodeRef::Output:
                 return {&look.out_node_x, &look.out_node_y};
             case NodeRef::Frame:
-                for (CanvasFrame& f : look.frames)
-                    if (f.id == id_) return {&f.x, &f.y};
+                if (CanvasFrame* f = find_frame(look, id_))
+                    return {&f->x, &f->y};
                 return {};
             case NodeRef::Group:
                 for (Layer& l : look.layers)
@@ -793,22 +793,18 @@ public:
         : LookCommand(look), id_(id), w_(w), h_(h) {}
     std::string name() const override { return "Resize Frame"; }
     void apply(Document& doc) override {
-        for (CanvasFrame& f : look_of(doc).frames)
-            if (f.id == id_) {
-                old_w_ = f.w;
-                old_h_ = f.h;
-                f.w = w_;
-                f.h = h_;
-                break;
-            }
+        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+            old_w_ = f->w;
+            old_h_ = f->h;
+            f->w = w_;
+            f->h = h_;
+        }
     }
     void revert(Document& doc) override {
-        for (CanvasFrame& f : look_of(doc).frames)
-            if (f.id == id_) {
-                f.w = old_w_;
-                f.h = old_h_;
-                break;
-            }
+        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+            f->w = old_w_;
+            f->h = old_h_;
+        }
     }
     bool merge(const Command& next) override {
         const auto* other =
@@ -831,19 +827,14 @@ public:
         : LookCommand(look), id_(id), color_(color) {}
     std::string name() const override { return "Tag Frame Colour"; }
     void apply(Document& doc) override {
-        for (CanvasFrame& f : look_of(doc).frames)
-            if (f.id == id_) {
-                old_color_ = f.color;
-                f.color = color_;
-                break;
-            }
+        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+            old_color_ = f->color;
+            f->color = color_;
+        }
     }
     void revert(Document& doc) override {
-        for (CanvasFrame& f : look_of(doc).frames)
-            if (f.id == id_) {
-                f.color = old_color_;
-                break;
-            }
+        if (CanvasFrame* f = find_frame(look_of(doc), id_))
+            f->color = old_color_;
     }
 
 private:
@@ -858,19 +849,14 @@ public:
         : LookCommand(look), id_(id), title_(std::move(title)) {}
     std::string name() const override { return "Rename Frame"; }
     void apply(Document& doc) override {
-        for (CanvasFrame& f : look_of(doc).frames)
-            if (f.id == id_) {
-                old_title_ = f.title;
-                f.title = title_;
-                break;
-            }
+        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+            old_title_ = f->title;
+            f->title = title_;
+        }
     }
     void revert(Document& doc) override {
-        for (CanvasFrame& f : look_of(doc).frames)
-            if (f.id == id_) {
-                f.title = old_title_;
-                break;
-            }
+        if (CanvasFrame* f = find_frame(look_of(doc), id_))
+            f->title = old_title_;
     }
 
 private:
@@ -921,10 +907,10 @@ std::unique_ptr<Command> remove_frame_command(uint64_t look,
 bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
     if (from == to) return true;
     if (to == 0) return false;   // Output has no outgoing links
-    const std::vector<NodeLink> links =
-        look.links.empty() ? synthesize_links(look) : look.links;
+    std::vector<NodeLink> synth;
+    const std::vector<NodeLink>& links = effective_links(look, synth);
     // Downstream walk from `to`: reaching `from` means the new link would
-    // close a loop (texed graph.js isReachable).
+    // close a loop.
     std::vector<uint64_t> stack{to};
     std::vector<uint64_t> seen;
     while (!stack.empty()) {
@@ -932,7 +918,11 @@ bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
         stack.pop_back();
         if (n == from) return true;
         bool visited = false;
-        for (uint64_t s : seen) visited = visited || s == n;
+        for (uint64_t s : seen)
+            if (s == n) {
+                visited = true;
+                break;
+            }
         if (visited) continue;
         seen.push_back(n);
         for (const NodeLink& l : links)

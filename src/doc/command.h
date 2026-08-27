@@ -77,8 +77,6 @@ private:
 
 class UndoStack {
 public:
-    explicit UndoStack(size_t max_depth = 1024) : max_depth_(max_depth) {}
-
     // Applies the command, then records it (clearing the redo stack).
     // With coalesce=true the top undo entry gets a chance to merge() it.
     void execute(Document& doc, std::unique_ptr<Command> cmd, bool coalesce = false);
@@ -123,7 +121,7 @@ private:
     std::vector<std::unique_ptr<Command>> undo_;
     std::vector<std::unique_ptr<Command>> redo_;
     std::vector<Group> open_groups_;
-    size_t max_depth_;
+    size_t max_depth_ = 1024;
     int group_depth_ = 0;
     bool coalesce_barrier_ = false;
     bool coalescing_active_ = false;

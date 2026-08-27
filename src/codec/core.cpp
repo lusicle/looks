@@ -71,21 +71,6 @@ constexpr int32_t kDctFwd[kBlockSize][kBlockSize] = {
     {1567, -3784, 3784, -1567, -1567, 3784, -3784, 1567},
     {799, -2276, 3406, -4017, 4017, -3406, 2276, -799}};
 
-struct DctTables {
-    int32_t fwd[kBlockSize][kBlockSize];
-    int32_t inv[kBlockSize][kBlockSize];   // transpose
-    constexpr DctTables() : fwd{}, inv{} {
-        for (int u = 0; u < kBlockSize; ++u) {
-            for (int x = 0; x < kBlockSize; ++x) {
-                fwd[u][x] = kDctFwd[u][x];
-                inv[x][u] = kDctFwd[u][x];
-            }
-        }
-    }
-};
-
-constexpr DctTables kDct;
-
 // The passes below exploit the DCT matrix's even/odd symmetry
 // (fwd[u][7-x] = +/-fwd[u][x]) to fold the 8-tap dot products into 4-tap
 // ones over sums/differences. Integer addition is exactly associative and

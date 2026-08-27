@@ -615,8 +615,6 @@ struct DropdownUser {
     const char* tooltip;
 };
 
-constexpr float kOptionRowH = kPopupRowH;
-
 Rect dropdown_popup_rect(const DropdownUser& u, const Rect& anchor,
                          const LayoutFrame& frame) {
     return list_popup_rect(anchor, anchor.w, u.items, u.count, frame);

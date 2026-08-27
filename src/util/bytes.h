@@ -36,10 +36,6 @@ inline uint64_t le64(const uint8_t* p) {
            (static_cast<uint64_t>(le32(p + 4)) << 32);
 }
 
-inline void put_be16(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>(v >> 8);
-    p[1] = static_cast<uint8_t>(v);
-}
 inline void put_be32(uint8_t* p, uint32_t v) {
     p[0] = static_cast<uint8_t>(v >> 24);
     p[1] = static_cast<uint8_t>(v >> 16);

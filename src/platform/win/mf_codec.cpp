@@ -92,6 +92,33 @@ HRESULT make_sample(const uint8_t* data, size_t size, int64_t pts,
 constexpr DWORD kAudioAllocFallback = 4096;
 constexpr DWORD kVideoAllocFallback = 4u << 20;
 
+// Base media types the negotiations share (attribute stores are
+// unordered bags); callers add the side-specific attributes - bitrate,
+// profile, stride, PAR, AAC payload.
+Com<IMFMediaType> video_type(const GUID& subtype, uint32_t w, uint32_t h,
+                             uint32_t fps_num, uint32_t fps_den) {
+    Com<IMFMediaType> t;
+    MFCreateMediaType(t.put());
+    t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    t->SetGUID(MF_MT_SUBTYPE, subtype);
+    t->SetUINT64(MF_MT_FRAME_SIZE, (static_cast<UINT64>(w) << 32) | h);
+    t->SetUINT64(MF_MT_FRAME_RATE,
+                 (static_cast<UINT64>(fps_num) << 32) | fps_den);
+    t->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    return t;
+}
+
+Com<IMFMediaType> audio_type(const GUID& subtype, uint32_t channels,
+                             uint32_t rate) {
+    Com<IMFMediaType> t;
+    MFCreateMediaType(t.put());
+    t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    t->SetGUID(MF_MT_SUBTYPE, subtype);
+    t->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+    t->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
+    return t;
+}
+
 // One D3D11 device + DXGI manager shared by every hardware MFT session
 // alive at once: per-session devices multiply per stream (two decode
 // sessions each) plus the export encoder. Refcounted through the
@@ -176,11 +203,9 @@ HRESULT pump_output(IMFTransform* mft, DWORD alloc_fallback,
     if (output.pSample) {
         out.reset();
         *out.put() = output.pSample;
-        if (provides) {
-            // MFT-owned sample: we now hold the only reference we manage.
-        } else {
-            output.pSample->AddRef();   // balance: `allocated` also releases
-        }
+        // An MFT-owned sample hands over its reference; one we allocated
+        // is also released through `allocated`, so take one more.
+        if (!provides) output.pSample->AddRef();
     }
     return S_OK;
 }
@@ -658,12 +683,8 @@ bool AacDecoder::create(const std::vector<uint8_t>& asc, uint32_t channels,
                                  nullptr, d.mft.put());
     if (FAILED(hr)) return set_error(error, "AAC decoder MFT not found", hr);
 
-    Com<IMFMediaType> input;
-    MFCreateMediaType(input.put());
-    input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    input->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-    input->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-    input->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
+    Com<IMFMediaType> input =
+        audio_type(MFAudioFormat_AAC, channels, sample_rate);
     input->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);   // raw AAC frames
     // MF_MT_USER_DATA = HEAACWAVEINFO tail (12 bytes) + AudioSpecificConfig.
     std::vector<uint8_t> user(12, 0);
@@ -700,12 +721,8 @@ bool Mp3Decoder::create(uint32_t channels, uint32_t sample_rate,
                                  nullptr, d.mft.put());
     if (FAILED(hr)) return set_error(error, "MP3 decoder MFT not found", hr);
 
-    Com<IMFMediaType> input;
-    MFCreateMediaType(input.put());
-    input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    input->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_MP3);
-    input->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-    input->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
+    Com<IMFMediaType> input =
+        audio_type(MFAudioFormat_MP3, channels, sample_rate);
     hr = d.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(MP3)", hr);
 
@@ -877,37 +894,21 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
             out_id = outs[0];
         }
 
-        Com<IMFMediaType> output;
-        MFCreateMediaType(output.put());
-        output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        Com<IMFMediaType> output = video_type(MFVideoFormat_H264, width,
+                                              height, fps_num, fps_den);
         output->SetUINT32(MF_MT_AVG_BITRATE, bitrate_bps);
-        output->SetUINT64(MF_MT_FRAME_SIZE,
-                          (static_cast<UINT64>(width) << 32) | height);
-        output->SetUINT64(MF_MT_FRAME_RATE,
-                          (static_cast<UINT64>(fps_num) << 32) | fps_den);
         output->SetUINT64(MF_MT_PIXEL_ASPECT_RATIO,
                           (static_cast<UINT64>(1) << 32) | 1);
-        output->SetUINT32(MF_MT_INTERLACE_MODE,
-                          MFVideoInterlace_Progressive);
         output->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
         if (FAILED(last_hr = mft->SetOutputType(out_id, output.get(), 0))) {
             last_stage = "SetOutputType";
             continue;
         }
 
-        Com<IMFMediaType> input;
-        MFCreateMediaType(input.put());
-        input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        input->SetUINT64(MF_MT_FRAME_SIZE,
-                         (static_cast<UINT64>(width) << 32) | height);
-        input->SetUINT64(MF_MT_FRAME_RATE,
-                         (static_cast<UINT64>(fps_num) << 32) | fps_den);
+        Com<IMFMediaType> input = video_type(MFVideoFormat_NV12, width,
+                                             height, fps_num, fps_den);
         input->SetUINT64(MF_MT_PIXEL_ASPECT_RATIO,
                          (static_cast<UINT64>(1) << 32) | 1);
-        input->SetUINT32(MF_MT_INTERLACE_MODE,
-                         MFVideoInterlace_Progressive);
         input->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
         if (FAILED(last_hr = mft->SetInputType(in_id, input.get(), 0))) {
             last_stage = "SetInputType";
@@ -990,29 +991,15 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
         return set_error(error, "H.264 encoder MFT not found", hr);
 
     // Encoders: set OUTPUT type first, then input.
-    Com<IMFMediaType> output;
-    MFCreateMediaType(output.put());
-    output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    Com<IMFMediaType> output =
+        video_type(MFVideoFormat_H264, width, height, fps_num, fps_den);
     output->SetUINT32(MF_MT_AVG_BITRATE, bitrate_bps);
-    output->SetUINT64(MF_MT_FRAME_SIZE,
-                      (static_cast<UINT64>(width) << 32) | height);
-    output->SetUINT64(MF_MT_FRAME_RATE,
-                      (static_cast<UINT64>(fps_num) << 32) | fps_den);
-    output->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     output->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
     hr = e.mft->SetOutputType(0, output.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetOutputType(H264)", hr);
 
-    Com<IMFMediaType> input;
-    MFCreateMediaType(input.put());
-    input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    input->SetUINT64(MF_MT_FRAME_SIZE,
-                     (static_cast<UINT64>(width) << 32) | height);
-    input->SetUINT64(MF_MT_FRAME_RATE,
-                     (static_cast<UINT64>(fps_num) << 32) | fps_den);
-    input->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    Com<IMFMediaType> input =
+        video_type(MFVideoFormat_NV12, width, height, fps_num, fps_den);
     input->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
     hr = e.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(NV12)", hr);
@@ -1108,25 +1095,17 @@ bool AacEncoder::create(uint32_t channels, uint32_t sample_rate,
                                  &out_info, e.mft.put());
     if (FAILED(hr)) return set_error(error, "AAC encoder MFT not found", hr);
 
-    Com<IMFMediaType> input;
-    MFCreateMediaType(input.put());
-    input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    input->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    Com<IMFMediaType> input =
+        audio_type(MFAudioFormat_PCM, channels, sample_rate);
     input->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    input->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
-    input->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
     hr = e.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(PCM)", hr);
 
     // The AAC encoder wants bytes-per-second in one of its supported tiers.
     const uint32_t bytes_per_sec = bitrate_bps / 8;
-    Com<IMFMediaType> output;
-    MFCreateMediaType(output.put());
-    output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    output->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+    Com<IMFMediaType> output =
+        audio_type(MFAudioFormat_AAC, channels, sample_rate);
     output->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    output->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate);
-    output->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
     output->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_sec);
     output->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
     hr = e.mft->SetOutputType(0, output.get(), 0);

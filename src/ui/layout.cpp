@@ -410,8 +410,10 @@ LayoutNode* make_node(LayoutArena& arena, NodeKind kind) {
     return n;
 }
 
-LayoutNode* with_children(LayoutArena& arena, LayoutNode* node,
-                          std::initializer_list<LayoutNode*> children) {
+// Null children are skipped (conditional rows just pass nullptr).
+template <class Children>
+static LayoutNode* fill_children(LayoutArena& arena, LayoutNode* node,
+                                 const Children& children) {
     size_t count = 0;
     for (LayoutNode* c : children)
         if (c) ++count;
@@ -423,22 +425,15 @@ LayoutNode* with_children(LayoutArena& arena, LayoutNode* node,
     return node;
 }
 
-static LayoutNode* make_stack(LayoutArena& arena, NodeKind kind,
-                              const StackOpts& opts,
-                              std::initializer_list<LayoutNode*> children) {
-    LayoutNode* n = make_node(arena, kind);
-    n->gap = opts.gap;
-    n->padding = opts.padding;
-    n->justify = opts.justify;
-    n->cross_align = opts.cross_align;
-    n->width = opts.width;
-    n->height = opts.height;
-    return with_children(arena, n, children);
+LayoutNode* with_children(LayoutArena& arena, LayoutNode* node,
+                          std::initializer_list<LayoutNode*> children) {
+    return fill_children(arena, node, children);
 }
 
-static LayoutNode* make_stack_dyn(LayoutArena& arena, NodeKind kind,
-                                  const StackOpts& opts,
-                                  const std::vector<LayoutNode*>& children) {
+template <class Children>
+static LayoutNode* make_stack(LayoutArena& arena, NodeKind kind,
+                              const StackOpts& opts,
+                              const Children& children) {
     LayoutNode* n = make_node(arena, kind);
     n->gap = opts.gap;
     n->padding = opts.padding;
@@ -446,25 +441,17 @@ static LayoutNode* make_stack_dyn(LayoutArena& arena, NodeKind kind,
     n->cross_align = opts.cross_align;
     n->width = opts.width;
     n->height = opts.height;
-    size_t count = 0;
-    for (LayoutNode* c : children)
-        if (c) ++count;
-    n->children = arena.alloc<LayoutNode*>(count);
-    n->child_count = static_cast<uint16_t>(count);
-    size_t i = 0;
-    for (LayoutNode* c : children)
-        if (c) n->children[i++] = c;
-    return n;
+    return fill_children(arena, n, children);
 }
 
 LayoutNode* VStackDyn(LayoutArena& arena, const StackOpts& opts,
                       const std::vector<LayoutNode*>& children) {
-    return make_stack_dyn(arena, NodeKind::VStack, opts, children);
+    return make_stack(arena, NodeKind::VStack, opts, children);
 }
 
 LayoutNode* HStackDyn(LayoutArena& arena, const StackOpts& opts,
                       const std::vector<LayoutNode*>& children) {
-    return make_stack_dyn(arena, NodeKind::HStack, opts, children);
+    return make_stack(arena, NodeKind::HStack, opts, children);
 }
 
 LayoutNode* VStack(LayoutArena& arena, const StackOpts& opts,

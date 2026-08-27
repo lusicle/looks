@@ -8,6 +8,74 @@ namespace looks::doc {
 
 namespace {
 
+// First element whose id matches, removed in place - the shape every
+// push_back-style apply reverts through.
+template <class V>
+void erase_by_id(V& v, uint64_t id) {
+    for (auto it = v.begin(); it != v.end(); ++it)
+        if (it->id == id) {
+            v.erase(it);
+            break;
+        }
+}
+
+// Append one document-level entity (bin / look / sequence / asset);
+// undo removes it by id.
+template <class T, std::vector<T> Document::*List>
+class AddEntityCommand final : public Command {
+public:
+    AddEntityCommand(T entity, const char* label)
+        : entity_(std::move(entity)), label_(label) {}
+    std::string name() const override { return label_; }
+    void apply(Document& doc) override { (doc.*List).push_back(entity_); }
+    void revert(Document& doc) override {
+        erase_by_id(doc.*List, entity_.id);
+    }
+
+private:
+    T entity_;
+    const char* label_;
+};
+
+// Ordered removal of one document-level entity: apply records the
+// index, revert re-inserts at it, clamped - the vector can have shrunk
+// between apply and revert. Index preservation is load-bearing for
+// assets (the FIRST asset drives auto canvas/fps), so the restored
+// entry must land where it was.
+template <class T, std::vector<T> Document::*List>
+class RemoveEntityCommand final : public Command {
+public:
+    RemoveEntityCommand(uint64_t id, const char* label)
+        : id_(id), label_(label) {}
+    std::string name() const override { return label_; }
+
+    void apply(Document& doc) override {
+        std::vector<T>& v = doc.*List;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].id == id_) {
+                index_ = i;
+                removed_ = v[i];
+                had_ = true;
+                v.erase(v.begin() + static_cast<ptrdiff_t>(i));
+                break;
+            }
+    }
+
+    void revert(Document& doc) override {
+        if (!had_) return;
+        std::vector<T>& v = doc.*List;
+        const size_t at = std::min(index_, v.size());
+        v.insert(v.begin() + static_cast<ptrdiff_t>(at), removed_);
+    }
+
+private:
+    uint64_t id_;
+    const char* label_;
+    size_t index_ = 0;
+    T removed_{};
+    bool had_ = false;
+};
+
 // A full deep copy of a look with every id reminted: MAKE UNIQUE's fork.
 // Definitions remint; references remap through the same table so wiring,
 // group faces, mod targets, lanes and snapshots keep pointing at the
@@ -118,25 +186,6 @@ Sequence clone_sequence_for_unique(Document& doc, const Sequence& src) {
     }
     return out;
 }
-
-class AddBinCommand final : public Command {
-public:
-    explicit AddBinCommand(Bin bin) : bin_(std::move(bin)) {}
-    std::string name() const override { return "Add Bin"; }
-
-    void apply(Document& doc) override { doc.bins.push_back(bin_); }
-
-    void revert(Document& doc) override {
-        for (auto it = doc.bins.begin(); it != doc.bins.end(); ++it)
-            if (it->id == bin_.id) {
-                doc.bins.erase(it);
-                break;
-            }
-    }
-
-private:
-    Bin bin_;
-};
 
 class RemoveBinCommand final : public Command {
 public:
@@ -271,57 +320,6 @@ private:
     uint64_t old_bin_ = 0;
 };
 
-class AddLookCommand final : public Command {
-public:
-    explicit AddLookCommand(Look look) : look_(std::move(look)) {}
-    std::string name() const override { return "Add Look"; }
-
-    void apply(Document& doc) override { doc.looks.push_back(look_); }
-
-    void revert(Document& doc) override {
-        for (auto it = doc.looks.begin(); it != doc.looks.end(); ++it)
-            if (it->id == look_.id) {
-                doc.looks.erase(it);
-                break;
-            }
-    }
-
-private:
-    Look look_;
-};
-
-class RemoveLookCommand final : public Command {
-public:
-    explicit RemoveLookCommand(uint64_t look_id) : look_id_(look_id) {}
-    std::string name() const override { return "Remove Look"; }
-
-    void apply(Document& doc) override {
-        for (size_t i = 0; i < doc.looks.size(); ++i)
-            if (doc.looks[i].id == look_id_) {
-                index_ = i;
-                removed_ = doc.looks[i];
-                had_ = true;
-                doc.looks.erase(doc.looks.begin() +
-                                static_cast<ptrdiff_t>(i));
-                break;
-            }
-    }
-
-    void revert(Document& doc) override {
-        if (!had_) return;
-        // Clamp: the vector can have shrunk between apply and revert.
-        const size_t at = std::min(index_, doc.looks.size());
-        doc.looks.insert(doc.looks.begin() + static_cast<ptrdiff_t>(at),
-                         removed_);
-    }
-
-private:
-    uint64_t look_id_;
-    size_t index_ = 0;
-    Look removed_;
-    bool had_ = false;
-};
-
 class SetLookPropsCommand final : public LookCommand {
 public:
     SetLookPropsCommand(uint64_t look, std::string name, uint32_t duration)
@@ -404,58 +402,6 @@ private:
     bool sealed_ = false;
 };
 
-class AddSequenceCommand final : public Command {
-public:
-    explicit AddSequenceCommand(Sequence seq) : seq_(std::move(seq)) {}
-    std::string name() const override { return "Add Sequence"; }
-
-    void apply(Document& doc) override { doc.sequences.push_back(seq_); }
-
-    void revert(Document& doc) override {
-        for (auto it = doc.sequences.begin(); it != doc.sequences.end();
-             ++it)
-            if (it->id == seq_.id) {
-                doc.sequences.erase(it);
-                break;
-            }
-    }
-
-private:
-    Sequence seq_;
-};
-
-class RemoveSequenceCommand final : public Command {
-public:
-    explicit RemoveSequenceCommand(uint64_t seq_id) : seq_id_(seq_id) {}
-    std::string name() const override { return "Remove Sequence"; }
-
-    void apply(Document& doc) override {
-        for (size_t i = 0; i < doc.sequences.size(); ++i)
-            if (doc.sequences[i].id == seq_id_) {
-                index_ = i;
-                removed_ = doc.sequences[i];
-                had_ = true;
-                doc.sequences.erase(doc.sequences.begin() +
-                                    static_cast<ptrdiff_t>(i));
-                break;
-            }
-    }
-
-    void revert(Document& doc) override {
-        if (!had_) return;
-        // Clamp: the vector can have shrunk between apply and revert.
-        const size_t at = std::min(index_, doc.sequences.size());
-        doc.sequences.insert(
-            doc.sequences.begin() + static_cast<ptrdiff_t>(at), removed_);
-    }
-
-private:
-    uint64_t seq_id_;
-    size_t index_ = 0;
-    Sequence removed_;
-    bool had_ = false;
-};
-
 class SetSequencePropsCommand final : public SequenceCommand {
 public:
     SetSequencePropsCommand(uint64_t seq, std::string name,
@@ -494,25 +440,6 @@ private:
     uint32_t old_duration_ = 0;
 };
 
-class AddAssetCommand final : public Command {
-public:
-    explicit AddAssetCommand(Asset asset) : asset_(std::move(asset)) {}
-    std::string name() const override { return "Add Media"; }
-
-    void apply(Document& doc) override { doc.assets.push_back(asset_); }
-
-    void revert(Document& doc) override {
-        for (auto it = doc.assets.begin(); it != doc.assets.end(); ++it)
-            if (it->id == asset_.id) {
-                doc.assets.erase(it);
-                break;
-            }
-    }
-
-private:
-    Asset asset_;
-};
-
 class SetAssetCommand final : public Command {
 public:
     explicit SetAssetCommand(Asset updated) : updated_(std::move(updated)) {}
@@ -544,39 +471,6 @@ private:
     bool had_ = false;
 };
 
-class RemoveAssetCommand final : public Command {
-public:
-    explicit RemoveAssetCommand(uint64_t asset_id) : asset_id_(asset_id) {}
-    std::string name() const override { return "Remove Media"; }
-
-    void apply(Document& doc) override {
-        for (size_t i = 0; i < doc.assets.size(); ++i)
-            if (doc.assets[i].id == asset_id_) {
-                index_ = i;
-                removed_ = doc.assets[i];
-                had_ = true;
-                doc.assets.erase(doc.assets.begin() +
-                                 static_cast<ptrdiff_t>(i));
-                break;
-            }
-    }
-
-    void revert(Document& doc) override {
-        if (!had_) return;
-        // Clamp: the vector can have shrunk between apply and revert.
-        // Index-preserving: the FIRST asset drives auto canvas/fps, so
-        // the restored entry must land where it was.
-        const size_t at = std::min(index_, doc.assets.size());
-        doc.assets.insert(doc.assets.begin() + static_cast<ptrdiff_t>(at),
-                          removed_);
-    }
-
-private:
-    uint64_t asset_id_;
-    size_t index_ = 0;
-    Asset removed_;
-    bool had_ = false;
-};
 
 // Every id the selection owns: the chosen layers plus the effects and
 // groups inside them. Links name effects too, so the boundary test has to
@@ -650,23 +544,14 @@ public:
 
     void revert(Document& doc) override {
         Look& parent = look_of(doc);
-        for (auto it = doc.looks.begin(); it != doc.looks.end(); ++it)
-            if (it->id == nested_.id) {
-                doc.looks.erase(it);
-                break;
-            }
+        erase_by_id(doc.looks, nested_.id);
         for (size_t i = parent.links.size(); i-- > 0;)
             if (parent.links[i].from == ref_.id && parent.links[i].to == 0) {
                 parent.links.erase(parent.links.begin() +
                                    static_cast<ptrdiff_t>(i));
                 break;
             }
-        for (size_t i = parent.layers.size(); i-- > 0;)
-            if (parent.layers[i].id == ref_.id) {
-                parent.layers.erase(parent.layers.begin() +
-                                    static_cast<ptrdiff_t>(i));
-                break;
-            }
+        erase_by_id(parent.layers, ref_.id);
         // Restored back-to-front, so each index is the one it was taken
         // from (apply() walked the vectors backwards).
         for (size_t i = removed_layers_.size(); i-- > 0;) {
@@ -737,20 +622,8 @@ public:
         if (!applied_) return;
         if (Placement* p = find_placement(sequence_of(doc), placement_id_))
             p->target = old_target_;
-        if (is_look_) {
-            for (auto it = doc.looks.begin(); it != doc.looks.end(); ++it)
-                if (it->id == look_.id) {
-                    doc.looks.erase(it);
-                    break;
-                }
-        } else {
-            for (auto it = doc.sequences.begin(); it != doc.sequences.end();
-                 ++it)
-                if (it->id == seq_.id) {
-                    doc.sequences.erase(it);
-                    break;
-                }
-        }
+        if (is_look_) erase_by_id(doc.looks, look_.id);
+        else erase_by_id(doc.sequences, seq_.id);
         applied_ = false;
     }
 
@@ -817,8 +690,8 @@ std::unique_ptr<Command> nest_layers_command(
     // Read the EFFECTIVE table - a look whose links are still synthesized
     // has wiring that is just as real, and the nested look must carry it
     // explicitly (its layer set no longer synthesizes the same thing).
-    const std::vector<NodeLink> table =
-        parent->links.empty() ? synthesize_links(*parent) : parent->links;
+    std::vector<NodeLink> synth;
+    const std::vector<NodeLink>& table = effective_links(*parent, synth);
     const std::vector<uint64_t> owned = owned_ids(*parent, layer_ids);
     auto inside = [&](uint64_t id) {
         for (const uint64_t o : owned)
@@ -887,7 +760,8 @@ Bin make_bin(Document& doc, std::string name) {
 }
 
 std::unique_ptr<Command> add_bin_command(Bin bin) {
-    return std::make_unique<AddBinCommand>(std::move(bin));
+    return std::make_unique<AddEntityCommand<Bin, &Document::bins>>(
+        std::move(bin), "Add Bin");
 }
 
 std::unique_ptr<Command> remove_bin_command(uint64_t bin_id) {
@@ -907,11 +781,13 @@ std::unique_ptr<Command> set_entity_bin_command(uint64_t entity_id,
 }
 
 std::unique_ptr<Command> add_look_command(Look look) {
-    return std::make_unique<AddLookCommand>(std::move(look));
+    return std::make_unique<AddEntityCommand<Look, &Document::looks>>(
+        std::move(look), "Add Look");
 }
 
 std::unique_ptr<Command> remove_look_command(uint64_t look_id) {
-    return std::make_unique<RemoveLookCommand>(look_id);
+    return std::make_unique<RemoveEntityCommand<Look, &Document::looks>>(
+        look_id, "Remove Look");
 }
 
 std::unique_ptr<Command> set_look_props_command(uint64_t look,
@@ -927,11 +803,15 @@ std::unique_ptr<Command> set_look_audio_split_command(uint64_t look,
 }
 
 std::unique_ptr<Command> add_sequence_command(Sequence seq) {
-    return std::make_unique<AddSequenceCommand>(std::move(seq));
+    return std::make_unique<
+        AddEntityCommand<Sequence, &Document::sequences>>(std::move(seq),
+                                                          "Add Sequence");
 }
 
 std::unique_ptr<Command> remove_sequence_command(uint64_t seq_id) {
-    return std::make_unique<RemoveSequenceCommand>(seq_id);
+    return std::make_unique<
+        RemoveEntityCommand<Sequence, &Document::sequences>>(
+        seq_id, "Remove Sequence");
 }
 
 std::unique_ptr<Command> set_sequence_props_command(uint64_t seq,
@@ -942,11 +822,13 @@ std::unique_ptr<Command> set_sequence_props_command(uint64_t seq,
 }
 
 std::unique_ptr<Command> add_asset_command(Asset asset) {
-    return std::make_unique<AddAssetCommand>(std::move(asset));
+    return std::make_unique<AddEntityCommand<Asset, &Document::assets>>(
+        std::move(asset), "Add Media");
 }
 
 std::unique_ptr<Command> remove_asset_command(uint64_t asset_id) {
-    return std::make_unique<RemoveAssetCommand>(asset_id);
+    return std::make_unique<RemoveEntityCommand<Asset, &Document::assets>>(
+        asset_id, "Remove Media");
 }
 
 std::unique_ptr<Command> set_asset_command(Asset updated) {

@@ -339,11 +339,21 @@ private:
         uint32_t last_frame = 0xFFFFFFFFu;
     };
     std::unordered_map<uint64_t, FeedbackSlot> feedback_state_;
+    // The instance's persistent target, (re)created on size change and
+    // cleared to black, left SHADER_READ_ONLY for the pass to sample.
+    // Null only on allocation failure.
+    FeedbackSlot* ensure_feedback_prev(VkCommandBuffer rec, uint64_t skey,
+                                       uint32_t w, uint32_t h);
+    void feedback_writeback(VkCommandBuffer rec, FeedbackSlot& slot,
+                            GpuImage* dst, uint32_t w, uint32_t h,
+                            uint32_t timeline_frame);
 
-    bool upload_gray_oneshot(GpuImage& dst, const uint8_t* gray, uint32_t width,
-                             uint32_t height);
-    bool upload_rgba_oneshot(GpuImage& dst, const uint8_t* rgba,
-                             uint32_t width, uint32_t height);
+    bool upload_oneshot(GpuImage& dst, const uint8_t* pixels,
+                        size_t bytes_per_pixel, uint32_t width,
+                        uint32_t height);
+    bool set_glyph_atlas_impl(const uint8_t* pixels, uint32_t width,
+                              uint32_t height, float tile_px, uint32_t cols,
+                              uint32_t rows, int slot, bool color);
     // 0 halftone, 1 ascii, 2 custom (droppable glyph sets),
     // 3 braille (procedural 2x4 dot cells), 4 teletext (procedural 2x3
     // block-mosaic sextants). A color-flagged slot holds RGBA tiles
@@ -405,6 +415,16 @@ private:
         uint32_t last_frame = 0xFFFFFFFFu;
     };
     std::unordered_map<uint64_t, SlitSlot> slit_state_;   // also Stutter rings
+    // Ring lookup; a size change drops the ring (stale history is a
+    // different format).
+    SlitSlot& slit_ring_slot(uint64_t skey, uint32_t w, uint32_t h);
+    // Record the current input once per timeline frame; false only on
+    // allocation failure.
+    bool slit_ring_push(VkCommandBuffer rec, SlitSlot& slot, GpuImage* in_img,
+                        uint32_t w, uint32_t h, uint32_t timeline_frame);
+    // Age 0 or past the recorded span reads the live input.
+    static const GpuImage* slit_history(const SlitSlot& slot,
+                                        GpuImage* in_img, uint32_t age);
 
     // Frame-rate sim: the held frame refreshes when the
     // hold-fps tick advances.
@@ -437,6 +457,13 @@ private:
     };
     std::unordered_map<uint64_t, RdSlot> rd_state_;
     std::unique_ptr<ComputePipeline> rd_step_;
+    // Resize-guarded state advance feeding on `in`: `steps` sim steps
+    // once per timeline frame, returned SHADER_READ_ONLY. Null only on
+    // allocation failure.
+    GpuImage* rd_advance(VkCommandBuffer rec, uint32_t frame_index,
+                         uint64_t skey, const GpuImage* in, uint32_t w,
+                         uint32_t h, uint32_t timeline_frame, uint32_t steps,
+                         float feed, float kill, float inject);
 
     // Velocity scan (dwell-time rendering): per-instance ping-pong front
     // field — one row of sweep-front positions per concurrent line, one
@@ -502,6 +529,16 @@ private:
     bool composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
                       const GpuImage* in_img, const EdState& ed, uint32_t w,
                       uint32_t h, uint32_t frame_index, GpuImage* dst);
+    // Codec-roundtrip tail, shared by the mosh boxes: the up_* planes to
+    // linear RGB into temp at identity fit (the planes are working-size).
+    void codec_planes_to_rgb(VkCommandBuffer rec, uint32_t frame_index,
+                             GpuImage* temp, uint32_t w, uint32_t h);
+    // Wet/opacity composite of temp over in into dst; temp goes back to
+    // the pool.
+    void mix_composite_release(VkCommandBuffer rec, uint32_t frame_index,
+                               const GpuImage* in, GpuImage* temp,
+                               GpuImage* dst, float wet, float opacity,
+                               uint32_t w, uint32_t h);
 
 public:
     // True while a deferred dither walk is in flight. The render worker

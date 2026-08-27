@@ -66,9 +66,9 @@ void encode_frame(const FrameView& frame, int quality, std::vector<uint8_t>& out
 bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
                   uint32_t height, DecodedFrame& out, bool parallel = false);
 
-// Two-phase intra encode (Codec-Box rate loops, ): the DCT is
-// quality-independent, so transform once (optionally across threads) and
-// re-run only quantize+entropy per quality step. intra_entropy output is
+// Two-phase intra encode (Codec-Box rate loops): the DCT is
+// quality-independent, so transform once (across threads) and re-run
+// only quantize+entropy per quality step. intra_entropy output is
 // byte-identical to encode_frame at the same quality. Import stays on
 // encode_frame — it is already parallel across frames and the coefficient
 // buffer (~12 MB at 1080p) would multiply across its workers.
@@ -77,7 +77,7 @@ struct IntraDct {
     std::vector<int16_t> coeffs;   // 64 per block, bitstream block order
     std::vector<uint8_t> flat;     // 1 = edge filler block (coeffs unused)
 };
-void intra_dct(const FrameView& frame, IntraDct& out, bool parallel);
+void intra_dct(const FrameView& frame, IntraDct& out);
 void intra_entropy(const IntraDct& dct, int quality,
                    std::vector<uint8_t>& out);
 
@@ -86,8 +86,7 @@ void intra_entropy(const IntraDct& dct, int quality,
 // intra_entropy + decode_frame at the same quality — the wire without the
 // bytes, for consumers that never read the stream (the Codec-Box when
 // nothing rate-limits or corrupts it).
-void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
-                 bool parallel);
+void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out);
 
 // Exact byte count intra_entropy would produce at this quality, without
 // writing it (parallel AC scan + serial DC-delta chain). Rate loops probe

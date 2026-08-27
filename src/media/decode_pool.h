@@ -188,6 +188,12 @@ private:
         // Decoded frames by index, newest last. Bounded by ring_depth_.
         std::deque<std::pair<uint32_t, std::shared_ptr<const codec::DecodedFrame>>>
             ring;
+        // The ringed frame, or null. Caller holds `m`.
+        std::shared_ptr<const codec::DecodedFrame> ringed(uint32_t frame) const {
+            for (const auto& e : ring)
+                if (e.first == frame) return e.second;
+            return nullptr;
+        }
         // Evicted frames nobody else holds recycle here (guarded by `m`):
         // their vectors keep capacity, so the next decode reuses pages
         // instead of paying an ~18 MB alloc + fault per 4K frame.
@@ -230,6 +236,12 @@ private:
         uint32_t deadline = 0;
     };
 
+    // Stream identity for an instance key (the canonical fold, or the
+    // key itself for keys outside the current flatten).
+    uint64_t alias_of(uint64_t key) const {
+        const auto it = canonical_.find(key);
+        return it != canonical_.end() ? it->second : key;
+    }
     Stream* stream_for(const Request& req);
     // Returns the decoded frame; a ring miss decodes on a free slot or
     // session (waiting at most one in-flight decode, never the prewarm

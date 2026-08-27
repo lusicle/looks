@@ -27,10 +27,18 @@ enum class NodeKind : uint8_t {
 };
 
 // Node identity: tag byte | document id (effect/route ids come from
-// separate counters and may collide across kinds).
+// separate counters and may collide across kinds). The two accessors
+// are the ONLY inverse of node_id - open-coding the shifts splits the
+// id layout across files.
 inline uint64_t node_id(NodeKind kind, uint64_t doc_id) {
     return (static_cast<uint64_t>(kind) + 1ull) << 56 |
            (doc_id & 0x00FFFFFFFFFFFFFFull);
+}
+inline NodeKind node_kind_of(uint64_t id) {
+    return static_cast<NodeKind>((id >> 56) - 1);
+}
+inline uint64_t node_doc_id(uint64_t id) {
+    return id & 0x00FFFFFFFFFFFFFFull;
 }
 inline constexpr uint64_t kOutNodeId = 0xFFull << 56;
 
@@ -382,7 +390,7 @@ ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,
 // ports occupy dedicated strip rows between the preview and the param
 // rows (they must never overlap a param row), so height depends on them.
 float node_width();
-float node_height(int row_count, bool has_preview, int port_rows = 0);
+float node_height(int row_count, bool has_preview, int port_rows);
 float node_height_of(const Node& nd);
 
 // The image wire nearest a SCREEN position (within the canvas's own

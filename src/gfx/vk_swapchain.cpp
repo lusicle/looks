@@ -3,7 +3,6 @@
 #include <algorithm>
 
 #include "gfx/vk_device.h"
-#include "util/log.h"
 
 namespace looks::gfx {
 

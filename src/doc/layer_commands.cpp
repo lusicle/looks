@@ -89,26 +89,6 @@ private:
     Layer old_;
 };
 
-// The placement list holding an id, wherever it lives - a video lane or
-// an audio track - plus the index inside it.
-std::vector<Placement>* placement_container(Sequence& seq,
-                                            uint64_t placement_id,
-                                            size_t* index) {
-    for (SeqTrack& t : seq.tracks)
-        for (size_t i = 0; i < t.placements.size(); ++i)
-            if (t.placements[i].id == placement_id) {
-                *index = i;
-                return &t.placements;
-            }
-    for (AudioTrack& t : seq.audio)
-        for (size_t i = 0; i < t.placements.size(); ++i)
-            if (t.placements[i].id == placement_id) {
-                *index = i;
-                return &t.placements;
-            }
-    return nullptr;
-}
-
 // One half of a razor: the placement being shortened and the fresh right
 // half that resumes at the cut's source frame.
 struct PlacementSplit {
@@ -133,23 +113,23 @@ public:
         Sequence& seq = sequence_of(doc);
         old_outs_.clear();
         for (const PlacementSplit& s : splits_) {
-            size_t i = 0;
-            std::vector<Placement>* c =
-                placement_container(seq, s.left_id, &i);
-            if (!c) continue;
-            old_outs_.emplace_back(s.left_id, (*c)[i].t_out);
-            (*c)[i].t_out = at_;
-            c->insert(c->begin() + static_cast<ptrdiff_t>(i + 1), s.right);
+            PlacementSlot slot;
+            if (!find_placement_slot(seq, s.left_id, &slot)) continue;
+            std::vector<Placement>* c = slot.list;
+            old_outs_.emplace_back(s.left_id, (*c)[slot.index].t_out);
+            (*c)[slot.index].t_out = at_;
+            c->insert(c->begin() + static_cast<ptrdiff_t>(slot.index + 1),
+                      s.right);
         }
     }
 
     void revert(Document& doc) override {
         Sequence& seq = sequence_of(doc);
         for (const PlacementSplit& s : splits_) {
-            size_t i = 0;
-            if (std::vector<Placement>* c =
-                    placement_container(seq, s.right.id, &i))
-                c->erase(c->begin() + static_cast<ptrdiff_t>(i));
+            PlacementSlot slot;
+            if (find_placement_slot(seq, s.right.id, &slot))
+                slot.list->erase(slot.list->begin() +
+                                 static_cast<ptrdiff_t>(slot.index));
         }
         for (const auto& [id, out] : old_outs_)
             if (Placement* p = find_placement(seq, id)) p->t_out = out;

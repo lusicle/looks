@@ -129,7 +129,7 @@ void encode_frame(const FrameView& frame, int quality,
 // Two-phase intra. Block order MUST mirror encode_frame
 // exactly — per MB: four luma (row-major), U, V — so intra_entropy's
 // bytes match encode_frame's at the same quality (test-enforced).
-void intra_dct(const FrameView& frame, IntraDct& out, bool parallel) {
+void intra_dct(const FrameView& frame, IntraDct& out) {
     const int w = static_cast<int>(frame.width);
     const int h = static_cast<int>(frame.height);
     const int cw = (w + 1) / 2;
@@ -142,7 +142,7 @@ void intra_dct(const FrameView& frame, IntraDct& out, bool parallel) {
     out.coeffs.resize(blocks * kBlockCoeffs);
     out.flat.assign(blocks, 0);
 
-    parallel_blocks(mb_w * mb_h, parallel, [&](int begin, int end) {
+    parallel_blocks(mb_w * mb_h, true, [&](int begin, int end) {
         for (int mb = begin; mb < end; ++mb) {
             const int mx = mb % mb_w;
             const int my = mb / mb_w;
@@ -248,8 +248,7 @@ void recon_block_write(const BlockDst& d, const int16_t* block) {
         }
 }
 
-void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
-                 bool parallel) {
+void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out) {
     uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
     build_quant_table(kQuantBaseLuma, quality, qy);
     build_quant_table(kQuantBaseChroma, quality, qc);
@@ -267,7 +266,7 @@ void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out,
     out.u.resize(static_cast<size_t>(cw) * ch);
     out.v.resize(static_cast<size_t>(cw) * ch);
 
-    parallel_blocks(mb_w * mb_h, parallel, [&](int begin, int end) {
+    parallel_blocks(mb_w * mb_h, true, [&](int begin, int end) {
         int16_t quantized[kBlockCoeffs];
         int16_t block[kBlockCoeffs];
         for (int mb = begin; mb < end; ++mb) {

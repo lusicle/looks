@@ -728,6 +728,23 @@ private:
     std::vector<Old> old_;
 };
 
+// The snapshot of a look's current effect state (params, wet, opacity).
+Snapshot capture_snapshot(const Look& look) {
+    Snapshot snapshot;
+    snapshot.valid = true;
+    for (const Layer& layer : look.layers) {
+        for (const EffectInstance& fx : layer.stack) {
+            SnapshotEntry entry;
+            entry.effect_id = fx.id;
+            entry.params = fx.params;
+            entry.wet = fx.wet;
+            entry.opacity = fx.opacity;
+            snapshot.entries.push_back(std::move(entry));
+        }
+    }
+    return snapshot;
+}
+
 class StoreSnapshotCommand final : public LookCommand {
 public:
     StoreSnapshotCommand(uint64_t look, int slot)
@@ -790,22 +807,6 @@ private:
 };
 
 }  // namespace
-
-Snapshot capture_snapshot(const Look& look) {
-    Snapshot snapshot;
-    snapshot.valid = true;
-    for (const Layer& layer : look.layers) {
-        for (const EffectInstance& fx : layer.stack) {
-            SnapshotEntry entry;
-            entry.effect_id = fx.id;
-            entry.params = fx.params;
-            entry.wet = fx.wet;
-            entry.opacity = fx.opacity;
-            snapshot.entries.push_back(std::move(entry));
-        }
-    }
-    return snapshot;
-}
 
 std::unique_ptr<Command> add_route_command(uint64_t look, ModRoute route) {
     return std::make_unique<AddRouteCommand>(look, std::move(route));

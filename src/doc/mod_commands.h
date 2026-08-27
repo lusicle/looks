@@ -60,9 +60,6 @@ std::unique_ptr<Command> store_snapshot_command(uint64_t look, int slot);
 // Applies slot's values to effects that still exist (matched by id).
 std::unique_ptr<Command> apply_snapshot_command(uint64_t look, int slot);
 
-// Helper shared with the UI: the snapshot of a look's current state.
-Snapshot capture_snapshot(const Look& look);
-
 // Morph position/endpoints. Coalesces (slider drags).
 std::unique_ptr<Command> set_morph_command(uint64_t look, int from, int to,
                                            float pos);

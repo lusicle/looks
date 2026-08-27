@@ -147,7 +147,7 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
 // to even, floor at 2. The worker, the engine and the readback MUST
 // size through this one function - the publish guard compares their
 // results for equality and silently drops frames on a mismatch.
-inline uint32_t even_down(uint32_t v, uint32_t div = 1) {
+inline uint32_t even_down(uint32_t v, uint32_t div) {
     const uint32_t d = (v / (div ? div : 1)) & ~1u;
     return d > 2u ? d : 2u;
 }

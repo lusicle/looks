@@ -78,7 +78,6 @@ struct TrackInfo {
     // Audio (mp4a)
     uint32_t channels = 0;
     uint32_t sample_rate = 0;
-    uint32_t sample_size_bits = 0;
     std::vector<uint8_t> audio_specific_config;  // from esds
 
     std::vector<SampleInfo> samples;

@@ -209,8 +209,9 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     // TRUE GRAPH: effect wiring and the final composite come from the
     // link table; an empty table compiles through the synthesized
     // stack-order chain.
-    const std::vector<doc::NodeLink> links =
-        look.links.empty() ? doc::synthesize_links(look) : look.links;
+    std::vector<doc::NodeLink> links_synth;
+    const std::vector<doc::NodeLink>& links =
+        doc::effective_links(look, links_synth);
     auto link_into = [&](uint64_t to, uint32_t port) -> uint64_t {
         for (const doc::NodeLink& l : links)
             if (l.to == to && l.to_port == port) return l.from;
@@ -478,11 +479,18 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     // gated by that layer's port-1 matte. The Output's In is simply
     // the composite's fan-in - effect ports merge by the same one
     // rule - and an inactive effect passes its own In merge through.
-    auto links_into_port = [&](uint64_t to, uint32_t port) {
-        std::vector<uint64_t> from;
-        for (const doc::NodeLink& l : links)
-            if (l.to == to && l.to_port == port) from.push_back(l.from);
-        return from;
+    // Indexed once: the recursive resolvers and the fixpoint loop below
+    // hit this superlinearly. One forward pass keeps link-vector order
+    // inside each key (stacking order). Key packing matches merge_memo:
+    // ports are tiny, so shifting is exact.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> port_links;
+    for (const doc::NodeLink& l : links)
+        port_links[(l.to << 8) | l.to_port].push_back(l.from);
+    static const std::vector<uint64_t> kNoLinks;
+    auto links_into_port =
+        [&](uint64_t to, uint32_t port) -> const std::vector<uint64_t>& {
+        const auto it = port_links.find((to << 8) | port);
+        return it == port_links.end() ? kNoLinks : it->second;
     };
     auto owner_layer_index = [&](uint64_t id) -> size_t {
         if (auto it = owner.find(id); it != owner.end()) return it->second;
@@ -779,18 +787,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         size_t want = SIZE_MAX;
         for (size_t k = 0; k < look.layers.size(); ++k)
             if (look.layers[k].id == preview_layer) want = k;
-        auto layer_of = [&](uint64_t id) -> size_t {
-            if (auto it = owner.find(id); it != owner.end())
-                return it->second;
-            for (size_t k = 0; k < look.layers.size(); ++k)
-                if (look.layers[k].id == id) return k;
-            return SIZE_MAX;
-        };
         int idx = -1;
         if (want != SIZE_MAX)
             for (const doc::NodeLink& l : links) {
-                if (layer_of(l.from) != want) continue;
-                if (l.to != 0 && layer_of(l.to) == want) continue;
+                if (owner_layer_index(l.from) != want) continue;
+                if (l.to != 0 && owner_layer_index(l.to) == want) continue;
                 if (int r = resolve(l.from); r >= 0) idx = r;
             }
         if (idx >= 0) graph.preview = idx;

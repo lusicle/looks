@@ -1,8 +1,8 @@
 // Vulkan instance/device bootstrap.
 //
-// One graphics+compute queue for all rendering, plus a dedicated transfer
-// queue for async frame-upload staging when the hardware has a DMA family
-// (falls back to the graphics queue otherwise). VMA owns every allocation.
+// One graphics+compute queue for all rendering, plus a second
+// graphics-family queue for the thumbnail worker when the family has
+// one. VMA owns every allocation.
 
 #pragma once
 
@@ -42,9 +42,6 @@ public:
 
     uint32_t graphics_family() const { return graphics_family_; }
     VkQueue graphics_queue() const { return graphics_queue_; }
-    uint32_t transfer_family() const { return transfer_family_; }
-    VkQueue transfer_queue() const { return transfer_queue_; }
-    bool has_dedicated_transfer() const { return transfer_family_ != graphics_family_; }
     // Second graphics-family queue (priority 0.5) for the thumbnail
     // worker's background renders; the graphics queue itself when the
     // family exposes only one. Same family = shared resources, and a
@@ -52,11 +49,6 @@ public:
     // across queues (execution ordered through the host, visibility
     // through the barrier).
     VkQueue thumb_queue() const { return thumb_queue_; }
-    bool has_dedicated_thumb_queue() const {
-        return thumb_queue_ != graphics_queue_;
-    }
-
-    const VkPhysicalDeviceProperties& properties() const { return properties_; }
 
     // Serializes vkQueueSubmit/vkQueuePresentKHR/vkDeviceWaitIdle
     // across ALL queues - preview loop, export worker, UI present and
@@ -79,9 +71,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VmaAllocator allocator_ = nullptr;
     uint32_t graphics_family_ = 0;
-    uint32_t transfer_family_ = 0;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
-    VkQueue transfer_queue_ = VK_NULL_HANDLE;
     VkQueue thumb_queue_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
     mutable std::mutex queue_mutex_;

@@ -27,6 +27,27 @@ namespace looks::media {
 
 namespace {
 
+std::wstring lower_ext(const std::filesystem::path& p) {
+    std::wstring ext = p.extension().native();
+    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+    return ext;
+}
+
+// An AAC audio track the importer can decode.
+bool aac_track(const TrackInfo* t) {
+    return t && std::string(t->fourcc) == "mp4a" && !t->samples.empty() &&
+           !t->audio_specific_config.empty();
+}
+
+// Container-level video facts every native import path stamps.
+void stamp_video_facts(const TrackInfo& video, ImportResult* result) {
+    result->width = video.width;
+    result->height = video.height;
+    result->frame_count = static_cast<uint32_t>(video.samples.size());
+    const uint32_t frame_duration = std::max(1u, video.samples[0].duration);
+    result->fps = static_cast<double>(video.timescale) / frame_duration;
+}
+
 // NV12 -> I420: split interleaved UV. Output planes are tightly packed.
 struct I420Frame {
     std::vector<uint8_t> y, u, v;
@@ -510,14 +531,11 @@ bool import_audio_file(const std::filesystem::path& source,
                        const std::filesystem::path& dest_dir,
                        const ImportOptions& options,
                        ImportProgress* progress, ImportResult* result) {
-    std::wstring ext = source.extension().native();
-    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
-
     uint32_t channels = 0, rate = 0;
     std::vector<int16_t> samples;
     std::vector<uint8_t> art;
     std::string error;
-    if (ext == L".wav") {
+    if (lower_ext(source) == L".wav") {
         WavData wav;
         if (!read_wav(source, &wav, &error)) {
             result->error = "wav: " + error;
@@ -551,11 +569,10 @@ bool import_audio_file(const std::filesystem::path& source,
         progress->frames_done.store(0);
     }
 
-    const std::filesystem::path pcm_path =
-        sidecars_for(dest_dir, source).pcm;
+    const SidecarPaths sc = sidecars_for(dest_dir, source);
     PcmWriter writer;
-    if (!writer.open(pcm_path, channels, rate)) {
-        result->error = "cannot create " + path_to_u8(pcm_path);
+    if (!writer.open(sc.pcm, channels, rate)) {
+        result->error = "cannot create " + path_to_u8(sc.pcm);
         return false;
     }
     if (!writer.append(samples.data(), samples.size())) {
@@ -563,11 +580,17 @@ bool import_audio_file(const std::filesystem::path& source,
         return false;
     }
     writer.finish();
-    result->pcm_path = pcm_path;
+    result->pcm_path = sc.pcm;
     result->audio_channels = channels;
     result->audio_sample_rate = rate;
     result->audio_frames =
         channels ? samples.size() / channels : 0;
+    // The still grid covering this audio's length: cover art holds this
+    // many frames and the audio curves land on the same grid.
+    const double secs =
+        rate ? static_cast<double>(result->audio_frames) / rate : 0.0;
+    const uint32_t grid = std::max<uint32_t>(
+        1, static_cast<uint32_t>(secs * kStillFps) + 1);
 
     if (!art.empty()) {
         ImageRgba img;
@@ -575,14 +598,8 @@ bool import_audio_file(const std::filesystem::path& source,
         if (platform::decode_image_rgba(art.data(), art.size(), &img.width,
                                         &img.height, &img.pixels,
                                         &wic_error)) {
-            // Hold the art for the audio's length on the still grid.
-            const double secs =
-                rate ? static_cast<double>(result->audio_frames) / rate : 0.0;
-            const uint32_t hold = std::max<uint32_t>(
-                1, static_cast<uint32_t>(secs * kStillFps) + 1);
             ImportResult art_result;
-            if (write_still_bundle(img, sidecars_for(dest_dir, source),
-                                   options, hold, &art_result)) {
+            if (write_still_bundle(img, sc, options, grid, &art_result)) {
                 result->mez_path = art_result.mez_path;
                 result->proxy_path = art_result.proxy_path;
                 result->thumbs_path = art_result.thumbs_path;
@@ -603,10 +620,6 @@ bool import_audio_file(const std::filesystem::path& source,
     // the script analysis ops work on them. With cover art the still
     // bundle wrote brightness/motion/cut at the same grid; merge in.
     {
-        const double secs =
-            rate ? static_cast<double>(result->audio_frames) / rate : 0.0;
-        const uint32_t grid = std::max<uint32_t>(
-            1, static_cast<uint32_t>(secs * kStillFps) + 1);
         mod::AnalysisData adata;
         if (!result->analysis_path.empty())
             mod::load_analysis(result->analysis_path, &adata);
@@ -618,10 +631,8 @@ bool import_audio_file(const std::filesystem::path& source,
         if (progress && progress->cancel.load()) return false;
         adata.fps = kStillFps;
         adata.frame_count = grid;
-        const std::filesystem::path ap =
-            sidecars_for(dest_dir, source).analysis;
-        if (mod::write_analysis(ap, adata))
-            result->analysis_path = ap;
+        if (mod::write_analysis(sc.analysis, adata))
+            result->analysis_path = sc.analysis;
         else
             log_warn("import: audio analysis write failed (non-fatal)");
     }
@@ -643,34 +654,31 @@ bool extract_audio_pcm(const std::filesystem::path& source,
         if (error) *error = std::move(what);
         return false;
     };
-    std::wstring ext = source.extension().native();
-    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+    auto write_pcm = [&](const std::vector<int16_t>& samples,
+                         uint32_t channels, uint32_t rate) {
+        PcmWriter writer;
+        if (!writer.open(dest_pcm, channels, rate))
+            return fail("cannot create " + path_to_u8(dest_pcm));
+        if (!writer.append(samples.data(), samples.size()))
+            return fail("pcm write failed");
+        writer.finish();
+        return true;
+    };
+    const std::wstring ext = lower_ext(source);
 
     if (ext == L".wav") {
         WavData wav;
         std::string wav_error;
         if (!read_wav(source, &wav, &wav_error))
             return fail("wav: " + wav_error);
-        PcmWriter writer;
-        if (!writer.open(dest_pcm, wav.channels, wav.sample_rate))
-            return fail("cannot create " + path_to_u8(dest_pcm));
-        if (!writer.append(wav.samples.data(), wav.samples.size()))
-            return fail("pcm write failed");
-        writer.finish();
-        return true;
+        return write_pcm(wav.samples, wav.channels, wav.sample_rate);
     }
     if (ext == L".mp3") {
         Mp3Data mp3;
         std::string mp3_error;
         if (!read_mp3(source, &mp3, &mp3_error))
             return fail("mp3: " + mp3_error);
-        PcmWriter writer;
-        if (!writer.open(dest_pcm, mp3.channels, mp3.sample_rate))
-            return fail("cannot create " + path_to_u8(dest_pcm));
-        if (!writer.append(mp3.samples.data(), mp3.samples.size()))
-            return fail("pcm write failed");
-        writer.finish();
-        return true;
+        return write_pcm(mp3.samples, mp3.channels, mp3.sample_rate);
     }
 
     platform::MfSession session;
@@ -680,9 +688,7 @@ bool extract_audio_pcm(const std::filesystem::path& source,
     if (!file.open(source, &demux_error))
         return fail("demux: " + demux_error);
     const TrackInfo* audio = file.movie().first_audio();
-    if (!audio || std::string(audio->fourcc) != "mp4a" ||
-        audio->samples.empty() || audio->audio_specific_config.empty())
-        return fail("no AAC audio track");
+    if (!aac_track(audio)) return fail("no AAC audio track");
     ImportResult scratch;
     if (!import_audio(file, *audio, dest_pcm, &scratch))
         return fail(scratch.error);
@@ -711,14 +717,11 @@ ImportResult consolidate_video(const std::filesystem::path& source,
         result.error = "no H.264 video track";
         return result;
     }
-    const uint32_t w = video->width;
-    const uint32_t h = video->height;
-    const uint32_t frames = static_cast<uint32_t>(video->samples.size());
+    stamp_video_facts(*video, &result);
+    const uint32_t w = result.width;
+    const uint32_t h = result.height;
+    const uint32_t frames = result.frame_count;
     const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
-    result.width = w;
-    result.height = h;
-    result.frame_count = frames;
-    result.fps = static_cast<double>(video->timescale) / frame_duration;
     if (progress) {
         progress->ready.store(true);
         progress->frames_total.store(frames);
@@ -856,11 +859,7 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
         result.error = "no H.264 video track";
         return result;
     }
-    result.width = video->width;
-    result.height = video->height;
-    result.frame_count = static_cast<uint32_t>(video->samples.size());
-    const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
-    result.fps = static_cast<double>(video->timescale) / frame_duration;
+    stamp_video_facts(*video, &result);
 
     // The fast-stage sidecar carries the audio curves; the pass rewrites
     // it with the video curves merged, exactly as first ingest would
@@ -888,8 +887,7 @@ ImportResult import_media(const std::filesystem::path& source,
 
     // Still images (PNG/TGA) skip Media Foundation entirely — the in-repo
     // decoders and the mezzanine writer are all it takes.
-    std::wstring ext = source.extension().native();
-    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+    const std::wstring ext = lower_ext(source);
     if (ext == L".png" || ext == L".tga") {
         import_still(source, dest_dir, options, progress, &result);
         return result;
@@ -933,18 +931,13 @@ ImportResult import_media(const std::filesystem::path& source,
     // place - no transcode); the AAC decode into the PCM sidecar and the
     // audio curves are the only real work. `ready` flips here and the
     // app binds/places the asset while the video pass below still runs.
-    result.width = video->width;
-    result.height = video->height;
-    result.frame_count = static_cast<uint32_t>(video->samples.size());
-    const uint32_t frame_duration = std::max(1u, video->samples[0].duration);
-    result.fps = static_cast<double>(video->timescale) / frame_duration;
+    stamp_video_facts(*video, &result);
 
     const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
     const TrackInfo* audio = file.movie().first_audio();
-    if (audio && std::string(audio->fourcc) == "mp4a" &&
-        !audio->samples.empty() && !audio->audio_specific_config.empty()) {
-        if (!import_audio(file, *audio, sc.pcm, &result)) return result;
-    }
+    if (aac_track(audio) &&
+        !import_audio(file, *audio, sc.pcm, &result))
+        return result;
 
     mod::AnalysisData analysis;
     analysis.fps = result.fps;

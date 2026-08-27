@@ -167,48 +167,40 @@ bool BmffMuxer::finish() {
     // so one build pass + one patch pass suffices.
     auto build_stbl_tables = [](const Track& track, bool with_ctts,
                                 bool with_stss) {
-        Bytes stbl;
-
-        Bytes stts;
-        {
-            // Run-length compress durations.
-            std::vector<std::pair<uint32_t, uint32_t>> runs;
+        // Run-length compress a per-sample field into count/value pairs
+        // (stts durations and ctts offsets share the coding).
+        auto rle_pairs = [&track](auto field) {
+            std::vector<std::pair<uint32_t, int64_t>> runs;
             for (const Sample& s : track.samples) {
-                if (!runs.empty() && runs.back().second == s.duration)
+                const int64_t v = field(s);
+                if (!runs.empty() && runs.back().second == v)
                     ++runs.back().first;
                 else
-                    runs.push_back({1, s.duration});
+                    runs.push_back({1, v});
             }
             Bytes p;
             p.u32(static_cast<uint32_t>(runs.size()));
-            for (auto [n, d] : runs) {
+            for (auto [n, v] : runs) {
                 p.u32(n);
-                p.u32(d);
+                p.u32(static_cast<uint32_t>(v));
             }
-            stts = full_box("stts", 0, 0, p);
-        }
-        stbl.append(stts);
+            return p;
+        };
+        Bytes stbl;
+
+        stbl.append(full_box("stts", 0, 0, rle_pairs([](const Sample& s) {
+            return static_cast<int64_t>(s.duration);
+        })));
 
         if (with_ctts) {
             bool any = false;
             for (const Sample& s : track.samples)
                 if (s.cts_offset != 0) any = true;
-            if (any) {
-                std::vector<std::pair<uint32_t, int32_t>> runs;
-                for (const Sample& s : track.samples) {
-                    if (!runs.empty() && runs.back().second == s.cts_offset)
-                        ++runs.back().first;
-                    else
-                        runs.push_back({1, s.cts_offset});
-                }
-                Bytes p;
-                p.u32(static_cast<uint32_t>(runs.size()));
-                for (auto [n, off] : runs) {
-                    p.u32(n);
-                    p.u32(static_cast<uint32_t>(off));
-                }
-                stbl.append(full_box("ctts", 1, 0, p));
-            }
+            if (any)
+                stbl.append(
+                    full_box("ctts", 1, 0, rle_pairs([](const Sample& s) {
+                        return static_cast<int64_t>(s.cts_offset);
+                    })));
         }
 
         {
@@ -234,14 +226,11 @@ bool BmffMuxer::finish() {
             stbl.append(full_box("stco", 0, 0, p));
         }
         if (with_stss) {
-            bool all_key = true;
+            uint32_t count = 0;
             for (const Sample& s : track.samples)
-                if (!s.keyframe) all_key = false;
-            if (!all_key) {
+                if (s.keyframe) ++count;
+            if (count < track.samples.size()) {
                 Bytes p;
-                uint32_t count = 0;
-                for (const Sample& s : track.samples)
-                    if (s.keyframe) ++count;
                 p.u32(count);
                 for (uint32_t i = 0; i < track.samples.size(); ++i)
                     if (track.samples[i].keyframe) p.u32(i + 1);

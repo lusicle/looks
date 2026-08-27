@@ -120,8 +120,7 @@ void parse_stsd(Reader& r, TrackInfo* track) {
         const uint16_t version = e.u16();
         e.skip(2 + 4);
         track->channels = e.u16();
-        track->sample_size_bits = e.u16();
-        e.skip(2 + 2);
+        e.skip(2 + 2 + 2);
         track->sample_rate = e.u32() >> 16;
         if (version == 1) e.skip(16);
         else if (version == 2) e.skip(36);

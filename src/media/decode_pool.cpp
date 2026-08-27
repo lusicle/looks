@@ -82,11 +82,6 @@ std::shared_ptr<const codec::DecodedFrame> nv12_to_decoded(
     return out;
 }
 
-bool read_sample_at(FILE* file, const FrameIndex::Sample& s,
-                    std::vector<uint8_t>& out) {
-    return BmffFile::read_at(file, s.offset, s.size, out);
-}
-
 // The scrub epoch the CURRENT worker thread's job was queued under:
 // an advisory roll bails when a drag started after it was queued.
 thread_local uint64_t t_job_epoch = 0;
@@ -104,15 +99,16 @@ uint64_t bits_of(double v) {
     return b;
 }
 
+uint64_t mix64(uint64_t k, uint64_t v) {
+    return k ^ (v + 0x9E3779B97F4A7C15ull + (k << 6) + (k >> 2));
+}
+
 uint64_t mapping_hash(const doc::MediaInstance& c) {
     uint64_t k = c.asset * 0x9E3779B97F4A7C15ull + 1;
-    auto mix = [&k](uint64_t v) {
-        k ^= v + 0x9E3779B97F4A7C15ull + (k << 6) + (k >> 2);
-    };
-    mix(bits_of(c.source_in - c.t_in * c.speed));
-    mix(bits_of(c.speed));
-    mix(bits_of(c.rate));
-    mix(static_cast<uint64_t>(c.shift));
+    k = mix64(k, bits_of(c.source_in - c.t_in * c.speed));
+    k = mix64(k, bits_of(c.speed));
+    k = mix64(k, bits_of(c.rate));
+    k = mix64(k, static_cast<uint64_t>(c.shift));
     return k;
 }
 
@@ -212,10 +208,8 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
         std::unordered_map<uint64_t, std::vector<uint64_t>> key_maps;
         for (const doc::MediaInstance& c : sources_) {
             uint64_t sched = mapping_hash(c);
-            sched ^= bits_of(c.t_in) + 0x9E3779B97F4A7C15ull +
-                     (sched << 6) + (sched >> 2);
-            sched ^= bits_of(c.t_out) + 0x9E3779B97F4A7C15ull +
-                     (sched << 6) + (sched >> 2);
+            sched = mix64(sched, bits_of(c.t_in));
+            sched = mix64(sched, bits_of(c.t_out));
             key_maps[c.key].push_back(sched);
         }
         std::unordered_map<uint64_t, uint64_t> group_min;
@@ -232,25 +226,18 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
             if (!fresh && e.first < g->second) g->second = e.first;
         }
         for (const auto& e : key_fp) canonical_[e.first] = group_min[e.second];
-        std::vector<uint64_t> distinct;
-        for (const auto& e : canonical_) {
-            bool have = false;
-            for (uint64_t v : distinct)
-                if (v == e.second) have = true;
-            if (!have) distinct.push_back(e.second);
-        }
         log_info("decode pool[%s]: %zu sources, %zu keys, %zu streams",
-                 name_, sources_.size(), canonical_.size(), distinct.size());
+                 name_, sources_.size(), canonical_.size(), group_min.size());
     }
     std::lock_guard<std::mutex> lock(map_m_);
+    std::unordered_map<uint64_t, const doc::MediaInstance*> by_stream;
+    for (const doc::MediaInstance& c : sources_)
+        by_stream[alias_of(c.key)] = &c;
     for (auto it = streams_.begin(); it != streams_.end();) {
-        const doc::MediaInstance* src = nullptr;
-        for (const doc::MediaInstance& c : sources_) {
-            auto ca = canonical_.find(c.key);
-            if (ca != canonical_.end() && ca->second == it->first) src = &c;
-        }
-        const AssetBundle* b =
-            src ? find_bundle(bundles_, src->asset) : nullptr;
+        const auto sit = by_stream.find(it->first);
+        const AssetBundle* b = sit != by_stream.end()
+                                   ? find_bundle(bundles_, sit->second->asset)
+                                   : nullptr;
         // A placement that moved to another asset - or vanished - must not
         // keep serving the old file's pixels.
         if (!b || bundle_video(*b) != it->second->path)
@@ -288,12 +275,7 @@ std::vector<DecodePool::Request> DecodePool::plan(uint32_t root_frame) const {
                 replaced = true;
                 break;
             }
-        if (!replaced) {
-            const auto ca = canonical_.find(c.key);
-            out.push_back({c.key,
-                           ca != canonical_.end() ? ca->second : c.key, i,
-                           idx});
-        }
+        if (!replaced) out.push_back({c.key, alias_of(c.key), i, idx});
     }
     return out;
 }
@@ -397,8 +379,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::ring_insert(
     std::shared_ptr<const codec::DecodedFrame> decoded, size_t depth) {
     std::lock_guard<std::mutex> lock(s.m);
     // A parallel slot/session may have landed the same frame; keep one.
-    for (const auto& e : s.ring)
-        if (e.first == frame) return e.second;
+    if (auto kept = s.ringed(frame)) return kept;
     s.ring.emplace_back(frame, decoded);
     // Evict against the DIRECTION OF TRAVEL. The live window ahead of
     // the playhead — in whichever direction it moves — is untouchable:
@@ -469,8 +450,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch(
     Stream& s, uint32_t frame, bool* was_miss, bool scrub, bool preroll) {
     {
         std::lock_guard<std::mutex> lock(s.m);
-        for (const auto& e : s.ring)
-            if (e.first == frame) return e.second;
+        if (auto hit = s.ringed(frame)) return hit;
     }
     if (was_miss) *was_miss = true;
     // was_miss == nullptr is the prewarm path: advisory work that must
@@ -502,8 +482,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_mez(
     }
     {
         std::lock_guard<std::mutex> lock(s.m);
-        for (const auto& e : s.ring)
-            if (e.first == frame) return e.second;   // landed while waiting
+        if (auto hit = s.ringed(frame)) return hit;   // landed while waiting
     }
     if (!slot->opened) {
         slot->opened = true;
@@ -669,12 +648,8 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
             // position-only guard then blocked the real entry preroll
             // from ever claiming a session - the cut went cold with a
             // "supplier" pointing at nothing.
-            if (guard_marks[i] != 0xFFFFFFFFu)
-                for (const auto& e : s.ring)
-                    if (e.first == guard_marks[i]) {
-                        mark_ringed[i] = true;
-                        break;
-                    }
+            if (guard_marks[i] != 0xFFFFFFFFu && s.ringed(guard_marks[i]))
+                mark_ringed[i] = true;
         }
     }
     // What a session's position is guarding: -1 = nothing, 0 = the live
@@ -754,12 +729,8 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
                         std::unique_lock<std::mutex> rlock(s.m);
                         s.cv.wait_for(rlock, std::chrono::milliseconds(25),
                                       [&] {
-                                          for (const auto& e : s.ring)
-                                              if (e.first == target) {
-                                                  hit = e.second;
-                                                  return true;
-                                              }
-                                          return false;
+                                          hit = s.ringed(target);
+                                          return hit != nullptr;
                                       });
                     }
                     if (hit) return hit;
@@ -863,8 +834,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
     }
     {
         std::lock_guard<std::mutex> lock(s.m);
-        for (const auto& e : s.ring)
-            if (e.first == target) return e.second;   // landed while waiting
+        if (auto hit = s.ringed(target)) return hit;   // landed while waiting
     }
 
     if (!sess->created) {
@@ -938,8 +908,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
         serve = floor_present + kScrubSnapRoll;
         approximated_ = true;
         std::lock_guard<std::mutex> lock(s.m);
-        for (const auto& e : s.ring)
-            if (e.first == serve) return e.second;
+        if (auto hit = s.ringed(serve)) return hit;
     }
     const uint32_t serve_decode = idx.present_to_decode[serve];
 
@@ -1009,8 +978,8 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
             if (sm.keyframe && sess->next_decode > key &&
                 sess->next_decode > serve_decode && !hold_was_dry) {
                 held = true;
-            } else if (!read_sample_at(static_cast<FILE*>(sess->file), sm,
-                                       sample_bytes) ||
+            } else if (!BmffFile::read_at(sess->file, sm.offset, sm.size,
+                                          sample_bytes) ||
                        !sess->dec.feed(sample_bytes.data(),
                                        sample_bytes.size(), sm.pts_100ns,
                                        sm.duration_100ns, sm.keyframe)) {
@@ -1115,23 +1084,23 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         : static_cast<uint32_t>(
               std::clamp(kFrameBudget / distinct, size_t{2}, size_t{40}));
 
+    // Same-alias requests read the same media frame: one fetch serves
+    // them all under their own keys.
+    struct Served {
+        uint64_t alias;
+        uint32_t frame;
+        std::shared_ptr<const codec::DecodedFrame> pixels;
+    };
+    std::vector<Served> served;
     for (const Request& req : want) {
-        // Same-alias requests read the same media frame: one fetch
-        // serves them all under their own keys.
-        std::shared_ptr<const codec::DecodedFrame> served;
-        for (const SourceFrame& sf : frames_)
-            if (sf.key != req.key) {
-                for (const Request& prior : want) {
-                    if (prior.key != sf.key) continue;
-                    if (prior.alias == req.alias &&
-                        prior.frame == req.frame)
-                        served = sf.frame;
-                    break;
-                }
-                if (served) break;
+        const Served* prior = nullptr;
+        for (const Served& sv : served)
+            if (sv.alias == req.alias && sv.frame == req.frame) {
+                prior = &sv;
+                break;
             }
-        if (served) {
-            frames_.push_back({req.key, std::move(served)});
+        if (prior) {
+            frames_.push_back({req.key, prior->pixels});
             continue;
         }
         Stream* s = stream_for(req);
@@ -1148,7 +1117,10 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         bool miss = false;
         auto frame = fetch(*s, req.frame, &miss, scrub);
         if (miss) ++misses_;
-        if (frame) frames_.push_back({req.key, std::move(frame)});
+        if (frame) {
+            served.push_back({req.alias, req.frame, frame});
+            frames_.push_back({req.key, std::move(frame)});
+        }
     }
 
     // PREWARM. What plays later is a closed form, so the frames a cut or a
@@ -1165,6 +1137,11 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
     // saturating the sessions behind it are what the drag then waits on
     // (the gen bump below still cancels whatever an earlier plan queued).
     std::vector<Job> queued;
+    auto queued_has = [&queued](uint64_t key, uint32_t frame) {
+        for (const Job& q : queued)
+            if (q.key == key && q.frame == frame) return true;
+        return false;
+    };
     // Entry protection collected FIRST, written ONCE per stream at the
     // end: resetting next_entry then re-marking it left a gap between
     // the two writes, and worker ring-inserts landing inside it evicted
@@ -1226,8 +1203,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         const double src = doc::media_asset_frame(c, at);
         Request req;
         req.key = c.key;
-        const auto ca = canonical_.find(c.key);
-        req.alias = ca != canonical_.end() ? ca->second : c.key;
+        req.alias = alias_of(c.key);
         req.source = i;
         req.frame = static_cast<uint32_t>(std::clamp(
             src, 0.0, static_cast<double>(b->frames - 1)));
@@ -1253,13 +1229,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
                 playing_now = true;
                 break;
             }
-        bool dup = false;
-        for (const Job& q : queued)
-            if (q.key == req.alias && q.frame == req.frame) {
-                dup = true;
-                break;
-            }
-        if (dup) continue;
+        if (queued_has(req.alias, req.frame)) continue;
         {
             std::lock_guard<std::mutex> lock(map_m_);
             // The cap guards OPEN files and live decoders; idle-closed
@@ -1317,13 +1287,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
             // and re-rolling them ping-pongs the sessions against the
             // backfill below.
             if (ps->want < ps->last_want) continue;
-            bool ringed = false;
-            for (const auto& e : ps->ring)
-                if (e.first == req.frame) {
-                    ringed = true;
-                    break;
-                }
-            if (ringed) continue;
+            if (ps->ringed(req.frame)) continue;
         }
         // The ENTRY rolls as its own job ahead of the frontier: an fps
         // conform can land the entry a frame under source_in, in the
@@ -1334,19 +1298,9 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
             bool entry_ringed = false;
             {
                 std::lock_guard<std::mutex> lock(ps->m);
-                for (const auto& e : ps->ring)
-                    if (e.first == entry) {
-                        entry_ringed = true;
-                        break;
-                    }
+                entry_ringed = ps->ringed(entry) != nullptr;
             }
-            bool entry_dup = false;
-            for (const Job& q : queued)
-                if (q.key == req.alias && q.frame == entry) {
-                    entry_dup = true;
-                    break;
-                }
-            if (!entry_ringed && !entry_dup)
+            if (!entry_ringed && !queued_has(req.alias, entry))
                 queued.push_back(
                     {req.alias, entry, 0, true,
                      static_cast<uint32_t>(first + horizons[h].bias)});
@@ -1376,20 +1330,11 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         {
             std::lock_guard<std::mutex> lock(ps->m);
             backward = ps->want < ps->last_want;
-            for (const auto& e : ps->ring)
-                if (e.first == back) {
-                    ringed = true;
-                    break;
-                }
+            ringed = ps->ringed(back) != nullptr;
         }
         if (!backward || ringed) continue;
-        bool dup = false;
-        for (const Job& q : queued)
-            if (q.key == req.alias && q.frame == back) {
-                dup = true;
-                break;
-            }
-        if (!dup) queued.push_back({req.alias, back, 0, false, root_frame});
+        if (!queued_has(req.alias, back))
+            queued.push_back({req.alias, back, 0, false, root_frame});
     }
     } else {
         // SCRUBBING: one CHASER per stream toward the drag target, and
@@ -1410,11 +1355,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
             bool ringed = false;
             {
                 std::lock_guard<std::mutex> lock(ps->m);
-                for (const auto& e : ps->ring)
-                    if (e.first == req.frame) {
-                        ringed = true;
-                        break;
-                    }
+                ringed = ps->ringed(req.frame) != nullptr;
             }
             if (ringed) continue;
             queued.push_back({req.alias, req.frame, 0, false, root_frame});

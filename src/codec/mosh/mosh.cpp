@@ -64,9 +64,8 @@ void MoshCodec::encode_decode_intra(const FrameView& in, int quality,
     // Entropy-free wire: pixels identical to encode + decode at this
     // quality, no bytes ever written. (in may alias out — the DCT pass
     // consumes it fully before recon writes.)
-    intra_dct(in, intra_scratch_, /*parallel=*/true);
-    intra_recon(intra_scratch_, std::clamp(quality, 1, 100), out,
-                /*parallel=*/true);
+    intra_dct(in, intra_scratch_);
+    intra_recon(intra_scratch_, std::clamp(quality, 1, 100), out);
 }
 
 void MoshCodec::process(const FrameView& in, uint32_t frame_index,
@@ -89,12 +88,12 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         // stream sizes per quality step without writing bits, and the
         // reconstruction skips entropy entirely — nothing downstream reads
         // the bytes, and entropy is lossless, so the pixels are identical.
-        intra_dct(in, intra_scratch_, /*parallel=*/true);
+        intra_dct(in, intra_scratch_);
         while (params.bitrate_budget > 0 && quality > 1 &&
                intra_entropy_bytes(intra_scratch_, quality) >
                    params.bitrate_budget)
             quality = std::max(1, quality - 15);
-        intra_recon(intra_scratch_, quality, clean_state_, /*parallel=*/true);
+        intra_recon(intra_scratch_, quality, clean_state_);
         // Generation loss: run the wire again N times. The integer pipeline
         // is idempotent at a fixed quality, so alternate the quantizer a
         // notch between passes — like every real dub chain, no two

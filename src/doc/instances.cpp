@@ -68,10 +68,6 @@ void walk(const Document& doc, const Cursor& cur, bool audio,
 // source-first order; every other node passes audio through on its
 // port-0 input. The chain ends at a layer: media is the voice, a nested
 // ref recurses, a generator is silence. Visibility never gates audio.
-std::vector<NodeLink> effective_links(const Look& look) {
-    return look.links.empty() ? synthesize_links(look) : look.links;
-}
-
 uint64_t link_into(const std::vector<NodeLink>& links, uint64_t to,
                    uint32_t port) {
     for (const NodeLink& l : links)
@@ -126,24 +122,17 @@ struct Voice {
     int64_t audio_off = 0;         // Offset shims on the voice's source
 };
 
-// The Output's In-wire fan-in: the BOTTOM chain wins, and bottom is
-// the FIRST port-0 link - stacking order IS the link-vector order, and
-// splices/rewires replace links in place, so the voice never moves
-// under a gesture. The compiler stacks the composite by the same rule.
-uint64_t output_feed(const Look& look, const std::vector<NodeLink>& links) {
-    (void)look;
-    for (const NodeLink& l : links)
-        if (l.to == 0 && l.to_port == 0) return l.from;
-    return 0;
-}
-
 Voice resolve_voice(const Look& look) {
     Voice v;
-    const std::vector<NodeLink> links = effective_links(look);
+    std::vector<NodeLink> synth;
+    const std::vector<NodeLink>& links = effective_links(look, synth);
     std::vector<AudioOp> rev;   // collected output-first
-    walk_chain(look, links,
-               look.audio_split ? link_into(links, 0, 1u)
-                                : output_feed(look, links),
+    // Combined voice = the Output's In-wire fan-in, where the BOTTOM
+    // chain wins and bottom is the FIRST port-0 link - stacking order
+    // IS the link-vector order, and splices/rewires replace links in
+    // place, so the voice never moves under a gesture. The compiler
+    // stacks the composite by the same rule.
+    walk_chain(look, links, link_into(links, 0, look.audio_split ? 1u : 0u),
                &v.root, rev, &v.audio_off);
     v.ops.assign(rev.rbegin(), rev.rend());
     return v;
@@ -265,7 +254,8 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
     // muted by a solo elsewhere in its layer, group live.
     std::vector<std::pair<uint64_t, int64_t>> vshifts;
     {
-        const std::vector<NodeLink> links = effective_links(look);
+        std::vector<NodeLink> synth;
+        const std::vector<NodeLink>& links = effective_links(look, synth);
         for (const Layer& holder : look.layers) {
             if (!holder.visible) continue;
             bool any_solo = false;
@@ -402,7 +392,8 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
     uint64_t start = node;
     for (int depth = 0; depth < kMaxLookDepth; ++depth) {
         if (!start) return {};
-        const std::vector<NodeLink> links = effective_links(*cur);
+        std::vector<NodeLink> synth;
+        const std::vector<NodeLink>& links = effective_links(*cur, synth);
         const Layer* root = nullptr;
         walk_chain(*cur, links, start, &root, rev, &off);
         if (!root) return {};
@@ -429,7 +420,8 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
         if (!layer_is_nested(*root) || !root->target) return {};
         const Look* t = doc.find_look(root->target);
         if (!t) return {};   // sequence ref: no single voice
-        const std::vector<NodeLink> tlinks = effective_links(*t);
+        std::vector<NodeLink> tsynth;
+        const std::vector<NodeLink>& tlinks = effective_links(*t, tsynth);
         start = link_into(tlinks, 0, t->audio_split ? 1u : 0u);
         cur = t;
     }

@@ -36,7 +36,6 @@ struct Constraints {
     }
     static Constraints loose(Vec2 size) { return {0, size.x, 0, size.y}; }
     bool bounded_w() const { return max_w < kUnboundedAxis * 0.5f; }
-    bool bounded_h() const { return max_h < kUnboundedAxis * 0.5f; }
 };
 
 enum class SizeMode : uint8_t { Auto, Fixed, Fill, Percent };
@@ -48,7 +47,6 @@ struct SizeSpec {
     static SizeSpec fixed(float px) { return {SizeMode::Fixed, px}; }
     static SizeSpec fill(float weight = 1.0f) { return {SizeMode::Fill, weight}; }
     static SizeSpec percent(float fraction) { return {SizeMode::Percent, fraction}; }
-    static SizeSpec auto_size() { return {}; }
 };
 
 enum class NodeKind : uint8_t {

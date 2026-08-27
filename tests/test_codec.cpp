@@ -173,7 +173,7 @@ TEST(codec_two_phase_intra_matches) {
         std::vector<uint8_t> one_shot, two_phase;
         encode_frame(f.view(), q, one_shot);
         IntraDct dct;
-        intra_dct(f.view(), dct, /*parallel=*/true);
+        intra_dct(f.view(), dct);
         intra_entropy(dct, q, two_phase);
         CHECK(one_shot == two_phase);
     }
@@ -186,14 +186,14 @@ TEST(codec_intra_recon_matches_decode) {
     const DecodedFrame f = make_test_frame(70, 50, 4);
     for (const int q : {5, 35, 90}) {
         IntraDct dct;
-        intra_dct(f.view(), dct, /*parallel=*/true);
+        intra_dct(f.view(), dct);
         std::vector<uint8_t> encoded;
         intra_entropy(dct, q, encoded);
         DecodedFrame via_stream;
         CHECK(decode_frame(encoded.data(), encoded.size(), 70, 50,
                            via_stream, /*parallel=*/true));
         DecodedFrame direct;
-        intra_recon(dct, q, direct, /*parallel=*/true);
+        intra_recon(dct, q, direct);
         CHECK(direct.y == via_stream.y);
         CHECK(direct.u == via_stream.u);
         CHECK(direct.v == via_stream.v);
@@ -206,7 +206,7 @@ TEST(codec_intra_entropy_bytes_exact) {
     // would change which quality ships.
     const DecodedFrame f = make_test_frame(70, 50, 8);
     IntraDct dct;
-    intra_dct(f.view(), dct, /*parallel=*/true);
+    intra_dct(f.view(), dct);
     for (const int q : {1, 12, 37, 60, 85, 100}) {
         std::vector<uint8_t> encoded;
         intra_entropy(dct, q, encoded);

@@ -929,6 +929,13 @@ inline const ValueNode* find_value_node(const Look& look, uint64_t node_id) {
     return find_value_node(const_cast<Look&>(look), node_id);
 }
 
+// The canvas frame behind an id. Null when the look holds no such frame.
+inline CanvasFrame* find_frame(Look& look, uint64_t frame_id) {
+    for (CanvasFrame& f : look.frames)
+        if (f.id == frame_id) return &f;
+    return nullptr;
+}
+
 // True when value node `from` already reaches `to` through its helper
 // inputs - the value graph's no-cycle guard; check before wiring `to`
 // into one of `from`'s inputs.
@@ -958,7 +965,34 @@ inline const Placement* find_placement(const Sequence& seq,
     return find_placement(const_cast<Sequence&>(seq), placement_id);
 }
 
+// The placement's container: which list holds it and where - a video
+// lane or an audio track.
+struct PlacementSlot {
+    std::vector<Placement>* list = nullptr;
+    uint64_t track_id = 0;
+    bool audio = false;
+    size_t index = 0;
+};
+inline bool find_placement_slot(Sequence& seq, uint64_t placement_id,
+                                PlacementSlot* out) {
+    for (SeqTrack& t : seq.tracks)
+        for (size_t i = 0; i < t.placements.size(); ++i)
+            if (t.placements[i].id == placement_id) {
+                *out = {&t.placements, t.id, false, i};
+                return true;
+            }
+    for (AudioTrack& t : seq.audio)
+        for (size_t i = 0; i < t.placements.size(); ++i)
+            if (t.placements[i].id == placement_id) {
+                *out = {&t.placements, t.id, true, i};
+                return true;
+            }
+    return false;
+}
+
 // The chain topology as links: source -> effects in stack order -> Output.
+// Consumers never read look.links directly for wiring: effective_links
+// below is the one definition of the empty-table fallback.
 inline std::vector<NodeLink> synthesize_links(const Look& look) {
     std::vector<NodeLink> links;
     for (const Layer& layer : look.layers) {
@@ -970,6 +1004,16 @@ inline std::vector<NodeLink> synthesize_links(const Look& look) {
         links.push_back({prev, 0, 0});
     }
     return links;
+}
+
+// The look's LIVE link table: the materialized links, or the
+// stack-order synthesis built into `scratch` (the returned reference
+// then points at it - no copy when the table is materialized).
+inline const std::vector<NodeLink>& effective_links(
+    const Look& look, std::vector<NodeLink>& scratch) {
+    if (!look.links.empty()) return look.links;
+    scratch = synthesize_links(look);
+    return scratch;
 }
 
 // Materializes the synthesized links onto a look (first link edit,

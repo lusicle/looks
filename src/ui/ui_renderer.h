@@ -94,6 +94,28 @@ private:
                          VkBufferUsageFlags usage);
     void destroy_buffer(GeometryBuffer& buf);
 
+    // Error strings for one upload, kept per caller. image_fail is a
+    // log_error format that receives width and height as arguments; the
+    // rest are vk_check labels.
+    struct UploadLabels {
+        const char* image_fail;
+        const char* pool;
+        const char* cmd;
+        const char* submit;
+        const char* view;
+    };
+    // One-shot staging upload shared by register_font/register_image:
+    // creates tex.image and tex.view at tex.width x tex.height in format,
+    // copies size bytes of pixels via a transient graphics-queue submit
+    // (waits idle), and leaves the image SHADER_READ_ONLY. On failure
+    // nothing survives; the caller drops tex.
+    bool upload_texture(UiTexture& tex, VkFormat format, const uint8_t* pixels,
+                        size_t size, const UploadLabels& labels);
+    // Allocates the texture descriptor set, binds tex.view with sampler,
+    // stores the texture, and returns the stored pointer.
+    UiTexture* commit_texture(std::unique_ptr<UiTexture> tex, VkSampler sampler,
+                              const char* set_label);
+
     gfx::Device& device_;
     VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;

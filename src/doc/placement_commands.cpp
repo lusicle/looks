@@ -10,6 +10,20 @@ namespace looks::doc {
 
 namespace {
 
+// The placement list of one track, video lane or audio track. Null
+// when the sequence has no such track.
+std::vector<Placement>* track_placements(Sequence& seq, uint64_t track_id,
+                                         bool audio) {
+    if (audio) {
+        for (AudioTrack& t : seq.audio)
+            if (t.id == track_id) return &t.placements;
+    } else {
+        for (SeqTrack& t : seq.tracks)
+            if (t.id == track_id) return &t.placements;
+    }
+    return nullptr;
+}
+
 // Every placement in the sequence sharing `link` (nonzero), the named one
 // included. The group is how one drop's picture and sound stay lockstep.
 std::vector<Placement*> group_members(Sequence& seq, uint64_t link) {
@@ -166,14 +180,8 @@ public:
         // lands exactly where it was.
         for (size_t k = removed_.size(); k-- > 0;) {
             const Slot& s = removed_[k];
-            std::vector<Placement>* list = nullptr;
-            if (s.audio) {
-                for (AudioTrack& t : seq.audio)
-                    if (t.id == s.container) list = &t.placements;
-            } else {
-                for (SeqTrack& t : seq.tracks)
-                    if (t.id == s.container) list = &t.placements;
-            }
+            std::vector<Placement>* list =
+                track_placements(seq, s.container, s.audio);
             if (!list) continue;
             list->insert(
                 list->begin() +
@@ -353,31 +361,6 @@ private:
     bool old_lock_ = false;
 };
 
-// The placement's container: which list holds it, and where. One lookup
-// shared by the vertical move and the overwrite dispatch.
-struct Container {
-    std::vector<Placement>* list = nullptr;
-    uint64_t track_id = 0;
-    bool audio = false;
-    size_t index = 0;
-};
-
-bool find_container(Sequence& seq, uint64_t placement_id, Container* out) {
-    for (SeqTrack& t : seq.tracks)
-        for (size_t i = 0; i < t.placements.size(); ++i)
-            if (t.placements[i].id == placement_id) {
-                *out = {&t.placements, t.id, false, i};
-                return true;
-            }
-    for (AudioTrack& t : seq.audio)
-        for (size_t i = 0; i < t.placements.size(); ++i)
-            if (t.placements[i].id == placement_id) {
-                *out = {&t.placements, t.id, true, i};
-                return true;
-            }
-    return false;
-}
-
 class MovePlacementCommand final : public SequenceCommand {
 public:
     MovePlacementCommand(uint64_t sequence, uint64_t placement_id,
@@ -388,16 +371,10 @@ public:
 
     void apply(Document& doc) override {
         Sequence& seq = sequence_of(doc);
-        Container from;
-        if (!find_container(seq, placement_id_, &from)) return;
-        std::vector<Placement>* dst = nullptr;
-        if (from.audio) {
-            for (AudioTrack& t : seq.audio)
-                if (t.id == to_track_) dst = &t.placements;
-        } else {
-            for (SeqTrack& t : seq.tracks)
-                if (t.id == to_track_) dst = &t.placements;
-        }
+        PlacementSlot from;
+        if (!find_placement_slot(seq, placement_id_, &from)) return;
+        std::vector<Placement>* dst =
+            track_placements(seq, to_track_, from.audio);
         if (!dst || dst == from.list) return;
         from_track_ = from.track_id;
         from_index_ = from.index;
@@ -411,18 +388,12 @@ public:
     void revert(Document& doc) override {
         if (!moved_) return;
         Sequence& seq = sequence_of(doc);
-        Container at;
-        if (!find_container(seq, placement_id_, &at)) return;
+        PlacementSlot at;
+        if (!find_placement_slot(seq, placement_id_, &at)) return;
         Placement p = (*at.list)[at.index];
         at.list->erase(at.list->begin() + static_cast<ptrdiff_t>(at.index));
-        std::vector<Placement>* src = nullptr;
-        if (at.audio) {
-            for (AudioTrack& t : seq.audio)
-                if (t.id == from_track_) src = &t.placements;
-        } else {
-            for (SeqTrack& t : seq.tracks)
-                if (t.id == from_track_) src = &t.placements;
-        }
+        std::vector<Placement>* src =
+            track_placements(seq, from_track_, at.audio);
         if (!src) return;
         src->insert(src->begin() + static_cast<ptrdiff_t>(
                         std::min(from_index_, src->size())),
@@ -463,14 +434,19 @@ private:
     size_t at_index_;
 };
 
+// Ordered track removal shared by video lanes and audio tracks: apply
+// records the index, revert re-inserts at it (clamped - the vector can
+// have shrunk between apply and revert).
+template <class Track, std::vector<Track> Sequence::*Member>
 class RemoveTrackCommand final : public SequenceCommand {
 public:
-    RemoveTrackCommand(uint64_t sequence, uint64_t track_id)
-        : SequenceCommand(sequence), track_id_(track_id) {}
-    std::string name() const override { return "Remove Lane"; }
+    RemoveTrackCommand(uint64_t sequence, uint64_t track_id,
+                       const char* label)
+        : SequenceCommand(sequence), track_id_(track_id), label_(label) {}
+    std::string name() const override { return label_; }
 
     void apply(Document& doc) override {
-        auto& tracks = sequence_of(doc).tracks;
+        auto& tracks = sequence_of(doc).*Member;
         for (size_t i = 0; i < tracks.size(); ++i)
             if (tracks[i].id == track_id_) {
                 index_ = i;
@@ -481,7 +457,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        auto& tracks = sequence_of(doc).tracks;
+        auto& tracks = sequence_of(doc).*Member;
         tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(
                           std::min(index_, tracks.size())),
                       removed_);
@@ -489,7 +465,8 @@ public:
 
 private:
     uint64_t track_id_;
-    SeqTrack removed_;
+    const char* label_;
+    Track removed_;
     size_t index_ = 0;
 };
 
@@ -512,36 +489,6 @@ public:
 
 private:
     AudioTrack track_;
-};
-
-class RemoveAudioTrackCommand final : public SequenceCommand {
-public:
-    RemoveAudioTrackCommand(uint64_t sequence, uint64_t track_id)
-        : SequenceCommand(sequence), track_id_(track_id) {}
-    std::string name() const override { return "Remove Audio Track"; }
-
-    void apply(Document& doc) override {
-        auto& audio = sequence_of(doc).audio;
-        for (size_t i = 0; i < audio.size(); ++i)
-            if (audio[i].id == track_id_) {
-                index_ = i;
-                removed_ = std::move(audio[i]);
-                audio.erase(audio.begin() + static_cast<ptrdiff_t>(i));
-                return;
-            }
-    }
-
-    void revert(Document& doc) override {
-        auto& audio = sequence_of(doc).audio;
-        audio.insert(audio.begin() + static_cast<ptrdiff_t>(
-                         std::min(index_, audio.size())),
-                     removed_);
-    }
-
-private:
-    uint64_t track_id_;
-    AudioTrack removed_;
-    size_t index_ = 0;
 };
 
 }  // namespace
@@ -609,19 +556,11 @@ std::unique_ptr<Command> move_placement_command(const Document& doc,
                                                 uint64_t to_track_id) {
     const Sequence* seq = doc.find_sequence(sequence);
     if (!seq) return nullptr;
-    Container from;
-    if (!find_container(const_cast<Sequence&>(*seq), placement_id, &from))
-        return nullptr;
+    Sequence& mut = const_cast<Sequence&>(*seq);
+    PlacementSlot from;
+    if (!find_placement_slot(mut, placement_id, &from)) return nullptr;
     if (from.track_id == to_track_id) return nullptr;
-    bool target_ok = false;
-    if (from.audio) {
-        for (const AudioTrack& t : seq->audio)
-            if (t.id == to_track_id) target_ok = true;
-    } else {
-        for (const SeqTrack& t : seq->tracks)
-            if (t.id == to_track_id) target_ok = true;
-    }
-    if (!target_ok) return nullptr;
+    if (!track_placements(mut, to_track_id, from.audio)) return nullptr;
     return std::make_unique<MovePlacementCommand>(sequence, placement_id,
                                                   to_track_id);
 }
@@ -655,7 +594,9 @@ std::unique_ptr<Command> remove_track_command(const Document& doc,
     for (const SeqTrack& t : seq->tracks)
         if (t.id == track_id) found = true;
     if (!found) return nullptr;
-    return std::make_unique<RemoveTrackCommand>(sequence, track_id);
+    return std::make_unique<
+        RemoveTrackCommand<SeqTrack, &Sequence::tracks>>(sequence, track_id,
+                                                         "Remove Lane");
 }
 
 std::unique_ptr<Command> add_audio_track_command(uint64_t sequence,
@@ -666,7 +607,9 @@ std::unique_ptr<Command> add_audio_track_command(uint64_t sequence,
 
 std::unique_ptr<Command> remove_audio_track_command(uint64_t sequence,
                                                     uint64_t track_id) {
-    return std::make_unique<RemoveAudioTrackCommand>(sequence, track_id);
+    return std::make_unique<
+        RemoveTrackCommand<AudioTrack, &Sequence::audio>>(
+        sequence, track_id, "Remove Audio Track");
 }
 
 void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
@@ -694,17 +637,20 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
         uint64_t end;   // UINT64_MAX = unbounded
     };
     std::vector<Victim> victims;
+    // fps is invariant across everything below: every command executed
+    // here is a placement edit, never a format or asset change.
+    double eff = 0.0;
     {
         const Sequence* seq = doc.find_sequence(sequence);
         if (!seq) return;
         const std::vector<Placement>* lane = lane_of(*seq);
         if (!lane) return;
+        eff = effective_fps(doc, *seq);
         for (const Placement& p : *lane) {
             if (p.id == keep_id) continue;
             if (keep_link && p.link == keep_link) continue;
             const uint32_t pe32 = placement_end(
-                p, source_length(doc, p),
-                placement_ratio(doc, p, effective_fps(doc, *seq)));
+                p, source_length(doc, p), placement_ratio(doc, p, eff));
             const uint64_t pe = pe32 ? pe32 : UINT64_MAX;
             if (p.t_in >= e1 || pe <= t0) continue;
             victims.push_back({p.id, p.t_in, pe});
@@ -721,7 +667,7 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
             if (!live) continue;
             const uint32_t le32 = placement_end(
                 *live, source_length(doc, *live),
-                placement_ratio(doc, *live, effective_fps(doc, *seq)));
+                placement_ratio(doc, *live, eff));
             const uint64_t le = le32 ? le32 : UINT64_MAX;
             if (live->t_in >= e1 || le <= t0) continue;
             v.t_in = live->t_in;
@@ -751,9 +697,7 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
                         right = &p;
             if (!right) continue;
             Placement np = *right;
-            trim_placement_head(np, t1,
-                                placement_ratio(doc, np,
-                                                effective_fps(doc, *seq)));
+            trim_placement_head(np, t1, placement_ratio(doc, np, eff));
             undo.execute(doc, set_placement_command(sequence, np));
             continue;
         }
@@ -766,9 +710,7 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
         } else {
             // Its head sits under: slide the start past the newcomer,
             // source_in follows so the surviving content holds still.
-            trim_placement_head(np, t1,
-                                placement_ratio(doc, np,
-                                                effective_fps(doc, *seq)));
+            trim_placement_head(np, t1, placement_ratio(doc, np, eff));
         }
         undo.execute(doc, set_placement_command(sequence, np));
     }

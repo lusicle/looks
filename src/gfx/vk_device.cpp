@@ -222,7 +222,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
     }
     dev->physical_ = best;
     dev->graphics_family_ = best_queues.graphics;
-    dev->transfer_family_ = best_queues.transfer;
     vkGetPhysicalDeviceProperties(best, &dev->properties_);
     log_info("gpu: %s", dev->properties_.deviceName);
 
@@ -242,7 +241,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
             fams[dev->graphics_family_].queueCount >= 2)
             gfx_queue_count = 2;
     }
-    float priority = 1.0f;
     const float gfx_priorities[2] = {1.0f, 0.5f};
     std::vector<VkDeviceQueueCreateInfo> queue_infos;
     {
@@ -251,12 +249,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
         qi.queueCount = gfx_queue_count;
         qi.pQueuePriorities = gfx_priorities;
         queue_infos.push_back(qi);
-        if (dev->transfer_family_ != dev->graphics_family_) {
-            qi.queueFamilyIndex = dev->transfer_family_;
-            qi.queueCount = 1;
-            qi.pQueuePriorities = &priority;
-            queue_infos.push_back(qi);
-        }
     }
 
     std::vector<const char*> device_exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -312,7 +304,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
     }
 
     vkGetDeviceQueue(dev->device_, dev->graphics_family_, 0, &dev->graphics_queue_);
-    vkGetDeviceQueue(dev->device_, dev->transfer_family_, 0, &dev->transfer_queue_);
     vkGetDeviceQueue(dev->device_, dev->graphics_family_,
                      gfx_queue_count > 1 ? 1 : 0, &dev->thumb_queue_);
 
