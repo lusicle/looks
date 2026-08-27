@@ -34,6 +34,9 @@ struct AnalysisCurves {
     std::vector<float> brightness;       // mean luma, 0..1
     std::vector<float> cut;              // 1 at detected scene cuts
     float bpm = 0.0f;
+    // The curves' frame grid rate; audio-only assets carry no video fps
+    // of their own, so the sidecar's grid must ride along.
+    double fps = 0.0;
 
     float sample(const std::vector<float>& curve, uint32_t frame) const {
         if (curve.empty()) return 0.0f;

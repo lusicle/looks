@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <vector>
@@ -37,14 +38,19 @@ struct AnalysisData {
         c.brightness = brightness;
         c.cut = cut;
         c.bpm = bpm;
+        c.fps = fps;
         return c;
     }
 };
 
 // Interleaved s16 -> band/onset/bpm curves sampled at video frame times.
+// Minutes of FFT on a long track: `cancel` (when given) is polled per
+// frame so a closing app never waits out the loop - a cancelled run
+// leaves `out` partial and the caller must not persist it.
 void analyze_audio(const int16_t* samples, uint64_t frame_total,
                    uint32_t channels, uint32_t sample_rate, double video_fps,
-                   uint32_t video_frames, AnalysisData* out);
+                   uint32_t video_frames, AnalysisData* out,
+                   const std::atomic<bool>* cancel = nullptr);
 
 // Streaming video analysis fed one I420 luma plane per frame.
 class VideoAnalyzer {

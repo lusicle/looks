@@ -450,12 +450,19 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
     // frames were still on the GPU and the map below is a copy, not a
     // stall.
     const size_t depth = d.shared ? 3 : 1;
+    int renegotiated = 0;
     while (d.inflight.size() < depth) {
         Com<IMFSample> pulled;
         bool stream_changed = false;
         const HRESULT hr = pump_output(d.mft.get(), kVideoAllocFallback,
                                        pulled, &stream_changed);
         if (stream_changed) {
+            // A stream that re-raises the change endlessly (mid-stream
+            // SPS churn) must FAIL the decode, never wedge the caller.
+            if (++renegotiated > 4) {
+                log_warn("mf: H264 output stream-change loop — giving up");
+                return false;
+            }
             std::string err;
             if (!d.negotiate_output(&err)) return false;
             continue;
@@ -591,12 +598,18 @@ struct PcmMftCore {
 
     bool receive(AudioChunk& out) {
         if (!mft) return false;
+        int renegotiated = 0;
         for (;;) {
             Com<IMFSample> sample;
             bool stream_changed = false;
             const HRESULT hr = pump_output(mft.get(), kAudioAllocFallback,
                                            sample, &stream_changed);
             if (stream_changed) {
+                if (++renegotiated > 4) {
+                    log_warn("mf: %s output stream-change loop — giving up",
+                             label);
+                    return false;
+                }
                 std::string err;
                 if (!negotiate_output(&err)) return false;
                 continue;

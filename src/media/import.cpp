@@ -176,12 +176,24 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
     std::string error;
     // Software decode: every frame is consumed on the CPU, and the DXVA
     // path's per-frame sync readback stall (~8 ms flat) costs more than
-    // the multithreaded software decoder at any resolution.
+    // the multithreaded software decoder at any resolution. LOW LATENCY
+    // is load-bearing, not a tuning: without it the software MFT
+    // schedules decode through the process-shared MF work queues, and
+    // with a preview pool's worth of hardware sessions live those can
+    // starve it PERMANENTLY - ProcessOutput then parks forever with
+    // zero CPU (ignoring the cancel poll around it) and the app hangs
+    // at close joining this thread. Synchronous per-frame completion
+    // never touches the shared queues, and a sequential pass loses
+    // nothing to it.
     if (!decoder.create(track.avcc, track.width, track.height, &error,
-                        /*allow_d3d=*/false)) {
+                        /*allow_d3d=*/false, /*low_latency=*/true)) {
         log_warn("ingest: video pass decoder failed (%s)", error.c_str());
         return false;
     }
+    // Stage breadcrumb: this pass runs on a background thread that the
+    // app JOINS at close - a wedge before the frame loop otherwise
+    // reads as a silent closing hang with no stage to blame.
+    log_info("ingest: pass decoder up (%zu samples)", track.samples.size());
     if (progress)
         progress->frames_total.store(
             static_cast<uint32_t>(track.samples.size()));
@@ -203,6 +215,7 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
 
     auto pump_decoder = [&]() {
         while (decoder.receive(nv12)) {
+            if (decoded == 0) log_info("ingest: pass first frame");
             // The analyzer reads the luma plane straight off the NV12
             // (identical bytes to a converted Y plane, so the curves
             // match what the old transcode-time analysis produced).
@@ -218,11 +231,16 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
     };
 
     const double to_100ns = 1.0e7 / track.timescale;
+    size_t fed = 0;
     for (const SampleInfo& sample : track.samples) {
         if (progress && progress->cancel.load()) {
             log_info("ingest: video pass cancelled — curves/thumbs skipped");
             return false;
         }
+        if (++fed % 1000 == 0)
+            log_info("ingest: video pass %zu/%zu", fed,
+                     track.samples.size());
+        if (progress) progress->stage.store(1, std::memory_order_relaxed);
         if (!file.read_sample(sample, sample_bytes)) {
             log_warn("ingest: sample read failed — curves/thumbs skipped");
             return false;
@@ -232,12 +250,15 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
                                 sample.cts_offset) * to_100ns);
         const int64_t duration =
             static_cast<int64_t>(sample.duration * to_100ns);
+        if (progress) progress->stage.store(2, std::memory_order_relaxed);
         if (!decoder.feed(sample_bytes.data(), sample_bytes.size(), pts,
                           duration, sample.keyframe)) {
             log_warn("ingest: video decode failed — curves/thumbs skipped");
             return false;
         }
+        if (progress) progress->stage.store(3, std::memory_order_relaxed);
         pump_decoder();
+        if (progress) progress->stage.store(0, std::memory_order_relaxed);
     }
     decoder.drain();
     pump_decoder();
@@ -577,6 +598,34 @@ bool import_audio_file(const std::filesystem::path& source,
         }
     }
 
+    // Audio curves (bands/onset/bpm) on the still grid - audio files get
+    // the same analysis a video's soundtrack gets, so beat clocks and
+    // the script analysis ops work on them. With cover art the still
+    // bundle wrote brightness/motion/cut at the same grid; merge in.
+    {
+        const double secs =
+            rate ? static_cast<double>(result->audio_frames) / rate : 0.0;
+        const uint32_t grid = std::max<uint32_t>(
+            1, static_cast<uint32_t>(secs * kStillFps) + 1);
+        mod::AnalysisData adata;
+        if (!result->analysis_path.empty())
+            mod::load_analysis(result->analysis_path, &adata);
+        mod::analyze_audio(samples.data(), result->audio_frames, channels,
+                           rate, kStillFps, grid, &adata,
+                           progress ? &progress->cancel : nullptr);
+        // A cancelled analysis is PARTIAL: persisting it would mark the
+        // bundle analyzed with dead curves.
+        if (progress && progress->cancel.load()) return false;
+        adata.fps = kStillFps;
+        adata.frame_count = grid;
+        const std::filesystem::path ap =
+            sidecars_for(dest_dir, source).analysis;
+        if (mod::write_analysis(ap, adata))
+            result->analysis_path = ap;
+        else
+            log_warn("import: audio analysis write failed (non-fatal)");
+    }
+
     if (progress) progress->frames_done.store(1);
     result->ok = true;
     log_info("import: audio %u ch @%u Hz, %llu frames%s", channels, rate,
@@ -783,18 +832,24 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
                                const std::filesystem::path& dest_dir,
                                const ImportOptions& options,
                                ImportProgress* progress) {
+    // Names the background thread's work: a wedge in here otherwise
+    // reads as a silent hang at close (the join in ~ImportJob).
+    log_info("ingest: resuming video pass %s",
+             path_to_u8(source).c_str());
     ImportResult result;
     platform::MfSession session;
     if (!session.ok()) {
         result.error = "Media Foundation unavailable";
         return result;
     }
+    log_info("ingest: mf session up");
     BmffFile file;
     std::string error;
     if (!file.open(source, &error)) {
         result.error = "demux: " + error;
         return result;
     }
+    log_info("ingest: demux open");
     const TrackInfo* video = file.movie().first_video();
     if (!video || std::string(video->fourcc) != "avc1" ||
         video->samples.empty()) {
@@ -904,8 +959,13 @@ ImportResult import_media(const std::filesystem::path& source,
                      static_cast<size_t>(pcm.frame_count()));
             mod::analyze_audio(samples.data(), pcm.frame_count(),
                                pcm.channels(), pcm.sample_rate(),
-                               result.fps, result.frame_count, &analysis);
+                               result.fps, result.frame_count, &analysis,
+                               progress ? &progress->cancel : nullptr);
         }
+    }
+    if (progress && progress->cancel.load()) {
+        result.error = "cancelled";
+        return result;
     }
     // The analysis sidecar is the READY marker resolve_bundle gates on:
     // written last in the fast stage, deleted never, rewritten (with the

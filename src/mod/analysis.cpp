@@ -68,7 +68,8 @@ float band_energy(const std::vector<float>& mags, uint32_t sample_rate,
 
 void analyze_audio(const int16_t* samples, uint64_t frame_total,
                    uint32_t channels, uint32_t sample_rate, double video_fps,
-                   uint32_t video_frames, AnalysisData* out) {
+                   uint32_t video_frames, AnalysisData* out,
+                   const std::atomic<bool>* cancel) {
     out->low.assign(video_frames, 0.0f);
     out->mid.assign(video_frames, 0.0f);
     out->high.assign(video_frames, 0.0f);
@@ -82,6 +83,7 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
     std::vector<float> flux(video_frames, 0.0f);
 
     for (uint32_t f = 0; f < video_frames; ++f) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) return;
         // Window starting at the frame's timestamp; mono mix.
         const uint64_t start = static_cast<uint64_t>(
             static_cast<double>(f) / video_fps * sample_rate);

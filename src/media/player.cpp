@@ -335,6 +335,15 @@ void Player::set_loop_region(uint32_t in_frame, uint32_t out_frame) {
     impl_->loop_out.store(out_frame);
 }
 
+bool Player::looping() const { return impl_->looping.load(); }
+
+void Player::loop_bounds(uint32_t* in_frame, uint32_t* out_frame) const {
+    uint32_t i = 0, o = 0;
+    impl_->loop_bounds(i, o);
+    if (in_frame) *in_frame = i;
+    if (out_frame) *out_frame = o;
+}
+
 void Player::set_audio_offset(double seconds) {
     impl_->audio_offset_samples.store(
         seconds_to_samples(seconds, impl_->clock_rate));

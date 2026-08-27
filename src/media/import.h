@@ -52,6 +52,11 @@ struct ImportProgress {
     std::atomic<uint32_t> frames_total{0};
     std::atomic<bool> ready{false};
     std::atomic<bool> cancel{false};
+    // Which call the video pass is inside (1 read, 2 feed, 3 pump; 0
+    // between iterations): a joiner reads it when the thread outlives
+    // its cancel, so a wedge names the parked call instead of hanging
+    // the close silently.
+    std::atomic<int> stage{0};
     // The pcm the job wrote, preloaded on the JOB thread and assigned
     // BEFORE `ready` flips (or before the job ends, for the fast
     // paths) - those atomic stores order the read. Adoption seeds the

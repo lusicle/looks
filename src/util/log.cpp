@@ -36,13 +36,21 @@ void log_emit(const char* level, const char* fmt, va_list args) {
     std::vsnprintf(msg, sizeof(msg), fmt, args);
     char line[2112];
     std::snprintf(line, sizeof(line), "[%s] %s\n", level, msg);
-    std::lock_guard<std::mutex> lock(g_log_mutex);
+    // File FIRST, under the mutex, flushed: the on-disk tail is the
+    // post-mortem record and must keep advancing even when a console
+    // or attached debugger stalls the other sinks. Those write OUTSIDE
+    // the lock - a stalled stderr (frozen console selection, full
+    // pipe) or OutputDebugString wedge then blocks only its own
+    // caller, never every logging thread queued behind one mutex.
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        if (FILE* f = log_file()) {
+            std::fputs(line, f);
+            std::fflush(f);
+        }
+    }
     std::fputs(line, stderr);
     OutputDebugStringA(line);
-    if (FILE* f = log_file()) {
-        std::fputs(line, f);
-        std::fflush(f);
-    }
 }
 
 }  // namespace

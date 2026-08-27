@@ -79,6 +79,11 @@ public:
     // Loop region: looping playback wraps inside [in, out) when
     // out > in (clamped to the trim); 0/0 loops the whole trim.
     void set_loop_region(uint32_t in_frame, uint32_t out_frame);
+    bool looping() const;
+    // The effective wrap window [in, out): the loop region clamped
+    // inside the trim when set, else the trim. Readers ahead of the
+    // playhead (the decode pool's prewarm) use it to warm the wrap.
+    void loop_bounds(uint32_t* in_frame, uint32_t* out_frame) const;
 
     // Audio nudge: positive delays monitored audio against video.
     void set_audio_offset(double seconds);

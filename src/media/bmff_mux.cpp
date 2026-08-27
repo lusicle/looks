@@ -5,6 +5,7 @@
 
 #include "media/bmff.h"
 #include "util/bytes.h"
+#include "util/log.h"
 
 namespace looks::media {
 
@@ -415,7 +416,11 @@ bool BmffMuxer::finish() {
 
     // ---- final file: ftyp + moov + mdat(payload streamed from temp)
     FILE* out = _wfopen(path_.c_str(), L"wb");
-    if (!out) return false;
+    if (!out) {
+        log_warn("mux: cannot open %ls for write (errno %d)", path_.c_str(),
+                 errno);
+        return false;
+    }
     bool ok = std::fwrite(ftyp.v.data(), 1, ftyp.v.size(), out) == ftyp.v.size();
     ok = ok && std::fwrite(moov.v.data(), 1, moov.v.size(), out) == moov.v.size();
     uint8_t mdat_header[8];
@@ -434,6 +439,9 @@ bool BmffMuxer::finish() {
         if (std::fwrite(chunk.data(), 1, n, out) != n) { ok = false; break; }
         remaining -= n;
     }
+    if (!ok)
+        log_warn("mux: final write failed with %llu bytes left (errno %d)",
+                 static_cast<unsigned long long>(remaining), errno);
     std::fclose(out);
     std::fclose(temp);
     temp_file_ = nullptr;

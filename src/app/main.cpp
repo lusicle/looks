@@ -1088,7 +1088,7 @@ void RenderWorker::run() {
     // FILE handles and are single-thread objects). stop() aborts the
     // pool through the shared pointer so quitting never waits out a
     // keyframe roll; the guard unpublishes it before the pool dies.
-    media::DecodePool pool;
+    media::DecodePool pool("preview");
     {
         std::lock_guard<std::mutex> lock(m_);
         pool_ptr_ = &pool;
@@ -1347,6 +1347,12 @@ void RenderWorker::run() {
         // tree, keyed exactly as the compiler keys its Source nodes.
         const auto tp0 = std::chrono::steady_clock::now();
         pool.set_document(doc, look_id, bundles, doc_revision);
+        // Wrap prewarm only when the loop bounds live in pool time: an
+        // active remap wraps at remap(loop) which is not the raw frame.
+        uint32_t loop_i = 0, loop_o = 0;
+        if (player.looping() && player.playing() && play_frame == mod_frame)
+            player.loop_bounds(&loop_i, &loop_o);
+        pool.set_loop(loop_i, loop_o);
         const std::vector<media::SourceFrame>& decoded =
             pool.collect(play_frame, scrubbing);
         const auto tp1 = std::chrono::steady_clock::now();
@@ -2267,7 +2273,7 @@ std::unique_ptr<ExportJob> start_export(
             gfx::even_down(canvas_h, doc_copy.export_scale);
         // Its own pool: MezReaders are single-thread objects, and the
         // preview worker is still running its own.
-        media::DecodePool pool;
+        media::DecodePool pool("export");
         pool.set_document(doc_copy, export_look_id, bundle_copy, 1);
         mod::TimeRemap remap;
         // The exported entity runs its OWN clock: a pinned fps exports
@@ -2805,6 +2811,29 @@ struct AppState {
     std::shared_ptr<const media::MixState> scope_mix;
     std::unique_ptr<ScopeJob> scope_job;
     uint64_t scope_pushed_key = ~0ull;
+    // Script-facing audio analysis of an ENTITY (a look's voice, a
+    // sequence's mix): rendered through the same build_mix/render_mix
+    // path the monitor plays, then run through the import-time analyzer.
+    // Cached per (entity, document revision); assets never come through
+    // here (their sidecar curves answer immediately).
+    struct AudioAnalysisJob {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        std::atomic<bool> cancel{false};
+        uint64_t entity = 0;
+        uint64_t revision = 0;
+        mod::AnalysisData data;
+        ~AudioAnalysisJob() {
+            cancel = true;
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::unique_ptr<AudioAnalysisJob> audio_analysis_job;
+    struct EntityAnalysis {
+        uint64_t revision = 0;
+        mod::AnalysisData data;
+    };
+    std::unordered_map<uint64_t, EntityAnalysis> entity_analysis;
     // The SCOPE's analysis composite on its root clock (built by
     // refresh_scope_analysis): eval's video sources, the timeline
     // analysis strip, live mode and export all read this one set.
@@ -3901,9 +3930,15 @@ void start_track_job(AppState& app, uint64_t asset_id,
             if (file.open(native, &err))
                 track = file.movie().first_video();
             platform::H264Decoder decoder;
+            // low_latency for the same reason as the import video pass:
+            // asynchronous software decode rides the process-shared MF
+            // work queues, which the preview pool's hardware sessions
+            // can starve permanently - receive() then parks forever and
+            // the close hangs joining this thread.
             if (track &&
                 decoder.create(track->avcc, track->width, track->height,
-                               &err, /*allow_d3d=*/false)) {
+                               &err, /*allow_d3d=*/false,
+                               /*low_latency=*/true)) {
                 size_t si = 0;
                 uint32_t received = 0;
                 bool drained = false;
@@ -4907,23 +4942,18 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame,
 // one block of its wrapper look (with the linked audio pair), laid
 // through the SAME undoable path a drop uses - there is exactly one way
 // anything enters the arrangement, and Delete makes it stay gone.
-// Already-placed media places nothing, so reopening never stacks blocks;
-// at look scope the media lands as a graph node instead (place_media_block
-// branches there).
+// Only a VIRGIN timeline gets the auto-place: any existing placement is
+// user arrangement, and landing a full-length pair into it would claim
+// both lanes span-wide (project open restores the primary media through
+// this path - it must never rewrite an edit). At look scope the media
+// lands as a graph node instead (place_media_block branches there).
 void ensure_media_placed(AppState& app,
                         const std::filesystem::path& picked) {
     if (!app.scope_is_look()) {
-        uint64_t asset_id = 0;
-        for (const doc::Asset& a : app.document.assets)
-            if (a.path == path_to_u8(picked)) asset_id = a.id;
-        if (asset_id) {
-            const uint64_t wrapper =
-                find_wrapper_look(app.document, asset_id);
-            if (wrapper)
-                for (const doc::SeqTrack& t : app.sequence().tracks)
-                    for (const doc::Placement& p : t.placements)
-                        if (p.target == wrapper) return;
-        }
+        for (const doc::SeqTrack& t : app.sequence().tracks)
+            if (!t.placements.empty()) return;
+        for (const doc::AudioTrack& t : app.sequence().audio)
+            if (!t.placements.empty()) return;
     }
     place_media_block(app, picked, app.player.current_frame_index(), 0);
 }
@@ -4931,7 +4961,12 @@ void ensure_media_placed(AppState& app,
 // Generic IMPORT: the asset joins the browser and NOTHING is placed or
 // played - placing is a separate, deliberate act (drop, browser "+").
 // Media without a bundle runs the import job flagged import_only.
-void import_media(AppState& app, const std::filesystem::path& picked) {
+void import_media(AppState& app, const std::filesystem::path& picked_in) {
+    // Same door rule as open_source: only absolute paths reach the
+    // document.
+    std::error_code aec;
+    const std::filesystem::path picked =
+        std::filesystem::absolute(picked_in, aec).lexically_normal();
     for (const doc::Asset& a : app.document.assets)
         if (a.path == path_to_u8(picked)) {
             app.status =
@@ -5013,7 +5048,13 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
     app.import->bind_layer = layer_id;
 }
 
-void open_source(AppState& app, const std::filesystem::path& picked) {
+void open_source(AppState& app, const std::filesystem::path& picked_in) {
+    // Paths PERSIST in the document: a relative path (script imports,
+    // command lines) would resolve against whatever working directory
+    // the next launch happens to have - absolutize at the door.
+    std::error_code aec;
+    const std::filesystem::path picked =
+        std::filesystem::absolute(picked_in, aec).lexically_normal();
     // Bind the media to the document so save/open restores it. Direct write,
     // not a command: the media binding is environment, not an undoable edit.
     bind_primary_media(app.document, path_to_u8(picked));
@@ -5487,6 +5528,8 @@ void open_project_load(AppState& app, const std::filesystem::path& load_from,
         loaded = doc::load_document(path, &error);
     if (!loaded) {
         app.status = "open failed: " + error;
+        log_warn("open failed: %s (%s)", error.c_str(),
+                 path_to_u8(path).c_str());
         return;
     }
     app.document = std::move(*loaded);
@@ -16512,6 +16555,103 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
 // Every log/assert/error line also appends to temp/script_log.txt - the
 // artifact a smoke run leaves behind.
 
+// ---- script-facing audio analysis: one flat view over either an
+// asset's sidecar curves or an entity's rendered-mix analysis, so every
+// query op reads one shape.
+struct AudioCurveView {
+    const std::vector<float>* low = nullptr;
+    const std::vector<float>* mid = nullptr;
+    const std::vector<float>* high = nullptr;
+    const std::vector<float>* onset = nullptr;
+    float bpm = 0.0f;
+    double fps = 0.0;
+    uint32_t frames = 0;
+};
+
+// kind: 1 bpm, 2 beats (seconds; the Beat node's grid, k*60/bpm from 0),
+// 3 onsets (seconds), 4 band value at t. An empty view answers honestly:
+// bpm 0, empty lists, band 0.
+script::Value audio_query_value(const AudioCurveView& v, int kind,
+                                int band, double t) {
+    using script::Value;
+    if (kind == 1) return Value::number(static_cast<double>(v.bpm));
+    if (kind == 2) {
+        Value out = Value::make_list();
+        if (v.bpm > 1.0f && v.fps > 0.0) {
+            const double dur = static_cast<double>(v.frames) / v.fps;
+            const double step = 60.0 / static_cast<double>(v.bpm);
+            for (double bt = 0.0; bt < dur; bt += step)
+                out.list->push_back(Value::number(bt));
+        }
+        return out;
+    }
+    if (kind == 3) {
+        Value out = Value::make_list();
+        if (v.onset && v.fps > 0.0)
+            for (size_t f = 0; f < v.onset->size(); ++f)
+                if ((*v.onset)[f] >= 0.5f)
+                    out.list->push_back(Value::number(
+                        static_cast<double>(f) / v.fps));
+        return out;
+    }
+    const std::vector<float>* vec = v.low;
+    if (band == 1) vec = v.mid;
+    if (band == 2) vec = v.high;
+    if (band == 3) vec = v.onset;
+    if (!vec || vec->empty() || v.fps <= 0.0) return Value::number(0.0);
+    const int64_t last = static_cast<int64_t>(vec->size()) - 1;
+    const int64_t idx =
+        std::clamp<int64_t>(llround(t * v.fps), 0, last);
+    return Value::number(
+        static_cast<double>((*vec)[static_cast<size_t>(idx)]));
+}
+
+void adopt_audio_analysis(AppState& app) {
+    auto& job = app.audio_analysis_job;
+    if (!job || !job->done.load()) return;
+    if (job->thread.joinable()) job->thread.join();
+    AppState::EntityAnalysis ea;
+    ea.revision = job->revision;
+    ea.data = std::move(job->data);
+    app.entity_analysis[job->entity] = std::move(ea);
+    job.reset();
+}
+
+// 1 = view ready, 0 = an entity render must land first, -1 = an asset
+// with no analysis (the honest answer is the empty view).
+int audio_view_state(AppState& app, uint64_t id, AudioCurveView* out) {
+    for (const doc::Asset& a : app.document.assets)
+        if (a.id == id) {
+            const auto it = app.asset_analysis.find(id);
+            if (it == app.asset_analysis.end() || !it->second) return -1;
+            const mod::AnalysisCurves& c = *it->second;
+            out->low = &c.low;
+            out->mid = &c.mid;
+            out->high = &c.high;
+            out->onset = &c.onset;
+            out->bpm = c.bpm;
+            // The sidecar's own grid wins; audio-only assets have no
+            // video fps to fall back on.
+            out->fps = c.fps > 0.0 ? c.fps : (a.fps > 0.0 ? a.fps : 30.0);
+            out->frames = static_cast<uint32_t>(c.low.size());
+            return 1;
+        }
+    adopt_audio_analysis(app);
+    const auto it = app.entity_analysis.find(id);
+    if (it == app.entity_analysis.end() ||
+        it->second.revision != app.document.revision)
+        return 0;
+    const mod::AnalysisData& d = it->second.data;
+    out->low = &d.low;
+    out->mid = &d.mid;
+    out->high = &d.high;
+    out->onset = &d.onset;
+    out->bpm = d.bpm;
+    out->fps = d.fps;
+    out->frames = d.frame_count;
+    return 1;
+}
+
 struct ScriptHost {
     // Per-pump context, set by the frame loop before pump().
     AppState* app = nullptr;
@@ -16541,13 +16681,20 @@ struct ScriptHost {
 
     enum class Wait {
         None, Frames, Idle, Export, Import, Capture, Track, Actions,
-        Macro
+        Macro, AudioAnalysis
     };
     Wait wait = Wait::None;
     int wait_frames = 0;
     uint64_t wait_seq0 = 0;
     double wait_deadline = 0.0;   // app_seconds
     std::filesystem::path capture_path;
+    // Audio-analysis query staged across the suspend: the wait's ready
+    // check re-runs it against the landed curves and resumes with the
+    // real result. kind: 1 bpm, 2 beats, 3 onsets, 4 band.
+    int aa_kind = 0;
+    uint64_t aa_id = 0;
+    int aa_band = 0;
+    double aa_t = 0.0;
 
     // Synthetic input due at future pump counters (logical px converted
     // to physical at enqueue).
@@ -16823,7 +16970,10 @@ struct ScriptHost {
                         resume_v = script::Value::string(app->status);
                     break;
                 case Wait::Import:
-                    ready = app->import == nullptr;
+                    // A curves/thumbs RESUME occupies the slot but the
+                    // asset was usable all along - scripts must not
+                    // hang on it (the UI treats that slot as free too).
+                    ready = !app->import || app->import->video_pass_only;
                     break;
                 case Wait::Track:
                     // The main loop adopts + resets the finished job;
@@ -16839,6 +16989,17 @@ struct ScriptHost {
                     // macro() resumes when the macro host's VM idles.
                     ready = !macro_host || !macro_host->active();
                     break;
+                case Wait::AudioAnalysis: {
+                    // The staged query re-runs against the landed
+                    // curves and its real result rides the resume.
+                    adopt_audio_analysis(*app);
+                    AudioCurveView v;
+                    ready = audio_view_state(*app, aa_id, &v) != 0;
+                    if (ready)
+                        resume_v =
+                            audio_query_value(v, aa_kind, aa_band, aa_t);
+                    break;
+                }
                 case Wait::Capture: {
                     std::vector<uint8_t> rgba;
                     uint32_t w = 0, h = 0;
@@ -17272,8 +17433,11 @@ void register_ops_app(ScriptHost& sh) {
                 std::error_code ec;
                 if (!std::filesystem::exists(p, ec))
                     return op_err(vm, "no file " + path_to_u8(p));
+                // No window = no autosave-recovery dialog: a script gets
+                // exactly the file it named, never a modal it cannot
+                // answer.
                 if (p.extension() == ".json")
-                    open_project(*sh.app, p, sh.window);
+                    open_project(*sh.app, p, nullptr);
                 else
                     open_source(*sh.app, p);
                 return Value::boolean(true);
@@ -17284,7 +17448,10 @@ void register_ops_app(ScriptHost& sh) {
                 std::error_code ec;
                 if (!std::filesystem::exists(p, ec))
                     return op_err(vm, "no file " + path_to_u8(p));
-                if (sh.app->import)
+                // Same gate as every UI entry path: a curves/thumbs
+                // resume yields the slot loss-free; only real imports
+                // and consolidates hold it.
+                if (!import_slot_free(*sh.app))
                     return op_err(vm, "an import is already running");
                 open_source(*sh.app, p);
                 return Value::boolean(true);
@@ -19060,6 +19227,77 @@ bool resolve_param_key(ScriptHost& sh, script::Vm& vm,
     return false;
 }
 
+// One query core behind bpm/beats/onsets/band. Assets answer from their
+// sidecar curves immediately; a look (its VOICE) or a sequence (its MIX)
+// renders through build_mix/render_mix on a helper thread the first
+// time, lands in the per-revision cache, and the op suspends until then
+// - the caller just sees the value arrive.
+script::Value audio_analysis_query(ScriptHost& sh, script::Vm& vm,
+                                   uint64_t id, int kind, int band,
+                                   double t) {
+    using script::Value;
+    AppState& app = *sh.app;
+    AudioCurveView v;
+    const int st = audio_view_state(app, id, &v);
+    if (st != 0) return audio_query_value(v, kind, band, t);
+    const doc::Look* lk = app.document.find_look(id);
+    const doc::Sequence* sq = app.document.find_sequence(id);
+    if (!lk && !sq)
+        return op_err(vm, "no asset, look or sequence with that id");
+    if (app.audio_analysis_job &&
+        app.audio_analysis_job->entity != id &&
+        !app.audio_analysis_job->done.load())
+        return op_err(vm, "another audio analysis is rendering");
+    if (!app.audio_analysis_job) {
+        double efps = app.player.fps();
+        if (lk && doc::format_has_fps(lk->format)) efps = lk->format.fps;
+        if (sq && doc::format_has_fps(sq->format)) efps = sq->format.fps;
+        if (efps <= 0.0) efps = 30.0;
+        const uint32_t span =
+            lk ? doc::look_duration(app.document, *lk)
+               : doc::sequence_duration(app.document, *sq);
+        if (!span) return op_err(vm, "entity has no duration");
+        auto job = std::make_unique<AppState::AudioAnalysisJob>();
+        job->entity = id;
+        job->revision = app.document.revision;
+        media::MixState mix = build_mix(
+            app.document, id, app.pcm_cache, efps,
+            app.player.audio_sample_rate(), app.player.audio_channels());
+        AppState::AudioAnalysisJob* raw = job.get();
+        job->thread =
+            std::thread([raw, mix = std::move(mix), efps, span] {
+                const uint32_t rate = mix.rate ? mix.rate : 48000;
+                const uint32_t ch = mix.channels ? mix.channels : 2;
+                const uint64_t total = static_cast<uint64_t>(
+                    media::frame_to_sample(span, efps, rate));
+                std::vector<int16_t> pcm(total * ch);
+                std::vector<float> scratch;
+                for (uint64_t s = 0; s < total; s += 4096) {
+                    if (raw->cancel.load(std::memory_order_relaxed)) break;
+                    const uint32_t n = static_cast<uint32_t>(
+                        std::min<uint64_t>(4096, total - s));
+                    media::render_mix(mix, static_cast<int64_t>(s),
+                                      pcm.data() + s * ch, n, scratch);
+                }
+                if (!raw->cancel.load(std::memory_order_relaxed))
+                    mod::analyze_audio(pcm.data(), total, ch, rate, efps,
+                                       span, &raw->data, &raw->cancel);
+                raw->data.fps = efps;
+                raw->data.frame_count = span;
+                raw->done = true;
+            });
+        app.audio_analysis_job = std::move(job);
+    }
+    sh.aa_kind = kind;
+    sh.aa_id = id;
+    sh.aa_band = band;
+    sh.aa_t = t;
+    sh.wait = ScriptHost::Wait::AudioAnalysis;
+    sh.wait_deadline = app.app_seconds + 180.0;
+    vm.mark_suspend();
+    return Value::nil();
+}
+
 void register_ops_mod(ScriptHost& sh) {
     script::Env& env = sh.env;
     using script::Value;
@@ -19071,6 +19309,40 @@ void register_ops_mod(ScriptHost& sh) {
                 for (const char* n : kModKindNames)
                     out.list->push_back(Value::string(n));
                 return out;
+            });
+    env.add("bpm",
+            "bpm(id) -> tempo estimate; id is an asset, a look (its "
+            "voice) or a sequence (its mix) - entity audio renders and "
+            "analyzes on first query, then caches per revision",
+            1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                return audio_analysis_query(sh, vm, a[0].as_id(), 1, 0,
+                                            0.0);
+            });
+    env.add("beats",
+            "beats(id) -> beat times in SECONDS (the Beat node's grid: "
+            "k * 60/bpm from 0)",
+            1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                return audio_analysis_query(sh, vm, a[0].as_id(), 2, 0,
+                                            0.0);
+            });
+    env.add("onsets", "onsets(id) -> onset times in seconds", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                return audio_analysis_query(sh, vm, a[0].as_id(), 3, 0,
+                                            0.0);
+            });
+    env.add("band",
+            "band(id, \"low|mid|high|onset\", t_seconds) -> 0..1",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
+                int b = 0;
+                const std::string& n = a[1].as_str();
+                if (n == "mid") b = 1;
+                else if (n == "high") b = 2;
+                else if (n == "onset") b = 3;
+                else if (n != "low")
+                    return op_err(vm, "band is low|mid|high|onset");
+                return audio_analysis_query(
+                    sh, vm, a[0].as_id(), 4, b,
+                    a[2].is_num() ? a[2].num : 0.0);
             });
     env.add("generate_track",
             "generate_track(look, node, start?, end?) - solve the camera "
@@ -27433,9 +27705,36 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     if (app.scope_job) app.scope_job->cancel = true;
     if (app.export_job) app.export_job->progress.cancel = true;
     if (app.track_job) app.track_job->cancel = true;
+    if (app.audio_analysis_job) app.audio_analysis_job->cancel = true;
     app.render_worker = nullptr;
     app.thumb_worker = nullptr;
+    if (app.import)
+        log_info("shutdown: jobs flagged (import live, stage %d, frame "
+                 "%u/%u)",
+                 app.import->progress.stage.load(),
+                 app.import->progress.frames_done.load(),
+                 app.import->progress.frames_total.load());
+    else
+        log_info("shutdown: jobs flagged");
     auto sd = std::chrono::steady_clock::now();
+    if (app.import && !app.import->done.load()) {
+        // Bounded join: every import loop polls cancel within a frame
+        // of work, so a thread alive seconds after the flag is parked
+        // inside a call that will never return (an MF-internal wait).
+        // A parked thread touches nothing - the pass writes sidecars
+        // only at completion - so abandon it to process teardown
+        // rather than hang the close on an unjoinable thread.
+        while (!app.import->done.load() && ms_since(sd) < 3000.0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!app.import->done.load()) {
+            log_warn("shutdown: import wedged (stage %d, frame %u/%u) — "
+                     "abandoning the thread",
+                     app.import->progress.stage.load(),
+                     app.import->progress.frames_done.load(),
+                     app.import->progress.frames_total.load());
+            app.import->thread.detach();
+        }
+    }
     app.import.reset();
     log_info("shutdown: import %.0f ms", ms_since(sd));
     sd = std::chrono::steady_clock::now();

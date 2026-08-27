@@ -26,13 +26,16 @@ struct AudioPacket {
 
 }  // namespace
 
-ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
-                          uint32_t fps_den, uint32_t frame_count,
-                          const FrameProducer& producer,
-                          const ExportAudio& audio,
-                          const std::filesystem::path& out_mp4,
-                          const ExportOptions& options,
-                          ExportProgress* progress) {
+namespace {
+
+ExportResult export_movie_impl(uint32_t width, uint32_t height,
+                               uint32_t fps_num, uint32_t fps_den,
+                               uint32_t frame_count,
+                               const FrameProducer& producer,
+                               const ExportAudio& audio,
+                               const std::filesystem::path& out_mp4,
+                               const ExportOptions& options,
+                               ExportProgress* progress) {
     ExportResult result;
     if (width == 0 || height == 0 || frame_count == 0 || fps_num == 0 ||
         fps_den == 0) {
@@ -201,6 +204,26 @@ ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
     log_info("export: %s  %u frames %ux%u%s", out_mp4.string().c_str(),
              frame_count, width, height, has_audio ? " + audio" : "");
     result.ok = true;
+    return result;
+}
+
+}  // namespace
+
+// Every failure exits through here so the log always carries the reason,
+// not just the status line.
+ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
+                          uint32_t fps_den, uint32_t frame_count,
+                          const FrameProducer& producer,
+                          const ExportAudio& audio,
+                          const std::filesystem::path& out_mp4,
+                          const ExportOptions& options,
+                          ExportProgress* progress) {
+    ExportResult result =
+        export_movie_impl(width, height, fps_num, fps_den, frame_count,
+                          producer, audio, out_mp4, options, progress);
+    if (!result.ok)
+        log_warn("export failed: %s (%s)", result.error.c_str(),
+                 out_mp4.string().c_str());
     return result;
 }
 

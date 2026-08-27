@@ -48,7 +48,10 @@ struct SourceFrame {
 
 class DecodePool {
 public:
-    DecodePool();
+    // The name prefixes this pool's log lines (preview / export / ...):
+    // several pools share one log and their stalls read identically
+    // without it.
+    explicit DecodePool(const char* name = "pool");
     ~DecodePool();
 
     DecodePool(const DecodePool&) = delete;
@@ -62,11 +65,24 @@ public:
 
     struct Request {
         uint64_t key = 0;
+        // Decode-stream identity: the CANONICAL key from set_document's
+        // fold - one stream per instance key, with keys whose whole
+        // mapping sets match (matte arms, locked feeds, forked
+        // duplicates) folded onto one, so identical decodes never run
+        // twice and a stream never splits per block.
+        uint64_t alias = 0;
         size_t source = 0;      // index into sources()
         uint32_t frame = 0;   // asset frame, clamped into the media
     };
     // Every placement playing at a root frame. Pure - no decode, no state.
     std::vector<Request> plan(uint32_t root_frame) const;
+
+    // Loop wrap window [in, out) for the prewarm horizon: when looping
+    // playback approaches `out`, the frames after the wrap play next -
+    // without this every lap re-entered the loop start cold. 0/0 = off
+    // (also the right call under an active time remap, whose wrap
+    // target is not the raw loop frame).
+    void set_loop(uint32_t in_frame, uint32_t out_frame);
 
     // Decodes the whole plan (blocking on a miss) and queues the prewarm
     // for the frames after it. Frames stay alive until the next collect().
@@ -102,6 +118,7 @@ private:
         std::filesystem::path path;   // decodable file: source (native) or mez
         bool native = false;
         uint32_t frames = 0;
+        uint64_t key = 0;             // the instance key, for log lines
         // `m` guards the ring/want and is only ever held briefly - a
         // ring PROBE must never wait behind a decode in flight. `cv`
         // fires on every ring insert: a consumer whose frame is already
@@ -161,7 +178,7 @@ private:
 
             ~Session();
         };
-        static constexpr size_t kSessions = 2;
+        static constexpr size_t kSessions = 3;
         Session sessions[kSessions];
         // Built once on first use, then immutable; sessions share it.
         std::mutex index_m;
@@ -177,6 +194,21 @@ private:
         std::vector<std::shared_ptr<codec::DecodedFrame>> spare;
         uint32_t want = 0;       // the frame the consumer last asked for
         uint32_t last_want = 0;  // previous ask: backward motion widens rolls
+        // Upcoming block entries on this stream (same key, different
+        // placements: blocks of one look share a stream whose position
+        // JUMPS at every cut). Their windows are protected from
+        // eviction so the cut prerolls survive until the playhead
+        // arrives - dense stutter cuts put SEVERAL entries inside the
+        // prewarm horizon at once. 0xFFFFFFFF = empty slot.
+        static constexpr size_t kEntryMarks = 4;
+        uint32_t next_entries[kEntryMarks] = {0xFFFFFFFFu, 0xFFFFFFFFu,
+                                              0xFFFFFFFFu, 0xFFFFFFFFu};
+        // Ring depth THIS stream needs (guarded by `m`): the live
+        // window plus a window per entry mark. Key folding concentrates
+        // several blocks' protection into one stream, and the global
+        // flow depth alone let a long entry roll evict its own en-route
+        // frames - the playhead then re-rolled them seconds later.
+        uint32_t ring_target = 0;
         // Idle-close bookkeeping, consumer thread only (written by
         // stream_for and the scan, both inside collect, under map_m_).
         uint64_t last_touch = 0;
@@ -187,6 +219,15 @@ private:
         uint64_t key = 0;
         uint32_t frame = 0;
         uint64_t gen = 0;
+        // A CUT PREROLL: the stream is not playing yet, its entry sits
+        // wherever the arrangement put it - exempt from the cold-seek
+        // distance gate (which exists to stop mid-run re-decodes of the
+        // stream the playhead is already inside).
+        bool preroll = false;
+        // Root frame the decoded frames are needed by. The queue runs
+        // NEAREST DEADLINE FIRST: flatten order let far-future prerolls
+        // starve the boundary about to play.
+        uint32_t deadline = 0;
     };
 
     Stream* stream_for(const Request& req);
@@ -195,13 +236,15 @@ private:
     // backlog).
     std::shared_ptr<const codec::DecodedFrame> fetch(Stream& s, uint32_t frame,
                                                      bool* was_miss,
-                                                     bool scrub = false);
+                                                     bool scrub = false,
+                                                     bool preroll = false);
     std::shared_ptr<const codec::DecodedFrame> fetch_mez(Stream& s,
                                                          uint32_t frame);
     std::shared_ptr<const codec::DecodedFrame> fetch_native(Stream& s,
                                                             uint32_t frame,
                                                             bool advisory,
-                                                            bool scrub);
+                                                            bool scrub,
+                                                            bool preroll);
     std::shared_ptr<const codec::DecodedFrame> ring_insert(
         Stream& s, uint32_t frame,
         std::shared_ptr<const codec::DecodedFrame> decoded, size_t depth);
@@ -210,7 +253,14 @@ private:
     void drain();
     void idle_close_scan();
 
+    const char* name_;
     std::vector<doc::MediaInstance> sources_;
+    // Instance key -> stream identity, rebuilt per flatten (consumer
+    // thread only; plan() reads it on the same thread).
+    std::unordered_map<uint64_t, uint64_t> canonical_;
+    // Loop wrap window, consumer thread only. out > in = active.
+    uint32_t loop_in_ = 0;
+    uint32_t loop_out_ = 0;
     std::vector<AssetBundle> bundles_;
     uint64_t revision_ = ~0ull;
     uint64_t look_ = 0;
