@@ -122,6 +122,14 @@ struct Node {
     // Live preview: an atlas cell (draw_image_quad); null = flat slot.
     const ui::UiTexture* preview = nullptr;
     float pu0 = 0.0f, pv0 = 0.0f, pu1 = 1.0f, pv1 = 1.0f;
+    // Audio card: the preview slot draws a waveform graph instead of a
+    // picture - two min/max envelope traces (input sum vs output),
+    // normalized -1..1, interleaved lo/hi per column. wave_count = 0
+    // draws the empty graph (an unfed audio node IS silent).
+    bool wave_card = false;
+    const float* wave_in = nullptr;
+    const float* wave_out = nullptr;
+    int wave_count = 0;
     // Value-node scope: the node's output sampled over a window that
     // starts at the playhead, drawn as a strip under the title (sample
     // 0 is NOW). lo/hi frame the plot; a bipolar window keeps its zero

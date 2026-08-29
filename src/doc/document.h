@@ -365,11 +365,11 @@ struct Look {
     // Browser bin; 0 = the project root.
     uint64_t bin = 0;
     // Output audio routing. COMBINED (false, default): image and audio
-    // arrive on the one In wire - the voice is the port-0 chain's audio,
-    // so looks wire exactly as always and the bottom chain wins the
-    // fan-in. SPLIT (true): the Output grows a dedicated audio-in
-    // (to=0, to_port=1) for a voice that differs from the picture's
-    // chain; unwired = silent, not fallback.
+    // arrive on the one In wire - the voice is the port-0 fan-in's
+    // audio, every live chain summed, so looks wire exactly as always.
+    // SPLIT (true): the Output grows a dedicated audio-in (to=0,
+    // to_port=1) whose fan-in sums the same way for a voice that
+    // differs from the picture's; unwired = silent, not fallback.
     bool audio_split = false;
 
     std::vector<Layer> layers;
@@ -991,11 +991,20 @@ inline const Group* group_of_input(const Look& look, uint64_t slot_id,
     return group_of_input(const_cast<Look&>(look), slot_id, layer_index);
 }
 
-// Resolves an id through group input slots to the real producer: a slot
-// reads its exterior port-0 feed (bottom LIVE chain first, matching
-// every other single-producer walk - deletes tolerate dangling links,
-// so a dead wire must not shadow a live feed above it). Non-slot ids
-// pass through; a dangling slot chain resolves to 0.
+// The ONE liveness rule for following a wire: a feed is followable
+// when its producer still exists - a layer, an effect, or a group
+// input slot. Deletes tolerate dangling links, so every walk (the
+// compiler's merge, the audio walk, adjacency hops) must skip dead
+// feeds rather than let them shadow live ones.
+inline bool wire_producer_live(const Look& look, uint64_t id) {
+    return id && (find_layer(look, id) || find_effect(look, id) ||
+                  group_of_input(look, id));
+}
+
+// Resolves an id through group input slots to a single real producer
+// (adjacency questions need ONE answer): a slot reads its bottom LIVE
+// exterior port-0 feed - link-vector order IS stacking order. Non-slot
+// ids pass through; a dangling slot chain resolves to 0.
 inline uint64_t hop_group_inputs(const Look& look,
                                  const std::vector<NodeLink>& links,
                                  uint64_t id) {
@@ -1003,9 +1012,8 @@ inline uint64_t hop_group_inputs(const Look& look,
         if (!group_of_input(look, id)) return id;
         uint64_t next = 0;
         for (const NodeLink& l : links)
-            if (l.to == id && l.to_port == 0 && l.from &&
-                (find_layer(look, l.from) || find_effect(look, l.from) ||
-                 group_of_input(look, l.from))) {
+            if (l.to == id && l.to_port == 0 &&
+                wire_producer_live(look, l.from)) {
                 next = l.from;
                 break;
             }

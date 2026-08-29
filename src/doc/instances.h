@@ -80,18 +80,76 @@ inline void shifted_window(double length, int64_t shift, double rate,
     }
 }
 
-// One audio-modifier hop on a voice: the effect's params snapshotted at
-// flatten time (audio DSP params are not modulatable - the mix rebuilds
-// on document revision, so slider edits land, value wires do not).
-// Applied in vector order, source first.
+// One audio-modifier hop: the effect's params snapshotted at flatten
+// time (audio DSP params are not modulatable - the mix rebuilds on
+// document revision, so slider edits land, value wires do not).
 struct AudioOp {
     EffectType type = EffectType::AudioGain;
     float params[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float wet = 1.0f;
 };
 
-// Voice chains cap here; hops past the cap are dropped deterministically.
+// Analysis chains cap here; hops past the cap drop deterministically.
 inline constexpr size_t kMaxVoiceOps = 8;
+
+// One node of a look's AUDIO PROGRAM: the wired graph flattened to a
+// DAG the mix evaluates directly. Leaves read media through composed
+// affine clocks; interior nodes SUM their fan-in (combine-all - the
+// same connection rule the video composite merges by); an op node
+// applies its DSP to the summed signal on the owning look's clock.
+// Sequence placements and nested duration cuts are WINDOWED hop nodes
+// sitting ABOVE the DSP, so a razor is structural for sound too.
+struct AudioNode {
+    // Leaf read; 0 = interior node.
+    uint64_t asset = 0;
+    uint64_t key = 0;     // media_stream_key, matching the compiler
+    uint64_t owner = 0;   // the look holding the media node
+    uint64_t layer = 0;
+    // The doc node behind this program node: the effect id on op
+    // nodes, the layer id on leaves, 0 on synthetic sums/hops. Card
+    // previews find their taps through this.
+    uint64_t doc_id = 0;
+    // Composed clock: local = a * root_frame + b, local ticking at
+    // local_fps (the owning entity's effective rate).
+    double a = 1.0, b = 0.0;
+    double local_fps = 30.0;
+    // Leaf conform: MEDIA frames per local frame, and the
+    // media-frame-exact in-point (slip + Offset shims).
+    double rate = 1.0;
+    int64_t shift = 0;
+    // Root-frame span. Hop nodes are windowed (contribution cut with
+    // an edge ramp); leaves carry their playable span for the LEAF
+    // VIEW only (the mix lets PCM bounds taper reads).
+    bool windowed = false;
+    double w0 = 0.0, w1 = kUnbounded;
+    // Track/placement gain composed onto the hop it rides.
+    float gain = 1.0f;
+    bool has_op = false;
+    AudioOp op;
+    std::vector<int> inputs;
+};
+
+// The program's node count caps deterministically; branches past the
+// cap drop bottom-kept.
+inline constexpr size_t kMaxAudioNodes = 1024;
+
+struct AudioProgram {
+    std::vector<AudioNode> nodes;
+    int root = -1;   // -1 = silent
+};
+
+// The AUDIO walk: the whole scoped entity's sound as ONE program.
+// Sequences contribute their AUDIO TRACKS' placements as windowed hops
+// (video lanes are silent - sound rides audio placements only); a look
+// contributes every chain wired into its Output, SUMMED (combined =
+// the port-0 In fan-in; split = the dedicated audio-in, silent when
+// unwired). Connection-following is ONE rule for image and sound - a
+// fan-in walks ALL live feeds, bottom-first - and only the mux
+// differs: video stacks by layer order, audio sums at the node, so
+// every op processes exactly the signal wired into it. Video effects
+// pass audio through; multi-input nodes carry port 0's audio;
+// generators are silent; the Feedback back edge contributes silence.
+AudioProgram flatten_audio_program(const Document& doc, uint64_t root_id);
 
 struct MediaInstance {
     uint64_t key = 0;    // hash(path, container id, asset) = GraphNode::key
@@ -114,12 +172,6 @@ struct MediaInstance {
     // Composed audio gain: the placement's, scaled by every enclosing
     // track and block, and 0 when anything on the path is muted.
     float gain = 1.0f;
-    // AUDIO WALK ONLY: the voice's DSP chain, inner (nested) ops first,
-    // outer ops appended; hops past the cap drop deterministically. A
-    // fixed array keeps the instance trivially destructible (UI arenas
-    // hold instances by value). The picture walk leaves it empty.
-    AudioOp ops[kMaxVoiceOps];
-    uint32_t op_count = 0;
 };
 
 // Every media source a picture walk from `root_id` (a look or a sequence)
@@ -129,26 +181,23 @@ struct MediaInstance {
 std::vector<MediaInstance> flatten_media_sources(const Document& doc,
                                                uint64_t root_id);
 
-// The AUDIO walk: sequences contribute their AUDIO TRACKS' placements
-// (video lanes are silent - sound rides audio placements only), and a
-// look contributes its VOICE: the chain wired into its Output (combined
-// = the In wire, where the first port-0 link is the bottom chain and
-// wins the fan-in; split = the dedicated audio-in, silent when
-// unwired), audio-modifier hops collected into `ops` in play order.
-// Video effects pass audio through; multi-input nodes carry port 0's
-// audio; generators are silent; nested entities recurse, outer ops
-// appending after inner. Gain composes as track gain * placement gain *
-// everything enclosing; any mute on the path is 0.
+// The LEAF VIEW of the audio program: every media read the program
+// reaches, with its composed time map and gain (track * placement *
+// everything enclosing; any mute prunes at build). Metering and scope
+// analysis follow WHAT SOUNDS through this; the mix plays the program
+// itself. A leaf a diamond reaches twice emits once.
 std::vector<MediaInstance> flatten_audio_sources(const Document& doc,
                                                 uint64_t root_id);
 
 // The audio chain FEEDING a graph node, composed to closed form: walk
 // back from `node` (a layer or effect id in `look`) through port-0
-// inputs, collecting audio-modifier hops exactly as the voice walk
-// does; nested look refs resolve through their own Output (inner ops
-// first, the leaf's slip carried out). asset 0 = nothing resolvable
-// behind the wire (generator, unwired, dangling, or a sequence ref -
-// a sequence has no single voice). Runtime analysis keys on this.
+// inputs with the same fan-in walk the mix sums, but keeping only the
+// bottom-most RESOLVABLE path - analysis is keyed on one media stream
+// and beat clocks anchor on media time. Nested look refs resolve
+// through their own Output (inner ops first, the leaf's slip carried
+// out). asset 0 = nothing resolvable behind the wire (generator,
+// unwired, dangling, or a sequence ref - a sequence has no single
+// voice). Runtime analysis keys on this.
 struct AudioChain {
     uint64_t asset = 0;
     uint32_t slip = 0;

@@ -242,8 +242,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         const size_t li = ito->second;
         const doc::EffectInstance& fx = *fx_by_id[id];
         // Audio modifiers are image-identity: the image graph routes
-        // around them like bypassed nodes; the audio flatten collects
-        // them into the voice's DSP op list instead. Offset shims never
+        // around them like bypassed nodes; the audio program lands
+        // them as its own op nodes instead. Offset shims never
         // dispatch either - pass A2 turns the source-adjacent ones into
         // shifted source reads, the rest route through.
         if (doc::is_audio_effect(fx.type) ||

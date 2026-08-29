@@ -60,6 +60,14 @@ public:
     void draw_rect_outline(const Rect& r, float stroke, Color color);
     void draw_triangle(Vec2 a, Vec2 b, Vec2 c, Color color);
     void draw_line(Vec2 a, Vec2 b, float thickness, Color color);
+    // Anti-aliased polyline: ONE shared strip with mitered joins and a
+    // one-pixel alpha fringe. Chained draw_line capsules double-blend
+    // where their round caps overlap (visible beads at every joint on
+    // translucent strokes); a strip shares its joint vertices, so the
+    // coverage is continuous. Butt ends; `closed` wraps the last point
+    // back to the first.
+    void draw_polyline(const Vec2* pts, int count, float thickness,
+                       Color color, bool closed = false);
     void draw_sdf_rect(const Rect& r, float radius, Color color);
     void draw_sdf_rect_outline(const Rect& r, float radius, float stroke, Color color);
 

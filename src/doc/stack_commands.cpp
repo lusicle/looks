@@ -500,17 +500,13 @@ public:
                     return;
                 }
         };
-        if (link_.to == 0 && link_.to_port == 1) {
-            // The Output's split audio-in holds ONE voice: replace in
-            // place, never touching the image fan-in on port 0.
-            replace_first([&](const NodeLink& l) {
-                return l.to == 0 && l.to_port == 1;
-            });
-        } else if (link_.to == 0 && link_.to_port == 0) {
-            // Output: ONE contribution per owner layer (cross-layer
-            // fan-in is the composite). A chain RE-TERMINATING replaces
-            // its old end IN PLACE, so a splice never restacks the
-            // composite; a new chain appends on top.
+        if (link_.to == 0) {
+            // Output fan-ins - the image composite on port 0, the
+            // split audio-in on port 1 - share ONE authoring rule:
+            // one contribution per owner layer, a chain RE-TERMINATING
+            // replaces its old end IN PLACE (a splice never restacks
+            // the fan-in), a new chain appends on top and SUMS/STACKS.
+            // The two ports never touch each other.
             auto owner_of = [&](uint64_t id) -> uint64_t {
                 if (find_layer(look, id)) return id;
                 const Layer* owner = nullptr;
@@ -520,7 +516,7 @@ public:
             };
             const uint64_t own = owner_of(link_.from);
             replace_first([&](const NodeLink& l) {
-                return own && l.to == 0 && l.to_port == 0 &&
+                return own && l.to == 0 && l.to_port == link_.to_port &&
                        owner_of(l.from) == own;
             });
         } else {

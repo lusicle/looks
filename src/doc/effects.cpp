@@ -1097,9 +1097,10 @@ constexpr ParamDesc kCornerPinParams[] = {
      "black|clamp|wrap|mirror"},
 };
 
-// ---- audio modifiers. Params snapshot into the flatten's DSP op lists
-// (doc/instances.h AudioOp carries at most 4); time-domain params are in
-// SOURCE samples/ms, so placement speed scales them with the pitch.
+// ---- audio modifiers. Params snapshot into the audio program's op
+// nodes (doc/instances.h AudioOp carries at most 4); time-domain params
+// live on the owning look's clock, so placement speed scales them with
+// the pitch.
 constexpr ParamDesc kAudioGainParams[] = {
     {"gain", "gain", 0.0f, 4.0f, 1.0f, "%.2fx"},
 };

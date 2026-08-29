@@ -437,10 +437,10 @@ static void lay_audio_block(Document& d, uint64_t target) {
     d.root().audio.push_back(at);
 }
 
-TEST(flatten_audio_voice_is_the_bottom_output_chain) {
-    // One wire = one voice: the synthesized table fans every chain into
-    // the Output, and the FIRST port-0 link - the bottom chain - wins.
-    // The picture walk still emits both layers.
+TEST(flatten_audio_sums_every_output_chain) {
+    // Combine all: the synthesized table fans every chain into the
+    // Output and EVERY live chain sounds, bottom-first - the same
+    // connection rule as the video composite, mux by summing.
     Rig rig(60);
     doc::Asset b;
     b.id = rig.doc.next_effect_id++;
@@ -458,10 +458,76 @@ TEST(flatten_audio_voice_is_the_bottom_output_chain) {
         size_t{2});
     const auto voice =
         doc::flatten_audio_sources(rig.doc, rig.doc.root_sequence);
-    CHECK_EQ(voice.size(), size_t{1});
+    CHECK_EQ(voice.size(), size_t{2});
+    if (voice.size() < 2) return;
     CHECK_EQ(voice[0].asset, rig.asset);
     CHECK_EQ(voice[0].layer, rig.doc.looks[0].layers[0].id);
-    CHECK_EQ(voice[0].op_count, uint32_t{0});
+    CHECK_EQ(voice[1].asset, b.id);
+    CHECK_EQ(voice[1].layer, second.id);
+}
+
+TEST(flatten_audio_fan_in_sums_at_the_op_node) {
+    // Two sources fanning into ONE audio hop: the program lands both
+    // leaves as inputs of the SAME op node, bottom-first - the op
+    // processes the summed signal it is wired to. Rewiring one source
+    // straight to the Output moves it out from under the op into the
+    // root sum.
+    Rig rig(60);
+    Document& d = rig.doc;
+    doc::Look& look = d.looks[0];
+    const uint64_t src_a = look.layers[0].id;
+    doc::Asset b;
+    b.id = d.next_effect_id++;
+    b.frame_count = 60;
+    d.assets.push_back(b);
+    doc::Layer second;
+    second.id = d.next_effect_id++;
+    second.source = doc::LayerSourceKind::Media;
+    second.asset = b.id;
+    const uint64_t src_b = second.id;
+    look.layers.push_back(second);
+    look.layers[0].stack.push_back(
+        doc::make_effect(d, doc::EffectType::AudioGain));
+    const uint64_t gain_id = look.layers[0].stack[0].id;
+    look.links = {{src_a, gain_id, 0}, {src_b, gain_id, 0},
+                  {gain_id, 0, 0}};
+    lay_audio_block(d, rig.look);
+
+    doc::AudioProgram prog = doc::flatten_audio_program(d, d.root_sequence);
+    CHECK(prog.root >= 0);
+    if (prog.root < 0) return;
+    // Root is the placement hop over the look's program.
+    const doc::AudioNode& hop = prog.nodes[prog.root];
+    CHECK(hop.windowed);
+    CHECK_EQ(hop.inputs.size(), size_t{1});
+    const doc::AudioNode& op = prog.nodes[hop.inputs[0]];
+    CHECK(op.has_op);
+    CHECK(op.op.type == doc::EffectType::AudioGain);
+    CHECK_EQ(op.inputs.size(), size_t{2});
+    CHECK_EQ(prog.nodes[op.inputs[0]].asset, rig.asset);
+    CHECK_EQ(prog.nodes[op.inputs[1]].asset, b.id);
+
+    // Both leaves still show in the leaf view, bottom-first.
+    const auto voice = doc::flatten_audio_sources(d, d.root_sequence);
+    CHECK_EQ(voice.size(), size_t{2});
+    if (voice.size() < 2) return;
+    CHECK_EQ(voice[0].layer, src_a);
+    CHECK_EQ(voice[1].layer, src_b);
+
+    look.links = {{src_a, gain_id, 0}, {gain_id, 0, 0}, {src_b, 0, 0}};
+    prog = doc::flatten_audio_program(d, d.root_sequence);
+    CHECK(prog.root >= 0);
+    if (prog.root < 0) return;
+    const doc::AudioNode& hop2 = prog.nodes[prog.root];
+    CHECK_EQ(hop2.inputs.size(), size_t{1});
+    const doc::AudioNode& sum = prog.nodes[hop2.inputs[0]];
+    CHECK(!sum.has_op);
+    CHECK_EQ(sum.inputs.size(), size_t{2});
+    const doc::AudioNode& gained = prog.nodes[sum.inputs[0]];
+    CHECK(gained.has_op);
+    CHECK_EQ(gained.inputs.size(), size_t{1});
+    CHECK_EQ(prog.nodes[gained.inputs[0]].asset, rig.asset);
+    CHECK_EQ(prog.nodes[sum.inputs[1]].asset, b.id);
 }
 
 TEST(flatten_audio_voice_skips_dangling_feeds) {
@@ -502,11 +568,11 @@ TEST(flatten_audio_voice_skips_dangling_feeds) {
 }
 
 TEST(flatten_audio_voice_survives_a_preset_splice) {
-    // Splicing a preset into the BOTTOM chain re-terminates it through
-    // the group. Stacking order IS the link order, so the splice must
-    // land IN PLACE (reconnect_command): the bottom chain stays the
-    // bottom link and the voice stays on the media - append semantics
-    // would flip it to the top layer (a silent generator).
+    // Splicing a preset into a chain re-terminates it through the
+    // group. Stacking order IS the link order, so the splice must land
+    // IN PLACE (reconnect_command): the chain keeps its fan-in
+    // position and the voice walk hops through the group's In slot -
+    // append semantics would restack the composite under a gesture.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -557,10 +623,10 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     CHECK_EQ(voice2[0].asset, rig.asset);
 }
 
-TEST(flatten_audio_collects_voice_ops_in_play_order) {
-    // Audio-modifier hops collect source-first; video effects in the
-    // same chain pass audio through; a bypassed hop drops out while the
-    // chain keeps flowing through it.
+TEST(flatten_audio_chains_ops_in_wire_order) {
+    // The program chains op nodes exactly as wired, source-first; video
+    // effects in the chain pass audio through (no node); a bypassed hop
+    // drops out while the chain keeps flowing through it.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -581,17 +647,32 @@ TEST(flatten_audio_collects_voice_ops_in_play_order) {
                   {gain_id, 0, 0}};
     lay_audio_block(d, rig.look);
 
-    auto voice = doc::flatten_audio_sources(d, d.root_sequence);
-    CHECK_EQ(voice.size(), size_t{1});
-    CHECK_EQ(voice[0].op_count, uint32_t{2});
-    CHECK(voice[0].ops[0].type == doc::EffectType::AudioDelay);
-    CHECK(voice[0].ops[1].type == doc::EffectType::AudioGain);
-    CHECK_EQ(voice[0].ops[1].params[0], 0.5f);
+    doc::AudioProgram prog = doc::flatten_audio_program(d, d.root_sequence);
+    CHECK(prog.root >= 0);
+    if (prog.root < 0) return;
+    const doc::AudioNode& hop = prog.nodes[prog.root];
+    CHECK_EQ(hop.inputs.size(), size_t{1});
+    const doc::AudioNode& gain = prog.nodes[hop.inputs[0]];
+    CHECK(gain.has_op);
+    CHECK(gain.op.type == doc::EffectType::AudioGain);
+    CHECK_EQ(gain.op.params[0], 0.5f);
+    CHECK_EQ(gain.inputs.size(), size_t{1});
+    const doc::AudioNode& delay = prog.nodes[gain.inputs[0]];
+    CHECK(delay.has_op);
+    CHECK(delay.op.type == doc::EffectType::AudioDelay);
+    CHECK_EQ(delay.inputs.size(), size_t{1});
+    CHECK_EQ(prog.nodes[delay.inputs[0]].asset, rig.asset);
 
     look.layers[0].stack[0].bypass = true;
-    voice = doc::flatten_audio_sources(d, d.root_sequence);
-    CHECK_EQ(voice[0].op_count, uint32_t{1});
-    CHECK(voice[0].ops[0].type == doc::EffectType::AudioGain);
+    prog = doc::flatten_audio_program(d, d.root_sequence);
+    CHECK(prog.root >= 0);
+    if (prog.root < 0) return;
+    const doc::AudioNode& hop2 = prog.nodes[prog.root];
+    const doc::AudioNode& gain2 = prog.nodes[hop2.inputs[0]];
+    CHECK(gain2.has_op);
+    CHECK(gain2.op.type == doc::EffectType::AudioGain);
+    CHECK_EQ(gain2.inputs.size(), size_t{1});
+    CHECK_EQ(prog.nodes[gain2.inputs[0]].asset, rig.asset);
 }
 
 TEST(flatten_audio_split_output_reads_its_own_port) {
@@ -612,9 +693,10 @@ TEST(flatten_audio_split_output_reads_its_own_port) {
              size_t{1});
 }
 
-TEST(flatten_audio_nested_voice_composes_ops) {
-    // Inner hops run first, the enclosing look's append after - the DSP
-    // list composes through nesting the way the clocks do.
+TEST(flatten_audio_nested_program_composes_through_the_hop) {
+    // The enclosing look's DSP sits ABOVE the nested hop, the inner
+    // look's below it - the program nests the way the clocks do, and
+    // the leaf view still reaches the media.
     Rig rig(60);
     Document& d = rig.doc;
     d.looks[0].layers[0].stack.push_back(
@@ -635,12 +717,26 @@ TEST(flatten_audio_nested_voice_composes_ops) {
     d.looks.push_back(std::move(outer));
     lay_audio_block(d, d.looks.back().id);
 
+    const doc::AudioProgram prog =
+        doc::flatten_audio_program(d, d.root_sequence);
+    CHECK(prog.root >= 0);
+    if (prog.root < 0) return;
+    const doc::AudioNode& place = prog.nodes[prog.root];
+    CHECK(place.windowed);
+    const doc::AudioNode& gain = prog.nodes[place.inputs[0]];
+    CHECK(gain.has_op);
+    CHECK(gain.op.type == doc::EffectType::AudioGain);
+    const doc::AudioNode& nest = prog.nodes[gain.inputs[0]];
+    CHECK(nest.windowed);
+    CHECK(!nest.has_op);
+    const doc::AudioNode& delay = prog.nodes[nest.inputs[0]];
+    CHECK(delay.has_op);
+    CHECK(delay.op.type == doc::EffectType::AudioDelay);
+    CHECK_EQ(prog.nodes[delay.inputs[0]].asset, rig.asset);
+
     const auto voice = doc::flatten_audio_sources(d, d.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});
     CHECK_EQ(voice[0].asset, rig.asset);
-    CHECK_EQ(voice[0].op_count, uint32_t{2});
-    CHECK(voice[0].ops[0].type == doc::EffectType::AudioDelay);
-    CHECK(voice[0].ops[1].type == doc::EffectType::AudioGain);
 }
 
 TEST(resolve_audio_chain_composes_to_closed_form) {

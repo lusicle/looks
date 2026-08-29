@@ -559,10 +559,14 @@ inline bool to_mix_op(const doc::AudioOp& op, media::MixOp* m) {
 }
 
 // The audio half of the instance tree: the same flattened placements the
-// decode pool decodes, carrying PCM instead of pixels.
+// decode pool decodes, carrying PCM instead of pixels. `doc_nodes`
+// (optional) maps each doc node id (effect ops, media leaves) to its
+// program node index - card previews tap their own node through it.
 inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
                                  const PcmCache& pcm, double fps,
-                                 uint32_t rate, uint32_t channels) {
+                                 uint32_t rate, uint32_t channels,
+                                 std::unordered_map<uint64_t, int>*
+                                     doc_nodes = nullptr) {
     media::MixState mix;
     mix.fps = fps > 0.0 ? fps : 30.0;
     mix.rate = rate;
@@ -579,33 +583,56 @@ inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
         static_cast<double>(std::max<uint32_t>(span, 1));
     // Sound rides AUDIO tracks only: a video block with no linked audio
     // partner genuinely has no audio; a scoped look sounds like its
-    // VOICE - the chain wired into its Output - with the chain's
-    // audio-modifier hops riding along as the instance's DSP op list.
-    for (const doc::MediaInstance& c : doc::flatten_audio_sources(doc, look_id)) {
-        if (c.gain <= 0.0f) continue;
-        const auto it = pcm.find(c.asset);
-        if (it == pcm.end() || !it->second) continue;
-        media::MixSource src;
-        src.pcm = it->second;
-        src.t_in = c.t_in;
-        src.t_out = std::min(c.t_out, horizon);
-        // The mix maps by SECONDS on the clock (frames / mix fps), so
-        // audio conforms naturally and must not double-conform; the
-        // media-frame-exact shift converts through the rate (shift/rate
-        // clock frames = shift/asset_fps seconds into the media).
-        src.source_in =
-            c.source_in + (c.rate > 0.0
-                               ? static_cast<double>(c.shift) / c.rate
-                               : static_cast<double>(c.shift));
-        src.speed = c.speed;
-        src.gain = c.gain;
-        for (uint32_t oi = 0; oi < c.op_count; ++oi) {
-            media::MixOp m;
-            if (to_mix_op(c.ops[oi], &m)) src.ops.push_back(m);
+    // graph - the flattened AUDIO PROGRAM, fan-ins summed at the node
+    // they land on, DSP processing the summed signal it is wired to.
+    const doc::AudioProgram prog = doc::flatten_audio_program(doc, look_id);
+    if (prog.root < 0) return mix;
+    if (doc_nodes)
+        for (size_t i = 0; i < prog.nodes.size(); ++i)
+            if (prog.nodes[i].doc_id)
+                (*doc_nodes)[prog.nodes[i].doc_id] =
+                    static_cast<int>(i);
+    mix.nodes.reserve(prog.nodes.size());
+    for (const doc::AudioNode& n : prog.nodes) {
+        media::MixNode m;
+        m.a = n.a;
+        // The mix maps by SECONDS on the clock, so audio conforms
+        // naturally and must not double-conform; the media-frame-exact
+        // shift converts through the rate into local frames.
+        m.b = n.b + (n.asset && n.rate > 0.0
+                         ? static_cast<double>(n.shift) / n.rate
+                         : 0.0);
+        m.local_fps = n.local_fps;
+        m.windowed = n.windowed;
+        m.w0 = n.w0;
+        m.w1 = n.w1 >= doc::kUnbounded ? media::kMixUnbounded : n.w1;
+        m.gain = n.gain;
+        m.inputs = n.inputs;
+        if (n.asset) {
+            // A missing sidecar is a silent leaf, not an error.
+            const auto it = pcm.find(n.asset);
+            if (it != pcm.end()) m.pcm = it->second;
         }
-        if (src.t_out <= src.t_in) continue;
-        mix.sources.push_back(std::move(src));
+        if (n.has_op) m.has_op = to_mix_op(n.op, &m.op);
+        mix.nodes.push_back(std::move(m));
     }
+    mix.root = prog.root;
+    // An unbounded program would run to the end of time: the scoped
+    // entity's own length is as far as anything can play. Cuts sit
+    // ABOVE the DSP, so an unwindowed root (leaf, op, sum) gets a
+    // horizon hop wrapped around it rather than a window of its own.
+    media::MixNode& root = mix.nodes[static_cast<size_t>(mix.root)];
+    if (root.windowed) {
+        root.w1 = std::min(root.w1, horizon);
+    } else {
+        media::MixNode hop;
+        hop.windowed = true;
+        hop.w1 = horizon;
+        hop.inputs.push_back(mix.root);
+        mix.nodes.push_back(std::move(hop));
+        mix.root = static_cast<int>(mix.nodes.size()) - 1;
+    }
+    media::prepare_mix(mix);
     return mix;
 }
 
@@ -2162,17 +2189,22 @@ std::vector<int16_t> scope_audio_from_mix(const media::MixState& mix,
                                           const std::atomic<bool>* cancel =
                                               nullptr) {
     *out_rate = 0;
-    if (mix.sources.empty() || !mix.rate || !mix.channels ||
-        mix.fps <= 0.0)
+    if (mix.root < 0 || !mix.rate || !mix.channels || mix.fps <= 0.0)
         return {};
+    // The strip's span: each leaf runs out where its media does (its
+    // composed clock read back to root frames), each hop where its
+    // window cuts.
     double end_frames = 0.0;
-    for (const media::MixSource& s : mix.sources) {
-        if (!s.pcm || s.pcm->rate == 0) continue;
-        const double media_frames =
-            static_cast<double>(s.pcm->frames()) / s.pcm->rate * mix.fps;
-        const double speed = s.speed > 1e-9 ? s.speed : 1.0;
-        const double end = std::min(
-            s.t_out, s.t_in + (media_frames - s.source_in) / speed);
+    for (const media::MixNode& n : mix.nodes) {
+        double end = n.windowed && n.w1 < media::kMixUnbounded
+                         ? n.w1
+                         : 0.0;
+        if (n.pcm && n.pcm->rate && n.a > 1e-9) {
+            const double lf = n.local_fps > 0.0 ? n.local_fps : mix.fps;
+            const double media_local =
+                static_cast<double>(n.pcm->frames()) / n.pcm->rate * lf;
+            end = std::max(end, (media_local - n.b) / n.a);
+        }
         end_frames = std::max(end_frames, end);
     }
     if (end_frames <= 0.0) return {};
@@ -2350,7 +2382,7 @@ std::unique_ptr<ExportJob> start_export(
         // The soundtrack is the same mix the scope stripped above: what
         // was heard is what is written.
         media::ExportAudio audio;
-        if (doc_copy.export_audio && !mix->sources.empty()) {
+        if (doc_copy.export_audio && mix->root >= 0) {
             audio.channels = mix->channels;
             audio.rate = mix->rate;
             auto scratch = std::make_shared<std::vector<float>>();
@@ -2899,16 +2931,6 @@ struct AppState {
     // editor's hint row teach the vocabulary from it.
     std::vector<std::pair<std::string, std::string>> op_help;
     SettingsUi settings;
-    // Timeline audio-strip acceleration: per-frame combined amplitude plus
-    // 64-frame block maxima, rebuilt when the analysis stamp moves. The
-    // strip's per-column max scan otherwise touches every frame in the
-    // visible span each UI frame - milliseconds per frame zoomed out on
-    // long media.
-    struct StripAccel {
-        uint64_t stamp = 0;
-        std::vector<float> amp_frame;         // max(low, mid, high) per frame
-        std::vector<float> amp, onset, cut;   // per-block maxima
-    } strip_accel;
     bool loop = true;
 
     size_t selected_layer = 0;      // the stack panel edits this layer
@@ -3132,14 +3154,56 @@ struct AppState {
     float frame_dt = 1.0f / 60.0f;   // seconds, for rate-based drags
     // One anchor per lane row: video lanes then audio lanes.
     char tl_lane_ids[doc::kMaxLayers * 2 + 1] = {};
-    // Per-asset loudness silhouettes at the asset's frame rate, from the
-    // PCM cache. Display only; rebuilt when the bundle table moves. An
-    // asset with no PCM has no entry, which is what gates the timeline's
-    // audio display (a silent look must not read as having audio).
-    struct AssetAmp {
-        uint64_t stamp = ~0ull;
-        std::unordered_map<uint64_t, std::vector<float>> amp;
-    } asset_amp;
+    // Timeline waveforms: per placed TARGET, the entity's own rendered
+    // submix (the audio program - DSP, sums, everything that sounds)
+    // folded into a min/max peak pyramid on a helper thread. Display
+    // only; the last finished pyramid holds while a fresh render keys
+    // on a moved document. An empty pyramid gates the audio band (a
+    // silent look must not read as having audio). Entries persist for
+    // the session - a pyramid is small and targets are few.
+    struct WaveJob {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        std::atomic<bool> cancel{false};
+        media::WavePyramid pyr;
+        ~WaveJob() {
+            cancel.store(true);
+            if (thread.joinable()) thread.join();
+        }
+    };
+    struct WaveEntry {
+        media::WavePyramid pyr;
+        double fps = 30.0;   // the target clock the pyramid rides
+        uint64_t key = ~0ull;
+        std::unique_ptr<WaveJob> job;
+        uint64_t job_key = ~0ull;
+    };
+    std::unordered_map<uint64_t, WaveEntry> wave_cache;
+    // Audio card previews: for every audio effect in the SCOPED look,
+    // the min/max envelopes of its input sum and its output over the
+    // look's span, rendered from the audio program on a helper thread.
+    // One job per (scoped look, revision); the last finished set holds
+    // while a fresh one renders.
+    struct CardTrace {
+        std::vector<media::WaveSpan> in;
+        std::vector<media::WaveSpan> out;
+    };
+    struct CardWaveJob {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        std::atomic<bool> cancel{false};
+        std::unordered_map<uint64_t, CardTrace> traces;
+        ~CardWaveJob() {
+            cancel.store(true);
+            if (thread.joinable()) thread.join();
+        }
+    };
+    struct CardWaves {
+        std::unordered_map<uint64_t, CardTrace> traces;
+        uint64_t key = ~0ull;
+        std::unique_ptr<CardWaveJob> job;
+        uint64_t job_key = ~0ull;
+    } card_waves;
     // Key clipboard: copies the selected keys of one lane,
     // normalized to the first key; paste lands at the playhead in the
     // source lane.
@@ -4030,13 +4094,11 @@ void reset_media_env(AppState& app) {
     app.analysis_revision = ~0ull;
 }
 
-// The SCOPE's analysis composite on its root clock, replacing the old
-// primary-asset-on-root-indices read: at each root frame the playing
-// media instances sample their asset's import-time curves at their
-// media-local frame and combine by max (the silhouette rule). Audio
-// curves follow what SOUNDS (flatten_audio_sources, mute/gain-0
-// culled), video curves what SHOWS (flatten_media_sources). A pure
-// function of (document, asset sidecars), so preview and export agree.
+// The SCOPE's VIDEO analysis composite on its root clock: at each root
+// frame the playing media instances sample their asset's import-time
+// curves at their media-local frame and combine by max (what SHOWS,
+// flatten_media_sources). A pure function of (document, asset
+// sidecars), so preview and export agree.
 void refresh_scope_analysis(AppState& app) {
     app.analysis = {};
     app.has_analysis = false;
@@ -4044,74 +4106,51 @@ void refresh_scope_analysis(AppState& app) {
     constexpr double kMaxFrames = 1u << 20;   // deterministic length cap
     mod::AnalysisCurves& out = app.analysis;
     bool any = false;
-    auto composite = [&](const std::vector<doc::MediaInstance>& list,
-                         bool audio) {
-        for (const doc::MediaInstance& c : list) {
-            if (audio && c.gain <= 0.0f) continue;
-            auto it = app.asset_analysis.find(c.asset);
-            if (it == app.asset_analysis.end() || !it->second) continue;
-            const mod::AnalysisCurves& a = *it->second;
-            const std::vector<float>* src[4];
-            std::vector<float>* dst[4];
-            size_t nsets;
-            if (audio) {
-                src[0] = &a.low;
-                src[1] = &a.mid;
-                src[2] = &a.high;
-                src[3] = &a.onset;
-                dst[0] = &out.low;
-                dst[1] = &out.mid;
-                dst[2] = &out.high;
-                dst[3] = &out.onset;
-                nsets = 4;
-                if (out.bpm == 0.0f) out.bpm = a.bpm;
-            } else {
-                src[0] = &a.motion;
-                src[1] = &a.brightness;
-                src[2] = &a.cut;
-                dst[0] = &out.motion;
-                dst[1] = &out.brightness;
-                dst[2] = &out.cut;
-                nsets = 3;
+    // VIDEO curves only: motion/brightness/cut feed the video-driven mod
+    // sources. Audio never reads the global composite - audio-driven
+    // nodes analyze their own wire's rendered chain.
+    for (const doc::MediaInstance& c :
+         doc::flatten_media_sources(app.document, app.scope_look)) {
+        auto it = app.asset_analysis.find(c.asset);
+        if (it == app.asset_analysis.end() || !it->second) continue;
+        const mod::AnalysisCurves& a = *it->second;
+        const std::vector<float>* src[3] = {&a.motion, &a.brightness,
+                                            &a.cut};
+        std::vector<float>* dst[3] = {&out.motion, &out.brightness,
+                                      &out.cut};
+        size_t longest = 0;
+        for (const std::vector<float>* s : src)
+            longest = std::max(longest, s->size());
+        if (!longest) continue;
+        // Root span where the instance plays INSIDE its curves
+        // (sidecar curves are MEDIA-frame indexed; the conform rate
+        // maps their end back onto the clock).
+        const double speed = c.speed > 1e-9 ? c.speed : 1.0;
+        const double rate = c.rate > 0.0 ? c.rate : 1.0;
+        const double lo_f = std::max(0.0, c.t_in);
+        const double hi_f = std::min(
+            {c.t_out,
+             c.t_in + ((static_cast<double>(longest) -
+                        static_cast<double>(c.shift)) / rate -
+                       c.source_in) / speed,
+             kMaxFrames});
+        if (hi_f <= lo_f) continue;
+        const uint32_t lo = static_cast<uint32_t>(std::ceil(lo_f));
+        const uint32_t hi = static_cast<uint32_t>(std::ceil(hi_f));
+        for (size_t s = 0; s < 3; ++s) {
+            if (src[s]->empty()) continue;
+            if (dst[s]->size() < hi) dst[s]->resize(hi, 0.0f);
+            for (uint32_t f = lo; f < hi; ++f) {
+                const double mf = doc::media_asset_frame(c, f);
+                if (mf < 0.0) continue;
+                size_t m = static_cast<size_t>(mf);
+                if (m >= src[s]->size()) m = src[s]->size() - 1;
+                float& d = (*dst[s])[f];
+                if ((*src[s])[m] > d) d = (*src[s])[m];
             }
-            size_t longest = 0;
-            for (size_t s = 0; s < nsets; ++s)
-                longest = std::max(longest, src[s]->size());
-            if (!longest) continue;
-            // Root span where the instance plays INSIDE its curves
-            // (sidecar curves are MEDIA-frame indexed; the conform rate
-            // maps their end back onto the clock).
-            const double speed = c.speed > 1e-9 ? c.speed : 1.0;
-            const double rate = c.rate > 0.0 ? c.rate : 1.0;
-            const double lo_f = std::max(0.0, c.t_in);
-            const double hi_f = std::min(
-                {c.t_out,
-                 c.t_in + ((static_cast<double>(longest) -
-                            static_cast<double>(c.shift)) / rate -
-                           c.source_in) / speed,
-                 kMaxFrames});
-            if (hi_f <= lo_f) continue;
-            const uint32_t lo = static_cast<uint32_t>(std::ceil(lo_f));
-            const uint32_t hi = static_cast<uint32_t>(std::ceil(hi_f));
-            for (size_t s = 0; s < nsets; ++s) {
-                if (src[s]->empty()) continue;
-                if (dst[s]->size() < hi) dst[s]->resize(hi, 0.0f);
-                for (uint32_t f = lo; f < hi; ++f) {
-                    const double mf = doc::media_asset_frame(c, f);
-                    if (mf < 0.0) continue;
-                    size_t m = static_cast<size_t>(mf);
-                    if (m >= src[s]->size()) m = src[s]->size() - 1;
-                    float& d = (*dst[s])[f];
-                    if ((*src[s])[m] > d) d = (*src[s])[m];
-                }
-            }
-            any = true;
         }
-    };
-    composite(doc::flatten_audio_sources(app.document, app.scope_look),
-              true);
-    composite(doc::flatten_media_sources(app.document, app.scope_look),
-              false);
+        any = true;
+    }
     app.has_analysis = any;
 }
 
@@ -4541,42 +4580,123 @@ void refresh_mix(AppState& app) {
     app.player.set_mix(std::move(mix));
 }
 
-// Rebuilds the per-asset loudness silhouettes the timeline blocks draw:
-// one float per ASSET frame, max |sample| over the frame's span. Only
-// assets whose PCM actually loaded get an entry — presence in this map IS
-// the "block has audio" test.
-void refresh_asset_amp(AppState& app) {
-    if (app.asset_amp.stamp == app.bundle_stamp) return;
-    app.asset_amp.stamp = app.bundle_stamp;
-    app.asset_amp.amp.clear();
-    // Buckets are indexed by source frame ON THE PROJECT CLOCK - the
-    // same conversion render_mix plays with (frames / mix.fps), so the
-    // drawn silhouette lines up with what sounds. Bucketing at the
-    // asset's own rate time-stretches the picture of a mismatched-rate
-    // asset against its audio.
-    const double fps = project_fps(app.document, app.bundles);
-    for (const auto& [asset_id, pcm] : app.pcm_cache) {
-        if (!pcm || pcm->rate == 0 || pcm->channels == 0 ||
-            pcm->samples.empty())
-            continue;
-        const uint64_t pcm_frames = pcm->frames();
-        const uint32_t frames = static_cast<uint32_t>(
-            pcm_frames * fps / pcm->rate) + 1;
-        std::vector<float> amp(frames, 0.0f);
-        const uint32_t ch = pcm->channels;
-        for (uint64_t s = 0; s < pcm_frames; ++s) {
-            int32_t peak = 0;
-            for (uint32_t c = 0; c < ch; ++c)
-                peak = std::max(peak, std::abs(static_cast<int32_t>(
-                                    pcm->samples[s * ch + c])));
-            const uint32_t f = static_cast<uint32_t>(
-                s * fps / pcm->rate);
-            if (f < frames)
-                amp[f] = std::max(amp[f],
-                                  static_cast<float>(peak) / 32768.0f);
-        }
-        app.asset_amp.amp.emplace(asset_id, std::move(amp));
+// The end-state waveform of a placed target: its own submix rendered
+// through the audio program and folded into a peak pyramid. Returns
+// the last FINISHED pyramid (null while the first render is in
+// flight); a stale key relaunches the render on a helper thread, so
+// edits land in the picture a beat after they land in the sound.
+const media::WavePyramid* tl_wave_of(AppState& app, uint64_t target,
+                                     double* out_fps) {
+    AppState::WaveEntry& e = app.wave_cache[target];
+    if (e.job && e.job->done.load()) {
+        e.pyr = std::move(e.job->pyr);
+        e.key = e.job_key;
+        e.job.reset();
     }
+    const uint64_t want = hash_combine(
+        hash_combine(app.document.revision, app.bundle_stamp), target);
+    if (e.key != want && (!e.job || e.job_key != want)) {
+        e.job.reset();   // cancels between chunks; the join is short
+        double efps = doc::entity_fps(app.document, target);
+        if (efps <= 0.0) efps = project_fps(app.document, app.bundles);
+        uint32_t span = 0;
+        if (const doc::Look* l = app.document.find_look(target))
+            span = doc::look_duration(app.document, *l);
+        else if (const doc::Sequence* s =
+                     app.document.find_sequence(target))
+            span = doc::sequence_duration(app.document, *s);
+        const uint32_t rate = app.player.audio_sample_rate();
+        media::MixState mix =
+            build_mix(app.document, target, app.pcm_cache, efps, rate,
+                      app.player.audio_channels());
+        e.fps = efps;
+        e.job_key = want;
+        auto job = std::make_unique<AppState::WaveJob>();
+        AppState::WaveJob* raw = job.get();
+        const int64_t s1 = media::frame_to_sample(
+            static_cast<double>(std::max<uint32_t>(span, 1)), efps,
+            static_cast<double>(rate ? rate : 48000));
+        job->thread = std::thread([raw, mix = std::move(mix), s1] {
+            media::build_wave_pyramid(mix, 0, s1, 64, &raw->pyr,
+                                      &raw->cancel);
+            raw->done.store(true);
+        });
+        e.job = std::move(job);
+    }
+    *out_fps = e.fps;
+    return e.pyr.levels.empty() ? nullptr : &e.pyr;
+}
+
+// Card preview traces are this many columns wide (the card's inner
+// width at zoom 1); the draw stretches them to the zoomed rect.
+constexpr uint32_t kCardWaveCols = 176;
+
+// Keeps the scoped look's audio-card envelopes current: harvests a
+// finished job, launches a fresh one when the document moved. Each
+// audio effect's op node renders its input-sum and output envelopes
+// through the same program the mix plays.
+void refresh_card_waves(AppState& app) {
+    AppState::CardWaves& cw = app.card_waves;
+    if (cw.job && cw.job->done.load()) {
+        cw.traces = std::move(cw.job->traces);
+        cw.key = cw.job_key;
+        cw.job.reset();
+    }
+    const doc::Look* look = app.document.find_look(app.scope_look);
+    if (!look) return;
+    bool any_audio = false;
+    for (const doc::Layer& l : look->layers)
+        for (const doc::EffectInstance& fx : l.stack)
+            if (doc::is_audio_effect(fx.type)) any_audio = true;
+    if (!any_audio) {
+        cw.traces.clear();
+        cw.key = ~0ull;
+        cw.job.reset();
+        return;
+    }
+    const uint64_t want = hash_combine(
+        hash_combine(app.document.revision, app.bundle_stamp),
+        app.scope_look);
+    if (cw.key == want || (cw.job && cw.job_key == want)) return;
+    cw.job.reset();
+    double efps = doc::entity_fps(app.document, app.scope_look);
+    if (efps <= 0.0) efps = project_fps(app.document, app.bundles);
+    const uint32_t rate = app.player.audio_sample_rate();
+    std::unordered_map<uint64_t, int> doc_nodes;
+    media::MixState mix =
+        build_mix(app.document, app.scope_look, app.pcm_cache, efps,
+                  rate, app.player.audio_channels(), &doc_nodes);
+    // Only the scoped look's own audio effects get cards; nested ops
+    // in the map render nothing.
+    std::vector<std::pair<uint64_t, int>> targets;
+    for (const doc::Layer& l : look->layers)
+        for (const doc::EffectInstance& fx : l.stack)
+            if (doc::is_audio_effect(fx.type)) {
+                const auto it = doc_nodes.find(fx.id);
+                if (it != doc_nodes.end())
+                    targets.push_back({fx.id, it->second});
+            }
+    const uint32_t span =
+        std::max<uint32_t>(doc::look_duration(app.document, *look), 1);
+    const int64_t s1 = media::frame_to_sample(
+        static_cast<double>(span), efps,
+        static_cast<double>(rate ? rate : 48000));
+    cw.job_key = want;
+    auto job = std::make_unique<AppState::CardWaveJob>();
+    AppState::CardWaveJob* raw = job.get();
+    job->thread = std::thread(
+        [raw, mix = std::move(mix), targets = std::move(targets), s1] {
+            for (const auto& [fx_id, node] : targets) {
+                if (raw->cancel.load(std::memory_order_relaxed)) break;
+                AppState::CardTrace t;
+                media::render_node_envelopes(mix, node, 0, s1,
+                                             kCardWaveCols, &t.in,
+                                             &t.out);
+                raw->traces.emplace(fx_id, std::move(t));
+            }
+            raw->done.store(true);
+        });
+    cw.job = std::move(job);
 }
 
 // The look wrapping an asset: a lone media node is the simplest look, so raw media
@@ -7530,9 +7650,14 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
         creating && path.size() >= 3 &&
         near_px(to_px(path[0].ax, path[0].ay));
     frame.canvas.push_clip(node.rect);
-    for (size_t i = 0; i + 3 < poly.size(); i += 2)
-        frame.canvas.draw_line(to_px(poly[i], poly[i + 1]),
-                               to_px(poly[i + 2], poly[i + 3]), 1.5f, ac);
+    if (poly.size() >= 4) {
+        std::vector<Vec2> ppts(poly.size() / 2);
+        for (size_t i = 0; i + 1 < poly.size(); i += 2)
+            ppts[i / 2] = to_px(poly[i], poly[i + 1]);
+        frame.canvas.draw_polyline(ppts.data(),
+                                   static_cast<int>(ppts.size()), 1.5f,
+                                   ac);
+    }
     if (creating && !path.empty())
         frame.canvas.draw_line(
             to_px(path.back().ax, path.back().ay),
@@ -9001,137 +9126,46 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 }
 
-// Audio strip: loudness silhouette from the import analysis (the
-// same per-frame band curves the mod sources read), onset ticks on the top
-// edge, scene cuts as full-height lines — keyframing gets the material's
-// rhythm in view without touching PCM.
-struct AudioStripUser {
-    AppState* app;
-    const mod::AnalysisCurves* curves;
-    uint32_t frame_count;
-    uint32_t playhead;
-    double v0, v1;
-};
-
-// 64 frames per acceleration block: coarse enough that a whole-media span
-// costs span/64 block reads, fine enough that partial edges stay cheap.
-constexpr uint32_t kStripBlock = 64;
-
-void draw_audio_strip(ui::LayoutNode& node, ui::LayoutFrame& frame) {
-    auto* u = static_cast<AudioStripUser*>(node.user);
-    const ui::Rect& r = node.rect;
-    const ui::Theme& theme = frame.theme;
-    frame.canvas.draw_sdf_rect(r, 2.0f, theme.control_bg_active);
-    if (u->frame_count == 0) return;
-    tl_extend_rect(*u->app, r);
-    const double v0 = u->v0;
-    const double vspan = std::max(1.0, u->v1 - u->v0);
-    const auto& c = *u->curves;
-    const AppState::StripAccel& accel = u->app->strip_accel;
-    // Max over [f0, f1): per-frame at the partial edges, per-block inside.
-    // Frames past the curve clamp to its last value (same as sample()).
-    auto span_max = [](const float* fr, size_t frn,
-                       const std::vector<float>& blocks, uint32_t f0,
-                       uint32_t f1) -> float {
-        if (!frn) return 0.0f;
-        float m = 0.0f;
-        if (f1 > frn) {
-            m = fr[frn - 1];
-            f1 = static_cast<uint32_t>(frn);
-        }
-        if (f0 >= f1) return m;
-        const uint32_t first_full =
-            (f0 + kStripBlock - 1) / kStripBlock * kStripBlock;
-        const uint32_t last_full = f1 / kStripBlock * kStripBlock;
-        if (first_full >= last_full) {
-            for (uint32_t f = f0; f < f1; ++f) m = std::max(m, fr[f]);
-            return m;
-        }
-        for (uint32_t f = f0; f < first_full; ++f) m = std::max(m, fr[f]);
-        for (uint32_t b = first_full / kStripBlock;
-             b < last_full / kStripBlock; ++b)
-            m = std::max(m, blocks[b]);
-        for (uint32_t f = last_full; f < f1; ++f) m = std::max(m, fr[f]);
-        return m;
-    };
-    frame.canvas.push_clip(r);
-    const float cy = r.y + r.h * 0.5f;
-    const int cols = std::max(1, static_cast<int>(r.w));
-    for (int i = 0; i < cols; ++i) {
-        // Per-column MAX over the covered frames — averaging (or point
-        // sampling) would swallow one-frame onsets when zoomed out.
-        const double fa = v0 + static_cast<double>(i) / cols * vspan;
-        const double fb = v0 + static_cast<double>(i + 1) / cols * vspan;
-        const uint32_t f0 = static_cast<uint32_t>(std::max(0.0, fa));
-        const uint32_t f1 = std::min(
-            u->frame_count,
-            std::max(f0 + 1, static_cast<uint32_t>(std::max(0.0, fb))));
-        const float amp = span_max(accel.amp_frame.data(),
-                                   accel.amp_frame.size(), accel.amp, f0, f1);
-        const float onset =
-            span_max(c.onset.data(), c.onset.size(), accel.onset, f0, f1);
-        const float cut =
-            span_max(c.cut.data(), c.cut.size(), accel.cut, f0, f1);
-        const float x = r.x + static_cast<float>(i) + 0.5f;
-        if (cut > 0.5f)
-            frame.canvas.draw_line({x, r.y}, {x, r.bottom()}, 1.0f,
-                                   theme.text_dim.with_alpha(0.8f));
-        const float h =
-            std::max(1.0f, amp * (r.h * 0.5f - 1.0f));
-        frame.canvas.draw_line({x, cy - h}, {x, cy + h}, 1.0f,
-                               theme.accent_dim.with_alpha(0.6f));
-        if (onset > 0.5f)
-            frame.canvas.draw_line({x, r.y}, {x, r.y + 4.0f}, 1.0f,
-                                   theme.accent);
-    }
-    const float px = tl_x_of(r, v0, vspan, u->playhead + 0.5);
-    frame.canvas.draw_line({px, r.y}, {px, r.bottom()}, 1.0f,
-                           theme.accent.with_alpha(0.5f));
-    frame.canvas.pop_clip();
-}
-
 // ---- timeline block lanes
 //
 // The scoped SEQUENCE's placements as BLOCKS, one display row per video
 // lane (topmost lane composites last) plus one per audio track. A scoped
 // look is timeless and shows no block lanes at all.
 
-// One audio contributor inside a block: samples the per-asset amp array
-// through the block's (possibly nested) time map. `outer` is the block
-// layer's placement in scoped-local time; `inner` is a flattened media
-// placement in the referenced look's local time (nested blocks only).
-struct TlAmpSrc {
-    const std::vector<float>* amp = nullptr;
-    doc::Placement outer;
-    doc::MediaInstance inner;
-    bool nested = false;
-    float gain = 1.0f;
-    // The block's hop ratio (target frames per lane frame) and the
-    // target-clock -> amp-bucket rescale (project fps / target fps).
-    double ratio = 1.0;
-    double amp_scale = 1.0;
-};
-
-inline float tl_amp_sample(const TlAmpSrc& s, double local) {
-    double af;
-    if (s.nested) {
-        const double rl =
-            doc::placement_source_frame(s.outer, local, s.ratio);
-        if (!doc::media_active(s.inner, rl)) return 0.0f;
-        // Amp buckets are PROJECT-CLOCK-indexed over the asset's audio,
-        // so the media-frame shift converts through the rate and the
-        // target's own clock rescales onto the bucket grid.
-        af = doc::media_source_frame(s.inner, rl) +
-             (s.inner.rate > 0.0
-                  ? static_cast<double>(s.inner.shift) / s.inner.rate
-                  : static_cast<double>(s.inner.shift));
-    } else {
-        af = doc::placement_source_frame(s.outer, local, s.ratio);
+// Min/max of a target's wave pyramid over TARGET-LOCAL frames [t0, t1):
+// picks the level at or just below the span so every covered bucket is
+// read - exact envelopes at any zoom, no point-sampling aliasing.
+// Values come back in raw s16 scale.
+inline bool tl_wave_span(const media::WavePyramid& p, double fps,
+                         double t0, double t1, float* lo, float* hi) {
+    if (p.levels.empty() || p.rate == 0 || fps <= 0.0) return false;
+    const double spf = static_cast<double>(p.rate) / fps;
+    int64_t s0 = static_cast<int64_t>(t0 * spf) - p.start;
+    int64_t s1 = static_cast<int64_t>(t1 * spf) - p.start;
+    if (s1 <= s0) s1 = s0 + 1;
+    if (s1 <= 0) return false;
+    s0 = std::max<int64_t>(s0, 0);
+    const int64_t span = s1 - s0;
+    size_t lvl = 0;
+    int64_t bucket = static_cast<int64_t>(p.base);
+    while (lvl + 1 < p.levels.size() && bucket * 4 <= span) {
+        bucket *= 4;
+        ++lvl;
     }
-    af *= s.amp_scale;
-    if (af < 0.0 || s.amp->empty()) return 0.0f;
-    const size_t idx = std::min(static_cast<size_t>(af), s.amp->size() - 1);
-    return (*s.amp)[idx] * s.gain;
+    const std::vector<media::WaveSpan>& L = p.levels[lvl];
+    const int64_t i0 = s0 / bucket;
+    if (i0 >= static_cast<int64_t>(L.size())) return false;
+    const int64_t i1 = std::min<int64_t>(
+        (s1 + bucket - 1) / bucket, static_cast<int64_t>(L.size()));
+    float flo = 3.4e38f, fhi = -3.4e38f;
+    for (int64_t i = i0; i < i1; ++i) {
+        flo = std::min(flo, L[static_cast<size_t>(i)].lo);
+        fhi = std::max(fhi, L[static_cast<size_t>(i)].hi);
+    }
+    if (flo > fhi) return false;
+    *lo = flo;
+    *hi = fhi;
+    return true;
 }
 
 struct TlBlock {
@@ -9147,8 +9181,12 @@ struct TlBlock {
     // The nesting hop's clock ratio (target frames per lane frame):
     // every end/trim computation converts through it.
     double hop_ratio = 1.0;
-    TlAmpSrc* srcs = nullptr;     // arena; empty = the block is silent
-    size_t src_count = 0;
+    // End-state waveform: the target's own rendered submix as a peak
+    // pyramid, mapped through the block's time map at draw. Null = the
+    // block is silent (or its first render is still in flight).
+    const media::WavePyramid* wave = nullptr;
+    double wave_fps = 30.0;   // the target clock the pyramid rides
+    float wave_gain = 1.0f;   // track * placement gain
     // Filmstrip: the asset's thumbnail strip mapped through source frames.
     const ui::UiTexture* thumbs = nullptr;
     uint32_t asset_frames = 0;
@@ -9235,31 +9273,47 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 br, b.thumbs, tu0, 0.0f, tu1, 1.0f,
                 ui::Color{1.0f, 1.0f, 1.0f, 0.55f}, 3.0f);
         }
-        // AUDIO: silhouette along the bottom third — drawn ONLY when the
-        // block's source tree actually holds PCM. A look built from
-        // shapes and gradients shows nothing here, which is the whole
-        // point: a silent block must not read as having audio. The band
-        // gets its own dark backing so it stays legible over a filmstrip.
-        if (b.src_count > 0) {
-            const float ah = std::max(6.0f, br.h * 0.34f);
-            const ui::Rect band{br.x, br.bottom() - ah, br.w, ah};
+        // AUDIO: the target's END-STATE waveform (its rendered submix,
+        // DSP and sums included) filling the block - audio blocks have
+        // no filmstrip, so the wave owns the height. Drawn ONLY when
+        // the render produced sound, so a silent block must not read
+        // as having audio. Per column the pyramid gives the exact
+        // min/max over the covered samples, so zooming reveals detail
+        // instead of frame-bucket plateaus.
+        if (b.wave) {
+            const ui::Rect band{br.x, br.y + 1.0f, br.w, br.h - 2.0f};
             frame.canvas.draw_sdf_rect(band, 2.0f,
                                        theme.window_bg.with_alpha(0.72f));
-            const float ab = band.bottom() - 1.0f;
-            const float span = ah - 2.0f;
+            const float mid = band.y + band.h * 0.5f;
+            const float half = band.h * 0.5f - 1.0f;
             const float cx0 = std::max(br.x, r.x);
             const float cx1 = std::min(br.right(), r.right());
+            const float gscale = b.wave_gain / 32768.0f;
             for (float x = cx0; x < cx1; x += 1.0f) {
-                const double f =
+                const double f0 =
                     tl_frame_of(r, v0, vspan, x, 0.0, 1.0e18);
-                float amp = 0.0f;
-                for (size_t s = 0; s < b.src_count; ++s)
-                    amp = std::max(amp, tl_amp_sample(b.srcs[s], f));
-                const float h = std::min(amp, 1.0f) * span;
-                if (h > 0.4f)
-                    frame.canvas.draw_line({x + 0.5f, ab - h},
-                                           {x + 0.5f, ab}, 1.0f,
-                                           theme.accent.with_alpha(0.85f));
+                const double f1 =
+                    tl_frame_of(r, v0, vspan, x + 1.0f, 0.0, 1.0e18);
+                double t0 = doc::placement_source_frame(b.place, f0,
+                                                        b.hop_ratio);
+                double t1 = doc::placement_source_frame(b.place, f1,
+                                                        b.hop_ratio);
+                if (t1 < t0) std::swap(t0, t1);
+                float lo = 0.0f, hi = 0.0f;
+                if (!tl_wave_span(*b.wave, b.wave_fps, t0, t1, &lo, &hi))
+                    continue;
+                lo = std::clamp(lo * gscale, -1.0f, 1.0f);
+                hi = std::clamp(hi * gscale, -1.0f, 1.0f);
+                float y0 = mid - hi * half;
+                float y1 = mid - lo * half;
+                if (y1 - y0 < 1.0f) {
+                    const float c = (y0 + y1) * 0.5f;
+                    y0 = c - 0.5f;
+                    y1 = c + 0.5f;
+                }
+                frame.canvas.draw_line({x + 0.5f, y0}, {x + 0.5f, y1},
+                                       1.0f,
+                                       theme.accent.with_alpha(0.85f));
             }
         }
         // Source-kind cap + name + selection edge.
@@ -9643,21 +9697,20 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
     if (state.selected >= static_cast<int>(keys.size())) state.selected = -1;
 
-    // Sampled curve (over the visible range only).
+    // Sampled curve (over the visible range only), one polyline so the
+    // stroke stays continuous through every sample joint.
     if (!keys.empty()) {
         const int steps = std::max(2, static_cast<int>(r.w / 3.0f));
-        Vec2 prev{};
+        std::vector<Vec2> cpts(static_cast<size_t>(steps) + 1);
         for (int i = 0; i <= steps; ++i) {
             const double f = v0 + static_cast<double>(i) / steps * vspan;
             const float v = std::clamp(mod::eval_lane(*u->lane, f),
                                        u->min_value, u->max_value);
-            const Vec2 p{to_x(f), to_y(v)};
-            if (i > 0)
-                frame.canvas.draw_line(
-                    prev, p, 1.0f,
-                    theme.accent_dim.with_alpha(lane_alpha));
-            prev = p;
+            cpts[static_cast<size_t>(i)] = {to_x(f), to_y(v)};
         }
+        frame.canvas.draw_polyline(
+            cpts.data(), steps + 1, 1.0f,
+            theme.accent_dim.with_alpha(lane_alpha));
     }
 
     // Value axis: range labels so a key's height means something.
@@ -10701,22 +10754,74 @@ static const bool kSrcAddIsLook[] = {false, false, false, false,
 constexpr int kSrcAddCount =
     static_cast<int>(sizeof(kSrcAddLabels) / sizeof(kSrcAddLabels[0]));
 
-// Popup value-node entries: each spawns an
-// unconnected value node at the click point — wiring happens by dragging
-// its out port onto a param row (or a helper node's input row). Order
-// here MUST match the pick handler's walk.
+// Value-node FAMILIES: one node type per PORT SHAPE. The card's kind
+// dropdown swaps the maths INSIDE its family only - a kind can never
+// change the node itself, so wires cannot drop or appear under a
+// dropdown edit. The media-wired measurements are ONE generic
+// "analysis" node whose kind picks the measurement; families with a
+// single kind show no kind row at all.
+struct ModFamily {
+    const char* title;                // the card's name (generic node)
+    const doc::ModSourceType* kinds;  // dropdown order
+    int count;
+    const char* options;              // family-local dropdown labels
+};
+static const doc::ModSourceType kFamGenerator[] = {
+    doc::ModSourceType::Lfo, doc::ModSourceType::Drift};
+static const doc::ModSourceType kFamAnalysis[] = {
+    doc::ModSourceType::AudioLow,  doc::ModSourceType::AudioMid,
+    doc::ModSourceType::AudioHigh, doc::ModSourceType::AudioOnset,
+    doc::ModSourceType::Beat,      doc::ModSourceType::LfoBeat,
+    doc::ModSourceType::Envelope};
+static const doc::ModSourceType kFamVideo[] = {
+    doc::ModSourceType::VideoMotion,
+    doc::ModSourceType::VideoBrightness,
+    doc::ModSourceType::VideoCut};
+static const doc::ModSourceType kFamSampler[] = {
+    doc::ModSourceType::VideoSample, doc::ModSourceType::VideoRegion};
+static const doc::ModSourceType kFamMath[] = {doc::ModSourceType::Math};
+static const doc::ModSourceType kFamNorm[] = {
+    doc::ModSourceType::Normalise};
+static const doc::ModSourceType kFamCamera[] = {
+    doc::ModSourceType::Camera};
+static const ModFamily kModFamilies[] = {
+    {"generator", kFamGenerator, 2, "lfo|drift"},
+    {"analysis", kFamAnalysis, 7,
+     "low|mid|high|onset|beat|beat lfo|envelope"},
+    {"video", kFamVideo, 3, "motion|bright|cut"},
+    {"sampler", kFamSampler, 2, "sample|region"},
+    {"math", kFamMath, 1, "math"},
+    {"norm", kFamNorm, 1, "norm"},
+    {"camera", kFamCamera, 1, "camera"},
+};
+static_assert(2 + 7 + 3 + 2 + 1 + 1 + 1 ==
+                  static_cast<size_t>(doc::ModSourceType::Count),
+              "every mod kind lives in exactly one family");
+// The family holding a kind, and the kind's index inside it.
+static const ModFamily& mod_family_of(doc::ModSourceType t, int* local) {
+    for (const ModFamily& f : kModFamilies)
+        for (int i = 0; i < f.count; ++i)
+            if (f.kinds[i] == t) {
+                if (local) *local = i;
+                return f;
+            }
+    if (local) *local = 0;
+    return kModFamilies[0];
+}
+
+// Popup value-node entries: ONE per family, spawning its default kind
+// unconnected at the click point — wiring happens by dragging its out
+// port onto a param row (or a helper node's input row). Order here
+// MUST match the pick handler's walk.
 static const char* kValAddLabels[] = {
-    "value: lfo",       "value: random",  "value: audio low",
-    "value: audio mid", "value: audio high", "value: onset",
-    "value: motion",    "value: bright",  "value: sample",
-    "value: region",    "value: math",    "value: normalise"};
+    "value: generator", "value: analysis", "value: video",
+    "value: sampler",   "value: math",     "value: normalise",
+    "value: camera"};
 static const doc::ModSourceType kValAddTypes[] = {
-    doc::ModSourceType::Lfo,        doc::ModSourceType::Drift,
-    doc::ModSourceType::AudioLow,   doc::ModSourceType::AudioMid,
-    doc::ModSourceType::AudioHigh,  doc::ModSourceType::AudioOnset,
-    doc::ModSourceType::VideoMotion, doc::ModSourceType::VideoBrightness,
-    doc::ModSourceType::VideoSample, doc::ModSourceType::VideoRegion,
-    doc::ModSourceType::Math,       doc::ModSourceType::Normalise};
+    doc::ModSourceType::Lfo,         doc::ModSourceType::AudioLow,
+    doc::ModSourceType::VideoMotion, doc::ModSourceType::VideoSample,
+    doc::ModSourceType::Math,        doc::ModSourceType::Normalise,
+    doc::ModSourceType::Camera};
 constexpr int kValAddCount =
     static_cast<int>(sizeof(kValAddLabels) / sizeof(kValAddLabels[0]));
 
@@ -10872,18 +10977,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     // Folded groups (subgraphs): members collapse into ONE card that
     // shows the exposed face; links crossing the boundary re-anchor there.
     std::unordered_set<uint64_t> emitted_groups;
-
-    static const char* kModNames[] = {"lfo",    "drift",  "a.low",
-                                      "a.mid",  "a.high", "onset",
-                                      "motion", "bright", "lfo.bpm",
-                                      "env",    "cut",    "beat",
-                                      "sample", "region", "math",
-                                      "norm",   "camera"};
-    constexpr size_t kModNameCount =
-        sizeof(kModNames) / sizeof(kModNames[0]);
-    static_assert(kModNameCount ==
-                      static_cast<size_t>(doc::ModSourceType::Count),
-                  "canvas mod-source names track the enum");
 
     const float kAutoX0 = 60.0f;
     const float kAutoPitch = flow::node_width() + 70.0f;
@@ -11534,7 +11627,43 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             en.bypass_clicked = act.bypass_changed;
             en.remove_clicked = act.remove;
             en.text_edit = fx.type == doc::EffectType::Text;
-            set_preview(en, fx.id);
+            if (doc::is_audio_effect(fx.type)) {
+                // Audio cards preview their SIGNAL: input sum vs
+                // output, from the audio program's envelopes. Missing
+                // traces (first render in flight, dormant node) draw
+                // the empty graph.
+                en.wave_card = true;
+                const auto wit = app.card_waves.traces.find(fx.id);
+                if (wit != app.card_waves.traces.end() &&
+                    !wit->second.out.empty()) {
+                    const AppState::CardTrace& tr = wit->second;
+                    const int n = static_cast<int>(tr.out.size());
+                    float* wi = arena.alloc<float>(
+                        static_cast<size_t>(n) * 2);
+                    float* wo = arena.alloc<float>(
+                        static_cast<size_t>(n) * 2);
+                    for (int c = 0; c < n; ++c) {
+                        const float s = 1.0f / 32768.0f;
+                        wi[c * 2] = std::clamp(
+                            tr.in[static_cast<size_t>(c)].lo * s, -1.0f,
+                            1.0f);
+                        wi[c * 2 + 1] = std::clamp(
+                            tr.in[static_cast<size_t>(c)].hi * s, -1.0f,
+                            1.0f);
+                        wo[c * 2] = std::clamp(
+                            tr.out[static_cast<size_t>(c)].lo * s, -1.0f,
+                            1.0f);
+                        wo[c * 2 + 1] = std::clamp(
+                            tr.out[static_cast<size_t>(c)].hi * s, -1.0f,
+                            1.0f);
+                    }
+                    en.wave_in = wi;
+                    en.wave_out = wo;
+                    en.wave_count = n;
+                }
+            } else {
+                set_preview(en, fx.id);
+            }
             if (fx.node_x != 0.0f || fx.node_y != 0.0f) {
                 en.x = fx.node_x;
                 en.y = fx.node_y;
@@ -11729,16 +11858,11 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             rows[slot].released = nr.slot_released[si];
             ++slot;
         };
-        static const std::string kModOptions = [] {
-            std::string s;
-            for (size_t i = 0; i < kModNameCount; ++i) {
-                if (i) s += '|';
-                s += kModNames[i];
-            }
-            return s;
-        }();
-        pick_row(0, "kind", kModOptions.c_str(),
-                 static_cast<int>(vn.source.type));
+        // The kind dropdown offers this node's FAMILY only (the maths,
+        // never the ports); one-kind families skip the row.
+        int fam_local = 0;
+        const ModFamily& fam = mod_family_of(vn.source.type, &fam_local);
+        if (fam.count > 1) pick_row(0, "kind", fam.options, fam_local);
         const bool is_lfo = vn.source.type == doc::ModSourceType::Lfo ||
                             vn.source.type == doc::ModSourceType::LfoBeat;
         const bool is_pulse =
@@ -11875,25 +11999,31 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         flow::Node rn{};
         rn.id = flow::node_id(flow::NodeKind::ModSource, vn.id);
         rn.kind = flow::NodeKind::ModSource;
-        rn.title = kModNames[static_cast<size_t>(vn.source.type) %
-                             kModNameCount];
+        rn.title = fam.title;
         rn.has_out = true;
         rn.rows = rows;
         rn.row_count = slot;
         rn.remove_clicked = nr.remove;
         // Scope strip: the node's OUTPUT (helper chain included) over
         // the next few seconds from the playhead. Video-sampling nodes
-        // skip it - a flat 0 plot would misreport the render.
+        // skip it - a flat 0 plot would misreport the render. The
+        // window start QUANTIZES to the sample step so the grid stays
+        // stationary in signal time: a free-running window slides the
+        // sample comb across the signal and every edge crawls between
+        // columns (temporal aliasing the eye reads as jitter); anchored,
+        // the plot scrolls in whole columns. Per-pixel density keeps
+        // the column quantum at ~1px.
         if (!is_video) {
-            constexpr int kScopeN = 96;
+            constexpr int kScopeN = 192;
             constexpr double kScopeSeconds = 4.0;
             float* samples = arena.alloc<float>(kScopeN);
             float lo = 0.0f, hi = 1.0f;
             mod::ValueEnv senv = venv;
+            const double step =
+                kScopeSeconds * live_fps / (kScopeN - 1);
+            const double base = std::floor(play_frame / step) * step;
             for (int si = 0; si < kScopeN; ++si) {
-                const double f =
-                    play_frame +
-                    kScopeSeconds * live_fps * si / (kScopeN - 1);
+                const double f = base + step * si;
                 senv.t = f / live_fps;
                 senv.frame = static_cast<uint32_t>(f);
                 samples[si] = mod::eval_value_node(senv, vn.id);
@@ -16168,7 +16298,7 @@ void draw_settings(ui::Canvas2D& canvas, const ui::Font& font,
 // fills the target-entity name (lane_name when no target resolves),
 // the pick outline, and the staged/changed/released/pressed/ctx
 // wiring; returns whether the target is a sequence. Kind fields,
-// filmstrip, silhouette, and the out record pushes stay with the
+// filmstrip, waveform, and the out record pushes stay with the
 // caller.
 bool tl_block_core(AppState& app, ui::LayoutArena& arena,
                    const doc::Sequence& seq, const doc::Placement& place,
@@ -16374,7 +16504,6 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     // ---- BLOCK LANES: the scoped sequence's video lanes, one row per
     // lane, topmost lane composites last. A scoped LOOK is timeless -
     // no block lanes, its ruler and keyframe rows are the whole editor.
-    refresh_asset_amp(app);
     if (seq_scope) {
         const doc::Sequence& seq = app.sequence();
         struct LaneBuild {
@@ -16408,7 +16537,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 b.kind = is_seq_target ? 2 : 0;
                 const uint64_t strip_asset = wrapped_asset(place.target);
                 // Sound rides AUDIO lanes: a video block draws no
-                // silhouette - its linked audio block does. Filmstrip:
+                // waveform - its linked audio block does. Filmstrip:
                 // the wrapped asset's own strip, mapped through the
                 // placement.
                 if (strip_asset) {
@@ -16508,7 +16637,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         }
 
         // ---- AUDIO LANES: real tracks holding real placements - the
-        // silhouette is display, the lane is not. Order is display only
+        // waveform is display, the lane is not. Order is display only
         // (summing commutes), so no reversal.
         for (size_t ai = 0; ai < seq.audio.size(); ++ai) {
             const doc::AudioTrack& track = seq.audio[ai];
@@ -16520,44 +16649,20 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 tl_block_core(app, arena, seq, place, track.name,
                               ruler_user->trim_out, &b);
                 b.kind = 0;
-                // The silhouette: the target entity's whole submix
-                // through this placement's time map - a look sounds like
-                // its media in lockstep, a sequence like its tracks.
-                std::vector<TlAmpSrc> srcs;
+                // The waveform: the target entity's OWN rendered
+                // submix (the audio program end-state) through this
+                // placement's time map - what the block actually
+                // sounds like, not its raw material.
                 const float pgain =
                     (track.mute || place.audio_mute)
                         ? 0.0f
                         : std::max(track.gain, 0.0f) *
                               std::max(place.audio_gain, 0.0f);
                 if (pgain > 0.0f && place.target) {
-                    for (const doc::MediaInstance& c :
-                         doc::flatten_audio_sources(app.document,
-                                                    place.target)) {
-                        if (c.gain <= 0.0f) continue;
-                        auto it = app.asset_amp.amp.find(c.asset);
-                        if (it == app.asset_amp.amp.end()) continue;
-                        TlAmpSrc s;
-                        s.amp = &it->second;
-                        s.outer = place;
-                        s.inner = c;
-                        s.nested = true;
-                        s.gain = c.gain * pgain;
-                        s.ratio = b.hop_ratio;
-                        const double tfps = doc::entity_fps(
-                            app.document, place.target);
-                        s.amp_scale =
-                            tfps > 0.0
-                                ? project_fps(app.document, app.bundles) /
-                                      tfps
-                                : 1.0;
-                        srcs.push_back(s);
-                    }
-                }
-                if (!srcs.empty()) {
-                    b.srcs = arena.alloc<TlAmpSrc>(srcs.size());
-                    for (size_t s = 0; s < srcs.size(); ++s)
-                        b.srcs[s] = srcs[s];
-                    b.src_count = srcs.size();
+                    double wfps = 30.0;
+                    b.wave = tl_wave_of(app, place.target, &wfps);
+                    b.wave_fps = wfps;
+                    b.wave_gain = pgain;
                 }
                 out.block_stages.push_back(
                     {0, place.id, b.staged, b.changed, b.released});
@@ -16631,55 +16736,6 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                                      stage.lock_clicked, alock_opts)})),
                  widget}));
         }
-    }
-
-    // Analysis strip: loudness + onsets + cuts from the import analysis,
-    // aligned to the same view range — keyframe against the material.
-    if (app.has_analysis &&
-        (!app.analysis.low.empty() || !app.analysis.onset.empty())) {
-        if (app.strip_accel.stamp != app.analysis_stamp) {
-            const mod::AnalysisCurves& c = app.analysis;
-            AppState::StripAccel& a = app.strip_accel;
-            const size_t n = std::max(
-                {c.low.size(), c.mid.size(), c.high.size()});
-            a.amp_frame.assign(n, 0.0f);
-            for (size_t f = 0; f < n; ++f) {
-                const uint32_t fi = static_cast<uint32_t>(f);
-                a.amp_frame[f] = std::max({c.sample(c.low, fi),
-                                           c.sample(c.mid, fi),
-                                           c.sample(c.high, fi)});
-            }
-            auto block_max = [](const std::vector<float>& fr,
-                                std::vector<float>& out) {
-                out.assign((fr.size() + kStripBlock - 1) / kStripBlock,
-                           0.0f);
-                for (size_t f = 0; f < fr.size(); ++f)
-                    out[f / kStripBlock] =
-                        std::max(out[f / kStripBlock], fr[f]);
-            };
-            block_max(a.amp_frame, a.amp);
-            block_max(c.onset, a.onset);
-            block_max(c.cut, a.cut);
-            a.stamp = app.analysis_stamp;
-        }
-        auto* strip_user = arena.alloc<AudioStripUser>();
-        strip_user->app = &app;
-        strip_user->curves = &app.analysis;
-        strip_user->frame_count = frame_count;
-        strip_user->playhead = playhead;
-        strip_user->v0 = v0;
-        strip_user->v1 = v1;
-        LayoutNode* strip = make_node(arena, NodeKind::Leaf);
-        strip->width = SizeSpec::fill();
-        strip->height = SizeSpec::fixed(16.0f);
-        strip->user = strip_user;
-        strip->draw_fn = draw_audio_strip;
-        rows.push_back(
-            HStack(arena, {6.0f},
-                   {SizedBox(arena, SizeSpec::fixed(150),
-                             SizeSpec::fixed(16.0f),
-                             Label(arena, "analysis", small_dim)),
-                    strip}));
     }
 
     // Lanes shown: only LIVE targets (a deleted node's lanes keep their
@@ -21975,6 +22031,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         // Node canvas: graph + events built before
         // the panels so the rail and the canvas share one selection.
+        refresh_card_waves(app);
         FlowBuild flow_ui = build_flow(arena, app, frame_ui, thumb_tex,
                                        thumb_view.thumb_img
                                            ? &thumb_view.thumb_cells
@@ -26570,13 +26627,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 doc::find_value_node(app.look(), row.id);
             if (!vn) continue;
             if (row.pick_changed[0] && *row.pick_changed[0]) {
+                // The kind row is FAMILY-LOCAL: the pick maps back
+                // through the node's family, so a dropdown edit can
+                // only ever swap the maths, never the node's ports.
                 const int sel = static_cast<int>(
                     *row.pick_staged[0] + 0.5f);
-                if (sel >= 0 &&
-                    sel < static_cast<int>(MST::Count) &&
-                    sel != static_cast<int>(vn->source.type)) {
+                int cur_local = 0;
+                const ModFamily& fam =
+                    mod_family_of(vn->source.type, &cur_local);
+                if (sel >= 0 && sel < fam.count && sel != cur_local) {
                     doc::ValueNode n = *vn;
-                    n.source.type = static_cast<MST>(sel);
+                    n.source.type = fam.kinds[sel];
                     app.undo.execute(app.document,
                                      doc::set_value_node_command(app.scope_look,n));
                 }

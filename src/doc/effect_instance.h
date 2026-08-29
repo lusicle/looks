@@ -132,9 +132,9 @@ enum class EffectType : uint32_t {
     // AUDIO MODIFIERS: nodes that transform the VOICE and pass the image
     // through untouched (the inverse of every effect above). They ride
     // the same stack/card/link machinery but never reach the image
-    // graph - the compiler routes around them and the audio flatten
-    // collects them into per-instance DSP op lists. New audio types
-    // append INSIDE this span (is_audio_effect is a range test).
+    // graph - the compiler routes around them and the audio program
+    // lands them as op nodes processing their summed fan-in. New audio
+    // types append INSIDE this span (is_audio_effect is a range test).
     AudioGain,         // linear level
     AudioBitcrush,     // amplitude quantize to N bits
     AudioDownsample,   // sample-and-hold rate crush

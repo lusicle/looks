@@ -1,6 +1,7 @@
 #include "media/audio_mix.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -11,7 +12,6 @@ namespace looks::media {
 
 namespace {
 
-constexpr int kFirTaps = 63;      // odd: symmetric kernel, exact center
 constexpr int kDelayTapMax = 12;  // echoes below ~-48 dB truncate anyway
 // Base fetches per output sample per channel: bounds chained wide ops
 // (filter-into-filter) deterministically instead of letting a
@@ -34,16 +34,6 @@ float fetch_pcm(const PcmBuffer& pcm, int64_t pcm_frames, double pos,
         base[static_cast<size_t>(i1) * pcm.channels + sc]);
     return v0 + (v1 - v0) * frac;
 }
-
-// Per-source render context; FIR kernels build once per call (filters
-// are the only op with derived coefficients), on the stack - the
-// monitor callback stays allocation-free.
-struct VoiceCtx {
-    const MixSource* src = nullptr;
-    const PcmBuffer* pcm = nullptr;
-    int64_t pcm_frames = 0;
-    float fir[kMaxMixOps][kFirTaps];
-};
 
 // Windowed-sinc (Hann) lowpass, unity DC; highpass by spectral
 // inversion of the same kernel.
@@ -71,23 +61,53 @@ void build_fir(const MixOp& op, float* w) {
     }
 }
 
-// The op chain's value at fractional source frame `pos`, channel k, in
-// raw s16 units; op < 0 is the PCM itself. PURE: every op is a function
-// of absolute position - delay taps, sample holds and FIR windows
-// RE-READ upstream at shifted positions instead of carrying state - so
-// any chunking mixes the same bytes and preview equals export. `budget`
-// counts base fetches; exhaustion silences the deepest taps
-// deterministically.
-float eval_voice(const VoiceCtx& ctx, int op, double pos, uint32_t k,
-                 int& budget) {
-    if (op < 0) {
+float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
+                int& budget);
+
+// The sum of a node's inputs at output position `pos` - the signal an
+// op node processes and re-reads at shifted positions.
+float eval_inputs(const MixState& mix, const MixNode& n, double pos,
+                  uint32_t k, int& budget) {
+    float v = 0.0f;
+    for (int i : n.inputs) v += eval_node(mix, i, pos, k, budget);
+    return v;
+}
+
+// The program's value at fractional output sample `pos`, channel k, in
+// raw s16 units. PURE: every node is a function of absolute position -
+// delay taps, sample holds and FIR windows RE-READ the node's input sum
+// at shifted positions instead of carrying state - so any chunking
+// mixes the same bytes and preview equals export. `budget` counts leaf
+// fetches; exhaustion silences the deepest taps deterministically.
+float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
+                int& budget) {
+    const MixNode& n = mix.nodes[static_cast<size_t>(idx)];
+    float level = n.gain;
+    if (n.windowed) {
+        if (pos < n.s0 || pos >= n.s1) return 0.0f;
+        if (n.ramp > 0) {
+            const double edge =
+                std::min(pos - n.s0, n.s1 - 1.0 - pos);
+            if (edge < static_cast<double>(n.ramp))
+                level *= static_cast<float>(
+                    (edge + 1.0) / static_cast<double>(n.ramp + 1));
+        }
+    }
+    if (n.pcm) {
         if (budget <= 0) return 0.0f;
         --budget;
-        return fetch_pcm(*ctx.pcm, ctx.pcm_frames, pos, k);
+        const int64_t frames = static_cast<int64_t>(n.pcm->frames());
+        return fetch_pcm(*n.pcm, frames, n.A * pos + n.B, k) * level;
     }
-    const MixOp& o = ctx.src->ops[static_cast<size_t>(op)];
-    const float dry = eval_voice(ctx, op - 1, pos, k, budget);
+    float v = eval_inputs(mix, n, pos, k, budget);
+    if (!n.has_op) return v * level;
+    const MixOp& o = n.op;
+    const float dry = v;
     float fx = dry;
+    // Taps shift in NODE-LOCAL samples; La converts back to output
+    // positions. A frozen clock (La <= 0) has no time axis to tap
+    // along, so time-domain ops act pointwise.
+    const bool ticking = n.La > 1e-12;
     switch (o.kind) {
         case MixOpKind::Gain:
             fx = dry * o.p[0];
@@ -99,10 +119,12 @@ float eval_voice(const VoiceCtx& ctx, int op, double pos, uint32_t k,
             break;
         }
         case MixOpKind::Downsample: {
+            if (!ticking) break;
             const double hold =
                 static_cast<double>(std::max(1.0f, o.p[0]));
-            const double held = std::floor(pos / hold) * hold;
-            fx = eval_voice(ctx, op - 1, held, k, budget);
+            const double local = n.La * pos + n.Lb;
+            const double held = std::floor(local / hold) * hold;
+            fx = eval_inputs(mix, n, (held - n.Lb) / n.La, k, budget);
             break;
         }
         case MixOpKind::Distortion: {
@@ -112,32 +134,35 @@ float eval_voice(const VoiceCtx& ctx, int op, double pos, uint32_t k,
             break;
         }
         case MixOpKind::Delay: {
+            if (!ticking) break;
             const double d = std::max(
                 1.0, static_cast<double>(o.p[0]) / 1000.0 *
-                         static_cast<double>(ctx.pcm->rate));
+                         static_cast<double>(mix.rate));
             const float fb = std::clamp(o.p[1], 0.0f, 0.95f);
             float g = fb;
             for (int t = 1; t <= kDelayTapMax && g > (1.0f / 256.0f);
                  ++t, g *= fb)
-                fx += g * eval_voice(ctx, op - 1,
-                                     pos - d * static_cast<double>(t),
-                                     k, budget);
+                fx += g * eval_inputs(
+                             mix, n,
+                             pos - d * static_cast<double>(t) / n.La, k,
+                             budget);
             break;
         }
         case MixOpKind::Filter: {
-            const float* w = ctx.fir[op];
+            if (!ticking) break;
             const int half = kFirTaps / 2;
             float acc = 0.0f;
             for (int i = 0; i < kFirTaps; ++i)
-                acc += w[i] *
-                       eval_voice(ctx, op - 1,
-                                  pos + static_cast<double>(i - half), k,
-                                  budget);
+                acc += n.fir[i] *
+                       eval_inputs(mix, n,
+                                   pos + static_cast<double>(i - half) /
+                                             n.La,
+                                   k, budget);
             fx = acc;
             break;
         }
     }
-    return dry + (fx - dry) * o.wet;
+    return (dry + (fx - dry) * o.wet) * level;
 }
 
 }  // namespace
@@ -157,94 +182,244 @@ std::shared_ptr<const PcmBuffer> load_pcm(const std::filesystem::path& path,
     return buffer;
 }
 
+void prepare_mix(MixState& mix) {
+    const double fps = mix.fps > 0.0 ? mix.fps : 30.0;
+    const double rate = static_cast<double>(mix.rate ? mix.rate : 48000);
+    for (MixNode& n : mix.nodes) {
+        const double lf = n.local_fps > 0.0 ? n.local_fps : fps;
+        // Node-local sample position (the owning look's clock at the
+        // mix rate): local = La * s + Lb.
+        n.La = n.a * fps / lf;
+        n.Lb = n.b * rate / lf;
+        if (n.pcm && n.pcm->rate) {
+            const double pr = static_cast<double>(n.pcm->rate);
+            n.A = n.La * pr / rate;
+            n.B = n.Lb * pr / rate;
+        }
+        if (n.windowed) {
+            n.s0 = static_cast<double>(
+                frame_to_sample(std::max(n.w0, 0.0), fps, rate));
+            n.s1 = n.w1 >= kMixUnbounded * 0.5
+                       ? kMixUnbounded
+                       : static_cast<double>(
+                             frame_to_sample(n.w1, fps, rate));
+            int64_t r = kRampSamples;
+            if (n.s1 < kMixUnbounded)
+                r = std::min<int64_t>(
+                    r, static_cast<int64_t>((n.s1 - n.s0) / 2.0));
+            n.ramp = std::max<int64_t>(r, 0);
+        }
+        if (n.has_op && n.op.kind == MixOpKind::Filter)
+            build_fir(n.op, n.fir);
+    }
+}
+
 void render_mix(const MixState& mix, int64_t start, int16_t* out,
                 uint32_t count, std::vector<float>& scratch) {
     const uint32_t ch = mix.channels ? mix.channels : 2;
     std::memset(out, 0, static_cast<size_t>(count) * ch * sizeof(int16_t));
     if (!count || mix.rate == 0 || mix.fps <= 0.0) return;
+    if (mix.root < 0 ||
+        static_cast<size_t>(mix.root) >= mix.nodes.size())
+        return;
 
-    // Accumulate in float: several sources summing into s16 must clip once,
-    // at the end, not per source.
+    // Accumulate in float: fan-ins summing into s16 must clip once, at
+    // the end, not per node.
     const size_t total = static_cast<size_t>(count) * ch;
     if (scratch.size() < total) scratch.resize(total);
     std::vector<float>& acc = scratch;
     std::fill(acc.begin(), acc.begin() + static_cast<ptrdiff_t>(total), 0.0f);
-    const double rate = static_cast<double>(mix.rate);
 
-    for (const MixSource& src : mix.sources) {
-        if (!src.pcm || src.gain <= 0.0f || src.speed <= 0.0) continue;
-        const PcmBuffer& pcm = *src.pcm;
-        const int64_t pcm_frames = static_cast<int64_t>(pcm.frames());
-        if (pcm_frames <= 0 || pcm.channels == 0 || pcm.rate == 0) continue;
-
-        // The placement's span in OUTPUT samples, on the same rounding
-        // rule as the transport cursor (sample_clock.h) so a block's
-        // first sample is exactly the cursor of its first frame.
-        const int64_t s0 = frame_to_sample(src.t_in, mix.fps, rate);
-        const int64_t s1 = frame_to_sample(src.t_out, mix.fps, rate);
-        const int64_t lo = std::max(s0, start);
-        const int64_t hi =
-            std::min(s1, start + static_cast<int64_t>(count));
-        if (hi <= lo) continue;
-
-        // Output sample -> source sample is affine, because placement is:
-        // src_sample = a * s + b.
-        const double src_rate = static_cast<double>(pcm.rate);
-        const double a = src.speed * src_rate / rate;
-        const double b =
-            (src.source_in - src.t_in * src.speed) * src_rate / mix.fps;
-        // Ramps never exceed half the span, so a very short block fades in
-        // and straight out instead of stepping.
-        const int64_t ramp = std::min<int64_t>(kRampSamples, (s1 - s0) / 2);
-
-        // The voice's DSP chain. Without ops the loop keeps the plain
-        // fetch (and its outside-the-media skip); with ops every sample
-        // in the window evaluates - delay tails ring past the media end
-        // until the placement window cuts them.
-        const int top =
-            static_cast<int>(std::min(src.ops.size(), kMaxMixOps)) - 1;
-        VoiceCtx ctx;
-        if (top >= 0) {
-            ctx.src = &src;
-            ctx.pcm = &pcm;
-            ctx.pcm_frames = pcm_frames;
-            for (int i = 0; i <= top; ++i)
-                if (src.ops[static_cast<size_t>(i)].kind ==
-                    MixOpKind::Filter)
-                    build_fir(src.ops[static_cast<size_t>(i)], ctx.fir[i]);
-        }
-
-        for (int64_t s = lo; s < hi; ++s) {
-            const double pos = a * static_cast<double>(s) + b;
-            if (top < 0 &&
-                (pos < 0.0 || pos >= static_cast<double>(pcm_frames)))
-                continue;
-            float level = src.gain;
-            if (ramp > 0) {
-                const int64_t from_in = s - s0;
-                const int64_t to_out = s1 - 1 - s;
-                const int64_t edge = std::min(from_in, to_out);
-                if (edge < ramp)
-                    level *= static_cast<float>(edge + 1) /
-                             static_cast<float>(ramp + 1);
-            }
-            float* dst = acc.data() + static_cast<size_t>(s - start) * ch;
-            for (uint32_t k = 0; k < ch; ++k) {
-                float v;
-                if (top >= 0) {
-                    int budget = kFetchBudget;
-                    v = eval_voice(ctx, top, pos, k, budget);
-                } else {
-                    v = fetch_pcm(pcm, pcm_frames, pos, k);
-                }
-                dst[k] += v * level;
-            }
+    // The root's window bounds the work; an unwindowed root evaluates
+    // the whole chunk (interior windows still gate their subtrees).
+    const MixNode& root = mix.nodes[static_cast<size_t>(mix.root)];
+    int64_t lo = start;
+    int64_t hi = start + static_cast<int64_t>(count);
+    if (root.windowed) {
+        lo = std::max<int64_t>(lo, static_cast<int64_t>(root.s0));
+        if (root.s1 < kMixUnbounded)
+            hi = std::min<int64_t>(hi, static_cast<int64_t>(root.s1));
+    }
+    for (int64_t s = lo; s < hi; ++s) {
+        float* dst = acc.data() + static_cast<size_t>(s - start) * ch;
+        for (uint32_t k = 0; k < ch; ++k) {
+            int budget = kFetchBudget;
+            dst[k] += eval_node(mix, mix.root,
+                                static_cast<double>(s), k, budget);
         }
     }
 
     for (size_t i = 0; i < total; ++i)
         out[i] = static_cast<int16_t>(
             std::clamp(acc[i], -32768.0f, 32767.0f));
+}
+
+namespace {
+
+// Chain evaluation over one PCM at native positions, for the analysis
+// path: op < 0 is the buffer itself. Same purity contract as the
+// program evaluator.
+float eval_chain(const PcmBuffer& pcm, int64_t frames,
+                 const std::vector<MixOp>& ops,
+                 const std::vector<std::array<float, kFirTaps>>& firs,
+                 int op, double pos, uint32_t k, int& budget) {
+    if (op < 0) {
+        if (budget <= 0) return 0.0f;
+        --budget;
+        return fetch_pcm(pcm, frames, pos, k);
+    }
+    const MixOp& o = ops[static_cast<size_t>(op)];
+    const float dry =
+        eval_chain(pcm, frames, ops, firs, op - 1, pos, k, budget);
+    float fx = dry;
+    switch (o.kind) {
+        case MixOpKind::Gain:
+            fx = dry * o.p[0];
+            break;
+        case MixOpKind::Bitcrush: {
+            const float bits = std::clamp(o.p[0], 1.0f, 16.0f);
+            const float step = 65536.0f / std::exp2(bits);
+            fx = std::floor(dry / step + 0.5f) * step;
+            break;
+        }
+        case MixOpKind::Downsample: {
+            const double hold =
+                static_cast<double>(std::max(1.0f, o.p[0]));
+            const double held = std::floor(pos / hold) * hold;
+            fx = eval_chain(pcm, frames, ops, firs, op - 1, held, k,
+                            budget);
+            break;
+        }
+        case MixOpKind::Distortion: {
+            const float g =
+                1.0f + std::clamp(o.p[0], 0.0f, 1.0f) * 24.0f;
+            fx = std::tanh(dry / 32768.0f * g) / std::tanh(g) * 32768.0f;
+            break;
+        }
+        case MixOpKind::Delay: {
+            const double d = std::max(
+                1.0, static_cast<double>(o.p[0]) / 1000.0 *
+                         static_cast<double>(pcm.rate));
+            const float fb = std::clamp(o.p[1], 0.0f, 0.95f);
+            float g = fb;
+            for (int t = 1; t <= kDelayTapMax && g > (1.0f / 256.0f);
+                 ++t, g *= fb)
+                fx += g * eval_chain(pcm, frames, ops, firs, op - 1,
+                                     pos - d * static_cast<double>(t), k,
+                                     budget);
+            break;
+        }
+        case MixOpKind::Filter: {
+            const float* w = firs[static_cast<size_t>(op)].data();
+            const int half = kFirTaps / 2;
+            float acc = 0.0f;
+            for (int i = 0; i < kFirTaps; ++i)
+                acc += w[i] *
+                       eval_chain(pcm, frames, ops, firs, op - 1,
+                                  pos + static_cast<double>(i - half), k,
+                                  budget);
+            fx = acc;
+            break;
+        }
+    }
+    return dry + (fx - dry) * o.wet;
+}
+
+}  // namespace
+
+void build_wave_pyramid(const MixState& mix, int64_t s0, int64_t s1,
+                        uint32_t base, WavePyramid* out,
+                        const std::atomic<bool>* cancel) {
+    out->levels.clear();
+    out->start = s0;
+    out->base = base ? base : 64;
+    out->rate = mix.rate;
+    if (s1 <= s0 || mix.root < 0 || !mix.rate) return;
+    const uint32_t ch = mix.channels ? mix.channels : 2;
+    const uint64_t total = static_cast<uint64_t>(s1 - s0);
+    std::vector<WaveSpan> l0(
+        static_cast<size_t>((total + out->base - 1) / out->base),
+        WaveSpan{3.4e38f, -3.4e38f});
+    constexpr uint32_t kChunk = 65536;
+    std::vector<int16_t> buf(static_cast<size_t>(kChunk) * ch);
+    std::vector<float> scratch;
+    for (uint64_t p = 0; p < total; p += kChunk) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) {
+            out->levels.clear();
+            return;
+        }
+        const uint32_t n =
+            static_cast<uint32_t>(std::min<uint64_t>(kChunk, total - p));
+        render_mix(mix, s0 + static_cast<int64_t>(p), buf.data(), n,
+                   scratch);
+        for (uint32_t i = 0; i < n; ++i) {
+            float v = 0.0f;
+            for (uint32_t k = 0; k < ch; ++k)
+                v += static_cast<float>(buf[static_cast<size_t>(i) * ch + k]);
+            v /= static_cast<float>(ch);
+            WaveSpan& w = l0[static_cast<size_t>((p + i) / out->base)];
+            w.lo = std::min(w.lo, v);
+            w.hi = std::max(w.hi, v);
+        }
+    }
+    out->levels.push_back(std::move(l0));
+    // Each level folds 4 spans into 1, so any zoom finds a level at or
+    // just below its samples-per-pixel.
+    while (out->levels.back().size() > 4) {
+        const std::vector<WaveSpan>& prev = out->levels.back();
+        std::vector<WaveSpan> next((prev.size() + 3) / 4,
+                                   WaveSpan{3.4e38f, -3.4e38f});
+        for (size_t i = 0; i < prev.size(); ++i) {
+            WaveSpan& w = next[i / 4];
+            w.lo = std::min(w.lo, prev[i].lo);
+            w.hi = std::max(w.hi, prev[i].hi);
+        }
+        out->levels.push_back(std::move(next));
+    }
+}
+
+void render_node_envelopes(const MixState& mix, int node, int64_t s0,
+                           int64_t s1, uint32_t columns,
+                           std::vector<WaveSpan>* in_env,
+                           std::vector<WaveSpan>* out_env) {
+    in_env->assign(columns, WaveSpan{});
+    out_env->assign(columns, WaveSpan{});
+    if (node < 0 || static_cast<size_t>(node) >= mix.nodes.size() ||
+        s1 <= s0 || !columns)
+        return;
+    const MixNode& n = mix.nodes[static_cast<size_t>(node)];
+    const uint32_t ch = mix.channels ? mix.channels : 2;
+    const double span = static_cast<double>(s1 - s0);
+    for (uint32_t c = 0; c < columns; ++c) {
+        const int64_t c0 =
+            s0 + static_cast<int64_t>(span * c / columns);
+        int64_t c1 = s0 + static_cast<int64_t>(span * (c + 1) / columns);
+        if (c1 <= c0) c1 = c0 + 1;
+        // A card column can cover thousands of samples; probing a
+        // deterministic stride keeps the render bounded while every
+        // rebuild draws the same envelope.
+        const int64_t stride = std::max<int64_t>(
+            1, (c1 - c0) / static_cast<int64_t>(kMaxColumnProbes));
+        WaveSpan wi{3.4e38f, -3.4e38f};
+        WaveSpan wo{3.4e38f, -3.4e38f};
+        for (int64_t s = c0; s < c1; s += stride) {
+            float vi = 0.0f, vo = 0.0f;
+            for (uint32_t k = 0; k < ch; ++k) {
+                int bi = kFetchBudget;
+                int bo = kFetchBudget;
+                vi += eval_inputs(mix, n, static_cast<double>(s), k, bi);
+                vo += eval_node(mix, node, static_cast<double>(s), k, bo);
+            }
+            vi /= static_cast<float>(ch);
+            vo /= static_cast<float>(ch);
+            wi.lo = std::min(wi.lo, vi);
+            wi.hi = std::max(wi.hi, vi);
+            wo.lo = std::min(wo.lo, vo);
+            wo.hi = std::max(wo.hi, vo);
+        }
+        (*in_env)[c] = wi;
+        (*out_env)[c] = wo;
+    }
 }
 
 void render_processed_pcm(const PcmBuffer& src,
@@ -258,21 +433,15 @@ void render_processed_pcm(const PcmBuffer& src,
     const int64_t frames = static_cast<int64_t>(src.frames());
     out->samples.assign(src.samples.size(), 0);
     if (frames <= 0 || src.channels == 0) return;
-    MixSource holder;   // op carrier only; the PCM rides the context
-    holder.ops = ops;
-    VoiceCtx ctx;
-    ctx.src = &holder;
-    ctx.pcm = &src;
-    ctx.pcm_frames = frames;
-    const int top =
-        static_cast<int>(std::min(ops.size(), kMaxMixOps)) - 1;
-    for (int i = 0; i <= top; ++i)
-        if (ops[static_cast<size_t>(i)].kind == MixOpKind::Filter)
-            build_fir(ops[static_cast<size_t>(i)], ctx.fir[i]);
+    std::vector<std::array<float, kFirTaps>> firs(ops.size());
+    for (size_t i = 0; i < ops.size(); ++i)
+        if (ops[i].kind == MixOpKind::Filter)
+            build_fir(ops[i], firs[i].data());
+    const int top = static_cast<int>(ops.size()) - 1;
     for (int64_t f = 0; f < frames; ++f)
         for (uint32_t k = 0; k < src.channels; ++k) {
             int budget = kFetchBudget;
-            const float v = eval_voice(ctx, top,
+            const float v = eval_chain(src, frames, ops, firs, top,
                                        static_cast<double>(f), k, budget);
             out->samples[static_cast<size_t>(f) * src.channels + k] =
                 static_cast<int16_t>(

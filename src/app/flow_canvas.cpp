@@ -126,31 +126,25 @@ float wire_dist2(Vec2 p0, Vec2 p3, Vec2 probe) {
     return best;
 }
 
-// Cubic bezier with horizontal tangents — the wire idiom. Canvas2D lines
-// are pass-through primitives (no analytic AA), so each segment gets a
-// layered stroke: a soft halo + a mid pass + the core, which reads as a
-// feathered edge at wire thickness.
+// Cubic bezier with horizontal tangents — the wire idiom, drawn as ONE
+// anti-aliased polyline (per-segment strokes bead at the joints).
+// Dashes fall out as isolated two-point strips.
 void draw_wire(ui::Canvas2D& canvas, Vec2 p0, Vec2 p3, float thickness,
                Color color, bool dashed) {
     Vec2 p1, p2;
     wire_controls(p0, p3, &p1, &p2);
     const float core = std::max(thickness, 2.0f);
     constexpr int kSeg = 36;
-    Vec2 prev = p0;
-    int dash = 0;
-    for (int i = 1; i <= kSeg; ++i) {
-        const Vec2 p =
-            wire_point(p0, p1, p2, p3, static_cast<float>(i) / kSeg);
-        const bool skip = dashed && (dash++ & 1);
-        if (!skip) {
-            canvas.draw_line(prev, p, core + 2.4f,
-                             color.with_alpha(color.a * 0.22f));
-            canvas.draw_line(prev, p, core + 1.2f,
-                             color.with_alpha(color.a * 0.5f));
-            canvas.draw_line(prev, p, core, color);
-        }
-        prev = p;
+    Vec2 pts[kSeg + 1];
+    pts[0] = p0;
+    for (int i = 1; i <= kSeg; ++i)
+        pts[i] = wire_point(p0, p1, p2, p3, static_cast<float>(i) / kSeg);
+    if (!dashed) {
+        canvas.draw_polyline(pts, kSeg + 1, core, color);
+        return;
     }
+    for (int i = 0; i < kSeg; i += 2)
+        canvas.draw_polyline(&pts[i], 2, core, color);
 }
 
 void draw_loop_glyph(ui::Canvas2D& canvas, Vec2 center, float r, Color color,
@@ -1775,7 +1769,47 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (node_has_preview(nd)) {
                 const Rect pv{cr.x + 6.0f * z, cy + 3.0f * z,
                               cr.w - 12.0f * z, kPrevH * z - 6.0f * z};
-                if (nd.preview) {
+                if (nd.wave_card) {
+                    // Audio card: a waveform graph in the preview slot.
+                    // Two traces on one axis - the input sum behind in
+                    // the dim tone, the node's OUTPUT in front in the
+                    // accent - each an exact min/max envelope column
+                    // fill. No traces yet = the empty graph.
+                    canvas.draw_sdf_rect(pv, 3.0f * z,
+                                         theme.control_bg_active);
+                    const float mid = pv.y + pv.h * 0.5f;
+                    const float half = pv.h * 0.5f - 2.0f * z;
+                    canvas.draw_rect({pv.x, mid - 0.5f, pv.w, 1.0f},
+                                     theme.hairline);
+                    auto trace = [&](const float* w, Color col) {
+                        if (!w) return;
+                        const float cw =
+                            pv.w / static_cast<float>(nd.wave_count);
+                        for (int c = 0; c < nd.wave_count; ++c) {
+                            const float lo = w[c * 2];
+                            const float hi = w[c * 2 + 1];
+                            float y0 = mid - hi * half;
+                            float y1 = mid - lo * half;
+                            if (y1 - y0 < 1.0f) {
+                                const float cc = (y0 + y1) * 0.5f;
+                                y0 = cc - 0.5f;
+                                y1 = cc + 0.5f;
+                            }
+                            canvas.draw_rect(
+                                {pv.x + cw * static_cast<float>(c), y0,
+                                 cw, y1 - y0},
+                                col);
+                        }
+                    };
+                    if (nd.wave_count > 0) {
+                        trace(nd.wave_in,
+                              theme.text_dim.with_alpha(0.55f));
+                        trace(nd.wave_out,
+                              theme.accent.with_alpha(0.85f));
+                    }
+                    canvas.draw_sdf_rect_outline(pv, 3.0f * z, 1.0f,
+                                                 theme.hairline);
+                } else if (nd.preview) {
                     canvas.draw_image_quad(pv, nd.preview, nd.pu0, nd.pv0,
                                            nd.pu1, nd.pv1,
                                            Color::rgba(1, 1, 1, 1),
@@ -1804,16 +1838,16 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (nd.scope_lo < 0.0f && nd.scope_hi > 0.0f)
                     canvas.draw_rect({sv.x, sy_of(0.0f), sv.w, 1.0f},
                                      theme.hairline);
-                Vec2 pp{sv.x, sy_of(nd.scope[0])};
-                for (int si = 1; si < nd.scope_count; ++si) {
-                    const Vec2 p{
+                std::vector<Vec2> spts(
+                    static_cast<size_t>(nd.scope_count));
+                for (int si = 0; si < nd.scope_count; ++si)
+                    spts[static_cast<size_t>(si)] = {
                         sv.x + sv.w * static_cast<float>(si) /
                                    static_cast<float>(nd.scope_count - 1),
                         sy_of(nd.scope[si])};
-                    canvas.draw_line(pp, p, std::max(1.0f, 1.2f * z),
+                canvas.draw_polyline(spts.data(), nd.scope_count,
+                                     std::max(1.0f, 1.2f * z),
                                      theme.accent_dim);
-                    pp = p;
-                }
                 const float dy = sy_of(nd.scope[0]);
                 canvas.draw_sdf_rect({sv.x - 1.0f, dy - 2.0f * z,
                                       4.0f * z, 4.0f * z},

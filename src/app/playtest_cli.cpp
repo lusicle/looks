@@ -85,10 +85,16 @@ int wmain(int argc, wchar_t** argv) {
         mix->rate = player.audio_sample_rate();
         mix->channels = player.audio_channels();
         if (auto pcm = media::load_pcm(bundle.pcm)) {
-            media::MixSource src;
-            src.pcm = pcm;
-            src.t_out = span;
-            mix->sources.push_back(std::move(src));
+            media::MixNode leaf;
+            leaf.pcm = pcm;
+            mix->nodes.push_back(std::move(leaf));
+            media::MixNode hop;
+            hop.windowed = true;
+            hop.w1 = span;
+            hop.inputs.push_back(0);
+            mix->nodes.push_back(std::move(hop));
+            mix->root = 1;
+            media::prepare_mix(*mix);
         }
         player.set_mix(std::move(mix));
     }

@@ -531,8 +531,8 @@ int wmain(int argc, wchar_t** argv) {
             return readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
                                     kWidth, kHeight, nv12, 0, f, &lf, 1);
         };
-        // The soundtrack goes through the same tree mix the app uses: one
-        // source, full span, unity gain.
+        // The soundtrack goes through the same graph mix the app uses:
+        // one leaf under a full-span hop, unity gain.
         media::MixState mix;
         std::vector<float> scratch;
         media::ExportAudio audio;
@@ -541,10 +541,16 @@ int wmain(int argc, wchar_t** argv) {
                 mix.fps = 30.0;
                 mix.rate = pcm->rate;
                 mix.channels = pcm->channels;
-                media::MixSource src;
-                src.pcm = pcm;
-                src.t_out = frames;
-                mix.sources.push_back(std::move(src));
+                media::MixNode leaf;
+                leaf.pcm = pcm;
+                mix.nodes.push_back(std::move(leaf));
+                media::MixNode hop;
+                hop.windowed = true;
+                hop.w1 = frames;
+                hop.inputs.push_back(0);
+                mix.nodes.push_back(std::move(hop));
+                mix.root = 1;
+                media::prepare_mix(mix);
                 audio.channels = mix.channels;
                 audio.rate = mix.rate;
                 audio.fill = [&](int64_t first, int16_t* out, uint32_t n) {
