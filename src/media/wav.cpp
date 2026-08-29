@@ -39,7 +39,6 @@ bool read_wav(const std::filesystem::path& path, WavData* out,
         std::memcmp(bytes.data() + 8, "WAVE", 4) != 0)
         return fail("not a RIFF/WAVE file");
 
-    // Chunk walk: fmt then data (ignore everything else).
     uint16_t format = 0, channels = 0, bits = 0;
     uint32_t sample_rate = 0;
     const uint8_t* data = nullptr;
@@ -55,15 +54,14 @@ bool read_wav(const std::filesystem::path& path, WavData* out,
             channels = le16(bytes.data() + body + 2);
             sample_rate = le32(bytes.data() + body + 4);
             bits = le16(bytes.data() + body + 14);
-            // WAVE_FORMAT_EXTENSIBLE: the real format sits in the GUID's
-            // first two bytes.
+            // 0xFFFE extensible: real format is the GUID's first two bytes.
             if (format == 0xFFFE && chunk_size >= 40)
                 format = le16(bytes.data() + body + 24);
         } else if (std::memcmp(hdr, "data", 4) == 0) {
             data = bytes.data() + body;
             data_size = chunk_size;
         }
-        pos = body + chunk_size + (chunk_size & 1);   // chunks are padded
+        pos = body + chunk_size + (chunk_size & 1);   // RIFF pads to even
     }
     if (!channels || !sample_rate) return fail("missing fmt chunk");
     if (!data || !data_size) return fail("missing data chunk");
@@ -95,7 +93,7 @@ bool read_wav(const std::filesystem::path& path, WavData* out,
                 (static_cast<uint32_t>(s[2]) << 24));
             out->samples[static_cast<size_t>(i)] =
                 static_cast<int16_t>(v >> 16);
-        } else {   // PCM32
+        } else {
             const int32_t v = static_cast<int32_t>(le32(s));
             out->samples[static_cast<size_t>(i)] =
                 static_cast<int16_t>(v >> 16);

@@ -11,8 +11,8 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;      // px at the frame edge, or edge-detect radius
-    float mode;        // 0 lens CA, 1 purple fringe
-    float threshold;   // purple mode only
+    float mode;
+    float threshold;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -30,13 +30,10 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float4 result;
     if (mode < 0.5) {
-        // Scales with distance from center, so the center stays clean the
-        // way a real lens does.
         const float2 d = uv - 0.5;
         const float s = amount / (0.5 * min(size.x, size.y));
         const float4 sr = input.SampleLevel(0.5 + d * (1.0 + s), 0);
         const float4 sb = input.SampleLevel(0.5 + d * (1.0 - s), 0);
-        // One alpha covers the channel spread: the union of the shifts.
         result = float4(sr.r, base.g, sb.b,
                         max(base.a, max(sr.a, sb.a)));
     } else {
@@ -50,7 +47,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             fx_luma(saturate(input.SampleLevel(uv - float2(0, e.y), 0).rgb));
         const float edge = length(float2(lx, ly));
         const float gate = saturate((edge - threshold * 0.5) * 4.0);
-        // Peaks just below clipping, where CCD blooming actually sits.
+        // The halo peaks just below clipping. This is deliberate.
         const float halo = saturate(1.0 - abs(l0 - 0.55) * 2.2);
         const float3 purple = float3(0.45, 0.1, 0.6);
         result = float4(base.rgb + purple * gate * halo,

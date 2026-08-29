@@ -1,6 +1,3 @@
-// Ghosts are center-mirrored, scaled copies of the thresholded frame,
-// which is what makes them track the highlights without any light search.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]

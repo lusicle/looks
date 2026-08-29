@@ -1,5 +1,5 @@
-// Encoded space, and the hard saturate below is deliberate: the clipped
-// halo rings are the point. Sharpen is the neutral version.
+// Work in encoded space, not in linear light.
+// The hard saturate is deliberate. The clipped halo rings are the point.
 
 #include "fx_common.slang"
 

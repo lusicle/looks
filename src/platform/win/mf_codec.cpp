@@ -2,7 +2,7 @@
 
 #include <windows.h>
 
-#include <initguid.h>   // instantiate CODECAPI_* GUIDs in this TU
+#include <initguid.h>   // Defines the CODECAPI_* GUIDs in this file.
 
 #include <codecapi.h>
 #include <d3d11.h>
@@ -40,10 +40,7 @@ bool set_error(std::string* error, const char* what, HRESULT hr) {
     return false;
 }
 
-// Finds and activates a synchronous MFT for the category, matched by
-// input and/or output type (either may be null). Candidates are tried
-// in MFTEnumEx's sorted order until one activates - the first-ranked
-// transform is not always usable on a given machine.
+// Try every candidate. The first-ranked MFT can fail to activate.
 HRESULT create_sync_mft(const GUID& category,
                         const MFT_REGISTER_TYPE_INFO* input_info,
                         const MFT_REGISTER_TYPE_INFO* output_info,
@@ -62,7 +59,6 @@ HRESULT create_sync_mft(const GUID& category,
     return hr;
 }
 
-// Wraps bytes into an IMFSample.
 HRESULT make_sample(const uint8_t* data, size_t size, int64_t pts,
                     int64_t duration, IMFSample** out) {
     Com<IMFMediaBuffer> buffer;
@@ -87,14 +83,10 @@ HRESULT make_sample(const uint8_t* data, size_t size, int64_t pts,
     return S_OK;
 }
 
-// Fallback sizes for MFTs that report cbSize 0: one comfortable audio
-// chunk, and a worst-case 4K video keyframe.
+// Some MFTs report a cbSize of 0. These are the fallback sizes.
 constexpr DWORD kAudioAllocFallback = 4096;
 constexpr DWORD kVideoAllocFallback = 4u << 20;
 
-// Base media types the negotiations share (attribute stores are
-// unordered bags); callers add the side-specific attributes - bitrate,
-// profile, stride, PAR, AAC payload.
 Com<IMFMediaType> video_type(const GUID& subtype, uint32_t w, uint32_t h,
                              uint32_t fps_num, uint32_t fps_den) {
     Com<IMFMediaType> t;
@@ -119,11 +111,7 @@ Com<IMFMediaType> audio_type(const GUID& subtype, uint32_t channels,
     return t;
 }
 
-// One D3D11 device + DXGI manager shared by every hardware MFT session
-// alive at once: per-session devices multiply per stream (two decode
-// sessions each) plus the export encoder. Refcounted through the
-// sessions, so the last one drops the device and an MF
-// startup/shutdown cycle never sees a stale cached one.
+// The last owner must drop this device. A cached device becomes stale.
 struct SharedD3d {
     Com<IMFDXGIDeviceManager> mgr;
     Com<ID3D11Device> d3d;
@@ -141,8 +129,7 @@ std::shared_ptr<SharedD3d> acquire_shared_d3d() {
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
         fresh->d3d.put(), nullptr, ctx.put());
     if (FAILED(hr)) return nullptr;
-    // Decode sessions, the readback maps and an encoder may all submit
-    // concurrently on this one device.
+    // Many threads submit to this one device, so protect it.
     Com<ID3D11Multithread> mt;
     if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(mt.put()))))
         mt->SetMultithreadProtected(TRUE);
@@ -155,7 +142,6 @@ std::shared_ptr<SharedD3d> acquire_shared_d3d() {
     return fresh;
 }
 
-// Allocates the output sample when the MFT does not provide its own.
 HRESULT alloc_output_sample(const MFT_OUTPUT_STREAM_INFO& info,
                             DWORD fallback, Com<IMFSample>& out) {
     Com<IMFMediaBuffer> buffer;
@@ -168,9 +154,7 @@ HRESULT alloc_output_sample(const MFT_OUTPUT_STREAM_INFO& info,
     return out->AddBuffer(buffer.get());
 }
 
-// Common sync-MFT output pump: allocates the output sample when the MFT
-// does not provide one, handles stream changes. Returns S_OK with a sample,
-// MF_E_TRANSFORM_NEED_MORE_INPUT, or a hard error.
+// MF_E_TRANSFORM_NEED_MORE_INPUT is a normal result, not an error.
 HRESULT pump_output(IMFTransform* mft, DWORD alloc_fallback,
                     Com<IMFSample>& out, bool* stream_changed) {
     *stream_changed = false;
@@ -203,16 +187,13 @@ HRESULT pump_output(IMFTransform* mft, DWORD alloc_fallback,
     if (output.pSample) {
         out.reset();
         *out.put() = output.pSample;
-        // An MFT-owned sample hands over its reference; one we allocated
-        // is also released through `allocated`, so take one more.
+        // The allocated holder also releases this, so add one reference.
         if (!provides) output.pSample->AddRef();
     }
     return S_OK;
 }
 
-// Copies one sample's contiguous payload and timing into a packet.
-// `key_default` seeds the keyframe flag for streams that do not stamp
-// MFSampleExtension_CleanPoint (every AAC frame is a sync point).
+// key_default applies when the stream does not stamp CleanPoint.
 bool sample_to_packet(IMFSample* sample, EncodedPacket& out,
                       bool key_default) {
     LONGLONG pts = 0, duration = 0;
@@ -233,9 +214,7 @@ bool sample_to_packet(IMFSample* sample, EncodedPacket& out,
     return true;
 }
 
-// Pitch-aware NV12 copy via IMF2DBuffer2 — the layout D3D-backed decoder
-// samples come in (GPU pitch, padded plane height). Returns false when the
-// sample has no 2D buffer; the caller falls back to the contiguous path.
+// Returns false when the sample has no 2D buffer. The caller falls back.
 bool copy_nv12_2d(IMFSample* sample, uint32_t w, uint32_t h,
                   VideoFrameNV12& out) {
     Com<IMFMediaBuffer> buffer;
@@ -252,8 +231,7 @@ bool copy_nv12_2d(IMFSample* sample, uint32_t w, uint32_t h,
         return false;
     bool ok = false;
     if (pitch > 0 && static_cast<uint32_t>(pitch) >= w) {
-        // NV12: Y rows at scanline 0, UV rows after the texture's padded
-        // plane height — recover that height from the buffer size.
+        // The UV plane starts after the padded Y height, not after h rows.
         const size_t p = static_cast<size_t>(pitch);
         const size_t padded_h = 2 * static_cast<size_t>(len) / (3 * p);
         if (padded_h >= h) {
@@ -275,8 +253,6 @@ bool copy_nv12_2d(IMFSample* sample, uint32_t w, uint32_t h,
 }
 
 }  // namespace
-
-// ------------------------------------------------------------- MfSession
 
 MfSession::MfSession() {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -301,30 +277,21 @@ MfLifetime::~MfLifetime() {
     if (mf_) MFShutdown();
 }
 
-// ----------------------------------------------------------- H264Decoder
-
 struct H264Decoder::Impl {
     Com<IMFTransform> mft;
     std::vector<uint8_t> sps_pps;      // Annex B parameter sets from avcC
-    std::vector<uint8_t> annexb;       // conversion scratch
+    std::vector<uint8_t> annexb;
     int nal_length_size = 4;
     uint32_t width = 0;
     uint32_t height = 0;
     bool sent_params = false;
-    // PIPELINED READBACK (DXVA): decoded samples held unmapped so the GPU
-    // decodes ahead while the CPU maps the OLDEST one - mapping a surface
-    // whose decode already finished is a copy, not a stall, and the stall
-    // was most of the hardware path's per-frame cost. Depth 1 (software
-    // samples are system memory) keeps the old emit-immediately behavior.
+    // Hold the samples unmapped so the GPU decodes ahead of the CPU map.
     std::deque<Com<IMFSample>> inflight;
 
-    // D3D11/DXVA acceleration: a reference on the process-shared device,
-    // held for the MFT's lifetime.
+    // Hold this reference for the full lifetime of the MFT.
     std::shared_ptr<SharedD3d> shared;
 
-    // Attaches the shared DXGI device manager when the decoder is
-    // D3D11-aware, so the pixel work runs on the GPU (DXVA). Failure is
-    // non-fatal — decode just stays on the pure software path.
+    // Failure is not fatal. Decode then stays on the software path.
     bool try_d3d() {
         Com<IMFAttributes> attrs;
         UINT32 aware = 0;
@@ -344,7 +311,6 @@ struct H264Decoder::Impl {
     }
 
     bool negotiate_output(std::string* error) {
-        // Pick NV12 among the advertised output types.
         for (DWORD i = 0;; ++i) {
             Com<IMFMediaType> type;
             HRESULT hr = mft->GetOutputAvailableType(0, i, type.put());
@@ -379,7 +345,6 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
     d.width = width;
     d.height = height;
 
-    // The record layout lives in media/h264_util.h beside its builder.
     media::AvccInfo info;
     if (!media::parse_avcc(avcc, &info)) {
         if (error) *error = "bad avcC";
@@ -394,19 +359,14 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
                                  nullptr, d.mft.put());
     if (FAILED(hr)) return set_error(error, "H.264 decoder MFT not found", hr);
 
-    // Wire the D3D11 manager for speed — before type negotiation
-    // so the decoder can plan its DXVA surface pool.
+    // Set the D3D manager before type negotiation.
     if (allow_d3d && d.try_d3d())
         log_info("mf: H.264 decode D3D11-accelerated (DXVA)");
     else
         log_info("mf: H.264 decode on the software path%s",
                  low_latency ? " (low latency)" : "");
 
-    // Latency cap for the SOFTWARE decoder only: its output lag equals
-    // its thread count (~40 frames on a big CPU), which no ring survives.
-    // The DXVA path lags only its DPB (a handful) and MF_LOW_LATENCY
-    // there just forces per-frame completion, defeating the GPU's own
-    // pipelining.
+    // Set MF_LOW_LATENCY on the software path only. It slows DXVA down.
     if (low_latency && !d.shared) {
         Com<IMFAttributes> attrs;
         if (SUCCEEDED(d.mft->GetAttributes(attrs.put())))
@@ -434,7 +394,7 @@ bool H264Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns,
     Impl& d = *impl_;
     if (!d.mft) return false;
 
-    // AVCC -> Annex B; SPS/PPS injected before the first/key frames.
+    // The MFT needs Annex B. Put SPS and PPS before each keyframe.
     d.annexb.clear();
     if (keyframe || !d.sent_params) {
         d.annexb.insert(d.annexb.end(), d.sps_pps.begin(), d.sps_pps.end());
@@ -450,7 +410,7 @@ bool H264Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns,
         media::append_annexb_nal(d.annexb, data + pos, nal_len);
         pos += nal_len;
     }
-    if (d.annexb.empty()) return true;   // nothing usable; skip
+    if (d.annexb.empty()) return true;   // Skip. This is not an error.
 
     Com<IMFSample> sample;
     HRESULT hr = make_sample(d.annexb.data(), d.annexb.size(), pts_100ns,
@@ -458,8 +418,7 @@ bool H264Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns,
     if (FAILED(hr)) return false;
     hr = d.mft->ProcessInput(0, sample.get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
-        // Caller must drain via receive() first; treat as hard error to
-        // keep the feed/receive contract simple.
+        // The caller must call receive() first. This stays a hard error.
         log_warn("mf: H264 ProcessInput not accepting — receive() first");
         return false;
     }
@@ -470,10 +429,6 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
     Impl& d = *impl_;
     if (!d.mft) return false;
 
-    // Fill the in-flight queue without mapping anything, then emit the
-    // OLDEST - pulled earliest, so its decode has finished while newer
-    // frames were still on the GPU and the map below is a copy, not a
-    // stall.
     const size_t depth = d.shared ? 3 : 1;
     int renegotiated = 0;
     while (d.inflight.size() < depth) {
@@ -482,8 +437,7 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
         const HRESULT hr = pump_output(d.mft.get(), kVideoAllocFallback,
                                        pulled, &stream_changed);
         if (stream_changed) {
-            // A stream that re-raises the change endlessly (mid-stream
-            // SPS churn) must FAIL the decode, never wedge the caller.
+            // Fail after too many stream changes. Do not loop forever.
             if (++renegotiated > 4) {
                 log_warn("mf: H264 output stream-change loop — giving up");
                 return false;
@@ -514,9 +468,6 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
         out.stride = w;
         out.pts_100ns = pts;
 
-        // D3D-backed samples (DXVA path) carry a GPU pitch — read them
-        // through the 2D buffer; system-memory samples fall through to the
-        // contiguous copy below.
         if (copy_nv12_2d(sample.get(), w, h, out)) return true;
 
         Com<IMFMediaBuffer> buffer;
@@ -526,15 +477,11 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
         DWORD len = 0;
         if (FAILED(buffer->Lock(&src, nullptr, &len))) return false;
 
-        // Contiguous NV12: stride == width (MF contiguous layout), height
-        // may include alignment padding — copy exactly what we need.
+        // In the contiguous layout the stride is the width.
         const size_t needed = static_cast<size_t>(w) * h * 3 / 2;
         out.data.resize(needed);
         if (len >= needed) {
-            // Y then UV; MF may pad height to 16 — planes are consecutive in
-            // the contiguous buffer at aligned offsets only when padded, so
-            // detect: if len == exactly needed, direct copy; else copy Y and
-            // UV with the padded plane height.
+            // MF pads the plane height to a multiple of 16.
             if (len == needed) {
                 std::memcpy(out.data.data(), src, needed);
             } else {
@@ -569,11 +516,6 @@ void H264Decoder::flush() {
     d.sent_params = false;
 }
 
-// ------------------------------------------- shared PCM decode core
-// AAC and MP3 decode through the same sync-MFT shape: negotiate a
-// 16-bit PCM output, feed compressed samples, drain PCM chunks. Only
-// create() differs (the input type), so the engine lives here once.
-
 struct PcmMftCore {
     Com<IMFTransform> mft;
     uint32_t out_channels = 0;
@@ -599,7 +541,6 @@ struct PcmMftCore {
         }
     }
 
-    // Negotiates the output and opens the stream (the tail of create()).
     bool start(std::string* error) {
         if (!negotiate_output(error)) return false;
         mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -667,8 +608,6 @@ struct PcmMftCore {
     }
 };
 
-// ------------------------------------------------------------ AacDecoder
-
 struct AacDecoder::Impl : PcmMftCore {};
 
 AacDecoder::AacDecoder() : impl_(new Impl) {}
@@ -705,8 +644,6 @@ bool AacDecoder::receive(AudioChunk& out) { return impl_->receive(out); }
 
 void AacDecoder::drain() { impl_->drain(); }
 
-// ------------------------------------------------------------ Mp3Decoder
-
 struct Mp3Decoder::Impl : PcmMftCore {};
 
 Mp3Decoder::Mp3Decoder() : impl_(new Impl) {}
@@ -737,25 +674,19 @@ bool Mp3Decoder::receive(AudioChunk& out) { return impl_->receive(out); }
 
 void Mp3Decoder::drain() { impl_->drain(); }
 
-// ----------------------------------------------------------- H264Encoder
-
 struct H264Encoder::Impl {
     Com<IMFTransform> mft;
     uint32_t width = 0;
     uint32_t height = 0;
 
-    // Async hardware path: hardware MFTs only run in hardware
-    // with an IMFDXGIDeviceManager attached, and they speak the async
-    // event-pump protocol (METransformNeedInput / HaveOutput) instead of
-    // the sync ProcessInput/Output model. Software fallback keeps the sync
-    // members above.
+    // A hardware MFT needs an IMFDXGIDeviceManager and the async pump.
     bool async_mode = false;
     DWORD in_id = 0, out_id = 0;
     Com<IMFMediaEventGenerator> events;
     std::shared_ptr<SharedD3d> shared;
-    int needs_input = 0;             // granted-but-unused input slots
+    int needs_input = 0;             // Input slots granted but not used.
     bool drain_complete = false;
-    std::deque<EncodedPacket> ready; // outputs collected while pumping
+    std::deque<EncodedPacket> ready;
 
     bool async_read_output();
     bool async_pump(bool wait);
@@ -764,8 +695,7 @@ struct H264Encoder::Impl {
                       uint32_t gop_frames);
 };
 
-// B-frames off (pts == dts, the muxer then emits no ctts); an explicit
-// GOP size pins the keyframe cadence when the caller asked for one.
+// B-frames must stay off, so that pts equals dts and the muxer skips ctts.
 static void apply_encoder_codec_api(IMFTransform* mft, uint32_t gop_frames) {
     Com<ICodecAPI> codec_api;
     if (FAILED(mft->QueryInterface(IID_PPV_ARGS(codec_api.put())))) return;
@@ -779,7 +709,6 @@ static void apply_encoder_codec_api(IMFTransform* mft, uint32_t gop_frames) {
     }
 }
 
-// Reads one encoded packet from an async encoder's output stream.
 bool H264Encoder::Impl::async_read_output() {
     Impl& e = *this;
     MFT_OUTPUT_STREAM_INFO info{};
@@ -811,8 +740,7 @@ bool H264Encoder::Impl::async_read_output() {
     return ok;
 }
 
-// Drains the encoder's event queue. `wait` blocks until at least one
-// event arrives (used when an input slot or drain-complete is owed).
+// A true wait blocks until at least one event arrives.
 bool H264Encoder::Impl::async_pump(bool wait) {
     Impl& e = *this;
     for (;;) {
@@ -821,7 +749,7 @@ bool H264Encoder::Impl::async_pump(bool wait) {
             e.events->GetEvent(wait ? 0 : MF_EVENT_FLAG_NO_WAIT, ev.put());
         if (hr == MF_E_NO_EVENTS_AVAILABLE) return true;
         if (FAILED(hr)) return false;
-        wait = false;   // one blocking wait per call is enough
+        wait = false;   // Do only one blocking wait for each call.
         MediaEventType type = MEUnknown;
         ev->GetType(&type);
         if (type == METransformNeedInput) {
@@ -840,8 +768,7 @@ bool H264Encoder::Impl::async_pump(bool wait) {
     }
 }
 
-// Attempts the hardware path; on any failure the caller falls back to the
-// software (sync) encoder with the impl reset to a clean slate.
+// On failure the caller must reset the impl and use the software encoder.
 bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
                                      uint32_t fps_num, uint32_t fps_den,
                                      uint32_t bitrate_bps,
@@ -865,9 +792,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
         if (activates) CoTaskMemFree(activates);
         return fail("enum", FAILED(hr) ? hr : MF_E_TOPO_CODEC_NOT_FOUND);
     }
-    // Try each candidate until one accepts our types (SORTANDFILTER puts
-    // the preferred transform first, but e.g. a virtual adapter's encoder
-    // can outrank the real GPU's).
+    // Try every candidate. The first-ranked MFT can refuse these types.
     HRESULT last_hr = MF_E_TOPO_CODEC_NOT_FOUND;
     const char* last_stage = "activate";
     for (UINT32 i = 0; i < count && !e.mft; ++i) {
@@ -877,7 +802,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
             last_stage = "activate";
             continue;
         }
-        // Async MFTs must be explicitly unlocked before use.
+        // You must unlock an async MFT before you use it.
         Com<IMFAttributes> attrs;
         last_hr = mft->GetAttributes(attrs.put());
         if (SUCCEEDED(last_hr))
@@ -886,7 +811,7 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
             last_stage = "async unlock";
             continue;
         }
-        // Stream ids (E_NOTIMPL means 0..n-1).
+        // A GetStreamIDs result of E_NOTIMPL means the ids are 0 to n-1.
         DWORD ins[1] = {0}, outs[1] = {0};
         DWORD in_id = 0, out_id = 0;
         if (mft->GetStreamIDs(1, ins, 1, outs) == S_OK) {
@@ -928,15 +853,11 @@ bool H264Encoder::Impl::try_hardware(uint32_t width, uint32_t height,
     CoTaskMemFree(activates);
     if (!e.mft) return fail(last_stage, last_hr);
 
-    // Shared D3D11 device + DXGI manager: hardware MFTs only run in
-    // hardware with a device manager attached.
+    // A hardware MFT runs in hardware only with a device manager attached.
     e.shared = acquire_shared_d3d();
     if (!e.shared) return fail("DXGI manager", E_FAIL);
 
-    // Attach the DXGI manager. Some encoder MFTs accept it only
-    // after type negotiation; a refusal is non-fatal — the async hardware
-    // MFT still encodes on the GPU from CPU samples, the manager merely
-    // enables zero-copy D3D surface input.
+    // A refusal here is not fatal. The MFT still encodes from CPU samples.
     hr = e.mft->ProcessMessage(
         MFT_MESSAGE_SET_D3D_MANAGER,
         reinterpret_cast<ULONG_PTR>(e.shared->mgr.get()));
@@ -967,9 +888,6 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     e.width = width;
     e.height = height;
 
-    // Hardware first: async MFT + IMFDXGIDeviceManager. Any
-    // failure resets to a clean slate and falls through to software —
-    // import/export are offline, so the fallback is only a speed loss.
     if (e.try_hardware(width, height, fps_num, fps_den, bitrate_bps,
                        gop_frames)) {
         log_info("mf: hardware H.264 encoder active (async MFT + D3D11)");
@@ -982,7 +900,7 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     e.needs_input = 0;
     e.in_id = e.out_id = 0;
 
-    // Software encoder: enumerate by OUTPUT type for encoders.
+    // You must enumerate an encoder by its OUTPUT type.
     const MFT_REGISTER_TYPE_INFO out_info{MFMediaType_Video,
                                           MFVideoFormat_H264};
     HRESULT hr = create_sync_mft(MFT_CATEGORY_VIDEO_ENCODER, nullptr,
@@ -990,7 +908,7 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
     if (FAILED(hr))
         return set_error(error, "H.264 encoder MFT not found", hr);
 
-    // Encoders: set OUTPUT type first, then input.
+    // Set the OUTPUT type first, then the input type.
     Com<IMFMediaType> output =
         video_type(MFVideoFormat_H264, width, height, fps_num, fps_den);
     output->SetUINT32(MF_MT_AVG_BITRATE, bitrate_bps);
@@ -1020,8 +938,6 @@ bool H264Encoder::feed_nv12(const uint8_t* data, int64_t pts_100ns,
     if (FAILED(make_sample(data, size, pts_100ns, duration_100ns, sample.put())))
         return false;
     if (e.async_mode) {
-        // Wait until the encoder grants an input slot, collecting any
-        // outputs that arrive meanwhile.
         while (e.needs_input == 0)
             if (!e.async_pump(/*wait=*/true)) return false;
         if (FAILED(e.mft->ProcessInput(e.in_id, sample.get(), 0)))
@@ -1062,14 +978,10 @@ void H264Encoder::drain() {
     e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     e.mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     if (e.async_mode) {
-        // Pump until METransformDrainComplete; every remaining output
-        // lands in the ready queue for receive().
         while (!e.drain_complete)
             if (!e.async_pump(/*wait=*/true)) break;
     }
 }
-
-// ------------------------------------------------------------ AacEncoder
 
 struct AacEncoder::Impl {
     Com<IMFTransform> mft;
@@ -1101,7 +1013,7 @@ bool AacEncoder::create(uint32_t channels, uint32_t sample_rate,
     hr = e.mft->SetInputType(0, input.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetInputType(PCM)", hr);
 
-    // The AAC encoder wants bytes-per-second in one of its supported tiers.
+    // The AAC encoder needs bytes for each second, not bits.
     const uint32_t bytes_per_sec = bitrate_bps / 8;
     Com<IMFMediaType> output =
         audio_type(MFAudioFormat_AAC, channels, sample_rate);
@@ -1111,7 +1023,6 @@ bool AacEncoder::create(uint32_t channels, uint32_t sample_rate,
     hr = e.mft->SetOutputType(0, output.get(), 0);
     if (FAILED(hr)) return set_error(error, "SetOutputType(AAC)", hr);
 
-    // Extract AudioSpecificConfig from the negotiated output type:
     // MF_MT_USER_DATA = HEAACWAVEINFO tail (12 bytes) + ASC.
     Com<IMFMediaType> negotiated;
     if (SUCCEEDED(e.mft->GetOutputCurrentType(0, negotiated.put()))) {

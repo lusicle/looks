@@ -1,9 +1,4 @@
-// Compute pipeline + per-frame descriptor arena (compute-first).
-//
-// Every effect kernel shares one shape: N sampled inputs (one shared
-// sampler), M storage outputs, one push-constant block. Descriptor sets are
-// allocated per dispatch from a per-frame-in-flight arena pool (reset when
-// the frame slot recycles) — no persistent set management.
+// Arena descriptor sets live only until reset() runs for the same frame slot.
 
 #pragma once
 
@@ -31,7 +26,7 @@ private:
 };
 
 struct ComputePipelineDesc {
-    const char* spv_name = nullptr;   // file in the staged shader dir
+    const char* spv_name = nullptr;
     uint32_t sampled_inputs = 1;
     uint32_t storage_outputs = 1;
     uint32_t push_bytes = 0;
@@ -47,9 +42,8 @@ public:
     ComputePipeline(const ComputePipeline&) = delete;
     ComputePipeline& operator=(const ComputePipeline&) = delete;
 
-    // Binds, writes a fresh descriptor set, pushes constants, dispatches
-    // ceil(w/8) x ceil(h/8) groups. Inputs must be in SHADER_READ_ONLY (or
-    // GENERAL), outputs in GENERAL — caller transitions.
+    // Inputs: SHADER_READ_ONLY or GENERAL. Outputs: GENERAL. Caller sets both.
+    // Group counts assume an 8x8 kernel local size.
     void dispatch(VkCommandBuffer cmd, DescriptorArena& arena,
                   uint32_t frame_index, const GpuImage* const* sampled,
                   uint32_t sampled_count, GpuImage* const* storage,

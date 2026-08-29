@@ -1,6 +1,3 @@
-// Curl noise: the rotated gradient of a scalar stream function is
-// divergence-free, which is what makes the warp swirl instead of tear.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -35,7 +32,7 @@ float vnoise2(uint s, float2 p, uint t)
     return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
-// Two time slices cross-faded, so evolution stays frame-quantized.
+// Cross-fade two time slices to keep the motion frame-quantized.
 float psi(uint s, float2 p, uint t0, float tf)
 {
     return lerp(vnoise2(s, p, t0), vnoise2(s, p, t0 + 1u), tf);
@@ -62,7 +59,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                      psi(seed, p - float2(eps, 0.0), t0, tf);
     const float dy = psi(seed, p + float2(0.0, eps), t0, tf) -
                      psi(seed, p - float2(0.0, eps), t0, tf);
-    // The 90 degree rotation of the gradient is the curl.
     const float2 vel = float2(dy, -dx) * (1.0 / (2.0 * eps));
 
     const float2 suv = clamp(uv + vel * amount * 2.0 / size, 0.0, 1.0);

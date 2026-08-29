@@ -95,8 +95,7 @@ bool decode_png(const uint8_t* data, size_t size, ImageRgba* out,
         } else if (std::memcmp(type, "IEND", 4) == 0) {
             saw_iend = true;
         } else if (!(type[0] & 0x20)) {
-            // Unknown CRITICAL chunk (e.g. PLTE for palette images we
-            // rejected above) — refuse; ancillary chunks are skipped.
+            // Bit 0x20 marks an ancillary chunk. Unknown critical fails.
             set_error(error, "unsupported critical chunk");
             return false;
         }
@@ -117,7 +116,6 @@ bool decode_png(const uint8_t* data, size_t size, ImageRgba* out,
         return false;
     }
 
-    // Un-filter into RGBA output.
     out->width = width;
     out->height = height;
     out->pixels.assign(static_cast<size_t>(width) * height * 4, 255);
@@ -130,9 +128,9 @@ bool decode_png(const uint8_t* data, size_t size, ImageRgba* out,
         const uint8_t* line = src + 1;
         const uint32_t bpp = channels;
         for (size_t x = 0; x < row_bytes; ++x) {
-            const int a = x >= bpp ? row[x - bpp] : 0;         // left
-            const int b = prev_row[x];                          // up
-            const int c = x >= bpp ? prev_row[x - bpp] : 0;     // up-left
+            const int a = x >= bpp ? row[x - bpp] : 0;
+            const int b = prev_row[x];
+            const int c = x >= bpp ? prev_row[x - bpp] : 0;
             int v = line[x];
             switch (filter) {
                 case 0: break;
@@ -198,7 +196,6 @@ bool decode_tga(const uint8_t* data, size_t size, ImageRgba* out,
         }
         std::memcpy(bgra.data(), data + pos, bgra.size());
     } else {
-        // RLE packets.
         size_t written = 0;
         while (written < bgra.size()) {
             if (pos >= size) {
@@ -240,7 +237,7 @@ bool decode_tga(const uint8_t* data, size_t size, ImageRgba* out,
             bgra.data() + static_cast<size_t>(src_y) * width * bytes_pp;
         uint8_t* dst = out->pixels.data() + static_cast<size_t>(y) * width * 4;
         for (uint32_t x = 0; x < width; ++x) {
-            dst[x * 4 + 0] = src[x * bytes_pp + 2];   // BGR(A) -> RGBA
+            dst[x * 4 + 0] = src[x * bytes_pp + 2];
             dst[x * 4 + 1] = src[x * bytes_pp + 1];
             dst[x * 4 + 2] = src[x * bytes_pp + 0];
             dst[x * 4 + 3] = bytes_pp == 4 ? src[x * bytes_pp + 3] : 255;
@@ -274,7 +271,6 @@ void put_be32(std::vector<uint8_t>& out, uint32_t v) {
     out.push_back(static_cast<uint8_t>(v));
 }
 
-// type (4 chars) + payload, with length prefix and CRC over type+payload.
 void put_chunk(std::vector<uint8_t>& out, const char type[4],
                const uint8_t* payload, size_t size) {
     put_be32(out, static_cast<uint32_t>(size));
@@ -309,7 +305,6 @@ std::vector<uint8_t> encode_png_rgba(const uint8_t* rgba, uint32_t width,
     ihdr[12] = 0;   // no interlace
     put_chunk(out, "IHDR", ihdr, sizeof(ihdr));
 
-    // Raw scanline stream: filter byte 0 per row.
     const size_t row = size_t{width} * 4;
     std::vector<uint8_t> raw((row + 1) * height);
     for (uint32_t y = 0; y < height; ++y) {
@@ -318,7 +313,7 @@ std::vector<uint8_t> encode_png_rgba(const uint8_t* rgba, uint32_t width,
         std::memcpy(dst + 1, rgba + row * y, row);
     }
 
-    // zlib wrapper around stored (uncompressed) deflate blocks.
+    // A zlib header, then stored deflate blocks with no compression.
     std::vector<uint8_t> z;
     z.reserve(raw.size() + raw.size() / 65535 * 5 + 16);
     z.push_back(0x78);

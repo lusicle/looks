@@ -1,6 +1,5 @@
-// Front stepper for velocity scan: texel x = along-axis position, y =
-// line slot. State texel is R = front position in px, G = active,
-// B = spawn tick + 1, where 0 means never spawned.
+// Texel x is the along-axis position and y is the line slot.
+// State is R = front px, G = active, B = spawn tick + 1, 0 = never.
 
 #include "fx_common.slang"
 
@@ -16,7 +15,7 @@ cbuffer Push
     float stick;
     float rate;     // spawns/s, staggered across slots
     float wiggle;
-    uint mode;      // 0 vertical lines sweep +x, 1 horizontal sweep +y
+    uint mode;
     uint frame_w;
     uint frame_h;
 };
@@ -46,12 +45,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint tick = uint(t * max(rate, 0.01));
 
     if (st.g < 0.5) {
-        // Staggered respawn: this slot's turn in the tick cycle, once.
         if (tick % slots == tid.y && st.b != float(tick) + 1.0) {
             st = float4(0.0, 1.0, float(tick) + 1.0, 0.0);
         }
     } else {
-        // Luma under the front brakes it: brightness becomes dwell time.
         const float2 uv = mode == 0u
             ? float2((st.r + 0.5) / float(frame_w),
                      (float(tid.x) + 0.5) / float(frame_h))
@@ -66,8 +63,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                                    float(tid.x) * 0.03 + t * 1.7) - 0.5) *
                       wiggle * 1.6;
         st.r += max(speed / max(fps, 1.0) * brake * shear, 0.04);
-        // Retire past the far edge, or after one full spawn cycle so a
-        // fully stuck front still frees its slot.
+        // A stuck front retires after one full spawn cycle.
         if (st.r >= extent) st.g = 0.0;
         if (float(tick) >= st.b - 1.0 + float(slots)) st.g = 0.0;
     }

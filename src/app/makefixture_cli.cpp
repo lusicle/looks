@@ -1,12 +1,3 @@
-// Dev CLI: generates a real MP4 (H.264 + AAC) from synthetic content
-// through media::export_movie - the SAME driver the app's export uses,
-// so a fixture exercises exactly the shipped encode->mux path.
-//
-//   looks_makefixture <out.mp4> [seconds] [width] [height] [gop_frames]
-//
-// gop_frames > 0 pins the keyframe interval - seek-latency benches need
-// fixtures with controlled spacing.
-
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +41,6 @@ int wmain(int argc, wchar_t** argv) {
         return true;
     };
 
-    // 440 Hz sine on both channels, a pure function of sample position.
     looks::media::ExportAudio audio;
     audio.channels = looks::media::Player::kChannels;
     audio.rate = looks::media::Player::kClockRate;

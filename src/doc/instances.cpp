@@ -10,33 +10,22 @@ namespace looks::doc {
 
 namespace {
 
-// A pathological file (deep nesting times wide layer counts) must
-// terminate: the depth guard alone allows kMaxLayers^kMaxLookDepth.
+// The depth guard alone allows kMaxLayers^kMaxLookDepth: cap the walk.
 constexpr size_t kMaxFlattened = 1024;
 
-// One instance being descended. `local = a * root + b` is the composed
-// affine clock; [r0, r1) is the root span the instance is live on.
 struct Cursor {
     uint64_t entity = 0;   // a look or a sequence
     uint64_t path = 0;
     int depth = 0;
-    // local = a * root + b maps ROOT frames onto THIS entity's OWN
-    // clock: every nesting hop folds its fps ratio into the affine, so
-    // pinned entities tick their own rate and the flatten stays one
-    // closed form.
+    // local = a * root + b maps root frames onto this entity's own clock.
     double a = 1.0, b = 0.0;
+    // [r0, r1) is the root span this instance plays on.
     double r0 = 0.0, r1 = kUnbounded;
-    // The ROOT entity's effective rate: TIMELINE-LOCKED media reads the
-    // root clock, so its conform ratio is against this.
+    // Root entity rate: timeline-locked media conforms against this.
     double root_fps = 30.0;
 };
 
-// Clamps the cursor's root window to a child live on LOCAL [lo, hi)
-// (hi = kUnbounded for none), and composes the child clock through a
-// placement-shaped step (speed, source_in). Returns false when the
-// window closes. The flatten and the compiler test the SAME real
-// bounds (conformed media windows may be fractional), so the
-// continuous test and the point test agree exactly.
+// The bounds are real, not whole: the compiler point test must agree here.
 bool child_window(const Cursor& cur, double lo, double hi, double speed,
                   double source_in, Cursor* child) {
     double r0 = cur.r0, r1 = cur.r1;
@@ -58,10 +47,7 @@ bool child_window(const Cursor& cur, double lo, double hi, double speed,
 void walk(const Document& doc, const Cursor& cur,
           std::vector<MediaInstance>& out);
 
-// The bottom LIVE feed into (to, port): the first link whose producer
-// still exists - link-vector order IS stacking order. Single-answer
-// questions (Offset adjacency, analysis chains) resolve through this;
-// the full fan-in walks every live feed.
+// Link-vector order is stacking order: this returns the bottom live feed.
 uint64_t link_into(const Look& look, const std::vector<NodeLink>& links,
                    uint64_t to, uint32_t port) {
     for (const NodeLink& l : links)
@@ -71,32 +57,20 @@ uint64_t link_into(const Look& look, const std::vector<NodeLink>& links,
     return 0;
 }
 
-// One resolved chain of a look's audio: a root layer plus the DSP hops
-// between it and the walk's start, in play order (source first). The
-// ANALYSIS view - the mix plays the program, analysis listens to one
-// stream.
+// ops are in play order, source first.
 struct VoicePath {
     const Layer* root = nullptr;
     std::vector<AudioOp> ops;
     int64_t audio_off = 0;   // Offset shims sitting on the path's source
 };
 
-// Fan-in paths cap deterministically, and the visit budget bounds the
-// walk through the one legal cycle (Feedback passes audio through).
+// The caps bound the walk through the one legal cycle, Feedback.
 constexpr size_t kMaxVoicePaths = 64;
 constexpr int kVoiceVisitBudget = 4096;
 constexpr int kMaxVoiceDepth = 256;
 
-// Walks back from `cur` (inclusive) through port-0 fan-ins, following
-// EVERY live feed - the same enumeration the compiler merges and the
-// audio program sums; this path view exists for single-stream
-// consumers. Audio-modifier hops (not bypassed, group live) ride each
-// path; every other node passes audio through; group input slots
-// splice to their exterior fan-in. A path ends at a layer; a dangling
-// or unfed hop is a silent dead end. Paths emit bottom-first, so
-// paths.front() is the bottom-most resolvable chain. `rev` holds the
-// hops output-first while recursing; each emit copies the first
-// kMaxVoiceOps (the hops nearest the output win).
+// Paths emit bottom-first: paths.front() is the bottom-most chain.
+// On overflow the hops nearest the output win.
 void walk_paths(const Look& look, const std::vector<NodeLink>& links,
                 uint64_t cur, std::vector<AudioOp>& rev, int64_t off,
                 int depth, int& budget, std::vector<VoicePath>& out) {
@@ -140,9 +114,7 @@ void walk_paths(const Look& look, const std::vector<NodeLink>& links,
         if (l.to != fx->id || l.to_port != 0 ||
             !wire_producer_live(look, l.from))
             continue;
-        // Source-adjacency looks THROUGH slots: an Offset just inside
-        // a group boundary still sits directly on the wired source.
-        // The shim rides only the branches whose feed IS a source.
+        // Adjacency looks through slots; the shim rides source branches only.
         int64_t branch_off = off;
         if (fx->type == EffectType::Offset && live &&
             offset_targets_audio(*fx) &&
@@ -154,9 +126,7 @@ void walk_paths(const Look& look, const std::vector<NodeLink>& links,
     if (pushed) rev.pop_back();
 }
 
-// Every chain wired into the look's Output, bottom-first: combined =
-// the In fan-in on port 0, split = the dedicated audio-in on port 1
-// (unwired = silent, never a fallback).
+// port 0 = the combined In, port 1 = the split audio-in. Unwired = silent.
 std::vector<VoicePath> resolve_voices(const Look& look) {
     std::vector<NodeLink> synth;
     const std::vector<NodeLink>& links = effective_links(look, synth);
@@ -171,13 +141,6 @@ std::vector<VoicePath> resolve_voices(const Look& look) {
     return out;
 }
 
-// ------------------------------------------------- audio program build
-//
-// The audio walk builds the wired graph itself, flattened: nodes sum
-// their fan-in, ops process the sum on their look's clock, hops window
-// and gain their subtree. The same cursor composition the picture walk
-// uses folds every nesting hop to closed form.
-
 struct ProgBuild {
     const Document& doc;
     AudioProgram& prog;
@@ -191,9 +154,7 @@ int alloc_audio_node(ProgBuild& pb) {
     return static_cast<int>(pb.prog.nodes.size()) - 1;
 }
 
-// Per-look-instance build state: one memo per instance (every nesting
-// hop composes its own clock), and a build stack that turns the one
-// legal cycle (Feedback) into a silent back edge.
+// One memo per instance: every nesting hop composes its own clock.
 struct LookBuild {
     ProgBuild& pb;
     const Look& look;
@@ -206,9 +167,6 @@ struct LookBuild {
 
 int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift);
 
-// A layer as a program node: media = a leaf read, nested = a windowed
-// hop over the child entity's program, generator = silence. src_shift
-// is an audio-targeting Offset sitting directly on this source.
 int build_layer_audio(LookBuild& lb, const Layer& layer,
                       int64_t src_shift) {
     const Document& doc = lb.pb.doc;
@@ -216,7 +174,7 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
     if (layer_is_media(layer)) {
         if (!layer.asset) return -1;
         const Asset* a = doc.find_asset(layer.asset);
-        if (!a) return -1;   // dangling id: dormant, like the picture
+        if (!a) return -1;   // dangling id: dormant
         const int64_t shift =
             static_cast<int64_t>(layer.slip) + src_shift;
         const double rate = media_conform_rate(
@@ -226,8 +184,7 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
                        &lo, &hi);
         Cursor leaf;
         if (layer.timeline_lock) {
-            // The node reads the asset at the ROOT clock: identity
-            // map, ignoring every composed placement hop.
+            // Locked: read at the root clock, ignore every placement hop.
             leaf.depth = cur.depth + 1;
             leaf.a = 1.0;
             leaf.b = 0.0;
@@ -241,8 +198,7 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
         if (idx < 0) return -1;
         AudioNode& n = lb.pb.prog.nodes[static_cast<size_t>(idx)];
         n.asset = layer.asset;
-        // Matching the compiler's Source stamp (media_stream_key - one
-        // formula); only the Offset shim folds in, never the slip.
+        // Only the Offset shim folds into the key, never the slip.
         n.key = media_stream_key(cur.path, layer.id, layer.asset,
                                  layer.timeline_lock, src_shift);
         n.owner = lb.look.id;
@@ -253,7 +209,6 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
         n.local_fps = layer.timeline_lock ? cur.root_fps : lb.eff;
         n.rate = rate;
         n.shift = shift;
-        // Leaf spans feed the LEAF VIEW; the mix tapers on PCM bounds.
         n.w0 = leaf.r0;
         n.w1 = leaf.r1;
         return idx;
@@ -261,8 +216,7 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
     if (layer_is_nested(layer)) {
         if (!layer.target) return -1;
         if (cur.depth + 1 >= kMaxLookDepth) return -1;
-        // An explicit duration cuts the nested entity; a derived one
-        // equals its content bounds, so only the explicit case clamps.
+        // Only an explicit duration clamps: a derived one is the content.
         double dur = 0.0;
         if (const Look* t = doc.find_look(layer.target)) {
             dur = static_cast<double>(t->duration);
@@ -297,9 +251,7 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
     return -1;   // generator: silence
 }
 
-// A doc node's contribution: layers end the wire, audio effects wrap
-// their fan-in sum in an op, everything else passes the sum through.
-// -1 = silence (dangling, unfed, generator, or the Feedback back edge).
+// -1 = silence: dangling, unfed, generator, or the Feedback back edge.
 int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift) {
     if (!src_shift) {
         const auto it = lb.memo.find(id);
@@ -316,9 +268,7 @@ int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift) {
         if (fx) {
             const bool live =
                 !fx->bypass && !group_bypassed(*owner, fx->group_id);
-            // An audio-targeting Offset shifts the sources it sits
-            // DIRECTLY on (slots forward the shim; any other hop
-            // drops it - adjacency is per branch).
+            // Offset shifts only the sources it sits directly on.
             int64_t feed_shift = 0;
             if (fx->type == EffectType::Offset && live &&
                 offset_targets_audio(*fx))
@@ -408,8 +358,6 @@ int build_look_audio(ProgBuild& pb, const Look& look, const Cursor& cur) {
     return idx;
 }
 
-// A sequence's audio is its AUDIO TRACKS' placements - each a windowed,
-// gained hop over its target's program (video lanes are silent).
 int build_seq_audio(ProgBuild& pb, const Sequence& seq,
                     const Cursor& cur) {
     const double eff = effective_fps(pb.doc, seq);
@@ -473,38 +421,26 @@ int build_entity_audio(ProgBuild& pb, uint64_t entity, const Cursor& cur) {
     return -1;
 }
 
-// ---------------------------------------------------------- picture walk
-
-// A look's sources run in LOCKSTEP: identity clock, windowed only by
-// what the source can play. Media layers add their slip; nested
-// entities pass time straight through, cut by an explicit duration when
-// one is set. The picture walk emits every visible wired-or-not layer
-// (compile culls by wiring itself).
+// Emits every visible layer, wired or not: compile culls by wiring.
 void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                std::vector<MediaInstance>& out) {
     const double eff = effective_fps(doc, look);
     auto emit_media = [&](const Layer& layer, int64_t off) {
         if (!layer.asset) return;
         const Asset* a = doc.find_asset(layer.asset);
-        // A DANGLING id (asset removed) is dormant exactly like an
-        // unbound node. An asset with no picture (audio import without
-        // cover art: no frames, no dimensions) has no image side.
+        // No frames and no size means audio only: there is no image side.
         if (!a) return;
         if (!a->frame_count && !a->width && !a->height) return;
         const uint32_t frames = a->frame_count;
         const int64_t shift = static_cast<int64_t>(layer.slip) + off;
-        // The cursor affine already lands in this LOOK's own clock, so
-        // the media ratio is against the look's effective rate; a
-        // LOCKED node reads the ROOT clock instead.
+        // The ratio is against the look rate; a locked node uses the root.
         const double rate = media_conform_rate(
             doc, *a, layer.timeline_lock ? cur.root_fps : eff);
         double lo = 0.0, hi = 0.0;
         shifted_window(static_cast<double>(frames), shift, rate, &lo, &hi);
         Cursor leaf;
         if (layer.timeline_lock) {
-            // The node reads the asset at the ROOT clock: identity map,
-            // ignoring every composed placement hop. The window bounds
-            // are the same formulas read in root frames.
+            // Locked: read at the root clock, ignore every placement hop.
             leaf.depth = cur.depth + 1;
             leaf.a = 1.0;
             leaf.b = 0.0;
@@ -515,8 +451,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
             return;
         }
         MediaInstance c;
-        // Container, asset, lock and shift fold into the key, matching
-        // the compiler's Source stamp (media_stream_key - one formula).
+        // The key must match the compiler Source stamp.
         c.key = media_stream_key(cur.path, layer.id, layer.asset,
                                  layer.timeline_lock, off);
         c.owner = look.id;
@@ -533,10 +468,8 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
     auto descend_nested = [&](const Layer& layer, int64_t off) {
         if (!layer.target) return;
         if (cur.depth + 1 >= kMaxLookDepth) return;
-        // An explicit duration cuts the nested entity; a derived one
-        // equals its content bounds, so only the explicit case clamps.
-        // LOCKSTEP means 1:1 IN TIME: the hop's fps ratio scales the
-        // child clock; the shift (child frames) moves it.
+        // Only an explicit duration clamps: a derived one is the content.
+        // Lockstep is 1:1 in time: the hop fps ratio scales the child clock.
         double dur = 0.0;
         if (const Look* t = doc.find_look(layer.target)) {
             dur = static_cast<double>(t->duration);
@@ -559,11 +492,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         walk(doc, child, out);
     };
 
-    // Live video-targeting Offset shims sitting DIRECTLY on a source
-    // (port-0 input is the layer): each adds a shifted read of that
-    // source next to the base one. Liveness mirrors compile's
-    // effect_active exactly - owner layer visible, not bypassed, not
-    // muted by a solo elsewhere in its layer, group live.
+    // Liveness must mirror compile effect_active exactly.
     std::vector<std::pair<uint64_t, int64_t>> vshifts;
     {
         std::vector<NodeLink> synth;
@@ -580,8 +509,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                 if (!offset_targets_video(fx)) continue;
                 const int64_t off = offset_frames(fx);
                 if (!off) continue;
-                // Adjacency looks THROUGH group input slots, matching
-                // the compiler's shim pass.
+                // Adjacency looks through group input slots, like the compiler.
                 const uint64_t src = hop_group_inputs(
                     look, links, link_into(look, links, fx.id, 0));
                 for (const Layer& l : look.layers)
@@ -610,13 +538,10 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
     }
 }
 
-// A sequence's placements are the affine hops. The picture walk reads
-// the video lanes only - sound is the audio program's business.
 void walk_sequence(const Document& doc, const Sequence& seq,
                    const Cursor& cur, std::vector<MediaInstance>& out) {
     const double eff = effective_fps(doc, seq);
-    // Hidden lanes leave the composite entirely - the flatten and
-    // the compiler must agree or the pool prewarms ghosts.
+    // The flatten and the compiler must agree on hidden lanes.
     for (const SeqTrack& t : seq.tracks) {
         if (t.hidden) continue;
         for (const Placement& p : t.placements) {
@@ -685,9 +610,7 @@ std::vector<MediaInstance> flatten_audio_sources(const Document& doc,
     const AudioProgram prog = flatten_audio_program(doc, root_id);
     std::vector<MediaInstance> out;
     if (prog.root < 0) return out;
-    // Depth-first, inputs in stored order (bottom chain first),
-    // composing hop gains down; a node a diamond reaches twice emits
-    // once, with its first path's gain.
+    // Depth-first in stored order: a node reached twice emits once.
     std::vector<char> seen(prog.nodes.size(), 0);
     std::vector<std::pair<int, float>> stack;
     stack.emplace_back(prog.root, 1.0f);
@@ -726,9 +649,7 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
     AudioChain out;
     std::vector<AudioOp> chain;   // play order, deepest hops first
     int64_t off = 0;              // Offset shims sum across the hops
-    // Analysis is keyed on ONE media stream (beat clocks anchor on
-    // media time), so a fan-in resolves to its bottom-most RESOLVABLE
-    // path - paths.front() of the same walk the program sums whole.
+    // Analysis needs one stream: take the bottom-most resolvable path.
     std::vector<VoicePath> paths;
     {
         std::vector<NodeLink> synth;
@@ -744,21 +665,18 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
         off += p.audio_off;
         const Layer& root = *p.root;
         if (layer_is_media(root)) {
-            // Unbound or dangling (asset removed): no voice, like the
-            // media walks.
+            // Unbound or dangling: no voice.
             if (!root.asset || !doc.find_asset(root.asset)) return {};
             out.asset = root.asset;
             out.slip = root.slip;
             out.offset = off;
-            // Lockstep hops are 1:1 in TIME, so the composed ratio
-            // telescopes to asset rate over the STARTING look's clock.
+            // Lockstep hops are 1:1 in time: the rate uses the start clock.
             out.rate = media_conform_rate(doc, *doc.find_asset(root.asset),
                                           effective_fps(doc, look));
             out.locked = root.timeline_lock;
             out.op_count = static_cast<uint32_t>(
                 std::min(chain.size(), kMaxVoiceOps));
-            // Prepends put play order in place; on overflow the hops
-            // nearest the walk's start win (the tail).
+            // On overflow the hops nearest the walk start win.
             const size_t base = chain.size() - out.op_count;
             for (uint32_t i = 0; i < out.op_count; ++i)
                 out.ops[i] = chain[base + i];

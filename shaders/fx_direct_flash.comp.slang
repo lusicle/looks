@@ -1,4 +1,4 @@
-// Linear light throughout, because this is literally light.
+// Keep the math in linear light.
 
 #include "fx_common.slang"
 
@@ -13,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float strength;
-    float falloff;   // radial exponent, higher = harder edge
+    float falloff;
     float cool;
     float red_eye;
 };
@@ -39,10 +39,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         lerp(float3(1.0, 1.0, 1.0), float3(0.85, 0.92, 1.15), saturate(cool));
     float3 col = base.rgb * (1.0 + lit * strength * 2.0) *
                  lerp(float3(1.0, 1.0, 1.0), flash_tint, lit);
-    col += lit * strength * 0.02;              // flat fill
-    col *= lerp(0.55, 1.0, lit);               // background falls off
+    col += lit * strength * 0.02;
+    col *= lerp(0.55, 1.0, lit);
 
-    // Keys on darkness near the lit center, standing in for pupils.
     if (red_eye > 0.001) {
         const float l = fx_luma(base.rgb);
         const float dark = saturate(1.0 - l * 6.0);

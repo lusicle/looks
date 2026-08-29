@@ -11,8 +11,8 @@ namespace looks::ui {
 
 namespace {
 
-// Column-major ortho: physical-pixel top-left (0,0) -> NDC (-1,-1),
-// bottom-right -> (+1,+1). Vulkan NDC is Y-down, so no flip is needed.
+// Column-major ortho: physical px top-left maps to NDC (-1,-1).
+// Vulkan NDC is y-down, so the matrix does no flip.
 struct Mat4 {
     float m[16];
 };
@@ -180,7 +180,6 @@ VkPipeline UiRenderer::build_pipeline(VkShaderModule vs, VkShaderModule fs,
 bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader_dir) {
     VkDevice dev = device_.device();
 
-    // Texture descriptor set layout: one combined image sampler in FS.
     VkDescriptorSetLayoutBinding binding{};
     binding.binding = 0;
     binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -219,16 +218,14 @@ bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader
     gfx::vk_check(vkCreateSampler(dev, &sampler_info, nullptr, &nearest_sampler_),
                   "vkCreateSampler(ui)");
 
-    // Pipeline layouts: 64-byte vertex push constant (ortho); the textured
-    // layout adds the atlas set plus a 16-byte fragment word (MSDF flag).
+    // Push range: 64 bytes of ortho, plus 16 bytes for the textured shaders.
     VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat4)};
     VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &push;
     gfx::vk_check(vkCreatePipelineLayout(dev, &layout_info, nullptr, &solid_layout_),
                   "vkCreatePipelineLayout(ui solid)");
-    // One VS|FS range: both text shaders declare the same 80-byte block
-    // (ortho + MSDF flag), pushed in a single combined update.
+    // Both text shaders declare the same 80-byte push block.
     VkPushConstantRange text_push{
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
         sizeof(Mat4) + 16};
@@ -246,7 +243,7 @@ bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader
     bool ok = ui_vs && ui_fs && text_vs && text_fs;
     if (ok) {
         solid_pipeline_ = build_pipeline(ui_vs, ui_fs, solid_layout_, color_format, 4);
-        // Text consumes pos/uv/color only — its shader has no shape input.
+        // The text shader has no shape input, so it takes 3 attributes.
         text_pipeline_ = build_pipeline(text_vs, text_fs, textured_layout_, color_format, 3);
         ok = solid_pipeline_ && text_pipeline_;
     }
@@ -277,7 +274,6 @@ bool UiRenderer::upload_texture(UiTexture& tex, VkFormat format,
         return false;
     }
 
-    // Staging buffer + one-shot upload on the graphics queue (init time).
     VkBufferCreateInfo staging_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     staging_info.size = size;
     staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -391,8 +387,7 @@ UiTexture* UiRenderer::commit_texture(std::unique_ptr<UiTexture> tex,
 const UiTexture* UiRenderer::register_font(Font& font) {
     const uint32_t width = font.atlas_width();
     const uint32_t height = font.atlas_height();
-    // MSDF fonts (fontbake): RGBA atlas, linear sampling, and the
-    // text shader's median-of-RGB decode (flagged via push constant).
+    // MSDF: RGBA atlas, linear sampling, median-of-RGB decode in the shader.
     const bool msdf = font.msdf();
     const std::vector<uint8_t>& pixels =
         msdf ? font.atlas_rgba() : font.atlas_pixels();
@@ -409,8 +404,6 @@ const UiTexture* UiRenderer::register_font(Font& font) {
         tex->unit_range[1] = font.px_range() / static_cast<float>(height);
     }
 
-    // View: replicate R into all channels so the shader's .r read works and
-    // future RGBA atlases need no shader change.
     if (!upload_texture(*tex,
                         msdf ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8_UNORM,
                         pixels.data(), pixels.size(),
@@ -438,8 +431,7 @@ const UiTexture* UiRenderer::register_image(const uint8_t* rgba,
     tex->height = height;
     tex->rgba_image = true;
 
-    // UNORM, not SRGB: UI colors are sRGB-encoded pass-through values (the
-    // viewport blit owns the OETF), so image bytes flow through unchanged.
+    // UNORM, not SRGB: the viewport blit owns the OETF.
     if (!upload_texture(*tex, VK_FORMAT_R8G8B8A8_UNORM, rgba, bytes,
                         {.image_fail = "ui: image texture creation failed (%ux%u)",
                          .pool = "vkCreateCommandPool(image upload)",
@@ -529,11 +521,9 @@ void UiRenderer::record(VkCommandBuffer cmd, uint32_t frame_index,
         if (batch.index_count == 0) continue;
         if (batch.kind == BatchKind::Image &&
             (!batch.texture || !batch.texture->rgba_image))
-            continue;   // image batch without a registered image
+            continue;
 
-        // Image batches ride the text pipeline: same vertex layout, and
-        // the fragment mode flag (0 A8 / 1 MSDF / 2 plain RGBA) selects
-        // the sampling flavor per batch.
+        // Fragment mode flag: 0 = A8, 1 = MSDF, 2 = plain RGBA.
         const bool textured = batch.kind != BatchKind::Solid;
         VkPipeline pipeline = textured ? text_pipeline_ : solid_pipeline_;
         VkPipelineLayout layout = textured ? textured_layout_ : solid_layout_;
@@ -550,8 +540,7 @@ void UiRenderer::record(VkCommandBuffer cmd, uint32_t frame_index,
         if (textured && batch.texture != bound_texture) {
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
                                     0, 1, &batch.texture->set, 0, nullptr);
-            // Per-atlas MSDF decode params ride the fragment tail of the
-            // push range (each font atlas has its own unit range).
+            // The decode data rides the fragment tail of the push range.
             uint8_t tail[16] = {};
             const uint32_t flag = batch.texture->rgba_image
                                       ? 2u
@@ -589,7 +578,7 @@ void UiRenderer::record(VkCommandBuffer cmd, uint32_t frame_index,
         vkCmdDrawIndexed(cmd, batch.index_count, 1, batch.first_index, 0, 0);
     }
 
-    // Restore the full-framebuffer scissor for whoever records next.
+    // Restore the full scissor for the next recorder.
     VkRect2D full{{0, 0}, extent};
     vkCmdSetScissor(cmd, 0, 1, &full);
 }

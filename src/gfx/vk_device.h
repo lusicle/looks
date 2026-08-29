@@ -1,9 +1,3 @@
-// Vulkan instance/device bootstrap.
-//
-// One graphics+compute queue for all rendering, plus a second
-// graphics-family queue for the thumbnail worker when the family has
-// one. VMA owns every allocation.
-
 #pragma once
 
 #include <memory>
@@ -11,23 +5,19 @@
 
 #include "gfx/vk_api.h"
 
-// Forward-declared so only vk_device.cpp/vma_impl.cpp see the VMA header.
+// Do not include vk_mem_alloc.h here; only the impl TUs see it.
 VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace looks::gfx {
 
 struct DeviceDesc {
-    void* hwnd = nullptr;        // HWND for the presentation surface;
-                                 // null = headless (no surface/swapchain —
-                                 // export CLIs, determinism harness)
+    void* hwnd = nullptr;        // HWND; null = headless (no surface/swapchain)
     void* hinstance = nullptr;   // HINSTANCE
     bool enable_validation = false;
 };
 
 class Device {
 public:
-    // Returns null on any failure (missing loader, no compatible GPU) after
-    // logging the reason — the app shows a message and exits cleanly.
     static std::unique_ptr<Device> create(const DeviceDesc& desc);
     ~Device();
 
@@ -42,18 +32,11 @@ public:
 
     uint32_t graphics_family() const { return graphics_family_; }
     VkQueue graphics_queue() const { return graphics_queue_; }
-    // Second graphics-family queue (priority 0.5) for the thumbnail
-    // worker's background renders; the graphics queue itself when the
-    // family exposes only one. Same family = shared resources, and a
-    // host fence wait plus the consumer's own barriers carry work
-    // across queues (execution ordered through the host, visibility
-    // through the barrier).
+    // Same as graphics_queue() when the family has only one queue.
+    // Cross-queue handoff: host fence wait plus the consumer's own barriers.
     VkQueue thumb_queue() const { return thumb_queue_; }
 
-    // Serializes vkQueueSubmit/vkQueuePresentKHR/vkDeviceWaitIdle
-    // across ALL queues - preview loop, export worker, UI present and
-    // the thumbnail queue take this one lock for every submit, so no
-    // per-queue ownership bookkeeping exists to get wrong.
+    // Take this lock for every submit, present, and wait-idle, on all queues.
     std::mutex& queue_mutex() const { return queue_mutex_; }
 
     void wait_idle() const {

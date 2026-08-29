@@ -1,4 +1,4 @@
-// Display-referred, self-converting.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -41,8 +41,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 center = fx_srgb_oetf(saturate(base.rgb));
     const float radius_px = 2.0 + saturate(bleed) * 9.0;
 
-    // Edge-stopped: taps differing too much in color barely count, so
-    // the wash melts detail without crossing hard boundaries.
     float3 acc = center;
     float acc_a = base.a;
     float wsum = 1.0;
@@ -60,7 +58,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 wash = acc / wsum;
     const float wash_a = acc_a / wsum;
 
-    // Pigment pools along boundaries, found by the input luma gradient.
     const float2 px = 1.5 / size;
     const float lr = fx_luma(input.SampleLevel(
         clamp(uv + float2(px.x, 0.0), 0.0, 1.0), 0).rgb);

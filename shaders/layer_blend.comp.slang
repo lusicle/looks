@@ -1,10 +1,5 @@
-// Premultiplied composite: the layer's own alpha is the gate, so crop /
-// scale-down / Shape coverage reveal the composite below even after the
-// effect stack reshaped it. Blend modes act on unpremultiplied layer
-// color, applied at the layer's coverage. Sequence lanes composite
-// through the placement's canvas affine RIGHT HERE - Motion is an
-// attribute of the composite, never an effect pass; use_xform 0 keeps
-// the untransformed path identical for look layers.
+// The composite is premultiplied. The layer alpha is the gate.
+// Blend modes act on unpremultiplied color at the layer coverage.
 
 #include "fx_common.slang"
 
@@ -13,14 +8,14 @@ cbuffer Push
 {
     uint width;
     uint height;
-    uint mode;         // doc::BlendMode
+    uint mode;
     float opacity;
     uint use_xform;
     float xf_scale;    // about the anchor, > 0
     float xf_rotate;   // radians
-    float xf_shift_x;  // canvas fractions; +x right, +y down
+    float xf_shift_x;  // canvas fractions, +x right and +y down
     float xf_shift_y;
-    float anchor_x;    // scale/rotate pivot, uv; 0.5 = canvas center
+    float anchor_x;    // scale and rotate pivot, uv
     float anchor_y;
 };
 
@@ -39,10 +34,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     float4 b;
     if (use_xform != 0u)
     {
-        // Inverse of the monitor's forward map
-        // out = a + shift + S*R*(src - a); rotation is rigid and scale
-        // uniform, so the frame edge gets a one-pixel analytic AA band
-        // like the layer transform's.
         const float aspect = float(width) / float(height);
         const float2 anchor = float2(anchor_x, anchor_y);
         float2 p = (uv - anchor - float2(xf_shift_x, xf_shift_y))

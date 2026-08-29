@@ -96,8 +96,7 @@ public:
         if (!desc.resizable)
             style &= ~static_cast<DWORD>(WS_THICKFRAME | WS_MAXIMIZEBOX);
 
-        // Desired size is logical px; scale by the primary monitor DPI, then
-        // convert client size -> outer size.
+        // The desc gives logical px. Scale by DPI, then get the outer size.
         UINT dpi = GetDpiForSystem();
         RECT rect{0, 0,
                   MulDiv(desc.width, static_cast<int>(dpi), 96),
@@ -114,7 +113,7 @@ public:
         dpi_scale_ = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
         update_client_size();
 
-        DragAcceptFiles(hwnd_, TRUE);   // WM_DROPFILES -> Event::FileDrop
+        DragAcceptFiles(hwnd_, TRUE);
         ShowWindow(hwnd_, SW_SHOW);
     }
 
@@ -190,7 +189,7 @@ private:
             case WM_CLOSE:
                 e.type = Event::Type::CloseRequested;
                 emit(e);
-                return 0;  // app decides; request_close() actually destroys
+                return 0;  // Do not destroy here. request_close() does it.
 
             case WM_DESTROY:
                 hwnd_ = nullptr;
@@ -266,7 +265,7 @@ private:
                 e.type = Event::Type::MouseWheel;
                 e.wheel_y = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
                 POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                ScreenToClient(hwnd_, &pt);   // wheel coords arrive in screen space
+                ScreenToClient(hwnd_, &pt);   // Wheel coords are screen space.
                 e.mouse_x = static_cast<float>(pt.x);
                 e.mouse_y = static_cast<float>(pt.y);
                 e.mods = current_mods();
@@ -287,13 +286,8 @@ private:
 
             case WM_DROPFILES: {
                 HDROP drop = reinterpret_cast<HDROP>(wparam);
-                // WHERE the files landed: dropping onto the timeline
-                // means something different from dropping anywhere
-                // else, and the last mouse-move is stale (dragging
-                // over another window sends us nothing). Physical
-                // client px, like every other event carries. A
-                // multi-select drop delivers ONE event per file, all
-                // at the same point - nothing is silently discarded.
+                // The drop point is in physical client px.
+                // A drop of many files sends one event for each file.
                 POINT drop_pt{};
                 DragQueryPoint(drop, &drop_pt);
                 const UINT count =
@@ -325,7 +319,7 @@ private:
                 e.repeat = (lparam & (1ll << 30)) != 0;
                 e.mods = current_mods();
                 emit(e);
-                // Let DefWindowProc handle Alt+F4 etc. for syskeys.
+                // Syskeys must go to DefWindowProc to keep Alt+F4.
                 return msg == WM_SYSKEYDOWN
                     ? DefWindowProcW(hwnd_, msg, wparam, lparam) : 0;
 
@@ -338,7 +332,7 @@ private:
                     ? DefWindowProcW(hwnd_, msg, wparam, lparam) : 0;
 
             case WM_CHAR: {
-                // UTF-16 in; pair surrogates into one UTF-32 event.
+                // WM_CHAR gives UTF-16 units. Join surrogates into one point.
                 uint32_t c = static_cast<uint32_t>(wparam);
                 if (c >= 0xD800 && c <= 0xDBFF) {
                     pending_high_surrogate_ = c;

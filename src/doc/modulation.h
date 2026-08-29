@@ -1,24 +1,5 @@
-// Modulation data model, stored in the Document: the look-local value
-// graph (value nodes + routes), per-param keyframe lanes, and snapshot
-// slots. Evaluation lives in src/mod/ — this header is pure data so the
-// document stays self-contained.
-//
-// Value model per param:
-//   unwired: the stored base (slider); keyframe lanes drive it
-//   wired:   final = clamp(min + span · curve(node), min, max)
-// A wire REPLACES the base — depth and offset shaping live in the value
-// graph (math, normalise), never on the wire.
-//
-// A VALUE NODE is a shared signal: a generator (LFO, drift, audio bands,
-// video sampling) or a helper that combines upstream node outputs (math
-// ops, normalise). A ROUTE is a plain wire from one value node's output
-// onto one param — one node can drive many params, a param holds at most
-// ONE wire (adding to a wired param replaces it), and helper nodes chain
-// node-to-node. The value graph is acyclic (commands guard wiring).
-//
-// Targets address effects by STABLE ID (survives reorder/undo); display
-// paths like "layer0.fx2.shift_x" are derived from the live stack by the
-// param table.
+// A wire replaces the base: final = clamp(min + span * curve(node), min, max).
+// One param holds at most one wire, and the value graph stays acyclic.
 
 #pragma once
 
@@ -27,25 +8,12 @@
 
 namespace looks::doc {
 
-// param_index >= 0 indexes EffectInstance::params; negatives address the
-// built-ins (kWetParam / kOpacityParam in stack_commands.h).
-//
-// Layer params are mod targets too: keys set kLayerParamBit and
-// carry the LAYER id (layers share the effect id counter, but the bit
-// keeps the addressing self-describing and JSON stores it as its own
-// field). Indices — the continuous Layer fields:
-//   0 opacity, 1-3 color_a rgb, 4-6 color_b rgb, 7 gen_scale,
-//   8 gen_angle, 9 crop_l, 10 crop_r, 11 crop_t, 12 crop_b,
-//   13 xf_scale, 14 xf_rotate.
+// param_index >= 0 indexes params; negatives are built-ins (stack_commands.h).
+// A layer key sets this bit and carries the layer id.
 inline constexpr uint64_t kLayerParamBit = 1ull << 62;
-// Indexes into the layer param slots; 15/16 are the slip and waveform
-// FIELD ids (view rows, not modulatable slots), 17 is the oscillator
-// phase.
+// Slots 15 and 16 are field ids only, never modulatable.
 inline constexpr int kLayerParamCount = 20;
-// Group params ride the same addressing: keys set kGroupParamBit and
-// carry the GROUP id; param_index is kWetParam / kOpacityParam only (a
-// group's composite knobs are exactly a node's built-ins). JSON stores
-// the bare id in its own field, like layer keys.
+// A group key sets this bit and carries the group id; wet/opacity only.
 inline constexpr uint64_t kGroupParamBit = 1ull << 61;
 
 struct ParamKey {
@@ -59,32 +27,27 @@ struct ParamKey {
 
 enum class ModSourceType : uint32_t {
     Lfo = 0,
-    Drift,             // Perlin-style wander
-    AudioLow,          // analysis curves (import-time, sampled per frame)
+    Drift,
+    AudioLow,
     AudioMid,
     AudioHigh,
     AudioOnset,
     VideoMotion,
     VideoBrightness,
-    LfoBeat,           // BPM-synced LFO: rate_hz = beats per cycle
-    Envelope,          // attack-decay burst fired by triggers (see below)
-    VideoCut,          // scene-cut trigger curve
-    Beat,              // deterministic pulse train from the BPM estimate
-    VideoSample,       // color/luma at a point of the current source frame
-    VideoRegion,       // mean color/luma over a rect of the source frame
-    Math,              // helper: op(a, b) over upstream nodes / constants
-    Normalise,         // helper: map the scaled window onto [0, 1], clamped
-    Camera,            // motion-solve channels of the wired media (track
-                       // sidecar; generate on the card): channel picks
-                       // stab x/y/rot/scale or an anchor projection
+    LfoBeat,
+    Envelope,
+    VideoCut,
+    Beat,
+    VideoSample,
+    VideoRegion,
+    Math,
+    Normalise,
+    // Camera: channel picks stab x/y/rot/scale or an anchor projection.
+    Camera,
     Count,
 };
 
-// Audio-driven node kinds REQUIRE a wired media input (audio_src): the
-// bands and onset sample the wired chain's curves, Beat/LfoBeat clock
-// on its BPM, Envelope's onset/beat triggers fire from it. Unwired = 0,
-// never the global curves. (Envelope's cut/keypress triggers are not
-// audio, but the kind keeps its input port for the audio ones.)
+// These kinds need audio_src wired. Unwired reads 0, never a global curve.
 inline bool value_kind_wants_audio(ModSourceType t) {
     return t == ModSourceType::AudioLow || t == ModSourceType::AudioMid ||
            t == ModSourceType::AudioHigh || t == ModSourceType::AudioOnset ||
@@ -92,9 +55,6 @@ inline bool value_kind_wants_audio(ModSourceType t) {
            t == ModSourceType::Envelope;
 }
 
-// Kinds whose card grows the media-In pin (audio_src is the wired media
-// input, whatever the analysis): the audio family reads processed-audio
-// curves, the Camera node reads the wired media's motion solve.
 inline bool value_kind_wants_media(ModSourceType t) {
     return value_kind_wants_audio(t) || t == ModSourceType::Camera;
 }
@@ -110,65 +70,47 @@ enum class ValueOp : uint32_t {
 struct ModSource {
     ModSourceType type = ModSourceType::Lfo;
     LfoShape shape = LfoShape::Sine;
-    float rate_hz = 1.0f;     // LFO / drift / S&H rate; LfoBeat: beats/cycle
+    float rate_hz = 1.0f;     // hz; LfoBeat reads it as beats per cycle
     float phase = 0.0f;       // cycles
-    uint64_t seed = 0;        // S&H / drift
-    // Envelope: attack-decay burst fired by a trigger. Keypress
-    // fires live only (exempts live mode from determinism); the
-    // Beat source reuses attack/decay for its pulse shape.
+    uint64_t seed = 0;
+    // Keypress fires in live mode only; Beat reuses attack and decay.
     float attack = 0.02f;     // seconds to peak
     float decay = 0.4f;       // exponential decay constant, seconds
     uint32_t trigger = 0;     // 0 onset, 1 scene cut, 2 beat, 3 keypress
-    // Video sampling: point / centered region on
-    // the CURRENT decoded source frame, uv 0..1. VideoSample ignores the
-    // extent (it averages a small fixed box so 8-bit code-value steps
-    // don't pop). channel: 0 luma, 1 R, 2 G, 3 B.
+    // px/py/pw/ph are uv 0..1. VideoSample ignores the extent.
+    // channel: 0 luma, 1 R, 2 G, 3 B.
     float px = 0.5f, py = 0.5f;
     float pw = 0.25f, ph = 0.25f;
     uint32_t channel = 0;
-    // Camera: the locked 3D anchor - a solved feature-track id picked
-    // on the monitor overlay; 0 = none (anchor channels read 0).
+    // A solved feature-track id. 0 = none.
     uint32_t anchor = 0;
 };
 
-// A node of the value graph. source.type is the node kind; generator
-// kinds read the ModSource fields, helper kinds read the fields below.
 // An unwired helper input (0) reads its constant instead.
 struct ValueNode {
     uint64_t id = 0;
     ModSource source;
-    // Math: out = op(a, b).
     ValueOp op = ValueOp::Add;
     uint64_t in_a = 0, in_b = 0;    // upstream value-node ids; 0 = constant
     float const_a = 0.0f, const_b = 1.0f;
-    // Analysis kinds (audio low/mid/high/onset): the media-graph node
-    // (layer or effect id, same look) whose AUDIO this node analyzes -
-    // runtime curves of the wired chain's processed signal. The input
-    // is REQUIRED: 0 = unwired = the node reads 0, nothing else.
+    // A layer or effect id in the same look. 0 = unwired = the node reads 0.
     uint64_t audio_src = 0;
-    // Normalise: the window [in_min, in_max] (bounds capped -1..1)
-    // scaled by the multiplier m = const_b, so wide windows come from
-    // the multiplier, not wide sliders:
-    //   out = clamp01((a - in_min*m) / ((in_max - in_min)*m))
+    // Window [in_min, in_max], capped -1..1, scaled by m = const_b.
     float in_min = 0.0f, in_max = 1.0f;
-    // Node-canvas position; (0,0) = unplaced.
+    // Node-canvas position. (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
 };
 
-// A wire: one value node's output REPLACING one param (the node's 0..1
-// maps onto the param's range through the curve). node 0 = dangling
-// (inert, kept so undo can resurrect its source).
+// node 0 = dangling: inert, kept so undo can restore its source.
 struct ModRoute {
-    uint64_t id = 0;          // stable identity for UI/undo
-    uint64_t node = 0;        // source ValueNode id
+    uint64_t id = 0;
+    uint64_t node = 0;
     ParamKey target;
     ResponseCurve curve = ResponseCurve::Linear;
 };
 
-// Cubic bezier key. Handles are (dframe, dvalue) offsets from the key —
-// out_* eases toward the next key, in_* eases from the previous. hold
-// steps to the next key with no interpolation.
+// Handles are (dframe, dvalue) offsets: out_* to next, in_* from previous.
 struct Keyframe {
     double frame = 0.0;
     float value = 0.0f;
@@ -180,16 +122,10 @@ struct Keyframe {
 struct KeyframeLane {
     ParamKey target;
     std::vector<Keyframe> keys;   // sorted by frame
-    // Loopable region: once the playhead passes the first key,
-    // evaluation wraps through the key span instead of holding the last
-    // value — draw a cycle once, it repeats forever.
     bool loop = false;
-    // Muted lanes keep their keys but stop driving the param (the
-    // timeline's disable toggle).
     bool muted = false;
 };
 
-// Full parameter snapshot: stack param values keyed by effect id.
 struct SnapshotEntry {
     uint64_t effect_id = 0;
     std::vector<float> params;

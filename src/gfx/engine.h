@@ -1,9 +1,3 @@
-// Engine: per-frame evaluation of the compiled render graph.
-// Uploads the decoded I420 frame, converts to the linear RGBA16F working
-// space in compute, then walks the graph's topological order dispatching
-// one kernel per effect over pooled ping-pong targets. Returns the final
-// image ready for the viewport blit (and, next milestone, export readback).
-
 #pragma once
 
 #include <filesystem>
@@ -17,12 +11,11 @@
 #include "gfx/error_diffusion.h"
 #include "gfx/render_cache.h"
 #include "gfx/texture.h"
-#include "ui/truetype.h"   // runtime TTF loader for the Text effect
+#include "ui/truetype.h"
 
 namespace looks::gfx {
 
-// CPU-side I420 planes (decoded mezzanine frame or a generator). Strides are
-// bytes per row; U/V are half resolution (rounded up).
+// I420 planes; strides are bytes per row, U and V half size rounded up.
 struct SourcePlanes {
     const uint8_t* y = nullptr;
     size_t y_stride = 0;
@@ -32,20 +25,14 @@ struct SourcePlanes {
     size_t v_stride = 0;
     uint32_t width = 0;
     uint32_t height = 0;
-    // NV12: `u` is the interleaved CbCr plane (u_stride = bytes per row,
-    // 2 bytes per chroma sample), `v` unused. The native decode path
-    // hands the decoder's buffer through untouched - no deinterleave.
+    // NV12: u is the interleaved CbCr plane and v is unused.
     bool nv12 = false;
 };
 
 class Engine {
 public:
-    // submit_queue: where the engine's INTERNAL submissions land (the
-    // Codec-Box segmented path submits its own command buffers, and
-    // their results must be complete before the caller's submission -
-    // same-queue ordering). Null = the device's graphics queue. A
-    // caller submitting the engine's output on another queue MUST pass
-    // that queue here.
+    // submit_queue takes the engine's internal submissions; null = graphics.
+    // A caller that submits on another queue must pass that queue here.
     static std::unique_ptr<Engine> create(
         Device& device, const std::filesystem::path& shader_dir,
         VkQueue submit_queue = VK_NULL_HANDLE);
@@ -54,65 +41,24 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // Records upload + the full effect graph into `cmd` (must be OUTSIDE any
-    // rendering pass). Returns the final target, transitioned to
-    // SHADER_READ_ONLY_OPTIMAL — valid until the next render() call for this
-    // frame slot. Null on failure (allocation, invalid graph).
-    // timeline_frame/fps feed the deterministic per-frame randomness and
-    // clocked effects (fixed timestep on frame index).
+    // cmd must be outside any render pass.
+    // The result is SHADER_READ_ONLY and is valid until the next render().
 
-    // Media sources: EVERY placement decodes its own frame - there is no
-    // shared playhead frame. The caller's decode
-    // pool maps each placement to its source frame and keeps the planes
-    // alive through render(); a key with no entry renders black.
+    // The caller keeps the planes alive through render().
+    // A key with no entry renders black.
     struct LayerSourceFrame {
-        // The instance-scoped key of the placement these planes belong
-        // to: hash(instance path, layer id), matching GraphNode::key.
+        // hash(instance path, layer id); it must match GraphNode::key.
         uint64_t key = 0;
-        // Producer's content identity (codec::DecodedFrame::stamp): the
-        // upload is skipped when a key re-presents the stamp it already
-        // uploaded. 0 = always upload.
+        // The upload is skipped when the stamp repeats; 0 = always upload.
         uint64_t content_stamp = 0;
         SourcePlanes planes;
     };
 
-    // cache_frame is what the cache keys on: the PLAYHEAD frame, not
-    // timeline_frame. Under a speed ramp several playhead frames land on
-    // one timeline position with different modulation, so the playhead is
-    // the only index that identifies an output frame. Ignored when
-    // cache_ctx is 0.
-    // cache_ctx != 0 enables the frame render cache for this
-    // render: a hit skips the whole graph and re-uploads the stored frame;
-    // a miss arms a deferred readback harvested kFramesInFlight renders
-    // later (the caller's fence wait makes the copy safe to read). Callers
-    // MUST pass 0 when any history-bearing effect is active
-    // (doc::document_uses_history) or determinism is not frame-indexed
-    // (live mode) — the engine does not re-check.
-    // out_source (A/B wipe / bypass-all): when non-null, receives
-    // the converted linear-RGB REFERENCE source — the first media source
-    // playing in the rendered look (kept alive alongside the final target,
-    // SHADER_READ_ONLY) — or nullptr when unavailable (cache hit, or a
-    // look with no media playing). Callers comparing A/B pass cache_ctx 0.
-    // preview_node: publish the named node's output instead of
-    // the composite (selection-follows preview). preview_layer: publish
-    // the named LAYER's whole contribution (chain end, pre-blend);
-    // preview_node outranks it. Callers hashing the render-cache context
-    // must include both; export passes 0.
-    // root_id names which entity renders: the scoped sequence or look in
-    // preview, the exported sequence in export.
-    // canvas_w/canvas_h are the PROJECT's working resolution
-    // (doc::canvas_size) — the media under the playhead never decides it.
-    // measure_placement: root-sequence block whose pre-Motion lane image
-    // gets the alpha-bounds reduction (read_measure_bounds after the
-    // fence). Preview-only - it bypasses the render cache LOOKUP so the
-    // measurement actually runs; export always passes 0.
-    // cache_store gates the WRITE side of the render cache: a miss arms
-    // a full-frame readback whose harvest crosses ~66 MB of
-    // write-combined memory at 4K - per frame, that is most of a bare
-    // feed's record cost. Continuous playback rarely revisits a frame,
-    // so the transport passes false while playing; paused and stepping
-    // states (where revisits are the point) keep storing. Reads (hits)
-    // stay on either way.
+    // cache_frame is the playhead frame, not timeline_frame.
+    // Callers must pass cache_ctx 0 for history effects; no re-check here.
+    // out_source gets the reference source, alive with the final target.
+    // measure_placement is preview-only and bypasses the cache lookup.
+    // cache_store gates only the write side; cache hits stay on either way.
     GpuImage* render(VkCommandBuffer cmd, uint32_t frame_index,
                      const doc::Document& doc,
                      uint64_t root_id, uint32_t timeline_frame, double fps,
@@ -126,14 +72,10 @@ public:
                      uint64_t measure_placement = 0,
                      bool cache_store = true);
 
-    // Alpha bounds of the last render's measure tap, as a canvas-fraction
-    // rect {x, y, w, h}. Valid only after the submission that recorded it
-    // has fenced. False: nothing measured, or fully transparent content.
+    // Alpha bounds as a canvas-fraction rect {x, y, w, h}.
+    // Valid only after the submission that recorded it has fenced.
     bool read_measure_bounds(float rect[4]) const;
-    // Did the LAST render() record a measure tap? A pipelined caller
-    // snapshots this per submission and reads the bounds only at that
-    // submission's fence (measures are one-shot per selection, so two
-    // in flight never both record one).
+    // A pipelined caller snapshots this and reads bounds at that fence.
     bool measure_recorded() const;
 
     RenderCache& cache() { return cache_; }
@@ -141,58 +83,43 @@ public:
     VkSampler linear_sampler() const { return linear_sampler_; }
     DescriptorArena& arena() { return arena_; }
 
-    // Glyph renderer: installs a tile atlas. Slot 0 is the
-    // procedural halftone built at init; slot 1 the ASCII ramp; slot 2 a
-    // user-droppable custom set (atlas PNG + JSON grid descriptor). R8,
-    // tiles ordered dark -> light. Blocking one-shot upload.
+    // Slot 0 = halftone, 1 = ASCII ramp, 2 = custom; R8, dark to light.
+    // The upload blocks until it completes.
     bool set_glyph_atlas(const uint8_t* gray, uint32_t width, uint32_t height,
                          float tile_px = 8.0f, uint32_t cols = 16,
                          uint32_t rows = 6, int slot = 1);
-    // Color tileset (emoji etc.): RGBA8 atlas, coverage from alpha, the
-    // tile's own hue rendered. Same slots as the gray variant.
+    // RGBA8 atlas; alpha gives coverage and the tile keeps its own hue.
     bool set_glyph_atlas_rgba(const uint8_t* rgba, uint32_t width,
                               uint32_t height, float tile_px = 8.0f,
                               uint32_t cols = 16, uint32_t rows = 6,
                               int slot = 2);
 
-    // Audio Scope: mono soundtrack copy (block-decimated, ~16 kHz) the
-    // engine slices into a per-frame min/max waveform strip. Call from the
-    // thread that renders (worker / export thread) — no internal locking.
-    // Empty vector = no audio (the scope draws a flat line).
+    // Call from the render thread only; there is no internal locking.
     void set_scope_audio(std::vector<int16_t> mono, uint32_t sample_rate);
 
-    // Track Pin plane solves, keyed by hash(asset, quantized region) —
-    // the app resolves planes from the .track sidecars and hands the
-    // flat table over (same thread contract as set_scope_audio). A pin
-    // with no entry renders with the identity homography.
+    // Same thread contract as set_scope_audio.
+    // A pin with no entry uses the identity homography.
     struct PinPlane {
         uint32_t start = 0;
-        std::vector<float> h;   // 9 floats per frame from `start`
+        std::vector<float> h;   // 9 floats per frame from start
     };
     using PinPlaneMap = std::unordered_map<uint64_t, PinPlane>;
     void set_track_planes(std::shared_ptr<const PinPlaneMap> planes) {
         pin_planes_ = std::move(planes);
     }
-    // The dispatch's lookup key; the app builds the map with the same
-    // quantization so both sides agree.
+    // Both sides must quantize the same way to agree on this key.
     static uint64_t pin_plane_key(uint64_t asset, float rx, float ry,
                                   float rw, float rh);
 
-    // Preview proxy: 1 = full, 2 = half, 4 = quarter. The source
-    // planes stay full-res; the working targets shrink (kernels sample by
-    // uv, so everything scales). Export uses its own Engine at 1.
+    // Preview divisor: 1 = full, 2 = half, 4 = quarter.
+    // The source planes stay full size; only the working targets shrink.
     void set_preview_divisor(uint32_t d) {
         preview_divisor_ = d < 1 ? 1 : (d > 4 ? 4 : d);
     }
     uint32_t preview_divisor() const { return preview_divisor_; }
 
-    // Node-canvas thumbnails: a fixed 8x8 grid of
-    // 160x90 cells, RGBA8 sRGB-encoded, tapped after each ROOT-instance
-    // layer-chain node plus the final composite (cell key 0). The cell
-    // map reflects the last EVALUATED graph; the app disables the frame
-    // cache while a look renders (the canvas is on screen there), so
-    // every displayed frame re-taps and a card absent from the map means
-    // its node was not evaluated — culled, bypassed, or disconnected.
+    // Thumbnail cells are RGBA8 and sRGB encoded; cell key 0 is the composite.
+    // A node absent from the map was not evaluated.
     static constexpr uint32_t kThumbCellW = 160, kThumbCellH = 90;
     static constexpr uint32_t kThumbGridCols = 8, kThumbGridRows = 8;
     GpuImage* thumb_atlas() { return thumb_atlas_.get(); }
@@ -200,10 +127,8 @@ public:
         return thumb_cells_;
     }
 
-    // Library gallery atlas: 160x90 cells the WORKER assigns (they
-    // persist across renders - entity/preset thumbnails fill one per
-    // idle cycle). Aspect-fit tap, recorded after a render() into the
-    // same command buffer.
+    // The worker assigns gallery cells and they persist across renders.
+    // The tap records into the same command buffer, after render().
     static constexpr uint32_t kGalleryCellW = 160, kGalleryCellH = 90;
     static constexpr uint32_t kGalleryCols = 8, kGalleryRows = 8;
     GpuImage* gallery_atlas() { return gallery_atlas_.get(); }
@@ -211,8 +136,7 @@ public:
                             GpuImage* src, uint32_t cell);
 
 private:
-    // Internal submissions (Codec-Box segments) land here so their
-    // results order before the caller's submission on the same queue.
+    // Internal submissions land here to order before the caller's submit.
     VkQueue submit_queue_ = VK_NULL_HANDLE;
 
     explicit Engine(Device& device)
@@ -228,15 +152,10 @@ private:
     Device& device_;
     DescriptorArena arena_;
     TargetPool pools_[kFramesInFlight];
-    // The slot whose intermediates this render may touch - set at render()
-    // entry. Per-slot pools let frame N record while N-1 still executes:
-    // shared intermediates would be a GPU data race.
+    // Per-slot pools stop a GPU data race between frames in flight.
     TargetPool* pool_ = nullptr;
     std::unique_ptr<StagingBuffer> staging_[kFramesInFlight];
-    // Previous frame's REFERENCE luma for flow/motion. Valid only when
-    // this render's timeline frame directly follows the last one AND the
-    // reference is still the same source (sequential playback/export); a
-    // seek or a cut yields zero flow for one frame.
+    // Previous reference luma; valid only on the next frame, same source.
     std::unique_ptr<GpuImage> prev_y_;
     // Flat-black stand-in when the look holds no media source at all.
     std::unique_ptr<GpuImage> dummy_y_;
@@ -246,9 +165,8 @@ private:
     bool prev_frame_valid_ = false;
     VkSampler linear_sampler_ = VK_NULL_HANDLE;
     std::unique_ptr<ComputePipeline> to_rgb_;
-    // Alpha-bounds measurement: 4x1 r32ui atomic min/max target + a
-    // persistently-mapped readback the UI harvests after the worker's
-    // per-cycle fence. Never touched by export.
+    // Alpha bounds: a 4x1 r32ui atomic min/max target and a mapped readback.
+    // The UI harvests it after the worker fence; export never uses it.
     std::unique_ptr<ComputePipeline> alpha_bounds_;
     std::unique_ptr<GpuImage> bounds_img_;
     VkBuffer bounds_buf_ = VK_NULL_HANDLE;
@@ -256,27 +174,18 @@ private:
     void* bounds_mapped_ = nullptr;
     bool bounds_recorded_ = false;
     uint32_t bounds_w_ = 0, bounds_h_ = 0;
-    // The placement the last recorded measurement belongs to: the cache
-    // LOOKUP is bypassed only until the current selection has been
-    // measured once - cached frames then serve normally and the UI keeps
-    // the last measured box (edits miss the cache anyway, so fresh
-    // content re-measures itself).
+    // The cache lookup is bypassed only until this selection measures once.
     uint64_t measured_placement_ = 0;
     std::unique_ptr<ComputePipeline> fx_[static_cast<size_t>(doc::EffectType::Count)];
     std::unique_ptr<ComputePipeline> matte_extract_, matte_apply_;
     std::unique_ptr<ComputePipeline> glow_pass_[4];   // bright, H, V, comp
     std::unique_ptr<ComputePipeline> flow_;
 
-    // ---- Codec-Box: mid-graph CPU roundtrip. The graph is
-    // evaluated in fenced SEGMENTS when a codec effect is present: render up
-    // to the box, read the frame back, run the mosh codec on the CPU
-    // (persistent per-instance decoder state), re-upload, continue.
+    // A codec effect splits the graph into fenced CPU roundtrip segments.
     struct CodecIo {
         std::unique_ptr<GpuImage> nv_y, nv_uv;        // NV12 conversion
         std::unique_ptr<GpuImage> up_y, up_u, up_v;   // I420 re-upload
         std::unique_ptr<GpuImage> up_idx;   // error-diffusion packed picks
-        // GPU rate control (Bitrate Starve): per-rung DC scratch, bit
-        // totals, and the picked quality the wire reads back.
         std::unique_ptr<GpuImage> rate_dc, rate_bits, rate_qsel;
         VkBuffer readback = VK_NULL_HANDLE;
         VmaAllocation readback_alloc = nullptr;
@@ -292,21 +201,14 @@ private:
         codec::MoshCodec codec;
         codec::DecodedFrame last_out;   // paused re-render must not restew
         uint32_t last_frame = 0xFFFFFFFFu;
-        // Param signature of the last process. A paused edit re-arms the
-        // gate as a DISCONTINUITY (codec reset, fresh I) so the change
-        // shows without moving the playhead; advancing frames never reset.
+        // A paused edit re-arms the gate; advancing frames never reset.
         uint64_t sig = 0;
         bool valid = false;
     };
     std::unordered_map<uint64_t, MoshSlot> mosh_state_;
     std::unique_ptr<ComputePipeline> to_nv12_, fx_mix_;
-    // Group composite (GraphNode::Kind::GroupMix): dry vs face two-lerp.
     std::unique_ptr<ComputePipeline> group_mix_;
-    // GPU mosh pipelines + per-instance chain state. Planes are r32ui
-    // storage images holding one byte value per texel; state lives on the
-    // GPU across timeline frames (the whole point — no readback). The CPU
-    // MoshCodec handles the byte-flips / bitrate-budget params, which are
-    // the only paths that still need real bytes.
+    // Mosh planes are r32ui storage images with one byte value per texel.
     std::unique_ptr<ComputePipeline> mosh_predict_, mosh_wire_, mosh_unorm_;
     std::unique_ptr<ComputePipeline> mosh_rate_probe_, mosh_rate_reduce_,
         mosh_rate_pick_;
@@ -321,10 +223,8 @@ private:
         bool has_state = false;
     };
     std::unordered_map<uint64_t, MoshGpuSlot> mosh_gpu_;
-    // Runs one codec-box frame fully on the GPU (no readback, no fence)
-    // and composites into dst. Only legal when the params need no real
-    // bitstream (no byte flips, no bitrate budget).
-    // state_key is the instance-scoped slot id (GraphNode::key).
+    // Legal only when the params need no real bitstream.
+    // state_key is the instance-scoped slot id, the same as GraphNode::key.
     bool mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
                       uint64_t state_key,
                       const codec::MoshParams& mp, const GpuImage* in,
@@ -333,17 +233,13 @@ private:
                       GpuImage* dst);
     std::unique_ptr<ComputePipeline> generator_, layer_blend_;
 
-    // Stateful feedback effects (echo/feedback): persistent per-instance
-    // previous-output target (the one-frame-delay rule, ). Updated
-    // only when the timeline advances so paused re-renders are stable.
+    // Updated only when the timeline advances, so paused re-renders match.
     struct FeedbackSlot {
         std::unique_ptr<GpuImage> prev;
         uint32_t last_frame = 0xFFFFFFFFu;
     };
     std::unordered_map<uint64_t, FeedbackSlot> feedback_state_;
-    // The instance's persistent target, (re)created on size change and
-    // cleared to black, left SHADER_READ_ONLY for the pass to sample.
-    // Null only on allocation failure.
+    // Recreated on size change and left SHADER_READ_ONLY for the pass.
     FeedbackSlot* ensure_feedback_prev(VkCommandBuffer rec, uint64_t skey,
                                        uint32_t w, uint32_t h);
     void feedback_writeback(VkCommandBuffer rec, FeedbackSlot& slot,
@@ -356,10 +252,8 @@ private:
     bool set_glyph_atlas_impl(const uint8_t* pixels, uint32_t width,
                               uint32_t height, float tile_px, uint32_t cols,
                               uint32_t rows, int slot, bool color);
-    // 0 halftone, 1 ascii, 2 custom (droppable glyph sets),
-    // 3 braille (procedural 2x4 dot cells), 4 teletext (procedural 2x3
-    // block-mosaic sextants). A color-flagged slot holds RGBA tiles
-    // (emoji sets): coverage from alpha, hue from the tile.
+    // Slots: 0 halftone, 1 ascii, 2 custom, 3 braille, 4 teletext.
+    // A color-flagged slot holds RGBA tiles: alpha is coverage.
     std::unique_ptr<GpuImage> glyph_atlas_[5];
     bool glyph_atlas_color_[5] = {};
     struct GlyphMeta {
@@ -368,17 +262,11 @@ private:
     };
     GlyphMeta glyph_meta_[5];
 
-    // Dust/damage plate (dust textures): assets/textures/dust.png
-    // when present, else a procedural grunge fallback — always non-null.
+    // Falls back to procedural grunge; this is always non-null.
     std::unique_ptr<GpuImage> dust_tex_;
 
-    // Text overlay: runtime TTFs from
-    // assets/fonts/*.ttf, sorted by filename — the `font` param indexes
-    // the list, no bake step. Per-instance string SDFs (truetype.h) are
-    // cached per SIZE BUCKET, so a keyframed/modulated size walks a
-    // bounded raster set (the kernel scales between buckets — SDFs
-    // magnify cleanly) instead of re-rasterizing every frame. A text or
-    // font change drops the whole slot.
+    // The font param indexes assets/fonts/*.ttf, sorted by filename.
+    // SDFs cache per size bucket; a text or font change drops the slot.
     std::vector<ui::TtfFont> fx_fonts_;
     static constexpr float kTextBuckets[6] = {12.0f, 24.0f, 48.0f,
                                               96.0f, 192.0f, 400.0f};
@@ -393,9 +281,7 @@ private:
     };
     std::unordered_map<uint64_t, TextSlot> text_state_;
 
-    // Custom shape SDF per layer id: CPU raster (gfx/shape_sdf) keyed on
-    // (path bytes, closed, raster dims); a path edit or size change
-    // re-rasterizes once, everything else reuses the texture.
+    // Keyed on (path bytes, closed, raster dims); other edits reuse it.
     struct ShapeSlot {
         uint64_t hash = 0;
         std::unique_ptr<GpuImage> tex;
@@ -404,11 +290,9 @@ private:
     std::unordered_map<uint64_t, ShapeSlot> shape_state_;
     std::shared_ptr<const PinPlaneMap> pin_planes_;
 
-    // Blue-noise / STBN dither LUT (build-time asset; procedural fallback).
     std::unique_ptr<GpuImage> noise_lut_;
 
-    // Slit-scan: per-instance ring of past INPUT frames. One
-    // slot per effect id; pushed once per timeline frame like feedback.
+    // Ring of past input frames, one slot per effect id, one push per frame.
     static constexpr uint32_t kSlitRing = 16;
     struct SlitSlot {
         std::unique_ptr<GpuImage> ring[kSlitRing];
@@ -416,20 +300,17 @@ private:
         uint32_t count = 0;     // valid entries
         uint32_t last_frame = 0xFFFFFFFFu;
     };
-    std::unordered_map<uint64_t, SlitSlot> slit_state_;   // also Stutter rings
-    // Ring lookup; a size change drops the ring (stale history is a
-    // different format).
+    std::unordered_map<uint64_t, SlitSlot> slit_state_;
+    // A size change drops the ring; the old history has a different size.
     SlitSlot& slit_ring_slot(uint64_t skey, uint32_t w, uint32_t h);
-    // Record the current input once per timeline frame; false only on
-    // allocation failure.
+    // Records the input once per timeline frame; false = allocation failure.
     bool slit_ring_push(VkCommandBuffer rec, SlitSlot& slot, GpuImage* in_img,
                         uint32_t w, uint32_t h, uint32_t timeline_frame);
     // Age 0 or past the recorded span reads the live input.
     static const GpuImage* slit_history(const SlitSlot& slot,
                                         GpuImage* in_img, uint32_t age);
 
-    // Frame-rate sim: the held frame refreshes when the
-    // hold-fps tick advances.
+    // The held frame refreshes when the hold-fps tick advances.
     struct HoldSlot {
         std::unique_ptr<GpuImage> held;
         uint32_t last_tick = 0xFFFFFFFFu;
@@ -437,10 +318,7 @@ private:
     std::unordered_map<uint64_t, HoldSlot> hold_state_;
     uint32_t preview_divisor_ = 1;
 
-    // Private source planes for placed layers, uploaded fresh each render
-    // that provides frames for them. Keyed by the INSTANCE-scoped node
-    // key, not a layer index: two placements of one look each want their
-    // own decoded frame.
+    // Keyed by the instance-scoped node key, not by a layer index.
     struct LayerPlanes {
         std::unique_ptr<GpuImage> y, u, v;   // v empty for NV12 media
         uint32_t width = 0, height = 0;
@@ -450,8 +328,7 @@ private:
     std::unordered_map<uint64_t, LayerPlanes> layer_planes_;
     std::unique_ptr<ComputePipeline> layer_transform_;
 
-    // Reaction-diffusion: persistent Gray-Scott (A, B) state,
-    // ping-ponged N steps per timeline frame.
+    // Persistent state, stepped once per timeline frame.
     struct RdSlot {
         std::unique_ptr<GpuImage> state[2];
         int cur = 0;
@@ -459,18 +336,13 @@ private:
     };
     std::unordered_map<uint64_t, RdSlot> rd_state_;
     std::unique_ptr<ComputePipeline> rd_step_;
-    // Resize-guarded state advance feeding on `in`: `steps` sim steps
-    // once per timeline frame, returned SHADER_READ_ONLY. Null only on
-    // allocation failure.
+    // Steps once per timeline frame; the result is SHADER_READ_ONLY.
     GpuImage* rd_advance(VkCommandBuffer rec, uint32_t frame_index,
                          uint64_t skey, const GpuImage* in, uint32_t w,
                          uint32_t h, uint32_t timeline_frame, uint32_t steps,
                          float feed, float kill, float inject);
 
-    // Velocity scan (dwell-time rendering): per-instance ping-pong front
-    // field — one row of sweep-front positions per concurrent line, one
-    // column per along-axis texel. The phosphor canvas rides the shared
-    // feedback machinery (own previous output).
+    // Front field layout: one row per line, one column per along-axis texel.
     static constexpr uint32_t kVsSlots = 24;
     struct VsSlot {
         std::unique_ptr<GpuImage> state[2];
@@ -480,16 +352,12 @@ private:
     std::unordered_map<uint64_t, VsSlot> vs_state_;
     std::unique_ptr<ComputePipeline> vs_front_;
 
-    // Engraver (FM raster): per-frame phase-integral scratch — each
-    // lane accumulates omega + distortion * signal across the frame
-    // (RGBA32F: R/G/B channel phases + luma phase). Recomputed by
-    // mod_integrate_ before every Engraver dispatch, so one shared
-    // scratch serves any number of instances (graph eval is sequential).
+    // RGBA32F scratch: R, G, B channel phases plus the luma phase.
+    // mod_integrate_ refills it before every dispatch, so instances share it.
     std::unique_ptr<GpuImage> mod_integral_;
     std::unique_ptr<ComputePipeline> mod_integrate_;
 
-    // Node-canvas thumbnail atlas (see public accessors). Allocated once,
-    // fixed size — no per-frame Vulkan object churn.
+    // Allocated once at a fixed size; no per-frame Vulkan object churn.
     std::unique_ptr<GpuImage> thumb_atlas_;
     std::unique_ptr<ComputePipeline> thumb_tap_;
     std::unordered_map<uint64_t, uint32_t> thumb_cells_;
@@ -497,22 +365,17 @@ private:
     void record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                           GpuImage* src, uint64_t key);
 
-    // Library gallery atlas (see public accessors). Lazy, fixed size.
+    // Allocated lazily at a fixed size.
     std::unique_ptr<GpuImage> gallery_atlas_;
     std::unique_ptr<ComputePipeline> gallery_tap_;
 
-    // Audio Scope (sidechain family): per-instance 1-D min/max
-    // waveform strip re-uploaded each render from the mono PCM copy.
     static constexpr uint32_t kAudioStripBins = 1024;
     std::unordered_map<uint64_t, std::unique_ptr<GpuImage>> audio_strip_;
     std::vector<int16_t> scope_audio_;
     uint32_t scope_rate_ = 0;
 
-    // CPU error diffusion (gfx/error_diffusion.h) runs ONE FRAME BEHIND —
-    // the same legal delay as Feedback's cycle exemption: frame N
-    // composites the walk of frame N-1's input while frame N's input is
-    // captured and walked on a worker thread during the rest of the
-    // frame. The serial walk overlaps GPU time instead of stalling it.
+    // CPU error diffusion runs one frame behind, on a worker thread.
+    // Frame N composites the walk of frame N-1's input.
     struct EdSlotAsync {
         EdState ed;
         std::vector<uint16_t> input;   // captured RGBA16F halves
@@ -522,31 +385,24 @@ private:
         bool has_result = false;
         uint32_t result_w = 0, result_h = 0;
         uint32_t captured_frame = 0xFFFFFFFFu;
-        // Param signature of the last kicked walk: a paused edit kicks a
-        // fresh walk (the settle pass lands it) instead of compositing the
-        // old pattern until the playhead moves.
+        // A paused edit kicks a fresh walk instead of reusing the old one.
         uint64_t sig = 0;
     };
     std::unordered_map<uint64_t, std::unique_ptr<EdSlotAsync>> ed_state_;
     bool composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
                       const GpuImage* in_img, const EdState& ed, uint32_t w,
                       uint32_t h, uint32_t frame_index, GpuImage* dst);
-    // Codec-roundtrip tail, shared by the mosh boxes: the up_* planes to
-    // linear RGB into temp at identity fit (the planes are working-size).
+    // The up_* planes are working-size, so this converts at identity fit.
     void codec_planes_to_rgb(VkCommandBuffer rec, uint32_t frame_index,
                              GpuImage* temp, uint32_t w, uint32_t h);
-    // Wet/opacity composite of temp over in into dst; temp goes back to
-    // the pool.
+    // Composites temp over in into dst and returns temp to the pool.
     void mix_composite_release(VkCommandBuffer rec, uint32_t frame_index,
                                const GpuImage* in, GpuImage* temp,
                                GpuImage* dst, float wet, float opacity,
                                uint32_t w, uint32_t h);
 
 public:
-    // True while a deferred dither walk is in flight. The render worker
-    // uses this to schedule one settle pass instead of idling, so paused
-    // frames (and a freshly applied effect on a paused frame) pick up the
-    // finished walk without waiting for user interaction.
+    // True while a deferred dither walk is in flight.
     bool ed_walk_pending() const {
         for (const auto& [id, slot] : ed_state_)
             if (slot && slot->busy) return true;
@@ -555,10 +411,8 @@ public:
 
 private:
 
-    // Frame render cache: per-slot host-visible transfer buffer,
-    // used in both directions — miss records image->buffer (harvested into
-    // cache_ when the slot comes around again), hit memcpys the stored
-    // frame in and records buffer->image.
+    // Host-visible transfer buffer used in both directions.
+    // A miss harvests when the same frame slot comes around again.
     struct CacheIo {
         VkBuffer buf = VK_NULL_HANDLE;
         VmaAllocation alloc = nullptr;

@@ -14,9 +14,6 @@ float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Resolves one axis of a node's own SizeSpec against constraints, given the
-// measured content extent. Fixed is authoritative; Fill stretches to the
-// bound when one exists; Auto hugs content.
 float resolve_axis(const SizeSpec& spec, float content, float min_c, float max_c) {
     const bool bounded = max_c < kUnboundedAxis * 0.5f;
     float v = content;
@@ -30,7 +27,7 @@ float resolve_axis(const SizeSpec& spec, float content, float min_c, float max_c
 }
 
 struct Axis {
-    // main-axis accessors for VStack (y) / HStack (x)
+    // The main axis is y for VStack and x for HStack.
     bool vertical;
     float main(Vec2 v) const { return vertical ? v.y : v.x; }
     float cross(Vec2 v) const { return vertical ? v.x : v.y; }
@@ -61,8 +58,6 @@ Vec2 measure_stack(LayoutNode& node, const Constraints& c,
         child_loose = {0, kUnboundedAxis, 0, max_cross};
     }
 
-    // Pass A: non-Fill children measure to content; Fill children collect
-    // weights.
     float fixed_main = 0.0f;
     float total_weight = 0.0f;
     float cross_extent = 0.0f;
@@ -80,7 +75,6 @@ Vec2 measure_stack(LayoutNode& node, const Constraints& c,
     const float gaps = node.child_count > 1
         ? node.gap * static_cast<float>(node.child_count - 1) : 0.0f;
 
-    // Pass B: distribute the remaining main extent across Fill children.
     if (total_weight > 0.0f) {
         const float remaining =
             std::max(0.0f, max_main - fixed_main - gaps);
@@ -116,9 +110,7 @@ void arrange_stack(LayoutNode& node, const Rect& rect, const Rect& clip,
     const float slot_main = ax.main({inner.w, inner.h});
     const float slot_cross = ax.cross({inner.w, inner.h});
 
-    // Fill children take exact shares of the ARRANGED slot (not their
-    // measured desired) so a row can never overflow the rect it was given,
-    // even when measure ran under different constraints.
+    // Fill children use the arranged slot, not their measured size.
     float used = 0.0f;
     float fill_weight = 0.0f;
     for (uint16_t i = 0; i < node.child_count; ++i) {
@@ -235,10 +227,7 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
         case NodeKind::Padding: {
             Constraints inner = c;
             inner.min_w = inner.min_h = 0;
-            // A Fixed/Percent own size is a TIGHT bound for children
-            // (SizedBox semantics). Without this, a fixed-width box in a
-            // loose parent measures its children against the loose bound
-            // and they overflow it at arrange.
+            // A Fixed or Percent size is a tight bound for the children.
             if (node.width.mode == SizeMode::Fixed)
                 inner.max_w = std::min(node.width.value, c.max_w);
             else if (node.width.mode == SizeMode::Percent &&
@@ -264,7 +253,6 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
             break;
         }
         case NodeKind::ScrollArea: {
-            // Child measures against an unbounded main (vertical) axis.
             Constraints inner = c;
             inner.min_w = inner.min_h = 0;
             inner.max_h = kUnboundedAxis;
@@ -347,8 +335,7 @@ void draw_scrollbar(LayoutNode& node, LayoutFrame& frame) {
     const Rect thumb{track.x, track.y + (track.h - thumb_h) * t, track.w,
                      thumb_h};
 
-    // Thumb drag via capture keyed on the scroll state. The gutter has no
-    // hit-test entries, so gate on the thumb rect + no live capture.
+    // The gutter has no hit entries, so gate on the thumb rect only.
     const WidgetId id = frame.ctx.acquire_widget_id(s);
     if (frame.input.left_pressed() && !frame.ctx.has_capture() &&
         thumb.contains(frame.input.mouse)) {
@@ -381,12 +368,10 @@ void run_frame(LayoutNode* root, const Rect& rect, LayoutFrame& frame) {
     frame.ctx.begin_frame();
     layout(*root, rect, frame);
 
-    // Hit pass, then winner resolution; a winner marks the pointer consumed.
     walk_hit(*root, frame);
     frame.ctx.finalize_hits(frame.input.mouse);
     if (frame.ctx.any_hit()) frame.input.consumed = true;
 
-    // Wheel: innermost scroll area under the cursor takes the notches.
     if (frame.input.wheel_y != 0.0f) {
         LayoutNode* target = nullptr;
         route_wheel(*root, frame, &target);
@@ -401,8 +386,6 @@ void run_frame(LayoutNode* root, const Rect& rect, LayoutFrame& frame) {
     frame.ctx.gc_widget_slots();
 }
 
-// ---- builders
-
 LayoutNode* make_node(LayoutArena& arena, NodeKind kind) {
     LayoutNode* n = arena.alloc<LayoutNode>();
     n->kind = kind;
@@ -410,7 +393,7 @@ LayoutNode* make_node(LayoutArena& arena, NodeKind kind) {
     return n;
 }
 
-// Null children are skipped (conditional rows just pass nullptr).
+// Null children are skipped.
 template <class Children>
 static LayoutNode* fill_children(LayoutArena& arena, LayoutNode* node,
                                  const Children& children) {

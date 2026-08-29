@@ -11,16 +11,13 @@ namespace {
 constexpr uint32_t kMagic = 0x314D4350;   // 'PCM1'
 constexpr size_t kHeaderSize = 16;
 
-// Header fields are explicit little-endian bytes (the sample payload is
-// native int16, which is the same thing on every platform this builds
-// for - pcm.h states the format as LE throughout).
+// Header is explicit LE; samples write as native int16, LE on all targets.
 using bytes::le32;
 using bytes::put_le32;
 }  // namespace
 
 PcmWriter::~PcmWriter() {
-    // Unfinished = aborted import: remove the partial instead of
-    // sealing it (a sealed short sidecar reads as valid shorter audio).
+    // Remove an unfinished file; a sealed short sidecar reads as valid audio.
     const bool partial = file_ && !finished_;
     if (file_) std::fclose(static_cast<FILE*>(file_));
     if (partial) {

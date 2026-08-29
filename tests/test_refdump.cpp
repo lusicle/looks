@@ -1,7 +1,4 @@
-// Dev harness, not a correctness test: when reference footage exists in
-// temp/, exercise the NATIVE video path on it - ingest sidecars, frame
-// dumps, decode/seek benches. Passes trivially when the files are absent,
-// so CI and other machines never notice it.
+// This is a dev harness: it passes trivially without temp/ footage.
 
 #include <algorithm>
 #include <chrono>
@@ -67,8 +64,7 @@ bool write_bmp(const fs::path& path, const uint8_t* rgb, uint32_t w,
     return ok;
 }
 
-// BT.709 limited-range NV12 -> RGB (matches the engine's fetch shader
-// closely enough for eyeballing).
+// BT.709 limited-range NV12 to RGB, for eyeballing only.
 void nv12_to_rgb(const looks::platform::VideoFrameNV12& v,
                  std::vector<uint8_t>& rgb) {
     rgb.resize(static_cast<size_t>(v.width) * v.height * 3);
@@ -91,9 +87,6 @@ void nv12_to_rgb(const looks::platform::VideoFrameNV12& v,
     }
 }
 
-// A single native decode session, the same shape as the pool's: a demux
-// cursor over the frame index plus an H.264 decoder; fetch() rolls from
-// the target's keyframe when it cannot continue.
 struct Roller {
     looks::media::FrameIndex idx;
     looks::platform::H264Decoder dec;
@@ -108,9 +101,7 @@ struct Roller {
 
     bool open(const fs::path& path, std::string* error) {
         if (!looks::media::load_frame_index(path, &idx, error)) return false;
-        // Exactly the pool's session configuration - the benches must
-        // measure what playback pays (DXVA when the machine has it,
-        // software fallback otherwise).
+        // Use the pool's configuration so the bench measures playback cost.
         if (!dec.create(idx.avcc, idx.width, idx.height, error,
                         /*allow_d3d=*/true, /*low_latency=*/true))
             return false;
@@ -119,8 +110,6 @@ struct Roller {
         return f != nullptr;
     }
 
-    // Decodes presentation frame `target`; `sink(p, nv12)` sees every
-    // frame emitted on the way.
     template <typename Sink>
     bool fetch(uint32_t target, Sink&& sink) {
         const uint32_t target_decode = idx.present_to_decode[target];
@@ -140,8 +129,7 @@ struct Roller {
         std::vector<uint8_t> bytes;
         looks::platform::VideoFrameNV12 nv12;
         bool got = false;
-        // Arrival-order labeling with a sane-pts override, exactly like
-        // the pool: the first post-flush stamp can be garbage.
+        // Labels use arrival order: the first stamp after a flush is bad.
         int64_t expect = floor_p;
         const int64_t half_dur = idx.timescale
             ? static_cast<int64_t>(5.0e6 * idx.frame_duration /
@@ -190,15 +178,6 @@ struct Roller {
 
 }  // namespace
 
-// Long-form footage: run the new ingest once (sidecars cached under
-// temp/long_example_ingest/) so timeline and player behavior on long
-// media can be exercised through the smoke workflow. The video pass is
-// one full decode - a one-time cost per machine, gated by the analysis
-// sidecar it produces.
-// CONSOLIDATE: a long-GOP fixture transcodes to all-intra with the
-// frame count preserved, and the artifact demuxes with EVERY sample a
-// keyframe — the property that turns a cold scrub into a one-frame
-// decode. The fixture is synthesized in-test through the export path.
 TEST(consolidate_all_intra) {
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path dir = root / "temp" / "consolidate_test";
@@ -251,19 +230,19 @@ TEST(consolidate_all_intra) {
         for (const looks::media::SampleInfo& s : v->samples)
             CHECK(s.keyframe);
     }
-    fs::remove(src, ec);     // test-owned temp fixtures
+    fs::remove(src, ec);
     fs::remove(intra, ec);
 }
 
 TEST(long_example_ingest) {
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path src = root / "temp" / "long example.mp4";
-    if (!fs::exists(src)) return;   // harness inactive on this machine
+    if (!fs::exists(src)) return;
 
     const fs::path dest = root / "temp" / "long_example_ingest";
     std::error_code ec;
     fs::create_directories(dest, ec);
-    if (fs::exists(dest / "long example.analysis")) return;   // cached
+    if (fs::exists(dest / "long example.analysis")) return;   // already cached
     const looks::media::ImportResult res =
         looks::media::import_media(src, dest, {});
     CHECK(res.ok);
@@ -273,8 +252,6 @@ TEST(long_example_ingest) {
 }
 
 TEST(mez_decode_throughput_bench) {
-    // Historical baseline, kept while the old fixture bundle exists on a
-    // machine: the sequential mez decode cost native playback replaced.
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path mez = root / "temp" / "long_example" / "long example.mez";
     if (!fs::exists(mez)) return;
@@ -283,7 +260,7 @@ TEST(mez_decode_throughput_bench) {
     CHECK(reader.open(mez, &error));
     if (reader.frame_count() < 2) return;
     looks::codec::DecodedFrame frame;
-    reader.decode(0, frame);   // warm the file cache / first-touch
+    reader.decode(0, frame);   // warm the file cache before the timing loop
     const uint32_t n = std::min(48u, reader.frame_count());
     const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < n; ++i) CHECK(reader.decode(i, frame));
@@ -296,8 +273,6 @@ TEST(mez_decode_throughput_bench) {
 }
 
 TEST(native_decode_throughput_bench) {
-    // Sequential native decode rate, one session - the number a stream's
-    // playback budget lives on now.
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path src = root / "temp" / "long example.mp4";
     if (!fs::exists(src)) return;
@@ -308,9 +283,7 @@ TEST(native_decode_throughput_bench) {
     CHECK(roller.open(src, &error));
     const uint32_t n = std::min(240u, roller.idx.frame_count());
     if (n < 2) return;
-    // The pool RINGS burst emissions, so a sequential consumer only
-    // fetches past the last emitted frame - mirror that, or every fetch
-    // reseeks the run the burst already decoded.
+    // Skip frames the burst already emitted, or each fetch reseeks.
     int64_t emitted_to = -1;
     roller.fetch(0, [&](uint32_t p, const looks::platform::VideoFrameNV12&) {
         emitted_to = std::max<int64_t>(emitted_to, p);
@@ -335,8 +308,7 @@ TEST(native_decode_throughput_bench) {
 }
 
 TEST(native_seek_latency_bench) {
-    // Cold-seek cost: flush + roll from the target's keyframe. Spread
-    // deterministic targets across the clip; most force a reseek.
+    // The seeded LCG keeps the seek targets deterministic.
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path src = root / "temp" / "long example.mp4";
     if (!fs::exists(src)) return;
@@ -372,7 +344,7 @@ TEST(native_seek_latency_bench) {
 TEST(ref_frames_dump) {
     const fs::path root(LOOKS_REPO_ROOT);
     const fs::path src = root / "temp" / "example.mp4";
-    if (!fs::exists(src)) return;   // harness inactive on this machine
+    if (!fs::exists(src)) return;
 
     looks::platform::MfSession session;
     if (!session.ok()) return;
@@ -384,8 +356,6 @@ TEST(ref_frames_dump) {
     const uint32_t second = std::min(
         roller.idx.frame_count(), static_cast<uint32_t>(fps + 0.5));
 
-    // First six consecutive frames (per-frame motion), then a spread
-    // across the rest of the first second.
     std::vector<uint32_t> picks;
     for (uint32_t i = 0; i < 6 && i < second; ++i) picks.push_back(i);
     for (uint32_t i = 8; i < second; i += std::max(second / 6u, 1u))

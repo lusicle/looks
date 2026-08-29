@@ -1,4 +1,4 @@
-// Display-referred core.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float hue;    // degrees
-    float sat;    // 0 gray, 1 unchanged, 2 doubled
+    float sat;    // 0 to 2, 1 is unchanged
     float lite;
 };
 
@@ -31,7 +31,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 c = fx_srgb_oetf(saturate(base.rgb));
 
-    // Rodrigues rotation about the normalized gray axis.
     const float a = hue * 0.01745329252;
     const float ca = cos(a), sa = sin(a);
     const float3 k = float3(0.57735, 0.57735, 0.57735);

@@ -16,7 +16,7 @@ constexpr double kPi = 3.14159265358979323846;
 
 float smooth01(float x) { return x * x * (3.0f - 2.0f * x); }
 
-// Shape evaluation at phase position pt (in cycles).
+// pt is in cycles.
 float lfo_shape_at(const doc::ModSource& s, double pt) {
     const double frac = pt - std::floor(pt);
     switch (s.shape) {
@@ -39,8 +39,7 @@ float eval_lfo(const doc::ModSource& s, double t) {
                                static_cast<double>(s.phase));
 }
 
-// BPM-synced LFO: rate_hz holds beats-per-cycle. Falls back to
-// 120 BPM when the media has no analysis/estimate.
+// rate_hz holds beats per cycle. No analysis falls back to 120 BPM.
 float eval_lfo_beat(const doc::ModSource& s, double t,
                     const AnalysisCurves* analysis) {
     const double bpm =
@@ -51,8 +50,6 @@ float eval_lfo_beat(const doc::ModSource& s, double t,
     return lfo_shape_at(s, beats / per_cycle + static_cast<double>(s.phase));
 }
 
-// Deterministic pulse train on the BPM grid (beat trigger): sharp
-// attack into an exponential decay, one burst per beat.
 float eval_beat(const doc::ModSource& s, double t,
                 const AnalysisCurves* analysis) {
     const double bpm =
@@ -67,10 +64,7 @@ float eval_beat(const doc::ModSource& s, double t,
     return static_cast<float>(std::exp(-(dt - attack) / decay));
 }
 
-// Envelope: attack-decay burst fired by the most recent trigger
-// (audio onset / scene cut / beat / live keypress) at or before this
-// frame. Onset/cut/beat variants are pure functions of the frame index —
-// scrubbing and export land on identical values; keypress is live-only.
+// Onset/cut/beat variants are pure functions of the frame index.
 float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
                     const AnalysisCurves* analysis, double fps,
                     double t_seconds, double key_time) {
@@ -89,13 +83,12 @@ float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
     if (trig.empty()) return 0.0f;
     const uint32_t last = static_cast<uint32_t>(trig.size()) - 1;
     const uint32_t start = std::min(frame_index, last);
-    // Bounded backward scan: past ~6 decay constants the burst is silent.
+    // After about 6 decay constants the burst is silent, so stop the scan.
     const uint32_t window = std::min<uint32_t>(
         600, static_cast<uint32_t>((s.attack + 6.0f * s.decay) * fps) + 2);
     for (uint32_t k = 0; k <= std::min(start, window); ++k) {
         if (trig[start - k] <= 0.5f) continue;
-        // Sample mid-frame so a sub-frame attack still peaks on the
-        // trigger frame instead of reading 0 at dt = 0.
+        // Sample mid-frame so a sub-frame attack peaks on the trigger frame.
         const double dt = k / fps + 0.5 / fps;
         const double attack = std::max(static_cast<double>(s.attack), 1e-4);
         const double decay = std::max(static_cast<double>(s.decay), 1e-3);
@@ -105,11 +98,7 @@ float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
     return 0.0f;
 }
 
-// Video sampling. Averages the channel over a decimated tap grid: the
-// point variant uses a small fixed box and the region variant caps its
-// grid, so cost stays bounded and single 8-bit code-value steps get
-// band-averaged instead of popping when downstream shaping magnifies
-// them.
+// The cap on the tap grid is deliberate. Averaging avoids 8-bit steps.
 float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
     if (!video || !video->y || video->width <= 0 || video->height <= 0)
         return 0.0f;
@@ -148,9 +137,7 @@ float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
                 sum += yf;
                 continue;
             }
-            // Half-res chroma; BT.709 limited range, the same expansion
-            // and primaries the render decodes with, so a sampled
-            // channel tracks the on-screen pixel.
+            // Must use the same BT.709 expansion the render decodes with.
             float cb, cr;
             if (video->nv12) {
                 const uint8_t* uv = video->u +
@@ -179,7 +166,6 @@ float eval_video(const doc::ModSource& s, const SourceFrameView* video) {
 }
 
 float eval_drift(const doc::ModSource& s, double t) {
-    // Value noise: smooth interpolation across a seeded lattice.
     const double pt = static_cast<double>(s.rate_hz) * t +
                       static_cast<double>(s.phase);
     const double cell = std::floor(pt);
@@ -190,13 +176,11 @@ float eval_drift(const doc::ModSource& s, double t) {
     return a + (b - a) * smooth01(frac);
 }
 
-// Cubic bezier segment between k0 and k1: solve x(t) = frame, return y(t).
 float eval_bezier(const doc::Keyframe& k0, const doc::Keyframe& k1,
                   double frame) {
     const double span = k1.frame - k0.frame;
     if (span <= 0.0) return k1.value;
 
-    // Zero handles = linear.
     if (k0.out_dx == 0.0f && k0.out_dy == 0.0f && k1.in_dx == 0.0f &&
         k1.in_dy == 0.0f) {
         const double u = (frame - k0.frame) / span;
@@ -204,8 +188,7 @@ float eval_bezier(const doc::Keyframe& k0, const doc::Keyframe& k1,
                static_cast<float>(u) * (k1.value - k0.value);
     }
 
-    // Control points; x handles clamped inside the segment so x(t) stays
-    // monotonic and the solve below converges.
+    // Clamp x handles inside the segment so x(t) stays monotonic.
     const double x0 = k0.frame;
     const double x3 = k1.frame;
     const double x1 = std::clamp(x0 + static_cast<double>(k0.out_dx), x0, x3);
@@ -221,7 +204,7 @@ float eval_bezier(const doc::Keyframe& k0, const doc::Keyframe& k1,
                t * t * t * d;
     };
 
-    // Bisection on monotonic x(t) — deterministic, 24 steps ≈ 1e-7.
+    // Bisection is deterministic. 24 steps give about 1e-7.
     double lo = 0.0, hi = 1.0;
     for (int i = 0; i < 24; ++i) {
         const double mid = 0.5 * (lo + hi);
@@ -238,18 +221,13 @@ float eval_source(const doc::ModSource& source, double t_seconds,
                   uint32_t frame_index, const AnalysisCurves* analysis,
                   double fps, double audio_offset_seconds, double key_time,
                   const SourceFrameView* video) {
-    // Audio-driven kinds (bands, onset, Beat, LfoBeat, Envelope's
-    // onset/beat triggers) evaluate ONLY on the wired path in
-    // eval_value_node - they require their media input, and the global
-    // curves carry no audio for them. The nudge rides that path too.
+    // Audio-driven kinds evaluate only on the wired path; the nudge too.
     (void)audio_offset_seconds;
     switch (source.type) {
         case doc::ModSourceType::Lfo:
             return eval_lfo(source, t_seconds);
         case doc::ModSourceType::Envelope:
-            // Only the video-cut and live-keypress triggers are not
-            // audio; the onset/beat triggers read 0 here (unwired =
-            // never fires).
+            // Onset/beat triggers read 0 here; only cut/keypress are not audio.
             if (source.trigger != 1 && source.trigger != 3) return 0.0f;
             return eval_envelope(source, frame_index, analysis, fps,
                                  t_seconds, key_time);
@@ -303,11 +281,7 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
             return std::clamp((a - n->in_min * m) / span, 0.0f, 1.0f);
         }
         case doc::ModSourceType::Camera: {
-            // Same wired-media contract as the audio family: the solve
-            // is media-frame indexed, slip + Offset shims map the look
-            // clock in, unwired or unsolved reads 0. channel picks
-            // stab x / y / rot / scale, the 3D anchor projection, or a
-            // plane corner.
+            // Unwired or unsolved reads 0; media-frame indexed like NodeAudio.
             if (!n->audio_src || !env.node_camera) return 0.0f;
             const auto it = env.node_camera->find(n->id);
             if (it == env.node_camera->end() || !it->second.curves)
@@ -328,7 +302,7 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
                 case 4: return c.sample(c.anchor_x, mf);
                 case 5: return c.sample(c.anchor_y, mf);
                 default:
-                    // 6..13: plane corner projections (region solve).
+                    // 6..13: plane corner projections.
                     return c.sample(c.corner[(n->source.channel - 6u) % 8u],
                                     mf);
             }
@@ -340,14 +314,8 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
         case doc::ModSourceType::Beat:
         case doc::ModSourceType::LfoBeat:
         case doc::ModSourceType::Envelope: {
-            // An audio-driven node REQUIRES its input: the wire is the
-            // only audio source. It taps its own connection - curves of
-            // the wired chain's processed audio, media-frame indexed
-            // (slip + Offset shims map the look clock in). Unwired or
-            // unresolvable reads 0, never the global curves. Beat
-            // clocks anchor on the MEDIA position, so cuts of one media
-            // beat-match. Envelope's cut/keypress triggers are not
-            // audio - they fall through to eval_source.
+            // Unwired or unresolvable reads 0, never the global curves.
+            // Envelope cut/keypress triggers fall through to eval_source.
             if (n->source.type == doc::ModSourceType::Envelope &&
                 n->source.trigger != 0 && n->source.trigger != 2)
                 break;
@@ -356,8 +324,7 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
             if (it == env.node_audio->end() || !it->second.curves)
                 return 0.0f;
             const AnalysisCurves& c = *it->second.curves;
-            // The same audio-nudge shift eval_source used to apply
-            // (clock seconds, so it lands BEFORE the conform rate).
+            // The nudge applies in clock seconds, before the conform rate.
             const double shifted = static_cast<double>(env.frame) -
                                    env.audio_off * env.fps;
             const uint32_t local =
@@ -380,10 +347,7 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
                 case doc::ModSourceType::AudioOnset:
                     return c.sample(c.onset, mf);
                 default: {
-                    // Beat / LfoBeat / Envelope on the chain's MEDIA
-                    // clock: the curve grid is the asset's own rate
-                    // (rate * project fps), so beat phase anchors on
-                    // media seconds at any conform ratio.
+                    // Beat clocks anchor on media seconds: grid is rate * fps.
                     const double cfps = it->second.rate * env.fps;
                     const double tm =
                         cfps > 0.0 ? static_cast<double>(mf) / cfps : 0.0;
@@ -405,8 +369,7 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
 }
 
 float apply_curve(doc::ResponseCurve curve, float x) {
-    // Linear stays raw: helper chains legitimately leave [0,1] (a
-    // centered LFO swings negative) and the param clamp is the bound.
+    // Linear stays raw on purpose. The param clamp is the final bound.
     if (curve == doc::ResponseCurve::Linear) return x;
     x = std::clamp(x, 0.0f, 1.0f);
     switch (curve) {
@@ -420,7 +383,6 @@ float apply_curve(doc::ResponseCurve curve, float x) {
 float eval_lane(const doc::KeyframeLane& lane, double frame) {
     const auto& keys = lane.keys;
     if (keys.empty()) return 0.0f;
-    // Loopable region: wrap through the key span once inside it.
     if (lane.loop && keys.size() >= 2) {
         const double start = keys.front().frame;
         const double span = keys.back().frame - start;
@@ -430,7 +392,6 @@ float eval_lane(const doc::KeyframeLane& lane, double frame) {
     if (frame <= keys.front().frame) return keys.front().value;
     if (frame >= keys.back().frame) return keys.back().value;
 
-    // Find the segment [k0, k1] containing `frame`.
     size_t hi = 1;
     while (hi < keys.size() && keys[hi].frame < frame) ++hi;
     const doc::Keyframe& k0 = keys[hi - 1];
@@ -450,8 +411,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
     const double t = live_seconds >= 0.0
                          ? live_seconds
                          : (fps > 0.0 ? frame_index / fps : 0.0);
-    // Value nodes read the PRE-RESOLVE look: node params are not
-    // themselves mod targets, so the copy-in-progress never feeds back.
+    // Value nodes read the pre-resolve look so resolution never feeds back.
     const ValueEnv env{&look, t,         frame_index, analysis,
                        fps,   audio_off, key_time,    video,
                        node_audio, node_camera};
@@ -465,16 +425,14 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         return nullptr;
     };
 
-    // Morph: interpolate between two snapshot slots; the position
-    // itself is a mod target (ParamKey {0, 0}) so routes are applied to it
-    // first. Runs before lanes — morph sets base values like snapshots do.
+    // Morph position is mod target ParamKey {0, 0}; routes apply to it first.
+    // Morph runs before lanes: it sets base values.
     {
         float pos = look.morph_pos;
         for (const doc::ModRoute& route : look.mod_routes) {
             if (route.target.effect_id != 0 || route.target.param_index != 0)
                 continue;
             if (!route.node) continue;
-            // Wired = graph-driven: the wire replaces the slider.
             pos = apply_curve(route.curve, eval_value_node(env, route.node));
         }
         pos = std::clamp(pos, 0.0f, 1.0f);
@@ -526,8 +484,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
             }
         return nullptr;
     };
-    // Group targets: keys carry kGroupParamBit + the group id; the only
-    // slots are the composite's own wet/opacity, both 0..1.
+    // Group keys carry kGroupParamBit + group id; slots are wet/opacity 0..1.
     auto group_slot = [&](const doc::ParamKey& key, float* min_v,
                           float* max_v) -> float* {
         if (!(key.effect_id & doc::kGroupParamBit)) return nullptr;
@@ -541,7 +498,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         return nullptr;
     };
 
-    // Keyframe lanes set the base (muted lanes keep keys, drive nothing).
+    // Lanes set the base; muted lanes drive nothing.
     for (const doc::KeyframeLane& lane : look.lanes) {
         if (lane.keys.empty() || lane.muted) continue;
         float min_v = 0.0f, max_v = 1.0f;
@@ -562,10 +519,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         *slot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
     }
 
-    // Wires REPLACE: a driven param maps the node's output onto its
-    // range, ignoring base and lanes. Commands keep one wire per param;
-    // in a hand-edited file the last one wins. (Group faces are DIRECT
-    // param aliases — they have no resolve-time behavior of their own.)
+    // Commands keep one wire per param; here the last route wins.
     for (const doc::ModRoute& route : look.mod_routes) {
         if (!route.node) continue;
         float min_v = 0.0f, max_v = 1.0f;
@@ -585,11 +539,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         *slot = std::clamp(min_v + (max_v - min_v) * value, min_v, max_v);
     }
 
-    // Discrete params (selectors + flagged counts) snap to whole numbers
-    // after every driver — lanes, routes, and morph all interpolate
-    // fractionally, and fractional counts alias kernel math (a dither
-    // `levels` of 2.2 cuts a hard band through the frame). Untouched
-    // params already sit on integers, so this only affects driven ones.
+    // Discrete params snap after all drivers; fractional counts alias kernels.
     for (doc::Layer& snap_layer : out.layers)
         for (doc::EffectInstance& fx : snap_layer.stack)
             for (size_t p = 0; p < fx.params.size(); ++p)
@@ -606,10 +556,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
     doc::Document out = doc;
     const double audio_off =
         static_cast<double>(doc.audio_offset_ms) * 0.001;
-    // Every look resolves at `frame_index`. That IS its local frame for
-    // the root and for the single-instance case; per-instance local times
-    // arrive with instance paths, which is why the per-look primitive
-    // above takes the frame explicitly.
+    // resolve treats frame_index as every look's local frame.
     for (size_t i = 0; i < out.looks.size(); ++i)
         resolve_look(doc.looks[i], out.looks[i], frame_index, fps, analysis,
                      audio_off, live_seconds, key_time, video, node_audio,
@@ -619,9 +566,7 @@ doc::Document resolve(const doc::Document& doc, uint32_t frame_index,
 
 float speed_at(const doc::Document& doc, uint32_t frame_index, double fps,
                const AnalysisCurves* analysis, double live_seconds) {
-    // Playback speed belongs to the root sequence, and sequences carry
-    // no keyframes or routes - the project speed is the scalar. Ramps
-    // live per-block (Placement::speed) or inside looks.
+    // The project speed scalar is the whole map; the args stay unused.
     (void)frame_index;
     (void)fps;
     (void)analysis;

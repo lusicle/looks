@@ -1,7 +1,3 @@
-// Micro test harness — no third-party test framework. Each test
-// file defines TESTs and links test_main.cpp. CHECK failures report and mark
-// the run failed but keep going; the exe exits non-zero for CTest.
-
 #pragma once
 
 #include <cstdio>
@@ -36,9 +32,8 @@ struct Registrar {
 
 inline int run_all() {
 #ifdef _MSC_VER
-    // Headless: debug CRT asserts report to stderr and abort instead of
-    // opening a dialog no harness can click. The trace line below names
-    // the test that died - stderr is unbuffered, stdout is not.
+    // Headless: send CRT asserts to stderr so no dialog blocks the run.
+    // The [run] trace uses stderr because stderr is unbuffered.
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
     _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);

@@ -17,8 +17,7 @@ namespace {
 
 constexpr uint32_t kW = 320, kH = 240;
 
-// Textured synthetic scene with plenty of corners; sampled with a
-// per-frame shift so the content translates smoothly (a camera pan).
+// The synthetic scene has many corners for the tracker to find.
 float scene(float x, float y) {
     const float a = std::sin(x * 0.11f + std::sin(y * 0.07f) * 2.0f);
     const float b = std::cos(y * 0.13f + std::sin(x * 0.05f) * 3.0f);
@@ -57,8 +56,8 @@ struct Synth {
 }  // namespace
 
 TEST(track_solve_recovers_translation_deterministically) {
-    // Content sampled at +1.6px/frame appears to move LEFT: the solve's
-    // cumulative tx goes negative in width fractions.
+    // A positive sample shift moves the content left, so tx goes negative.
+    // tx and ty units are fractions of width and height.
     Synth s(1.6f, 0.9f);
     TrackData a, b;
     auto feed = [&](uint32_t f, GrayFrame* g) { return s.frame(f, g); };
@@ -84,10 +83,8 @@ TEST(track_solve_recovers_translation_deterministically) {
     CHECK(std::fabs(a.solve[11].rot) < 0.01f);
     CHECK(std::fabs(a.solve[11].scale - 1.0f) < 0.01f);
     CHECK(a.solve[11].inliers >= 20u);
-    // A static first frame solves as identity.
     CHECK_EQ(a.solve[0].tx, 0.0f);
     CHECK_EQ(a.solve[0].scale, 1.0f);
-    // Features actually tracked across the range.
     CHECK(a.tracks.size() >= 30u);
 }
 
@@ -128,8 +125,7 @@ TEST(track_plane_solve_recovers_translation) {
         looks::media::ensure_plane(&a, 0.5f, 0.5f, 0.6f, 0.6f);
     CHECK(p != nullptr);
     CHECK_EQ(p->h.size(), size_t{12 * 9});
-    // Frame 0 is identity; frame 11 approximates the accumulated pure
-    // translation (uv units), no scale, no perspective.
+    // Frame 0 is identity and the homography works in uv units.
     CHECK_EQ(p->h[0], 1.0f);
     CHECK_EQ(p->h[2], 0.0f);
     const float* h = p->h.data() + 11 * 9;
@@ -144,7 +140,6 @@ TEST(track_plane_solve_recovers_translation) {
     // A repeat request reuses the cached plane.
     looks::media::ensure_plane(&a, 0.5f, 0.5f, 0.6f, 0.6f);
     CHECK_EQ(a.planes.size(), size_t{1});
-    // Planes ride the cache file.
     const std::filesystem::path pth =
         std::filesystem::temp_directory_path() / "looks_plane_test.track";
     CHECK(looks::media::track_save(pth, a));
@@ -157,8 +152,7 @@ TEST(track_plane_solve_recovers_translation) {
 }
 
 TEST(track_cut_resets_chains) {
-    // Two 12-frame shots of unrelated content; the cut list re-anchors
-    // everything at frame 12.
+    // The two shots hold unrelated content, and the cut is at frame 12.
     Synth s(1.6f, 0.9f);
     s.cut_at = 12;
     TrackData a;
@@ -166,30 +160,25 @@ TEST(track_cut_resets_chains) {
     CHECK(looks::media::track_run(0, 24, feed, &a, {12}));
     CHECK_EQ(a.cuts.size(), size_t{1});
     CHECK_EQ(a.cuts[0], 12u);
-    // The similarity chain resets to identity at the cut...
     CHECK_EQ(a.solve[12].tx, 0.0f);
     CHECK_EQ(a.solve[12].rot, 0.0f);
     CHECK_EQ(a.solve[12].scale, 1.0f);
     CHECK_EQ(a.solve[12].inliers, 0u);
-    // ...after the first shot accumulated real motion.
     const float ex = -11.0f * 1.6f / static_cast<float>(kW);
     CHECK(std::fabs(a.solve[11].tx - ex) < 0.006f);
-    // No track spans the cut.
     for (const looks::media::FeatureTrack& t : a.tracks) {
         const bool spans = t.points.front().frame <= 11u &&
                            t.points.back().frame >= 12u;
         CHECK(!spans);
     }
-    // The plane chain freezes at the cut instead of re-locking onto
-    // the new shot's content.
+    // The plane chain freezes at the cut and does not re-lock.
     const looks::media::PlaneSolve* p =
         looks::media::ensure_plane(&a, 0.5f, 0.5f, 0.6f, 0.6f);
     CHECK(p != nullptr);
     for (uint32_t k = 12; k < 24; ++k)
         for (int q = 0; q < 9; ++q)
             CHECK_EQ(p->h[k * 9 + q], p->h[11 * 9 + q]);
-    // The 3D solve sees two segments; a flat pan is
-    // homography-degenerate and must say so, not fake a solve.
+    // A flat pan has no parallax, so the solve reports it, not a fake.
     looks::media::sfm_solve(&a);
     CHECK_EQ(a.sfm.size(), size_t{2});
     CHECK_EQ(a.sfm[0].start, 0u);
@@ -201,11 +190,7 @@ TEST(track_cut_resets_chains) {
 }
 
 TEST(track_sfm_synthetic_orbit_recovers_poses) {
-    // Hand-built tracks from a known scene and camera path: a jittered
-    // depth grid trucked past with a slight pan/roll. The solver must
-    // recover relative poses, geometry, and focal - up to the gauge
-    // (anchor camera + baseline scale), so every assertion below is
-    // gauge-invariant.
+    // The solve is up to gauge, so every check below is gauge-invariant.
     using looks::hash_combine;
     using looks::media::FeatureTrack;
     using looks::util::m3_transpose;
@@ -297,8 +282,7 @@ TEST(track_sfm_synthetic_orbit_recovers_poses) {
     CHECK(rel_rot_err(5, 20) < 0.01);
     CHECK(rel_rot_err(5, 35) < 0.01);
 
-    // Camera-center geometry: angles between center differences and
-    // distance ratios survive any rigid gauge + scale.
+    // Angles and distance ratios survive any rigid gauge and scale.
     auto center = [&](uint32_t k, double out[3]) {
         double r9[9], rt[9];
         rodrigues(seg.cams[k].aa, r9);
@@ -334,8 +318,6 @@ TEST(track_sfm_synthetic_orbit_recovers_poses) {
     const double s2 = vlen(e2) / vlen(g2);
     CHECK(std::fabs(s1 / s2 - 1.0) < 0.02);
 
-    // Point reprojection through a solved camera matches the synthetic
-    // track - exactly what the anchor channels consume.
     {
         const looks::media::SfmPoint& sp = seg.points.front();
         const FeatureTrack* trk = nullptr;
@@ -372,9 +354,7 @@ TEST(track_sfm_synthetic_orbit_recovers_poses) {
                       d.sfm[0].points.size() *
                           sizeof(looks::media::SfmPoint)) == 0);
 
-    // The 3D solve also feeds ensure_plane: a region over the (jittered
-    // but near-planar) grid yields per-frame homographies with h[0]
-    // identity.
+    // The jittered grid is near-planar, so the homography is near identity.
     const looks::media::PlaneSolve* p =
         looks::media::ensure_plane(&d, 0.5f, 0.5f, 0.5f, 0.5f);
     if (p) {
@@ -383,10 +363,9 @@ TEST(track_sfm_synthetic_orbit_recovers_poses) {
         CHECK(std::fabs(p->h[2]) < 1.0e-4f);
     }
 
-    // The whole solve rides the sidecar.
     const std::filesystem::path pth =
         std::filesystem::temp_directory_path() / "looks_sfm_test.track";
-    d.cuts = {7u};   // exercise the field even though this solve had none
+    d.cuts = {7u};   // set a cut to exercise the field: this solve has none
     CHECK(looks::media::track_save(pth, d));
     TrackData b;
     CHECK(looks::media::track_load(pth, &b));

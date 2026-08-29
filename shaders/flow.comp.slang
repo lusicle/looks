@@ -1,18 +1,13 @@
-// One thread per 16x16 block, three-step SAD search, writing a per-block
-// motion vector in CANVAS pixels to a (w/16, h/16) RG target. A pure
-// function of the two luma planes, so flow never carries state across
-// frames. The planes are NATIVE source pixels while the block grid is
-// the canvas: sampling maps through the source's aspect-fit rect, the
-// same placement ycbcr_to_rgb composites it at - blocks outside the fit
-// rect are transparent bars and emit zero.
+// Output motion vectors are in canvas pixels on a (w/16, h/16) grid.
+// Luma planes use native source pixels. The fit rect maps canvas to uv.
 
 [[vk::push_constant]]
 cbuffer Push
 {
-    uint width;        // working canvas size
+    uint width;        // canvas size, not the plane size
     uint height;
-    uint valid;        // 0 = seek discontinuity, emit zero flow
-    float rect_x;      // the reference source's fit rect, canvas px
+    uint valid;
+    float rect_x;      // source fit rect, canvas px
     float rect_y;
     float inv_fit_w;
     float inv_fit_h;
@@ -25,8 +20,6 @@ cbuffer Push
 float block_sad(float2 cur_base, float2 prev_base, float2 rect,
                 float2 inv_fit)
 {
-    // 8x8 taps at stride 2 over the 16x16 block; canvas px -> source uv
-    // through the fit rect.
     float sad = 0.0;
     [unroll]
     for (int y = 0; y < 8; ++y)
@@ -64,15 +57,13 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    // Sign convention: the search asks where the CURRENT block came FROM
-    // in the previous frame, hence the minus on cand below.
+    // The search finds where the block came from. Thus the minus on cand.
     float2 mv = float2(0.0, 0.0);
     float best = block_sad(block_origin, block_origin, rect, inv_fit);
     for (int step = 8; step >= 1; step >>= 1)
     {
         bool improved = true;
-        // Fixed round count: the search must not iterate to convergence,
-        // or the result stops being deterministic across drivers.
+        // A fixed round count keeps the result the same on all drivers.
         for (int round = 0; round < 2 && improved; ++round)
         {
             improved = false;

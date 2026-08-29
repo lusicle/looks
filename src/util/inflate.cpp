@@ -6,7 +6,7 @@ namespace looks {
 
 namespace {
 
-// LSB-first bit reader (DEFLATE bit order — opposite of the codec bitio).
+// LSB-first bit order. The codec bitio reader is MSB-first.
 struct Bits {
     const uint8_t* data;
     size_t size;
@@ -30,11 +30,8 @@ struct Bits {
     void align_byte() { pos = (pos + 7) & ~size_t{7}; }
 };
 
-// Canonical Huffman decoder from code lengths (RFC 1951 §3.2.2). Decodes
-// bit-by-bit against per-length counts — compact and deterministic.
 struct Huffman {
-    // count[len] = number of codes of that length; symbols sorted by
-    // (length, symbol order).
+    // count[len] holds the code count. symbols sorts by length, then symbol.
     uint16_t count[16] = {};
     std::vector<uint16_t> symbols;
 
@@ -42,7 +39,6 @@ struct Huffman {
         for (int i = 0; i < 16; ++i) count[i] = 0;
         for (size_t i = 0; i < n; ++i) count[lengths[i]]++;
         count[0] = 0;
-        // Over-subscribed check.
         int left = 1;
         for (int len = 1; len < 16; ++len) {
             left <<= 1;
@@ -106,7 +102,7 @@ bool inflate_block(Bits& bits, const Huffman& lit, const Huffman& dist,
             if (!bits.ok || distance > out.size()) return false;
             const size_t start = out.size() - distance;
             for (uint32_t i = 0; i < length; ++i)
-                out.push_back(out[start + i]);   // may overlap — by design
+                out.push_back(out[start + i]);   // The overlap is correct.
         }
     }
 }
@@ -125,7 +121,6 @@ bool inflate(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
         if (!bits.ok) return false;
 
         if (type == 0) {
-            // Stored: byte-aligned LEN/NLEN + raw bytes.
             bits.align_byte();
             const size_t byte = bits.pos >> 3;
             if (byte + 4 > size) return false;
@@ -136,7 +131,6 @@ bool inflate(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
             out.insert(out.end(), data + byte + 4, data + byte + 4 + len);
             bits.pos = (byte + 4 + len) << 3;
         } else if (type == 1) {
-            // Fixed trees (RFC 1951 §3.2.6).
             uint8_t lit_lengths[288];
             for (int i = 0; i < 144; ++i) lit_lengths[i] = 8;
             for (int i = 144; i < 256; ++i) lit_lengths[i] = 9;
@@ -149,7 +143,6 @@ bool inflate(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
                 return false;
             if (!inflate_block(bits, lit, dist, out)) return false;
         } else if (type == 2) {
-            // Dynamic trees.
             const uint32_t hlit = bits.get(5) + 257;
             const uint32_t hdist = bits.get(5) + 1;
             const uint32_t hclen = bits.get(4) + 4;

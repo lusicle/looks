@@ -15,7 +15,6 @@ namespace {
 
 constexpr uint32_t kFftSize = 1024;
 
-// 95th percentile (robust against single spikes); deterministic.
 float percentile95(const std::vector<float>& curve) {
     if (curve.empty()) return 0.0f;
     std::vector<float> sorted = curve;
@@ -32,12 +31,10 @@ void scale_curve(std::vector<float>& curve, float scale) {
     for (float& v : curve) v = std::min(1.0f, v / scale);
 }
 
-// Normalize a curve to 0..1 by its own 95th percentile.
 void normalize_curve(std::vector<float>& curve) {
     scale_curve(curve, percentile95(curve));
 }
 
-// Envelope-follower smoothing baked at import (attack/release).
 void smooth_curve(std::vector<float>& curve, double fps, float attack_s,
                   float release_s) {
     if (curve.empty() || fps <= 0.0) return;
@@ -84,7 +81,6 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
 
     for (uint32_t f = 0; f < video_frames; ++f) {
         if (cancel && cancel->load(std::memory_order_relaxed)) return;
-        // Window starting at the frame's timestamp; mono mix.
         const uint64_t start = static_cast<uint64_t>(
             static_cast<double>(f) / video_fps * sample_rate);
         for (uint32_t i = 0; i < kFftSize; ++i) {
@@ -113,8 +109,7 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
         prev_mags = std::move(mags);
     }
 
-    // One shared scale across the bands: relative levels survive (a bass-
-    // only track must not light up the high band via self-normalization).
+    // Use one shared scale so relative band levels survive.
     const float scale =
         std::max({percentile95(out->low), percentile95(out->mid),
                   percentile95(out->high)});
@@ -125,7 +120,6 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
     smooth_curve(out->mid, video_fps, 0.01f, 0.15f);
     smooth_curve(out->high, video_fps, 0.01f, 0.15f);
 
-    // Onsets: flux peaks above a moving median-ish threshold.
     normalize_curve(flux);
     for (uint32_t f = 1; f + 1 < video_frames; ++f) {
         float local = 0.0f;
@@ -136,7 +130,6 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
         if (peak) out->onset[f] = 1.0f;
     }
 
-    // Naive BPM: autocorrelation of the flux curve over 60-180 BPM lags.
     if (video_frames > 8) {
         float best_score = 0.0f;
         float best_bpm = 0.0f;
@@ -157,11 +150,8 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
     }
 }
 
-// ------------------------------------------------------------- video
-
 void VideoAnalyzer::push_frame(const uint8_t* y, size_t stride, uint32_t width,
                                uint32_t height) {
-    // Subsample to a ~120-wide luma thumbnail for the diff.
     const uint32_t step = std::max(1u, width / 120);
     const uint32_t sw = width / step;
     const uint32_t sh = height / step;
@@ -201,8 +191,6 @@ void VideoAnalyzer::finish(AnalysisData* out) {
     out->brightness = std::move(brightness_);
     out->cut = std::move(cut_);
 }
-
-// -------------------------------------------------------------- file io
 
 namespace {
 

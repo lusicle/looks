@@ -1,5 +1,4 @@
-// History is gathered by sampling BACKWARD along the flow, so no scatter
-// or atomics are needed to advect the field.
+// Advect with a backward gather along the flow. Never scatter.
 
 #include "fx_common.slang"
 
@@ -35,13 +34,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     float2 mv = flow.SampleLevel(uv, 0).rg;
-    // Varies smoothly across the frame so trails curl rather than
-    // translating as a block.
     const float bend =
         swirl * (fx_value_noise1(seed, uv.x * 7.0 + uv.y * 11.0 +
                                            float(frame) * 0.01) - 0.5) * 2.0;
     mv += float2(-mv.y, mv.x) * bend;
-    // Idle drift, so still footage still flows a little.
+    // Add a constant idle drift so still footage flows.
     mv += float2(0.4, -0.25);
 
     const float2 suv = clamp(uv - mv * advect / size, 0.0, 1.0);

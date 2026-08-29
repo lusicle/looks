@@ -1,6 +1,3 @@
-// Pure block-pointer corruption with no bitstream involved, unlike the
-// Codec-Box effects.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -16,7 +13,7 @@ cbuffer Push
     float block_px;
     float amount;     // fraction of blocks remapped
     float spread;
-    float rate;       // hz, 0 = frozen
+    float rate;       // hz
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

@@ -1,6 +1,3 @@
-// Script language core: compile/run round trips, control flow, values,
-// natives, suspension, budget yields, error reporting.
-
 #include <memory>
 #include <string>
 #include <vector>

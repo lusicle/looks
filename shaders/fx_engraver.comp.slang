@@ -1,6 +1,4 @@
-// Draws iso-phase crests (phi crossing an integer) of a carrier whose
-// instantaneous frequency the image modulates. The phase field phi is
-// accumulated by the separate mod_integrate pass, bound at binding 1.
+// Binding 1 holds the phase field from the separate mod_integrate pass.
 
 #include "fx_common.slang"
 
@@ -16,23 +14,21 @@ cbuffer Push
     float fps;
     float omega;
     float distortion;
-    float lowpass;      // consumed by the integrator pass, unused here
+    float lowpass;      // the integrator pass uses this, not the shader
     float speed;
     float mode;
     float line_w;
     float channels;
     float spread;
     float color;
-    float threshold;    // consumed by the integrator pass, unused here
+    float threshold;    // the integrator pass uses this, not the shader
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D integral;   // RGBA32F phase field
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
-// The slope clamp is load-bearing: downstream of bright regions the
-// lateral phase gradient can be huge, and an unclamped slope smears
-// traces into solid fill.
+// Keep the slope clamp. An unclamped slope fills the traces solid.
 float fm_trace(float phi, float f_px, float slope_px, float lw)
 {
     const float dc = phi - round(phi);
@@ -40,9 +36,7 @@ float fm_trace(float phi, float f_px, float slope_px, float lw)
     const float slant = min(abs(slope_px), 2.5);
     const float dist = max(d_px - slant * 0.75, 0.0);
     float a = saturate(1.0 - dist / lw);
-    // A crest landing inside this pixel must light regardless of the
-    // sampling stride, or dense regions beat against the pixel grid and
-    // read as black voids.
+    // A crest inside this pixel must light, or dense regions alias to black.
     if (abs(dc) <= f_px * 0.6) a = max(a, 0.8);
     return a * a;
 }
@@ -74,12 +68,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 phi_r =
         integral.SampleLevel(clamp(uv + d_lane, 0.0, 1.0), 0);
 
-    // abs: a reversed march accumulates phase in the other direction.
+    // Use abs. A reversed march accumulates phase the other way.
     const float4 f_px = max(abs(phi - phi_prev), 1e-5);   // cycles/px
     const float4 dlane = (phi_r - phi_l) * 0.5;           // cycles/px
 
-    // Travel always runs along the march; the direction flip lives in
-    // the integrator, where the speed sign selects the spawn edge.
+    // The integrator owns the speed sign. travel uses abs here.
     const float travel = -abs(speed) * t;
     const float3 tint[3] = {
         float3(1.0, 0.12, 0.10),

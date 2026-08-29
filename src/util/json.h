@@ -1,10 +1,4 @@
-// Minimal hand-rolled JSON reader/writer.
-//
-// Projects and presets are single JSON files. This is a small DOM model:
-// parse to a Value tree, mutate, write back. Objects preserve insertion
-// order so saved projects diff cleanly; member lookup is linear, which is
-// fine at project-file scale. Numbers are doubles (exact for integers to
-// 2^53 — frame indices and seeds fit comfortably).
+// Numbers are doubles. Integers stay exact to 2^53.
 
 #pragma once
 
@@ -51,8 +45,7 @@ public:
     bool is_array() const { return type_ == Type::Array; }
     bool is_object() const { return type_ == Type::Object; }
 
-    // Typed access with defaults — never throws; wrong-type reads yield the
-    // fallback so loading a slightly-off project degrades instead of dying.
+    // These accessors do not throw. A wrong type gives the fallback.
     bool as_bool(bool fallback = false) const { return is_bool() ? bool_ : fallback; }
     double as_number(double fallback = 0.0) const { return is_number() ? num_ : fallback; }
     int64_t as_int(int64_t fallback = 0) const {
@@ -68,10 +61,10 @@ public:
     const Object& object() const { static const Object empty; return is_object() ? obj_ : empty; }
     Object& object() { return obj_; }
 
-    // Object member access. get() returns null-Value for missing keys.
+    // get() returns a null Value for a key that does not exist.
     const Value* find(std::string_view key) const;
     const Value& get(std::string_view key) const;
-    // Insert-or-assign, preserving first-insertion order.
+    // This keeps the order of the first insertion.
     Value& set(std::string_view key, Value v);
 
     void push(Value v) { arr_.push_back(std::move(v)); }
@@ -91,13 +84,12 @@ private:
 };
 
 struct ParseResult {
-    std::optional<Value> value;   // empty on failure
-    std::string error;            // human-readable, with line:col
+    std::optional<Value> value;
+    std::string error;
 };
 
 ParseResult parse(std::string_view text);
 
-// pretty=true indents with 2 spaces; false emits the most compact form.
 std::string write(const Value& v, bool pretty = true);
 
 }  // namespace looks::json

@@ -1,6 +1,3 @@
-// Occlusion comes from walking bottom-to-top while tracking the
-// per-column silhouette, so nearer ridges hide the ones behind them.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -18,7 +15,7 @@ cbuffer Push
     float line_w;    // px
     float soften;
     float fill;
-    float color;     // 0 white lines, 1 source color
+    float color;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -31,9 +28,7 @@ float ridge_enc(Sampler2D tex, float u, float v)
     return fx_srgb_oetf(saturate(float3(l, l, l))).x;
 }
 
-// The vertical band average is load-bearing: it dilutes 8-bit and codec
-// luma quantization, without which a flat region crossing one code value
-// pops the whole flat line segment up a pixel at once.
+// Keep the band average. It dilutes 8-bit luma quantization steps.
 float ridge_luma(Sampler2D tex, float u, float v, float blur_u,
                  float band_v)
 {
@@ -79,7 +74,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 col = base.rgb * (1.0 - saturate(fill));
     float sil = 1e9;
 
-    // i = 0 is the bottom (nearest) ridge.
+    // i = 0 is the bottom ridge, the nearest one.
     for (uint i = 0; i < n; ++i) {
         const float y_base = size.y - spacing * (1.5 + float(i));
         const float sv = 1.0 - (float(i) + 0.5) / float(n);
@@ -89,9 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float y_line = y_base - l * height_px;
 
         if (y_line < sil) {
-            // Slope-aware distance: on steep segments the curve sweeps
-            // several rows within one column, and without covering that
-            // span the line beads into per-column dashes.
+            // Keep the slope term. Without it the line beads into dashes.
             const float du = 1.5 / size.x;
             const float slope_px =
                 (ridge_enc(input, uv.x + du, sv) -

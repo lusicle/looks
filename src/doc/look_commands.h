@@ -1,7 +1,3 @@
-// Undoable mutations of the project's looks, sequences and assets.
-// A look is a timeless node graph; a sequence is arrangement; an asset is
-// imported media that media nodes bind to by id.
-
 #pragma once
 
 #include <memory>
@@ -13,88 +9,58 @@
 
 namespace looks::doc {
 
-// Fresh empty look with a minted id (shares the effect id space, so a
-// look id never collides with a node id).
+// Look and sequence ids come from the effect id space. They never collide.
 Look make_look(Document& doc, std::string name);
-// Fresh empty sequence with one video lane, same id space.
 Sequence make_sequence(Document& doc, std::string name);
-// Fresh asset entry for an imported bundle.
 Asset make_asset(Document& doc, std::string name, std::string path);
 
 std::unique_ptr<Command> add_look_command(Look look);
-// Sources referencing a removed look go dormant, the way routes
-// targeting a removed effect do; undo restores both.
+// Sources that name a removed look go dormant. Undo restores them.
 std::unique_ptr<Command> remove_look_command(uint64_t look_id);
-// Name + explicit duration (0 = derive from the longest source).
-// Coalesces per look so a duration drag is one undo step.
+// A duration of 0 makes the look derive it from the longest source.
+// This command coalesces per look, thus a drag is one undo step.
 std::unique_ptr<Command> set_look_props_command(uint64_t look,
                                                 std::string name,
                                                 uint32_t duration);
-// Output audio routing: combined (false) = the voice rides the In wire's
-// chain; split (true) = the dedicated audio-in (port 1), silent unwired.
+// split false = the voice rides the In wire chain. split true = port 1.
 std::unique_ptr<Command> set_look_audio_split_command(uint64_t look,
                                                       bool split);
 
 std::unique_ptr<Command> add_sequence_command(Sequence seq);
-// Blocks and sources referencing a removed sequence go dormant; undo
-// restores them. Callers never name the root sequence (the project
-// timeline) - the UI does not offer it.
+// Blocks and sources that name a removed sequence go dormant.
+// The UI does not offer the root sequence, thus this does not refuse it.
 std::unique_ptr<Command> remove_sequence_command(uint64_t sequence_id);
-// Name + explicit duration (0 = derive from the furthest block end).
+// A duration of 0 makes the sequence derive it from the last block end.
 std::unique_ptr<Command> set_sequence_props_command(uint64_t sequence,
                                                     std::string name,
                                                     uint32_t duration);
 
 std::unique_ptr<Command> add_asset_command(Asset asset);
-// Whole-asset replacement matched by id: rebinding a path, or writing
-// back what opening the bundle probed (frame count, fps, still length).
+// Whole-asset replacement matched by id: copy it, then change fields.
 std::unique_ptr<Command> set_asset_command(Asset updated);
-// Un-import: the entry leaves the project. Media layers naming the id
-// go DORMANT (both walks treat dangling as unbound); the source file
-// and its cache stay on disk.
+// Media layers that name the id go dormant. The file stays on disk.
 std::unique_ptr<Command> remove_asset_command(uint64_t asset_id);
 
-// Browser bins: project-panel folders. Membership is the `bin` field on
-// looks, sequences and assets; bins nest by parent.
+// Bin membership is the `bin` field on looks, sequences and assets.
 Bin make_bin(Document& doc, std::string name);
 std::unique_ptr<Command> add_bin_command(Bin bin);
-// Deleting a bin keeps its contents: members and child bins move up to
-// the bin's parent; undo restores every membership and the bin itself.
+// Members and child bins move up to the parent bin. They stay in the doc.
 std::unique_ptr<Command> remove_bin_command(uint64_t bin_id);
-// Rename + reparent in one. Callers guard cycles with bin_reaches FIRST
-// (a bin must not land inside its own subtree).
+// The caller must guard cycles with bin_reaches first.
 std::unique_ptr<Command> set_bin_props_command(uint64_t bin,
                                                std::string name,
                                                uint64_t parent);
-// Files a look, sequence or asset under `bin` (0 = project root).
+// A bin of 0 is the project root.
 std::unique_ptr<Command> set_entity_bin_command(uint64_t entity_id,
                                                 uint64_t bin);
 
-// NEST: moves `layer_ids` out of `look` into a brand new look and puts a
-// LookRef source node in their place; Ctrl+G one level up. Everything
-// plays in lockstep, so nothing is rebased - the nested look renders
-// exactly what the members rendered.
-//
-// Wiring: links with BOTH ends inside the selection travel with it, and
-// so do its feeds to the Output (they become the new look's Output). A
-// link crossing the boundary is DROPPED - the same break grouping makes -
-// because the nested look has no port to carry it. Undo restores every
-// dropped link.
-//
-// Null when the selection is empty, names nothing that exists, or would
-// leave the parent look with nothing.
+// A link that crosses the selection boundary is dropped. Undo restores it.
+// Returns null if the selection is empty or makes the parent look empty.
 std::unique_ptr<Command> nest_layers_command(
     Document& doc, uint64_t look, const std::vector<uint64_t>& layer_ids,
     std::string name);
 
-// MAKE UNIQUE: sharing is the default, so this explicit fork must exist
-// or the default is a trap. Deep-copies the look or sequence the
-// placement targets - every id reminted, wiring and mod targets
-// remapped; nested references inside the copy keep pointing at the SAME
-// shared entities (the fork is one level deep, like the edit that wants
-// it) - and retargets THAT placement at the fork; every other placement
-// keeps the original. Null when the placement does not target a live
-// entity, or at the entity-count bound.
+// The fork is one level deep: nested references in the copy stay shared.
 std::unique_ptr<Command> make_unique_command(Document& doc,
                                              uint64_t sequence,
                                              uint64_t placement_id);

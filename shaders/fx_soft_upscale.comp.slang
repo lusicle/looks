@@ -11,7 +11,7 @@ cbuffer Push
     uint frame;
     float fps;
     float factor;     // source pixels per fat texel
-    float softness;   // 0 blocky nearest, 1 extra-soft bilinear
+    float softness;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,8 +38,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 cell = floor(g);
     const float2 frac_g = g - cell;
 
-    // softness widens the interpolation window past the texel edge, which
-    // is what over-smooths beyond plain bilinear.
     const float spread = 1.0 + softness * 1.5;
     const float4 c00 = tap((cell + 0.5) / low);
     const float4 c10 = tap((cell + float2(1.5, 0.5)) / low);

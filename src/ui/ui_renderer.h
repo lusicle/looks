@@ -1,12 +1,4 @@
-// UiRenderer — the single UI TU that touches Vulkan (mirrors the reference
-// toolkit's renderer_frame). Turns Canvas2D batches into draw calls inside
-// the caller's already-begun dynamic-rendering pass.
-//
-// Geometry streams through per-frame-in-flight host-visible buffers that
-// grow on demand (safe to recreate at record time: the frame slot's fence
-// was waited before begin_frame). Textures (font atlases, later images) are
-// long-lived; each gets a descriptor set at registration — no per-frame
-// descriptor churn.
+// Geometry buffers can grow at record time: the frame fence already waited.
 
 #pragma once
 
@@ -30,21 +22,15 @@ struct UiTexture {
     VkDescriptorSet set = VK_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
-    // MSDF font atlases carry their decode parameters (multiple fonts =
-    // multiple atlases with different dimensions/px ranges).
     bool msdf = false;
-    // Plain RGBA image (thumbnail strips): sampled and tinted as-is.
     bool rgba_image = false;
-    // Wraps an externally-owned view (engine thumbnail atlas): the
-    // renderer allocated only the descriptor set, never the image/view.
+    // External view: the renderer owns only the descriptor set.
     bool external = false;
     float unit_range[2] = {0.0f, 0.0f};   // px_range / atlas size
 };
 
 class UiRenderer {
 public:
-    // color_format: the render target the UI pipelines will draw into
-    // (the swapchain). shader_dir: directory holding the compiled .spv.
     static std::unique_ptr<UiRenderer> create(gfx::Device& device,
                                               VkFormat color_format,
                                               const std::filesystem::path& shader_dir);
@@ -53,25 +39,18 @@ public:
     UiRenderer(const UiRenderer&) = delete;
     UiRenderer& operator=(const UiRenderer&) = delete;
 
-    // Uploads the font atlas (A8, nearest-sampled) and binds it to the font.
-    // Returns null on failure.
     const UiTexture* register_font(Font& font);
 
-    // Uploads a plain RGBA8 image (sRGB-encoded bytes, linear-sampled) for
-    // Canvas2D::draw_image_quad — thumbnail strips etc. Long-lived; there
-    // is no unregister (textures die with the renderer).
+    // Textures live until the renderer dies; there is no unregister.
     const UiTexture* register_image(const uint8_t* rgba, uint32_t width,
                                     uint32_t height);
 
-    // Wraps an externally-owned SHADER_READ_ONLY view (the engine's node
-    // thumbnail atlas) so Canvas2D can draw it: allocates a descriptor set
-    // only. The caller keeps the view alive for the renderer's lifetime.
+    // The caller keeps the view alive and in SHADER_READ_ONLY layout.
     const UiTexture* register_external(VkImageView view, uint32_t width,
                                        uint32_t height);
 
-    // Records the canvas into `cmd` (must be inside a rendering pass whose
-    // color attachment matches color_format). frame_index selects the
-    // geometry buffer slot; extent is the framebuffer size in physical px.
+    // Call inside a rendering pass whose color format matches color_format.
+    // extent is the framebuffer size in physical px.
     void record(VkCommandBuffer cmd, uint32_t frame_index, VkExtent2D extent,
                 const Canvas2D& canvas);
 
@@ -94,9 +73,7 @@ private:
                          VkBufferUsageFlags usage);
     void destroy_buffer(GeometryBuffer& buf);
 
-    // Error strings for one upload, kept per caller. image_fail is a
-    // log_error format that receives width and height as arguments; the
-    // rest are vk_check labels.
+    // image_fail is a log_error format that takes width and height.
     struct UploadLabels {
         const char* image_fail;
         const char* pool;
@@ -104,15 +81,9 @@ private:
         const char* submit;
         const char* view;
     };
-    // One-shot staging upload shared by register_font/register_image:
-    // creates tex.image and tex.view at tex.width x tex.height in format,
-    // copies size bytes of pixels via a transient graphics-queue submit
-    // (waits idle), and leaves the image SHADER_READ_ONLY. On failure
-    // nothing survives; the caller drops tex.
+    // Leaves the image in SHADER_READ_ONLY; on failure the caller drops tex.
     bool upload_texture(UiTexture& tex, VkFormat format, const uint8_t* pixels,
                         size_t size, const UploadLabels& labels);
-    // Allocates the texture descriptor set, binds tex.view with sampler,
-    // stores the texture, and returns the stored pointer.
     UiTexture* commit_texture(std::unique_ptr<UiTexture> tex, VkSampler sampler,
                               const char* set_label);
 
@@ -120,7 +91,7 @@ private:
     VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkSampler nearest_sampler_ = VK_NULL_HANDLE;
-    VkSampler linear_sampler_ = VK_NULL_HANDLE;   // MSDF font atlases
+    VkSampler linear_sampler_ = VK_NULL_HANDLE;
     VkPipelineLayout solid_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout textured_layout_ = VK_NULL_HANDLE;
     VkPipeline solid_pipeline_ = VK_NULL_HANDLE;

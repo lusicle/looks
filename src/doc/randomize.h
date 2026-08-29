@@ -1,6 +1,4 @@
-// Randomize / mutate: per-effect or whole stack, intensity 0..1,
-// respecting param ranges and per-param randomizable-ness. One undo step
-// per gesture. Deterministic per rng_seed — callers advance a counter.
+// The intensity is 0 to 1. The caller must advance rng_seed each time.
 
 #pragma once
 
@@ -10,8 +8,7 @@
 
 namespace looks::doc {
 
-// Selectors (modes, palettes, glyph sets, corners) hold the effect's
-// identity and stay put; continuous params are fair game.
+// A selector param holds the identity of the effect: it does not change.
 bool param_randomizable(const ParamDesc& desc);
 
 void randomize_effect(Document& doc, UndoStack& undo, uint64_t look,

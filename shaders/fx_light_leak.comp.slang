@@ -1,5 +1,4 @@
-// Additive in LINEAR light, which is what makes leaks glow rather than
-// paint over the image.
+// Add the leak in linear light.
 
 #include "fx_common.slang"
 
@@ -34,7 +33,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * max(drift, 1.0e-3);
 
-    // Blobs sit off the right edge so only their falloff enters frame.
+    // The blobs sit off the right edge. Only their falloff enters frame.
     float leak = 0.0;
     for (uint i = 0u; i < 2u; ++i) {
         const float cy = fx_value_noise1(seed + i * 17u, t + float(i) * 3.7);
@@ -70,7 +69,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         result_rgb += float3(1.0, 0.45, 0.1) * edge_burn +
                       float3(1.0, 0.95, 0.85) * core * core;
     }
-    // Leak and burn are their own light: coverage rides their energy.
+    // Leak and burn are their own light. Coverage follows their energy.
     const float4 result = float4(
         result_rgb,
         max(base.a, saturate(fx_luma(max(result_rgb - base.rgb, 0.0)))));

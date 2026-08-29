@@ -54,7 +54,6 @@ void vk_load_device(VkDevice device) {
     LOOKS_VK_DEVICE_FNS_DYNRENDER(LOOKS_VK_LOAD)
 #undef LOOKS_VK_LOAD
 
-    // Vulkan 1.2 devices expose dynamic rendering under the KHR suffix.
     if (!vkCmdBeginRendering) {
         vkCmdBeginRendering = reinterpret_cast<PFN_vkCmdBeginRendering>(
             vkGetDeviceProcAddr(device, "vkCmdBeginRenderingKHR"));
@@ -87,9 +86,7 @@ const char* vk_result_name(VkResult result) {
 
 void vk_check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return;
-    // Unrecoverable — log_fatal persists the reason to looks.log and
-    // raises the app's fatal sink (message box) before aborting; autosave
-    // recovery offers the document back on the next launch.
+    // log_fatal does not return.
     if (result == VK_ERROR_DEVICE_LOST)
         log_fatal(
             "%s failed: VK_ERROR_DEVICE_LOST — the GPU or driver reset. "

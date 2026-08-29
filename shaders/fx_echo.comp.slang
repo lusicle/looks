@@ -1,5 +1,4 @@
-// Binding 1 is this instance's own previous output, under the
-// one-frame-delay rule.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -14,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float decay;
-    float mode;        // 0 lighten, 1 crossfade
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -33,7 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 trail = prev.rgb * saturate(decay);
     const float trail_a = prev.a * saturate(decay);
 
-    // The trail is content: its coverage decays exactly like its color.
+    // The trail is content. Alpha decays the same as color.
     float3 echoed;
     float echoed_a;
     if (int(mode + 0.5) == 0) {

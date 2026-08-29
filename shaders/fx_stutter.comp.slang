@@ -1,5 +1,4 @@
-// All the ring bookkeeping happens engine-side; this kernel only chooses
-// between the live input and the ring frame at binding 1.
+// Binding 1 is the ring frame. The engine owns the ring.
 
 #include "fx_common.slang"
 
@@ -13,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float frames;   // consumed engine-side, unused here
+    float frames;   // the engine uses this, not the shader
     float armed;
-    float rate;     // consumed engine-side, unused here
+    float rate;     // the engine uses this, not the shader
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

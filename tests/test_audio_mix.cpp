@@ -1,13 +1,3 @@
-// Graph audio mix: a look's audio is its wired graph, flattened to a
-// program - leaves read PCM through composed clocks, fan-ins SUM at the
-// node they land on, ops process the summed signal, hops window and
-// gain their subtree.
-//
-// render_mix is a PURE function of (mix, sample range) - the monitor
-// callback and the export encoder share it, so any position dependence
-// would desync what you hear from what you get. DSP ops must keep that
-// contract: they are functions of absolute position, no carried state.
-
 #include "media/audio_mix.h"
 
 #include <cstring>
@@ -24,8 +14,6 @@ using looks::media::render_mix;
 
 namespace {
 
-// A ramp: sample n holds value n, so a mapping error is readable straight
-// off the output.
 std::shared_ptr<const PcmBuffer> ramp_pcm(uint32_t frames, uint32_t channels,
                                           uint32_t rate) {
     auto pcm = std::make_shared<PcmBuffer>();
@@ -78,8 +66,6 @@ int add_hop(MixState& mix, double t_in, double t_out, float gain,
     return static_cast<int>(mix.nodes.size()) - 1;
 }
 
-// One placed source: leaf under a windowed hop, the shape build_mix
-// emits for a lone media chain.
 MixState one_source_mix(std::shared_ptr<const PcmBuffer> pcm, double t_in,
                         double t_out, double source_in, double speed) {
     MixState mix;
@@ -95,8 +81,6 @@ MixState one_source_mix(std::shared_ptr<const PcmBuffer> pcm, double t_in,
 }  // namespace
 
 TEST(mix_gap_is_silence) {
-    // A timeline position no source covers is silence - which is what a
-    // gap between two blocks is.
     const MixState mix = one_source_mix(ramp_pcm(4800, 1, 48000), 30.0, 60.0,
                                         0.0, 1.0);
     std::vector<float> scratch;
@@ -106,19 +90,17 @@ TEST(mix_gap_is_silence) {
 }
 
 TEST(mix_maps_output_samples_onto_source_samples) {
-    // Speed 1, matching rates: output sample s reads source sample s,
-    // offset by where the placement starts.
     const MixState mix = one_source_mix(ramp_pcm(48000, 1, 48000), 0.0, 100.0,
                                         0.0, 1.0);
     std::vector<float> scratch;
     std::vector<int16_t> out(8, 0);
-    // Past the edge ramp so the level is unity.
+    // Start after the edge fade so the level is unity.
     const int64_t at = 4000;
     render_mix(mix, at, out.data(), 8, scratch);
     for (uint32_t i = 0; i < 8; ++i)
         CHECK_EQ(out[i], static_cast<int16_t>(at + i));
 
-    // source_in 10 frames at 30 fps = 16000 samples in.
+    // source_in of 10 frames at 30 fps equals 16000 samples.
     const MixState offset = one_source_mix(ramp_pcm(48000, 1, 48000), 0.0,
                                            100.0, 10.0, 1.0);
     render_mix(offset, at, out.data(), 8, scratch);
@@ -127,7 +109,6 @@ TEST(mix_maps_output_samples_onto_source_samples) {
 }
 
 TEST(mix_speed_resamples) {
-    // Double speed walks the source twice as fast.
     const MixState mix = one_source_mix(ramp_pcm(48000, 1, 48000), 0.0, 100.0,
                                         0.0, 2.0);
     std::vector<float> scratch;
@@ -139,8 +120,7 @@ TEST(mix_speed_resamples) {
 }
 
 TEST(mix_sums_sources_and_applies_gain) {
-    // Two placed chains fan into the root: both sound, each through its
-    // own hop gain - combine-all, the sum is the mux.
+    // The two hop gains 0.5 and 0.25 sum to 0.75 at the root.
     auto pcm = ramp_pcm(48000, 1, 48000);
     MixState mix;
     mix.fps = 30.0;
@@ -163,9 +143,7 @@ TEST(mix_sums_sources_and_applies_gain) {
 }
 
 TEST(mix_is_position_independent) {
-    // The callback pulls in blocks whose size the device picks; export
-    // pulls in 1024s. Same samples either way, or preview and export
-    // disagree about the soundtrack.
+    // The device picks the block size, so any chunking mixes the same bytes.
     MixState mix = one_source_mix(ramp_pcm(48000, 2, 48000), 5.0, 40.0, 3.0,
                                   1.5);
     mix.nodes[static_cast<size_t>(mix.root)].gain = 0.8f;
@@ -183,9 +161,8 @@ TEST(mix_is_position_independent) {
 }
 
 TEST(mix_ramps_the_edges) {
-    // A cut must not click: the level fades in over a few ms at the
-    // in-point, deterministically, and is at unity well clear of it. A
-    // flat source makes the fade the only thing that can vary.
+    // The level fades in at the in-point so a cut does not click.
+    // A flat source makes the fade the only thing that can change.
     const MixState mix = one_source_mix(flat_pcm(1000, 48000), 0.0, 100.0,
                                         0.0, 1.0);
     std::vector<float> scratch;
@@ -239,9 +216,7 @@ TEST(mix_ops_bitcrush_quantizes_amplitude) {
 }
 
 TEST(mix_fan_in_sums_before_the_op) {
-    // The graph semantics the program exists for: an op wired to a
-    // fan-in processes the SUM, not each branch. 100 + 60 crushed at 8
-    // bits snaps to 256; crushing the branches separately would give 0.
+    // The op crushes the sum: 100 + 60 snaps to 256, each branch to 0.
     MixState mix;
     mix.fps = 30.0;
     mix.rate = 48000;
@@ -266,10 +241,8 @@ TEST(mix_fan_in_sums_before_the_op) {
 }
 
 TEST(mix_ops_delay_echoes_the_past) {
-    // Impulse at source frame 0; 100 ms at 48 kHz is 4800 samples. The
-    // echoes re-read the op's INPUT at shifted positions - no carried
-    // state, and the placement cut sits above the DSP so taps read the
-    // raw signal.
+    // 100 ms at 48 kHz is 4800 samples.
+    // The taps re-read the input at shifted positions, with no carried state.
     auto pcm = std::make_shared<PcmBuffer>();
     pcm->channels = 1;
     pcm->rate = 48000;
@@ -297,8 +270,6 @@ TEST(mix_ops_delay_echoes_the_past) {
 }
 
 TEST(mix_render_processed_pcm_applies_ops) {
-    // The runtime-analysis path renders the whole source through the
-    // ops at native rate; no ops is a straight copy.
     auto pcm = ramp_pcm(64, 1, 48000);
     looks::media::PcmBuffer out;
     looks::media::render_processed_pcm(*pcm, {}, &out);
@@ -312,9 +283,7 @@ TEST(mix_render_processed_pcm_applies_ops) {
 }
 
 TEST(mix_wave_pyramid_folds_exact_envelopes) {
-    // The pyramid holds the ACTUAL rendered output: level 0 buckets the
-    // mix at `base` samples, upper levels fold 4:1 with min/max intact,
-    // so any zoom reads exact peaks. An impulse must survive to the top.
+    // Level 0 buckets at base samples, and upper levels fold 4:1.
     auto pcm = std::make_shared<PcmBuffer>();
     pcm->channels = 1;
     pcm->rate = 48000;
@@ -336,7 +305,6 @@ TEST(mix_wave_pyramid_folds_exact_envelopes) {
     const looks::media::WaveSpan& hit = pyr.levels[0][10000 / 64];
     CHECK(hit.hi > 11000.0f);
     CHECK(hit.lo < -8000.0f);
-    // The impulse survives every fold to the coarsest level.
     for (const auto& level : pyr.levels) {
         float hi = 0.0f, lo = 0.0f;
         for (const looks::media::WaveSpan& w : level) {
@@ -349,8 +317,6 @@ TEST(mix_wave_pyramid_folds_exact_envelopes) {
 }
 
 TEST(mix_node_envelopes_show_input_vs_output) {
-    // A card graph's two traces: the op node's input sum is the raw
-    // signal, its output carries the DSP - here a 2x gain.
     auto flat = flat_pcm(1000, 48000);
     MixState mix;
     mix.fps = 30.0;
@@ -376,9 +342,7 @@ TEST(mix_node_envelopes_show_input_vs_output) {
 }
 
 TEST(mix_ops_are_pure_under_any_chunking) {
-    // The purity contract survives DSP: whole-range, odd-sized chunks,
-    // and sample-at-a-time renders of a delay+filter chain produce
-    // identical bytes - ops are functions of absolute position.
+    // Ops are pure functions of absolute sample position.
     auto pcm = ramp_pcm(48000, 1, 48000);
     MixState mix;
     mix.fps = 30.0;

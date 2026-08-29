@@ -1,5 +1,4 @@
-// The deck-side sibling of the camcorder HUD, which is the camera side.
-// Drawn in encoded space.
+// Draw in encoded space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 play, 1 rec, 2 pause, 3 ff
+    float mode;
     float size;      // px per glyph unit
     float counter;
 };
@@ -21,7 +20,7 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// 7-segment bit masks, one per decimal digit.
+// 7-segment bit masks, one for each decimal digit.
 static const uint kDigit[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66,
                                 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
@@ -93,7 +92,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // Tape counter, M:SS:FF, where slot code -2 is the colon.
+    // Slot code -2 is the colon in the M:SS:FF counter.
     if (counter >= 0.5) {
         const uint total_s = fps > 0.0 ? uint(float(frame) / fps) : 0u;
         const uint mm = (total_s / 60u) % 10u;

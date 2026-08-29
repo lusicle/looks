@@ -1,6 +1,3 @@
-// Every wedge samples the first one, mirrored at the seam so the edges
-// meet cleanly rather than butting.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -40,8 +37,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float seg = 2.0 * kPi / clamp(round(segments), 2.0, 32.0);
     float a = atan2(d.y, d.x) + angle;
-    a = a - seg * floor(a / seg);          // wrap into one wedge
-    if (a > seg * 0.5) a = seg - a;        // mirror at the wedge seam
+    a = a - seg * floor(a / seg);
+    if (a > seg * 0.5) a = seg - a;
     a -= angle;
 
     const float2 sample_px = center + r * float2(cos(a), sin(a));

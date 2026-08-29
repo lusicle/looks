@@ -1,5 +1,4 @@
-// Strokes follow the isophote tangent, so they crawl along contours. The
-// canvas at binding 1 is this instance's own previous output.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -19,7 +18,7 @@ cbuffer Push
     float persist;
     float beam_w;    // px
     float edge;
-    float color;     // 0 mono phosphor, 1 source color
+    float color;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -40,7 +39,7 @@ float2 vt_grad(Sampler2D tex, float2 uv, float2 size)
     return float2(lr - ll, ld - lu);
 }
 
-// Returns (distance from p to segment ab, normalized parameter along it).
+// Returns the distance to segment ab and the parameter along it.
 float2 vt_seg(float2 p, float2 a, float2 b)
 {
     const float2 ab = b - a;

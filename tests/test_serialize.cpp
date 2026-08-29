@@ -64,8 +64,6 @@ Document make_rich_doc() {
     overlay.stack.back().text = "REC · SP";
     d.looks[0].layers.push_back(overlay);
 
-    // Group the base layer's first two effects; expose a member param
-    // on the face (the face is direct param aliases).
     doc::Group g = doc::make_group(d, "combo");
     g.folded = true;
     g.exposed.push_back({d.looks[0].layers[0].stack[1].id, 4});
@@ -88,7 +86,6 @@ Document make_rich_doc() {
     env_node.source.trigger = 1;
     d.looks[0].value_nodes.push_back(env_node);
 
-    // A helper chained onto the LFO, exercising op/inputs/constants.
     doc::ValueNode math_node;
     math_node.id = d.next_route_id++;
     math_node.source.type = doc::ModSourceType::Math;
@@ -120,9 +117,6 @@ Document make_rich_doc() {
     d.looks[0].snapshots[1].entries.push_back(
         {d.looks[0].layers[0].stack[0].id, {0.5f, 0.5f, 0.2f}, 0.9f, 1.0f});
 
-    // The root SEQUENCE: a linked video/audio pair of the wrapper look
-    // (the drop shape), the trim band, and markers - lanes, links and
-    // levels must all survive the trip.
     const uint64_t pair = d.next_effect_id++;
     doc::Placement block;
     block.id = d.next_effect_id++;
@@ -169,8 +163,7 @@ TEST(serialize_placement_transform_roundtrip) {
     p.anchor_x = 0.2f;
     p.anchor_y = 0.8f;
     d.sequences[0].tracks[0].placements.push_back(p);
-    // A layer anchor with an otherwise-identity transform must persist
-    // (the pivot is set before the scale that uses it).
+    // The anchor must persist even when the transform is otherwise identity.
     d.looks[0].layers[0].xf_anchor_x = 0.1f;
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
@@ -207,7 +200,7 @@ TEST(serialize_shape_path_roundtrip) {
     l.path_closed = false;
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
-    CHECK(doc::doc_to_json(d2) == a);   // byte-stable
+    CHECK(doc::doc_to_json(d2) == a);
     const doc::Layer& l2 = d2.looks[0].layers[0];
     CHECK_EQ(l2.path.size(), size_t{3});
     CHECK_EQ(l2.path[0].ax, 0.5f);
@@ -279,9 +272,7 @@ TEST(serialize_bins_roundtrip_and_heal) {
 }
 
 TEST(serialize_audio_voice_roundtrip) {
-    // The Output routing flag, audio-modifier effects, the Offset shim
-    // and the media node's timeline lock survive the trip; defaults
-    // stay absent from the JSON.
+    // Defaults stay absent from the JSON.
     Document d;
     d.looks[0].audio_split = true;
     d.looks[0].layers[0].asset = d.next_effect_id++;
@@ -331,9 +322,8 @@ TEST(serialize_roundtrip_stable) {
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
     json::Value b = doc::doc_to_json(d2);
-    CHECK(a == b);   // byte-stable roundtrip
+    CHECK(a == b);
 
-    // Spot checks through the loaded document.
     CHECK_EQ(d2.name, "rich");
     CHECK_EQ(d2.assets.size(), size_t{1});
     CHECK_EQ(d2.assets[0].path, "C:/clips/test.mp4");
@@ -389,7 +379,6 @@ TEST(serialize_roundtrip_stable) {
     CHECK(d2.looks[0].lanes[0].keys[1].hold);
     CHECK(d2.looks[0].snapshots[1].valid);
     CHECK(!d2.looks[0].snapshots[0].valid);
-    // The sequence: block map, pair link, levels, region, markers.
     CHECK_EQ(d2.root().tracks.size(), size_t{1});
     CHECK_EQ(d2.root().tracks[0].placements.size(), size_t{1});
     const doc::Placement& blk = d2.root().tracks[0].placements[0];
@@ -408,13 +397,11 @@ TEST(serialize_roundtrip_stable) {
     CHECK_EQ(d2.root().trim_in, uint32_t{4});
     CHECK_EQ(d2.root().trim_out, uint32_t{110});
     CHECK_EQ(d2.root().markers.size(), size_t{3});
-    // Counters stay usable.
     CHECK(d2.next_effect_id >= d.next_effect_id);
 }
 
 TEST(serialize_tolerant_load) {
-    // Unknown effect type skipped, missing keys default, counters re-derived
-    // above the highest id even when the stored counters lie.
+    // The loader skips unknown types and re-derives counters above the ids.
     const char* text = R"({
         "looks_project": 5,
         "name": "sparse",
@@ -431,22 +418,19 @@ TEST(serialize_tolerant_load) {
     CHECK(parsed.value.has_value());
     Document d = doc::doc_from_json(*parsed.value);
     CHECK_EQ(d.looks[0].layers.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{1});   // unknown skipped
+    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{1});
     CHECK(d.looks[0].layers[0].stack[0].type == EffectType::Vignette);
     CHECK_EQ(d.looks[0].layers[0].stack[0].params[0], 0.9f);
-    // Missing params take defaults.
     CHECK_EQ(d.looks[0].layers[0].stack[0].params[1],
              doc::effect_info(EffectType::Vignette).params[1].default_value);
     CHECK(d.looks[0].layers[0].visible);
     CHECK_EQ(d.looks[0].layers[0].opacity, 1.0f);
     CHECK(d.next_effect_id > 42);   // not the stored 1
 
-    // Garbage text fails cleanly.
     CHECK(!json::parse("{nope").value.has_value());
 }
 
 TEST(serialize_v57_roundtrip) {
-    // Sequence markers, export settings, layer-param lanes — byte-stable.
     Document d;
     d.root().markers = {12, 45, 90};
     d.export_bitrate_mbps = 22.0f;
@@ -474,9 +458,7 @@ TEST(serialize_v57_roundtrip) {
 }
 
 TEST(preset_insert_lands_dormant) {
-    // v5.8: adding never wires. The preset's members chain INTERNALLY
-    // only; the group card joins the graph through a wire gesture. The
-    // pre-existing chain wiring freezes as-is.
+    // Adding a preset never wires it: the members chain internally only.
     Document d;
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
     doc::UndoStack undo;
@@ -492,9 +474,7 @@ TEST(preset_insert_lands_dormant) {
     undo.execute(d, doc::insert_group_command(d.looks[0].id, 0, g,
                                               std::move(members), m0));
 
-    // The old chain froze: source -> vignette -> output. The group
-    // seeds its In slot (interior-only wire onto m0) but nothing
-    // EXTERIOR touches the newcomers.
+    // The group seeds its In slot, and nothing exterior touches the members.
     CHECK(!d.looks[0].links.empty());
     const doc::Group* placed = doc::find_group(d.looks[0], gid);
     CHECK(placed && placed->inputs.size() == size_t{1});
@@ -516,7 +496,6 @@ TEST(preset_insert_lands_dormant) {
     CHECK(!boundary);
     CHECK(chain_out);
 
-    // Undo restores the un-materialized document exactly.
     undo.undo(d);
     CHECK(d.looks[0].links.empty());
     CHECK_EQ(d.looks[0].layers[0].groups.size(), size_t{0});
@@ -524,8 +503,8 @@ TEST(preset_insert_lands_dormant) {
 }
 
 TEST(serialize_dedupes_input_fanin) {
-    // Fan-in is legal on EVERY image port (stacking order is the link
-    // order); only EXACT duplicate wires shed, first (= bottom) kept.
+    // Fan-in is legal on every image port.
+    // Only an exact duplicate wire sheds, and the first one stays.
     const char* text = R"({
         "looks_project": 5,
         "root_look": 100,
@@ -556,14 +535,13 @@ TEST(serialize_dedupes_input_fanin) {
         }
         if (l.to == 0) ++into_output;
     }
-    CHECK_EQ(into_effect2, 2);         // fan-in survives the load
-    CHECK_EQ(bottom, uint64_t{1});     // the exact dup shed, FIRST kept
-    CHECK_EQ(into_output, 2);          // the Output merge keeps fan-in
+    CHECK_EQ(into_effect2, 2);
+    CHECK_EQ(bottom, uint64_t{1});
+    CHECK_EQ(into_output, 2);
 }
 
 TEST(serialize_lane_keys_sorted_on_load) {
-    // Hand-authored files may list keys out of order; eval assumes sorted
-    // — the loader must sort.
+    // Eval assumes sorted keys, so the loader must sort them.
     const char* text = R"({
         "looks_project": 5,
         "root_look": 100,
@@ -598,7 +576,6 @@ TEST(group_commands_lifecycle) {
     CHECK_EQ(d.looks[0].layers[0].stack[1].group_id, g.id);
     CHECK_EQ(d.looks[0].layers[0].stack[2].group_id, uint64_t{0});
 
-    // Face exposure: expose, de-dup, hide, undo both ways.
     const doc::ParamKey pk{d.looks[0].layers[0].stack[1].id, 0};
     undo.execute(d, doc::set_group_exposed_command(d.looks[0].id,0, g.id, pk, true));
     CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});
@@ -606,7 +583,7 @@ TEST(group_commands_lifecycle) {
     CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});   // no dup
     undo.execute(d, doc::set_group_exposed_command(d.looks[0].id,0, g.id, pk, false));
     CHECK(d.looks[0].layers[0].groups[0].exposed.empty());
-    undo.undo(d);   // un-hide
+    undo.undo(d);
     CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});
     CHECK(d.looks[0].layers[0].groups[0].exposed[0] == pk);
 
@@ -641,9 +618,7 @@ TEST(group_bypass_compiles_out) {
 }
 
 TEST(group_creation_slotifies_crossings) {
-    // Ctrl+G over a wired chain: the exterior feed reroutes through a
-    // minted In slot at the crossing's fan-in position; undo restores
-    // the link table exactly.
+    // The exterior feed reroutes through a minted In slot.
     Document d;
     doc::UndoStack undo;
     doc::Layer& layer = d.looks[0].layers[0];
@@ -671,8 +646,7 @@ TEST(group_creation_slotifies_crossings) {
     CHECK(exterior);
     CHECK(interior);
     CHECK(!raw_crossing);
-    // The graph still compiles to the same chain shape through the
-    // slot splice: source -> vignette -> grain -> composite.
+    // The chain still compiles to source -> vignette -> grain.
     (void)f1;
     doc::Asset media;
     media.id = d.next_effect_id++;
@@ -699,9 +673,7 @@ TEST(group_creation_slotifies_crossings) {
 }
 
 TEST(group_legacy_face_in_migrates_on_load) {
-    // Pre-slot file: crossing links target members and the group binds
-    // its In through face_in. The loader reroutes through minted slots
-    // exactly once - a re-save carries "inputs" and skips migration.
+    // A pre-slot file reroutes through minted slots exactly once.
     const char* text = R"({
         "looks_project": 5,
         "looks": [{"id": 100,
@@ -733,7 +705,7 @@ TEST(group_legacy_face_in_migrates_on_load) {
     }
     CHECK(exterior);
     CHECK(interior);
-    // Round-trip: slot-aware files re-load identically (idempotent).
+    // A slot-aware file re-loads identically.
     json::Value out = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(out);
     const doc::Group* g2 = doc::find_group(d2.looks[0], 9);
@@ -753,7 +725,6 @@ TEST(group_wet_serializes_and_snapshots) {
     d.looks[0].layers[0].stack[0].group_id = gid;
     d.looks[0].layers[0].groups.push_back(g);
 
-    // Round-trip keeps the composite knobs.
     json::Value out = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(out);
     const doc::Group* g2 = doc::find_group(d2.looks[0], gid);
@@ -761,7 +732,6 @@ TEST(group_wet_serializes_and_snapshots) {
     CHECK(std::fabs(g2->wet - 0.25f) < 1e-6f);
     CHECK(std::fabs(g2->opacity - 0.5f) < 1e-6f);
 
-    // Snapshots capture and restore group knobs (group-keyed entries).
     undo.execute(d, doc::store_snapshot_command(d.looks[0].id, 0));
     doc::find_group(d.looks[0], gid)->wet = 1.0f;
     undo.execute(d, doc::apply_snapshot_command(d.looks[0].id, 0));
@@ -799,8 +769,7 @@ TEST(group_wet_compiles_the_mix_wrapper) {
     for (const gfx::GraphNode& n : plain.nodes)
         CHECK(n.kind != gfx::GraphNode::Kind::GroupMix);
 
-    // wet 0.5: the face re-lands as GroupMix{dry, face}; the composite
-    // reads the wrapped output.
+    // With wet below 1 the face re-lands as GroupMix{dry, face}.
     doc::find_group(d.looks[0], gid)->wet = 0.5f;
     gfx::RenderGraph mixed = gfx::compile_graph(d, d.looks[0].id, 0);
     CHECK(mixed.valid);
@@ -821,8 +790,7 @@ TEST(group_wet_compiles_the_mix_wrapper) {
     CHECK_EQ(mixed.nodes[static_cast<size_t>(mix_at)].effect_index, 0);
     CHECK_EQ(mixed.output, mix_at);
 
-    // A group matte (port 1 on the GROUP id) gates the composite
-    // through the same extract/apply diamond as any effect.
+    // A port-1 wire on a group id gates it like any effect.
     doc::Layer matte_layer;
     matte_layer.id = d.next_effect_id++;
     matte_layer.source = doc::LayerSourceKind::Shape;
@@ -887,13 +855,11 @@ TEST(preset_capture_and_instantiate) {
     CHECK_EQ(p.effects.size(), size_t{2});
     CHECK_EQ(p.group.exposed.size(), size_t{1});
 
-    // File roundtrip.
     json::Value pj = doc::preset_to_json(p);
     auto p2 = doc::preset_from_json(pj);
     CHECK(p2.has_value());
     CHECK(doc::preset_to_json(*p2) == pj);
 
-    // Instantiate into a fresh doc: fresh ids, remapped face keys.
     Document target;
     doc::Group ng;
     std::vector<doc::EffectInstance> nfx;
@@ -933,8 +899,7 @@ TEST(morph_interpolates_snapshots) {
     Document r = mod::resolve(d, 0, 30.0, nullptr);
     CHECK(std::fabs(r.looks[0].layers[0].stack[0].params[0] - 0.25f) < 1e-5f);
 
-    // The morph position is itself a mod target ({0, 0}): wired, the
-    // slider is replaced - a sine LFO at t = 0 reads 0.5 -> pos 0.5.
+    // The morph position is the mod target {0, 0}; a sine at t=0 reads 0.5.
     doc::ValueNode sine;
     sine.id = d.next_route_id++;
     d.looks[0].value_nodes.push_back(sine);
@@ -946,7 +911,6 @@ TEST(morph_interpolates_snapshots) {
     r = mod::resolve(d, 0, 30.0, nullptr);
     CHECK(std::fabs(r.looks[0].layers[0].stack[0].params[0] - 0.5f) < 1e-4f);
 
-    // Undo the morph command; project files carry morph state.
     undo.undo(d);
     CHECK_EQ(d.looks[0].morph_pos, 0.0f);
     undo.redo(d);
@@ -958,9 +922,7 @@ TEST(morph_interpolates_snapshots) {
 }
 
 TEST(era_presets_ship_valid) {
-    // Every shipped preset in assets/presets must load, carry effects,
-    // and have every exposed face param resolve to a member effect (the
-    // group face is exposed params - direct aliases, no macro offsets).
+    // Every exposed face param must resolve to a member effect.
     const std::filesystem::path dir =
         std::filesystem::path(LOOKS_REPO_ROOT) / "assets" / "presets";
     std::vector<doc::Preset> presets = doc::scan_presets(dir);
@@ -983,12 +945,8 @@ TEST(era_presets_ship_valid) {
     }
 }
 
-
-
 TEST(serialize_lane_flags_roundtrip) {
-    // hidden/lock on video lanes and lock on audio tracks are document
-    // state (hidden changes what exports): they must survive the trip
-    // and default false when absent.
+    // The hidden flag changes what exports, so it is document state.
     Document d;
     d.root().tracks[0].hidden = true;
     d.root().tracks[0].lock = true;

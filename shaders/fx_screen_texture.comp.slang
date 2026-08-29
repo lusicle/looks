@@ -1,4 +1,4 @@
-// Multiplicative in linear light: this is a surface, not a paint.
+// Multiply in linear light. This is a surface, not a paint.
 
 #include "fx_common.slang"
 
@@ -30,11 +30,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Static in screen space: the screen does not move with the picture.
+    // The screen is static in screen space. It does not move.
     const float pitch = max(weave_px, 2.0);
     const float2 ph = float2(tid.xy) * (6.28318 / pitch);
     const float wv = 0.5 * (sin(ph.x) + sin(ph.y * 1.07 + 1.3));
-    // Per-cell irregularity, or it reads as a grid rather than cloth.
+    // Keep the per-cell irregularity or it looks like a grid.
     const uint2 cell = uint2(float2(tid.xy) / pitch);
     const float irregular =
         fx_hash01(fx_hash3(seed, cell.x, cell.y)) - 0.5;

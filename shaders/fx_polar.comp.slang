@@ -12,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;    // 0 wrap around center, 1 unwrap to a strip
+    float mode;
     float swirl;   // radians of shear across the radius
     float zoom;
 };
@@ -46,7 +46,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float r = length(d) / (0.5 * max(zoom, 1.0e-3));
         const float theta = atan2(d.y, d.x) - swirl * r;
         float ax = theta / (2.0 * kPi);
-        ax -= floor(ax);                    // wrap the angle axis
+        ax -= floor(ax);
         suv = float2(ax, clamp(r, 0.0, 1.0));
     }
     const float4 result = input.SampleLevel(suv, 0);

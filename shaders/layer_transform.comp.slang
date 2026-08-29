@@ -1,7 +1,4 @@
-// Applied to the layer source before its effect stack. Coverage is
-// written as premultiplied alpha, so the chain carries the transformed
-// region's shape through every effect and layer_blend composites what
-// actually survived the stack.
+// Coverage is written as premultiplied alpha.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -15,7 +12,7 @@ cbuffer Push
     uint flips;        // bit 0 = horizontal, bit 1 = vertical
     float scale;       // about the anchor, > 0
     float rotate_rad;
-    float anchor_x;    // scale/rotate pivot, uv; 0.5 = frame center
+    float anchor_x;    // scale and rotate pivot, uv
     float anchor_y;
 };
 
@@ -24,8 +21,6 @@ cbuffer Push
 
 float2 xform_source_uv(float2 uv, float aspect)
 {
-    // Inverse of out = a + S*R*(src - a): the anchor is the fixed
-    // point of the scale/rotate. Flips stay frame mirrors.
     const float2 anchor = float2(anchor_x, anchor_y);
     float2 p = (uv - anchor) * float2(aspect, 1.0);
     const float s = sin(-rotate_rad), c = cos(-rotate_rad);
@@ -39,8 +34,6 @@ float2 xform_source_uv(float2 uv, float aspect)
 
 float xform_coverage(float2 suv)
 {
-    // Rotation is rigid and scale uniform, so one output pixel spans
-    // 1 / (dim * scale) in source uv, giving the one-pixel AA edge.
     const float2 lo = float2(crop_l, crop_t);
     const float2 hi = float2(1.0 - crop_r, 1.0 - crop_b);
     const float dx = min(suv.x - lo.x, hi.x - suv.x) * float(width) * scale;

@@ -1,8 +1,3 @@
-// Each span is replaced by a gradient between its darkest and brightest
-// member, which is what a real per-row sort converges to. That framing is
-// what lets every pixel resolve its own span independently, with no
-// scatter and no cross-thread ordering.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -18,7 +13,7 @@ cbuffer Push
     float threshold;   // band low edge, encoded luma
     float range;
     float length_px;   // max walked per side
-    float direction;   // 0 horizontal, 1 vertical
+    float direction;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -51,8 +46,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                                          : float2(1.0 / size.x, 0.0);
     const int max_walk = int(clamp(length_px, 8.0, 256.0));
 
-    // Walk both ways while the band holds, collecting the span extremes
-    // and this pixel's position within it.
     int back = 0;
     float3 dark = base.rgb, bright = base.rgb;
     float dark_a = base.a, bright_a = base.a;

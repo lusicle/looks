@@ -1,5 +1,4 @@
-// Linear-light channel gains, normalized so a temperature sweep re-tints
-// without re-exposing.
+// Apply the channel gains in linear light and normalize them by luma.
 
 #include "fx_common.slang"
 
@@ -29,7 +28,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    // The luma renormalize below is what keeps this a chromatic shift.
     float3 gain = float3(1.0 + 0.5 * temperature,
                          1.0 + 0.35 * tint,
                          1.0 - 0.5 * temperature);

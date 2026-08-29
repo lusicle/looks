@@ -13,8 +13,7 @@ namespace {
 using json::Array;
 using json::Value;
 
-// ---- enum <-> string tables. Names are the stable on-disk vocabulary;
-// enum order can change without breaking saved files.
+// These names are the on-disk vocabulary. Do not change them.
 
 const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
@@ -79,12 +78,9 @@ float num(const Value& obj, std::string_view key, float fallback) {
     return static_cast<float>(obj.get(key).as_number(fallback));
 }
 
-// ---- modulation pieces
-
 Value param_key_to_json(const ParamKey& k) {
     Value v = Value::make_object();
-    // Layer/group keys carry bits 62/61, past the JSON number's 2^53
-    // exact-integer range — store the bare id in its own field instead.
+    // Bits 62 and 61 are past the exact JSON integer range: store bare ids.
     if (k.effect_id & kLayerParamBit)
         v.set("layer", static_cast<int64_t>(k.effect_id & ~kLayerParamBit));
     else if (k.effect_id & kGroupParamBit)
@@ -119,9 +115,7 @@ Value mod_source_to_json(const ModSource& s) {
     v.set("attack", static_cast<double>(s.attack));
     v.set("decay", static_cast<double>(s.decay));
     v.set("trigger", static_cast<int64_t>(s.trigger));
-    // Sampling geometry only for the video-sampling types — older files
-    // stay byte-identical through a load/save roundtrip. The camera
-    // node's channel selector rides the same field.
+    // Only the sampling types write this geometry. Roundtrips stay stable.
     if (s.type == ModSourceType::VideoSample ||
         s.type == ModSourceType::VideoRegion) {
         v.set("px", static_cast<double>(s.px));
@@ -131,7 +125,7 @@ Value mod_source_to_json(const ModSource& s) {
         v.set("channel", static_cast<int64_t>(s.channel));
     } else if (s.type == ModSourceType::Camera) {
         v.set("channel", static_cast<int64_t>(s.channel));
-        // The plane region rides the sampling-geometry fields.
+        // The camera plane region uses the sampling geometry fields.
         v.set("px", static_cast<double>(s.px));
         v.set("py", static_cast<double>(s.py));
         v.set("pw", static_cast<double>(s.pw));
@@ -173,7 +167,8 @@ Value value_node_to_json(const ValueNode& n) {
     }
     if (n.source.type == ModSourceType::Normalise) {
         v.set("const_a", static_cast<double>(n.const_a));
-        v.set("const_b", static_cast<double>(n.const_b));   // window mult
+        // const_b is the window multiplier.
+        v.set("const_b", static_cast<double>(n.const_b));
         v.set("in_min", static_cast<double>(n.in_min));
         v.set("in_max", static_cast<double>(n.in_max));
     }
@@ -261,8 +256,7 @@ KeyframeLane lane_from_json(const Value& v) {
         k.hold = kv.get("hold").as_bool(false);
         lane.keys.push_back(k);
     }
-    // eval_lane assumes ascending frames; the command path sorts on every
-    // edit but hand-authored files may not — sort here so both hold.
+    // eval_lane needs ascending frames. A hand-edited file can be unsorted.
     std::stable_sort(lane.keys.begin(), lane.keys.end(),
                      [](const Keyframe& a, const Keyframe& b) {
                          return a.frame < b.frame;
@@ -276,8 +270,7 @@ Value snapshot_to_json(const Snapshot& s) {
     Value entries = Value::make_array();
     for (const SnapshotEntry& e : s.entries) {
         Value ev = Value::make_object();
-        // Group entries carry kGroupParamBit, past JSON's exact-integer
-        // range - bare id in its own field, like param keys.
+        // kGroupParamBit is past the exact JSON integer range: store bare.
         if (e.effect_id & kGroupParamBit)
             ev.set("group",
                    static_cast<int64_t>(e.effect_id & ~kGroupParamBit));
@@ -312,8 +305,6 @@ Snapshot snapshot_from_json(const Value& v) {
     }
     return s;
 }
-
-// ---- placements (shared by video lanes and audio tracks)
 
 Value placement_to_json(const Placement& p) {
     Value pl = Value::make_object();
@@ -361,8 +352,6 @@ Placement placement_from_json(const Value& pl) {
     return p;
 }
 
-// ---- layers
-
 Value layer_to_json(const Layer& l) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(l.id));
@@ -382,7 +371,7 @@ Value layer_to_json(const Layer& l) {
     if (l.osc_shape)
         v.set("osc_shape", static_cast<int64_t>(l.osc_shape));
     if (!l.path.empty()) {
-        // Custom shape path: [ax,ay,in_dx,in_dy,out_dx,out_dy] per point.
+        // Each path point is [ax, ay, in_dx, in_dy, out_dx, out_dy].
         Value pts = Value::make_array();
         for (const PathPoint& p : l.path) {
             Value pt = Value::make_array();
@@ -397,10 +386,8 @@ Value layer_to_json(const Layer& l) {
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
-    // Transform: written only when non-default so untransformed
-    // projects stay byte-stable. A moved anchor persists even while the
-    // transform is otherwise identity (the pivot is set before the
-    // scale that uses it).
+    // Write the transform only if it is not the default: files stay stable.
+    // A moved anchor stays written even if the transform is identity.
     if (layer_has_transform(l) || l.xf_anchor_x != 0.5f ||
         l.xf_anchor_y != 0.5f) {
         Value xf = Value::make_object();
@@ -431,9 +418,7 @@ Value layer_to_json(const Layer& l) {
     return v;
 }
 
-// One pre-slot group met by the loader: which group, and the face_in id
-// its In slot seeds from (normalize_group_inputs runs after id counters
-// are restored, so slot minting can't collide).
+// normalize_group_inputs must run after the id counters are restored.
 struct GroupMigration {
     uint64_t group = 0;
     uint64_t face_in = 0;
@@ -445,7 +430,7 @@ Layer layer_from_json(const Value& v,
     l.id = static_cast<uint64_t>(v.get("id").as_int(0));
     l.name = v.get("name").as_string();
     std::string src_name = v.get("source").as_string();
-    if (src_name == "clip") src_name = "media";   // pre-rename projects
+    if (src_name == "clip") src_name = "media";   // old files say "clip"
     l.source = static_cast<LayerSourceKind>(
         enum_index(kSourceKindNames, src_name));
     l.asset = static_cast<uint64_t>(v.get("asset").as_int(0));
@@ -506,8 +491,6 @@ Layer layer_from_json(const Value& v,
     return l;
 }
 
-// ---- assets
-
 Value asset_to_json(const Asset& a) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(a.id));
@@ -544,13 +527,8 @@ Asset asset_from_json(const Value& v) {
     return a;
 }
 
-// ---- looks
-
-// Fan-in is legal on every image port (stacking order IS the link
-// order, first = bottom), so a hand-edited file only sheds EXACT
-// duplicate wires - the FIRST occurrence (the bottom position) wins,
-// matching connect's dup-replaces-itself. The Output's split audio-in
-// stays single-feed: the last wins, matching connect's replace.
+// An exact duplicate wire drops. The first one wins, thus order stays.
+// The audio-in of the Output stays single-feed: the last one wins.
 void dedupe_links(std::vector<NodeLink>& links) {
     for (size_t i = 0; i < links.size(); ++i)
         for (size_t j = links.size(); j-- > i + 1;)
@@ -670,9 +648,7 @@ Look look_from_json(const Value& v,
 
     look.out_node_x = num(v, "out_node_x", 0.0f);
     look.out_node_y = num(v, "out_node_y", 0.0f);
-    // An absent link table means implicit chain wiring; consumers call
-    // ensure_links when they need the graph — the loader stays
-    // byte-roundtrip-stable.
+    // An absent link table means implicit wiring. The loader keeps it empty.
     for (const Value& lv : v.get("links").array())
         look.links.push_back(
             {static_cast<uint64_t>(lv.get("from").as_int(0)),
@@ -693,7 +669,6 @@ Look look_from_json(const Value& v,
     return look;
 }
 
-// Highest id in a look, so id counters can never mint a duplicate.
 uint64_t max_node_id(const Look& look) {
     uint64_t max_id = look.id;
     for (const Layer& l : look.layers) {
@@ -723,8 +698,6 @@ uint64_t max_sequence_id(const Sequence& seq) {
     }
     return max_id;
 }
-
-// ---- sequences
 
 Value sequence_to_json(const Sequence& seq) {
     Value v = Value::make_object();
@@ -838,8 +811,6 @@ Sequence sequence_from_json(const Value& v) {
 
 }  // namespace
 
-// ---- effects (shared with presets)
-
 json::Value effect_to_json(const EffectInstance& fx) {
     Value v = Value::make_object();
     v.set("type", effect_info(fx.type).id);
@@ -864,7 +835,7 @@ json::Value effect_to_json(const EffectInstance& fx) {
 
 std::optional<EffectInstance> effect_from_json(const json::Value& v) {
     const auto type = effect_type_from_id(v.get("type").as_string());
-    if (!type) return std::nullopt;   // effect from a newer build: skip
+    if (!type) return std::nullopt;   // an unknown effect type: skip it
     const EffectInfo& info = effect_info(*type);
     EffectInstance fx;
     fx.type = *type;
@@ -889,8 +860,6 @@ std::optional<EffectInstance> effect_from_json(const json::Value& v) {
     return fx;
 }
 
-// ---- groups (shared with presets)
-
 json::Value group_to_json(const Group& g) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(g.id));
@@ -901,7 +870,6 @@ json::Value group_to_json(const Group& g) {
         v.set("node_x", static_cast<double>(g.node_x));
         v.set("node_y", static_cast<double>(g.node_y));
     }
-    // The group face: exposed member params — direct aliases.
     Value exposed = Value::make_array();
     for (const ParamKey& k : g.exposed) {
         Value ev = Value::make_object();
@@ -912,9 +880,7 @@ json::Value group_to_json(const Group& g) {
     v.set("exposed", std::move(exposed));
     v.set("wet", static_cast<double>(g.wet));
     v.set("opacity", static_cast<double>(g.opacity));
-    // Always emitted, empty included: presence is what marks a file as
-    // slot-aware (absence routes the loader through the legacy face_in
-    // migration in normalize_group_inputs).
+    // Always write "inputs", empty included: it marks the file slot-aware.
     Value inputs = Value::make_array();
     for (uint64_t s : g.inputs)
         inputs.push(Value(static_cast<int64_t>(s)));
@@ -947,10 +913,7 @@ Group group_from_json(const json::Value& v, GroupLegacy* legacy) {
     g.opacity = num(v, "opacity", 1.0f);
     for (const Value& sv : v.get("inputs").array())
         g.inputs.push_back(static_cast<uint64_t>(sv.as_int(0)));
-    // Pre-slot files bound the In through face_in; the caller feeds it
-    // to normalize_group_inputs, which seeds slot 0 from it exactly
-    // once. Slot-aware files carry the "inputs" key (even empty) and
-    // skip the migration.
+    // No "inputs" key means the file needs the face_in migration.
     if (legacy) {
         legacy->migrate = !v.get("inputs").is_array();
         legacy->face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
@@ -962,8 +925,6 @@ Group group_from_json(const json::Value& v, GroupLegacy* legacy) {
     g.out_y = num(v, "out_y", 0.0f);
     return g;
 }
-
-// ---- document
 
 json::Value doc_to_json(const Document& doc) {
     Value v = Value::make_object();
@@ -1070,8 +1031,7 @@ Document doc_from_json(const json::Value& v) {
         b.parent = static_cast<uint64_t>(bv.get("parent").as_int(0));
         if (b.id) doc.bins.push_back(std::move(b));
     }
-    // Bin refs heal to the root: a dangling parent or membership, or a
-    // parent loop, must not orphan rows out of the browser.
+    // A dangling or looped bin reference heals to the root.
     for (Bin& b : doc.bins)
         if (b.parent &&
             (!doc.find_bin(b.parent) || bin_reaches(doc, b.parent, b.id)))
@@ -1083,9 +1043,7 @@ Document doc_from_json(const json::Value& v) {
     for (Sequence& seq : doc.sequences) heal_bin(&seq.bin);
     for (Asset& a : doc.assets) heal_bin(&a.bin);
 
-    // Re-derive id counters from the content: stored values are honored but
-    // never allowed below (max seen id + 1), so a hand-edited file cannot
-    // mint duplicate ids.
+    // An id counter never goes below the highest id seen plus 1.
     uint64_t max_id = 0, max_route_id = 0;
     for (const Look& look : doc.looks)
         max_id = std::max(max_id, max_node_id(look));
@@ -1106,9 +1064,7 @@ Document doc_from_json(const json::Value& v) {
         std::max(static_cast<uint64_t>(v.get("next_route_id").as_int(1)),
                  max_route_id + 1);
 
-    // Pre-slot groups migrate exactly once: crossings reroute through
-    // minted slots and face_in seeds the In. Runs after the counter
-    // restore above so fresh slot ids can never collide.
+    // This must run after the counter restore, or new slot ids collide.
     for (const GroupMigration& m : migrations)
         for (Look& look : doc.looks) {
             size_t li = 0;
@@ -1125,8 +1081,7 @@ Document doc_from_json(const json::Value& v) {
             }
         }
 
-    // A document always holds at least one look holding at least one
-    // layer, and at least one sequence holding at least one lane.
+    // A document keeps one look with a layer, and one sequence with a lane.
     if (doc.looks.empty()) {
         Look look;
         look.name = "look 1";
@@ -1159,9 +1114,7 @@ Document doc_from_json(const json::Value& v) {
     if (!doc.find_sequence(doc.root_sequence))
         doc.root_sequence = doc.sequences.front().id;
 
-    // Assets and hand-authored entries minted after the id high-water
-    // mark. An unbound placement is a deliberate state (a dormant block)
-    // and loads back exactly as written.
+    // An unbound placement is deliberate: it loads back as written.
     for (Asset& a : doc.assets)
         if (!a.id) a.id = doc.next_effect_id++;
     for (Look& look : doc.looks)
@@ -1206,9 +1159,6 @@ std::optional<Document> load_document(const std::filesystem::path& path,
         if (error) *error = "not a looks project file";
         return std::nullopt;
     }
-    // Clean break at version 5 (value graph): an older file's inline
-    // route sources would load as silence, which reads as data loss.
-    // Refuse it honestly.
     if (parsed.value->get("looks_project").as_int(0) < kProjectVersion) {
         if (error) *error = "project predates the value graph format";
         return std::nullopt;

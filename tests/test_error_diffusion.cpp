@@ -1,8 +1,4 @@
-// Exact-equivalence harness for the CPU error diffusion: the optimized
-// implementation (planar channel threads + register-forwarded same-row
-// taps) must reproduce the original interleaved serial walk bit for bit
-// across every kernel, serpentine state, level count, and the temporal
-// carry. The reference below is that original walk, kept verbatim.
+// The reference walk below stays verbatim: it is the equivalence check.
 
 #include <algorithm>
 #include <cmath>
@@ -319,7 +315,7 @@ uint32_t hash32(uint32_t x) {
     return x;
 }
 
-// Test-side encoder; production only decodes halves (half_to_float).
+// The test needs this encoder: production only decodes halves.
 uint16_t float_to_half(float f) {
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -327,8 +323,8 @@ uint16_t float_to_half(float f) {
     const int32_t exp =
         static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
     const uint32_t man = x & 0x7FFFFFu;
-    if (exp <= 0) return static_cast<uint16_t>(sign);            // -> 0
-    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); // clamp
+    if (exp <= 0) return static_cast<uint16_t>(sign);
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu); // max half
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
                                  (man >> 13));
 }
@@ -351,9 +347,8 @@ std::vector<uint16_t> make_halves(uint32_t w, uint32_t h, uint32_t seed) {
 }  // namespace
 
 TEST(error_diffusion_matches_reference) {
-    // EXACT mode only: fast mode intentionally diverges (banded walk).
-    // Odd width exercises the margin/edge paths of every kernel; two
-    // frames with carry exercise the temporal path in both layouts.
+    // Only exact mode matches: fast mode uses a different banded walk.
+    // The odd width 97 exercises the margin and edge paths of each kernel.
     const uint32_t w = 97, h = 200;
     const std::vector<uint16_t> frame_a = make_halves(w, h, 11);
     const std::vector<uint16_t> frame_b = make_halves(w, h, 12);
@@ -376,8 +371,6 @@ TEST(error_diffusion_matches_reference) {
 }
 
 TEST(error_diffusion_fast_mode) {
-    // Fast (banded) mode: deterministic across runs, and genuinely a
-    // different walk than exact (seams drop error like frame edges).
     const uint32_t w = 97, h = 61;
     const std::vector<uint16_t> frame = make_halves(w, h, 21);
     for (const int kernel : {0, 6, 7}) {

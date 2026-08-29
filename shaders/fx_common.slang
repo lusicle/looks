@@ -1,20 +1,9 @@
-// Shared kernel helpers. All randomness here is counter-based hashing
-// keyed on (seed, frame, cell): no stateful RNG anywhere, which is what
-// keeps preview and export bit-exact.
-//
-// ALPHA IS THE GATE: the layer composite reveals a pixel only through
-// its alpha (no emissive path), so every kernel must keep alpha equal
-// to the COVERAGE of its output content. Remaps carry the sampled
-// pixel's alpha, gathers gather alpha with the same weights, trails
-// and added light extend it, burn-ins union it in, full-frame redraws
-// own it; only pure color work keeps base.a. Footage is alpha-1
-// everywhere and every rule above preserves constant 1, so this only
-// matters - and matters completely - for shapes and mattes.
+// All randomness uses counter hashes on (seed, frame, cell). Keep it stateless.
+// Every kernel must set alpha equal to the coverage of its output content.
 
 #ifndef FX_COMMON_SLANG
 #define FX_COMMON_SLANG
 
-// splitmix32-style avalanche.
 uint fx_hash(uint x)
 {
     x ^= x >> 16;
@@ -48,28 +37,26 @@ float fx_luma(float3 rgb)
     return dot(rgb, kFxLumaW);
 }
 
-// BT.709 chroma difference scales: Cb carries (B-Y)/kFxCb709, Cr carries
-// (R-Y)/kFxCr709. Every encoder, decoder and scope derives from these two
-// anchors plus the fx_luma weights so the round trip stays inverse.
+// Cb carries (B-Y)/kFxCb709 and Cr carries (R-Y)/kFxCr709.
+// All encoders and scopes must use these anchors to keep the round trip.
 static const float kFxCb709 = 1.8556;
 static const float kFxCr709 = 1.5748;
 static const float kFxCb709G = kFxCb709 * kFxLumaW.b / kFxLumaW.g;
 static const float kFxCr709G = kFxCr709 * kFxLumaW.r / kFxLumaW.g;
 
-// Encoded-domain RGB to (Cb, Cr) about the given luma.
+// The RGB input must be encoded, not linear.
 float2 fx_rgb_to_cbcr709(float3 enc, float y)
 {
     return float2((enc.b - y) / kFxCb709, (enc.r - y) / kFxCr709);
 }
 
-// Screen blend, bounded: inputs saturate so linear-light values above 1
-// cannot flip the term negative and push the result past white.
+// Saturate the inputs. Linear values above 1 push the result past white.
 float3 fx_screen(float3 a, float3 b)
 {
     return 1.0 - (1.0 - saturate(a)) * (1.0 - saturate(b));
 }
 
-// Hue (0..1) -> fully saturated RGB, abs-ramp construction.
+// The hue input h is in the range 0 to 1.
 float3 fx_hue_to_rgb(float h)
 {
     const float r = abs(h * 6.0 - 3.0) - 1.0;
@@ -92,8 +79,8 @@ float3 fx_srgb_eotf(float3 encoded)
     return lerp(hi, lo, step(encoded, 0.04045));
 }
 
-// The packed LUT is 512x192 R8: rows 0..63 hold the STBN 64x64x8 atlas
-// with slice s at x = s*64, rows 64..191 the 128x128 blue noise.
+// The packed LUT is 512x192 R8. Rows 0 to 63 hold the STBN 64x64x8 atlas,
+// slice s at x = s*64. Rows 64 to 191 hold the 128x128 blue noise.
 
 static const float kFxBayer2[4] = {0.0, 2.0, 3.0, 1.0};
 static const float kFxBayer4[16] = {
@@ -102,16 +89,13 @@ static const float kFxBayer4[16] = {
 
 float fx_bayer8(uint2 p)
 {
-    // 8x8 from the recursive construction over the 4x4.
     const uint2 q = p & 7;
     const float base = kFxBayer4[(q.y & 3) * 4 + (q.x & 3)];
     const float quad = float(((q.y >> 2) & 1) * 2 + ((q.x >> 2) & 1));
     return (base * 4.0 + kFxBayer2[uint(quad)]) / 64.0;
 }
 
-// Clustered-dot screen threshold at 45 degrees: the black dot grows
-// from the cell center of an 8 px lattice, and the radial map keeps dot
-// area tracking tone (dots merge into the corners in the shadows).
+// Clustered-dot screen at 45 degrees on an 8 px lattice.
 float fx_cluster_dot(float2 pf)
 {
     const float2 r45 = float2(pf.x - pf.y, pf.x + pf.y) * 0.70710678;
@@ -119,8 +103,7 @@ float fx_cluster_dot(float2 pf)
     return saturate(1.0 - dot(cell, cell) * 0.04908739);
 }
 
-// Interleaved gradient noise: a screen-space ordered pattern between
-// bayer's regularity and white noise's grain.
+// p is a screen-space pixel coordinate.
 float fx_ign(uint2 p)
 {
     const float g = 0.06711056 * float(p.x) + 0.00583715 * float(p.y);
@@ -157,7 +140,6 @@ float3 fx_nearest_of4(float3 c, float3 p0, float3 p1, float3 p2, float3 p3)
     return best;
 }
 
-// NES: a representative 12-entry cut of the 2C02 palette.
 float3 fx_nes_nearest(float3 c)
 {
     const float3 nes[12] = {
@@ -177,9 +159,7 @@ float3 fx_nes_nearest(float3 c)
     return best;
 }
 
-// Fixed-palette snap shared by the Quantizer and PaletteMap: 0 DMG
-// greens, 1 CGA, 2 NES, 3 teletext, 4 duotone. Luma palettes read l,
-// color palettes read c_enc; callers prepare both (dither, cycling).
+// The caller must supply both l and c_enc. Each palette reads only one.
 float3 fx_palette_snap(int pal, float3 c_enc, float l,
                        float hue_a, float hue_b)
 {
@@ -208,12 +188,8 @@ float3 fx_palette_snap(int pal, float3 c_enc, float l,
                           float3(0.98, 0.98, 0.98));
 }
 
-// Picks between the two encoded levels bracketing lin using the LINEAR
-// interpolant as the probability, so a dithered field averages back to
-// the input on screen. Dithering in code values instead preserves the
-// encoded mean, and the display's convex EOTF then lifts every dithered
-// region: a 5% linear sky encodes near 0.25 and renders 25% white.
-// Returns the level index, not a color.
+// The linear interpolant is the probability, so the dither averages back.
+// The function returns the level index, not a color.
 float3 fx_dither_levels(float3 lin, float n, float t01)
 {
     lin = saturate(lin);
@@ -223,11 +199,10 @@ float3 fx_dither_levels(float3 lin, float n, float t01)
     const float3 lin_hi = fx_srgb_eotf((lo + 1.0) / (n - 1.0));
     const float3 p =
         (lin - lin_lo) / max(lin_hi - lin_lo, 1.0e-6);
-    // Strict compare: p = 0 (a pixel ON a level) must never pick up.
+    // Use a strict compare. A pixel on a level must never move up.
     return lo + step(t01 + 1.0e-6, p);
 }
 
-// Bilinear 2D value noise on an integer lattice.
 float fx_vnoise2(uint s, float2 p)
 {
     const float2 i = floor(p);
@@ -242,7 +217,6 @@ float fx_vnoise2(uint s, float2 p)
     return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
-// Smooth value noise over one dimension (deterministic wander).
 float fx_value_noise1(uint seed, float t)
 {
     const float cell = floor(t);

@@ -1,8 +1,4 @@
-// Encoded space: snow rides on the signal, not the scene.
-//
-// Weak-RF reception: impulse sparks smear into comet tails along the
-// scan direction, a multipath ghost adds a delayed copy to the right
-// (AGC renormalizes the sum), and the noise floor lifts everywhere.
+// Work in encoded space. The snow rides on the signal.
 
 #include "fx_common.slang"
 
@@ -38,8 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 enc = fx_srgb_oetf(saturate(base.rgb));
     float out_a = base.a;
 
-    // Multipath: the delayed copy lands to the RIGHT of the direct
-    // signal; AGC pulls the summed level back down.
+    // The delayed copy lands to the right, so the sample uses a minus.
     const float g = saturate(ghost);
     if (g > 0.001) {
         const float2 guv =
@@ -50,9 +45,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         out_a = max(out_a, ghost4.a * g * 0.8);
     }
 
-    // Impulse sparks with comet tails: a hit at x smears over the
-    // following ~dozen pixels of the scan, decaying by its own tail
-    // length. Dark hits are shorter drop-out combs.
     float spark = 0.0;
     float dark = 0.0;
     [unroll]
@@ -69,7 +61,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (d > 0.001)
             dark += d * exp(-float(k) / 2.5);
     }
-    // The floor: broadband grain under everything, faintly streaky.
     const uint fh = fx_hash4(seed ^ 0x5A0Fu, frame, tid.x >> 1, tid.y);
     const float fl = (fx_hash01(fh) - 0.5) * saturate(floor_amt) * 0.5;
 

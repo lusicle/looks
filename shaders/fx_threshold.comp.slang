@@ -1,4 +1,4 @@
-// Display-referred core.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 

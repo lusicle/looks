@@ -11,10 +11,8 @@ cbuffer Push
     uint frame;
     float fps;
     float gain;
-    float pure_diff;   // 0 source scaled by motion, 1 raw difference
-    // The reference source's aspect-fit rect (canvas px): the luma
-    // planes are NATIVE while `input` is the canvas - the motion mask
-    // must sample where the content actually composites.
+    float pure_diff;
+    // The fit rect is in canvas px. The luma planes use native pixels.
     float rect_x;
     float rect_y;
     float inv_fit_w;

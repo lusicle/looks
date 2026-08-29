@@ -1,9 +1,5 @@
-// GPU mosh rate control, pass 2: the DC delta code lengths. Every block's
-// term depends only on its own quantized DC and its predecessor's in the
-// STREAM traversal order (luma: macroblock raster, four blocks row-major
-// inside each; chroma: block raster) - a pairwise map, not a chain.
-// Intra edge fillers repeat the predictor (chain-transparent, bounded
-// lookback); P fillers are zero blocks that reset it.
+// Luma traverses macroblock raster, four blocks row-major inside each.
+// Chroma traverses block raster. Both must match the stream order.
 
 #include "mosh_common.slang"
 
@@ -21,7 +17,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_dc;
 [[vk::binding(1, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> rate_bits;
 
-// Sequence index -> block coordinates for this plane's traversal.
 int2 seq_to_block(uint seq, uint mb_w)
 {
     if (plane != 0)
@@ -50,7 +45,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     {
         const uint cur = rate_dc[int2(int(r * bw + tid.x), int(tid.y))];
         if (cur == 0x80000000u)
-            continue;   // intra filler: fixed bits counted in pass 1
+            continue;   // intra filler, pass 1 counted its bits
         const int dc = cur == 0x40000000u ? 0 : int(cur) - 65536;
         int pred = 0;
         uint back = seq;
@@ -61,7 +56,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             const uint pv = rate_dc[int2(int(r * bw + uint(pb.x)),
                                          pb.y)];
             if (pv == 0x80000000u)
-                continue;   // transparent: keep looking back
+                continue;
             pred = pv == 0x40000000u ? 0 : int(pv) - 65536;
             break;
         }

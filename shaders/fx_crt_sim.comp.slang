@@ -1,13 +1,4 @@
-// The display-side counterpart to the signal-path effects: Composite and
-// Snow simulate the cable, this simulates the glass.
-//
-// The picture is drawn by a BEAM: each virtual scanline is a Gaussian in
-// linear light whose width grows with beam current, so highlights bloom
-// into the gaps while dark lines stay thin and crisp. RGB beams land
-// slightly apart (convergence error, worst toward the edges), the
-// phosphor sits behind a grille / slot / shadow mask, and the faceplate
-// glass scatters bright content as halation. LCD is the flat
-// screen-door geometry instead: no tube terms, scanline = row gaps.
+// The beam and the halation sum in linear light.
 
 #include "fx_common.slang"
 
@@ -25,7 +16,7 @@ cbuffer Push
     float scanline;
     float lines;       // virtual scanline count
     float bloom;
-    float mask_mode;   // 0 grille, 1 slot, 2 shadow, 3 lcd
+    float mask_mode;
     float mask_amt;
     float triad;       // px
     float converge;    // px
@@ -35,10 +26,8 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// One scanline's beam: the three guns sample the video at their own
-// landing positions along the line (sx = r/g/b x in uv), and each
-// channel's Gaussian weight follows its own level (bloom widens a hot
-// beam). dist is measured to the point being lit, in line pitches.
+// sx holds the r, g and b landing positions as x in uv space.
+// dist is the distance to the lit point, in line pitches.
 void beam_line(float3 sx, float line_y, float dist, float bloom_amt,
                out float3 lvl, out float3 w, out float wgt_a)
 {
@@ -65,7 +54,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int mm = int(mask_mode + 0.5);
     const bool lcd = mm == 3;
 
-    // Outside the curved screen is tube black. LCD glass is flat.
     float2 c = uv * 2.0 - 1.0;
     const float k = lcd ? 0.0 : curvature * 0.22;
     c *= 1.0 + k * dot(c, c);
@@ -79,7 +67,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float4 s = input.SampleLevel(suv, 0);
             col = s.rgb;
             col_a = s.a;
-            // scanline drives the row-gap depth here, triad the cell size.
             const float tw = max(triad, 2.0);
             const float cx = frac(float(tid.x) / (tw * 3.0)) * 3.0;
             const uint stripe = uint(cx) % 3u;
@@ -100,24 +87,17 @@ void main(uint3 tid : SV_DispatchThreadID)
             col *= 1.0 + saturate(mask_amt) * 0.9;
         } else {
             const float m = saturate(mask_amt);
-            // Convergence: beams land apart, worst toward the edges.
             const float edge = 0.25 + 0.75 * dot(c, c);
             const float dc = converge * edge;   // px
 
-            // The phosphor lattice is printed on the GLASS: it lives in
-            // faceplate coordinates, so it bows with exactly the same
-            // mapping the picture does - never a screen-space overlay.
+            // The phosphor lattice uses faceplate space, not screen space.
             const float2 fp = suv * size;
             const float sw = max(triad, 2.0);
 
-            // Which phosphor element sits under this pixel, its matrix
-            // coverage window, and the element center - the unit that
-            // lights as a whole.
             int ch;
             float cov;
             float ex, ey;
             if (mm == 2) {
-                // Shadow mask: staggered dot triads.
                 const float rowf = fp.y / sw;
                 const int row_i = int(floor(rowf));
                 const float xoff = (row_i & 1) != 0 ? 0.5 : 0.0;
@@ -129,8 +109,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                 ex = (float(col_i) + 0.5 - xoff) * sw;
                 ey = (float(row_i) + 0.5) * sw;
             } else {
-                // Grille stripes; the slot mask breaks them with
-                // staggered bridges.
                 const float px = fp.x / sw;
                 const int elem = int(floor(px));
                 ch = (elem % 3 + 3) % 3;
@@ -151,10 +129,6 @@ void main(uint3 tid : SV_DispatchThreadID)
                 }
             }
 
-            // The beams light the ELEMENT: as the matrix fades in, the
-            // guns' sampling collapses from the pixel to the element
-            // center, so each stripe/dot carries one level - the
-            // picture becomes the lattice instead of wearing it.
             const float bx = lerp(fp.x, ex, m);
             const float3 sx =
                 float3(bx - dc, bx, bx + dc) / size.x;
@@ -170,10 +144,9 @@ void main(uint3 tid : SV_DispatchThreadID)
                       lv0, w0, a0);
             beam_line(sx, (l0 + 1.0) * pitch / size.y, l0 + 1.0 - ys,
                       bloom, lv1, w1, a1);
-            // 1.25 pays back the energy the line integral loses.
+            // The 1.25 factor replaces the energy the line integral loses.
             const float3 beam = (lv0 * w0 + lv1 * w1) * 1.25;
 
-            // Flat reference (scanline = 0), convergence kept.
             const float4 fg = input.SampleLevel(float2(sx.y, suv.y), 0);
             const float fr =
                 input.SampleLevel(float2(sx.x, suv.y), 0).r;
@@ -182,9 +155,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             col = lerp(float3(fr, fg.g, fb), beam, saturate(scanline));
             col_a = lerp(fg.a, max(a0, a1), saturate(scanline));
 
-            // Black matrix: only this element's phosphor emits here;
-            // the leak floor is glass scatter. The lit element runs
-            // hotter than the average it replaces, as a real tube does.
             float3 tr = float3(0.05, 0.05, 0.05);
             if (ch == 0) tr.r = max(cov, 0.05);
             else if (ch == 1) tr.g = max(cov, 0.05);
@@ -192,7 +162,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             col *= lerp(float3(1.0, 1.0, 1.0), tr, m);
             col *= 1.0 + m * 1.8;
 
-            // Faceplate halation: bright content scatters in the glass.
             if (halation > 0.001) {
                 const float rh = size.y * 0.035;
                 float3 hal = float3(0.0, 0.0, 0.0);
@@ -208,14 +177,12 @@ void main(uint3 tid : SV_DispatchThreadID)
                 }
                 hal *= 0.125;
                 hal_a *= 0.125;
-                // Scatter favors what is already bright.
                 const float3 h2 = hal * hal;
                 col += h2 * halation * 0.45;
                 col_a = max(col_a, saturate(fx_luma(h2)) * halation * 0.45 *
                                        hal_a);
             }
 
-            // Edge focus and brightness fall off with deflection.
             const float corner =
                 saturate(1.0 - dot(c, c) * 0.28 * curvature);
             col *= corner;

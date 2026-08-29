@@ -1,8 +1,4 @@
-// GPU mosh rate control, pass 3: the ladder decision. Reads the exact
-// per-rung stream sizes accumulated by the probe/reduce passes and writes
-// the chosen quality into qsel - the wire reads it from there, so rate
-// control never touches the CPU. Rule matches the CPU box: first rung
-// whose stream fits the budget, else the ladder's floor.
+// Pick the first rung that fits the budget, else the ladder floor.
 
 #include "mosh_common.slang"
 
@@ -11,7 +7,7 @@ cbuffer Push
 {
     uint rung_count;
     uint budget;          // bytes
-    uint header_bytes;    // 1 for intra streams (quality byte), 0 for P
+    uint header_bytes;    // 1 for intra streams, 0 for P streams
     uint pad0;
     uint4 rungs_lo;
     uint4 rungs_hi;

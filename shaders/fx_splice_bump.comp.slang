@@ -1,6 +1,3 @@
-// bump drives the whole event and does nothing at 0, so it is meant to
-// be mod-routed from a scene-cut or beat trigger.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -38,7 +35,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 rolled = input.SampleLevel(suv, 0);
     float3 col = rolled.rgb;
 
-    // Dark tape bar at the wrap seam.
     if (dy > 0.0005) {
         const float seam = 1.0 - dy;
         const float d = abs(uv.y - seam);

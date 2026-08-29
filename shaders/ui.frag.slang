@@ -1,6 +1,5 @@
-// v_shape is { radius, stroke, halfW, halfH } in physical px, and both
-// zero selects the pass-through path. Blending is straight alpha, so
-// coverage is folded into the returned alpha rather than a separate mask.
+// v_shape is { radius, stroke, halfW, halfH } in physical px.
+// Blending is straight alpha, so coverage folds into the returned alpha.
 
 struct FSInput
 {

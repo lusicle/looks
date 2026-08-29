@@ -95,19 +95,18 @@ void layer_param_range(int param_index, float* min_value, float* max_value) {
     *min_value = 0.0f;
     *max_value = 1.0f;
     switch (param_index) {
-        case 7: *min_value = 1.0f; *max_value = 64.0f; break;  // gen_scale
-        case 8:                                                // gen_angle
+        case 7: *min_value = 1.0f; *max_value = 64.0f; break;
+        case 8:
             *min_value = -3.14159265f;
             *max_value = 3.14159265f;
             break;
         case 9:
         case 10:
         case 11:
-        case 12: *max_value = 0.45f; break;                    // crops
-        case 13: *min_value = 0.25f; *max_value = 4.0f; break; // xf_scale
+        case 12: *max_value = 0.45f; break;
+        case 13: *min_value = 0.25f; *max_value = 4.0f; break;
         case 14: *min_value = -180.0f; *max_value = 180.0f; break;
-        // Phase wraps in the kernel, so keys and wires may run far past
-        // one period (long loops) without the eval clamp folding them.
+        // Phase wraps in the kernel; the large max lets loops run many periods.
         case 17: *max_value = 1.0e6f; break;
         default: break;   // opacity + colors, normalized 0..1
     }
@@ -169,8 +168,6 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc,
             add(static_cast<int>(p), info.params[p].id, info.params[p].label,
                 fx.params[p]);
     }
-    // Group composites: wet/opacity, addressed with kGroupParamBit —
-    // mod targets exactly like a node's built-ins.
     for (size_t l = 0; l < look.layers.size(); ++l)
         for (const doc::Group& g : look.layers[l].groups) {
             const std::string gname = g.name.empty() ? "group" : g.name;
@@ -188,8 +185,6 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc,
             add(doc::kWetParam, "wet", "wet/dry", g.wet);
             add(doc::kOpacityParam, "opacity", "opacity", g.opacity);
         }
-    // Layer params: opacity, generator fields, and the transform —
-    // mod targets exactly like effect params.
     for (size_t l = 0; l < look.layers.size(); ++l) {
         doc::Layer probe = look.layers[l];
         const std::string lname =

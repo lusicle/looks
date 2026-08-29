@@ -1,5 +1,4 @@
-// Taps stay in linear light so highlights bloom through the streak the
-// way real motion blur does.
+// Taps sum in linear light so highlights bloom through the streak.
 
 #include "fx_common.slang"
 
@@ -14,10 +13,9 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;   // px, or degrees for radial
-    float mode;     // 0 directional, 1 radial, 2 zoom, 3 gauss, 4 tilt,
-                    // 5 bokeh, 6 surface
+    float mode;
     float angle;
-    float focus;    // tilt band center; doubles as surface range weight
+    float focus;
     float band;
 };
 
@@ -35,11 +33,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const uint m = uint(mode + 0.5);
-    // Taps accumulate float4: coverage blurs with color, so a
-    // transparent layer's edge feathers instead of smearing black.
     float4 blurred;
     if (m >= 3u) {
-        // Disc-tap family: 24 golden-spiral taps, per-mode weights.
         float radius = amount * 0.5;
         if (m == 4u) {
             const float2 axis = float2(-sin(angle), cos(angle));
@@ -58,12 +53,9 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float4 c = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
             float wgt;
             if (m == 5u) {
-                // Energy-weighted so bright points bloom into discs.
                 const float lum = fx_luma(c.rgb);
                 wgt = 1.0 + lum * lum * 6.0;
             } else if (m == 6u) {
-                // Bilateral: spatial falloff x range weight, so texture
-                // smooths while real edges hold.
                 const float3 dc = c.rgb - base.rgb;
                 const float range = max(focus * focus, 0.002);
                 wgt = (1.0 - fi * 0.7) * exp(-dot(dc, dc) / range);

@@ -1,17 +1,5 @@
-// GPU mosh: the codec wire, one thread per 8x8 block of ONE plane per
-// dispatch. Ports codec_core's fixed-point DCT (13-bit constants, int32
-// accumulators, symmetric rounding) exactly - integer shader math is
-// bit-deterministic, so preview and export stay identical. Entropy never
-// runs here: quantize + dequantize IS the decode when no bitstream is
-// rate-limited or corrupted (the CPU box keeps those paths).
-//
-// mode 0 = intra: source -> center -> DCT -> quant -> dequant -> IDCT ->
-//   +128 into out_clean (and out_moshed when write_moshed).
-// mode 1 = P: residual against clean_pred -> wire -> the SAME spatial
-//   residual lands on both chains (corrupt-rolled macroblocks skip the
-//   moshed add: prediction-only holes that persist - open loop).
-// src_from_plane selects the src storage plane (generation-loss cycles)
-// over the NV12 textures.
+// The integer DCT must stay bit-identical to the CPU codec core.
+// Quantize and dequantize is the decode. No entropy coding runs here.
 
 #include "mosh_common.slang"
 
@@ -20,16 +8,16 @@ cbuffer Push
 {
     uint pw;              // this plane's pixel dims
     uint ph;
-    uint plane;           // 0 = Y (nv_y), 1 = U, 2 = V (nv_uv channels)
-    uint mode;            // 0 intra, 1 P
-    uint quality;         // 1..100
-    uint write_moshed;    // intra: also write the moshed chain
-    uint src_from_plane;  // 1 = read src storage plane, 0 = NV12 textures
+    uint plane;           // 0 = Y, 1 = U, 2 = V
+    uint mode;
+    uint quality;         // 1 to 100
+    uint write_moshed;
+    uint src_from_plane;
     uint corrupt_enable;
     float corrupt_prob;
     uint seed_frame;
-    uint mb_shift;        // block -> macroblock: 1 for luma, 0 for chroma
-    uint quality_from_qsel;   // 1 = rate control picked it (read qsel)
+    uint mb_shift;        // 1 for luma, 0 for chroma
+    uint quality_from_qsel;
 };
 
 [[vk::binding(0, 0)]] Sampler2D nv_y;
@@ -41,8 +29,7 @@ cbuffer Push
 [[vk::binding(6, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> out_moshed;
 [[vk::binding(7, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> qsel;
 
-// Source fetch: NV12 textures (unorm round-trips the byte exactly) or the
-// src storage plane, with edge replication for partial blocks.
+// The unorm texture round-trips the byte exactly.
 int fetch_src(int2 p)
 {
     p = clamp(p, int2(0, 0), int2(int(pw) - 1, int(ph) - 1));
@@ -65,9 +52,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const int2 org = int2(int(bx) * 8, int(by) * 8);
 
-    // Per-thread quant table: closed-form scale of the base table. Rate
-    // control delivers its pick through qsel so the decision never leaves
-    // the GPU.
     const int q_eff = int(quality_from_qsel != 0
                               ? clamp(qsel[int2(0, 0)], 1u, 100u)
                               : quality);
@@ -118,7 +102,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    // P frame: seeded per-macroblock corruption skips the moshed add.
+    // Seeded macroblock corruption skips the moshed add.
     const uint mbx = bx >> mb_shift;
     const uint mby = by >> mb_shift;
     const bool corrupt =

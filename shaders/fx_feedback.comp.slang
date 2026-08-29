@@ -1,5 +1,4 @@
-// Reads its own previous output at binding 1: the one-frame delay that
-// is the only legal cycle in the graph.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -14,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;
-    float zoom;        // per pass, 1 = none
+    float zoom;        // per pass
     float rotate;      // radians per pass
     float fade;
     float hue_shift;   // degrees per pass
@@ -34,7 +33,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Inverse transform: where this pixel came from last frame.
+    // Inverse map. Sample where this pixel was in the last frame.
     const float aspect = size.x / size.y;
     float2 p = uv - 0.5;
     p.x *= aspect;
@@ -53,7 +52,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         fb_a = prev.a * (1.0 - saturate(fade));
     }
 
-    // Rodrigues rotation of the color about the luma axis.
     if (abs(hue_shift) > 0.01) {
         const float ha = hue_shift * 0.01745329252;
         const float hc = cos(ha), hs = sin(ha);

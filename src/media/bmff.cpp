@@ -23,8 +23,7 @@ struct Box {
     Reader payload{nullptr, 0};
 };
 
-// Reads the next child box from `r`. Returns false at end-of-payload or on
-// malformation (r.ok distinguishes).
+// Returns false at end of payload or on malformation; r.ok separates them.
 bool next_box(Reader& r, Box* out) {
     if (!r.ok || r.pos >= r.size) return false;
     if (!r.has(8)) { r.fail(); return false; }
@@ -61,9 +60,6 @@ FullBox full_box(Reader& r) {
     fb.flags |= r.u8();
     return fb;
 }
-
-// ---- per-track sample table accumulators (raw box contents, expanded at
-// the end of the trak walk)
 
 struct SttsRun { uint32_t count, delta; };
 struct CttsRun { uint32_t count; int64_t offset; };
@@ -239,25 +235,22 @@ void parse_stbl(Reader& r, TrackInfo* track, SampleTables* tables) {
     }
 }
 
-// Expands the accumulated tables into flat per-sample records.
 bool expand_samples(const SampleTables& t, TrackInfo* track) {
     const uint32_t count = t.sample_count;
     track->samples.resize(count);
     if (count == 0) return true;
 
-    // Sizes.
     for (uint32_t i = 0; i < count; ++i) {
         track->samples[i].size =
             t.fixed_size ? t.fixed_size
                          : (i < t.sizes.size() ? t.sizes[i] : 0);
     }
 
-    // Offsets: walk chunks through the stsc runs.
     if (t.chunk_offsets.empty() || t.stsc.empty()) return false;
     uint32_t sample = 0;
     const size_t chunk_count = t.chunk_offsets.size();
     for (size_t chunk = 0; chunk < chunk_count && sample < count; ++chunk) {
-        // Applicable stsc run: last with first_chunk <= chunk+1.
+        // The applicable stsc run is the last with first_chunk <= chunk + 1.
         uint32_t per_chunk = t.stsc[0].samples_per_chunk;
         for (const StscRun& run : t.stsc) {
             if (run.first_chunk <= chunk + 1) per_chunk = run.samples_per_chunk;
@@ -271,7 +264,6 @@ bool expand_samples(const SampleTables& t, TrackInfo* track) {
     }
     if (sample != count) return false;
 
-    // Timing.
     uint64_t dts = 0;
     uint32_t i = 0;
     for (const SttsRun& run : t.stts) {
@@ -287,7 +279,6 @@ bool expand_samples(const SampleTables& t, TrackInfo* track) {
             track->samples[i].cts_offset = run.offset;
     }
 
-    // Keyframes.
     if (t.has_stss) {
         for (SampleInfo& s : track->samples) s.keyframe = false;
         for (uint32_t sync : t.sync)
@@ -396,8 +387,6 @@ bool parse_moov(const uint8_t* data, size_t size, MovieInfo* out,
     return true;
 }
 
-// ---------------------------------------------------------------- file IO
-
 BmffFile::~BmffFile() { close(); }
 
 void BmffFile::close() {
@@ -416,11 +405,8 @@ bool BmffFile::open(const std::filesystem::path& path, std::string* error) {
     }
     file_ = f;
 
-    // Walk top-level boxes to find moov. The file length bounds every
-    // declared size - a corrupt box must not drive an unbounded
-    // allocation, and a largesize smaller than its own 16-byte header
-    // must not seek backwards into it (the in-memory walker, next_box,
-    // enforces the same two rules).
+    // The file length must bound every declared box size; a corrupt box
+    // must not cause an unbounded allocation or a backward seek.
     _fseeki64(f, 0, SEEK_END);
     const int64_t file_size = _ftelli64(f);
     _fseeki64(f, 0, SEEK_SET);

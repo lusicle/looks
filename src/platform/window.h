@@ -1,12 +1,5 @@
-// Platform window + input abstraction (all platform code stays in
-// src/platform/ so a macOS port swaps implementations, not callers).
-//
-// Model: one window, polled events. Each frame the app drains the queue via
-// pump_events(); nothing here blocks. Sizes and mouse positions are in
-// PHYSICAL pixels — the UI applies its own scale (mirrors the reference
-// toolkit, which feeds physical px into the draw list and lets the
-// projection handle the rest). dpi_scale() is the per-monitor factor
-// (96 dpi == 1.0).
+// Sizes and mouse positions are in physical pixels.
+// dpi_scale() is 1.0 at 96 dpi.
 
 #pragma once
 
@@ -33,7 +26,6 @@ enum class Key : uint16_t {
 
 enum class MouseButton : uint8_t { Left, Right, Middle, X1, X2 };
 
-// Modifier bitmask carried on key and mouse events.
 inline constexpr uint32_t kModCtrl = 1u << 0;
 inline constexpr uint32_t kModShift = 1u << 1;
 inline constexpr uint32_t kModAlt = 1u << 2;
@@ -51,8 +43,8 @@ struct Event {
         MouseWheel,    // wheel_y in scroll lines (+ = away from user)
         KeyDown,       // key, repeat, mods
         KeyUp,
-        Char,          // codepoint (UTF-32), for text input
-        FileDrop,      // drop_path: first file of a drag-and-drop
+        Char,          // codepoint, in UTF-32
+        FileDrop,      // drop_path, the first file only
     };
 
     Type type;
@@ -73,7 +65,7 @@ struct Event {
 
 struct WindowDesc {
     std::string title = "looks";   // UTF-8
-    int width = 1600;              // desired client size, logical px (scaled by DPI)
+    int width = 1600;              // logical px, scaled by DPI
     int height = 900;
     bool resizable = true;
 };
@@ -82,8 +74,7 @@ class Window {
 public:
     virtual ~Window() = default;
 
-    // Drains pending OS messages into `out`. Returns false once the window
-    // has been destroyed (after the app reacts to CloseRequested).
+    // Returns false after the native window is destroyed.
     virtual bool pump_events(std::vector<Event>& out) = 0;
 
     virtual uint32_t width() const = 0;    // client area, physical px
@@ -94,12 +85,12 @@ public:
     virtual void set_title(const std::string& utf8) = 0;
     virtual void request_close() = 0;      // destroys the native window
 
-    // Native handles for the graphics backend (HWND / HINSTANCE on win32).
+    // These are the HWND and the HINSTANCE on Win32.
     virtual void* native_window() const = 0;
     virtual void* native_instance() const = 0;
 };
 
-// Must be called once before create_window (sets process DPI awareness).
+// Call this one time before create_window().
 void init();
 
 std::unique_ptr<Window> create_window(const WindowDesc& desc);

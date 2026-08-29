@@ -1,6 +1,3 @@
-// Inverse-maps through the square-to-quad homography, which is what keeps
-// straight lines straight under the perspective.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -37,8 +34,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / dim;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Unit square to pinned quad, then the adjugate inverts it without
-    // needing the determinant.
     const float2 p00 = float2(tl_x, tl_y);
     const float2 p10 = float2(1.0 + tr_x, tr_y);
     const float2 p01 = float2(bl_x, 1.0 + bl_y);
@@ -61,7 +56,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float e = p01.y - p00.y + h * p01.y;
     const float f = p00.y;
 
-    // adj(H) rows for H = [a b c; dq e f; g h 1].
     const float3 q = float3(uv, 1.0);
     const float3 r0 = float3(e - f * h, c * h - b, b * f - c * e);
     const float3 r1 = float3(f * g - dq, a - c * g, c * dq - a * f);
@@ -73,17 +67,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int em = int(edge_mode + 0.5);
     float coverage = 1.0;
     if (em == 0) {
-        // Half-pixel analytic AA on the uncovered edge.
         const float2 dpx = min(suv, 1.0 - suv) * dim;
         coverage = saturate(min(dpx.x, dpx.y) + 0.5);
         suv = clamp(suv, 0.0, 1.0);
     } else if (em == 2) {
         suv = frac(suv);
     } else if (em == 3) {
-        // Triangle wave, 0..1..0 over a 2-frame period.
         suv = 1.0 - abs(frac(suv * 0.5) * 2.0 - 1.0);
     }
-    // em == 1 needs no case: the sampler already clamps.
+    // em == 1 needs no case. The sampler already clamps.
 
     float4 pinned = input.SampleLevel(suv, 0) * coverage;
 

@@ -1,7 +1,4 @@
-// Error diffusion upload expand: packed level indices (3x5 bits per
-// pixel) to linear RGBA16F. The palette arrives via push, computed on the
-// CPU with the exact tables the walk used - re-deriving it in-shader
-// would drift by ulps.
+// The CPU walk must supply the palette. In-shader math drifts by ulps.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -10,10 +7,10 @@ cbuffer Push
     uint height;
     uint nlevels;
     uint pad0;
-    float4 lv0;    // level_lin[0..3]
-    float4 lv1;    // [4..7]
-    float4 lv2;    // [8..11]
-    float4 lv3;    // [12..15]
+    float4 lv0;
+    float4 lv1;
+    float4 lv2;
+    float4 lv3;
     float lv16;
 };
 

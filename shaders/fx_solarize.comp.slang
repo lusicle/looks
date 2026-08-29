@@ -1,5 +1,4 @@
-// Folds per channel rather than on luma, which is what shears color into
-// the metallic look.
+// Fold each channel, not the luma.
 
 #include "fx_common.slang"
 
@@ -23,11 +22,8 @@ cbuffer Push
 
 float fold1(float x, float t, float k)
 {
-    // Reflect x about t, then renormalize so the full input range keeps
-    // using the full output range.
     const float over = x - t;
     if (k > 1.0e-3) {
-        // sqrt(over^2 + k^2) - k is a smooth |over|, rounding the crease.
         const float folded = t - (sqrt(over * over + k * k) - k);
         return max(folded, 0.0) / max(t, 1.0e-3) * t;
     }
@@ -51,7 +47,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         enc.x = fold1(enc.x, t, k);
         enc.y = fold1(enc.y, t, k);
         enc.z = fold1(enc.z, t, k);
-        // Each extra fold re-expands so the next pass has range to bite.
         if (i + 1 < n) enc = saturate(enc / max(t, 1.0e-3));
     }
 

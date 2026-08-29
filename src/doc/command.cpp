@@ -6,8 +6,6 @@ namespace looks::doc {
 
 namespace {
 
-// A group of commands that undoes/redoes as one unit. Reverts run in
-// reverse application order.
 class CompositeCommand final : public Command {
 public:
     CompositeCommand(std::string name, std::vector<std::unique_ptr<Command>> cmds)
@@ -98,7 +96,7 @@ void UndoStack::end_group() {
 
     auto composite = std::make_unique<CompositeCommand>(
         std::move(group.name), std::move(group.commands));
-    // Commands in the group already ran; record without re-applying.
+    // The group commands ran already: record them without a re-apply.
     push_entry(std::move(composite), /*coalesce=*/false);
 }
 

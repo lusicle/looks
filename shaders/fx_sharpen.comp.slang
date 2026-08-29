@@ -1,5 +1,4 @@
-// Tap count stays fixed at 9 regardless of radius; the halo look lives
-// in Oversharpen, this is the neutral tool.
+// Keep the tap count at 9 for all radius values.
 
 #include "fx_common.slang"
 
@@ -30,8 +29,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) * px;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Bilinear taps let the footprint scale continuously with radius
-    // without adding samples.
+    // Bilinear taps scale the footprint with radius. Do not add taps.
     const float2 r = px * max(radius, 0.01);
     float3 blur = base.rgb * 0.25;
     blur += input.SampleLevel(uv + float2(r.x, 0.0), 0).rgb * 0.125;

@@ -1,7 +1,4 @@
-// Group composite: the standard two-lerp tail with the group's subgraph
-// as the kernel - out = lerp(dry, lerp(dry, face, wet), opacity). Full
-// RGBA: a group's interior may carve alpha (mattes inside), and wet 1
-// must return the face exactly.
+// Composite full RGBA. A wet of 1 must return the face exactly.
 
 [[vk::push_constant]]
 cbuffer Push

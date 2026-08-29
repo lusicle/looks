@@ -41,8 +41,6 @@ bool Value::operator==(const Value& rhs) const {
     return false;
 }
 
-// ---------------------------------------------------------------- parser
-
 namespace {
 
 constexpr int kMaxDepth = 128;
@@ -112,7 +110,7 @@ struct Parser {
     }
 
     bool parse_string(std::string& out) {
-        ++p;  // opening quote
+        ++p;
         while (p < end) {
             char c = *p;
             if (c == '"') { ++p; return true; }
@@ -166,7 +164,6 @@ struct Parser {
             if (p < end && (*p == '+' || *p == '-')) ++p;
             while (p < end && (*p >= '0' && *p <= '9')) ++p;
         }
-        // Copy to a NUL-terminated buffer for strtod.
         char buf[64];
         size_t n = static_cast<size_t>(p - start);
         if (n == 0 || n >= sizeof(buf)) return fail("bad number");
@@ -253,8 +250,6 @@ ParseResult parse(std::string_view text) {
     return {std::move(v), {}};
 }
 
-// ---------------------------------------------------------------- writer
-
 namespace {
 
 void write_string(std::string& out, const std::string& s) {
@@ -274,7 +269,7 @@ void write_string(std::string& out, const std::string& s) {
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
                 } else {
-                    out += static_cast<char>(c);  // UTF-8 passes through
+                    out += static_cast<char>(c);  // UTF-8 bytes pass through.
                 }
         }
     }
@@ -282,8 +277,7 @@ void write_string(std::string& out, const std::string& s) {
 }
 
 void write_number(std::string& out, double v) {
-    // Integers print without a fractional part; everything else uses %.17g
-    // (shortest round-trip-safe fixed precision without a Grisu).
+    // %.17g keeps the value exact through a write and read cycle.
     double integral;
     if (std::modf(v, &integral) == 0.0 && std::abs(v) < 9.0e15) {
         char buf[32];

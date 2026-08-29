@@ -1,5 +1,3 @@
-// Disparity rides luma as a depth proxy, so bright subjects read as near.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -14,7 +12,7 @@ cbuffer Push
     float fps;
     float depth;    // base disparity, px
     float pop;
-    float mode;     // 0 red/cyan, 1 red/blue, 2 green/magenta
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -41,14 +39,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const uint m = uint(mode + 0.5);
     float3 outc;
-    if (m == 1u)         // red/blue: green channel mostly dies
+    if (m == 1u)
         outc = float3(left.r, 0.25 * (left.g + right.g) * 0.5, right.b);
-    else if (m == 2u)    // green/magenta
+    else if (m == 2u)
         outc = float3(right.r, left.g, right.b);
-    else                 // red/cyan
+    else
         outc = float3(left.r, right.g, right.b);
 
-    // One alpha covers both eyes: the union of the shifted coverages.
     const float4 result = float4(outc, max(left4.a, right4.a));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

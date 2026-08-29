@@ -1,16 +1,4 @@
-// Context — cross-frame UI interaction state (first-party mirror of the
-// reference toolkit's ui_context).
-//
-// Widget identity is keyed on the WIDGET-STATE POINTER: the same
-// caller-owned state struct yields the same WidgetId every frame via an
-// open-addressed slot table. Slots not re-acquired in a frame are recycled
-// by gc_widget_slots() with a generation bump, so stale captures compare
-// unequal instead of aliasing a new widget.
-//
-// Hit testing: widgets register rects during the hit pass; finalize_hits()
-// picks
-// the top entry under the cursor by (layer, registration order). Input
-// capture (drags) overrides the winner until released.
+// Widget identity keys on the caller-owned state pointer.
 
 #pragma once
 
@@ -35,34 +23,27 @@ class Context {
 public:
     Context();
 
-    // ---- frame flow
-    void begin_frame();          // bumps frame counter, resets hit state
+    void begin_frame();
     void gc_widget_slots();      // call after the draw pass
 
-    // ---- widget identity
     WidgetId acquire_widget_id(const void* state_ptr);
 
-    // ---- hit testing (rects in logical px, pre-clipped by the caller)
+    // Hit rects are logical px and the caller clips them first.
     void add_hit(const Rect& rect, WidgetId id, HitLayer layer = HitLayer::Tree);
     void finalize_hits(Vec2 mouse_logical);
     WidgetId hit_winner() const { return winner_; }
     bool any_hit() const { return !winner_.is_null(); }
 
-    // ---- capture (drag ownership)
     void set_capture(WidgetId id) { capture_ = id; }
     void clear_capture() { capture_ = {}; }
     bool has_capture() const;
 
-    // The one canonical mouse-ownership check widgets use: a live capture
-    // wins; otherwise the hit-test winner.
+    // A live capture wins; if there is none, the hit-test winner wins.
     bool widget_owns_mouse(WidgetId id) const;
 
     uint64_t frame() const { return frame_; }
 
-    // ---- deferred tooltip: a widget sets it during the draw pass after a
-    // sustained hover; the app renders it once after run_frame so it
-    // overlays everything. Pointer must stay valid through the frame
-    // (string literals / arena copies).
+    // The text pointer must stay valid for the whole frame.
     void set_tooltip(const char* text, Vec2 pos) {
         tooltip_ = text;
         tooltip_pos_ = pos;
@@ -73,23 +54,19 @@ public:
         tooltip_ = nullptr;
     }
 
-    // ---- deferred overlay popup. The open widget registers its overlay
-    // each frame during draw; the app runs RunPopup right after run_frame —
-    // BEFORE the frame's edit handlers — so a selection lands in its
-    // out-param in time to be applied the same frame. `owner` (persistent)
-    // enforces a single open popup.
+    // Run RunPopup after run_frame and before the frame edit handlers.
     enum class PopupKind : uint8_t { List, Color };
     struct PopupRequest {
         PopupKind kind = PopupKind::List;
         Rect anchor;
         Rect rect;
-        // List: dropdown option rows.
+        // List kind only.
         const char* const* items = nullptr;
         int count = 0;
         int selected = -1;
         void* state = nullptr;
         int* out_selected = nullptr;
-        // Color: picker writing an rgb triplet as it drags.
+        // Color kind only.
         float* out_rgb = nullptr;
         bool* out_changed = nullptr;
         bool* out_released = nullptr;

@@ -1,9 +1,3 @@
-// Dev CLI: headless transport + decode pool verification. Builds a
-// one-media project over an imported bundle, runs the
-// timeline clock, pulls frames through the pool, and exercises seek and
-// trim.
-//   looks_playtest <bundle.mez> [bundle.pcm]
-
 #include <windows.h>
 
 #include <cstdio>
@@ -30,9 +24,6 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    // A project the way the app builds one: an asset, the starter look's
-    // media node bound to it, and one block placing that look on the root
-    // sequence.
     doc::Document doc;
     doc::Asset asset;
     asset.id = doc.next_effect_id++;
@@ -78,7 +69,6 @@ int wmain(int argc, wchar_t** argv) {
     expect(span == probe.frame_count(),
            "timeline length derives from the placement");
 
-    // The mix: one media source across the whole span.
     {
         auto mix = std::make_shared<media::MixState>();
         mix->fps = doc.fps;
@@ -108,7 +98,6 @@ int wmain(int argc, wchar_t** argv) {
            "decoded frame has pixels");
     expect(player.current_frame_index() == 0, "playhead at 0 before play");
 
-    // Play ~1.1s of a looping timeline; the clock must advance.
     player.set_looping(true);
     player.play();
     Sleep(1100);
@@ -126,26 +115,22 @@ int wmain(int argc, wchar_t** argv) {
     expect(player.position_seconds() == paused_pos,
            "clock frozen while paused");
 
-    // Instant seek.
     player.seek_frame(5);
     expect(player.current_frame_index() == 5, "seek lands on frame 5");
     const auto& sought = pool.collect(5);
     expect(sought.size() == 1 && sought[0].frame != nullptr,
            "frame decoded after seek");
 
-    // Prewarm: replaying a span the pool has already walked must not
-    // re-read the same frames from disk.
     const uint64_t before = pool.misses();
     for (uint32_t f = 5; f < 9; ++f) pool.collect(f);
     const uint64_t walked = pool.misses() - before;
     std::printf("prewarm: %llu disk decodes over 4 sequential frames\n",
                 static_cast<unsigned long long>(walked));
 
-    // Trim + loop stays inside the region.
     player.set_trim(10, 20);
     player.seek_frame(10);
     player.play();
-    Sleep(700);   // > 10 frames at 30fps -> must have wrapped
+    Sleep(700);   // more than 10 frames at 30 fps: the loop must wrap
     const uint32_t trimmed_idx = player.current_frame_index();
     std::printf("trim [10,20): frame=%u\n", trimmed_idx);
     expect(trimmed_idx >= 10 && trimmed_idx < 20, "loop stays inside trim");

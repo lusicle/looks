@@ -1,5 +1,4 @@
-// Shared body for both glow blur passes. GLOW_DIR is 0 horizontal or
-// 1 vertical, defined by the including file.
+// The including file must define GLOW_DIR as 0 for x or 1 for y.
 
 #include "fx_common.slang"
 
@@ -16,7 +15,7 @@ cbuffer Push
     float amount;
     float radius;      // px
     float threshold;
-    float mode;        // 0 pro-mist, 1 halation, 2 ccd smear
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -31,8 +30,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 size = float2(width, height);
     const float2 uv = (float2(tid.xy) + 0.5) / size;
 
-    // CCD smear is a readout COLUMN, not a bloom, so the horizontal pass
-    // collapses to nothing and the vertical one runs several radii long.
+    // CCD smear is a readout column, so the two passes use different radii.
     const bool ccd = int(mode + 0.5) == 2;
     float r = max(radius, 0.5);
     if (ccd)
@@ -46,8 +44,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     for (int i = -8; i <= 8; ++i)
     {
         const float offset = float(i) / 8.0 * r;
-        // Flat weights give the smear its constant-intensity column; the
-        // film modes keep the gaussian falloff.
         const float w = (ccd && GLOW_DIR == 1)
             ? 1.0 / (1.0 + abs(offset) / max(r, 1.0) * 1.5)
             : exp(-0.5 * (offset * offset) / (sigma * sigma));

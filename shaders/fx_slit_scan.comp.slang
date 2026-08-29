@@ -1,5 +1,4 @@
-// One dispatch per age band with the matching history frame bound. The
-// bands are disjoint, so the passes tile the output exactly once.
+// The engine runs one dispatch for each age band.
 
 #include "fx_common.slang"
 
@@ -13,10 +12,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 rows map to time, 1 columns
+    float mode;
     float depth;
     float reverse;
-    uint pass_age;   // engine-appended age band for this dispatch
+    uint pass_age;   // the engine appends this age band word
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

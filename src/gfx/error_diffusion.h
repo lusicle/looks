@@ -1,7 +1,5 @@
-// CPU error diffusion (the ErrorDiffusion Codec-Box effect): pure buffer
-// in/out with no GPU types, split from the engine so the exact-equivalence
-// tests can link it without a Vulkan device. Input is tight-packed RGBA16F
-// halves; output lands in EdState::out in the same format.
+// Keep this file Vulkan-free; tests link it without a GPU.
+// Input halves are tight-packed RGBA16F.
 
 #pragma once
 
@@ -15,7 +13,6 @@ struct EffectInstance;
 
 namespace looks::gfx {
 
-// Half-float decode shared with the engine (flow-field readback).
 inline float half_to_float(uint16_t h) {
     const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -44,17 +41,14 @@ inline float half_to_float(uint16_t h) {
     return out;
 }
 
-// Per-instance persistent state (temporal carry, cached Hilbert walk,
-// reused scratch). The engine keys one per effect id.
+// The engine keys one EdState per effect id.
 struct EdState {
-    // Level indices packed 3x5 bits per pixel — the walk's real output is
-    // picks, not colors, and shipping picks cuts the upload 4x. The GPU
-    // expand pass reconstructs the linear palette from ed_level_table.
+    // Level indices, 3x5 bits per pixel; GPU expand decodes via ed_level_table.
     std::vector<uint32_t> out;
-    std::vector<uint8_t> idx;     // per-channel pick planes (walk scratch)
+    std::vector<uint8_t> idx;     // per-channel pick planes
     std::vector<float> carry;     // quantization error, planar RGB
-    std::vector<float> work;      // working buffer, planar RGB (reused)
-    std::vector<uint32_t> hilbert;   // Riemersma visit order (cached)
+    std::vector<float> work;      // working buffer, planar RGB
+    std::vector<uint32_t> hilbert;   // Riemersma visit order
     uint32_t hilbert_w = 0, hilbert_h = 0;
     uint32_t last_frame = 0xFFFFFFFFu;
     bool valid = false;
@@ -64,9 +58,7 @@ void run_error_diffusion(const uint16_t* halves, uint32_t width,
                          uint32_t height, const doc::EffectInstance& fx,
                          EdState& slot);
 
-// The output palette in linear light, exactly as the walk's pick tables
-// build it. The GPU expand pass must reproduce these values bit for bit,
-// so they are computed once here and pushed — never re-derived in-shader.
+// Linear-light palette; GPU expand must match bit for bit, never re-derive.
 int ed_level_table(const doc::EffectInstance& fx, float out_levels[17]);
 
 }  // namespace looks::gfx

@@ -54,10 +54,8 @@ TEST(mosh_intra_roundtrip_quality) {
     codec.process(frame.view(), 0, params, {}, out);
     CHECK(codec.has_state());
     CHECK_EQ(out.width, kW);
-    // High quality: close to the source.
     CHECK(mean_abs_diff(out.y, frame.y) < 3.0);
 
-    // Low quality (JPEG Blocking territory): visibly worse but bounded.
     MoshCodec crushed;
     MoshParams low = params;
     low.quality = 5;
@@ -68,7 +66,6 @@ TEST(mosh_intra_roundtrip_quality) {
 }
 
 TEST(mosh_p_frame_static_converges) {
-    // Same frame twice: the P frame's residual is small, output stays close.
     TestFrame frame(0);
     MoshCodec codec;
     MoshParams params;
@@ -85,26 +82,24 @@ TEST(mosh_datamosh_drop_holds_stale_reference) {
     TestFrame second(3);   // very different content
     MoshParams params;
     params.quality = 80;
-    params.gop_length = 1;        // every frame is an I frame...
-    params.drop_iframes = true;   // ...and the mosh drops them all: freeze
+    params.gop_length = 1;        // gop 1 makes every frame an I frame
+    params.drop_iframes = true;   // a dropped I frame freezes the output
 
     MoshCodec codec;
     DecodedFrame a, b;
-    codec.process(first.view(), 0, params, {}, a);   // first I establishes
-    codec.process(second.view(), 1, params, {}, b);  // dropped I -> hold
-    CHECK(b.y == a.y);   // pure repeat of the stale frame
+    codec.process(first.view(), 0, params, {}, a);
+    codec.process(second.view(), 1, params, {}, b);
+    CHECK(b.y == a.y);
 
-    // gop 2 across a cut: frame 2's I is dropped (hold), frame 3's P
-    // residuals were encoded against the CLEAN reference of `second`, so
-    // they repaint texture without ever repairing the stale imagery.
+    // A later P frame aims at the clean reference, not the frozen output.
     MoshParams melt = params;
     melt.gop_length = 2;
     MoshCodec moshed;
     DecodedFrame m;
     moshed.process(first.view(), 0, melt, {}, m);
     moshed.process(first.view(), 1, melt, {}, m);
-    moshed.process(second.view(), 2, melt, {}, m);   // dropped I
-    moshed.process(second.view(), 3, melt, {}, m);   // open-loop P
+    moshed.process(second.view(), 2, melt, {}, m);
+    moshed.process(second.view(), 3, melt, {}, m);
 
     MoshCodec honest;
     MoshParams clean = melt;
@@ -115,15 +110,13 @@ TEST(mosh_datamosh_drop_holds_stale_reference) {
     honest.process(second.view(), 2, clean, {}, hn);
     honest.process(second.view(), 3, clean, {}, hn);
 
-    // The honest decode tracks the cut; the mosh keeps the old imagery.
     CHECK(mean_abs_diff(hn.y, second.y) < 4.0);
     CHECK(mean_abs_diff(m.y, second.y) > 8.0);
     CHECK(mean_abs_diff(m.y, first.y) < mean_abs_diff(m.y, second.y));
 }
 
 TEST(mosh_open_loop_scar_persists) {
-    // A corruption scar is never repaired by later residuals: the encoder
-    // corrects against its clean reference, not the moshed output.
+    // The encoder corrects against its clean reference, so a scar stays.
     TestFrame f0(0), f1(3);
     MoshParams params;
     params.quality = 90;
@@ -132,11 +125,10 @@ TEST(mosh_open_loop_scar_persists) {
     DecodedFrame a, b, c;
     codec.process(f0.view(), 0, params, {}, a);
     MoshParams wound = params;
-    wound.residual_corrupt = 1.0f;   // this frame's residuals all lost
-    codec.process(f1.view(), 1, wound, {}, b);   // holds ~f0 content
-    codec.process(f1.view(), 2, params, {}, c);  // corruption off again
+    wound.residual_corrupt = 1.0f;   // 1.0 drops all residuals of this frame
+    codec.process(f1.view(), 1, wound, {}, b);
+    codec.process(f1.view(), 2, params, {}, c);
     CHECK(mean_abs_diff(b.y, f1.y) > 8.0);
-    // A closed loop would repair c back toward f1; open loop keeps the scar.
     CHECK(mean_abs_diff(c.y, f1.y) > 8.0);
     CHECK(mean_abs_diff(c.y, b.y) < 2.0);
 }
@@ -148,7 +140,7 @@ TEST(mosh_mv_field_advects) {
     params.gop_length = 100;
     params.residual_corrupt = 1.0f;   // isolate the prediction path
 
-    // Constant MV field: +8 px right.
+    // MV units are pixels: this field is +8 px right.
     const uint32_t bw = (kW + 15) / 16;
     const uint32_t bh = (kH + 15) / 16;
     std::vector<float> mx(bw * bh, 8.0f), my(bw * bh, 0.0f);
@@ -159,7 +151,6 @@ TEST(mosh_mv_field_advects) {
     codec.process(frame.view(), 0, params, {}, a);
     codec.process(frame.view(), 1, params, mvs, b);
 
-    // Row content should have shifted right by ~8 px (interior sample).
     int matches = 0, total = 0;
     for (uint32_t r = 8; r < kH - 8; r += 4) {
         for (uint32_t c = 16; c < kW - 16; c += 4) {
@@ -171,7 +162,6 @@ TEST(mosh_mv_field_advects) {
     }
     CHECK(matches > total * 3 / 4);
 
-    // MV scale doubles the shift.
     MoshCodec scaled;
     MoshParams double_mv = params;
     double_mv.mv_scale = 2.0f;
@@ -218,7 +208,6 @@ TEST(mosh_bitrate_starvation_caps_quality) {
     MoshCodec codec;
     DecodedFrame out;
     codec.process(frame.view(), 0, params, {}, out);
-    // Starved output is much worse than unconstrained q95.
     MoshCodec free_codec;
     MoshParams free_params = params;
     free_params.bitrate_budget = 0;
@@ -243,8 +232,7 @@ TEST(mosh_deterministic) {
         DecodedFrame out;
         codec.process(f0.view(), 0, params, {}, out);
         codec.process(f1.view(), 1, params, {}, out);
-        // Capture the P frame — that's where the seeded ops live (an I
-        // frame is seed-independent by design).
+        // Capture the P frame: an I frame does not use the seed.
         out_y = out.y;
         codec.process(f2.view(), 2, params, {}, out);
     };
@@ -253,7 +241,6 @@ TEST(mosh_deterministic) {
     run(b);
     CHECK(a == b);
 
-    // Different seed -> different bytes.
     params.seed = 78;
     std::vector<uint8_t> c;
     run(c);

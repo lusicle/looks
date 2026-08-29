@@ -8,7 +8,7 @@
 #include <cstring>
 #include <vector>
 
-#include "codec/core.h"   // parallel_blocks for the staging conversions
+#include "codec/core.h"
 #include "doc/effects.h"
 #include "gfx/error_diffusion.h"
 #include "gfx/graph.h"
@@ -24,9 +24,7 @@ namespace looks::gfx {
 
 namespace {
 
-// xorshift32 walk for procedural atlas/plate content: stable per seed
-// and deliberately decoupled from the effect-hash family, so a change
-// to the project hash never redraws these baked assets.
+// Keep this decoupled from the effect hash so baked assets stay stable.
 struct XorShift32 {
     uint32_t s;
     uint32_t next() {
@@ -37,7 +35,6 @@ struct XorShift32 {
     }
 };
 
-// Hash-shuffle the first n entries of order (Fisher-Yates).
 void seeded_shuffle(uint8_t* order, int n, uint32_t seed) {
     XorShift32 rng{seed};
     for (int i = n - 1; i > 0; --i) {
@@ -60,12 +57,8 @@ struct FxShaderDesc {
     uint32_t sampled_inputs;
 };
 
-// Indexed by doc::EffectType. Push layout is shared by every effect kernel:
-// {uint width, uint height, float wet, float opacity, uint seed, uint frame,
-//  float fps, float params[param_count]} — the doc param order matches the
-// shader cbuffer member order by construction. Kernels apply the canonical
-// composition: final = mix(in, blend(in, mix(in, fx(in), wet)), opacity).
-// A null spv marks a multi-pass effect with dedicated pipelines (glow).
+// Indexed by doc::EffectType; this order must match the enum.
+// Push layout: 7-word prelude, then params; a null spv means multi-pass.
 constexpr uint32_t kFxPreludeWords = 7;
 constexpr FxShaderDesc kFxShaders[] = {
     {"fx_rgb_split.comp.spv", 1},
@@ -169,7 +162,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_audio_scope.comp.spv", 2},     // input + waveform strip
     {"fx_engraver.comp.spv", 2},        // input + FM phase integral
     {"fx_blend_node.comp.spv", 2},      // In + B aux input (graph merge)
-    {"fx_matte.comp.spv", 1},           // matte maker
+    {"fx_matte.comp.spv", 1},
     {"fx_levels.comp.spv", 1},
     {"fx_hue_sat.comp.spv", 1},
     {"fx_channel_mix.comp.spv", 1},
@@ -183,16 +176,14 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_white_balance.comp.spv", 1},
     {"fx_sharpen.comp.spv", 1},
     {"fx_corner_pin.comp.spv", 1},
-    // Audio modifiers: no kernel - the compiler routes the image graph
-    // around them (is_audio_effect), so they never dispatch.
+    // Audio modifiers have no kernel; the compiler routes around them.
     {nullptr, 0},
     {nullptr, 0},
     {nullptr, 0},
     {nullptr, 0},
     {nullptr, 0},
     {nullptr, 0},
-    // Offset: a time shim - the compiler replaces it with a shifted
-    // source read (or routes through it); it never dispatches.
+    // Offset is a time shim; it never dispatches.
     {nullptr, 0},
     {"fx_track_pin.comp.spv", 2},       // input + pinned B
     {"fx_vhs.comp.spv", 1},
@@ -200,8 +191,6 @@ constexpr FxShaderDesc kFxShaders[] = {
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
 
-// Maps a Codec-Box effect's params onto the mosh codec (same
-// box, different params = the four named effects).
 codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
     codec::MoshParams mp;
     mp.seed = seed;
@@ -236,11 +225,8 @@ codec::MoshParams mosh_params(const doc::EffectInstance& fx, uint64_t seed) {
     return mp;
 }
 
-// Signature of everything a GATED stateful pass reads from its instance.
-// Gates that only withhold state ADVANCEMENT (feedback, RD, sweep fronts)
-// need no signature - their composite re-reads params every render. Gates
-// that withhold the effect's whole parameter response (the mosh boxes,
-// the dither walk) re-arm on a paused edit through this.
+// Only gates that withhold the whole parameter response need a signature.
+// Gates that withhold state advancement re-read params every render.
 uint64_t stateful_param_sig(const doc::EffectInstance& fx, uint64_t seed) {
     return hash_combine(
         seed, fnv1a(fx.params.data(), fx.params.size() * sizeof(float)));
@@ -278,8 +264,7 @@ Engine::~Engine() {
 
 bool Engine::ensure_cache_io(CacheIo& io, size_t bytes) {
     if (io.capacity >= bytes) return true;
-    // The caller has waited this slot's fence, so its previous submission
-    // no longer touches the old buffer.
+    // The caller waited this slot's fence, so the old buffer is free.
     if (io.buf) vmaDestroyBuffer(device_.allocator(), io.buf, io.alloc);
     io.buf = VK_NULL_HANDLE;
     io.alloc = nullptr;
@@ -367,15 +352,9 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         desc.spv_name = kFxShaders[i].spv_name;
         desc.sampled_inputs = kFxShaders[i].sampled_inputs;
         desc.storage_outputs = 1;
-        // Slit-scan, time-displace and security-mux append one extra push
-        // word (the history-pass index), velocity-scan one (front-state
-        // width); glyph appends four (atlas grid cols/rows + tile px +
-        // color flag, custom glyph sets); text appends four
-        // (glyph count + MSDF px range + string width + atlas em px);
-        // motion-extract appends four (the reference source's fit rect -
-        // its luma planes are native while the frame is the canvas).
+        // Extra push words: 1 = history-pass index or front-state width,
+        // 4 = glyph/text/motion-extract tail, 9 = Track Pin homography.
         const auto type_i = static_cast<doc::EffectType>(i);
-        // Track Pin appends nine (the composed 3x3 homography).
         const uint32_t extra =
             (type_i == doc::EffectType::SlitScan ||
              type_i == doc::EffectType::TimeDisplace ||
@@ -396,46 +375,30 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     flow_ = mk("flow.comp.spv", 2, 1, 7 * sizeof(uint32_t));
     if (!flow_) return false;
 
-    // Velocity-scan front stepper (dwell-time rendering): advances the
-    // per-line sweep fronts against the current frame's luma. Inputs:
-    // front state + video frame.
+    // Inputs: front state, then the video frame.
     vs_front_ = mk("vs_front.comp.spv", 2, 1, 12 * sizeof(uint32_t));
     if (!vs_front_) return false;
 
-    // Modulation phase integrator: one thread per lane, marching across
-    // the frame accumulating the FM phase (numthreads(8,1,1) — dispatch
-    // as (lanes, 1)).
+    // numthreads is (8,1,1); dispatch this as (lanes, 1).
     mod_integrate_ = mk("mod_integrate.comp.spv", 1, 1, 7 * sizeof(uint32_t));
     if (!mod_integrate_) return false;
 
-    // Node-canvas thumbnail tap: one small
-    // downsample dispatch per evaluated graph node into a fixed atlas.
     thumb_tap_ = mk("thumb_tap.comp.spv", 1, 1, 2 * sizeof(uint32_t));
     if (!thumb_tap_) return false;
 
-    // Library gallery tap: aspect-FIT variant with caller-assigned
-    // cells (the worker owns the atlas's lifecycle, unlike node thumbs).
     gallery_tap_ = mk("gallery_tap.comp.spv", 1, 1, 4 * sizeof(uint32_t));
     if (!gallery_tap_) return false;
 
     rd_step_ = mk("rd_step.comp.spv", 2, 1, 5 * sizeof(uint32_t));
     if (!rd_step_) return false;
 
-    // Codec-Box roundtrip: NV12 conversion (shared with export) + generic
-    // wet/opacity composite for the CPU-processed result.
     to_nv12_ = mk("export_nv12.comp.spv", 1, 2, 2 * sizeof(uint32_t));
     fx_mix_ = mk("fx_mix.comp.spv", 2, 1, 4 * sizeof(uint32_t));
     if (!to_nv12_ || !fx_mix_) return false;
-    // Group composite: the standard two-lerp tail over {dry, face},
-    // full RGBA (a group's interior may carve alpha; wet 1 must return
-    // the face exactly).
+    // Full RGBA: wet 1 must return the face exactly.
     group_mix_ = mk("group_mix.comp.spv", 2, 1, 4 * sizeof(uint32_t));
     if (!group_mix_) return false;
 
-    // GPU mosh: the codec box stays on the GPU whenever no bitstream is
-    // rate-limited or corrupted (entropy is lossless, so the wire is just
-    // predict + DCT + quant + dequant + IDCT — all data-parallel integer
-    // math). The CPU box remains the byte-flips / bitrate path.
     mosh_predict_ = mk("mosh_predict.comp.spv", 1, 6, 16 * sizeof(uint32_t));
     mosh_wire_ = mk("mosh_wire.comp.spv", 2, 6, 12 * sizeof(uint32_t));
     mosh_rate_probe_ =
@@ -454,9 +417,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                                    1, 1, VK_IMAGE_USAGE_SAMPLED_BIT);
     if (!dummy_flow_) return false;
 
-    // Compositing: layer generators + blend. The generator's one sampled
-    // input is the custom-shape SDF (dummy-bound for every other
-    // generator kind).
+    // The generator's one sampled input is the custom-shape SDF.
     generator_ = mk("gen.comp.spv", 1, 1, 15 * sizeof(uint32_t));
     layer_blend_ = mk("layer_blend.comp.spv", 2, 1, 11 * sizeof(uint32_t));
     layer_transform_ =
@@ -480,8 +441,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                            &codec_io_.fence),
              "vkCreateFence(codecbox)");
 
-    // Procedural glyph atlases share one scaffold: 96 8x8 tiles on a
-    // 16-column R8 grid, one-shot upload.
+    // Atlas layout: 96 tiles of 8x8 on a 16-column R8 grid.
     constexpr uint32_t kAtlasW = 128, kAtlasH = 48;
     const auto build_atlas = [&](int atlas_slot, auto&& fill_tile) -> bool {
         std::vector<uint8_t> pix(kAtlasW * kAtlasH, 0);
@@ -498,8 +458,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                               kAtlasW, kAtlasH);
     };
 
-    // Procedural halftone atlas (dots are glyphs): 96 tiles of
-    // 8x8, dot area grows with the tile index.
+    // Dot area grows with the tile index.
     if (!build_atlas(0, [](std::vector<uint8_t>& pix, uint32_t tile,
                            uint32_t tx, uint32_t ty) {
             const float coverage = static_cast<float>(tile) / 95.0f;
@@ -518,22 +477,17 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         }))
         return false;
 
-    // Procedural braille atlas: 2x4 dot cells on the same
-    // 96-tile grid, lit-dot count rising with the tile index; which dots
-    // light is a stable per-tile hash so the ramp reads organically.
+    // Lit-dot count rises with the tile index; the dot pick is hashed.
     if (!build_atlas(3, [](std::vector<uint8_t>& pix, uint32_t tile,
                            uint32_t tx, uint32_t ty) {
             const uint32_t lit =
                 (tile * 8 + 47) / 95;   // 0..8 dots, rounded ramp
-            // Stable dot pick: knuth-hash the tile, take `lit` of the 8
-            // dot slots in a hash-shuffled order.
             uint8_t order[8] = {0, 1, 2, 3, 4, 5, 6, 7};
             seeded_shuffle(order, 8, tile * 2654435761u + 0x9E3779B9u);
             for (uint32_t d = 0; d < lit && d < 8; ++d) {
                 const uint32_t slot = order[d];
                 const uint32_t dx = tx + 2 + (slot & 1u) * 3;   // cols 2/5
                 const uint32_t dy = ty + (slot >> 1) * 2;       // rows 0/2/4/6
-                // 2x2 dot with a soft corner.
                 pix[dy * kAtlasW + dx] = 255;
                 pix[dy * kAtlasW + dx + 1] = 255;
                 pix[(dy + 1) * kAtlasW + dx] = 255;
@@ -542,16 +496,13 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         }))
         return false;
 
-    // Procedural teletext atlas: 2x3 block-mosaic sextant
-    // cells — filled rectangles, not dots — lit-block count rising with
-    // the tile index, hash-shuffled per tile like the braille ramp.
+    // Lit-block count rises with the tile index; the pick is hashed.
     if (!build_atlas(4, [](std::vector<uint8_t>& pix, uint32_t tile,
                            uint32_t tx, uint32_t ty) {
             const uint32_t lit = (tile * 6 + 47) / 95;   // 0..6 blocks
             uint8_t order[6] = {0, 1, 2, 3, 4, 5};
             seeded_shuffle(order, 6, tile * 2246822519u + 0x9E3779B9u);
-            // Sextant grid inside the 8x8 tile: cols [0,4)/[4,8),
-            // rows [0,3)/[3,6)/[6,8) — full-bleed mosaic blocks.
+            // Sextant grid: cols [0,4)/[4,8), rows [0,3)/[3,6)/[6,8).
             for (uint32_t b = 0; b < lit && b < 6; ++b) {
                 const uint32_t slot = order[b];
                 const uint32_t bx = (slot & 1u) * 4;
@@ -565,10 +516,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         }))
         return false;
 
-    // Dust/damage plate (texture-driven dust):
-    // a user-droppable assets/textures/dust.png (dark marks = damage);
-    // missing file synthesizes a procedural grunge plate so the binding
-    // always exists.
+    // In the dust plate, dark marks are the damage.
     {
         constexpr uint32_t kDustW = 256, kDustH = 256;
         std::vector<uint8_t> plate;
@@ -585,8 +533,6 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                 plate[i] = color::luma709_u8(p[0], p[1], p[2]);
             }
         } else {
-            // Grunge fallback: mostly-white plate with hashed blotch
-            // clusters and a few long fibers.
             plate.assign(static_cast<size_t>(kDustW) * kDustH, 255);
             XorShift32 rng{0x9E3779B9u};
             auto next = [&rng] { return rng.next(); };
@@ -630,9 +576,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Dither LUT: STBN + blue noise generated by the build-time
-    // tool, staged under assets/noise next to the exe. Missing file falls
-    // back to deterministic hash noise so headless runs never hard-fail.
+    // A missing LUT falls back to deterministic hash noise.
     {
         constexpr uint32_t kLutW = 512, kLutH = 192;
         std::vector<uint8_t> lut(static_cast<size_t>(kLutW) * kLutH);
@@ -661,12 +605,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
             return false;
     }
 
-    // Text-overlay fonts: every .ttf under
-    // assets/fonts, parsed by the in-repo TrueType loader — drop a font
-    // next to the shipped ones and it's index N, no bake step. Sorted by
-    // lowercased filename so the `font` param stays deterministic;
-    // unparseable files (CFF-flavored renames) are skipped. An empty
-    // list just leaves the effect dormant.
+    // Sorted by lowercased filename so the font param index is stable.
     {
         const std::filesystem::path fonts_dir =
             shader_dir.parent_path() / "assets" / "fonts";
@@ -700,8 +639,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         }
     }
 
-    // Glow's four passes share the standard push layout (5 params — the
-    // composite pass reads the ccd-smear knob).
+    // Glow's four passes share the standard push layout with 5 params.
     {
         const uint32_t glow_push =
             (kFxPreludeWords + 5) * static_cast<uint32_t>(sizeof(uint32_t));
@@ -730,8 +668,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
 bool Engine::ensure_prev_ref(uint32_t width, uint32_t height) {
     if (prev_y_ && prev_y_->width() == width && prev_y_->height() == height)
         return true;
-    // The reference source changed format: the old copy may still be in
-    // flight — rare enough that a full sync is the simple correct answer.
+    // The old copy can still be in flight, so do a full sync here.
     device_.wait_idle();
     prev_y_ = GpuImage::create(device_, VK_FORMAT_R8_UNORM, width, height,
                                VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -741,8 +678,7 @@ bool Engine::ensure_prev_ref(uint32_t width, uint32_t height) {
 
 uint64_t Engine::pin_plane_key(uint64_t asset, float rx, float ry, float rw,
                                float rh) {
-    // Millifraction quantization matches ensure_plane's match epsilon,
-    // so slider noise folds onto one plane.
+    // The quantization must match ensure_plane's match epsilon.
     auto q = [](float v) {
         return static_cast<uint64_t>(
             static_cast<int64_t>(std::lround(v * 1000.0f)) + 100000);
@@ -812,8 +748,7 @@ void Engine::set_scope_audio(std::vector<int16_t> mono,
 
 void Engine::codec_planes_to_rgb(VkCommandBuffer rec, uint32_t frame_index,
                                  GpuImage* temp, uint32_t w, uint32_t h) {
-    // The nv12 word must be pushed explicitly (up_u/up_v are separate
-    // planes): a short push would inherit the previous dispatch's value.
+    // Push the nv12 word: a short push inherits the last dispatch value.
     struct {
         uint32_t w, h;
         float rx, ry, iw, ih;
@@ -872,11 +807,8 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
         g.has_state = false;
         g.last_frame = 0xFFFFFFFFu;
     }
-    // Stateful advance happens once per timeline frame; paused re-renders
-    // reuse the resident state (same contract as the CPU box's cache).
-    // A paused PARAM EDIT re-arms as a discontinuity - state drops and the
-    // frame rebuilds as a fresh I, so the edit shows without moving the
-    // playhead. Advancing frames keep their chain (params apply forward).
+    // State advances once per timeline frame; paused re-renders reuse it.
+    // A paused param edit re-arms as a discontinuity.
     const uint64_t sig = stateful_param_sig(fx, mp.seed);
     if (g.has_state && g.last_frame == timeline_frame && g.sig != sig)
         g.has_state = false;
@@ -900,12 +832,10 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     transition3(g.pred_clean);
     transition3(g.pred_moshed);
     transition3(g.pred_tmp);
-    // Also orders this frame's reads against the previous submission's
-    // state writes (GENERAL-to-GENERAL transitions above are no-ops).
+    // This orders reads against the previous submission's state writes.
     barrier();
 
     if (advance) {
-        // NV12 conversion: the wire's source.
         codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
         codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
         {
@@ -971,11 +901,7 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
                                  linear_sampler_);
         };
 
-        // Rate control (Bitrate Starve): probe the exact per-rung stream
-        // sizes on the GPU (per-block AC bits + pairwise DC deltas — the
-        // DC "chain" is a sum of neighbor terms, so it reduces), pick the
-        // ladder rung in a one-thread kernel, and let the wire read the
-        // choice from qsel. Rate control never touches the CPU.
+        // The wire reads the picked rung from qsel; rate control stays on GPU.
         const bool rate_on = mp.bitrate_budget > 0;
         uint32_t rungs[8] = {};
         uint32_t nrungs = 0;
@@ -1049,8 +975,6 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
         };
 
         if (!g.has_state || gop_i) {
-            // I frame into the clean chain (+ generation-loss recycles),
-            // then the moshed chain accepts it unless dropping.
             if (rate_on) run_rate(0, 1);
             for (int p = 0; p < 3; ++p)
                 wire(planes[p], 0, static_cast<uint32_t>(quality), 0, 0,
@@ -1067,7 +991,6 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
                          g.clean[p].get());
             }
             if (!g.has_state || !mp.drop_iframes) {
-                // Accept: the moshed chain takes the clean picture.
                 VkMemoryBarrier to_xfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 to_xfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                 to_xfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1149,7 +1072,6 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
         g.sig = sig;
     }
 
-    // Moshed planes -> unorm upload images -> shared RGB + composite tail.
     barrier();
     codec_io_.up_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
     codec_io_.up_u->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
@@ -1179,8 +1101,7 @@ bool Engine::composite_ed(VkCommandBuffer rec, const doc::EffectInstance& fx,
                           const GpuImage* in_img, const EdState& ed,
                           uint32_t w, uint32_t h, uint32_t frame_index,
                           GpuImage* dst) {
-    // Packed picks (3x5 bits per pixel, 4x smaller than colors) up to the
-    // GPU, palette expand, wet/opacity composite.
+    // The picks upload packed as 3x5 bits per pixel.
     const size_t px_count = static_cast<size_t>(w) * h;
     if (!codec_io_.staging->upload_image(rec, ed.out.data(), px_count * 4, w,
                                          *codec_io_.up_idx))
@@ -1232,9 +1153,7 @@ bool Engine::ensure_codec_io(uint32_t width, uint32_t height) {
     codec_io_.up_idx = GpuImage::create(
         device_, VK_FORMAT_R32_UINT, width, height,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    // Rate control scratch: 8 rung columns of per-block DCs (sized for the
-    // luma grid, chroma reuses the left portion), the per-rung bit totals
-    // (cleared per probe), and the picked quality.
+    // Rate scratch: 8 rung columns of per-block DCs on the luma grid.
     const uint32_t bw_luma = (width + 7) / 8;
     const uint32_t bh_luma = (height + 7) / 8;
     codec_io_.rate_dc =
@@ -1310,9 +1229,7 @@ void Engine::codec_flush_segment() {
              "vkResetFences(codecbox)");
 }
 
-// Node-canvas thumbnail tap: downsample `src` into
-// the next free atlas cell, keyed for the UI's cell map. Silently drops
-// taps past the fixed grid — 64 previews bound the cost.
+// Taps past the fixed grid drop silently.
 void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                               GpuImage* src, uint64_t key) {
     if (!thumb_tap_ || !thumb_atlas_ || !src) return;
@@ -1329,10 +1246,6 @@ void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                          linear_sampler_);
 }
 
-// Library gallery tap: downsample a rendered thumbnail into the CALLER's
-// atlas cell, aspect-fit. Cells persist across renders - the worker
-// assigns and evicts them - so unlike the node thumb atlas nothing here
-// resets per frame.
 void Engine::record_gallery_tap(VkCommandBuffer rec, uint32_t frame_index,
                                 GpuImage* src, uint32_t cell) {
     if (!gallery_tap_ || !src) return;
@@ -1359,19 +1272,15 @@ void Engine::record_gallery_tap(VkCommandBuffer rec, uint32_t frame_index,
 bool Engine::measure_recorded() const { return bounds_recorded_; }
 
 bool Engine::read_measure_bounds(float rect[4]) const {
-    // No bounds_recorded_ gate: a pipelined caller reads at the fence of
-    // the submission that recorded the tap, by which time a NEWER render
-    // has already reset the flag. The caller's measure_recorded()
-    // snapshot is the per-submission truth; the untouched-clear sentinel
-    // below still rejects garbage.
+    // No bounds_recorded_ gate here: the caller's snapshot owns that check.
+    // The untouched-clear sentinel below still rejects garbage.
     if (!bounds_mapped_ || !bounds_w_ || !bounds_h_)
         return false;
     vmaInvalidateAllocation(device_.allocator(), bounds_alloc_, 0,
                             VK_WHOLE_SIZE);
     uint32_t v[4];
     std::memcpy(v, bounds_mapped_, sizeof(v));
-    // Max cells store the complement (one atomic min serves all four);
-    // an untouched clear means fully transparent content.
+    // The max cells hold the complement, so one atomic min serves all four.
     if (v[0] == 0xFFFFFFFFu || v[2] == 0xFFFFFFFFu) return false;
     const uint32_t max_x = 0xFFFFFFFFu - v[2];
     const uint32_t max_y = 0xFFFFFFFFu - v[3];
@@ -1396,7 +1305,6 @@ Engine::FeedbackSlot* Engine::ensure_feedback_prev(VkCommandBuffer rec,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         slot.last_frame = 0xFFFFFFFFu;
         if (!slot.prev) return nullptr;
-        // First use: clear to black.
         slot.prev->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue black{};
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -1408,8 +1316,7 @@ Engine::FeedbackSlot* Engine::ensure_feedback_prev(VkCommandBuffer rec,
     return &slot;
 }
 
-// Feed the loop: copy this output into the persistent target — once per
-// timeline frame (paused = stable). dst leaves back in GENERAL.
+// Copies once per timeline frame; dst leaves in GENERAL.
 void Engine::feedback_writeback(VkCommandBuffer rec, FeedbackSlot& slot,
                                 GpuImage* dst, uint32_t w, uint32_t h,
                                 uint32_t timeline_frame) {
@@ -1440,7 +1347,6 @@ Engine::SlitSlot& Engine::slit_ring_slot(uint64_t skey, uint32_t w,
     return slot;
 }
 
-// Push the current input once per timeline frame.
 bool Engine::slit_ring_push(VkCommandBuffer rec, SlitSlot& slot,
                             GpuImage* in_img, uint32_t w, uint32_t h,
                             uint32_t timeline_frame) {
@@ -1507,7 +1413,6 @@ GpuImage* Engine::rd_advance(VkCommandBuffer rec, uint32_t frame_index,
         }
         slot.cur = 0;
     }
-    // Advance the sim once per timeline frame.
     if (slot.last_frame != timeline_frame) {
         const uint32_t rd_push[5] = {w, h, as_bits(feed), as_bits(kill),
                                      as_bits(inject)};
@@ -1541,11 +1446,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          uint64_t preview_node, uint64_t preview_layer,
                          uint64_t measure_placement, bool cache_store) {
     bounds_recorded_ = false;
-    // The entity being rendered (a sequence or a scoped look) and the
-    // frame it plays at. Nodes belonging to NESTED instances read their
-    // own look and their own local frame instead (both are shadowed
-    // inside the dispatch loop) — only the root's clock drives caching
-    // and prev-frame tracking.
+    // Only the root instance's clock drives caching and prev-frame tracking.
     if (out_source) *out_source = nullptr;
     if (canvas_w == 0 || canvas_h == 0) return nullptr;
 
@@ -1555,16 +1456,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     StagingBuffer& staging = *staging_[frame_index % kFramesInFlight];
     staging.reset();
 
-    // The CANVAS is the project's, never the media's: a cut between two
-    // source sizes must not resize the graph.
-    // Working dimensions shrink under the preview proxy — kernels sample
-    // by uv, so everything scales; even dims keep the codec paths happy.
+    // The canvas is the project's, so a cut must not resize the graph.
+    // The proxy shrinks the working size; even dims keep the codec paths safe.
     const uint32_t w = even_down(canvas_w, preview_divisor_);
     const uint32_t h = even_down(canvas_h, preview_divisor_);
 
-    // ---- frame render cache. First harvest the readback this
-    // slot recorded kFramesInFlight renders ago — the caller has waited the
-    // slot's fence, so the copy is complete and the buffer is ours again.
+    // Harvest the readback this slot recorded kFramesInFlight renders ago.
+    // The caller waited the slot's fence, so the copy is complete.
     CacheIo& cio = cache_io_[frame_index % kFramesInFlight];
     if (cio.pending) {
         cio.pending = false;
@@ -1584,9 +1482,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     if (measure_placement == 0) measured_placement_ = 0;
     if (cache_ctx != 0) {
         cache_.set_context(cache_ctx);
-        // A newly-selected block needs ONE evaluated graph to measure
-        // its bounds; after that, cached frames serve as usual and the
-        // last measured box stands (edits miss the cache anyway).
+        // A newly-selected block needs one evaluated graph to measure.
         const bool need_measure =
             measure_placement && measure_placement != measured_placement_;
         const RenderCache::Frame* hit =
@@ -1609,9 +1505,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                        1, &copy);
                 dst->transition(cmd,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                // The GPU planes no longer track the playhead; force a
-                // prev-luma re-sync (one frame of zero flow, same as a
-                // seek) on the next miss.
+                // The GPU planes no longer track the playhead, so re-sync.
                 have_last_frame_ = false;
                 return dst;
             }
@@ -1626,10 +1520,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         log_error("engine: render graph invalid (cycle?)");
         return nullptr;
     }
-    // A node's subject lives in ITS instance's look. Resolved once per
-    // instance: doc.look() linear-scans the look list and the dispatch
-    // below asks per node per frame (same fallback as Document::look -
-    // a sequence instance resolves to the first look).
+    // A node's subject lives in its own instance's look.
+    // A sequence instance resolves to the first look, like Document::look.
     std::vector<const doc::Look*> inst_look(graph.instances.size());
     for (size_t i = 0; i < graph.instances.size(); ++i)
         inst_look[i] = &doc.look(graph.instances[i].look);
@@ -1637,9 +1529,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         return *inst_look[static_cast<size_t>(n.instance)];
     };
 
-    // Codec-Box nodes need the frame on the CPU mid-graph: evaluate in
-    // fenced segments on an internal command buffer instead of `cmd`
-    // (correctness-first; the roundtrip stalls preview, accepts).
+    // Codec-Box nodes evaluate in fenced segments on an internal buffer.
     bool segmented = false;
     for (const GraphNode& n : graph.nodes) {
         if (n.kind != GraphNode::Kind::Effect) continue;
@@ -1657,31 +1547,24 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         return nullptr;
     }
     VkCommandBuffer rec = segmented ? codec_begin_segment() : cmd;
-    // One staging reset per render: every prior render's segments were
-    // fence-waited at its end, so retired buffers and offsets are safe to
-    // recycle here (mid-frame resets would clobber same-segment uploads).
+    // Reset staging once per render only; a mid-frame reset clobbers
+    // uploads that the same segment still needs.
     if (segmented) codec_io_.staging->reset();
 
-    // The REFERENCE SOURCE: the first media source playing in the root
-    // instance. A multi-source entity has no single "the source", so the
-    // graph names one — the shared motion field and prev-luma are
-    // measured on it (the A/B wipe compares against `before` instead).
+    // The reference source anchors the motion field and the prev luma.
     const uint64_t ref_key =
         graph.source >= 0
             ? graph.nodes[static_cast<size_t>(graph.source)].key
             : 0;
 
-    // Preserve the reference luma for flow/motion BEFORE the new upload
-    // overwrites its planes. Only when the timeline advanced (a paused
-    // re-render keeps the prior prev frame) and the reference is still the
-    // same source — a cut has no motion across it, by construction.
+    // Copy the reference luma before the new upload overwrites its planes.
+    // Copy only when the timeline advanced and the source is unchanged.
     const auto ref_it = ref_key ? layer_planes_.find(ref_key)
                                 : layer_planes_.end();
     const LayerPlanes* ref_last =
         ref_it != layer_planes_.end() ? &ref_it->second : nullptr;
-    // A reference that changes size this render has its planes recreated
-    // below, so the copy would read a freed image — and there is no motion
-    // between two different formats anyway.
+    // A reference that changes size gets new planes below, so the copy
+    // would read a freed image.
     if (ref_last) {
         for (size_t i = 0; i < layer_source_count; ++i)
             if (layer_sources[i].key == ref_key &&
@@ -1725,8 +1608,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             const uint32_t lcw = (lf.planes.width + 1) / 2;
             const uint32_t lch = (lf.planes.height + 1) / 2;
-            // Y also feeds the prev-luma copy when this source is the
-            // graph's reference.
+            // Y also feeds the prev-luma copy, so it needs TRANSFER_SRC.
             lp.y = GpuImage::create(device_, VK_FORMAT_R8_UNORM,
                                     lf.planes.width, lf.planes.height,
                                     lu | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -1747,11 +1629,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             lp.nv12 = lf.planes.nv12;
             lp.stamp = 0;
         }
-        // A key re-presenting the stamp it already uploaded holds the
-        // same pixels on the GPU - stills, slowed placements and paused
-        // re-renders would otherwise re-copy megabytes of identical
-        // planes every render. Layouts still normalize: the prev-luma
-        // copy above may have left Y in TRANSFER_SRC.
+        // A repeated stamp holds the same pixels, so skip the upload.
+        // Layouts still normalize: the copy above can leave Y in TRANSFER_SRC.
         if (lp.stamp != 0 && lp.stamp == lf.content_stamp) {
             lp.y->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             lp.u->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1766,8 +1645,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                   lf.planes.y_stride, *lp.y))
             return nullptr;
         if (lp.nv12) {
-            // Interleaved CbCr rows into the RG8 texture; bufferRowLength
-            // is texels, two bytes each.
+            // bufferRowLength is in texels, and each is two bytes.
             if (!staging.upload_image(rec, lf.planes.u,
                                       lf.planes.u_stride * lch,
                                       lf.planes.u_stride / 2, *lp.u))
@@ -1787,10 +1665,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             lp.v->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
-    // The motion pair the shared Flow field and MotionExtract read. With
-    // no media source in the look there is nothing moving to measure: a
-    // cleared 1x1 plane reads as flat black, so motion comes out zero
-    // instead of undefined.
+    // With no media source, a cleared 1x1 plane makes the motion zero.
     GpuImage* ref_plane = nullptr;
     if (ref_key) {
         if (auto it = layer_planes_.find(ref_key);
@@ -1815,16 +1690,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         prev_frame_valid_ = false;
     }
     ref_plane->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // Seek gap / first frame / cut: neutral prev = current (zero motion).
+    // On a seek, first frame or cut, prev = current, so motion is zero.
     GpuImage* prev_plane = prev_frame_valid_ ? prev_y_.get() : ref_plane;
 
-    // Audio Scope strips: one 1-D min/max waveform texture per active
-    // instance, sliced from the mono PCM copy for the trailing window
-    // ending at this timeline frame (deterministic on frame index).
     {
-        // The strip is a function of the effect's params and the ROOT
-        // frame only, so every instance of one effect shares it: upload
-        // once per id, not once per instance.
+        // The strip depends on the params and the root frame only, so
+        // every instance of one effect shares it. Upload once per id.
         std::vector<uint64_t> uploaded;
         auto upload_strip = [&](const doc::EffectInstance& fx) -> bool {
             if (fx.type != doc::EffectType::AudioScope || fx.bypass)
@@ -1879,18 +1750,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             tex->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             return true;
         };
-        // Every instance that actually renders, so a scope in a nested
-        // look still gets its waveform.
         for (size_t ii = 0; ii < graph.instances.size(); ++ii)
         for (const doc::Layer& layer : inst_look[ii]->layers)
             for (const doc::EffectInstance& fx : layer.stack)
                 if (!upload_strip(fx)) return nullptr;
     }
 
-    // Thumbnail atlas + cell map: reset only when the graph actually
-    // evaluates. A render-cache hit above keeps the previous taps — the
-    // app only serves hits while a SEQUENCE renders, where no canvas
-    // reads them.
+    // The cell map resets only when the graph evaluates; a hit keeps it.
     if (thumb_tap_ && !thumb_atlas_)
         thumb_atlas_ = GpuImage::create(
             device_, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1906,28 +1772,19 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     for (const GraphNode& node : graph.nodes)
         for (int input : node.inputs)
             remaining_uses[static_cast<size_t>(input)]++;
-    // The viewport blit is the published node's final consumer — the
-    // preview tap when set, the output otherwise; the output survives
-    // regardless (the Output card thumb reads it at the end).
+    // These extra uses keep the published images alive to the tail.
     remaining_uses[static_cast<size_t>(graph.output)]++;
     if (graph.preview >= 0)
         remaining_uses[static_cast<size_t>(graph.preview)]++;
-    // A/B wipe: keep the effect-stripped BEFORE composite alive to the
-    // end (composition attributes intact - only effects differ).
     if (out_source && graph.before >= 0)
         remaining_uses[static_cast<size_t>(graph.before)]++;
-    // The measure tap survives to the tail's alpha-bounds reduction.
     if (graph.measure >= 0)
         remaining_uses[static_cast<size_t>(graph.measure)]++;
 
     for (int index : graph.order) {
         const GraphNode& node = graph.nodes[static_cast<size_t>(index)];
-        // Per-instance view: `look` is the look this node
-        // came from and `timeline_frame` its LOCAL clock, both shadowing
-        // the root's. Everything below addresses its own placement, so a
-        // look nested twice runs twice on two different frames. `skey`
-        // is the instance-scoped state key — history slots and private
-        // source planes hang off it, never off the bare effect id.
+        // look and timeline_frame below are per instance and shadow the root.
+        // skey is the instance-scoped state key, never the bare effect id.
         const LookInstance& linst =
             graph.instances[static_cast<size_t>(node.instance)];
         const doc::Look& look = *inst_look[static_cast<size_t>(node.instance)];
@@ -1950,10 +1807,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
         switch (node.kind) {
             case GraphNode::Kind::Source: {
-                // The decode pool feeds every media source under this
-                // node's key. A key with no frame (decode failed, or an
-                // unbound asset) reads flat black rather than another
-                // layer's pixels.
+                // A key with no frame reads black, never another layer.
                 auto it = layer_planes_.find(skey);
                 if (it == layer_planes_.end() || !it->second.y) {
                     dst->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1965,14 +1819,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                          &clear, 1, &range);
                     break;
                 }
-                // NV12 media binds the interleaved chroma texture to
-                // both chroma slots; the shader's flag reads Cr from .g.
+                // NV12 binds one chroma texture to both slots; Cr is in .g.
                 const GpuImage* planes[3] = {
                     it->second.y.get(), it->second.u.get(),
                     it->second.v ? it->second.v.get()
                                  : it->second.u.get()};
-                // Aspect-preserving fit: the media lands centered at its
-                // own shape, transparent outside - never stretched.
+                // The media fits centered and aspect-preserved.
                 float fit[4];
                 source_fit_rect(it->second.y->width(),
                                 it->second.y->height(), w, h, fit);
@@ -1990,8 +1842,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::LayerTransform: {
-                // Look layers only - sequence Motion composites through
-                // the lane blend, never through a transform pass.
+                // Look layers only; sequence Motion runs in the lane blend.
                 const doc::Layer& layer =
                     look.layers[static_cast<size_t>(node.layer_index)];
                 uint32_t push[11] = {};
@@ -2017,8 +1868,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 uint32_t push[15] = {};
                 push[0] = w;
                 push[1] = h;
-                // The dummy is created UNDEFINED and never written; the
-                // first bind must still hand the sampler a legal layout.
+                // The dummy starts UNDEFINED, so give the sampler a layout.
                 dummy_flow_->transition(
                     rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 const GpuImage* sdf_tex = dummy_flow_.get();
@@ -2039,9 +1889,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[14] = as_bits(layer.gen_phase);
                     if (layer.source == doc::LayerSourceKind::Shape &&
                         layer.osc_shape == 3u && !layer.path.empty()) {
-                        // Custom path: CPU SDF raster at half target
-                        // res, re-run only when the path bytes or the
-                        // raster size change (gfx/shape_sdf).
+                        // The raster re-runs only on a path or size change.
                         const uint32_t rw =
                             std::clamp(w / 2u, 64u, 1920u);
                         const uint32_t rh =
@@ -2094,8 +1942,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         sdf_tex = slot.tex.get();
                     }
                 } else {
-                    // Unwired Output: a solid with zeroed colors —
-                    // an empty composite renders black, never the source.
+                    // An unwired Output renders black, never the source.
                     push[2] = static_cast<uint32_t>(
                         doc::LayerSourceKind::Solid);
                     push[4] = timeline_frame;
@@ -2108,13 +1955,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::LayerBlend: {
-                // layer_index -1 is a SEQUENCE lane stack: plain
-                // alpha-over at the PLACEMENT's opacity, sampling the
-                // lane through its canvas affine IN the composite -
-                // Motion is an attribute of the arrangement, never an
-                // effect pass, and the timeline owns no blend modes.
-                // Otherwise the owning look layer's mode applies;
-                // premultiplied alpha is the gate either way.
+                // layer_index -1 is a sequence lane: plain alpha-over only.
+                // A look layer uses its own mode; alpha stays premultiplied.
                 doc::BlendMode mode = doc::BlendMode::Normal;
                 float opacity = node.p_opacity;
                 bool moved = false;
@@ -2159,9 +2001,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             ? input_image(1)
                             : nullptr;
 
-                    // GPU box whenever no real bitstream is needed: the
-                    // wire is pure data-parallel integer math then, and
-                    // the roundtrip (readback, fence, upload) vanishes.
                     const uint64_t gpu_seed = hash_combine(
                         hash_combine(doc.master_seed, fx.id), fx.seed);
                     const codec::MoshParams gp = mosh_params(fx, gpu_seed);
@@ -2173,9 +2012,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         break;
                     }
 
-                    // --- CPU Codec-Box: GPU->CPU->GPU roundtrip (the
-                    // byte-flips / bitrate-budget paths need real bytes).
-                    // 1. NV12 conversion + readback, then flush the segment.
+                    // The byte-flip and bitrate paths need real bytes, so
+                    // they roundtrip through the CPU in three steps.
                     codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                     codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
                     {
@@ -2239,12 +2077,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                          &to_host, 0, nullptr, 0, nullptr);
                     codec_flush_segment();
 
-                    // 2. CPU: mosh with persistent per-instance state. A
-                    // paused re-render reuses the cached output so the
-                    // decoder does not keep stewing (vs export). A paused
-                    // PARAM EDIT re-arms as a discontinuity (codec reset,
-                    // fresh I) - the edit shows without moving the
-                    // playhead; advancing frames keep their chain.
+                    // A paused re-render reuses the cached output.
+                    // A paused param edit resets the codec to a fresh I.
                     MoshSlot& slot = mosh_state_[skey];
                     const uint64_t box_seed = hash_combine(
                         hash_combine(doc.master_seed, fx.id), fx.seed);
@@ -2307,7 +2141,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     }
                     const codec::DecodedFrame& mo = slot.last_out;
 
-                    // 3. Re-upload + back to linear RGB + wet/opacity mix.
                     rec = codec_begin_segment();
                     codec_io_.staging->reset();
                     if (!codec_io_.staging->upload_image(
@@ -2343,17 +2176,15 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     EdSlotAsync& slot = *slot_ptr;
                     const size_t px_count = static_cast<size_t>(w) * h;
 
-                    // 0. Land the deferred walk (kicked last frame — it
-                    // had the whole frame to run off-thread).
+                    // Land the walk kicked last frame before you read it.
                     if (slot.busy) {
                         slot.worker.join();
                         slot.busy = false;
                         slot.has_result = true;
                     }
 
-                    // 1. Composite LAST frame's dither (the one-frame
-                    // delay, same legal latency as Feedback's cycle
-                    // exemption). First frame / size change passes dry.
+                    // This composites the last frame's dither, one frame
+                    // behind; a first frame or a size change passes dry.
                     if (slot.has_result && slot.result_w == w &&
                         slot.result_h == h) {
                         if (!composite_ed(rec, fx, in_img, slot.ed, w, h,
@@ -2369,12 +2200,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                           linear_sampler_);
                     }
 
-                    // 2. Capture THIS frame's input and walk it during the
-                    // rest of the frame; next frame consumes the result.
-                    // Once per timeline frame (paused re-renders reuse) -
-                    // unless the params changed: a paused edit kicks a
-                    // fresh walk (the worker's settle pass lands it), so
-                    // the pattern follows the edit without playhead moves.
+                    // This kicks one walk per timeline frame; the next
+                    // frame consumes it. A param edit kicks a fresh walk.
                     const uint64_t ed_sig = stateful_param_sig(
                         fx, hash_combine(doc.master_seed, fx.seed));
                     if (slot.captured_frame != timeline_frame ||
@@ -2430,13 +2257,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     }
                     break;
                 }
-                // Shared push layout: uint2 size, wet, opacity, seed, frame,
-                // fps, params (seeded counter-based randomness).
+                // Push prelude: size, wet, opacity, seed, frame, fps.
                 const uint64_t seed64 = hash_combine(
                     hash_combine(doc.master_seed, fx.id), fx.seed);
-                // 32 words = the 128-byte push floor: prelude + the
-                // largest param block + the largest extra tail (Track
-                // Pin's 9-float homography) must all fit.
+                // 32 words is the 128-byte push floor; prelude, params and
+                // the largest extra tail must all fit inside it.
                 uint32_t push[32] = {};
                 static_assert(kFxPreludeWords + 16 + 9 <= 32,
                               "push buffer covers params + extras");
@@ -2475,8 +2300,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::MotionExtract) {
-                    // Native luma planes vs canvas frame: the mask
-                    // samples through the reference source's fit rect.
+                    // The luma planes are native, so sample through the fit.
                     float fit[4];
                     source_fit_rect(ref_plane->width(),
                                     ref_plane->height(), w, h, fit);
@@ -2494,9 +2318,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + 4 * sizeof(uint32_t), w, h,
                         linear_sampler_);
                 } else if (fx.type == doc::EffectType::Glyph) {
-                    // set: 0 halftone, 1 ascii, 2 custom (user-
-                    // droppable tilesets), 3 braille, 4 teletext; missing
-                    // slots fall back down.
+                    // Sets: 0 halftone, 1 ascii, 2 custom, 3 braille,
+                    // 4 teletext; a missing slot falls back down.
                     int which = std::clamp(
                         static_cast<int>(fx.params[1] + 0.5f), 0, 4);
                     if (which == 4 && !glyph_atlas_[4]) which = 1;
@@ -2517,18 +2340,14 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + 4 * sizeof(uint32_t), w, h,
                         linear_sampler_);
                 } else if (fx.type == doc::EffectType::Quantize) {
-                    // RD-stipple dither (mode 9) reuses the RD
-                    // sim: a per-instance Gray-Scott state seeded by the
-                    // frame becomes the threshold pattern. Other modes
-                    // bind the noise LUT in that slot as a dummy.
+                    // Mode 9 puts the RD state in this slot; other modes
+                    // bind the noise LUT there as a dummy.
                     const int dm = fx.params.size() > 2
                         ? static_cast<int>(fx.params[2] + 0.5f)
                         : 0;
                     const GpuImage* stipple = noise_lut_.get();
                     if (dm == 9) {
-                        // Soliton-regime constants (dots); moderate
-                        // frame injection so isolated dots nucleate
-                        // instead of saturating along midtone bands.
+                        // These constants hold the soliton dot regime.
                         GpuImage* st = rd_advance(rec, frame_index, skey,
                                                   input_image(0), w, h,
                                                   timeline_frame, 8, 0.030f,
@@ -2536,9 +2355,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         if (!st) return nullptr;
                         stipple = st;
                     }
-                    // Motion lock: the graph wires the flow
-                    // node as a second input when lock is on; the LUT
-                    // doubles as an unread dummy otherwise.
+                    // The graph wires flow as input 1 under motion lock;
+                    // otherwise the LUT rides there as an unread dummy.
                     const GpuImage* flow_tex = node.inputs.size() > 1
                                                    ? input_image(1)
                                                    : noise_lut_.get();
@@ -2549,9 +2367,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 4, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::Dither) {
-                    // Standalone ordered dither: LUT always rides
-                    // as input 1; the flow field joins as input 2 only in
-                    // motion-locked mode (the LUT doubles as the dummy).
+                    // The LUT is always input 1; flow joins as input 2
+                    // only under motion lock, and the LUT is the dummy.
                     const GpuImage* flow_tex = node.inputs.size() > 1
                                                    ? input_image(1)
                                                    : noise_lut_.get();
@@ -2561,11 +2378,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 3, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::Interlace) {
-                    // Field weave reads the previous frame (ring delay
-                    // 1); the input doubles as the past frame until the
-                    // ring holds one. Comb/lines modes ignore input 1,
-                    // but the ring still advances so a mode switch
-                    // lands on fresh history.
+                    // The input doubles as the past frame until the ring
+                    // fills; the ring advances in every mode.
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     GpuImage* in_img =
                         const_cast<GpuImage*>(input_image(0));
@@ -2583,8 +2397,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                         timeline_frame))
                         return nullptr;
                 } else if (fx.type == doc::EffectType::FrameDelay) {
-                    // Plain N-frame delay: the slit-scan ring
-                    // machinery, one slice bound as the second input.
+                    // One ring slice binds as the second input.
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     const uint32_t delay = static_cast<uint32_t>(std::clamp(
                         fx.params[0], 0.0f,
@@ -2606,14 +2419,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                         timeline_frame))
                         return nullptr;
                 } else if (fx.type == doc::EffectType::Text) {
-                    // Runtime-TTF text: pick the size BUCKET
-                    // covering the resolved size param, rasterize the
-                    // string's SDF once per (text, font, bucket), and
-                    // let the kernel scale — a keyframed/modulated size
-                    // walks a bounded raster set instead of
-                    // re-rasterizing every frame. Bucketing keys on the
-                    // PARAM (1080-reference px), so proxy preview and
-                    // export pick identical rasters.
+                    // The bucket keys on the param in 1080-reference px,
+                    // so a proxy preview and export pick the same raster.
                     const int font_n = static_cast<int>(fx_fonts_.size());
                     const int which =
                         font_n > 0
@@ -2637,8 +2444,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                 thash, static_cast<uint8_t>(ch));
                         TextSlot& slot = text_state_[fx.id];
                         if (slot.hash != thash) {
-                            // Text/font changed: the old rasters may be
-                            // in flight — settle before dropping them.
+                            // The old rasters can be in flight; settle first.
                             bool any = false;
                             for (const TextRaster& tb : slot.buckets)
                                 any = any || tb.tex != nullptr;
@@ -2675,8 +2481,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                 tb.h = s.height;
                                 tb.spread = s.spread_px;
                             } else {
-                                // Nothing drawable (spaces): remember,
-                                // don't re-rasterize every frame.
+                                // Nothing drawable; w = 1 stops a re-raster.
                                 tb.w = 1;
                             }
                         }
@@ -2697,9 +2502,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + 4 * sizeof(uint32_t), w, h,
                         linear_sampler_);
                 } else if (fx.type == doc::EffectType::Displace) {
-                    // Second input: the wired map/matte as the
-                    // displacement map when the graph wired one; otherwise
-                    // the input doubles as its own map (self-luma).
+                    // Input 1 is the wired map, or the input's own luma.
                     const GpuImage* map = node.inputs.size() > 1
                                               ? input_image(1)
                                               : input_image(0);
@@ -2708,16 +2511,15 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::DustScratches) {
-                    // The damage plate rides as a second input (
-                    // texture-driven dust); always present (fallback).
+                    // The damage plate is input 1 and is always present.
                     const GpuImage* sampled[2] = {input_image(0),
                                                   dust_tex_.get()};
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::SlitScan) {
-                    // Ring of past inputs; one masked dispatch per age band
-                    // (bands are disjoint pixels, so no barriers between).
+                    // One dispatch per age band; the bands write disjoint
+                    // pixels, so they need no barrier between them.
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     const uint32_t depth = static_cast<uint32_t>(std::clamp(
                         fx.params[1], 2.0f, static_cast<float>(kSlitRing)));
@@ -2738,9 +2540,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                         timeline_frame))
                         return nullptr;
                 } else if (fx.type == doc::EffectType::TimeDisplace) {
-                    // Same ring mechanism as SlitScan: one dispatch per
-                    // age band; the shader masks pixels to its band from
-                    // the delay map (self-luma, or a wired map input).
+                    // One dispatch per age band; the shader masks pixels
+                    // to its band from the delay map.
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     const uint32_t depth = static_cast<uint32_t>(std::clamp(
                         fx.params[0], 2.0f, static_cast<float>(kSlitRing)));
@@ -2834,8 +2635,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_[static_cast<size_t>(fx.type)]->dispatch(
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
-                    // Record while unarmed, once per timeline frame; armed
-                    // freezes the ring (that IS the repeat).
+                    // Record once per timeline frame while unarmed; armed
+                    // freezes the ring on purpose.
                     if (!armed && !slit_ring_push(rec, slot, in_img, w, h,
                                                   timeline_frame))
                         return nullptr;
@@ -2853,11 +2654,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1, push,
                         push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::VelocityScan) {
-                    // Velocity-modulated scanning (dwell-time rendering):
-                    // sweep fronts advance at luma-braked speed (ping-pong
-                    // state, stepped once per timeline frame); the render
-                    // splats the beams over the phosphor canvas — the
-                    // effect's own previous output via the feedback slot.
+                    // The fronts step once per timeline frame; the canvas
+                    // is the effect's own previous output.
                     VsSlot& vs = vs_state_[skey];
                     const uint32_t state_w = std::max(w, h);
                     if (vs.state[0] && vs.state[0]->width() != state_w) {
@@ -2866,10 +2664,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         vs.last_frame = 0xFFFFFFFFu;
                     }
                     if (!vs.state[0]) {
-                        // Full-float state: positions live in PIXELS (up
-                        // to frame extent), and half floats step by a
-                        // whole pixel past 1024 — slow luma-braked fronts
-                        // would freeze, then pop a pixel at a time.
+                        // Positions are in pixels, so the state must be
+                        // float32: half floats step a full pixel past 1024.
                         for (int s = 0; s < 2; ++s) {
                             vs.state[s] = GpuImage::create(
                                 device_, VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -2934,8 +2730,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         w, h, linear_sampler_);
                     feedback_writeback(rec, *fb, dst, w, h, timeline_frame);
                 } else if (fx.type == doc::EffectType::FlowParticles) {
-                    // Feedback-style persistent field advected by flow:
-                    // inputs = {frame, own previous output, flow}.
+                    // Inputs: frame, own previous output, then flow.
                     FeedbackSlot* fb = ensure_feedback_prev(rec, skey, w, h);
                     if (!fb) return nullptr;
                     const GpuImage* sampled[3] = {input_image(0),
@@ -2946,10 +2741,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes, w, h, linear_sampler_);
                     feedback_writeback(rec, *fb, dst, w, h, timeline_frame);
                 } else if (fx.type == doc::EffectType::SecurityMux) {
-                    // Same ring mechanism as SlitScan at full depth: one
-                    // masked dispatch per age band; each tile's seeded
-                    // delay picks exactly one band, so the passes tile
-                    // the output exactly once.
+                    // Each tile picks exactly one band, so the passes
+                    // cover the output exactly once.
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     GpuImage* in_img =
                         const_cast<GpuImage*>(input_image(0));
@@ -2968,9 +2761,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                         timeline_frame))
                         return nullptr;
                 } else if (fx.type == doc::EffectType::Engraver) {
-                    // FM raster: run the phase integrator over this
-                    // node's input, then render iso-phase traces from
-                    // the integral (GenerateMe fm.pde model).
+                    // The phase integrator must run before this dispatch.
                     if (mod_integral_ &&
                         (mod_integral_->width() != w ||
                          mod_integral_->height() != h))
@@ -2989,8 +2780,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                 fx.params[4] >= 0.5f
                             ? 1u
                             : 0u;
-                    // Bit 1: reversed march — the integration always
-                    // follows the travel direction (speed sign).
+                    // Bit 1 reverses the march to follow the speed sign.
                     if (fx.params.size() > 3 && fx.params[3] < 0.0f)
                         fm_mode |= 2u;
                     const uint32_t lanes = (fm_mode & 1u) ? h : w;
@@ -3018,11 +2808,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         rec, arena_, frame_index, sampled, 2, &dst, 1,
                         push, push_bytes, w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::TrackPin) {
-                    // Compose (user adjust) x (inverse plane motion)
-                    // into one 3x3, CPU-side in double; the kernel does
-                    // a single homogeneous transform per pixel. Rotation
-                    // happens in aspect-corrected metric space so a
-                    // pinned card turns instead of shearing.
+                    // The CPU composes one 3x3 in double for the kernel.
+                    // Rotation stays in metric space to stop a shear.
                     const doc::Layer& own =
                         look.layers[static_cast<size_t>(node.layer_index)];
                     double H[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
@@ -3062,7 +2849,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     if (stabilize) {
                         std::memcpy(M, H, sizeof(M));
                     } else {
-                        // Invert H (adjugate over determinant).
                         const double a = H[0], b = H[1], c = H[2];
                         const double d = H[3], e = H[4], f = H[5];
                         const double g = H[6], i = H[7], j = H[8];
@@ -3075,9 +2861,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             a * Hi[0] + b * Hi[3] + c * Hi[6];
                         if (std::fabs(det) > 1.0e-12)
                             for (double& v : Hi) v /= det;
-                        // A: reference uv -> B uv. Placed content =
-                        // c + off + s*R(angle)*((B - 0.5) * (rw, rh)),
-                        // rotation metric-corrected; A is its inverse.
+                        // A maps reference uv to B uv.
                         const double aspect =
                             h > 0 ? static_cast<double>(w) / h : 1.0;
                         const double cx = fx.params[1], cy = fx.params[2];
@@ -3090,16 +2874,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         const double ang = fx.params[8];
                         const double ca = std::cos(-ang);
                         const double sa = std::sin(-ang);
-                        // T(-c-off), metric rotate, 1/s, 1/(rw,rh), +0.5
                         const double t1[9] = {1, 0, -(cx + ox),
                                               0, 1, -(cy + oy),
                                               0, 0, 1};
-                        // Metric rotate: S(aspect,1), R(-ang),
-                        // S(1/aspect,1) folded into one matrix.
+                        // Metric rotate, folded into one matrix.
                         const double r2[9] = {ca, -sa / aspect, 0,
                                               sa * aspect, ca, 0,
                                               0, 0, 1};
-                        // Scale into B space, then recentre on 0.5.
                         const double s3[9] = {1.0 / (s * rw2), 0, 0.5,
                                               0, 1.0 / (s * rh2), 0.5,
                                               0, 0, 1};
@@ -3122,8 +2903,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             9u * static_cast<uint32_t>(sizeof(uint32_t)),
                         w, h, linear_sampler_);
                 } else if (fx.type == doc::EffectType::BlendNode) {
-                    // Graph merge: B rides input 1; unwired B falls
-                    // back to In (the blend becomes identity-ish).
+                    // B is input 1; an unwired B falls back to In.
                     const GpuImage* b = node.inputs.size() > 1
                         ? input_image(1)
                         : input_image(0);
@@ -3160,9 +2940,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::Flow: {
-                // Native planes vs canvas block grid: sample through the
-                // reference source's fit rect so the field registers
-                // with the composited content.
+                // The planes are native, so sample through the fit rect.
                 float fit[4];
                 source_fit_rect(ref_plane->width(), ref_plane->height(),
                                 w, h, fit);
@@ -3183,8 +2961,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::MatteExtract: {
-                // Image-matte adapter (masks ARE images): the wired
-                // image's luma IS the matte.
+                // The wired image's luma is the matte.
                 const uint32_t push[2] = {w, h};
                 const GpuImage* sampled[1] = {input_image(0)};
                 matte_extract_->dispatch(rec, arena_, frame_index, sampled,
@@ -3202,9 +2979,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::GroupMix: {
-                // The group's composite knobs read from the RESOLVED
-                // look per frame (lanes + wires baked), exactly like
-                // effect params.
+                // The group knobs read from the resolved look, like params.
                 const doc::Group& grp =
                     look.layers[static_cast<size_t>(node.layer_index)]
                         .groups[static_cast<size_t>(node.effect_index)];
@@ -3220,14 +2995,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
 
         results[static_cast<size_t>(index)] = dst;
-        // Node-canvas thumbnail taps, ROOT instance only: the canvas
-        // shows the scoped look's own cards, so nested instances' taps
-        // would burn atlas cells on keys nothing displays (topo order
-        // evaluates nested nodes FIRST — a big nested ref could exhaust
-        // the grid before the visible cards tapped) and two instances
-        // of one look would overwrite each other's cells. Effects key
-        // on their id, layer sources on layer.id | bit 62 (id spaces
-        // overlap).
+        // Tap the root instance only; nested taps would fill the grid.
+        // Effects key on their id, layer sources on layer.id plus bit 62.
         constexpr uint64_t kThumbSourceBit = 1ull << 62;
         if (node.instance == 0 && node.kind == GraphNode::Kind::Effect &&
             node.effect_index >= 0 && node.layer_index >= 0) {
@@ -3250,9 +3019,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 pool_->release(results[static_cast<size_t>(input)]);
     }
 
-    // Alpha-bounds reduction on the measure tap: cleared bounds cells,
-    // atomic min/max sweep, 16-byte copy-out. Harvested by
-    // read_measure_bounds after the caller's fence.
+    // read_measure_bounds harvests this after the caller's fence.
     if (graph.measure >= 0 && results[static_cast<size_t>(graph.measure)]) {
         GpuImage* mimg = results[static_cast<size_t>(graph.measure)];
         mimg->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -3285,9 +3052,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         measured_placement_ = measure_placement;
     }
 
-    // The published image: the preview tap when set, the OUTPUT
-    // otherwise. The output itself always feeds the Output card's
-    // thumbnail (cell key 0) — the preview never touches it.
+    // Cell key 0 always takes the output, never the preview tap.
     GpuImage* out = results[static_cast<size_t>(
         graph.preview >= 0 ? graph.preview : graph.output)];
     record_thumb_tap(rec, frame_index,
@@ -3299,15 +3064,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         ref->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         *out_source = ref;
     }
-    // Segmented (Codec-Box) evaluation ran on internal command buffers; the
-    // caller's cmd records nothing — flush the tail segment so the result
-    // is complete before the caller's submission (same-queue ordering).
+    // Flush the tail segment so it completes before the caller submits.
     if (segmented) codec_flush_segment();
 
-    // Cache miss: read the finished frame back into this slot's buffer,
-    // harvested when the slot's fence has been waited. (Segmented docs are
-    // history-bearing and never reach here with a nonzero ctx — guarded
-    // anyway so the copy always records on the caller's cmd.)
+    // The copy records on the caller's cmd and harvests at its fence.
     if (arm_readback && !segmented) {
         const size_t bytes = static_cast<size_t>(w) * h * 8;
         if (ensure_cache_io(cio, bytes)) {

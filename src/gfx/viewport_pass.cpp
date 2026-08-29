@@ -68,9 +68,7 @@ bool ViewportPass::init(VkFormat color_format,
     vk_check(vkCreateDescriptorSetLayout(dev, &set_info, nullptr, &set_layout_),
              "vkCreateDescriptorSetLayout(viewport)");
 
-    // One shared block: both stages' declared push blocks must sit
-    // inside their stage's range, so the range covers the whole struct
-    // for both.
+    // Each stage's declared push block must sit inside that stage's range.
     VkPushConstantRange push{
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
         sizeof(ViewportPush)};
@@ -97,7 +95,6 @@ bool ViewportPass::init(VkFormat color_format,
         stages[1].module = fs;
         stages[1].pName = "main";
 
-        // Fullscreen triangle: no vertex input.
         VkPipelineVertexInputStateCreateInfo vertex_input{
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
 
@@ -121,7 +118,6 @@ bool ViewportPass::init(VkFormat color_format,
             VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-        // Opaque video: no blend.
         VkPipelineColorBlendAttachmentState blend_attachment{};
         blend_attachment.colorWriteMask =
             VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -178,8 +174,7 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
         extent.height == 0 || clip_x1 <= clip_x0)
         return;
 
-    // Aspect-preserving fit, centered in the dst rect - the one fit
-    // formula (graph.h), so matching aspects fill exactly.
+    // Use the same fit formula as graph.h so equal aspects fill exactly.
     float fit[4];
     source_fit_rect(static_cast<float>(image.width()),
                     static_cast<float>(image.height()), dst_w, dst_h, fit);
@@ -208,8 +203,7 @@ void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,
     write.pImageInfo = &image_info;
     vkUpdateDescriptorSets(device_.device(), 1, &write, 0, nullptr);
 
-    // The cover triangle overshoots the fitted rect — scissor confines it
-    // (further narrowed by the wipe clip fractions and the bound rect).
+    // The cover triangle overshoots the fitted rect; the scissor confines it.
     const float fit_left = cx - fit_w * 0.5f;
     int32_t sx = std::max(
         0, static_cast<int32_t>(std::floor(fit_left + fit_w * clip_x0)));

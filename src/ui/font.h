@@ -1,11 +1,5 @@
-// Bitmap font (baked bitmap atlas; the offline fontbake tool
-// will emit atlas + metrics in exactly this model). Until fontbake lands,
-// Font::create_debug() provides a compiled-in 8x8 monospace pixel font so
-// the toolkit has text from day one.
-//
-// Metrics are in em units, baseline-relative, y-up (matching the reference
-// toolkit's glyph model so a future variable-width baked font drops in
-// without touching the text renderer). UVs are normalized, v-down.
+// Glyph metrics are em units, baseline-relative, y-up.
+// UVs are normalized atlas coords, v-down.
 
 #pragma once
 
@@ -21,7 +15,7 @@ struct UiTexture;
 struct Glyph {
     uint32_t codepoint = 0;
     float advance = 0.0f;                       // em units
-    float plane_l = 0.0f, plane_b = 0.0f;       // em units vs. baseline, y-up
+    float plane_l = 0.0f, plane_b = 0.0f;       // em units from baseline, y-up
     float plane_r = 0.0f, plane_t = 0.0f;
     float uv_l = 0.0f, uv_t = 0.0f;             // normalized atlas coords
     float uv_r = 0.0f, uv_b = 0.0f;
@@ -30,26 +24,20 @@ struct Glyph {
 
 class Font {
 public:
-    // Compiled-in 8x8 ASCII debug font.
     static Font create_debug();
 
-    // Baked MSDF font (fontbake): atlas PNG + metrics JSON as
-    // emitted by msdf-atlas-gen (-yorigin top). Empty on missing files or
-    // parse failure — callers fall back to create_debug().
+    // The metrics JSON must come from msdf-atlas-gen with -yorigin top.
     static std::optional<Font> load_msdf(
         const std::filesystem::path& atlas_png,
         const std::filesystem::path& metrics_json);
 
-    // True for MSDF fonts: RGBA atlas, median-of-RGB decode in the text
-    // shader, linear sampling.
+    // MSDF: RGBA atlas, median-of-RGB decode, linear sampling.
     bool msdf() const { return msdf_; }
     const std::vector<uint8_t>& atlas_rgba() const { return atlas_rgba_; }
-    // The bake's -pxrange: distance-field span in atlas pixels. The text
-    // shader derives its screen-space AA band from this analytically.
+    // Distance-field span in atlas px; the shader derives the AA band from it.
     float px_range() const { return px_range_; }
 
-    // Binary search over the sorted glyph table; missing codepoints fall
-    // back to '?' (then to any glyph). Never returns null on a valid font.
+    // Missing codepoints fall back to '?'; never null on a valid font.
     const Glyph* find_glyph(uint32_t codepoint) const;
 
     float ascender() const { return ascender_; }        // em units
@@ -59,7 +47,7 @@ public:
     uint32_t atlas_height() const { return atlas_height_; }
     const std::vector<uint8_t>& atlas_pixels() const { return atlas_; }  // A8
 
-    // Set by UiRenderer::register_font after the GPU upload.
+    // Null until UiRenderer::register_font uploads the atlas.
     const UiTexture* texture() const { return texture_; }
     void set_texture(const UiTexture* t) { texture_ = t; }
 
@@ -76,8 +64,7 @@ private:
     const UiTexture* texture_ = nullptr;
 };
 
-// Incremental UTF-8 decoder: reads one codepoint at *cursor, advances it.
-// Malformed input yields U+FFFD and advances one byte.
+// Decodes one codepoint at *cursor and advances it; bad input gives U+FFFD.
 uint32_t utf8_decode(const char* text, size_t length, size_t* cursor);
 
 }  // namespace looks::ui

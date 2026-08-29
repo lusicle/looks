@@ -8,7 +8,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float shift_x;    // px; red shifts one way, blue the other
+    float shift_x;    // px, red shifts one way and blue the other
     float shift_y;
 };
 
@@ -31,7 +31,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 sb = input.SampleLevel(uv - offset, 0);
     split.r = sr.r;
     split.b = sb.b;
-    // One alpha covers all three channels: the union of the shifts.
     split.a = max(base.a, max(sr.a, sb.a));
 
     const float4 wetted = lerp(base, split, saturate(wet));

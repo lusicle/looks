@@ -1,6 +1,4 @@
-// The displacement field always arrives at binding 1: the graph binds
-// either this effect's own input or a wired map there, so the kernel
-// never branches on which.
+// The graph always binds a map at binding 1 (the input when unwired).
 
 #include "fx_common.slang"
 
@@ -16,8 +14,8 @@ cbuffer Push
     float fps;
     float amount;     // px at full luma swing
     float angle;
-    float mode;       // 0 directional, 1 gradient
-    float map_mode;   // consumed by the graph compiler, unused here
+    float mode;
+    float map_mode;   // the graph compiler uses this, not the shader
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

@@ -1,9 +1,3 @@
-// Dev CLI: exercises ingest end-to-end on a real file. Video sources
-// write sidecars only (playback decodes the source natively); stills and
-// audio cover art still produce a mezzanine.
-//   looks_import <input.mp4> <output_dir> [quality]
-// Prints the resulting bundle info; exit 0 on success.
-
 #include <cstdio>
 #include <cstdlib>
 #include <string>

@@ -1,8 +1,5 @@
-// I420 planes to linear RGB, BT.709 limited range. The transfer is
-// decoded with the sRGB EOTF, which stands in for BT.709 camera gamma.
-// The source lands in its aspect-preserving fit rect (rect origin +
-// reciprocal size, output pixels); outside it the target is transparent
-// black - sources never stretch to the canvas.
+// I420 to linear RGB, BT.709 limited range, decoded with the sRGB EOTF.
+// Outside the fit rect the output is transparent black. Never stretch.
 
 #include "fx_common.slang"
 
@@ -15,8 +12,8 @@ cbuffer Push
     float rect_y;
     float inv_fit_w;
     float inv_fit_h;
-    // NV12 chroma: plane_u is the interleaved RG8 CbCr texture (bound to
-    // both chroma slots) - Cb in .r either way, Cr moves to plane_u.g.
+    // For NV12, plane_u is the interleaved RG8 CbCr texture in both slots.
+    // Cb stays in .r and Cr moves to plane_u.g.
     uint nv12;
 };
 

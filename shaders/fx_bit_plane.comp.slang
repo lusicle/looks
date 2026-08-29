@@ -1,4 +1,4 @@
-// Display-referred by definition: bits live on the encoded signal.
+// Bit ops act on the encoded signal, not on linear light.
 
 #include "fx_common.slang"
 
@@ -12,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float op;         // 0 xor, 1 and, 2 or
-    float value;      // pattern byte
-    float channels;   // 0 rgb, 1 r, 2 g, 3 b
+    float op;
+    float value;
+    float channels;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

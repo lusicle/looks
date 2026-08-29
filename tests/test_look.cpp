@@ -1,7 +1,3 @@
-// The two-entity model: looks as timeless templates, sequences as the
-// only timelines, placements as affine maps, link groups, the nesting
-// guard, and the version gate.
-
 #include "doc/look_commands.h"
 
 #include <cstring>
@@ -81,17 +77,15 @@ TEST(look_audio_split_toggle_undo) {
 }
 
 TEST(look_disconnect_last_wire_stays_deleted) {
-    // Deleting the last real wire must not fall back into the
-    // empty-table synthesis sentinel - the chain would resurrect.
+    // An empty link table means synthesized wiring, so the delete seals it.
     Document d;
     d.looks[0].layers[0].asset = d.next_effect_id++;
     doc::UndoStack undo;
     const uint64_t lid = d.looks[0].layers[0].id;
     undo.execute(d, doc::disconnect_command(d.looks[0].id, {lid, 0, 0}));
-    CHECK(!d.looks[0].links.empty());   // sealed, not synthesized
+    CHECK(!d.looks[0].links.empty());
     for (const doc::NodeLink& l : d.looks[0].links)
         CHECK(!(l.to == 0 && l.to_port == 0));
-    // A real connect prunes the seal; undo restores it.
     undo.execute(d, doc::connect_command(d.looks[0].id, {lid, 0, 0}));
     for (const doc::NodeLink& l : d.looks[0].links)
         CHECK(!doc::link_is_tombstone(l));
@@ -99,7 +93,7 @@ TEST(look_disconnect_last_wire_stays_deleted) {
     for (const doc::NodeLink& l : d.looks[0].links)
         CHECK(!(l.to == 0 && l.to_port == 0));
     undo.undo(d);
-    CHECK(d.looks[0].links.empty());   // back to synthesized wiring
+    CHECK(d.looks[0].links.empty());
 }
 
 TEST(sequence_add_remove_undo) {
@@ -133,8 +127,7 @@ TEST(asset_add_remove_undo) {
     undo.execute(d, doc::add_asset_command(std::move(b)));
     CHECK_EQ(d.assets.size(), size_t{2});
 
-    // Removal un-imports the entry; undo restores it AT ITS INDEX -
-    // the first asset drives auto canvas/fps, so order carries meaning.
+    // The first asset drives auto canvas and fps, so index order matters.
     undo.execute(d, doc::remove_asset_command(aid));
     CHECK_EQ(d.assets.size(), size_t{1});
     CHECK(d.find_asset(aid) == nullptr);
@@ -150,14 +143,13 @@ TEST(sequence_track_commands_undo) {
     CHECK_EQ(d.sequence(sid).tracks.size(), size_t{1});
     const uint64_t v1 = d.sequence(sid).tracks[0].id;
 
-    // Lanes insert at an index (higher composites later) and undo out.
+    // A higher lane index composites later.
     doc::SeqTrack lane = doc::make_track(d, d.sequence(sid));
     const uint64_t v2 = lane.id;
     undo.execute(d, doc::add_track_command(sid, std::move(lane), 1));
     CHECK_EQ(d.sequence(sid).tracks.size(), size_t{2});
     CHECK_EQ(d.sequence(sid).tracks[1].id, v2);
 
-    // A removed lane takes its placements; undo restores both in place.
     doc::Placement p;
     p.id = d.next_effect_id++;
     p.target = d.looks[0].id;
@@ -175,8 +167,7 @@ TEST(sequence_track_commands_undo) {
     undo.execute(d, doc::remove_track_command(d, sid, v2));
     CHECK(doc::remove_track_command(d, sid, v1) == nullptr);
 
-    // Audio tracks add bare and remove with their placements. (Shed the
-    // default a1 first: this exercises the bare add/remove pair.)
+    // Clear the default a1 first to exercise the bare add and remove.
     d.sequence(sid).audio.clear();
     CHECK_EQ(d.sequence(sid).audio.size(), size_t{0});
     doc::AudioTrack at = doc::make_audio_track(d, d.sequence(sid));
@@ -212,14 +203,12 @@ TEST(sequence_overwrite_claims_span) {
         return p.id;
     };
 
-    // Tail under the newcomer: cut to its start.
     const uint64_t a = lay(0, 100);
     const uint64_t b = lay(60, 160);
     doc::overwrite_lane_span(d, undo, sid, lane, b, 0, 60, 160);
     CHECK_EQ(doc::find_placement(d.sequence(sid), a)->t_out, uint32_t{60});
 
-    // Newcomer strictly inside: split (razor + head-trim), content holds
-    // still through source_in.
+    // A newcomer inside splits the block, and source_in holds the content.
     const uint64_t c = lay(20, 50);
     doc::overwrite_lane_span(d, undo, sid, lane, c, 0, 20, 50);
     CHECK_EQ(doc::find_placement(d.sequence(sid), a)->t_out, uint32_t{20});
@@ -230,8 +219,6 @@ TEST(sequence_overwrite_claims_span) {
     CHECK_EQ(doc::find_placement(d.sequence(sid), right)->source_in,
              uint32_t{50});
 
-    // One landing that tail-trims, removes whole, and head-trims at once;
-    // a single undo of the group restores all three.
     const uint64_t e = lay(45, 70);
     undo.begin_group("Overwrite");
     doc::overwrite_lane_span(d, undo, sid, lane, e, 0, 45, 70);
@@ -259,17 +246,14 @@ TEST(bin_commands_organise_the_browser) {
     undo.execute(d, doc::add_bin_command(std::move(inner)));
     CHECK_EQ(d.bins.size(), size_t{2});
 
-    // Membership: file the first look inside the inner bin.
     const uint64_t look_id = d.looks[0].id;
     undo.execute(d, doc::set_entity_bin_command(look_id, inner_id));
     CHECK_EQ(d.looks[0].bin, inner_id);
 
-    // The reparent guard walks parents: inner sits under top, never the
-    // other way.
     CHECK(doc::bin_reaches(d, inner_id, top_id));
     CHECK(!doc::bin_reaches(d, top_id, inner_id));
 
-    // Deleting a bin lifts its contents to its parent; undo restores.
+    // Deleting a bin lifts its contents to the parent bin.
     undo.execute(d, doc::remove_bin_command(inner_id));
     CHECK_EQ(d.bins.size(), size_t{1});
     CHECK_EQ(d.looks[0].bin, top_id);
@@ -279,7 +263,6 @@ TEST(bin_commands_organise_the_browser) {
     undo.redo(d);
     CHECK_EQ(d.looks[0].bin, top_id);
 
-    // Rename + reparent ride one command; undo restores both.
     undo.execute(d, doc::set_bin_props_command(top_id, "renamed", 0));
     CHECK_EQ(d.find_bin(top_id)->name, "renamed");
     undo.undo(d);
@@ -287,8 +270,7 @@ TEST(bin_commands_organise_the_browser) {
 }
 
 TEST(look_commands_stay_on_their_own_look) {
-    // A command captures the look it edits: undo must land there no
-    // matter what the editing scope moved to afterwards.
+    // A command captures the look it edits, so undo lands there.
     Document d;
     doc::UndoStack undo;
     doc::Look second = doc::make_look(d, "second");
@@ -323,8 +305,7 @@ TEST(look_placement_maps_local_to_source) {
     CHECK_EQ(doc::placement_source_frame(p, 10.0), 100.0);
     CHECK_EQ(doc::placement_source_frame(p, 20.0), 120.0);
 
-    // Unbounded (t_out 0) with a known target length: the 100 target
-    // frames REMAINING past source_in, at 2x, occupy 50 local frames.
+    // 100 target frames left past source_in at 2x fill 50 local frames.
     CHECK_EQ(doc::placement_end(p, 200), uint32_t{60});
     CHECK(!doc::placement_active(p, 200, 9));
     CHECK(doc::placement_active(p, 200, 10));
@@ -336,8 +317,7 @@ TEST(look_placement_maps_local_to_source) {
     CHECK_EQ(doc::placement_end(open, 0), uint32_t{0});
     CHECK(doc::placement_active(open, 0, 100000));
 
-    // A FROZEN placement (speed 0) plays one frame forever: its end must
-    // stay a usable frame index rather than wrapping uint32.
+    // Speed 0 plays one frame forever, so the end must not wrap uint32.
     doc::Placement frozen;
     frozen.speed = 0.0f;
     const uint32_t fend = doc::placement_end(frozen, 5000);
@@ -370,15 +350,14 @@ TEST(look_duration_is_lockstep_content) {
     l.asset = b.id;
     d.looks[0].layers.push_back(std::move(l));
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{200});
-    // Generator-only looks derive 0 = unbounded; explicit wins.
+    // An explicit duration wins over the derived one.
     d.looks[0].duration = 42;
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{42});
 }
 
 namespace {
 
-// One asset, its wrapper look, one block on the root lane, and a linked
-// audio placement - the shape one drop lays down.
+// The rig holds one look, one video block, and a linked audio block.
 struct SeqRig {
     Document d;
     doc::UndoStack undo;
@@ -387,8 +366,7 @@ struct SeqRig {
     uint64_t video = 0;
 
     explicit SeqRig(uint32_t frames = 200) {
-        // Shed the default a1 so the pair lay exercises mint-on-demand
-        // and the rig's track stays audio[0].
+        // Clear the default a1 so the pair lay mints the track on demand.
         d.root().audio.clear();
         doc::Asset a;
         a.id = d.next_effect_id++;
@@ -422,7 +400,6 @@ TEST(sequence_audio_placements_pair_and_edit_as_one) {
     CHECK(link != 0);
     CHECK_EQ(rig.d.root().audio[0].placements[0].link, link);
 
-    // A timing edit through EITHER member moves both.
     doc::Placement upd = rig.d.root().tracks[0].placements[0];
     upd.t_in = 25;
     upd.t_out = 125;
@@ -432,7 +409,6 @@ TEST(sequence_audio_placements_pair_and_edit_as_one) {
     CHECK_EQ(rig.d.root().audio[0].placements[0].t_in, uint32_t{25});
     CHECK_EQ(rig.d.root().audio[0].placements[0].source_in, uint32_t{5});
 
-    // A level edit on the audio half touches only it.
     doc::Placement aupd = rig.d.root().audio[0].placements[0];
     aupd.audio_gain = 0.25f;
     rig.undo.execute(rig.d,
@@ -447,7 +423,6 @@ TEST(sequence_audio_placements_pair_and_edit_as_one) {
     CHECK_EQ(rig.d.root().tracks[0].placements[0].t_in, uint32_t{0});
     CHECK_EQ(rig.d.root().audio[0].placements[0].t_in, uint32_t{0});
 
-    // Unlink dissolves the group: the same timing edit now moves one.
     rig.undo.execute(
         rig.d, doc::unlink_placement_command(rig.d.root_sequence,
                                              rig.video));
@@ -469,14 +444,12 @@ TEST(sequence_razor_splits_the_whole_link_group) {
                                 rig.d, rig.d.root_sequence, lane, 40));
     CHECK_EQ(rig.d.root().tracks[0].placements.size(), size_t{2});
     CHECK_EQ(rig.d.root().audio[0].placements.size(), size_t{2});
-    // Left halves keep the original pair; right halves pair fresh.
     CHECK_EQ(rig.d.root().tracks[0].placements[0].link, link);
     CHECK_EQ(rig.d.root().audio[0].placements[0].link, link);
     const uint64_t right_link =
         rig.d.root().tracks[0].placements[1].link;
     CHECK(right_link != 0 && right_link != link);
     CHECK_EQ(rig.d.root().audio[0].placements[1].link, right_link);
-    // The halves are continuous: right resumes at the cut's source.
     CHECK_EQ(rig.d.root().tracks[0].placements[0].t_out, uint32_t{40});
     CHECK_EQ(rig.d.root().tracks[0].placements[1].t_in, uint32_t{40});
     CHECK_EQ(rig.d.root().tracks[0].placements[1].source_in, uint32_t{40});
@@ -492,7 +465,6 @@ TEST(sequence_razor_splits_the_whole_link_group) {
 
 TEST(sequence_remove_placement_takes_the_link_group) {
     SeqRig rig;
-    // A second, unlinked block later on the lane.
     doc::Placement second;
     second.id = rig.d.next_effect_id++;
     second.target = rig.look;
@@ -531,7 +503,6 @@ TEST(look_nest_wraps_graph_selection_in_a_lockstep_ref) {
     CHECK(cmd != nullptr);
     undo.execute(d, std::move(cmd));
     CHECK_EQ(d.looks.size(), size_t{2});
-    // The ref stands where the solid stood, in lockstep.
     CHECK_EQ(d.looks[0].layers.size(), size_t{2});
     const doc::Layer& ref = d.looks[0].layers[1];
     CHECK(ref.source == doc::LayerSourceKind::LookRef);
@@ -539,7 +510,6 @@ TEST(look_nest_wraps_graph_selection_in_a_lockstep_ref) {
     CHECK(nested != nullptr);
     CHECK_EQ(nested->layers.size(), size_t{1});
     CHECK(nested->layers[0].source == doc::LayerSourceKind::Solid);
-    // The parent kept its other chain; the media layer stayed put.
     CHECK_EQ(d.looks[0].layers[0].id, media_id);
 
     undo.undo(d);
@@ -552,7 +522,6 @@ TEST(look_make_unique_forks_the_template) {
     SeqRig rig;
     rig.d.looks[0].layers[0].stack.push_back(
         make_effect(rig.d, EffectType::Vignette));
-    // A second block sharing the template.
     doc::Placement dup;
     dup.id = rig.d.next_effect_id++;
     dup.target = rig.look;
@@ -568,8 +537,6 @@ TEST(look_make_unique_forks_the_template) {
     const uint64_t fork =
         rig.d.root().tracks[0].placements[1].target;
     CHECK(fork != rig.look);
-    // The first block keeps the original; the fork carries the stack
-    // with reminted ids.
     CHECK_EQ(rig.d.root().tracks[0].placements[0].target, rig.look);
     const doc::Look* forked = rig.d.find_look(fork);
     CHECK(forked != nullptr);
@@ -607,7 +574,6 @@ TEST(sequence_make_unique_forks_a_nested_cut) {
     CHECK(fork != cut_id);
     const doc::Sequence* forked = d.find_sequence(fork);
     CHECK(forked != nullptr);
-    // The fork's placements reminted but still target the SHARED look.
     CHECK_EQ(forked->tracks[0].placements.size(), size_t{1});
     CHECK_EQ(forked->tracks[0].placements[0].target, d.looks[0].id);
     CHECK(forked->tracks[0].placements[0].id != inner.id);
@@ -629,8 +595,6 @@ TEST(look_version_gate_refuses_older_projects) {
 }
 
 TEST(fresh_sequences_carry_a_default_audio_track) {
-    // Sound needs somewhere to land from the first drop: the document's
-    // root and every minted sequence start with one audio track.
     Document d;
     CHECK_EQ(d.root().audio.size(), size_t{1});
     CHECK_EQ(d.root().audio[0].name, "a1");
@@ -702,9 +666,6 @@ TEST(move_placement_lands_on_a_same_kind_lane) {
 }
 
 TEST(audio_overwrite_claims_span_like_video) {
-    // Landing on an audio track trims what it covers - overlaps never
-    // persist past an edit on EITHER lane kind; summing stays the
-    // mid-gesture rendering rule only.
     Document d;
     doc::UndoStack undo;
     const uint64_t sid = d.root_sequence;
@@ -721,22 +682,19 @@ TEST(audio_overwrite_claims_span_like_video) {
         return p.id;
     };
 
-    // Tail under the newcomer: cut to its start.
     const uint64_t a = lay(0, 100);
     const uint64_t b = lay(60, 160);
     doc::overwrite_group_spans(d, undo, sid, b);
     CHECK_EQ(d.root().audio[0].placements.size(), size_t{2});
     CHECK_EQ(doc::find_placement(d.root(), a)->t_out, uint32_t{60});
 
-    // Fully covered: removed.
     const uint64_t c = lay(0, 200);
     doc::overwrite_group_spans(d, undo, sid, c);
     CHECK(doc::find_placement(d.root(), a) == nullptr);
     CHECK(doc::find_placement(d.root(), b) == nullptr);
     CHECK_EQ(d.root().audio[0].placements.size(), size_t{1});
 
-    // Strictly inside: the survivor splits and the right half's start
-    // slides past the newcomer, content holding still.
+    // The right half's source_in slides so the content holds still.
     const uint64_t mid = lay(80, 120);
     doc::overwrite_group_spans(d, undo, sid, mid);
     CHECK_EQ(d.root().audio[0].placements.size(), size_t{3});
@@ -754,9 +712,6 @@ TEST(audio_overwrite_claims_span_like_video) {
 }
 
 TEST(linked_pair_lands_claiming_both_lanes) {
-    // One drop's landing overwrites the video lane AND the audio track
-    // together: a pair laid over two older pairs trims both halves of
-    // each, group timing keeping every pair coherent.
     SeqRig rig;
     doc::Placement block;
     block.id = rig.d.next_effect_id++;
@@ -775,7 +730,6 @@ TEST(linked_pair_lands_claiming_both_lanes) {
                                 rig.d.root().audio[0].id, ap, block.id));
     doc::overwrite_group_spans(rig.d, rig.undo, rig.d.root_sequence,
                                block.id);
-    // The first pair's halves both end at 60 now.
     CHECK_EQ(doc::find_placement(rig.d.root(), rig.video)->t_out,
              uint32_t{60});
     CHECK_EQ(rig.d.root().audio[0].placements[0].t_out, uint32_t{60});

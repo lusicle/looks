@@ -55,7 +55,7 @@ public:
             other->effect_index_ != effect_index_ ||
             other->param_index_ != param_index_)
             return false;
-        new_value_ = other->new_value_;   // keep our old_value_
+        new_value_ = other->new_value_;   // keep old_value_ for the undo
         return true;
     }
 
@@ -67,10 +67,7 @@ private:
     float old_value_ = 0.0f;
 };
 
-// A gizmo drag writes an x/y pair per frame; issuing two singles would
-// defeat back-of-stack merging (alternating params never match), so the
-// whole per-frame write set travels as one command. Keyed params arrive
-// as lane replacements (the auto-key path), unkeyed ones as base writes.
+// Keyed params arrive as lane writes, unkeyed params as base writes.
 class SetParamGestureCommand final : public LookCommand {
 public:
     SetParamGestureCommand(uint64_t look, size_t layer_index,
@@ -145,7 +142,7 @@ public:
             base_writes_[i].value = o->base_writes_[i].value;
         for (size_t i = 0; i < lane_writes_.size(); ++i)
             lane_writes_[i].keys = o->lane_writes_[i].keys;
-        return true;   // our old_* stashes stay the gesture origin
+        return true;   // the old_* stashes stay at the gesture start
     }
 
 private:
@@ -154,7 +151,7 @@ private:
     std::vector<ParamWrite> base_writes_;
     std::vector<KeyframeLane> lane_writes_;
     std::vector<float> old_base_;
-    // {lane existed, its keys before}; parallel to lane_writes_.
+    // Pairs of {the lane was there, its keys before}, one per lane write.
     std::vector<std::pair<bool, std::vector<Keyframe>>> old_lanes_;
 };
 
@@ -356,9 +353,7 @@ private:
     size_t to_;
 };
 
-// Node-canvas placement. Resolves the target by
-// document id on every apply/revert — indices may shift under undo, ids
-// never do. A missing target is a silent no-op (node deleted mid-history).
+// A missing target is a silent no-op: the node can be gone in the history.
 class SetNodePosCommand final : public LookCommand {
 public:
     SetNodePosCommand(uint64_t look, NodeRef kind, uint64_t id, float x,
@@ -443,13 +438,7 @@ private:
     float old_x_ = 0.0f, old_y_ = 0.0f;
 };
 
-// Freezes the implicit stack-order wiring into the link table:
-// every node-creation path runs this FIRST so newborns spawn UNWIRED —
-// with the table empty, stack-order synthesis would chain them straight
-// into the composite. Wiring is a wire gesture, never a side effect of
-// adding. On a look with no layers the synthesis is empty and this
-// stays a no-op: the very first source keeps auto-wiring to the Output
-// (a black one-node composite would be hostile).
+// On a look with no layers this is a no-op: the first source auto-wires.
 class MaterializeLinksCommand final : public LookCommand {
 public:
     explicit MaterializeLinksCommand(uint64_t look) : LookCommand(look) {}
@@ -469,14 +458,8 @@ private:
     bool materialized_ = false;
 };
 
-// TRUE GRAPH link edits. STACKING ORDER IS THE LINK ORDER - per
-// (to node, to port) the first link is the BOTTOM of that fan-in - so
-// every edit here is position-exact: replacements land in place, undo
-// restores the removed position, and only genuinely NEW wires append
-// (newest on top, connection chronology). apply/revert address links
-// by value plus the recorded position — ids are stable, indices are
-// not. First edit materializes the synthesized legacy table (reverted
-// symmetrically).
+// Link order is stacking order: the first link of a port is the bottom.
+// Keep positions exact. Only a new wire appends to the end.
 class ConnectCommand final : public LookCommand {
 public:
     ConnectCommand(uint64_t look, NodeLink link)
@@ -487,7 +470,7 @@ public:
         Look& look = look_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
-        pruned_ = prune_tombstone(look);   // a real wire replaces it
+        pruned_ = prune_tombstone(look);   // a real wire replaces the seal
         had_replaced_ = false;
         appended_ = false;
         auto replace_first = [&](auto&& match) {
@@ -501,12 +484,8 @@ public:
                 }
         };
         if (link_.to == 0) {
-            // Output fan-ins - the image composite on port 0, the
-            // split audio-in on port 1 - share ONE authoring rule:
-            // one contribution per owner layer, a chain RE-TERMINATING
-            // replaces its old end IN PLACE (a splice never restacks
-            // the fan-in), a new chain appends on top and SUMS/STACKS.
-            // The two ports never touch each other.
+            // The Output keeps one contribution per owner layer, per port.
+            // A chain that re-terminates replaces its old end in place.
             auto owner_of = [&](uint64_t id) -> uint64_t {
                 if (find_layer(look, id)) return id;
                 const Layer* owner = nullptr;
@@ -520,9 +499,7 @@ public:
                        owner_of(l.from) == own;
             });
         } else {
-            // Effect ports fan in freely in link order; an exact
-            // duplicate replaces itself (a no-op that never
-            // double-feeds the port).
+            // An exact duplicate replaces itself: a port never double-feeds.
             replace_first([&](const NodeLink& l) {
                 return l.from == link_.from && l.to == link_.to &&
                        l.to_port == link_.to_port;
@@ -609,11 +586,8 @@ private:
     bool sealed_ = false;
 };
 
-// Splice rewire: replaces one link with another AT ITS POSITION, so a
-// chain re-terminating through an inserted node (effect drop, preset
-// splice, removal heal, boundary rewire) keeps its place in the
-// consumer port's stacking order. Old link absent = plain append; the
-// new link already present = the old one is just removed.
+// If old_link is absent this appends. If new_link is there this only
+// removes old_link.
 class ReconnectCommand final : public LookCommand {
 public:
     ReconnectCommand(uint64_t look, NodeLink old_link, NodeLink new_link)
@@ -696,10 +670,7 @@ private:
     bool pruned_ = false;
 };
 
-// Reorders one feed within a port's fan-in: swaps the index-th and
-// (index+delta)-th links INTO (to, to_port), leaving every other link
-// where it was. The stacking permute behind the port popup and the
-// rail arrows; self-inverse.
+// The swap is self-inverse, thus apply and revert do the same operation.
 class MovePortLinkCommand final : public LookCommand {
 public:
     MovePortLinkCommand(uint64_t look, uint64_t to, uint32_t to_port,
@@ -733,8 +704,6 @@ private:
     int delta_;
 };
 
-// Canvas frames: pure annotations, but still
-// undoable like every mutation.
 class AddFrameCommand final : public LookCommand {
 public:
     AddFrameCommand(uint64_t look, CanvasFrame frame)
@@ -781,8 +750,6 @@ private:
     bool had_ = false;
 };
 
-// Frame resize drags coalesce per frame id (one undo step per gesture);
-// rename is a single edit.
 class SetFrameBoundsCommand final : public LookCommand {
 public:
     SetFrameBoundsCommand(uint64_t look, uint64_t id, float w, float h)
@@ -902,11 +869,9 @@ std::unique_ptr<Command> remove_frame_command(uint64_t look,
 
 bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
     if (from == to) return true;
-    if (to == 0) return false;   // Output has no outgoing links
+    if (to == 0) return false;   // the Output node has no outgoing links
     std::vector<NodeLink> synth;
     const std::vector<NodeLink>& links = effective_links(look, synth);
-    // Downstream walk from `to`: reaching `from` means the new link would
-    // close a loop.
     std::vector<uint64_t> stack{to};
     std::vector<uint64_t> seen;
     while (!stack.empty()) {
@@ -921,9 +886,7 @@ bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
             }
         if (visited) continue;
         seen.push_back(n);
-        // A group id as a link target (its port-1 matte) has no outgoing
-        // links of its own: the wrapper it feeds flows into the face
-        // member's consumers, so the walk continues there.
+        // A group id has no outgoing links. The walk continues at the face.
         if (const uint64_t face = group_face_member(look, n))
             stack.push_back(face);
         for (const NodeLink& l : links)

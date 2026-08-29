@@ -1,5 +1,4 @@
-// The engine picks the ring slice and binds it at binding 1; the kernel
-// only presents it.
+// The engine picks the ring slice and binds it at binding 1.
 
 #include "fx_common.slang"
 
@@ -13,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float frames;   // consumed engine-side, unused here
+    float frames;   // the engine uses this, not the shader
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

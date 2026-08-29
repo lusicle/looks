@@ -318,7 +318,6 @@ private:
     uint32_t old_h_ = 0;
 };
 
-// Per-entity FORMAT (look or sequence): all-zero = inherit the project.
 class SetEntityFormatCommand final : public Command {
 public:
     SetEntityFormatCommand(uint64_t entity, EntityFormat next)
@@ -387,8 +386,7 @@ public:
     std::string name() const override { return "Wire Param"; }
 
     void apply(Document& doc) override {
-        // One wire per param: wiring an already-driven target replaces
-        // its wire, exactly like image links at (to, port).
+        // One wire per param: this replaces the wire of the same target.
         std::vector<ModRoute>& routes = look_of(doc).mod_routes;
         replaced_.clear();
         for (size_t i = routes.size(); i-- > 0;) {
@@ -470,8 +468,7 @@ public:
         unwired_.clear();
         removed_ = {};
         index_ = 0;
-        // Cascade: every wire out of this node goes with it - routes it
-        // feeds, and helper inputs reading it (captured for undo).
+        // Cascade: the routes it feeds and the helper inputs that read it.
         for (size_t i = look.mod_routes.size(); i-- > 0;) {
             if (look.mod_routes[i].node != node_id_) continue;
             routes_.push_back({i, look.mod_routes[i]});
@@ -503,8 +500,7 @@ public:
         for (const auto& [nid, which] : unwired_)
             if (ValueNode* n = find_value_node(look, nid))
                 (which == 0 ? n->in_a : n->in_b) = node_id_;
-        // routes_ was captured back-to-front; reinsert front-to-back so
-        // the stored indices land exactly.
+        // Insert front-to-back: routes_ was captured back-to-front.
         for (size_t i = routes_.size(); i-- > 0;)
             look.mod_routes.insert(look.mod_routes.begin() +
                                        routes_[i].first,
@@ -646,7 +642,7 @@ public:
         const auto* other = dynamic_cast<const SetLaneCommand*>(&next);
         if (!other || !same_look(*other) || !(other->target_ == target_))
             return false;
-        keys_ = other->keys_;   // keep our old_keys_ — gesture start
+        keys_ = other->keys_;   // old_keys_ stays at the gesture start
         return true;
     }
 
@@ -715,7 +711,7 @@ public:
         for (size_t i = 0; i < lanes_.size(); ++i)
             if (!(other->lanes_[i].target == lanes_[i].target)) return false;
         for (size_t i = 0; i < lanes_.size(); ++i)
-            lanes_[i].keys = other->lanes_[i].keys;   // keep our old_
+            lanes_[i].keys = other->lanes_[i].keys;   // old_ stays as it is
         return true;
     }
 
@@ -728,9 +724,7 @@ private:
     std::vector<Old> old_;
 };
 
-// The snapshot of a look's current effect state (params, wet, opacity).
-// Group composites snapshot their wet/opacity the same way, keyed with
-// kGroupParamBit.
+// A group entry keys its effect_id with kGroupParamBit.
 Snapshot capture_snapshot(const Look& look) {
     Snapshot snapshot;
     snapshot.valid = true;

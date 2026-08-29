@@ -1,15 +1,4 @@
-// Determinism harness: same project + seeds => identical frames.
-// Renders a deterministic synthetic media through the full GPU path (upload
-// -> YCbCr->linear -> effect chain -> NV12 readback) TWICE with independent
-// Engine/readback instances and compares per-frame FNV-1a hashes. With
-// --export it additionally drives the offline export pipeline (encoder MFT
-// + muxer) and re-demuxes the result with our own parser as a structural
-// check. Headless: no window, no swapchain.
-//
-//   looks_rendertest [frames] [--export out.mp4] [--pcm sidecar.pcm]
-//
-// Exit codes: 0 ok, 1 mismatch/failure, 77 skipped (no Vulkan device —
-// CTest SKIP_RETURN_CODE).
+// Exit code 77 tells CTest to record a skip.
 
 #include <algorithm>
 #include <chrono>
@@ -37,13 +26,10 @@ using namespace looks;
 constexpr uint32_t kWidth = 320;
 constexpr uint32_t kHeight = 240;
 
-// The harness stands in for the decode pool: one media source, fed under
-// the instance key compile_graph stamps on its Source node.
+// The key must match the Source key that compile_graph stamps.
 gfx::Engine::LayerSourceFrame media_frame(const doc::Document& doc,
                                          const gfx::SourcePlanes& planes) {
     gfx::Engine::LayerSourceFrame lf;
-    // Rendering the look directly: path = look id, and the media node's
-    // asset folds into the Source key.
     lf.key = hash_combine(
         hash_combine(doc.looks[0].id, doc.looks[0].layers[0].id),
         doc.looks[0].layers[0].asset);
@@ -51,7 +37,6 @@ gfx::Engine::LayerSourceFrame media_frame(const doc::Document& doc,
     return lf;
 }
 
-// Deterministic animated I420 source (gradient + moving bar + chroma sweep).
 struct SyntheticSource {
     std::vector<uint8_t> y, u, v;
 
@@ -84,78 +69,61 @@ struct SyntheticSource {
     }
 };
 
-// The fixed "project": a broad slice of the roster at non-default settings —
-// stochastic effects (grain, jitter, quantizer boil), the multi-pass glow,
-// and the flow-fed smear all must hash bit-exact across evaluations.
 doc::Document make_document() {
     doc::Document doc;
     doc.master_seed = 1234;
-    // The media node binds a synthetic asset id (no Asset entry: unknown
-    // length = always on); the harness feeds its planes under the key.
+    // The asset id has no Asset entry on purpose: unknown length plays always.
     doc.looks[0].layers[0].asset = doc.next_effect_id++;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.looks[0].layers[0].stack[1].params[0] = 9.0f;      // block size
+    doc.looks[0].layers[0].stack[1].params[0] = 9.0f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Jitter));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
-    doc.looks[0].layers[0].stack[6].params[0] = 4.5f;      // shift x
-    doc.looks[0].layers[0].stack[6].params[1] = 1.5f;      // shift y
+    doc.looks[0].layers[0].stack[6].params[0] = 4.5f;
+    doc.looks[0].layers[0].stack[6].params[1] = 1.5f;
     doc.looks[0].layers[0].stack[6].wet = 0.8f;
     doc.looks[0].layers[0].stack[6].opacity = 0.9f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
-    // Codec-Box: exercises the segmented GPU->CPU->GPU roundtrip with
-    // persistent decoder state, flow-fed MVs, and seeded corruption.
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Datamosh));
-    doc.looks[0].layers[0].stack[8].params[1] = 8.0f;      // gop 8
-    doc.looks[0].layers[0].stack[8].params[3] = 4.0f;      // mv random
-    doc.looks[0].layers[0].stack[8].params[4] = 0.15f;     // corrupt
-    // Stateful one-frame-delay effects (persistent GPU targets).
+    doc.looks[0].layers[0].stack[8].params[1] = 8.0f;
+    doc.looks[0].layers[0].stack[8].params[3] = 4.0f;
+    doc.looks[0].layers[0].stack[8].params[4] = 0.15f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Echo));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Feedback));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FilmStock));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
-    // Wave 2: seeded slice shuffle, time-quantized curl-noise warp, and a
-    // pure-geometry fold.
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SliceShuffle));
-    doc.looks[0].layers[0].stack.back().params[3] = 0.7f;   // probability
+    doc.looks[0].layers[0].stack.back().params[3] = 0.7f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Turbulence));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
     doc.looks[0].layers[0].stack.back().wet = 0.6f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Snow));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Composite));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Timestamp));
-    // Dither-engine wave: STBN mode reads the build-time LUT; slit-scan
-    // exercises the past-frames ring across sequential evaluation.
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.looks[0].layers[0].stack.back().params[0] = 5.0f;   // levels
-    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;   // STBN
+    doc.looks[0].layers[0].stack.back().params[0] = 5.0f;
+    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;
     doc.looks[0].layers[0].stack.back().wet = 0.5f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SlitScan));
-    doc.looks[0].layers[0].stack.back().params[1] = 8.0f;   // depth
-    // RD-stipple dither (mode 9): the quantizer's own Gray-Scott
-    // state must evolve bit-exact across evaluations.
+    doc.looks[0].layers[0].stack.back().params[1] = 8.0f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
     doc.looks[0].layers[0].stack.back().params[2] = 9.0f;
     doc.looks[0].layers[0].stack.back().params[3] = 0.8f;
     doc.looks[0].layers[0].stack.back().wet = 0.5f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Voronoi));
     doc.looks[0].layers[0].stack.back().wet = 0.6f;
-    // Stateful sim: N Gray-Scott steps per frame, seeded by the picture.
     doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::ReactionDiffusion));
-    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;   // steps
+    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;
     doc.looks[0].layers[0].stack.back().wet = 0.7f;
-    // CPU serpentine dither with temporal carry (second CPU roundtrip).
     doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::ErrorDiffusion));
-    doc.looks[0].layers[0].stack.back().params[0] = 3.0f;   // levels
-    doc.looks[0].layers[0].stack.back().params[3] = 0.4f;   // carry
+    doc.looks[0].layers[0].stack.back().params[0] = 3.0f;
+    doc.looks[0].layers[0].stack.back().params[3] = 0.4f;
     doc.looks[0].layers[0].stack.back().wet = 0.6f;
-    // Compositing: a noise generator layer multiplied over the base, with
-    // its own mini stack.
     doc::Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.name = "noise";
@@ -165,9 +133,7 @@ doc::Document make_document() {
     overlay.gen_scale = 24.0f;
     overlay.stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
     doc.looks[0].layers.push_back(std::move(overlay));
-    // Port-1 matte on the pixelate (masks ARE images): a Shape layer wired
-    // into the matte port gates the effect through extract + apply. The
-    // layer feeds ONLY the gate — no link to the composite.
+    // The Shape layer feeds only the matte port. It has no composite link.
     doc::Layer matte;
     matte.id = doc.next_effect_id++;
     matte.name = "matte";
@@ -189,8 +155,7 @@ doc::Document make_document() {
     return doc;
 }
 
-// History-free slice of the roster for the render-cache coherence check
-//: every effect here is a pure function of (document, frame).
+// Every effect here must stay a pure function of document and frame.
 doc::Document make_cacheable_document() {
     doc::Document doc;
     doc.master_seed = 555;
@@ -198,13 +163,11 @@ doc::Document make_cacheable_document() {
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
-    // Level cycling (mode 8) is time-based but pure — must stay cacheable.
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
     doc.looks[0].layers[0].stack.back().params[2] = 8.0f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
     doc.looks[0].layers[0].stack.back().wet = 0.5f;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
-    // Port-1 matte on the pixelate — the wire path must stay cacheable.
     doc::Layer matte;
     matte.id = doc.next_effect_id++;
     matte.name = "matte";
@@ -223,8 +186,6 @@ doc::Document make_cacheable_document() {
     return doc;
 }
 
-// Renders the frame range twice through ONE engine with the cache armed:
-// pass 1 misses populate it, pass 2 must be served from it bit-exact.
 bool cache_coherence_check(gfx::Device& device,
                            const std::filesystem::path& shader_dir,
                            uint32_t frames) {
@@ -263,9 +224,7 @@ bool cache_coherence_check(gfx::Device& device,
             std::fprintf(stderr, "cache: frame %u hit != miss\n", f);
             ok = false;
         }
-    // The readback path fences every call, so each pending readback is
-    // harvested on the next render — by pass 2 every frame is resident and
-    // every render must hit.
+    // The readback path fences each call, so pass 2 finds every frame resident.
     if (engine->cache().hits() < frames) {
         std::fprintf(stderr, "cache: expected %u hits, saw %llu\n", frames,
                      static_cast<unsigned long long>(engine->cache().hits()));
@@ -308,12 +267,6 @@ bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
     return true;
 }
 
-// ---- per-effect benchmark (--bench). Renders every effect type in
-// isolation at 1080p through the fenced readback path (wall time = upload +
-// effect + readback, including CPU roundtrips) and writes a sorted
-// ms/frame table to <repo>/temp/bench.txt. Gated on temp/bench_request.txt
-// containing '1' so routine ctest runs skip it (exit 77).
-
 struct BenchSource {
     uint32_t w, h;
     std::vector<uint8_t> y, u, v;
@@ -326,8 +279,6 @@ struct BenchSource {
     }
 
     gfx::SourcePlanes planes(uint32_t frame) {
-        // The harness's signal at bench resolution: content-dependent
-        // kernels must be measured against what determinism verifies.
         for (uint32_t r = 0; r < h; ++r)
             for (uint32_t c = 0; c < w; ++c)
                 y[static_cast<size_t>(r) * w + c] =
@@ -371,9 +322,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
     };
     std::vector<Row> rows;
 
-    // GPU clock warmup: without sustained load first, the sweep's early
-    // rows measure idle clocks and the table sorts by enum order instead
-    // of kernel cost.
+    // Keep this warmup: idle GPU clocks make the first rows measure too slow.
     {
         auto engine = gfx::Engine::create(device, shader_dir);
         auto readback = gfx::Nv12Readback::create(device, shader_dir);
@@ -396,9 +345,8 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
         }
     }
 
-    // Baseline first: upload + convert + readback with an empty stack.
-    // One extra virtual row measures Error Diffusion's exact mode (the
-    // default is fast; the speculative exact path deserves its own line).
+    // The range is deliberate: t = -1 is the baseline, t = kTypes is an extra
+    // row for the Error Diffusion exact mode.
     const int kTypes = static_cast<int>(doc::EffectType::Count);
     for (int t = -1; t <= kTypes; ++t) {
         doc::Document doc;
@@ -414,7 +362,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
             name = t == kTypes ? "Error Diffusion (exact)"
                                : doc::effect_info(type).label;
             if (t == kTypes)
-                doc.looks[0].layers[0].stack[0].params[4] = 0.0f;   // speed = exact
+                doc.looks[0].layers[0].stack[0].params[4] = 0.0f;
         }
         auto engine = gfx::Engine::create(device, shader_dir);
         auto readback = gfx::Nv12Readback::create(device, shader_dir);
@@ -423,13 +371,9 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
             return 1;
         }
         std::vector<uint8_t> nv12;
-        // Min of the timed frames, not the mean: strips clock-ramp and
-        // scheduler spikes, leaving the effect's steady per-frame cost.
         double best = 1.0e9;
         for (uint32_t f = 0; f < kFrames; ++f) {
-            // Pattern generation stays OUTSIDE the timed window: it is
-            // several ms of single-threaded CPU work that would otherwise
-            // flatten every GPU effect onto one harness floor.
+            // Keep planes() before t0: its CPU cost would hide the GPU cost.
             const auto lf = media_frame(doc, source.planes(f));
             const auto t0 = std::chrono::steady_clock::now();
             if (!readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
@@ -481,7 +425,7 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
 
-    gfx::DeviceDesc desc;   // headless: no hwnd
+    gfx::DeviceDesc desc;   // no hwnd: the device stays headless
     auto device = gfx::Device::create(desc);
     if (!device) {
         std::fprintf(stderr, "SKIP: no Vulkan device\n");
@@ -531,8 +475,6 @@ int wmain(int argc, wchar_t** argv) {
             return readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
                                     kWidth, kHeight, nv12, 0, f, &lf, 1);
         };
-        // The soundtrack goes through the same graph mix the app uses:
-        // one leaf under a full-span hop, unity gain.
         media::MixState mix;
         std::vector<float> scratch;
         media::ExportAudio audio;
@@ -564,7 +506,6 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "export failed: %s\n", result.error.c_str());
             return 1;
         }
-        // Structural validation: our own demuxer must accept the output.
         media::BmffFile file;
         std::string error;
         if (!file.open(export_path, &error)) {

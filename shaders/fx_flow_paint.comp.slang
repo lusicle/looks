@@ -1,6 +1,4 @@
-// Anisotropic Kuwahara steered by the flow field. Picking the
-// lowest-variance sector of the three is what keeps edges crisp; a plain
-// mean over the whole ellipse would smear them.
+// Keep the lowest-variance sector. A plain mean smears the edges.
 
 #include "fx_common.slang"
 
@@ -23,7 +21,6 @@ cbuffer Push
 [[vk::binding(1, 0)]] Sampler2D flow;    // block MVs in px
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
-// Mean and variance over 12 taps in an oriented ellipse half.
 void sector(float2 uv, float2 size, float2 major, float2 minor,
             float side, out float3 mean, out float mean_a,
             out float variance)
@@ -64,7 +61,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float speed = length(mv);
     const float2 dir = speed > 0.05 ? mv / speed : float2(1.0, 0.0);
 
-    // Major axis runs along the flow.
     const float stretch =
         1.0 + aniso * (1.0 + saturate(speed * 0.15) * boost) * 1.6;
     const float2 major = dir * radius * stretch;
@@ -74,9 +70,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 m0, m1, m2;
     float a0, a1, a2;
     float v0, v1, v2;
-    sector(uv, size, major, minor, 1.0, m0, a0, v0);    // ahead
-    sector(uv, size, major, minor, -1.0, m1, a1, v1);   // behind
-    sector(uv, size, minor, major * 0.4, 1.0, m2, a2, v2);   // across
+    sector(uv, size, major, minor, 1.0, m0, a0, v0);
+    sector(uv, size, major, minor, -1.0, m1, a1, v1);
+    sector(uv, size, minor, major * 0.4, 1.0, m2, a2, v2);
     float3 outc = m0;
     float out_a = a0;
     float best = v0;

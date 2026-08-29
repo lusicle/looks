@@ -1,5 +1,4 @@
-// Colors arrive sRGB-encoded from the UI and are decoded into the linear
-// working space here.
+// Colors arrive sRGB-encoded from the UI. Decode them to linear here.
 
 #include "fx_common.slang"
 
@@ -8,30 +7,21 @@ cbuffer Push
 {
     uint width;
     uint height;
-    uint kind;         // LayerSourceKind: 1 solid, 2 gradient, 3 noise,
-                       // 4 pattern, 5 oscillator, 6 shape
+    uint kind;
     uint seed;
     uint frame;
     float ar, ag, ab;  // sRGB
     float br, bg, bb;  // sRGB
     float scale;
     float angle;       // radians
-    uint shape;        // noise: 0 value, 1 perlin, 2 cellular, 3 fbm,
-                       // 4 static; pattern: 0 checker, 1 stripes,
-                       // 2 grid, 3 dots, 4 smpte bars; oscillator:
-                       // 0 sine bars, 1 rings, 2 plasma, 3 lissajous;
-                       // shape node: 0 circle, 1 box, 2 diamond,
-                       // 3 custom path (SDF texture)
-    float phase;       // oscillator: percent of one period; wraps, so
-                       // 0 and 100 are identical
+    uint shape;
+    float phase;       // percent of one period, wraps at 100
 };
 
-// Custom-shape SDF (gfx/shape_sdf): canvas uv, 0.5 = on the curve,
-// distances span +-0.25 canvas heights. Dummy-bound for every other
-// generator kind.
+// The SDF uses canvas uv. 0.5 is on the curve, the span is +-0.25 heights.
+// The engine dummy-binds it for every other generator kind.
 [[vk::binding(0, 0)]] Sampler2D shape_sdf;
 
-// Value noise at integer lattice p with smooth (quintic-free) fade.
 float gen_value_noise(float2 p, uint seed, uint t)
 {
     const int2 c = int2(floor(p));
@@ -44,8 +34,7 @@ float gen_value_noise(float2 p, uint seed, uint t)
     return lerp(lerp(n00, n10, u.x), lerp(n01, n11, u.x), u.y);
 }
 
-// Perlin-style gradient noise: hashed unit gradients at the lattice,
-// remapped to 0..1.
+// The result is in the range 0 to 1.
 float gen_perlin(float2 p, uint seed, uint t)
 {
     const int2 c = int2(floor(p));
@@ -67,8 +56,7 @@ float gen_perlin(float2 p, uint seed, uint t)
     return saturate(0.5 + n * 0.7071);
 }
 
-// Worley/cellular: distance to the nearest seeded feature point in the
-// 3x3 neighborhood, 0 at the point rising outward.
+// Returns the distance to the nearest feature point, 0 at the point.
 float gen_worley(float2 p, uint seed, uint t)
 {
     const int2 c = int2(floor(p));
@@ -112,8 +100,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 3)
     {
-        // Noise family: value / perlin / cellular / fbm boil on a slow
-        // frame tick; static re-rolls every frame per pixel.
         const float cell = max(scale, 2.0);
         const float2 p = float2(tid.xy) / cell;
         const uint t = frame / 4;
@@ -146,11 +132,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 4)
     {
-        // Pattern family: two-color screens on a rotatable cell grid,
-        // plus the SMPTE-style bars (which keep their fixed colors).
         if (shape == 4u)
         {
-            // 75% SMPTE-style bars, grayscale ramp, pluge strip.
             if (uv.y < 0.72)
             {
                 const int bar = min(int(uv.x * 7.0), 6);
@@ -209,10 +192,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 5)
     {
-        // scale = cycles across the frame; motion creeps on the frame
-        // clock, never wall clock. `phase` slides the pattern along its
-        // own direction: 100% is one full period, so 0 and 100 match
-        // exactly (every term shifts by a whole 2 pi).
+        // scale is cycles across the frame. Motion uses the frame clock.
+        // phase is one full period at 100, so 0 and 100 match exactly.
         const float t = float(frame) * 0.02;
         const float ph = frac(phase * 0.01) * 6.2831853;
         const float freq = max(scale, 0.5) * 6.2831853;
@@ -233,15 +214,12 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         else if (shape == 3u)
         {
-            // Distance field to sin(a*s), sin(b*s) with b = a + 1;
-            // scale picks the ratio, angle the phase offset.
             const float2 asp =
                 float2(float(width) / float(height), 1.0);
             const float2 p = (uv - 0.5) * asp;
             const float fa = clamp(floor(scale * 0.5 + 0.5), 1.0, 6.0);
             const float fb = fa + 1.0;
-            // Polyline distance, not point distance: sampling the curve
-            // as points alone leaves gaps between the samples.
+            // Use polyline distance. Point distance leaves gaps.
             float md = 1e9;
             float2 prev = 0.42 * float2(sin(t * 0.7 + angle + ph),
                                         sin(t * 0.3));
@@ -270,18 +248,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (kind == 6)
     {
-        // Centered SDF matte drawn color_a on color_b. angle carries the
-        // feather width here, not an orientation; position and rotation
-        // come from the layer transform instead.
+        // angle carries the feather width here, not an orientation.
         const float2 p = (uv - 0.5) *
                          float2(float(width) / float(height), 1.0);
         const float r = clamp(scale * 0.05, 0.02, 1.5);
         float d;
         if (shape == 3u)
         {
-            // Custom path: the CPU raster's SDF, size scaling about the
-            // canvas center (sample at uv/s, distance times s). scale 6
-            // = drawn size.
+            // scale 6 is the drawn size.
             const float s = clamp(scale, 0.5, 30.0) * (1.0 / 6.0);
             const float2 suv = (uv - 0.5) / s + 0.5;
             d = (shape_sdf.SampleLevel(clamp(suv, 0.0, 1.0), 0).r - 0.5) *
@@ -295,8 +269,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             d = length(p) - r;                        // circle
         const float feather = max(abs(angle) * 0.25, 0.002);
         const float v = saturate(0.5 - d / feather);
-        // Premultiplied: the SDF coverage IS the alpha. color_b is dead
-        // for shapes - transparency replaced "draw on a background".
+        // The SDF coverage is the alpha. color_b is unused for shapes.
         const float sv = v * v * (3.0 - 2.0 * v);
         rgb = color_a * sv;
         alpha = sv;

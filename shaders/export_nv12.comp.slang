@@ -1,7 +1,4 @@
-// Working space to NV12, the inverse of the import path. One dispatch at
-// full res: every thread writes Y, and the even/even thread of each 2x2
-// block writes that block's interleaved UV texel from the encoded-domain
-// average.
+// Average the chroma in the encoded domain to invert the import path.
 
 #include "fx_common.slang"
 

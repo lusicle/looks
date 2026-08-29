@@ -19,8 +19,7 @@ float draw_text(Canvas2D& canvas, const Font& font, std::string_view text,
     const UiTexture* atlas = font.texture();
     if (!atlas) return 0.0f;
 
-    // Snap the baseline to the physical pixel grid to avoid shimmer; with
-    // the 8x8 debug font at integer scales this keeps glyphs pixel-exact.
+    // Snap the baseline to the physical pixel grid to stop shimmer.
     const float scale = canvas.scale();
     auto snap = [&](float v) {
         return std::floor(v * scale + 0.5f) / scale;

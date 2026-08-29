@@ -13,7 +13,6 @@ namespace looks::media {
 
 namespace {
 
-// One parsed frame header. Layer III only; everything else resyncs.
 struct FrameHeader {
     int version = 0;        // 1 = MPEG-1, 2 = MPEG-2, 3 = MPEG-2.5
     uint32_t bitrate_kbps = 0;
@@ -56,13 +55,11 @@ bool parse_header(const uint8_t* p, FrameHeader* out) {
         f.version == 1 ? kBitrateV1[bitrate_index] : kBitrateV2[bitrate_index];
     f.channels = mode == 3 ? 1 : 2;
     f.samples_per_frame = f.version == 1 ? 1152 : 576;
-    // Layer III frame length: floor(samples/8 * bitrate / rate) + padding.
     f.frame_bytes = (f.samples_per_frame / 8) * f.bitrate_kbps * 1000 /
                         f.sample_rate +
                     (padding ? 1 : 0);
     if (f.frame_bytes < 24) return false;
-    // Side info sits right after the header (and the 2-byte CRC when
-    // present); the Xing/Info tag begins after it.
+    // Side info follows the header plus the 2-byte CRC when present.
     uint32_t side = 0;
     if (f.version == 1)
         side = f.channels == 2 ? 32 : 17;
@@ -73,8 +70,7 @@ bool parse_header(const uint8_t* p, FrameHeader* out) {
     return true;
 }
 
-// A Xing/Info (or VBRI) header frame carries stream metadata in an
-// otherwise-silent frame; feeding it would prepend a frame of silence.
+// A fed Xing/Info/VBRI metadata frame prepends a frame of silence.
 bool is_metadata_frame(const uint8_t* frame, uint32_t frame_bytes,
                        const FrameHeader& h) {
     const uint32_t at = 4 + h.side_info_bytes;
@@ -102,7 +98,7 @@ bool decode_mp3(const uint8_t* bytes, size_t size, Mp3Data* out,
     size_t pos = 0;
     size_t end = size;
 
-    // ID3v2 tag at the front: syncsafe size + optional footer.
+    // ID3v2 size is syncsafe; flag 0x10 adds a 10-byte footer.
     if (size >= 10 && !std::memcmp(bytes, "ID3", 3)) {
         const uint32_t tag = (static_cast<uint32_t>(bytes[6] & 0x7F) << 21) |
                              (static_cast<uint32_t>(bytes[7] & 0x7F) << 14) |
@@ -138,10 +134,10 @@ bool decode_mp3(const uint8_t* bytes, size_t size, Mp3Data* out,
     while (pos + 4 <= end) {
         FrameHeader h;
         if (!parse_header(bytes + pos, &h)) {
-            ++pos;   // resync: scan forward
+            ++pos;
             continue;
         }
-        if (pos + h.frame_bytes > end) break;   // truncated tail
+        if (pos + h.frame_bytes > end) break;
         if (!created) {
             std::string mf_error;
             if (!decoder.create(h.channels, h.sample_rate, &mf_error))
@@ -149,7 +145,7 @@ bool decode_mp3(const uint8_t* bytes, size_t size, Mp3Data* out,
             created = true;
             first = h;
         } else if (h.sample_rate != first.sample_rate) {
-            break;   // rate change mid-stream: stop at the clean prefix
+            break;   // rate change: keep only the clean prefix
         }
         if (!is_metadata_frame(bytes + pos, h.frame_bytes, h)) {
             const int64_t pts = static_cast<int64_t>(
@@ -201,9 +197,7 @@ bool mp3_cover_art(const uint8_t* b, size_t size,
         if (!std::memcmp(id, "APIC", 4)) {
             const uint8_t* d = b + pos;
             uint32_t off = 0;
-            // Transformed frames (compressed/encrypted/per-frame unsync)
-            // are not worth the machinery for artwork; group/data-length
-            // prefixes just skip.
+            // Compressed, encrypted, or unsync APIC frames are unsupported.
             if (ver == 4) {
                 if (format_flags & 0x0E) return false;
                 if (format_flags & 0x40) off += 1;   // grouping id
@@ -220,7 +214,7 @@ bool mp3_cover_art(const uint8_t* b, size_t size,
             if (off >= fsz) return false;
             off += 1;         // its terminator
             off += 1;         // picture type byte
-            // Description: terminator width follows the text encoding.
+            // Description terminator is 2 bytes for UTF-16 encodings.
             if (enc == 1 || enc == 2) {
                 while (off + 1 < fsz && (d[off] || d[off + 1])) off += 2;
                 off += 2;

@@ -13,7 +13,7 @@ cbuffer Push
     float amount;   // displacement, px
     float freq;     // cycles across the frame
     float speed;    // hz
-    float mode;     // 0 horizontal, 1 vertical, 2 ripple
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

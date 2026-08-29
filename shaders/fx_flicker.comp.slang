@@ -1,4 +1,4 @@
-// Linear light and uniform across the frame.
+// Keep the math in linear light.
 
 #include "fx_common.slang"
 
@@ -14,7 +14,7 @@ cbuffer Push
     float fps;
     float amount;
     float rate;    // hz
-    float mode;    // 0 projector beat, 1 random gate, 2 color strobe
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -33,7 +33,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     float gain;
     float3 tint = float3(1.0, 1.0, 1.0);
     if (mode < 0.5) {
-        // Two shutter harmonics beating, as a blade does against mains.
         const float beat = 0.6 * sin(6.28318 * rate * t) +
                            0.4 * sin(6.28318 * rate * 0.37 * t + 1.3);
         gain = 1.0 - amount * 0.25 * (beat + 1.0);
@@ -42,7 +41,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float g = fx_hash01(fx_hash3(seed, tick, 5u));
         gain = 1.0 - amount * 0.6 * g * g;
     } else {
-        // Exposure holds here and chroma pulses instead.
         const uint tick = uint(t * rate);
         const float hue = fx_hash01(fx_hash3(seed, tick, 11u));
         tint = lerp(float3(1.0, 1.0, 1.0), fx_hue_to_rgb(hue),

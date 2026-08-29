@@ -1,5 +1,4 @@
-// The Quantizer's palette lock without the level snap or dither.
-// Display-referred core.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float palette;    // 0 game boy, 1 cga, 2 nes, 3 teletext, 4 duotone
+    float palette;
     float pal_hue_a;
     float pal_hue_b;
 };

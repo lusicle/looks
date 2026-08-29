@@ -7,8 +7,7 @@ using namespace looks;
 
 namespace {
 
-// 6x4 RGBA PNG written by GDI+ (dynamic Huffman, ancillary chunks):
-// pixel (x,y) = {r=x*40, g=y*60, b=(x+y)*20, a=255}, except (5,3) a=128.
+// 6x4 RGBA PNG from GDI+: dynamic Huffman plus ancillary chunks.
 const uint8_t kFixturePng[] = {
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
     0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04,
@@ -61,7 +60,7 @@ TEST(png_decode_fixture) {
     CHECK_EQ(image.width, 6u);
     CHECK_EQ(image.height, 4u);
     CHECK_EQ(image.pixels.size(), size_t{6 * 4 * 4});
-    // Spot-check pixels: (x,y) = {x*40, y*60, (x+y)*20, 255}.
+    // Fixture pixel (x,y) is {x*40, y*60, (x+y)*20, 255}.
     auto px = [&](uint32_t x, uint32_t y) {
         return image.pixels.data() + (y * 6 + x) * 4;
     };
@@ -91,8 +90,8 @@ TEST(tga_decode_uncompressed_and_rle) {
     // row0(bottom): blue, green; row1(top): red, white  (BGR order).
     const uint8_t tga[] = {
         0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 24, 0,
-        255, 0, 0,  0, 255, 0,     // bottom row: blue, green
-        0, 0, 255,  255, 255, 255  // top row: red, white
+        255, 0, 0,  0, 255, 0,
+        0, 0, 255,  255, 255, 255
     };
     ImageRgba image;
     CHECK(decode_tga(tga, sizeof(tga), &image));
@@ -102,7 +101,6 @@ TEST(tga_decode_uncompressed_and_rle) {
     CHECK_EQ(image.pixels[0], 255);
     CHECK_EQ(image.pixels[1], 0);
     CHECK_EQ(image.pixels[2], 0);
-    // (1,1) = green.
     const uint8_t* p11 = image.pixels.data() + (1 * 2 + 1) * 4;
     CHECK_EQ(p11[0], 0);
     CHECK_EQ(p11[1], 255);
@@ -111,7 +109,7 @@ TEST(tga_decode_uncompressed_and_rle) {
     // RLE: 4 identical magenta pixels (32-bit, top origin).
     const uint8_t rle[] = {
         0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 32, 0x20,
-        0x83, 255, 0, 255, 200   // run of 4: BGRA = magenta, a=200
+        0x83, 255, 0, 255, 200
     };
     ImageRgba rle_image;
     CHECK(decode_tga(rle, sizeof(rle), &rle_image));
@@ -126,8 +124,8 @@ TEST(tga_decode_uncompressed_and_rle) {
 }
 
 TEST(png_encode_decode_roundtrip) {
-    // Every byte value crosses the encoder: gradient + alpha ramp, odd
-    // size so the stored-block split and row filters see uneven rows.
+    // The gradient and alpha ramp send every byte value to the encoder.
+    // The odd size makes the stored-block split and the row filters uneven.
     const uint32_t w = 131, h = 67;
     std::vector<uint8_t> src(size_t{w} * h * 4);
     for (uint32_t y = 0; y < h; ++y)

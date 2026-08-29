@@ -1,8 +1,3 @@
-// Frame arena for the layout tree (mirrors the reference toolkit's
-// LayoutArena). The whole widget tree — nodes, child arrays, per-widget
-// user blobs, duped label strings — is bump-allocated each frame and freed
-// wholesale by reset(). Allocated types must be trivially destructible.
-
 #pragma once
 
 #include <cstddef>
@@ -25,7 +20,6 @@ public:
     LayoutArena(const LayoutArena&) = delete;
     LayoutArena& operator=(const LayoutArena&) = delete;
 
-    // Zero-initialized array of T.
     template <typename T>
     T* alloc(size_t count = 1) {
         static_assert(std::is_trivially_destructible_v<T>,
@@ -36,7 +30,6 @@ public:
         return static_cast<T*>(p);
     }
 
-    // Copies a string into the arena (NUL-terminated).
     const char* dup(const char* text, size_t length) {
         char* p = static_cast<char*>(alloc_bytes(length + 1, 1));
         std::memcpy(p, text, length);
@@ -44,7 +37,6 @@ public:
         return p;
     }
 
-    // Keeps the blocks, rewinds the cursors.
     void reset() {
         for (Block& b : blocks_) b.used = 0;
         current_ = 0;

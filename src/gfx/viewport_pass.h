@@ -1,14 +1,11 @@
-// Viewport blit: samples the engine's final linear RGBA16F target
-// and draws it letterboxed into a screen rect inside the active present
-// pass. The sRGB swapchain performs the OETF encode on write — this is the
-// only place preview pixels leave the linear working space.
+// Pixels stay linear; the sRGB swapchain encodes on write.
 
 #pragma once
 
 #include <filesystem>
 #include <memory>
 
-#include "gfx/compute.h"   // DescriptorArena
+#include "gfx/compute.h"
 #include "gfx/texture.h"
 #include "gfx/vk_api.h"
 
@@ -24,15 +21,8 @@ public:
     ViewportPass(const ViewportPass&) = delete;
     ViewportPass& operator=(const ViewportPass&) = delete;
 
-    // Records inside an active dynamic-rendering pass. Fits `image`
-    // (SHADER_READ_ONLY layout) into the dst rect (physical px), aspect
-    // preserved and centered; restores the full-extent scissor afterwards.
-    // clip_x0/clip_x1 (fractions of the fitted rect) confine the draw
-    // horizontally — the A/B before-after wipe is two draws with
-    // complementary clips. alpha_mode: 0 flattens the composite's
-    // alpha over black, 1 over a checkerboard. bound_* (physical px,
-    // bound_w <= 0 = none) further clamps the scissor — the monitor
-    // zoom scales dst past its panel and must not paint outside it.
+    // image must be in SHADER_READ_ONLY. dst_* and bound_* are physical px.
+    // clip_x0/x1 are fractions of the fitted rect; bound_w <= 0 = no bound.
     void draw(VkCommandBuffer cmd, DescriptorArena& arena, uint32_t frame_index,
               GpuImage& image, VkSampler sampler, VkExtent2D extent,
               float dst_x, float dst_y, float dst_w, float dst_h,

@@ -10,9 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float af;     // focus hunt
-    float ae;     // exposure pump
-    float awb;    // white-balance drift
+    float af;
+    float ae;
+    float awb;
     float rate;   // hz
 };
 
@@ -32,7 +32,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float r = max(rate, 0.05);
 
-    // Squaring the noise keeps focus sharp most of the time, then lunges.
     const float hunt = fx_value_noise1(seed, t * r * 1.3);
     const float defocus = af * 9.0 * hunt * hunt;
 
@@ -62,7 +61,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         (fx_value_noise1(seed ^ 0x0AEAu, t * r * 0.8) - 0.5) * 2.0;
     const float gain = 1.0 + target * ae * 0.55;
     col *= gain;
-    // Gain drags the noise floor with it, so shadows crawl on a pump up.
     const float floor_amt = ae * max(gain - 1.0, 0.0) * 0.35;
     if (floor_amt > 0.001) {
         const float n =

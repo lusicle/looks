@@ -1,6 +1,3 @@
-// Frame render cache: LRU byte budget, context invalidation,
-// and the history scan that gates cacheability.
-
 #include "test_framework.h"
 
 #include "doc/effects.h"
@@ -58,10 +55,10 @@ TEST(cache_budget_evicts_lru) {
     cache.insert(1, 0, 4, 2, fill(4, 2, 0));
     cache.insert(1, 1, 4, 2, fill(4, 2, 1));
     cache.insert(1, 2, 4, 2, fill(4, 2, 2));
-    CHECK(cache.find(0) != nullptr);   // freshen 0: frame 1 is now the LRU
+    CHECK(cache.find(0) != nullptr);   // find freshens 0; frame 1 is now LRU
     cache.insert(1, 3, 4, 2, fill(4, 2, 3));
     CHECK_EQ(cache.count(), 3u);
-    CHECK(cache.find(1) == nullptr);   // evicted
+    CHECK(cache.find(1) == nullptr);
     CHECK(cache.find(0) != nullptr);
     CHECK(cache.find(2) != nullptr);
     CHECK(cache.find(3) != nullptr);
@@ -99,21 +96,20 @@ TEST(history_scan_gates_cache) {
     doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Feedback));
     CHECK(doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack.back().bypass = true;   // bypassed never dispatches
+    doc.looks[0].layers[0].stack.back().bypass = true;
     CHECK(!doc::document_uses_history(doc));
 }
 
 TEST(history_scan_quantize_rd_stipple) {
-    // The quantizer is pure except in RD-stipple mode (dither 9), whose
-    // Gray-Scott state accumulates across frames.
+    // params[2] is the dither mode; only mode 9 (RD stipple) has state.
     doc::Document doc;
     doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Quantize));
     CHECK(!doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack[0].params[2] = 8.0f;   // level cycle: still pure
+    doc.looks[0].layers[0].stack[0].params[2] = 8.0f;
     CHECK(!doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack[0].params[2] = 9.0f;   // RD stipple: stateful
+    doc.looks[0].layers[0].stack[0].params[2] = 9.0f;
     CHECK(doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack[0].params[2] = 13.0f;  // ordered patterns: pure
+    doc.looks[0].layers[0].stack[0].params[2] = 13.0f;
     CHECK(!doc::document_uses_history(doc));
 }

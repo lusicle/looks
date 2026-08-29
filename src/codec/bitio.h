@@ -1,6 +1,4 @@
-// Bitstream I/O + exp-Golomb VLC — shared by the mezzanine and mosh codecs
-// (codec_core). MSB-first bit order. Fully deterministic:
-// identical input produces identical bytes on every platform.
+// MSB-first bit order. Output is bit-exact on all platforms.
 
 #pragma once
 
@@ -9,12 +7,7 @@
 
 namespace looks::codec {
 
-// Bytes are staged in a local chunk and bulk-appended to `out` — one vector
-// insert per 4 KB instead of a push_back per byte. That keeps the hot loop
-// out of the STL entirely, which matters twice: debug-CRT vector writes
-// take a process-global lock (parallel encode threads would serialize), and
-// even optimized push_back costs more than a store. `out` is only valid
-// after finish().
+// out is valid only after finish().
 class BitWriter {
 public:
     explicit BitWriter(std::vector<uint8_t>& out) : out_(out) {}
@@ -33,7 +26,6 @@ public:
         for (int i = count - 1; i >= 0; --i) put_bit((value >> i) & 1u);
     }
 
-    // Unsigned exp-Golomb.
     void put_ue(uint32_t v) {
         const uint32_t x = v + 1;
         int bits = 0;
@@ -42,13 +34,11 @@ public:
         put_bits(x, bits + 1);
     }
 
-    // Signed exp-Golomb (0, 1, -1, 2, -2, ...).
     void put_se(int32_t v) {
         put_ue(v > 0 ? static_cast<uint32_t>(v) * 2 - 1
                      : static_cast<uint32_t>(-v) * 2);
     }
 
-    // Pads the final partial byte with zeros and flushes staged bytes.
     void finish() {
         while (filled_ != 0) put_bit(0);
         spill();

@@ -1,4 +1,4 @@
-// Display-referred core.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float levels;
-    float mode;   // 0 rgb, 1 luma-only banding
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -32,7 +32,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float n = max(levels, 2.0);
     float3 c;
     if (mode >= 0.5) {
-        // Adding the luma delta carries the chroma vector across intact.
         const float l = fx_luma(enc);
         const float ql = round(l * (n - 1.0)) / (n - 1.0);
         c = saturate(enc + (ql - l));

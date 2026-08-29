@@ -37,7 +37,7 @@ std::filesystem::path executable_dir() {
 }
 
 std::string path_to_u8(const std::filesystem::path& path) {
-    const std::wstring& w = path.native();   // UTF-16 on Windows
+    const std::wstring& w = path.native();
     std::string out;
     out.reserve(w.size());
     auto put = [&](uint32_t cp) {
@@ -65,7 +65,7 @@ std::string path_to_u8(const std::filesystem::path& path) {
             cp = 0x10000 + ((cp - 0xD800) << 10) +
                  (static_cast<uint16_t>(w[i++]) - 0xDC00);
         } else if (cp >= 0xD800 && cp <= 0xDFFF) {
-            cp = 0xFFFD;   // unpaired surrogate
+            cp = 0xFFFD;
         }
         put(cp);
     }
@@ -88,7 +88,7 @@ std::filesystem::path u8_to_path(std::string_view utf8) {
             i += 1;
         } else if ((b0 & 0xE0) == 0xC0 && cont(1)) {
             cp = (static_cast<uint32_t>(b0 & 0x1F) << 6) | (b[i + 1] & 0x3F);
-            if (cp < 0x80) cp = 0xFFFD;   // overlong
+            if (cp < 0x80) cp = 0xFFFD;
             i += 2;
         } else if ((b0 & 0xF0) == 0xE0 && cont(1) && cont(2)) {
             cp = (static_cast<uint32_t>(b0 & 0x0F) << 12) |
@@ -104,7 +104,7 @@ std::filesystem::path u8_to_path(std::string_view utf8) {
             if (cp < 0x10000 || cp > 0x10FFFF) cp = 0xFFFD;
             i += 4;
         } else {
-            i += 1;   // stray byte
+            i += 1;
         }
         if (cp >= 0x10000) {
             const uint32_t v = cp - 0x10000;

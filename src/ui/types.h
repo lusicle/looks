@@ -1,8 +1,5 @@
-// UI core types (mirrors the reference toolkit's types.h — first-party
-// implementation). Colors are LINEAR floats internally; to_rgba8() re-encodes
-// RGB to sRGB bytes (keeps precision in the dark UI ladder) with linear
-// alpha, and the vertex shaders decode back to linear so interpolation and
-// blending stay linear. Units are logical px unless suffixed _physical.
+// Colors are linear floats; to_rgba8 packs sRGB bytes, shaders decode back.
+// Units are logical px unless the name says _physical.
 
 #pragma once
 
@@ -54,7 +51,6 @@ struct Color {
         return {r, g, b, a};
     }
 
-    // Perceptual (sRGB-encoded) inputs -> linear storage.
     static Color srgb(float r, float g, float b, float a = 1.0f) {
         return {srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a};
     }
@@ -66,7 +62,6 @@ struct Color {
 
     Color with_alpha(float alpha) const { return {r, g, b, alpha}; }
 
-    // Little-endian packed R,G,B,A bytes; RGB re-encoded to sRGB.
     uint32_t to_rgba8() const {
         auto encode = [](float linear) -> uint32_t {
             float e = linear_to_srgb(std::clamp(linear, 0.0f, 1.0f));

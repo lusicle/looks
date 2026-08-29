@@ -1,13 +1,4 @@
-// Encoded space: these artifacts live in the signal, not the scene.
-//
-// The real NTSC path, not a lookalike: luma plus quadrature chroma
-// modulated onto a subcarrier at 4 virtual samples per cycle, phase
-// alternating per line and stepping per frame, then separated again
-// imperfectly. The boxcar-4 luma notch leaves carrier residue where
-// chroma changes (dot crawl, crawling because of the phase steps); the
-// chroma demodulator swallows whatever luma detail reaches it and
-// returns it as drifting color (rainbow). S-video keeps the bandlimits
-// but never muxes, so both cross artifacts vanish there by construction.
+// Operate in encoded space. The artifacts live in the signal.
 
 #include "fx_common.slang"
 
@@ -21,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;          // 0 composite, 1 s-video
+    float mode;
     float res;           // virtual luma samples across the width
     float chroma_res;    // virtual chroma samples across the width
     float dot_crawl;
@@ -32,7 +23,7 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// NTSC YIQ over encoded R'G'B'.
+// The input RGB must be encoded, not linear.
 float3 rgb_to_yiq(float3 c)
 {
     return float3(dot(c, float3(0.299, 0.587, 0.114)),
@@ -59,16 +50,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const bool svideo = mode >= 0.5;
     const float smp = max(res, 32.0);
-    // This pixel's position in virtual samples; the virtual scanline
-    // raster keeps square virtual pixels so the artifact geometry
-    // scales with the sample rate, not the canvas.
+    // n0 and vline use virtual samples. Virtual pixels stay square.
     const float n0 = uv.x * smp;
     const uint vline = uint(uv.y * smp * size.y / size.x);
     // Carrier: 4 samples per cycle, 180 deg per line, 90 deg per frame.
     const float line_ph = 3.14159265 * float(vline & 1u) +
                           1.57079633 * float(frame & 3u);
 
-    // ---- luma: boxcar-4 across one carrier period.
     float y_sep = 0.0;
     float comp_c = 0.0;
     [unroll]
@@ -82,16 +70,13 @@ void main(uint3 tid : SV_DispatchThreadID)
                             ? yiq.x
                             : yiq.x + yiq.y * cos(th) + yiq.z * sin(th);
         y_sep += c * 0.25;
-        // Center tap keeps full carrier amplitude for the crawl residue.
+        // One raw tap keeps full carrier amplitude for the crawl residue.
         if (k == 1) comp_c = c;
     }
-    // A worse notch keeps more of everything near the carrier: sharper
-    // luma AND dots. S-video luma never carried chroma to begin with.
     const float y_out = svideo
                             ? y_sep
                             : lerp(y_sep, comp_c, saturate(dot_crawl) * 0.6);
 
-    // ---- chroma: demodulate over the chroma bandwidth window.
     const float cres = clamp(chroma_res, 8.0, smp);
     const float span = smp / cres * 2.0;    // window in virtual samples
     const float stride = span / 8.0;
@@ -111,8 +96,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         } else {
             const float th = 1.57079633 * n + line_ph;
             const float c = yiq.x + yiq.y * cos(th) + yiq.z * sin(th);
-            // Perfect separation subtracts true luma; rainbow lets the
-            // raw signal through, so luma HF demodulates as color.
             const float feed = c - (1.0 - saturate(rainbow)) * yiq.x;
             iq += 2.0 * feed * float2(cos(th), sin(th)) * wgt;
         }

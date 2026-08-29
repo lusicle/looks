@@ -1,5 +1,4 @@
-// Encoded-domain mapping, and unlike the Quantizer's palettes this ramp
-// is continuous.
+// Map the luma in the encoded domain, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,9 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float sh_hue;    // stop at black
-    float mid_hue;   // stop at middle gray
-    float hi_hue;    // stop at white
+    float sh_hue;
+    float mid_hue;
+    float hi_hue;
     float sat;
 };
 
@@ -33,9 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float l = fx_luma(fx_srgb_oetf(saturate(base.rgb)));
 
-    // The stops keep a rising luminance ramp so tonality survives, and
-    // the dark stop stays near-black so the hue reads in the low mids
-    // rather than lifting the floor into a wash.
+    // The stop luminances must rise. Keep the dark stop near black.
     const float3 c0 = fx_hue_to_rgb(sh_hue) * 0.12;
     const float3 c1 = fx_hue_to_rgb(mid_hue) * 0.6;
     const float3 c2 =

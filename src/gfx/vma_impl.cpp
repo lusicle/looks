@@ -1,6 +1,4 @@
-// Single TU compiling the VMA implementation. Configuration macros
-// (VMA_STATIC_VULKAN_FUNCTIONS=0, VMA_DYNAMIC_VULKAN_FUNCTIONS=1) come from
-// the build so every includer agrees.
+// VMA config macros come from the build; do not define them here.
 
 #include "gfx/vk_api.h"
 

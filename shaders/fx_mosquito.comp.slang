@@ -1,4 +1,4 @@
-// Encoded space: this is a codec artifact, not scene light.
+// Work in encoded space. This is a codec artifact, not scene light.
 
 #include "fx_common.slang"
 
@@ -30,8 +30,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Max gradient over a ring of probes, so the shimmer hugs BOTH sides
-    // of an edge rather than only the side this pixel sits on.
+    // Take the max gradient on a ring so the shimmer hugs both sides.
     const float2 px = 1.0 / size;
     float edge = 0.0;
     [unroll]
@@ -53,7 +52,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const uint tick = uint(t * max(rate, 0.01));
-    // 2px cells, standing in for DCT basis residue.
+    // The cells are 2 px.
     const float n = fx_hash01(fx_hash4(seed ^ tick * 0x9E37u, tick,
                                        tid.x / 2u, tid.y / 2u)) - 0.5;
 

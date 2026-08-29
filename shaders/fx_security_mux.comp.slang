@@ -1,6 +1,4 @@
-// The engine dispatches this once per age band of the past-frames ring,
-// as slit-scan does. Each tile's seeded delay picks exactly one band, so
-// every other dispatch returns early for that tile.
+// The engine dispatches this once for each age band of the ring.
 
 #include "fx_common.slang"
 
@@ -16,17 +14,17 @@ cbuffer Push
     float fps;
     float cols;
     float rows_n;
-    float spread;    // how deep tile delays reach into the ring
+    float spread;
     float mono;
     float osd;
-    uint pass_age;   // engine-appended age band for this dispatch
+    uint pass_age;   // the engine appends this age band word
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D history;   // frame at age == pass_age
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
-static const uint kRing = 16;   // matches the engine's kSlitRing
+static const uint kRing = 16;   // must match the engine kSlitRing
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -52,7 +50,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Tile-local uv: every monitor shows the full frame.
     const float2 luv = float2(frac(uv.x * float(nc)),
                               frac(uv.y * float(nr)));
     const float4 feed = history.SampleLevel(luv, 0);
@@ -87,7 +84,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             col_a = max(col_a, o);
         }
 
-        // Cam index: tile + 1 dots along the bottom edge.
         const float2 dpx = tpx - float2(8.0, tsz.y - 9.0);
         if (dpx.y >= 0.0 && dpx.y < 3.0 && dpx.x >= 0.0) {
             const float slot_f = dpx.x / 6.0;

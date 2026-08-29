@@ -1,4 +1,4 @@
-// Inverse-maps in PIXEL space, not uv, so rotation stays aspect-true.
+// Inverse-map in pixel space, not uv, so rotation stays aspect-true.
 
 #include "fx_common.slang"
 
@@ -50,17 +50,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int em = int(edge_mode + 0.5);
     float coverage = 1.0;
     if (em == 0) {
-        // Half-pixel analytic AA on the uncovered edge.
         const float2 d = min(suv, 1.0 - suv) * dim;
         coverage = saturate(min(d.x, d.y) + 0.5);
         suv = clamp(suv, 0.0, 1.0);
     } else if (em == 2) {
         suv = frac(suv);
     } else if (em == 3) {
-        // Triangle wave, 0..1..0 over a 2-frame period.
         suv = 1.0 - abs(frac(suv * 0.5) * 2.0 - 1.0);
     }
-    // em == 1 needs no case: the sampler already clamps.
+    // em == 1 needs no case. The sampler already clamps.
 
     float4 moved = input.SampleLevel(suv, 0) * coverage;
 

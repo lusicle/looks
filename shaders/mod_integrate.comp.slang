@@ -1,6 +1,5 @@
-// One thread per lane, marching across the frame accumulating FM phase
-// per channel (R, G, B) plus a luma phase in .a. Frequency is clamped
-// positive: phase must stay monotonic for the crest search downstream.
+// Channels R, G and B hold the FM phase. Channel a holds the luma phase.
+// The frequency must stay positive so the phase stays monotonic.
 
 #include "fx_common.slang"
 
@@ -12,10 +11,7 @@ cbuffer Push
     float omega;
     float distortion;
     float lowpass;
-    uint mode;          // bit 0: row lanes; bit 1: reversed march. The
-                        // march always follows the travel direction, so
-                        // the causal lowpass wake sits behind the lines
-                        // rather than on the incoming side.
+    uint mode;          // bit 0 is row lanes, bit 1 is a reversed march
     float knee;
 };
 
@@ -36,12 +32,10 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float alpha = lerp(1.0, 0.03, saturate(lowpass));
 
-    float4 sig_s = float4(-1.0, -1.0, -1.0, -1.0);   // filter state
+    float4 sig_s = float4(-1.0, -1.0, -1.0, -1.0);
     float4 phi = float4(0.0, 0.0, 0.0, 0.0);
 
-    // The lateral 3-tap average below is load-bearing: neighbouring lanes
-    // must accumulate similar phase through detailed regions, or the
-    // traces downstream shatter into incoherent fragments.
+    // Keep the lateral 3-tap average or the traces shatter.
     const float2 d_lane =
         (vert ? float2(0.0, 1.0) : float2(1.0, 0.0)) / size;
 
@@ -57,7 +51,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                 0.25));
         const float4 sig = float4(rgb, fx_luma(rgb));
 
-        if (sig_s.x < 0.0) sig_s = sig;               // filter warm-up
+        if (sig_s.x < 0.0) sig_s = sig;
         sig_s += alpha * (sig - sig_s);
 
         // Negative distortion inverts the signal.
@@ -65,16 +59,13 @@ void main(uint3 tid : SV_DispatchThreadID)
             distortion < 0.0
                 ? float4(1.0, 1.0, 1.0, 1.0) - sig_s
                 : sig_s;
-        // distortion is the EXTRA multiplier at full density (0 = off),
-        // and the response stays continuous everywhere: no dead zone, so
-        // even subtle shading slows the lines a little.
+        // distortion is the extra multiplier at full density. 0 is off.
         const float dext = abs(distortion);
         const float4 w4 = pow(max(s4, float4(0.0, 0.0, 0.0, 0.0)),
                               float4(1.0, 1.0, 1.0, 1.0) *
                                   (1.0 + knee * 3.0));
-        // Base capped at half the density cap so detail modulation keeps
-        // 2x headroom at any line count; total capped at 0.25 cycles/px,
-        // a 4px minimum trace pitch.
+        // The base caps at half the density cap to keep 2x headroom.
+        // The total caps at 0.25 cycles/px, a 4 px minimum trace pitch.
         const float base_f = min(omega / float(steps), 0.125);
         const float4 f = min(base_f * (1.0 + dext * w4),
                              float4(0.25, 0.25, 0.25, 0.25));

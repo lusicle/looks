@@ -14,9 +14,7 @@ namespace {
 std::mutex g_log_mutex;
 void (*g_fatal_sink)(const char* message) = nullptr;
 
-// Session log beside the exe: stderr is invisible in a GUI build,
-// so post-crash diagnosis needs a file. Truncated per run, flushed per
-// line — the tail must survive an abort().
+// The file is truncated for each run and flushed for each line.
 FILE* log_file() {
     static FILE* file = [] {
         wchar_t path[MAX_PATH];
@@ -36,12 +34,8 @@ void log_emit(const char* level, const char* fmt, va_list args) {
     std::vsnprintf(msg, sizeof(msg), fmt, args);
     char line[2112];
     std::snprintf(line, sizeof(line), "[%s] %s\n", level, msg);
-    // File FIRST, under the mutex, flushed: the on-disk tail is the
-    // post-mortem record and must keep advancing even when a console
-    // or attached debugger stalls the other sinks. Those write OUTSIDE
-    // the lock - a stalled stderr (frozen console selection, full
-    // pipe) or OutputDebugString wedge then blocks only its own
-    // caller, never every logging thread queued behind one mutex.
+    // Write to the file first, in the lock, and flush each line.
+    // Write the other sinks outside the lock so a stall blocks one thread.
     {
         std::lock_guard<std::mutex> lock(g_log_mutex);
         if (FILE* f = log_file()) {
@@ -87,8 +81,6 @@ void log_fatal(const char* fmt, ...) {
     std::vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
     log_error("%s", msg);
-    // The sink (installed by the app) tells the user before the process
-    // dies — autosave recovery picks the work up on the next launch.
     if (g_fatal_sink) g_fatal_sink(msg);
     std::abort();
 }

@@ -4,15 +4,14 @@
 #include <cmath>
 #include <cstring>
 
-#include "ui/font.h"     // utf8_decode
+#include "ui/font.h"
 #include "util/file.h"
 
 namespace looks::ui {
 
 namespace {
 
-// Big-endian readers, bounds-checked — 0 on overrun (malformed fonts
-// must never index out of the file).
+// Bounds-checked big-endian reads; overrun returns 0, never out of range.
 uint32_t rd8(const std::vector<uint8_t>& b, size_t off) {
     return off < b.size() ? b[off] : 0u;
 }
@@ -30,7 +29,7 @@ uint32_t rd32(const std::vector<uint8_t>& b, size_t off) {
            (static_cast<uint32_t>(b[off + 2]) << 8) | b[off + 3];
 }
 
-// Rasterizer working segment, bitmap px, y-down.
+// Segment in bitmap px, y-down.
 struct Seg {
     float x0, y0, x1, y1;
 };
@@ -50,7 +49,7 @@ std::optional<TtfFont> TtfFont::load(const std::filesystem::path& path) {
     const std::vector<uint8_t>& b = f.bytes_;
 
     const uint32_t sfnt = rd32(b, 0);
-    // 0x00010000 / 'true' are glyf-flavored; 'OTTO' is CFF — unsupported.
+    // 0x00010000 and 'true' are glyf; 'OTTO' is CFF, unsupported.
     if (sfnt != 0x00010000u && sfnt != 0x74727565u) return std::nullopt;
 
     uint32_t head = 0, maxp = 0, cmap = 0, hhea = 0, kern = 0;
@@ -87,7 +86,6 @@ std::optional<TtfFont> TtfFont::load(const std::filesystem::path& path) {
     f.num_hmetrics_ = static_cast<uint16_t>(rd16(b, hhea + 34));
     if (f.num_hmetrics_ == 0) f.num_hmetrics_ = 1;
 
-    // cmap: prefer format 12 (full Unicode), fall back to format 4.
     const uint32_t n_sub = rd16(b, cmap + 2);
     uint32_t best4 = 0, best12 = 0;
     for (uint32_t i = 0; i < n_sub && i < 32; ++i) {
@@ -106,7 +104,7 @@ std::optional<TtfFont> TtfFont::load(const std::filesystem::path& path) {
         return std::nullopt;
     }
 
-    // kern format 0, horizontal (coverage bit 0, format byte 0).
+    // Accept only kern format 0 with horizontal coverage.
     if (kern) {
         const uint32_t n_kt = rd16(b, kern + 2);
         uint32_t sub = kern + 4;
@@ -143,7 +141,7 @@ uint32_t TtfFont::glyph_index(uint32_t cp) const {
         }
         return 0;
     }
-    // Format 4 (BMP only).
+    // cmap format 4; BMP only.
     if (cp > 0xFFFF) return 0;
     const uint32_t seg2 = rd16(b, sub + 6);
     const uint32_t ends = sub + 14;
@@ -206,7 +204,7 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
     const uint32_t g = glyf_off_ + off1;
     const int n_cont = static_cast<int>(rd16s(b, g));
 
-    // Font-unit point -> bitmap px (y-up; the caller flips).
+    // Font units to px, y-up; the caller flips to y-down.
     auto map_x = [&](float x, float y) {
         return (xf[0] * x + xf[2] * y + xf[4]) * scale_px;
     };
@@ -215,7 +213,7 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
     };
 
     if (n_cont < 0) {
-        // Composite: children transformed by F2Dot14 2x2 + offset.
+        // Composite glyph: the child transform is F2Dot14 2x2 plus an offset.
         size_t p = g + 10;
         for (int guard = 0; guard < 16; ++guard) {
             const uint32_t flags = rd16(b, p);
@@ -254,7 +252,7 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
                 d = f2dot14(p + 6);
                 p += 8;
             }
-            // parent ∘ child.
+            // cxf applies the child first, then the parent.
             const float cxf[6] = {
                 xf[0] * a + xf[2] * bb, xf[1] * a + xf[3] * bb,
                 xf[0] * c + xf[2] * d,  xf[1] * c + xf[3] * d,
@@ -267,7 +265,6 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
     }
     if (n_cont == 0) return;
 
-    // Simple glyph decode.
     const size_t ends_at = g + 10;
     const uint32_t n_pts_u =
         rd16(b, ends_at + 2u * static_cast<uint32_t>(n_cont) - 2) + 1;
@@ -312,8 +309,7 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
         ys[i] = acc;
     }
 
-    // Contours: quadratics with implied on-curve midpoints, flattened
-    // adaptively by px extent.
+    // Quadratics; each off-curve pair implies an on-curve midpoint.
     auto flatten = [&](std::vector<float>& out, float x0, float y0,
                        float cx, float cy, float x1, float y1) {
         const float ext = std::fabs(x0 - cx) + std::fabs(y0 - cy) +
@@ -348,8 +344,7 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
         auto on = [&](size_t k) {
             return (flags[start + (k % count)] & 0x01u) != 0;
         };
-        // Anchor on an on-curve point; an all-off-curve contour anchors
-        // on the first implied midpoint.
+        // An all-off-curve contour anchors on the first implied midpoint.
         size_t first = 0;
         while (first < count && !on(first)) ++first;
         std::vector<float> out;
@@ -376,8 +371,6 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
                 cur_x = px(nk);
                 cur_y = py(nk);
             } else {
-                // Control point; its segment ends at the next on-curve
-                // point or the implied midpoint to the next control.
                 float ex, ey;
                 if (on(nk + 1)) {
                     ex = px(nk + 1);
@@ -394,7 +387,6 @@ void TtfFont::append_outline(uint32_t glyph, const float xf[6],
             }
             k = k + 1;
         }
-        // Close back to the anchor.
         if (cur_x != sx || cur_y != sy) {
             out.push_back(sx);
             out.push_back(sy);
@@ -412,7 +404,7 @@ TtfFont::Sdf TtfFont::rasterize(std::string_view utf8, float size_px,
     spread_px = std::max(spread_px, 2.0f);
     const float pad = std::ceil(spread_px) + 2.0f;
 
-    // Layout: pen advance + kerning in font units, contours in px (y-up).
+    // The pen advances in font units; contours land in px, y-up.
     std::vector<std::vector<float>> contours;
     float pen = 0.0f;
     uint32_t prev = 0;
@@ -426,7 +418,7 @@ TtfFont::Sdf TtfFont::rasterize(std::string_view utf8, float size_px,
         pen += advance_units(gid);
         prev = gid;
         if (pen * scale > static_cast<float>(kMaxBitmapW) - 2.0f * pad)
-            break;   // overlong string: truncate at the width cap
+            break;   // overlong string truncates at the width cap
     }
     if (contours.empty()) return sdf;
 
@@ -441,7 +433,7 @@ TtfFont::Sdf TtfFont::rasterize(std::string_view utf8, float size_px,
     if (w < 4 || h < 4) return sdf;
     const float baseline = pad + asc;
 
-    // px y-up -> bitmap y-down segments.
+    // Flip y-up px to y-down bitmap.
     std::vector<Seg> segs;
     for (const std::vector<float>& c : contours) {
         const size_t n = c.size() / 2;
@@ -456,7 +448,7 @@ TtfFont::Sdf TtfFont::rasterize(std::string_view utf8, float size_px,
         }
     }
 
-    // Inside mask: per-row non-zero winding scanline.
+    // The fill rule is non-zero winding.
     std::vector<uint8_t> inside(static_cast<size_t>(w) * h, 0);
     std::vector<std::pair<float, int>> hits;
     for (uint32_t y = 0; y < h; ++y) {
@@ -488,9 +480,7 @@ TtfFont::Sdf TtfFont::rasterize(std::string_view utf8, float size_px,
         }
     }
 
-    // Banded exact distance: segments bucketed on a spread-sized grid,
-    // each texel checks its 3x3 neighborhood (cell >= spread, so every
-    // segment within reach is covered); empty neighborhoods clamp.
+    // cell >= spread, so the 3x3 neighborhood holds every segment in range.
     const float cell = std::max(spread_px, 6.0f);
     const uint32_t gw = static_cast<uint32_t>(std::ceil(w / cell)) + 1;
     const uint32_t gh = static_cast<uint32_t>(std::ceil(h / cell)) + 1;

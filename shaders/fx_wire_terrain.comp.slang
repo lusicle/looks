@@ -1,7 +1,3 @@
-// Hidden-line removal comes from walking rows near-to-far and tracking
-// the per-column silhouette: a far row draws only where it rises above
-// everything nearer.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -20,15 +16,13 @@ cbuffer Push
     float horizon;   // screen position, 0 = top
     float line_w;    // px
     float grid;
-    float color;     // 0 synth green, 1 source color
+    float color;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// The vertical band average is load-bearing: the wire height amplifies
-// 8-bit and codec luma quantization, so without it a single code-value
-// step pops a whole flat segment at once.
+// Keep the band average. It dilutes 8-bit luma quantization steps.
 float wt_luma(Sampler2D tex, float2 suv, float band_v)
 {
     const float l0 = fx_luma(tex.SampleLevel(suv, 0).rgb);
@@ -61,8 +55,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     for (uint i = 0; i < n; ++i) {
         const float d = (float(i) + 0.5) / float(n);   // 0 near, 1 far
         const float persp = pow(d, lerp(1.0, 2.2, saturate(pitch)));
-        // Screen x maps to a stretched source u, so out of range means
-        // the receding plane has no geometry at this pixel.
         const float su =
             0.5 + (uv.x - 0.5) * lerp(1.0, 2.0, d * saturate(pitch));
         if (su < 0.0 || su > 1.0) continue;
@@ -79,8 +71,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float y_line = y_base - l * height_px;
 
         if (y_line < sil) {
-            // Slope-aware distance: cover the rows the wire sweeps
-            // through in this column, or steep segments bead into dashes.
+            // Keep the slope term. Without it the wire beads into dashes.
             const float dsu =
                 (1.5 / size.x) * lerp(1.0, 2.0, d * saturate(pitch));
             const float slope_px =

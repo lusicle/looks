@@ -1,6 +1,3 @@
-// codec_core + mezzanine tests: bit I/O, DCT roundtrip, frame quality,
-// bit-exact determinism, .mez file roundtrip.
-
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -14,7 +11,6 @@ using namespace looks::codec;
 
 namespace {
 
-// Deterministic pseudo-random (counter-hash style, like the engine will use).
 uint32_t hash32(uint32_t x) {
     x ^= x >> 16;
     x *= 0x7FEB352Du;
@@ -24,7 +20,6 @@ uint32_t hash32(uint32_t x) {
     return x;
 }
 
-// Synthetic I420 frame: gradient + checkerboard + hashed noise.
 DecodedFrame make_test_frame(uint32_t w, uint32_t h, uint32_t seed) {
     DecodedFrame f;
     f.width = w;
@@ -123,7 +118,6 @@ TEST(codec_frame_roundtrip_quality) {
     std::vector<uint8_t> encoded;
     encode_frame(src.view(), 90, encoded);
     CHECK(!encoded.empty());
-    // Better than uncompressed? (sanity: it should compress a lot)
     CHECK(encoded.size() < src.y.size());
 
     DecodedFrame out;
@@ -134,7 +128,6 @@ TEST(codec_frame_roundtrip_quality) {
     CHECK(plane_psnr(src.u, out.u) > 32.0);
     CHECK(plane_psnr(src.v, out.v) > 32.0);
 
-    // Lower quality -> smaller stream, still decodable.
     std::vector<uint8_t> low;
     encode_frame(src.view(), 20, low);
     CHECK(low.size() < encoded.size());
@@ -144,8 +137,7 @@ TEST(codec_frame_roundtrip_quality) {
 }
 
 TEST(codec_lossless_roundtrip) {
-    // Lossless mode: quality 0 must reproduce every byte of
-    // every plane, including odd dimensions.
+    // Quality 0 is lossless: every byte of every plane must return.
     for (const auto [w, h] : {std::pair{128u, 96u}, std::pair{71u, 53u}}) {
         const DecodedFrame f = make_test_frame(w, h, 5);
         std::vector<uint8_t> encoded;
@@ -157,7 +149,6 @@ TEST(codec_lossless_roundtrip) {
         CHECK(out.y == f.y);
         CHECK(out.u == f.u);
         CHECK(out.v == f.v);
-        // The parallel flag must not change lossless output either.
         DecodedFrame out2;
         CHECK(decode_frame(encoded.data(), encoded.size(), w, h, out2,
                            /*parallel=*/true));
@@ -166,8 +157,7 @@ TEST(codec_lossless_roundtrip) {
 }
 
 TEST(codec_two_phase_intra_matches) {
-    // The rate-loop path (DCT once + entropy per quality) must produce the
-    // exact bytes of the one-shot encoder — odd size hits flat edge blocks.
+    // The odd size makes the encoder hit flat edge blocks.
     const DecodedFrame f = make_test_frame(70, 50, 9);
     for (const int q : {12, 37, 85}) {
         std::vector<uint8_t> one_shot, two_phase;
@@ -180,9 +170,7 @@ TEST(codec_two_phase_intra_matches) {
 }
 
 TEST(codec_intra_recon_matches_decode) {
-    // The entropy-free wire must reproduce encode+decode EXACTLY: the mosh
-    // box's output pixels ride on this equivalence. Odd size hits flat
-    // edge blocks.
+    // The odd size makes the encoder hit flat edge blocks.
     const DecodedFrame f = make_test_frame(70, 50, 4);
     for (const int q : {5, 35, 90}) {
         IntraDct dct;
@@ -201,9 +189,6 @@ TEST(codec_intra_recon_matches_decode) {
 }
 
 TEST(codec_intra_entropy_bytes_exact) {
-    // The rate probe must count the writer's bytes exactly: quality
-    // selection in the starvation loop depends on it, and a one-byte drift
-    // would change which quality ships.
     const DecodedFrame f = make_test_frame(70, 50, 8);
     IntraDct dct;
     intra_dct(f.view(), dct);
@@ -231,7 +216,7 @@ TEST(codec_determinism) {
     std::vector<uint8_t> a, b;
     encode_frame(src.view(), 77, a);
     encode_frame(src.view(), 77, b);
-    CHECK(a == b);   // bit-exact
+    CHECK(a == b);
 
     DecodedFrame da, db;
     CHECK(decode_frame(a.data(), a.size(), 64, 64, da));
@@ -262,7 +247,7 @@ TEST(codec_mez_file_roundtrip) {
         CHECK_EQ(reader.timescale(), 30000u);
         CHECK_EQ(reader.frame_duration(), 1001u);
 
-        // Random access: decode frame 2 first, then 0.
+        // Decode out of order to test random access.
         DecodedFrame f2, f0;
         CHECK(reader.decode(2, f2));
         CHECK(reader.decode(0, f0));
@@ -270,26 +255,23 @@ TEST(codec_mez_file_roundtrip) {
         const DecodedFrame src0 = make_test_frame(96, 64, 10);
         CHECK(plane_psnr(src2.y, f2.y) > 30.0);
         CHECK(plane_psnr(src0.y, f0.y) > 30.0);
-        CHECK(!reader.decode(3, f0));   // out of range
+        CHECK(!reader.decode(3, f0));
     }
     std::filesystem::remove(path);
 }
 
 TEST(codec_mez_partial_writer_removes_its_file) {
-    // An unfinished writer is an aborted import: the destructor must
-    // DELETE the partial, never seal it - a sealed partial reads as a
-    // valid shorter clip and poisons the bundle cache.
+    // The destructor deletes an unfinished file, and never seals it.
     const auto path =
         std::filesystem::temp_directory_path() / "looks_partial.mez";
     {
         MezWriter writer;
         CHECK(writer.open(path, 96, 64, 30000, 1001, 88));
         CHECK(writer.add_frame(make_test_frame(96, 64, 3).view()));
-        // No finish(): simulated cancel/error path.
+        // The missing finish() simulates a cancel.
     }
     CHECK(!std::filesystem::exists(path));
 
-    // A finished writer's file survives and reopens.
     {
         MezWriter writer;
         CHECK(writer.open(path, 96, 64, 30000, 1001, 88));
@@ -330,7 +312,6 @@ TEST(codec_mez_set_frame_count) {
         CHECK(!reader.decode(9, f));
     }
 
-    // Shrink below the original count.
     CHECK(mez_set_frame_count(path, 3));
     {
         MezReader reader;
@@ -343,7 +324,7 @@ TEST(codec_mez_set_frame_count) {
         CHECK(!reader.decode(3, f));
     }
 
-    CHECK(!mez_set_frame_count(path, 0));   // rejected, file untouched
+    CHECK(!mez_set_frame_count(path, 0));
     {
         MezReader reader;
         std::string error;
@@ -354,10 +335,7 @@ TEST(codec_mez_set_frame_count) {
 }
 
 TEST(codec_mez_payload_offset_aliases_hold_frames) {
-    // Hold-frame entries repeat one payload offset - the contract the
-    // decode pool's still alias rides (decode once, serve every frame
-    // that points at the same payload). Distinct frames get distinct
-    // offsets.
+    // Hold frames repeat one payload offset; distinct frames do not.
     const auto path =
         std::filesystem::temp_directory_path() / "looks_test_alias.mez";
     {
@@ -377,7 +355,7 @@ TEST(codec_mez_payload_offset_aliases_hold_frames) {
     CHECK_EQ(reader.payload_offset(1), held);
     CHECK_EQ(reader.payload_offset(3), held);
     CHECK(reader.payload_offset(4) != held);
-    CHECK_EQ(reader.payload_offset(5), uint64_t{0});   // out of range
+    CHECK_EQ(reader.payload_offset(5), uint64_t{0});
     reader.close();
     std::filesystem::remove(path);
 }

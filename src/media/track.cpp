@@ -12,8 +12,7 @@ namespace looks::media {
 
 namespace {
 
-// Fixed budgets: determinism comes from never letting timing or load
-// change a count or an order.
+// Fixed budgets: timing or load must never change a count or an order.
 constexpr int kMaxFeatures = 96;
 constexpr int kRedetectBelow = 48;
 constexpr int kRedetectEvery = 30;
@@ -27,8 +26,7 @@ constexpr float kInlierThresh = 0.008f;  // canvas heights
 constexpr uint32_t kCacheMagic = 0x334B544Cu;  // 'LTK3'
 
 struct Pyramid {
-    // Level 0 is the working base (source downsampled so the max dim
-    // fits kBaseMax); each level halves.
+    // Level 0 is the working base, max dim under kBaseMax; levels halve.
     static constexpr uint32_t kBaseMax = 640;
     std::vector<float> img[kPyrLevels];
     uint32_t w[kPyrLevels] = {}, h[kPyrLevels] = {};
@@ -52,8 +50,6 @@ struct Pyramid {
 };
 
 void build_pyramid(const GrayFrame& src, Pyramid* pyr) {
-    // Integer decimation to the working base: pick the power-of-two
-    // step that brings the max dimension under kBaseMax, box-averaged.
     uint32_t step = 1;
     while (std::max(src.width, src.height) / step > Pyramid::kBaseMax)
         step <<= 1;
@@ -100,9 +96,8 @@ struct Feature {
     bool alive = true;
 };
 
-// Harris corners on level 0, best-per-cell NMS, ordered by (response
-// desc, y, x) so the pick is deterministic. Cells occupied by live
-// features are skipped so re-detection fills gaps instead of doubling.
+// Order picks by (response desc, y, x) so the pick is deterministic.
+// Occupied cells are skipped so re-detection fills gaps, not doubles.
 void detect_features(const Pyramid& pyr, std::vector<Feature>* feats,
                      uint32_t* next_id) {
     const uint32_t w = pyr.w[0], h = pyr.h[0];
@@ -172,15 +167,13 @@ void detect_features(const Pyramid& pyr, std::vector<Feature>* feats,
     }
 }
 
-// One feature through the pyramid, prev -> cur. Returns false on a lost
-// track (out of bounds, flat patch, high residual).
 bool klt_track(const Pyramid& prev, const Pyramid& cur, float* io_x,
                float* io_y) {
     const float sub = static_cast<float>(1 << (kPyrLevels - 1));
     float gx_total = 0.0f, gy_total = 0.0f;   // guess, top-level px
     float px = *io_x / sub, py = *io_y / sub;
     for (int l = kPyrLevels - 1; l >= 0; --l) {
-        // Spatial gradient matrix over the window at the PREV position.
+        // The gradient window samples the prev image position on purpose.
         float ixx = 0.0f, iyy = 0.0f, ixy = 0.0f;
         float grads_x[(2 * kKltWin + 1) * (2 * kKltWin + 1)];
         float grads_y[(2 * kKltWin + 1) * (2 * kKltWin + 1)];
@@ -249,7 +242,6 @@ bool klt_track(const Pyramid& prev, const Pyramid& cur, float* io_x,
         nx >= static_cast<float>(cur.w[0]) - 4.0f ||
         ny >= static_cast<float>(cur.h[0]) - 4.0f)
         return false;
-    // Residual: mean abs diff over the window at the solution.
     float resid = 0.0f;
     int n = 0;
     for (int dy = -kKltWin; dy <= kKltWin; ++dy)
@@ -270,7 +262,7 @@ struct Sim {
 };
 
 Sim compose(const Sim& outer, const Sim& inner) {
-    // outer(inner(p)): p -> s_i*R_i*p + t_i -> s_o*R_o*(that) + t_o.
+    // The result applies inner first, then outer.
     Sim r;
     r.scale = outer.scale * inner.scale;
     r.rot = outer.rot + inner.rot;
@@ -280,8 +272,7 @@ Sim compose(const Sim& outer, const Sim& inner) {
     return r;
 }
 
-// Closed-form least-squares similarity a -> b over paired points
-// (metric coords). False when degenerate.
+// Fits a -> b in metric coords; false when degenerate.
 bool fit_similarity(const std::vector<float>& ax, const std::vector<float>& ay,
                     const std::vector<float>& bx, const std::vector<float>& by,
                     const std::vector<int>& idx, Sim* out) {
@@ -347,7 +338,7 @@ bool track_run(uint32_t start, uint32_t end,
     std::vector<Feature> feats;
     uint32_t next_id = 1;
     std::vector<FeatureTrack> done;
-    std::vector<FeatureTrack> open;   // parallel to feats by id lookup
+    std::vector<FeatureTrack> open;
 
     auto record_point = [&](const Feature& f, uint32_t frame, float w,
                             float h) {
@@ -391,9 +382,6 @@ bool track_run(uint32_t start, uint32_t end,
             frame != start &&
             std::binary_search(out->cuts.begin(), out->cuts.end(), frame);
         if (at_cut) {
-            // New shot: nothing tracks across the boundary. Drop every
-            // live feature, re-anchor the chain at identity, detect
-            // fresh.
             for (Feature& f : feats)
                 if (f.alive) {
                     f.alive = false;
@@ -409,7 +397,7 @@ bool track_run(uint32_t start, uint32_t end,
             for (const Feature& f : feats)
                 record_point(f, frame, w0, h0);
         } else {
-            // Track every live feature prev -> cur, fixed order.
+            // Fixed iteration order keeps the solve deterministic.
             std::vector<float> pax, pay, pbx, pby;   // metric pairs
             for (Feature& f : feats) {
                 if (!f.alive) continue;
@@ -425,8 +413,6 @@ bool track_run(uint32_t start, uint32_t end,
                     retire(f.id);
                 }
             }
-            // Frame-to-frame similarity, RANSAC over the pairs, then a
-            // least-squares refit on the inlier set.
             Sim delta;
             std::vector<int> best_in;
             const size_t np = pax.size();
@@ -466,7 +452,6 @@ bool track_run(uint32_t start, uint32_t end,
                     fit_similarity(pax, pay, pbx, pby, best_in, &delta);
             }
             total = compose(delta, total);
-            // Residual on the inliers under the refit.
             if (!best_in.empty()) {
                 const float cc = std::cos(delta.rot) * delta.scale;
                 const float ss = std::sin(delta.rot) * delta.scale;
@@ -487,7 +472,6 @@ bool track_run(uint32_t start, uint32_t end,
                 err_sum += sf.error;
                 ++err_n;
             }
-            // Re-detect on the fixed cadence or when thin.
             int live = 0;
             for (const Feature& f : feats)
                 if (f.alive) ++live;
@@ -499,7 +483,6 @@ bool track_run(uint32_t start, uint32_t end,
                     if (f.alive && f.id >= first_new)
                         record_point(f, frame, w0, h0);
             }
-            // Compact retired features so the scan stays bounded.
             feats.erase(std::remove_if(feats.begin(), feats.end(),
                                        [](const Feature& f) {
                                            return !f.alive;
@@ -543,7 +526,7 @@ void h_apply(const float* h, float x, float y, float* ox, float* oy) {
     *oy = (h[3] * x + h[4] * y + h[5]) * iw;
 }
 
-// Unit square -> quad homography (the corner-pin adjugate construction).
+// Maps the unit square onto the quad.
 bool h_from_quad(const float qx[4], const float qy[4], float* out) {
     // Corners ordered 00, 10, 01, 11.
     const float dx1 = qx[1] - qx[3], dy1 = qy[1] - qy[3];
@@ -586,8 +569,7 @@ bool h_invert(const float* h, float* out) {
     return true;
 }
 
-// Exact 4-point homography a -> b: square->b composed with inverse of
-// square->a.
+// Exact 4-point homography a -> b.
 bool h_4point(const float ax[4], const float ay[4], const float bx[4],
               const float by[4], float* out) {
     float ha[9], hb[9], hai[9];
@@ -597,9 +579,7 @@ bool h_4point(const float ax[4], const float ay[4], const float bx[4],
     return true;
 }
 
-// Least-squares refit with h33 = 1 (normal equations, 8x8 Gaussian
-// elimination). Good in the planar-track regime; falls back to the
-// seed when the system degenerates.
+// The refit holds h33 = 1; a false return leaves the seed h unchanged.
 bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
              const std::vector<float>& bx, const std::vector<float>& by,
              const std::vector<int>& idx, float* io_h) {
@@ -609,8 +589,6 @@ bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
     for (int ii : idx) {
         const size_t i = static_cast<size_t>(ii);
         const double x = ax[i], y = ay[i], u = bx[i], v = by[i];
-        // Row 1: [x y 1 0 0 0 -ux -uy] . h = u
-        // Row 2: [0 0 0 x y 1 -vx -vy] . h = v
         const double r1[8] = {x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y};
         const double r2[8] = {0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y};
         for (int r = 0; r < 8; ++r) {
@@ -619,7 +597,6 @@ bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
             atb[r] += r1[r] * u + r2[r] * v;
         }
     }
-    // Gaussian elimination with partial pivoting, fixed order.
     int perm[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     for (int col = 0; col < 8; ++col) {
         int piv = col;
@@ -649,14 +626,8 @@ bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
     return true;
 }
 
-// ------------------------------------------------------------- 3D solve
-//
-// Per-shot structure from motion over the stored tracks. Coordinates:
-// observations are METRIC (centered uv, y down, x scaled by aspect so a
-// height is 1); cameras are world-to-camera x_cam = R(aa)·X + t with z
-// forward; projection is f·(x/z, y/z) in the same metric units, so
-// every residual below reads in canvas heights. The world frame is the
-// bootstrap camera; the bootstrap baseline is unit length (the gauge).
+// Observations are metric: centered uv, y down, x scaled by aspect.
+// Cameras are world-to-camera; residuals read in canvas heights.
 
 using util::jacobi_eigen_sym;
 using util::m3_det;
@@ -670,9 +641,7 @@ using util::svd3;
 using util::sym_solve;
 
 constexpr uint32_t kSfmMinFrames = 10;
-constexpr uint32_t kSfmBaWindow = 400;    // bundle-adjusted cams cap; the
-                                          // tail localizes against the
-                                          // adjusted structure
+constexpr uint32_t kSfmBaWindow = 400;    // bundle-adjusted camera cap
 constexpr int kSfmMinShared = 16;         // bootstrap pair floor
 constexpr double kSfmMinMotion = 0.006;   // median disparity, heights
 constexpr int kSfmEssIters = 192;
@@ -685,8 +654,7 @@ constexpr int kSfmMinPoints = 16;
 constexpr double kSfmMaxReproj = 0.02;    // solved-status ceiling
 constexpr double kSfmHomographyShare = 0.92;
 
-// Metric observation of a track at an absolute frame (tracks store
-// consecutive frames, so the lookup is index arithmetic).
+// The index arithmetic relies on tracks storing consecutive frames.
 bool track_obs(const FeatureTrack& t, uint32_t f, double aspect,
                double* mx, double* my) {
     if (t.points.empty() || f < t.points.front().frame ||
@@ -706,8 +674,7 @@ void cam_apply(const double r[9], const double t[3], const double X[3],
     out[2] = r[6] * X[0] + r[7] * X[1] + r[8] * X[2] + t[2];
 }
 
-// Squared metric reprojection error; a point behind the camera reads
-// as a fixed fat residual so gates and error sums stay finite.
+// A point behind the camera reads as a fixed large residual.
 double reproj_sq(const double r[9], const double t[3], double f,
                  const double X[3], double mx, double my) {
     double c[3];
@@ -718,9 +685,7 @@ double reproj_sq(const double r[9], const double t[3], double f,
     return du * du + dv * dv;
 }
 
-// Least-squares essential matrix over the index set (normalized
-// coordinates): nullspace eigenvector of A^T A, spectrum forced to
-// (1, 1, 0) through the SVD.
+// Inputs are normalized coordinates.
 void essential_fit(const std::vector<double>& ax,
                    const std::vector<double>& ay,
                    const std::vector<double>& bx,
@@ -761,8 +726,7 @@ double sampson_sq(const double e[9], double x1, double y1, double x2,
     return den > 1.0e-18 ? xex * xex / den : 1.0e18;
 }
 
-// Two-view DLT triangulation with P = [R|t] on normalized coordinates:
-// nullspace of the 4x4 A^T A.
+// Inputs are normalized coordinates.
 bool triangulate2(const double r1[9], const double t1[3], double x1,
                   double y1, const double r2[9], const double t2[3],
                   double x2, double y2, double X_out[3]) {
@@ -793,9 +757,7 @@ bool triangulate2(const double r1[9], const double t1[3], double x1,
     return true;
 }
 
-// Damped Gauss-Newton refine of one camera against fixed points.
-// Fixed iteration cap; the damping schedule reacts to the error but
-// depends only on the values, so the path is deterministic.
+// The damping path depends only on values, so it is deterministic.
 void refine_camera(const std::vector<double>& X,
                    const std::vector<double>& obs, double f, double aa[3],
                    double t[3]) {
@@ -870,10 +832,6 @@ void refine_camera(const std::vector<double>& X,
     }
 }
 
-// Homography inlier count over the pair's metric correspondences (the
-// existing 4-point RANSAC + LS refit) - the degeneracy arbiter: motion
-// a plane explains as well as the essential is a pan/static/planar
-// case that must NOT pretend to 3D-solve.
 int homography_inliers(const std::vector<float>& pax,
                        const std::vector<float>& pay,
                        const std::vector<float>& pbx,
@@ -907,11 +865,7 @@ int homography_inliers(const std::vector<float>& pax,
     return best;
 }
 
-// One shot's full solve. The pipeline: keyframe pair -> essential ->
-// cheirality -> triangulate -> incremental resection -> bundle
-// adjustment (two rounds around an observation prune). Long shots
-// adjust the first kSfmBaWindow cameras and localize the tail against
-// that structure, so poses stay in one gauge at bounded memory.
+// Long shots adjust kSfmBaWindow cams; the tail localizes in that gauge.
 void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
                    const std::function<bool()>& cancelled,
                    SfmSegment* seg) {
@@ -931,8 +885,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     }
     const uint32_t ba_nf = std::min(nf, kSfmBaWindow);
 
-    // Tracks with at least two observations inside the segment, id
-    // order (tracks never span cuts, so clipping is interval math).
     struct SegTrack {
         uint32_t t_index = 0;
         uint32_t first = 0, last = 0;   // inclusive absolute frames
@@ -949,11 +901,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     }
     if (st.size() < static_cast<size_t>(kSfmMinShared)) return;
 
-    // ---- keyframe pair: anchors every 6 frames across the whole
-    // window (real footage can open on a fade or junk cohort - the
-    // trackable stretch lives wherever it lives), partner scan, score
-    // = shared count x capped median disparity. Static footage never
-    // clears the motion floor and reports low-parallax honestly.
+    // Static footage never clears the motion floor; it reads low-parallax.
     uint32_t best_i = 0, best_j = 0;
     double best_score = 0.0;
     bool saw_pair = false;
@@ -1019,9 +967,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     const size_t np = pax.size();
     if (np < 8) return;
 
-    // ---- focal sweep: essential RANSAC per candidate, scored by the
-    // cheirality front count (then inliers). The winner seeds the
-    // adjustment, which refines focal continuously.
     const double kFocals[6] = {0.6, 0.8, 1.0, 1.3, 1.7, 2.4};
     double focal = 0.0;
     double boot_r[9], boot_t[3];
@@ -1059,7 +1004,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
             }
         }
         if (binl.size() < 8) continue;
-        // LS refit on the consensus, then recount.
         double e9[9];
         essential_fit(nax, nay, nbx, nby, binl.data(),
                       static_cast<int>(binl.size()), e9);
@@ -1071,7 +1015,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
             binl = std::move(inl2);
             std::memcpy(be, e9, sizeof(e9));
         }
-        // Decompose; four (R, t) candidates; cheirality votes.
         double u[9], sv[3], vt[9];
         svd3(be, u, sv, vt);
         if (m3_det(u) < 0.0) {   // proper U: flip the null column
@@ -1120,8 +1063,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     }
     if (best_front < kSfmMinShared / 2) return;
 
-    // ---- degeneracy arbiter: a homography that explains the essential
-    // consensus as well is a pan / static / planar shot.
+    // A homography that explains the consensus as well means no 3D solve.
     {
         std::vector<float> fax(np), fay(np), fbx(np), fby(np);
         for (size_t k = 0; k < np; ++k) {
@@ -1140,7 +1082,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
         }
     }
 
-    // ---- bootstrap: cameras at the pair, points from its inliers.
     const uint32_t li = best_i - s, lj = best_j - s;
     std::vector<SfmCamera> cams(nf);
     rodrigues_inv(boot_r, cams[lj].aa);
@@ -1181,9 +1122,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     }
     if (pt_track.size() < static_cast<size_t>(kSfmMinPoints)) return;
 
-    // ---- incremental resection + triangulation. Order: between the
-    // pair (left neighbor init), forward past it, then backward - all
-    // fixed. Each solved frame may triangulate tracks it newly covers.
+    // Resection order is fixed: between the pair, forward, then backward.
     std::vector<uint8_t> cam_solved(nf, 0);
     cam_solved[li] = cam_solved[lj] = 1;
     std::vector<double> rs_cache(nf * 9, 0.0);
@@ -1202,8 +1141,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
                            &my))
                 continue;
             const double* P = &pts[static_cast<size_t>(tk.point) * 3];
-            // Loose gate against the init pose keeps gross outliers out
-            // of the refine.
             if (reproj_sq(r0, cams[lf].t, focal, P, mx, my) > 0.08 * 0.08)
                 continue;
             X.insert(X.end(), {P[0], P[1], P[2]});
@@ -1213,8 +1150,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
             refine_camera(X, ob, focal, cams[lf].aa, cams[lf].t);
         cam_solved[lf] = 1;
         rodrigues(cams[lf].aa, &rs_cache[lf * 9]);
-        // New tracks first seen well at this frame: partner = solved
-        // frame with the widest disparity among the track's span.
         for (uint32_t sti = 0; sti < st.size(); ++sti) {
             SegTrack& tk = st[sti];
             if (tk.point >= 0) continue;
@@ -1255,10 +1190,7 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
     for (uint32_t lf = li; lf-- > 0 && !stop();) resect(lf, lf + 1);
     if (stop()) return;
 
-    // ---- bundle adjustment over the window: free cameras (all but
-    // the gauge) + shared focal on the reduced side, point blocks
-    // Schur-eliminated. Fixed iteration cap; value-driven damping and
-    // early convergence exit keep the path deterministic.
+    // Damping and exit depend only on values, so the path is deterministic.
     struct BaObs {
         uint32_t cam = 0, pt = 0;
         double u = 0.0, v = 0.0;
@@ -1400,11 +1332,8 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
                     yp[a2] += jp[a2] * jf0 + jp[3 + a2] * jf1;
                 }
             }
-            // Marquardt damping plus an additive floor: a camera with
-            // no live observations has an all-zero block that no
-            // multiplicative damping can lift - the floor makes its
-            // step exactly zero (gradient is zero too), holding the
-            // resection pose instead of sinking the whole solve.
+            // The additive floor zeroes the step of a camera with no
+            // live observations; that camera keeps its resection pose.
             double dmax = 0.0;
             for (int d = 0; d < m; ++d)
                 dmax = std::max(dmax,
@@ -1499,8 +1428,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
                 o0 = o1;
             }
             if (!sym_solve(S.data(), m, rhs.data())) {
-                // More damping makes S diagonally dominant; the
-                // iteration cap bounds the hunt.
                 lambda = std::min(lambda * 8.0, 1.0e8);
                 continue;
             }
@@ -1604,15 +1531,12 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
         if (rd + 1 < kSfmBaRounds) prune();
     }
 
-    // Tail beyond the adjustment window: localize against the adjusted
-    // structure, triangulating fresh points as the view moves on.
     for (uint32_t c2 = 0; c2 < ba_nf; ++c2)
         rodrigues(cams[c2].aa, &rs_cache[c2 * 9]);
     for (uint32_t lf = ba_nf; lf < nf && !stop(); ++lf)
         resect(lf, lf - 1);
     if (stop()) return;
 
-    // Final stats over the adjusted window.
     double mean = 0.0;
     size_t cnt = 0;
     {
@@ -1645,11 +1569,6 @@ void solve_segment(const TrackData& data, uint32_t s, uint32_t e,
                                    pts[p * 3 + 1], pts[p * 3 + 2]});
 }
 
-// 3D plane path for ensure_plane: when the range-start shot solved,
-// fit a plane to the solved points the region covers at the anchor
-// frame and induce each frame's homography from the camera poses -
-// perspective-true where the chained 2D fits only approximate. Frames
-// past the shot freeze at the last in-shot value.
 bool plane_from_sfm(const TrackData& data, float rx, float ry, float rw,
                     float rh, PlaneSolve* out) {
     if (data.sfm.empty()) return false;
@@ -1663,7 +1582,7 @@ bool plane_from_sfm(const TrackData& data, float rx, float ry, float rw,
     double ra[9];
     rodrigues(seg.cams[0].aa, ra);
     const double* ta = seg.cams[0].t;
-    // Region membership at the anchor frame, anchor-camera coords.
+    // P holds anchor-camera coordinates.
     std::vector<double> P;
     for (const SfmPoint& sp : seg.points) {
         const double X[3] = {sp.x, sp.y, sp.z};
@@ -1680,8 +1599,6 @@ bool plane_from_sfm(const TrackData& data, float rx, float ry, float rw,
     }
     const size_t npt = P.size() / 3;
     if (npt < 8) return false;
-    // Plane fit: centroid + smallest covariance eigenvector; one
-    // reweight pass sheds points off the dominant surface.
     std::vector<uint8_t> keep(npt, 1);
     double nrm[3] = {0, 0, 1}, dd = 0.0;
     auto fit = [&]() -> bool {
@@ -1725,8 +1642,7 @@ bool plane_from_sfm(const TrackData& data, float rx, float ry, float rw,
     for (size_t i = 0; i < npt; ++i) keep[i] = dev[i] <= gate ? 1 : 0;
     if (!fit()) return false;
     if (std::fabs(dd) < 1.0e-9) return false;
-    // uv -> metric and the (shared-focal) calibration, both invertible
-    // by construction.
+    // M maps uv to metric; K is the shared-focal calibration.
     const double M[9] = {aspect, 0, -0.5 * aspect, 0, 1, -0.5, 0, 0, 1};
     double Minv[9];
     if (!m3_invert(M, Minv)) return false;
@@ -1801,8 +1717,6 @@ const PlaneSolve* ensure_plane(TrackData* data, float rx, float ry,
             return &p;
     const uint32_t n = data->end - data->start;
     if (n == 0) return nullptr;
-    // 3D-first: a solved range-start shot induces perspective-true
-    // homographies; the chained 2D fits below are the fallback.
     {
         PlaneSolve p3;
         if (plane_from_sfm(*data, rx, ry, rw, rh, &p3)) {
@@ -1810,11 +1724,8 @@ const PlaneSolve* ensure_plane(TrackData* data, float rx, float ry,
             return &data->planes.back();
         }
     }
-    // For each consecutive pair (f-1, f): tracks observed in both, whose
-    // f-1 position lies inside the region AS TRACKED so far (the seed
-    // rect pushed through the accumulated homography). The chain stops
-    // at the first scene cut - the region's shot is over, and the new
-    // shot's content must not re-capture the frozen rect.
+    // Membership tests the seed rect pushed through the accumulated h.
+    // The chain stops at the first cut; the frozen rect must not recapture.
     uint32_t freeze_k = n;
     for (uint32_t c : data->cuts)
         if (c > data->start) {
@@ -1829,7 +1740,6 @@ const PlaneSolve* ensure_plane(TrackData* data, float rx, float ry,
     plane.h.resize(static_cast<size_t>(n) * 9);
     float acc[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     std::memcpy(plane.h.data(), acc, 9 * sizeof(float));
-    // Region corners at the reference frame.
     const float cx0[4] = {rx - rw * 0.5f, rx + rw * 0.5f, rx - rw * 0.5f,
                           rx + rw * 0.5f};
     const float cy0[4] = {ry - rh * 0.5f, ry - rh * 0.5f, ry + rh * 0.5f,
@@ -1843,7 +1753,6 @@ const PlaneSolve* ensure_plane(TrackData* data, float rx, float ry,
         }
         const uint32_t fa = data->start + k - 1;
         const uint32_t fb = data->start + k;
-        // The region as of frame fa.
         float qx[4], qy[4];
         for (int c = 0; c < 4; ++c)
             h_apply(acc, cx0[c], cy0[c], &qx[c], &qy[c]);

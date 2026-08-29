@@ -24,9 +24,8 @@ constexpr uint32_t kMonitorChannels = Player::kChannels;
 }  // namespace
 
 struct Player::Impl {
-    // ---- timeline (master clock)
-    // Position is a sample cursor at the monitor rate. The audio callback
-    // advances it; everything else reads it.
+    // The cursor counts samples at the monitor rate. The audio callback
+    // advances it; all other threads only read it.
     std::atomic<uint64_t> cursor{0};
     std::atomic<bool> playing{false};
     std::atomic<bool> looping{true};
@@ -40,28 +39,22 @@ struct Player::Impl {
     std::atomic<double> fps{30.0};
     uint32_t clock_rate = kMonitorRate;
 
-    // ---- mix (published from the UI thread, pulled by the callback)
+    // The UI thread publishes the mix; the callback pulls it.
     std::atomic<std::shared_ptr<const MixState>> mix{nullptr};
-    // The callback must never drop the last reference to a mix: freeing
-    // its PCM buffers in the audio thread is a dropout. Retiring two
-    // generations UI-side guarantees it never can.
+    // The callback must never drop the last mix reference; the UI thread
+    // retires two generations to prevent it.
     std::mutex retire_mutex;
     std::shared_ptr<const MixState> retired[2];
     int retire_slot = 0;
     std::vector<float> mix_scratch;
     std::vector<int16_t> mix_out;
 
-    // ---- wall-clock fallback (no audio device)
     std::mutex tick_mutex;
     std::chrono::steady_clock::time_point last_tick;
     bool use_audio_clock = false;
 
-    // The audio device lives on its OWN thread, start to finish. Not for
-    // concurrency - miniaudio runs its own - but for COM: the WASAPI
-    // backend puts the thread that opens a device into a multi-threaded
-    // apartment, and the shell's file dialog needs the UI thread in a
-    // single-threaded one. Opening the device on the UI thread deadlocks
-    // the next file dialog against its own owner window.
+    // Open the device on its own thread: WASAPI makes that thread MTA,
+    // and the UI thread must stay STA for file dialogs.
     ma_device device{};
     bool device_started = false;
     std::thread device_thread;
@@ -79,8 +72,7 @@ struct Player::Impl {
         if (device_thread.joinable()) device_thread.join();
     }
 
-    // Opens the device, holds it for the process, and tears it down on the
-    // same thread it was created on (WASAPI objects are apartment-bound).
+    // Init and uninit must run on one thread; WASAPI is apartment-bound.
     void device_main() {
         ma_device_config config = device_config();
         const bool ok =
@@ -113,22 +105,15 @@ struct Player::Impl {
         return config;
     }
 
-    // fps is normalized at init and configure, so it is always > 0 and
-    // the shared converter's rounding rule (sample_clock.h) is the whole
-    // story: seek, trim and loop clamps, and configure's reclamp all
-    // round-trip frames through the cursor and rely on it.
+    // configure() keeps fps above 0, so do not check it here.
+    // All frame and cursor conversions must use the sample_clock.h rule.
     uint64_t frame_to_cursor(uint32_t frame) const {
         return static_cast<uint64_t>(frame_to_sample(
             frame, fps.load(std::memory_order_relaxed), clock_rate));
     }
 
     uint32_t cursor_to_frame(uint64_t c) const {
-        // Multiply before dividing and floor with an epsilon: a cursor
-        // sitting exactly on a frame boundary must read as that frame,
-        // and the bare quotient can land a few ulps under the integer
-        // (385920/48000*25 = 200.99999...). 1e-6 frames is far below
-        // one sample (>= 1e-4 frames at any supported rate), so only
-        // rounding noise is absorbed, never a real sample offset.
+        // The 1e-6 absorbs ulps below an exact frame boundary.
         const double frames_f =
             static_cast<double>(c) * fps.load(std::memory_order_relaxed) /
             clock_rate;
@@ -137,8 +122,6 @@ struct Player::Impl {
         return frame >= out ? (out ? out - 1 : 0) : frame;
     }
 
-    // Loop bounds in frames: the loop region clamped inside the trim when
-    // set, else the trim itself.
     void loop_bounds(uint32_t& in_f, uint32_t& out_f) const {
         in_f = trim_in.load();
         out_f = trim_out.load();
@@ -153,7 +136,6 @@ struct Player::Impl {
         }
     }
 
-    // Wraps/clamps the cursor into the trim (or loop) region.
     uint64_t advance_cursor(uint64_t current, uint64_t delta) {
         uint32_t in_f, out_f;
         loop_bounds(in_f, out_f);
@@ -163,8 +145,7 @@ struct Player::Impl {
         uint64_t next = current + delta;
         if (next >= out_c) {
             if (looping.load()) {
-                // A playhead before the loop region plays into it, then
-                // wraps inside it.
+                // A playhead before the loop region plays into it, then wraps.
                 const uint64_t base = next >= in_c ? in_c : trim_in_c;
                 const uint64_t span = out_c > base ? out_c - base : 1;
                 next = base + (next - base) % span;
@@ -178,7 +159,6 @@ struct Player::Impl {
         return next;
     }
 
-    // ---- audio callback: master clock + the tree mix
     static void audio_callback(ma_device* dev, void* output,
                                const void* /*input*/, ma_uint32 frame_count) {
         auto* self = static_cast<Impl*>(dev->pUserData);
@@ -188,8 +168,7 @@ struct Player::Impl {
         if (!self->playing.load(std::memory_order_relaxed)) return;
 
         const uint64_t begin = self->cursor.load(std::memory_order_relaxed);
-        // The cursor wraps at the loop point, so the block is mixed in
-        // runs: each run is contiguous in timeline samples.
+        // Each run must stay contiguous in timeline samples.
         uint64_t c = begin;
         const float gain = self->gain.load(std::memory_order_relaxed);
         const int64_t offset =
@@ -204,7 +183,7 @@ struct Player::Impl {
             while (done + run < frame_count) {
                 const uint64_t next = self->advance_cursor(c, 1);
                 ++run;
-                if (next != c + 1) {   // wrapped or stopped
+                if (next != c + 1) {
                     c = next;
                     break;
                 }
@@ -212,8 +191,7 @@ struct Player::Impl {
                 if (!self->playing.load(std::memory_order_relaxed)) break;
             }
             if (run == 0) break;
-            // A mix built for a different channel count would be read as
-            // interleaved garbage; silence is the honest answer.
+            // A mix with another channel count reads as garbage; keep silence.
             if (mix && mix->channels == ch && gain > 0.0f) {
                 if (self->mix_out.size() < static_cast<size_t>(run) * ch)
                     self->mix_out.resize(static_cast<size_t>(run) * ch);
@@ -232,7 +210,6 @@ struct Player::Impl {
         self->cursor.store(c, std::memory_order_relaxed);
     }
 
-    // No audio device: step the cursor from wall time (called by pollers).
     void tick_synthetic_clock() {
         if (use_audio_clock) return;
         std::lock_guard<std::mutex> lock(tick_mutex);
@@ -255,8 +232,6 @@ struct Player::Impl {
 Player::Player() : impl_(new Impl) {
     Impl& p = *impl_;
     p.last_tick = std::chrono::steady_clock::now();
-    // The device opens ONCE and stays: it is the clock, not a media file's
-    // playback. A machine without one falls back to wall time.
     p.device_thread = std::thread([&p] { p.device_main(); });
     std::unique_lock<std::mutex> lock(p.device_mutex);
     p.device_cv.wait(lock, [&p] { return p.device_ready; });
@@ -270,8 +245,6 @@ void Player::configure(double fps, uint32_t frames) {
     if (p.fps.load() == rate && p.frames.load() == frames) return;
     p.fps.store(rate);
     p.frames.store(frames);
-    // The trim follows the timeline unless a narrower one is already set
-    // inside it; a shortened timeline pulls both bounds in.
     uint32_t in_f = p.trim_in.load(), out_f = p.trim_out.load();
     if (out_f == 0 || out_f > frames) out_f = frames;
     if (in_f >= out_f) in_f = out_f ? out_f - 1 : 0;

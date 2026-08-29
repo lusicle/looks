@@ -1,12 +1,5 @@
-// Import-time analysis: PCM -> FFT band-energy curves +
-// spectral-flux onsets + naive BPM; video pass -> motion/brightness/cut
-// curves. Everything is sampled per VIDEO frame and stored in the
-// `.analysis` sidecar so audio-reactive params scrub instantly and
-// deterministically. Live mode computes the same sources in realtime later.
-//
-// .analysis layout (little-endian):
-//   'ANL1' u32 version=1 f64 fps u32 frame_count f32 bpm u32 curve_count
-//   then per curve: u8 name_len, name, frame_count × f32
+// The curves have one sample for each video frame.
+// The .analysis file format is little-endian.
 
 #pragma once
 
@@ -43,16 +36,14 @@ struct AnalysisData {
     }
 };
 
-// Interleaved s16 -> band/onset/bpm curves sampled at video frame times.
-// Minutes of FFT on a long track: `cancel` (when given) is polled per
-// frame so a closing app never waits out the loop - a cancelled run
-// leaves `out` partial and the caller must not persist it.
+// The samples are interleaved s16. cancel is polled once per frame.
+// After a cancel, out is incomplete and the caller must not save it.
 void analyze_audio(const int16_t* samples, uint64_t frame_total,
                    uint32_t channels, uint32_t sample_rate, double video_fps,
                    uint32_t video_frames, AnalysisData* out,
                    const std::atomic<bool>* cancel = nullptr);
 
-// Streaming video analysis fed one I420 luma plane per frame.
+// Feed one luma plane per frame.
 class VideoAnalyzer {
 public:
     void push_frame(const uint8_t* y, size_t stride, uint32_t width,

@@ -1,5 +1,4 @@
-// Native file dialogs (Win32 platform layer, IFileDialog
-// open/save). Blocking; call from the UI thread only.
+// These dialogs block. Call them from the UI thread only.
 
 #pragma once
 
@@ -13,11 +12,10 @@ namespace looks::platform {
 class Window;
 
 struct FileFilter {
-    std::string label;     // "MP4 video"
-    std::string pattern;   // "*.mp4;*.mov"
+    std::string label;
+    std::string pattern;   // Put a semicolon between patterns.
 };
 
-// Returns the chosen path, or nullopt on cancel/error.
 std::optional<std::filesystem::path> show_open_dialog(
     Window* parent, const std::vector<FileFilter>& filters);
 
@@ -25,8 +23,7 @@ std::optional<std::filesystem::path> show_save_dialog(
     Window* parent, const std::vector<FileFilter>& filters,
     const std::string& default_name);
 
-// Fatal-error box: ownerless so it works from any thread on the way
-// down — installed as the log_fatal sink at startup.
+// This box has no owner window, so any thread can call it.
 void show_fatal(const char* message);
 
 }  // namespace looks::platform

@@ -1,8 +1,3 @@
-// Muxer <-> demuxer roundtrip: our BmffMuxer writes a file, our BmffFile
-// parses it back — sample tables, avcC/esds, offsets, and payload bytes
-// must survive. No codecs involved (payloads are arbitrary bytes).
-// Also home to the WAV codec roundtrip and the MP3 container walk.
-
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -42,8 +37,6 @@ TEST(wav_roundtrip) {
 }
 
 TEST(wav_imports_as_audio_only_bundle) {
-    // A wav import writes JUST the PCM sidecar: no mezzanine, no video
-    // side - asset frame_count stays 0 (image-dormant media node).
     const auto dir = std::filesystem::temp_directory_path() / "looks_wavimp";
     std::filesystem::create_directories(dir);
     const auto src = dir / "tone.wav";
@@ -74,8 +67,7 @@ TEST(wav_imports_as_audio_only_bundle) {
 }
 
 TEST(mp3_cover_art_parses_id3v2_apic) {
-    // Synthetic ID3v2.3 tag: one TIT2 frame, then APIC with a marker
-    // payload. The parser walks frames and slices the image bytes out.
+    // The fixture is a synthetic ID3v2.3 tag: one TIT2 frame, then APIC.
     const uint8_t img[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
     std::vector<uint8_t> apic;
     apic.push_back(0);                        // text encoding: latin-1
@@ -117,7 +109,6 @@ TEST(mp3_cover_art_parses_id3v2_apic) {
     CHECK_EQ(out.size(), size_t{5});
     CHECK(!std::memcmp(out.data(), img, 5));
 
-    // No APIC frame = no art; garbage = no art.
     std::vector<uint8_t> plain = {'I', 'D', '3', 3, 0, 0, 0, 0, 0, 0};
     CHECK(!mp3_cover_art(plain.data(), plain.size(), &out));
     CHECK(!mp3_cover_art(img, 5, &out));
@@ -197,7 +188,6 @@ TEST(mux_demux_roundtrip) {
     CHECK(a->audio_specific_config == audio.audio_specific_config);
     CHECK_EQ(a->samples.size(), size_t{4});
 
-    // Payload bytes survive the trip (faststart offsets are correct).
     std::vector<uint8_t> bytes;
     for (size_t i = 0; i < video_payloads.size(); ++i) {
         CHECK(file.read_sample(v->samples[i], bytes));
@@ -213,7 +203,7 @@ TEST(mux_demux_roundtrip) {
 }
 
 TEST(h264_annexb_avcc_utils) {
-    // Annex B: SPS + PPS + IDR with mixed 3/4-byte start codes.
+    // The fixture mixes 3-byte and 4-byte start codes.
     const std::vector<uint8_t> annexb = {
         0, 0, 0, 1, 0x67, 0x4D, 0x40, 0x1E,   // SPS
         0, 0, 1, 0x68, 0xCE, 0x06,            // PPS

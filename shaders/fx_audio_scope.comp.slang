@@ -1,6 +1,4 @@
-// The engine slices the mono PCM copy into the min/max strip at binding
-// 1, keyed on the timeline frame index rather than playback position, so
-// preview and export agree bit-exactly. No audio gives a flat line.
+// The engine keys the strip on the frame index so export matches preview.
 
 #include "fx_common.slang"
 
@@ -14,13 +12,13 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float window;    // consumed engine-side building the strip
-    float mode;      // 0 filled, 1 mirror magnitude, 2 outline only
+    float window;    // the engine uses this, not the shader
+    float mode;
     float thick;     // px
     float height_f;  // fraction of frame
     float pos_y;     // fraction of frame
     float glow;
-    float color;     // 0 phosphor green, 1 source color
+    float color;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -47,7 +45,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float tk = max(thick, 1.0);
     const uint m = uint(mode + 0.5);
 
-    // Screen y grows downward, hence max maps to y_top.
+    // Screen y grows downward, so max maps to y_top.
     float y_top, y_bot;
     if (m == 1u) {
         const float mag = max(abs(mn), abs(mx));
@@ -76,7 +74,6 @@ void main(uint3 tid : SV_DispatchThreadID)
              saturate(color));
     const float3 col = base.rgb + tc * trace * saturate(glow) * 1.2;
 
-    // The drawn trace carries its own coverage.
     const float4 result =
         float4(col, max(base.a, saturate(trace * saturate(glow) * 1.2)));
     const float4 wetted = lerp(base, result, saturate(wet));

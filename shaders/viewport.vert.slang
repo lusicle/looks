@@ -1,7 +1,7 @@
 [[vk::push_constant]]
 cbuffer Push
 {
-    float2 scale;    // fitted quad size in NDC, giving the letterbox
+    float2 scale;    // fitted quad size in NDC
     float2 offset;
 };
 
@@ -14,7 +14,7 @@ struct VSOutput
 [shader("vertex")]
 VSOutput main(uint vertex_id : SV_VertexID)
 {
-    // One oversized triangle, not a quad; uv lands in [0,1] over the rect.
+    // One oversized triangle, not a quad. uv lands in 0 to 1.
     const float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
     VSOutput o;
     o.v_uv = uv;

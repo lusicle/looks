@@ -1,7 +1,3 @@
-// Byte-order accessors and cursors shared by every hand-rolled
-// container and sidecar codec (bmff, mez, wav, pcm, mp3, analysis,
-// png). One spelling per direction: an open-coded shift expression in a
-// parser is a divergence waiting to happen.
 #pragma once
 
 #include <cstdint>
@@ -10,7 +6,7 @@
 
 namespace looks::bytes {
 
-// ---- scalar accessors (caller guarantees the span)
+// No bounds check. The caller must guarantee the span.
 
 inline uint16_t be16(const uint8_t* p) {
     return static_cast<uint16_t>((p[0] << 8) | p[1]);
@@ -56,8 +52,6 @@ inline void put_le64(uint8_t* p, uint64_t v) {
     for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (i * 8));
 }
 
-// ---- bounds-checked big-endian cursor (container parsing)
-
 struct BeReader {
     const uint8_t* data;
     size_t size;
@@ -100,8 +94,6 @@ struct BeReader {
     }
 };
 
-// ---- bounds-checked little-endian cursor (sidecar parsing)
-
 struct LeReader {
     const uint8_t* p;
     const uint8_t* end;
@@ -128,8 +120,6 @@ struct LeReader {
     }
 };
 
-// ---- big-endian append builder (container writing)
-
 struct BeWriter {
     std::vector<uint8_t> v;
 
@@ -149,8 +139,6 @@ struct BeWriter {
         v.insert(v.end(), o.v.begin(), o.v.end());
     }
 };
-
-// ---- plain-vector append helpers
 
 inline void app_be16(std::vector<uint8_t>& out, uint16_t x) {
     out.push_back(static_cast<uint8_t>(x >> 8));

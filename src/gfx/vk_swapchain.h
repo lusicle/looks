@@ -1,9 +1,4 @@
-// Swapchain wrapper: sRGB target, FIFO present, resize-driven recreation.
-//
-// The swapchain format is *_SRGB so UI/blit writes blend in linear and store
-// encoded — matching the reference toolkit's pipeline expectations. The
-// engine's working space stays linear RGBA16F offscreen; only the
-// viewport blit and UI touch this surface.
+// The swapchain format is *_SRGB: writes blend in linear and store encoded.
 
 #pragma once
 
@@ -23,8 +18,6 @@ public:
     Swapchain(const Swapchain&) = delete;
     Swapchain& operator=(const Swapchain&) = delete;
 
-    // Rebuilds at the surface's current size. Safe to call every resize
-    // event; no-ops when the size is unchanged and valid.
     void recreate(uint32_t width, uint32_t height);
 
     VkFormat format() const { return format_; }
@@ -34,8 +27,7 @@ public:
     VkImageView view(uint32_t i) const { return views_[i]; }
     VkSwapchainKHR handle() const { return swapchain_; }
 
-    // VK_ERROR_OUT_OF_DATE_KHR is returned (not fatal) so the frame loop can
-    // recreate and retry.
+    // VK_ERROR_OUT_OF_DATE_KHR is not fatal; the caller recreates and retries.
     VkResult acquire(VkSemaphore signal, uint32_t* image_index);
     VkResult present(VkQueue queue, VkSemaphore wait, uint32_t image_index);
 

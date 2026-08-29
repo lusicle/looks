@@ -1,13 +1,3 @@
-// Canvas2D — immediate-mode CPU draw-list recorder (first-party
-// re-implementation of the reference toolkit's canvas).
-//
-// Pure CPU: records vertices/indices/batches each frame; the Vulkan side
-// (UiRenderer) turns batches into draw calls. Inputs are LOGICAL px; the
-// per-frame scale is applied exactly once, at vertex write, so positions in
-// the buffers are PHYSICAL px. Anti-aliasing is analytic — SDF params ride
-// the per-vertex `shape` attribute and the fragment shader feathers edges
-// with fwidth; no MSAA, no coverage geometry.
-
 #pragma once
 
 #include <cstdint>
@@ -17,14 +7,13 @@
 
 namespace looks::ui {
 
-struct UiTexture;  // opaque; defined and owned by UiRenderer
+struct UiTexture;
 
 struct Vertex {
     Vec2 pos;         // physical px
     Vec2 uv;
     uint32_t color;   // packed RGBA8, sRGB-encoded RGB + linear A
-    // {radius/type, stroke, halfW, halfH} in physical px. All zero on
-    // pass-through primitives (solid rect / triangle / line / glyph).
+    // {radius, stroke, halfW, halfH} in physical px; all zero for plain quads.
     float shape[4];
 };
 static_assert(sizeof(Vertex) == 36, "vertex layout is shared by all UI pipelines");
@@ -43,49 +32,36 @@ class Canvas2D {
 public:
     Canvas2D();
 
-    // Clears the recorded lists (buffers are reused, not freed) and sets the
-    // frame's logical->physical scale.
     void begin_frame(float logical_to_physical, Vec2 viewport_logical);
 
     float scale() const { return scale_; }
     Vec2 viewport() const { return viewport_logical_; }
 
-    // ---- primitives (logical px)
+    // The primitives take logical px.
     void draw_rect(const Rect& r, Color color);
-    // Per-corner colors, bilinear across the quad (smooth gradients:
-    // the color picker's SV square is ONE quad, not banded strips).
-    // Order: top-left, top-right, bottom-right, bottom-left.
+    // Corner order: top-left, top-right, bottom-right, bottom-left.
     void draw_rect_corners(const Rect& r, Color c00, Color c10, Color c11,
                            Color c01);
     void draw_rect_outline(const Rect& r, float stroke, Color color);
     void draw_triangle(Vec2 a, Vec2 b, Vec2 c, Color color);
     void draw_line(Vec2 a, Vec2 b, float thickness, Color color);
-    // Anti-aliased polyline: ONE shared strip with mitered joins and a
-    // one-pixel alpha fringe. Chained draw_line capsules double-blend
-    // where their round caps overlap (visible beads at every joint on
-    // translucent strokes); a strip shares its joint vertices, so the
-    // coverage is continuous. Butt ends; `closed` wraps the last point
-    // back to the first.
     void draw_polyline(const Vec2* pts, int count, float thickness,
                        Color color, bool closed = false);
     void draw_sdf_rect(const Rect& r, float radius, Color color);
     void draw_sdf_rect_outline(const Rect& r, float radius, float stroke, Color color);
 
-    // Glyph quad in logical px with normalized atlas UVs (Text batch).
+    // The rect is logical px; the UVs are normalized atlas coords.
     void draw_glyph_quad(const Rect& r, float u0, float v0, float u1, float v1,
                          Color color, const UiTexture* atlas);
 
-    // Textured quad; radius > 0 applies the SDF rounded-corner mask.
     void draw_image_quad(const Rect& r, const UiTexture* texture,
                          float u0, float v0, float u1, float v1,
                          Color tint, float corner_radius = 0.0f);
 
-    // ---- clipping (scissor stack; rects intersect with the parent top)
     void push_clip(const Rect& logical);
     void pop_clip();
     Rect current_clip_physical() const;   // empty() => unclipped
 
-    // ---- renderer access
     const std::vector<Vertex>& vertices() const { return vertices_; }
     const std::vector<uint16_t>& indices() const { return indices_; }
     const std::vector<Batch>& batches() const { return batches_; }
@@ -94,7 +70,7 @@ public:
 private:
     bool clip_collapsed() const;
     Batch& current_batch(BatchKind kind, const UiTexture* texture);
-    // Emits TL,TR,BR,BL + two triangles. Positions already physical.
+    // Emits TL, TR, BR, BL. The positions are already physical px.
     void emit_quad_physical(BatchKind kind, const UiTexture* texture,
                             const Vec2 (&pos)[4], const Vec2 (&uv)[4],
                             const uint32_t (&color)[4], const float (&shape)[4]);

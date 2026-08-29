@@ -1,8 +1,3 @@
-// WAV read/write: minimal RIFF/WAVE codec for the sidechain
-// path (— analyze an external WAV instead of the media's audio).
-// Reader accepts PCM16/24/32 and float32, any channel count, and converts
-// to interleaved s16; writer emits canonical PCM16.
-
 #pragma once
 
 #include <cstdint>

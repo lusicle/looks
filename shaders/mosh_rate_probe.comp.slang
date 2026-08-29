@@ -1,10 +1,4 @@
-// GPU mosh rate control, pass 1: one thread per 8x8 block of one plane.
-// Transforms the block once, then for every quality rung on the ladder
-// quantizes and accumulates the exact AC code length (run/level exp-Golomb
-// + end-of-block) into bits[rung], and stores the quantized DC in the
-// scratch image for pass 2's delta terms. The DC chain LOOKS serial but
-// its size is a sum of pairwise terms - that is what makes rate control
-// a reduction instead of a CPU job.
+// This pass writes the AC bit count and the quantized DC for pass 2.
 
 #include "mosh_common.slang"
 
@@ -14,13 +8,13 @@ cbuffer Push
     uint pw;
     uint ph;
     uint plane;           // 0 = Y, 1 = U, 2 = V
-    uint mode;            // 0 intra, 1 P residual
+    uint mode;
     uint rung_count;
     uint blocks_w;        // this plane's block grid width
     uint pad0;
     uint pad1;
-    uint4 rungs_lo;       // quality ladder, descending (packed uint4s:
-    uint4 rungs_hi;       // scalar arrays get 16-byte std140 strides)
+    uint4 rungs_lo;       // quality ladder, descending
+    uint4 rungs_hi;       // packed as uint4 for the std140 stride
 };
 
 [[vk::binding(0, 0)]] Sampler2D nv_y;
@@ -56,9 +50,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     {
         for (uint r = 0; r < rung_count; ++r)
         {
-            // Intra fillers repeat the DC predictor: se(0) + EOB = 14
-            // bits, chain-transparent (sentinel). P fillers are true zero
-            // blocks: EOB only, DC 0 resets the chain.
+            // Intra fillers cost 14 bits and use a transparent sentinel.
+            // P fillers are zero blocks. They cost 13 bits and reset the chain.
             InterlockedAdd(rate_bits[int2(int(r), 0)],
                            mode == 0 ? 14u : 13u);
             rate_dc[int2(int(r * bw + bx), int(by))] =
@@ -116,6 +109,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         bits += ue_bits(63u);   // end-of-block marker
         InterlockedAdd(rate_bits[int2(int(r), 0)], bits);
         rate_dc[int2(int(r * bw + bx), int(by))] =
-            uint(dc + 65536);   // biased; sentinels use high bits
+            uint(dc + 65536);   // biased, sentinels use the high bits
     }
 }

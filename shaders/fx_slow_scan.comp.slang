@@ -1,5 +1,4 @@
-// A beam crawls the frame replacing the held image line by line, so the
-// canvas at binding 1 is this instance's own previous output.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -14,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float period;    // seconds per full frame
-    float mode;      // 0 rows top to bottom, 1 columns
+    float mode;
     float beam;
     float noise;
     float dim;
@@ -73,8 +72,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             col *= 1.0 - saturate(dim) * 0.6;
     }
 
-    // Glow only ahead of the write line: those pixels get overwritten
-    // clean when the band reaches them, so it never burns into the canvas.
+    // Glow only ahead of the write line so it does not burn in.
     const float ahead = (pos - s_now) * extent;
     if (ahead > 0.0) {
         const float glow =

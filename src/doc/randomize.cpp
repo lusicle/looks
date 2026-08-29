@@ -12,8 +12,7 @@ bool param_randomizable(const ParamDesc& desc) {
                                           "preset", "shape"};
     for (const char* f : kFrozen)
         if (std::strstr(desc.id, f)) return false;
-    // Exact-match selectors (substring would catch "gop" via "op"):
-    // discrete identity knobs on the newer effects.
+    // These ids match in full: a substring match catches "gop" with "op".
     static const char* const kFrozenExact[] = {
         "op",     "channels", "counter", "pattern", "flip",
         "r_from", "g_from",   "b_from",  "font",    "drop_i",
@@ -28,7 +27,7 @@ namespace {
 void randomize_one(Document& doc, UndoStack& undo, uint64_t look,
                    size_t layer_index, size_t effect_index, float intensity,
                    uint64_t rng_seed) {
-    // A wrong-kind or stale id must not land on the fallback look.
+    // A stale id must not edit the fallback look: check before doc.look().
     const Look* guard = doc.find_look(look);
     if (!guard || layer_index >= guard->layers.size() ||
         effect_index >= guard->layers[layer_index].stack.size())

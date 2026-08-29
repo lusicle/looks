@@ -1,5 +1,4 @@
-// Drawn in encoded space: the burn is an overlay on the signal, not
-// scene light.
+// Draw in encoded space. The burn is an overlay on the signal.
 
 #include "fx_common.slang"
 
@@ -13,15 +12,15 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;    // 0 date, 1 timecode, 2 both
+    float mode;
     float size;    // px per segment unit
-    float corner;  // 0 TL, 1 TR, 2 BL, 3 BR
+    float corner;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// gfedcba segment masks for 0-9.
+// gfedcba segment masks for 0 to 9.
 static const uint kDigit[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66,
                                 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
@@ -31,19 +30,19 @@ float seg_coverage(uint mask, float2 lp)
     if (lp.x < 0.0 || lp.x >= 4.0 || lp.y < 0.0 || lp.y >= 7.0) return 0.0;
     bool on = false;
     if ((mask & 0x01u) != 0u && lp.y < 1.0 && lp.x >= 0.5 && lp.x < 3.5)
-        on = true;                                                   // a top
+        on = true;
     if ((mask & 0x40u) != 0u && lp.y >= 3.0 && lp.y < 4.0 &&
-        lp.x >= 0.5 && lp.x < 3.5) on = true;                        // g mid
+        lp.x >= 0.5 && lp.x < 3.5) on = true;
     if ((mask & 0x08u) != 0u && lp.y >= 6.0 && lp.x >= 0.5 && lp.x < 3.5)
-        on = true;                                                   // d bot
+        on = true;
     if ((mask & 0x20u) != 0u && lp.x < 1.0 && lp.y >= 0.5 && lp.y < 3.5)
-        on = true;                                                   // f tl
+        on = true;
     if ((mask & 0x02u) != 0u && lp.x >= 3.0 && lp.y >= 0.5 && lp.y < 3.5)
-        on = true;                                                   // b tr
+        on = true;
     if ((mask & 0x10u) != 0u && lp.x < 1.0 && lp.y >= 3.5 && lp.y < 6.5)
-        on = true;                                                   // e bl
+        on = true;
     if ((mask & 0x04u) != 0u && lp.x >= 3.0 && lp.y >= 3.5 && lp.y < 6.5)
-        on = true;                                                   // c br
+        on = true;
     return on ? 1.0 : 0.0;
 }
 
@@ -55,7 +54,7 @@ float colon_coverage(float2 lp)
     return 0.0;
 }
 
-// codes: 0-9 digit, -1 space, -2 colon.
+// codes: 0 to 9 is a digit, -1 is a space, -2 is a colon.
 float line_coverage(float2 lp, int codes[10], uint count)
 {
     if (lp.y < 0.0 || lp.y >= 7.0) return 0.0;
@@ -92,7 +91,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     int tc[10] = {int(hh), -2, int(mm / 10u), int(mm % 10u), -2,
                   int(ss / 10u), int(ss % 10u), -1, -1, -1};
     const uint tc_slots = 7u;
-    // Fixed date, 12 24 2003.
+    // The date is fixed at 12 24 2003.
     int date[10] = {1, 2, -1, 2, 4, -1, 2, 0, 0, 3};
     const uint date_slots = 10u;
 

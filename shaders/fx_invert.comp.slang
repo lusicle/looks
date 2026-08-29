@@ -1,4 +1,4 @@
-// Encoded-domain.
+// Work in the encoded domain, not in linear light.
 
 #include "fx_common.slang"
 
@@ -12,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;     // 0 invert, 1 film negative, 2 luma-only
+    float mode;
     float amount;
 };
 
@@ -32,14 +32,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint m = uint(mode + 0.5);
     float3 flipped;
     if (m == 1u) {
-        // Orange print mask, and the floor lift because film base is
-        // never black.
         const float3 mask = float3(1.0, 0.62, 0.30);
         flipped = (1.0 - enc) * mask;
         flipped = flipped * 0.92 + 0.05;
     } else if (m == 2u) {
-        // Adding the luma delta flips tone while the chroma vector rides
-        // through unchanged.
         const float l = fx_luma(enc);
         flipped = saturate(enc + ((1.0 - l) - l));
     } else {

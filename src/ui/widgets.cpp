@@ -26,7 +26,7 @@ Rect list_popup_rect(const Rect& anchor, float min_w,
                           measure_text(font, items[i], font_size).x + 24.0f);
     const float h = static_cast<float>(count) * kPopupRowH + 8.0f;
     float y = anchor.bottom() + 2.0f;
-    if (y + h > viewport.y - 4.0f) y = anchor.y - h - 2.0f;  // flip upward
+    if (y + h > viewport.y - 4.0f) y = anchor.y - h - 2.0f;
     const float x =
         std::max(4.0f, std::min(anchor.x, viewport.x - widest - 4.0f));
     return {x, y, widest, h};
@@ -55,7 +55,7 @@ Theme make_night() {
 }
 
 Theme make_ember() {
-    Theme t;   // graphite surfaces, warm accent
+    Theme t;
     t.accent = Color::hex(0xE0954A);
     t.accent_dim = Color::hex(0x8A5C2E);
     return t;
@@ -106,7 +106,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                      Vec2 center, Color color, float font_size) {
     const float cx = center.x;
     const float cy = center.y;
-    // Glyph-drawn icons ride the MSDF text pipeline for clean AA.
     auto glyph = [&](const char* s) {
         const Vec2 ts = measure_text(font, s, font_size);
         draw_text(canvas, font, s,
@@ -120,15 +119,12 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                                  {cx - 4.0f, cy + 5.5f}, color);
             break;
         case Icon::Pause:
-            // SDF rects: anti-aliased, unlike raw triangles.
             canvas.draw_sdf_rect({cx - 5.0f, cy - 5.0f, 3.5f, 10.0f}, 1.0f,
                                  color);
             canvas.draw_sdf_rect({cx + 1.5f, cy - 5.0f, 3.5f, 10.0f}, 1.0f,
                                  color);
             break;
         case Icon::Up:
-            // Chevron strokes (the app's fold language), not filled
-            // triangles — 1 px lines read clean, triangles alias.
             canvas.draw_line({cx - 4.0f, cy + 2.0f}, {cx, cy - 2.0f}, 1.0f,
                              color);
             canvas.draw_line({cx, cy - 2.0f}, {cx + 4.0f, cy + 2.0f}, 1.0f,
@@ -144,7 +140,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
             glyph("x");
             break;
         case Icon::Wave: {
-            // Two-arch sine: modulation.
             const float a = 2.6f;
             canvas.draw_line({cx - 5.0f, cy}, {cx - 2.5f, cy - a}, 1.0f,
                              color);
@@ -155,7 +150,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
             break;
         }
         case Icon::Key: {
-            // Keyframe diamond (outline strokes).
             const float d = 3.6f;
             canvas.draw_line({cx, cy - d}, {cx + d, cy}, 1.0f, color);
             canvas.draw_line({cx + d, cy}, {cx, cy + d}, 1.0f, color);
@@ -164,12 +158,10 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
             break;
         }
         case Icon::Knob:
-            // Macro dot: SDF circle (full-radius rect).
             canvas.draw_sdf_rect({cx - 3.5f, cy - 3.5f, 7.0f, 7.0f}, 3.5f,
                                  color);
             break;
         case Icon::Eye:
-            // Capsule outline + pupil.
             canvas.draw_sdf_rect_outline({cx - 6.0f, cy - 3.5f, 12.0f, 7.0f},
                                          3.5f, 1.0f, color);
             canvas.draw_sdf_rect({cx - 1.75f, cy - 1.75f, 3.5f, 3.5f}, 1.75f,
@@ -192,7 +184,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                                  color);
             break;
         case Icon::Link:
-            // Two overlapping capsule links.
             canvas.draw_sdf_rect_outline({cx - 6.5f, cy - 2.5f, 8.0f, 5.0f},
                                          2.5f, 1.0f, color);
             canvas.draw_sdf_rect_outline({cx - 1.5f, cy - 2.5f, 8.0f, 5.0f},
@@ -203,7 +194,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
             glyph("s");
             break;
         case Icon::Lock:
-            // Padlock: filled body + shackle arch strokes.
             canvas.draw_sdf_rect({cx - 4.0f, cy - 0.5f, 8.0f, 6.0f}, 1.5f,
                                  color);
             canvas.draw_line({cx - 2.5f, cy - 0.5f}, {cx - 2.5f, cy - 3.5f},
@@ -214,7 +204,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                              1.0f, color);
             break;
         case Icon::Magnet:
-            // Horseshoe magnet: U strokes + pole tips.
             canvas.draw_line({cx - 3.5f, cy - 5.0f}, {cx - 3.5f, cy + 1.5f},
                              1.5f, color);
             canvas.draw_line({cx + 3.5f, cy - 5.0f}, {cx + 3.5f, cy + 1.5f},
@@ -231,7 +220,6 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                                  color);
             break;
         case Icon::Copy:
-            // Two offset outline squares: duplicate.
             canvas.draw_sdf_rect_outline({cx - 5.5f, cy - 5.5f, 8.0f, 8.0f},
                                          1.5f, 1.0f, color);
             canvas.draw_sdf_rect_outline({cx - 2.0f, cy - 2.0f, 8.0f, 8.0f},
@@ -250,8 +238,7 @@ float transition_step(float current, bool on, float dt) {
     return current + (target - current) * rate;
 }
 
-// Press-then-release-inside click contract shared by button-like widgets.
-// Returns true on a completed click this frame.
+// Returns true when a press releases inside the rect.
 bool tick_press_release(ButtonState& state, WidgetId id, const Rect& rect,
                         LayoutFrame& frame) {
     const bool owns = frame.ctx.widget_owns_mouse(id);
@@ -274,7 +261,6 @@ bool tick_press_release(ButtonState& state, WidgetId id, const Rect& rect,
     return clicked;
 }
 
-// Arms the deferred tooltip after a sustained hover.
 void maybe_tooltip(const ButtonState& state, const char* tooltip,
                    LayoutFrame& frame) {
     if (tooltip && state.hover_seconds > 0.5f)
@@ -282,8 +268,6 @@ void maybe_tooltip(const ButtonState& state, const char* tooltip,
                               {frame.input.mouse.x + 12.0f,
                                frame.input.mouse.y + 18.0f});
 }
-
-// ---- Label
 
 struct LabelUser {
     const char* text;
@@ -306,8 +290,6 @@ Vec2 measure_label(LayoutNode& node, const Constraints&,
 void draw_label(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const LabelUser*>(node.user);
     const Font& font = label_font(*u, frame);
-    // Center vertically when the arranged rect is taller than the text —
-    // labels sit on the same line as neighbouring controls in rows.
     const float text_h = font.line_height() * u->size;
     const float inner_h = node.rect.h - node.padding.t - node.padding.b;
     const float y_off = std::max(0.0f, (inner_h - text_h) * 0.5f);
@@ -316,8 +298,6 @@ void draw_label(LayoutNode& node, LayoutFrame& frame) {
                node.rect.y + node.padding.t + y_off},
               u->size, u->color);
 }
-
-// ---- Button
 
 struct ButtonUser {
     const char* label;
@@ -369,12 +349,8 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
         if (u->flat) fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
     }
 
-    // Lit state on a TEXT button: label in accent, and chromed buttons
-    // trade the hairline for an accent outline — the same "lit" meaning
-    // the icon buttons carry.
     if (u->active && !u->disabled) fg = theme.accent;
     if (u->flat) {
-        // Chrome fades in with hover; resting state is just the label.
         if (!u->disabled && u->state->hover_t > 0.01f) {
             Color hover_bg = theme.control_bg_hover;
             hover_bg.a *= u->state->hover_t;
@@ -387,8 +363,7 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
             u->active && !u->disabled ? theme.accent : theme.hairline);
     }
 
-    // Label clipped to the button: a label wider than its slot truncates
-    // instead of bleeding into neighbours (narrow Fill rows).
+    // Clip the label so a wide label truncates instead of bleeding out.
     const Rect text_clip = node.clip.empty() ? r : r.intersect(node.clip);
     frame.canvas.push_clip(text_clip);
     const Vec2 text_size =
@@ -402,8 +377,6 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
               theme.font_size, fg);
     frame.canvas.pop_clip();
 }
-
-// ---- Segmented (one control, N segments, one active)
 
 struct SegmentedUser {
     const char* const* labels;
@@ -445,10 +418,6 @@ void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
 
-    // The active/inactive read is VALUE alone, and it must survive a
-    // glance: the track sinks well below the control fill and the lit
-    // segment rises above it. control_bg_active is the PRESSED tone
-    // (darker than the fill) — never the lit one.
     const Color track = lerp(theme.control_bg,
                              Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
     const Color lit_fill = lerp(theme.control_bg,
@@ -491,8 +460,6 @@ void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
                                        theme.stroke_width, theme.hairline);
 }
 
-// ---- Chip (toggle)
-
 struct ChipUser {
     const char* label;
     size_t length;
@@ -500,7 +467,7 @@ struct ChipUser {
     ButtonState* state;
     bool* out_clicked;
     const char* tooltip;
-    // Trailing close X inside the chip; null = plain chip.
+    // Null gives a plain chip with no close zone.
     ButtonState* close_state;
     bool* out_close;
 };
@@ -574,8 +541,6 @@ void draw_chip(LayoutNode& node, LayoutFrame& frame) {
     }
 }
 
-// ---- IconButton
-
 struct IconUser {
     Icon icon;
     ButtonState* state;
@@ -626,14 +591,11 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
             : lerp(theme.text_dim, theme.text, u->state->hover_t);
     }
 
-    // Active solo reads accent even at rest.
     if (u->icon == Icon::SoloOn && !u->disabled) fg = theme.accent;
     draw_icon_glyph(frame.canvas, frame.font, u->icon,
                     {r.x + r.w * 0.5f, r.y + r.h * 0.5f}, fg,
                     theme.font_size);
 }
-
-// ---- Dropdown
 
 struct DropdownUser {
     const char* const* items;
@@ -659,8 +621,7 @@ Vec2 measure_dropdown(LayoutNode& node, const Constraints& c,
         measure_text(frame.font, current, frame.theme.font_size).x;
     const float w = c.bounded_w() && node.width.mode == SizeMode::Fill
         ? c.max_w : std::max(64.0f, text_w + 28.0f);
-    // Closed height ALWAYS — the open list is an overlay (RunPopup), so
-    // opening never reflows the surrounding layout.
+    // Always the closed height; the open list is an overlay.
     return {w, frame.theme.control_height};
 }
 
@@ -690,8 +651,7 @@ void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
         st.open = !st.open;
         if (st.open) frame.ctx.set_popup_owner(&st);
     }
-    // One open popup at a time; click-away closes (a press over the popup
-    // itself is owned by the popup's hit layer, not "away").
+    // One popup opens at a time; a press outside it closes it.
     if (st.open && frame.ctx.popup_owner() != &st) st.open = false;
     const bool over_popup =
         st.open && frame.ctx.widget_owns_mouse(
@@ -717,7 +677,6 @@ void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
                          0.5f},
               theme.font_size, theme.text);
     frame.canvas.pop_clip();
-    // Caret: down when closed, up when open.
     const float cxr = r.right() - 11.0f;
     const float cyr = r.y + r.h * 0.5f - (st.open ? -1.5f : 1.0f);
     const float dir = st.open ? -3.5f : 3.5f;
@@ -738,8 +697,6 @@ void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
         frame.ctx.set_popup(req);
     }
 }
-
-// ---- Scrubber
 
 struct ScrubberUser {
     float* frame_value;
@@ -790,7 +747,6 @@ void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
         }
     }
 
-    // Thin track + elapsed fill + playhead line: transport, not a slider.
     const float track_h = 4.0f;
     const Rect track{r.x, r.y + (r.h - track_h) * 0.5f, r.w, track_h};
     const float last = std::max(1.0f, u->frame_count - 1.0f);
@@ -803,8 +759,6 @@ void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
     frame.canvas.draw_rect({px - 1.0f, r.y + 3.0f, 2.0f, r.h - 6.0f},
                            theme.accent);
 }
-
-// ---- Checkbox
 
 struct CheckboxUser {
     const char* label;
@@ -854,8 +808,6 @@ void draw_checkbox(LayoutNode& node, LayoutFrame& frame) {
               theme.font_size, theme.text);
 }
 
-// ---- Slider
-
 struct SliderUser {
     float* value;
     float min_value;
@@ -887,9 +839,7 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     const Rect& r = node.rect;
     SliderState& s = *u->state;
 
-    // Value readout measured up front — its zone doubles as the type-in
-    // hotspot (canvas rule, applied to the rail: ONLY the value
-    // text opens the editor, the track always jump-drags).
+    // The value text zone opens the editor; the track always drags.
     char buf[32] = {};
     float text_w = 0.0f;
     if (u->format) {
@@ -915,8 +865,7 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     }
     if (s.dragging) {
         const float span = u->max_value - u->min_value;
-        // Shift = fine drag: 0.1x, relative from the anchor so
-        // engaging shift mid-drag never jumps the handle.
+        // Shift gives a 0.1x drag from an anchor, so the handle never jumps.
         const bool want_fine =
             (frame.input.mods & platform::kModShift) != 0;
         if (want_fine != s.fine) {
@@ -938,8 +887,7 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
                 : 0.0f;
             next = u->min_value + t * span;
         }
-        // Snap in DISPLAY space so what the readout shows is what the
-        // document stores (deg-displayed radian params included).
+        // Snap in display space so the readout matches the stored value.
         const float ds =
             u->display_scale != 0.0f ? u->display_scale : 1.0f;
         next = (snap_to_format(next * ds + u->display_offset, u->format) -
@@ -986,8 +934,6 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     }
 }
 
-// ---- Dial
-
 struct DialUser {
     float* value;
     float min_value;
@@ -1005,8 +951,7 @@ struct DialUser {
 
 constexpr float kDialRadius = 8.0f;
 
-// Mouse angle around `center` in display degrees: 0 at 12 o'clock,
-// clockwise positive (screen y grows downward).
+// Angle in degrees: 0 at 12 o'clock, clockwise positive.
 float dial_mouse_angle(Vec2 mouse, Vec2 center) {
     return std::atan2(mouse.x - center.x, center.y - mouse.y) * 57.29578f;
 }
@@ -1054,9 +999,7 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
         } else {
             s.dragging = true;
             s.dial_angle = dial_mouse_angle(frame.input.mouse, center);
-            // Raw accumulator: the stored value snaps to the display
-            // precision, so slow drags must integrate unsnapped or
-            // sub-step movement would never accumulate.
+            // Integrate unsnapped, or sub-step drags never accumulate.
             s.fine_anchor_value = *u->value;
             frame.ctx.set_capture(id);
         }
@@ -1099,7 +1042,6 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
     frame.canvas.draw_sdf_rect(knob, kDialRadius, theme.control_bg_active);
     frame.canvas.draw_sdf_rect_outline(knob, kDialRadius, theme.stroke_width,
                                        theme.hairline);
-    // Zero notch at 12 o'clock, outside the rim.
     frame.canvas.draw_line({center.x, knob.y - 3.0f}, {center.x, knob.y - 1.0f},
                            1.0f, theme.text_dim);
     const float shown = std::fmod(*u->value * u->display_scale, 360.0f);
@@ -1119,8 +1061,6 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
                   theme.font_size_small, theme.text);
     }
 }
-
-// ---- ColorSwatch
 
 }  // namespace
 
@@ -1219,8 +1159,7 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
             frame.ctx.set_popup_owner(&st);
         }
     }
-    // Closing lands any typed field first (blur commit) — a click away
-    // must never drop the entered value.
+    // Closing commits the typed field first, so no value is lost.
     const auto close = [&] {
         swatch_commit_field(st, u->out_rgb, u->out_changed,
                             u->out_released);
@@ -1254,10 +1193,7 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
 
 }  // namespace
 
-// Lands the focused entry field: R/G/B take faithful 0-255 bytes, hex
-// takes rrggbb (or the rgb shorthand). Shared by the popup pass, the
-// close paths, and the canvas card swatches, so a click-away never
-// drops a typed value.
+// The R/G/B fields take 0-255 bytes; hex takes rrggbb or the shorthand.
 void swatch_commit_field(SwatchState& st, float* out_rgb,
                          bool* out_changed, bool* out_released) {
     if (st.field_edit < 0) return;
@@ -1313,7 +1249,6 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
                                  theme.hairline);
     const Rect sv{r.x + 6.0f, r.y + 6.0f, r.w - 12.0f, kPickerSvH};
     const Rect hue{sv.x, sv.bottom() + 6.0f, sv.w, kPickerHueH};
-    // Entry rows: chip + the three byte fields, then the hex line.
     const Rect chip{sv.x, hue.bottom() + 6.0f, kPickerFieldH,
                     kPickerFieldH};
     const float fw = (sv.w - chip.w - 4.0f * 3.0f) / 3.0f;
@@ -1330,9 +1265,7 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
         int hit_field = -1;
         for (int i = 0; i < 4; ++i)
             if (fields[i].contains(input.mouse)) hit_field = i;
-        // Any press lands the open field first (blur commit), then
-        // routes: a field focuses and seeds its faithful text, the SV
-        // square / hue strip start their drags.
+        // A press commits the open field first, then routes to the new zone.
         if (st->field_edit >= 0 && hit_field != st->field_edit)
             swatch_commit_field(*st, req.out_rgb, req.out_changed,
                                 req.out_released);
@@ -1395,8 +1328,6 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
         }
     }
 
-    // SV square: ONE gradient quad — bilinear white/hue over black IS
-    // the SV formula, so the field is smooth at every size.
     float hue_rgb[3];
     hsv_to_rgb(st->hue, 1.0f, 1.0f, hue_rgb);
     canvas.draw_rect_corners(
@@ -1410,8 +1341,6 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
                                      ? Color{0.0f, 0.0f, 0.0f, 0.9f}
                                      : Color{1.0f, 1.0f, 1.0f, 0.9f});
 
-    // Hue strip: six 60-degree gradient segments (exact between the
-    // primaries, no banding).
     for (int i = 0; i < 6; ++i) {
         float c0[3], c1[3];
         hsv_to_rgb(static_cast<float>(i) * 60.0f, 1.0f, 1.0f, c0);
@@ -1428,8 +1357,6 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
     canvas.draw_rect({hx - 1.0f, hue.y - 1.0f, 2.0f, hue.h + 2.0f},
                      Color{1.0f, 1.0f, 1.0f, 0.9f});
 
-    // Result chip + the entry fields (0-255 bytes and hex, directly
-    // editable; the focused one shows its faithful typed text).
     hsv_to_rgb(st->hue, st->sat, st->val, cur);
     canvas.draw_sdf_rect(chip, 3.0f, Color{cur[0], cur[1], cur[2], 1.0f});
     canvas.draw_sdf_rect_outline(chip, 3.0f, theme.stroke_width,
@@ -1469,15 +1396,13 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
     }
 }
 
-// ---- SectionHeader
-
 namespace {
 
 struct SectionUser {
     const char* label;
     size_t length;
     bool open;
-    bool small;   // nested level: body font, indented, smaller
+    bool small;   // nested level: body font, indented
     ButtonState* state;
     bool* out_clicked;
 };
@@ -1504,7 +1429,6 @@ void draw_section(LayoutNode& node, LayoutFrame& frame) {
     probe_add(std::string("sec:") + std::string(u->label, u->length), r);
 
     const Color fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
-    // Chevron drawn with two strokes: ▸ folded, ▾ open (no glyph needed).
     const float cx = r.x + (u->small ? 13.0f : 5.0f);
     const float cy = r.y + r.h * 0.5f;
     if (u->open) {
@@ -1527,8 +1451,6 @@ void draw_section(LayoutNode& node, LayoutFrame& frame) {
                r.y + (r.h - font.line_height() * size) * 0.5f},
               size, fg);
 }
-
-// ---- Panel / Separator
 
 struct PanelUser {
     float corner_radius;
@@ -1580,7 +1502,7 @@ LayoutNode* Label(LayoutArena& arena, std::string_view text,
 LayoutNode* Heading(LayoutArena& arena, std::string_view text) {
     LabelOpts opts;
     opts.size = active_theme().font_size_heading;
-    opts.header = true;   // serif display face when one is loaded
+    opts.header = true;
     return Label(arena, text, opts);
 }
 

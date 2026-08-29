@@ -1,9 +1,3 @@
-// GPU image + staging upload helpers. VMA-backed images with
-// simple explicit layout tracking; pooled RGBA16F intermediates for the
-// render graph. Uploads go through per-frame staging rings on the graphics
-// queue for now — the dedicated transfer queue path arrives with async
-// double-buffered player uploads.
-
 #pragma once
 
 #include <memory>
@@ -33,8 +27,6 @@ public:
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
 
-    // Records a layout transition (all-commands scope — correctness first;
-    // tighter stages come with the real graph scheduler).
     void transition(VkCommandBuffer cmd, VkImageLayout new_layout);
     VkImageLayout layout() const { return layout_; }
 
@@ -51,21 +43,15 @@ private:
     VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 
-// Host-visible staging buffer reused across frames; grows on demand.
 class StagingBuffer {
 public:
     explicit StagingBuffer(Device& device) : device_(device) {}
     ~StagingBuffer();
 
-    // Copies `data` into the staging area at an internal offset and records
-    // a buffer->image copy. Call between begin_frame's fence wait and
-    // submit; offsets reset with reset().
+    // Call between the frame slot's fence wait and its submit.
     bool upload_image(VkCommandBuffer cmd, const void* data, size_t size,
                       size_t row_pitch, GpuImage& dst);
-    // Resets the write offset and destroys buffers retired by growth.
-    // MUST run after the owning slot's fence wait: growth mid-frame keeps
-    // the old buffer alive (already-recorded copies reference it), and the
-    // fence is what proves those copies have executed.
+    // Run only after the owning slot's fence wait; it frees retired buffers.
     void reset();
 
 private:
@@ -84,13 +70,7 @@ private:
     std::vector<Retired> retired_;
 };
 
-// Pooled RGBA16F render targets: acquire per pass, release when the frame's
-// evaluation is done. Images are reused by (width, height); sizes that
-// stop being served (proxy divisor change, a nested canvas or flow field
-// dropping out of the graph) retire after kRetireFrames unused
-// release_all cycles — release_all runs at render entry AFTER the owning
-// slot's fence wait, the one point where a free entry is provably
-// unreferenced by the GPU.
+// release_all must run after the owning slot's fence wait.
 class TargetPool {
 public:
     explicit TargetPool(Device& device) : device_(device) {}
@@ -98,8 +78,7 @@ public:
     GpuImage* acquire(uint32_t width, uint32_t height);
     void release(GpuImage* image);
     void release_all();
-    // Destroys every pooled image (source-size change). Caller must ensure
-    // the GPU is idle.
+    // Caller must make sure the GPU is idle.
     void clear();
 
 private:

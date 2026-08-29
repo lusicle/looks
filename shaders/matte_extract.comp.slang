@@ -1,6 +1,3 @@
-// The wired image's luma IS the matte: masks are ordinary images, so
-// inverting or shaping one happens upstream with ordinary effects.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]

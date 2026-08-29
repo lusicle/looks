@@ -19,8 +19,7 @@ std::wstring widen(const std::string& utf8) {
     return out;
 }
 
-// One COM apartment per dialog call: cheap, and keeps the platform layer
-// free of process-wide COM lifetime management.
+// RPC_E_CHANGED_MODE means COM is usable but must not be uninitialized.
 struct ComScope {
     HRESULT hr;
     ComScope() : hr(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |

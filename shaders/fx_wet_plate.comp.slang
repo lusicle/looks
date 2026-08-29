@@ -1,5 +1,5 @@
-// Static per seed: this is a plate, not a video artifact, so nothing
-// here reads the frame clock. Display-referred, self-converting.
+// Nothing here reads the frame clock. The plate is static per seed.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -14,7 +14,7 @@ cbuffer Push
     uint frame;
     float fps;
     float ortho;
-    float tone;     // 0 cold silver, 1 warm sepia
+    float tone;
     float plate;
     float fog;
     float vign;
@@ -34,7 +34,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
-    // Blue-sensitive collodion response; weights sum to 1 at both ends.
+    // The weights must sum to 1 at both ends of the lerp.
     const float3 w = lerp(kFxLumaW,
                           float3(0.05, 0.25, 0.70), saturate(ortho));
     float l = dot(enc, w);
@@ -42,7 +42,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     l = pow(l, 0.9);
     l = l * 0.92 + 0.04 + saturate(fog) * 0.2 * (1.0 - l);
 
-    // Pour marks: swirl noise gated to the border zone.
     const float2 border = min(uv, 1.0 - uv);
     const float edge_zone =
         1.0 - smoothstep(0.0, 0.28, min(border.x, border.y));

@@ -1,8 +1,3 @@
-// Synthetic dev-fixture signal, spelled once: the fixture generator,
-// the determinism harness and the effect benches all sample these, so
-// benches measure the same content the harness verifies. Moving
-// diagonal gradient with a sweeping bright bar (limited-range luma) and
-// drifting chroma ramps.
 #pragma once
 
 #include <cstdint>
@@ -16,7 +11,7 @@ inline uint8_t luma(uint32_t c, uint32_t r, uint32_t frame, uint32_t w) {
     return static_cast<uint8_t>(16 + v * 219 / 255);
 }
 
-// Chroma sampled on the half-res grid (cx, cy).
+// cx and cy are coordinates on the half resolution chroma grid.
 inline uint8_t cb(uint32_t cx, uint32_t frame) {
     return static_cast<uint8_t>(96 + ((cx * 2 + frame) & 63));
 }

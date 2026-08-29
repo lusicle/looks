@@ -1,4 +1,4 @@
-// Display-referred, self-converting.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -33,14 +33,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float g = fx_luma(fx_srgb_oetf(saturate(base.rgb)));
 
-    // Roller streaks wobble the drum threshold per column, static in time.
+    // The roller streaks are static in time. Do not add a time term.
     const float streak_n =
         fx_value_noise1(seed ^ 0x51EDu, float(tid.x) * 0.02) +
         0.35 * fx_value_noise1(seed ^ 0xA3u, float(tid.x) * 0.11);
     const float thresh =
         0.55 + (streak_n / 1.35 - 0.5) * 0.4 * saturate(streaks);
 
-    // The smoothstep window narrows every copy, collapsing tone further.
     const uint gens = uint(clamp(generations, 1.0, 8.0) + 0.5);
     for (uint i = 0; i < gens; ++i) {
         const float w =
@@ -48,16 +47,15 @@ void main(uint3 tid : SV_DispatchThreadID)
         g = smoothstep(thresh - w, thresh + w, g);
     }
 
-    // Re-seeds at 8 hz, not per frame: every frame being a fresh copy
-    // reads as noise rather than toner.
+    // The specks reseed at 8 hz, not every frame.
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const uint tick = uint(t * 8.0);
     const uint h = fx_hash4(seed ^ (tick + 1u) * 0x9E37u, tid.x, tid.y, tick);
     const float sp = fx_hash01(h);
     if (sp < toner * 0.05 * g)
-        g = 0.08;                       // dark speck on the whites
+        g = 0.08;
     else if (sp > 1.0 - toner * 0.06 * (1.0 - g))
-        g = lerp(g, 0.75, 0.8);         // toner failed to stick
+        g = lerp(g, 0.75, 0.8);
 
     const float3 enc = lerp(float3(0.05, 0.05, 0.07),
                             float3(0.97, 0.96, 0.93), g);

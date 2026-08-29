@@ -1,6 +1,4 @@
-// Text emission over Canvas2D. Owns no GPU state — glyph quads go through
-// the same draw list as everything else (Text batches keyed on the font's
-// atlas texture). `size` is the em height in logical px.
+// size is the em height in logical px.
 
 #pragma once
 
@@ -11,12 +9,10 @@
 
 namespace looks::ui {
 
-// Advance-width of a run (no kerning in the debug font; baked fonts may add
-// it later). Returns {width, line_height} in logical px.
+// Returns {advance width, line height} in logical px.
 Vec2 measure_text(const Font& font, std::string_view text, float size);
 
-// Draws a single line; `top_left` is the glyph box's top-left (baseline is
-// derived from the font ascender). Returns the advance in logical px.
+// top_left is the glyph box top, not the baseline. Advance is in logical px.
 float draw_text(Canvas2D& canvas, const Font& font, std::string_view text,
                 Vec2 top_left, float size, Color color);
 

@@ -1,5 +1,4 @@
-// Drawn in encoded space: the HUD is signal, not scene, so placing it
-// before a Codec-Box gets it crushed along with the picture.
+// Draw the HUD in encoded space. It is signal, not scene.
 
 #include "fx_common.slang"
 
@@ -15,13 +14,13 @@ cbuffer Push
     float fps;
     float size;       // px per overlay unit
     float blink_hz;
-    float elements;   // 0 rec, 1 +counter, 2 +battery and brackets
+    float elements;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// 7-segment bit masks, one per decimal digit.
+// 7-segment bit masks, one for each decimal digit.
 static const uint kDigit[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66,
                                 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
@@ -78,27 +77,24 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float2 d = lp - float2(2.0, 3.5);
             if (dot(d, d) < 4.0) red = 1.0;
         }
-        // "REC" as three 4x7 letter cells built from boxes.
         const float2 rp = lp - float2(6.0, 0.0);
         white = max(white, box(rp, float2(0, 0), float2(1, 7)));
         white = max(white, box(rp, float2(0.5, 0), float2(3.5, 1)));
         white = max(white, box(rp, float2(0.5, 3), float2(3.5, 4)));
         white = max(white, box(rp, float2(3, 0.5), float2(4, 3.5)));
         white = max(white, box(rp, float2(2.5, 4), float2(3.5, 7)));
-        // E
         const float2 ep = lp - float2(11.5, 0.0);
         white = max(white, box(ep, float2(0, 0), float2(1, 7)));
         white = max(white, box(ep, float2(0.5, 0), float2(3.5, 1)));
         white = max(white, box(ep, float2(0.5, 3), float2(3.0, 4)));
         white = max(white, box(ep, float2(0.5, 6), float2(3.5, 7)));
-        // C
         const float2 cp = lp - float2(17.0, 0.0);
         white = max(white, box(cp, float2(0, 0), float2(1, 7)));
         white = max(white, box(cp, float2(0.5, 0), float2(3.5, 1)));
         white = max(white, box(cp, float2(0.5, 6), float2(3.5, 7)));
     }
 
-    // Counter, mm:ss, where slot code -2 is the colon.
+    // Slot code -2 is the colon in the mm:ss counter.
     if (el >= 1) {
         const uint total_s = uint(t);
         const uint mm = (total_s / 60u) % 100u;
@@ -135,7 +131,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         white = max(white, box(lp, float2(1.4, 1.4), float2(4.6, 3.6)));
         white = max(white, box(lp, float2(5.4, 1.4), float2(8.6, 3.6)));
 
-        // Corner brackets at the 90% safe frame.
+        // The 0.05 margin puts brackets on the 90 percent safe frame.
         const float2 m = size_px * 0.05;
         const float bl = 10.0 * unit;
         const float bw = 1.0 * unit;

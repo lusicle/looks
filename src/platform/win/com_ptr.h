@@ -1,5 +1,4 @@
-// Minimal intrusive COM pointer shared by the platform TUs - no ATL.
-// Move-only: a copyable raw-Release holder is a double-release.
+// This type is move-only. A copy would cause a double Release.
 #pragma once
 
 namespace looks::platform {

@@ -1,9 +1,3 @@
-// Export: rendered frames -> H.264 + AAC encoder MFTs ->
-// hand-rolled BMFF mux -> MP4. Frame pixels arrive through a producer
-// callback (the app supplies mezzanine decode + engine render + readback),
-// keeping this module free of any GPU dependency; audio comes from the PCM
-// sidecar. Offline and correctness-first — software MFT fallback is fine.
-
 #pragma once
 
 #include <atomic>
@@ -18,14 +12,10 @@ namespace looks::media {
 struct ExportOptions {
     uint32_t video_bitrate_bps = 8'000'000;
     uint32_t audio_bitrate_bps = 128'000;
-    // 0 = the encoder's own cadence; > 0 pins the keyframe interval
-    // (fixtures with controlled spacing for the seek benches).
+    // 0 = encoder default cadence; > 0 pins the keyframe interval.
     uint32_t gop_frames = 0;
-    // Mix samples skipped before the first exported video frame - the
-    // trim lead-in minus the user nudge, already rounded by the caller
-    // through the sample_clock.h converters so export and monitor agree
-    // sample for sample. Negative delays audio with leading silence;
-    // out-of-range reads are silence, so any skip is safe.
+    // Count of mix samples to skip before the first video frame.
+    // A negative value delays the audio with leading silence.
     int64_t audio_skip_samples = 0;
 };
 
@@ -40,20 +30,16 @@ struct ExportResult {
     std::string error;
 };
 
-// Fills `nv12` with a packed frame (stride == width, Y then interleaved
-// UV) for frame `index`. Returning false aborts the export.
+// nv12 is packed: stride equals width, Y plane then interleaved UV.
+// A false return aborts the export.
 using FrameProducer =
     std::function<bool(uint32_t index, std::vector<uint8_t>& nv12)>;
 
-// The export's soundtrack: the same tree mix the monitor pulls
-// (audio_mix.h), so what was heard is what is written. channels == 0 =
-// silent movie.
+// channels == 0 exports a silent movie.
 struct ExportAudio {
     uint32_t channels = 0;
     uint32_t rate = 0;
-    // Writes `frames` interleaved samples starting at output sample
-    // `first`. `first` may be negative (the audio nudge); positions
-    // outside every source are silence.
+    // first can be negative; positions outside all sources give silence.
     std::function<void(int64_t first, int16_t* out, uint32_t frames)> fill;
 };
 

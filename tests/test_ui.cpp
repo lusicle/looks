@@ -1,6 +1,3 @@
-// CPU-side UI toolkit tests: draw-list recording, batching, clipping,
-// color packing, UTF-8, text measurement. No GPU required.
-
 #include "test_framework.h"
 #include "ui/canvas2d.h"
 #include "ui/font.h"
@@ -53,7 +50,7 @@ TEST(ui_canvas_clip_stack) {
     canvas.draw_rect({0, 0, 10, 10}, Color::hex(0xFFFFFF));
     canvas.push_clip({100, 100, 200, 200});
     canvas.draw_rect({100, 100, 10, 10}, Color::hex(0xFFFFFF));
-    canvas.push_clip({150, 150, 500, 500});   // intersects with parent
+    canvas.push_clip({150, 150, 500, 500});
     canvas.draw_rect({150, 150, 10, 10}, Color::hex(0xFFFFFF));
     const Rect clip = canvas.current_clip_physical();
     CHECK_EQ(clip.x, 150.0f);
@@ -99,12 +96,12 @@ TEST(ui_utf8_decode) {
     CHECK_EQ(utf8_decode(text, len, &cursor), 0x20ACu);
     CHECK_EQ(utf8_decode(text, len, &cursor), 0x1F600u);
     CHECK_EQ(cursor, len);
-    // Malformed: lone continuation byte -> U+FFFD, advances 1.
+    // 0x80 is a lone continuation byte.
     const char bad[] = "\x80x";
     cursor = 0;
     CHECK_EQ(utf8_decode(bad, 2, &cursor), 0xFFFDu);
     CHECK_EQ(cursor, size_t{1});
-    // Overlong encoding rejected.
+    // 0xC0 0xAF is an overlong encoding.
     const char overlong[] = "\xC0\xAF";
     cursor = 0;
     CHECK_EQ(utf8_decode(overlong, 2, &cursor), 0xFFFDu);
@@ -114,16 +111,13 @@ TEST(ui_font_and_measure) {
     Font font = Font::create_debug();
     CHECK(font.find_glyph('A') != nullptr);
     CHECK_EQ(font.find_glyph('A')->codepoint, uint32_t{'A'});
-    // Missing codepoints fall back to '?'.
     CHECK_EQ(font.find_glyph(0x4E2D)->codepoint, uint32_t{'?'});
-    // Space exists but has no geometry.
     CHECK(!font.find_glyph(' ')->has_geometry);
     CHECK(font.find_glyph('g')->has_geometry);
     // Monospace: N chars at size S measure N*S wide.
     const Vec2 m = measure_text(font, "hello", 16.0f);
     CHECK_EQ(m.x, 80.0f);
     CHECK_EQ(m.y, 16.0f * 1.25f);
-    // Atlas has ink.
     bool any = false;
     for (uint8_t p : font.atlas_pixels()) any |= p != 0;
     CHECK(any);
@@ -131,14 +125,14 @@ TEST(ui_font_and_measure) {
 
 TEST(ui_text_emits_glyph_quads) {
     Font font = Font::create_debug();
-    // Give the font a fake texture pointer so draw_text emits.
+    // draw_text emits nothing without a texture, so set a fake one.
     const UiTexture* fake = reinterpret_cast<const UiTexture*>(0x1);
     font.set_texture(fake);
 
     Canvas2D canvas;
     canvas.begin_frame(1.0f, {800, 600});
     ui::draw_text(canvas, font, "ok go", {10, 10}, 16.0f, Color::hex(0xFFFFFF));
-    // 4 visible glyphs (space skipped), one Text batch.
+    // The space makes no quad, so 5 chars give 4 quads.
     CHECK_EQ(canvas.batches().size(), size_t{1});
     CHECK_EQ(canvas.batches()[0].kind == BatchKind::Text, true);
     CHECK_EQ(canvas.batches()[0].texture, fake);

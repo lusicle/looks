@@ -1,8 +1,4 @@
-// Downsamples one rendered library thumbnail into its gallery atlas
-// cell, aspect-FIT (the canvas can be any shape, cells are 16:9):
-// pixels outside the fit read opaque black. The atlas holds LINEAR
-// working-space values; the sRGB swapchain applies the transfer once
-// at composite - same contract as the node thumb tap.
+// The atlas holds linear values. The sRGB swapchain encodes them.
 
 #include "fx_common.slang"
 
@@ -32,8 +28,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         fit.y = cell_aspect / src_aspect;
     else
         fit.x = src_aspect / cell_aspect;
-    // Stratified 6x6 box average against undersampling, matching the
-    // node thumb tap; pixels outside the fit stay opaque black.
+    // Use a 6x6 box average. One bilinear tap shimmers.
     const float2 cell = 1.0 / float2(160.0, 90.0);
     float3 acc = float3(0.0, 0.0, 0.0);
     for (int j = 0; j < 6; ++j)

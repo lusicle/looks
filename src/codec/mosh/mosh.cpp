@@ -24,7 +24,6 @@ void alloc_frame(DecodedFrame& f, uint32_t width, uint32_t height) {
     f.v.assign(static_cast<size_t>(cw) * ch, 128);
 }
 
-// Motion-compensated block copy with edge clamping (full-pel).
 void copy_block(const uint8_t* src, size_t src_stride, int src_w, int src_h,
                 int sx, int sy, uint8_t* dst, size_t dst_stride, int dx,
                 int dy, int bw, int bh) {
@@ -39,7 +38,6 @@ void copy_block(const uint8_t* src, size_t src_stride, int src_w, int src_h,
     }
 }
 
-// Adds a decoded residual block onto dst in place.
 void add_residual(const int16_t block[kBlockCoeffs], uint8_t* dst,
                   size_t dst_stride, int avail_w, int avail_h) {
     const int bw = std::min(kBlockSize, avail_w);
@@ -61,9 +59,7 @@ void MoshCodec::reset() {
 
 void MoshCodec::encode_decode_intra(const FrameView& in, int quality,
                                     DecodedFrame& out) {
-    // Entropy-free wire: pixels identical to encode + decode at this
-    // quality, no bytes ever written. (in may alias out — the DCT pass
-    // consumes it fully before recon writes.)
+    // in may alias out: the DCT pass consumes in before recon writes.
     intra_dct(in, intra_scratch_);
     intra_recon(intra_scratch_, std::clamp(quality, 1, 100), out);
 }
@@ -80,24 +76,15 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         frame_index % static_cast<uint32_t>(params.gop_length) == 0;
 
     if (!has_state_ || gop_i) {
-        // The virtual encoder emits an I frame. The clean reference always
-        // takes it; the moshed chain takes it only when not dropping —
-        // a dropped I repeats the stale frame (the freeze before the melt).
+        // A dropped I frame repeats the stale moshed frame by intent.
         int quality = std::clamp(params.quality, 1, 100);
-        // Two-phase: DCT once (parallel), then the rate loop probes exact
-        // stream sizes per quality step without writing bits, and the
-        // reconstruction skips entropy entirely — nothing downstream reads
-        // the bytes, and entropy is lossless, so the pixels are identical.
         intra_dct(in, intra_scratch_);
         while (params.bitrate_budget > 0 && quality > 1 &&
                intra_entropy_bytes(intra_scratch_, quality) >
                    params.bitrate_budget)
             quality = std::max(1, quality - 15);
         intra_recon(intra_scratch_, quality, clean_state_);
-        // Generation loss: run the wire again N times. The integer pipeline
-        // is idempotent at a fixed quality, so alternate the quantizer a
-        // notch between passes — like every real dub chain, no two
-        // generations quantize identically, and the error accumulates.
+        // Fixed quality is idempotent; alternate the quantizer so error grows.
         for (int g = 0; g < std::min(params.generations, 12); ++g) {
             const int gq = std::clamp(
                 params.quality - ((g & 1) ? 9 : 0), 1, 100);
@@ -109,15 +96,10 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         return;
     }
 
-    // ---- P frame, open loop: the residual is encoded against the CLEAN
-    // reference (raw flow MVs — what the virtual encoder believes the
-    // decoder holds) and applied to the MOSHED prediction (mangled MVs over
-    // the diverged state). Divergence between the chains is therefore never
-    // repaired, only repainted by new residual texture — the melt.
+    // Open loop by intent: encode against clean, apply to moshed.
     predict(clean_state_, frame_index, params, mvs, /*mangle=*/false,
             clean_pred_);
     predict(state_, frame_index, params, mvs, /*mangle=*/true, pred_);
-    // Bloom: re-apply the mangled motion field N extra times.
     for (int r = 0; r < std::min(params.p_repeat, 8); ++r) {
         predict(pred_, frame_index, params, mvs, /*mangle=*/true, pred_tmp_);
         std::swap(pred_, pred_tmp_);
@@ -132,10 +114,7 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
     const uint64_t frame_seed =
         hash_combine(hash_combine(params.seed, 0x9E3779B9u), frame_index);
 
-    // Two-phase residual encode: the residual DCT is quality-independent,
-    // so transform every block once (parallel across MBs), then the rate
-    // loop re-runs only quantize+entropy. Bitstream identical to the
-    // one-shot walk.
+    // The bitstream must stay identical to the one-shot walk.
     const int mb_count = mb_w * mb_h;
     p_coeffs_.resize(static_cast<size_t>(mb_count) * 6 * kBlockCoeffs);
     p_zero_.assign(static_cast<size_t>(mb_count) * 6, 0);
@@ -183,20 +162,13 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         }
     });
 
-    // Rate loop: probes exact stream sizes without writing a bit. The
-    // quality sequence matches the old encode-and-measure loop exactly.
     while (params.bitrate_budget > 0 && quality > 1 &&
            p_stream_bytes(mb_count, quality) > params.bitrate_budget)
         quality = std::max(1, quality - 15);
     build_quant_table(kQuantBaseLuma, quality, qy);
     build_quant_table(kQuantBaseChroma, quality, qc);
 
-    // ---- moshed parse. Entropy is lossless, so with no byte flips the
-    // decoder's quantized coefficients are exactly quantize(p_coeffs_) and
-    // no bitstream exists at all. With flips the stream is written once at
-    // the final quality, corrupted, and parsed serially tolerating desync:
-    // every block after the desync point stays on bare prediction — and
-    // open loop means the scar persists.
+    // After a parse desync, later blocks stay on bare prediction by intent.
     int done = mb_count * 6;
     if (params.byte_flips > 0) {
         bitstream_.clear();
@@ -245,10 +217,6 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         done = parsed;
     }
 
-    // ---- reconstruction, both chains in parallel across MBs. The clean
-    // chain adds every residual (faithful decode). The moshed chain skips
-    // corrupt-rolled MBs, blocks past the desync point, and uses the parsed
-    // (possibly garbage) coefficients when the stream was flipped.
     parallel_blocks(mb_count, true, [&](int begin, int end) {
         int16_t quantized[kBlockCoeffs];
         int16_t block[kBlockCoeffs];
@@ -321,7 +289,7 @@ size_t MoshCodec::p_stream_bytes(int mb_count, int quality) {
             const size_t base = static_cast<size_t>(mb) * 6;
             for (int b = 0; b < 6; ++b) {
                 if (p_zero_[base + b]) {
-                    // Encoded as a zero block: DC 0 resets the predictor.
+                    // A zero block writes DC 0 and resets the predictor.
                     p_dc_[base + b] = 0;
                     p_acbits_[base + b] = zero_ac;
                     continue;
@@ -362,8 +330,7 @@ void MoshCodec::predict(const DecodedFrame& ref, uint32_t frame_index,
     const float sr = std::sin(params.mv_rotate);
     const uint64_t mv_seed = hash_combine(params.seed, 0x33CC33CCu);
 
-    // MBs are independent (disjoint output blocks, per-block seeded MVs),
-    // so the motion comp fans out across threads deterministically.
+    // MB outputs are disjoint; parallel motion comp stays deterministic.
     parallel_blocks(mb_w * mb_h, true, [&](int begin, int end) {
         for (int mb = begin; mb < end; ++mb) {
             const int mx = mb % mb_w;
@@ -375,10 +342,7 @@ void MoshCodec::predict(const DecodedFrame& ref, uint32_t frame_index,
                 vy = mvs.my[my * static_cast<int>(mvs.blocks_w) + mx];
             }
             if (mangle) {
-                // Replace-with-custom-field: synthetic MV fields swap in for
-                // the flow-supplied vectors; the mangling ops below still
-                // apply, so rotate steers the pan and scale amplifies the
-                // whole field.
+                // Field replacement comes first; scale/rotate/random follow.
                 if (params.mv_field != 0) {
                     const float px = (mx + 0.5f) / mb_w - 0.5f;
                     const float py = (my + 0.5f) / mb_h - 0.5f;
@@ -398,7 +362,6 @@ void MoshCodec::predict(const DecodedFrame& ref, uint32_t frame_index,
                             break;
                     }
                 }
-                // MV mangling: scale, rotate, seeded randomization.
                 const float rx = vx * cr - vy * sr;
                 const float ry = vx * sr + vy * cr;
                 vx = rx * params.mv_scale;
@@ -421,7 +384,7 @@ void MoshCodec::predict(const DecodedFrame& ref, uint32_t frame_index,
             const int bw = std::min(16, static_cast<int>(w) - dx);
             const int bh = std::min(16, static_cast<int>(h) - dy);
             if (bw <= 0 || bh <= 0) continue;
-            // The block's content came FROM (dx - mv) in the reference.
+            // The block content comes from (dst - mv) in the reference.
             copy_block(ref.y.data(), ref.y_stride, static_cast<int>(w),
                        static_cast<int>(h), dx - ivx, dy - ivy, out.y.data(),
                        out.y_stride, dx, dy, bw, bh);

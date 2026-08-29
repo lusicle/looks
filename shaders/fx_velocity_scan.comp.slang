@@ -1,6 +1,4 @@
-// Brightness is rendered as time-spent, not intensity: the beam runs at
-// constant intensity and the look comes from dwell accumulating on the
-// canvas, which is this instance's own previous output.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -14,15 +12,15 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 vertical lines sweep +x, 1 horizontal +y
-    float speed;     // stepper param, unused here
-    float stick;     // stepper param, unused here
+    float mode;
+    float speed;     // the stepper uses this, not the shader
+    float stick;     // the stepper uses this, not the shader
     float persist;
-    float rate;      // stepper param, unused here
+    float rate;      // the stepper uses this, not the shader
     float beam_w;    // half-width, px
-    float wiggle;    // stepper param, unused here
-    float color;     // 0 white beam, 1 source-colored
-    uint state_w;    // engine-appended front-field width
+    float wiggle;    // the stepper uses this, not the shader
+    float color;
+    uint state_w;    // the engine appends the front field width
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -65,7 +63,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             col_a = max(col_a, glow * glow * 0.35);
         }
     }
-    // Ceiling instead of blowout, so bunched stuck fronts stay readable.
+    // Use a ceiling instead of blowout so bunched fronts stay readable.
     col = min(col, float3(1.6, 1.6, 1.6));
 
     const float4 result = float4(col, saturate(col_a));

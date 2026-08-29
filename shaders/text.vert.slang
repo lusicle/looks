@@ -1,6 +1,3 @@
-// Same transform and color model as ui.vert.slang. UV addresses the
-// glyph atlas directly.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]

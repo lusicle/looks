@@ -1,11 +1,5 @@
-// Hand-rolled TrueType loader + string SDF rasterizer: parses
-// glyf-flavored TTFs (cmap formats 4/12,
-// simple + composite glyphs, hmtx advances, kern format 0) and renders
-// whole strings into single-channel signed-distance bitmaps — the Text
-// effect's runtime font path, no bake step, any dropped .ttf. Output is
-// a pure function of (font bytes, text, size, spread), so preview and
-// export stay bit-identical. CFF/PostScript outlines (.otf) are out of
-// scope — load() rejects fonts without a glyf table.
+// The SDF output is a pure function of (font bytes, text, size, spread).
+// load() rejects fonts without a glyf table; CFF outlines are unsupported.
 
 #pragma once
 
@@ -19,15 +13,11 @@ namespace looks::ui {
 
 class TtfFont {
 public:
-    // Whole-file parse; empty on malformed/unsupported fonts. Every
-    // table read is bounds-checked — user-dropped files are untrusted.
+    // Font bytes are untrusted; bounds-check every table read.
     static std::optional<TtfFont> load(const std::filesystem::path& path);
 
-    // The string rendered at `size_px` as a signed-distance bitmap:
-    // 0.5 = the outline edge, encoded across ±spread_px (inside > 0.5).
-    // y-down, string box centered (pad = spread on every side); width 0
-    // when nothing is drawable. Overlong strings are truncated at the
-    // width cap.
+    // SDF encode: 0.5 is the outline edge, inside > 0.5, span is +-spread_px.
+    // Bitmap is y-down, padded spread_px each side; overlong text truncates.
     struct Sdf {
         uint32_t width = 0, height = 0;
         std::vector<uint8_t> pixels;   // R8, y-down
@@ -42,19 +32,17 @@ private:
     uint32_t glyph_index(uint32_t codepoint) const;
     float advance_units(uint32_t glyph) const;
     float kern_units(uint32_t left, uint32_t right) const;
-    // Appends the glyph's flattened contours in px (y-up), transformed
-    // by the font-unit affine xf {a, b, c, d, e, f} then scaled.
-    // Composite glyphs recurse (depth-capped).
+    // Emits contours in px, y-up; xf is the font-unit affine {a,b,c,d,e,f}.
     void append_outline(uint32_t glyph, const float xf[6], float scale_px,
                         std::vector<std::vector<float>>* contours,
                         int depth) const;
 
     std::vector<uint8_t> bytes_;
-    // Table offsets/lengths into bytes_ (0 = absent).
+    // Table offsets/lengths into bytes_; 0 = absent.
     uint32_t glyf_off_ = 0, glyf_len_ = 0;
     uint32_t loca_off_ = 0, loca_len_ = 0;
     uint32_t hmtx_off_ = 0, hmtx_len_ = 0;
-    uint32_t cmap_sub_off_ = 0;   // the chosen cmap subtable
+    uint32_t cmap_sub_off_ = 0;
     uint32_t kern_pairs_off_ = 0; // format-0 pair array
     uint32_t kern_pair_count_ = 0;
     uint16_t cmap_format_ = 0;

@@ -1,8 +1,3 @@
-// Lexer -> single-pass compiler -> bytecode -> stack VM. The VM is
-// re-entrant per instruction so the host can budget it per frame and
-// suspend it inside native calls (the call result is simply not pushed
-// yet; resume pushes it and continues).
-
 #include "script/script.h"
 
 #include <algorithm>
@@ -81,8 +76,6 @@ int Env::index_of(const std::string& name) const {
     const auto it = by_name_.find(name);
     return it == by_name_.end() ? -1 : it->second;
 }
-
-// ------------------------------------------------------------------ lexer
 
 namespace {
 
@@ -267,8 +260,6 @@ private:
     int line_ = 1;
 };
 
-// -------------------------------------------------------------- bytecode
-
 enum class Op : uint8_t {
     Const,        // u16 constant index
     Nil, True, False, Pop,
@@ -305,8 +296,6 @@ struct Program {
     std::vector<Value> constants;
 };
 
-// -------------------------------------------------------------- compiler
-
 class Compiler {
 public:
     Compiler(const std::string& src, std::string chunk_name, const Env& env)
@@ -329,7 +318,6 @@ public:
     Program take() { return std::move(prog_); }
 
 private:
-    // ---- token plumbing
     void advance() {
         prev_ = cur_tok_;
         cur_tok_ = lex_.next();
@@ -355,7 +343,6 @@ private:
         error_line_ = cur_tok_.line;
     }
 
-    // ---- emit helpers
     void emit(Op op) {
         cur_chunk().code.push_back(static_cast<uint8_t>(op));
         cur_chunk().lines.push_back(prev_.line);
@@ -396,7 +383,6 @@ private:
         emit_u16(static_cast<uint16_t>(dist));
     }
     uint16_t constant(Value v) {
-        // Small pools: linear dedup of strings/numbers keeps them tidy.
         for (size_t i = 0; i < prog_.constants.size(); ++i) {
             const Value& c = prog_.constants[i];
             if (c.kind != v.kind) continue;
@@ -416,17 +402,16 @@ private:
         return constant(Value::string(n));
     }
 
-    // ---- scopes
     struct Local {
         std::string name;
         int depth;
     };
     struct LoopCtx {
-        size_t continue_target = 0;      // Loop target (while)
-        bool continue_patches = false;   // for-in: continue jumps forward
+        size_t continue_target = 0;
+        bool continue_patches = false;
         std::vector<size_t> breaks;
         std::vector<size_t> continues;
-        size_t local_floor = 0;          // locals live outside the loop
+        size_t local_floor = 0;
     };
 
     void begin_scope() { ++depth_; }
@@ -458,7 +443,6 @@ private:
         locals_.push_back({name, depth_});
     }
 
-    // ---- statements
     void statement() {
         if (match(Tok::Semicolon)) return;
         if (match(Tok::KwLet)) return let_statement();
@@ -493,7 +477,7 @@ private:
         if (fn_depth_ == 0 && depth_ == 0) {
             emit_op16(Op::DefGlobal, name_constant(name));
         } else {
-            declare_local(name);   // the value stays as the slot
+            declare_local(name);
         }
     }
 
@@ -528,7 +512,6 @@ private:
     }
 
     void for_statement() {
-        // for x in e {}  ==  hidden list+index locals, x rebound per pass.
         expect(Tok::Ident, "a loop variable");
         const std::string var = prev_.text;
         expect(Tok::KwIn, "'in'");
@@ -540,7 +523,7 @@ private:
         begin_scope();
         expression();
         declare_local("(it)");
-        emit(Op::Nil);   // placeholder slot for x
+        emit(Op::Nil);
         declare_local(var);
         emit_op16(Op::Const, constant(Value::number(0.0)));
         declare_local("(i)");
@@ -549,8 +532,7 @@ private:
         const int i_slot = resolve_local("(i)");
 
         const size_t top = cur_chunk().code.size();
-        // i < len(it), through the native directly - shadowing the `len`
-        // global never breaks loops.
+        // Call the native directly. A shadowed len global must not break it.
         emit_op16(Op::GetLocal, static_cast<uint16_t>(i_slot));
         {
             Value v;
@@ -563,7 +545,6 @@ private:
         emit_u8(1);
         emit(Op::Lt);
         const size_t exit = emit_jump(Op::JumpFalse);
-        // x = it[i]
         emit_op16(Op::GetLocal, static_cast<uint16_t>(it_slot));
         emit_op16(Op::GetLocal, static_cast<uint16_t>(i_slot));
         emit(Op::Index);
@@ -576,7 +557,6 @@ private:
         loops_.push_back(loop);
         block();
         for (const size_t c : loops_.back().continues) patch_jump(c);
-        // i = i + 1
         emit_op16(Op::GetLocal, static_cast<uint16_t>(i_slot));
         emit_op16(Op::Const, constant(Value::number(1.0)));
         emit(Op::Add);
@@ -631,13 +611,12 @@ private:
     }
 
     void return_statement() {
-        // `return` alone (newline / '}' next) returns nil.
         if (check(Tok::RBrace) || check(Tok::End) || cur_tok_.newline_before)
             emit(Op::Nil);
         else
             expression();
         if (fn_depth_ == 0) {
-            emit(Op::HaltValue);   // top-level return: script result
+            emit(Op::HaltValue);
         } else {
             emit(Op::Return);
         }
@@ -665,15 +644,12 @@ private:
             emit_loop(loop.continue_target);
     }
 
-    // Pops block locals declared inside the loop body before a jump out
-    // of it (the jump bypasses end_scope's pops).
+    // A jump out of a loop skips end_scope, so pop the locals here.
     void pop_to_floor(size_t floor) {
         for (size_t i = locals_.size(); i > floor; --i) emit(Op::Pop);
     }
 
     void expr_statement() {
-        // Assignment vs expression: parse the target expression; '='
-        // afterwards rewrites the last load into a store.
         expression();
         if (match(Tok::Assign)) {
             rewrite_store();
@@ -684,8 +660,7 @@ private:
         }
     }
 
-    // ---- assignment rewriting: expression() tracked what it last
-    // emitted; a[i] = v and name = v reuse those tails.
+    // rewrite_store() needs the load to be the last emitted bytes.
     enum class LastLoad : uint8_t { None, Local, Global, Index };
     LastLoad last_load_ = LastLoad::None;
     uint16_t last_slot_ = 0;
@@ -696,12 +671,10 @@ private:
         switch (last_load_) {
             case LastLoad::Local:
             case LastLoad::Global:
-                // Drop the load: value wasn't needed.
                 cur_chunk().code.resize(cur_chunk().code.size() - 3);
                 cur_chunk().lines.resize(cur_chunk().code.size());
                 break;
             case LastLoad::Index:
-                // a i Index -> keep a i on the stack for SetIndex.
                 cur_chunk().code.resize(cur_chunk().code.size() - 1);
                 cur_chunk().lines.resize(cur_chunk().code.size());
                 break;
@@ -728,12 +701,9 @@ private:
     LastLoad pending_store_ = LastLoad::None;
     uint16_t pending_slot_ = 0;
 
-    // ---- expressions (precedence climbing)
     void expression() { parse_or(); }
 
-    // Binary operators never continue across a newline at depth 0 - a
-    // fresh line starts a fresh statement, like the surrounding app
-    // code's readers expect.
+    // A newline ends the expression unless it is in parens or brackets.
     bool op_continues() const {
         return group_depth_ > 0 || !cur_tok_.newline_before;
     }
@@ -900,7 +870,7 @@ private:
             uint16_t count = 0;
             if (!check(Tok::RBracket)) {
                 do {
-                    if (check(Tok::RBracket)) break;   // trailing comma
+                    if (check(Tok::RBracket)) break;
                     expression();
                     ++count;
                 } while (match(Tok::Comma));
@@ -915,7 +885,7 @@ private:
             uint16_t count = 0;
             if (!check(Tok::RBrace)) {
                 do {
-                    if (check(Tok::RBrace)) break;   // trailing comma
+                    if (check(Tok::RBrace)) break;
                     if (match(Tok::Ident) || match(Tok::String)) {
                         emit_op16(Op::Const, name_constant(prev_.text));
                     } else {
@@ -968,8 +938,6 @@ private:
 
 }  // namespace
 
-// -------------------------------------------------------------------- vm
-
 struct Vm::Impl {
     Program prog;
     const Env* env = nullptr;
@@ -998,7 +966,6 @@ std::unique_ptr<Vm> Vm::compile(const std::string& source,
     std::unique_ptr<Vm> vm(new Vm());
     vm->impl_->prog = comp.take();
     vm->impl_->env = &env;
-    // Natives preload as globals under their names.
     const auto& defs = env.defs();
     for (size_t i = 0; i < defs.size(); ++i) {
         Value v;
@@ -1290,8 +1257,6 @@ Vm::Status Vm::execute(uint64_t budget) {
                         runtime_error("call stack overflow");
                         return Status::Error;
                     }
-                    // Args become the frame's first locals; the callee
-                    // value under them is removed.
                     stack.erase(stack.begin() +
                                 static_cast<ptrdiff_t>(callee_at));
                     im.frames.push_back({callee.fn, 0, callee_at});
@@ -1408,8 +1373,6 @@ Vm::Status Vm::execute(uint64_t budget) {
     }
     return Status::Yielded;
 }
-
-// ---------------------------------------------------------- core natives
 
 namespace {
 

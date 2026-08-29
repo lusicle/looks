@@ -1,4 +1,4 @@
-// Display-referred: the drawing is ink on paper.
+// Work in display-referred space. The drawing is ink on paper.
 
 #include "fx_common.slang"
 
@@ -39,8 +39,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float paper = 1.0;
     for (int i = 0; i < n; ++i) {
-        // Each layer only draws below its band threshold, so deeper
-        // shadows accumulate more hatch directions.
         const float thresh = 1.0 - (float(i) + 0.55) / (float(n) + 0.6);
         if (l >= thresh) continue;
         const float a = kAngles[i];
@@ -52,7 +50,6 @@ void main(uint3 tid : SV_DispatchThreadID)
             wobble * pitch * 0.8;
         const float d =
             abs(frac((across + tremor) / pitch) - 0.5) * pitch;
-        // Strokes widen as tone darkens, like pressing harder.
         const float press = saturate((thresh - l) / max(thresh, 1.0e-3));
         const float half_w = 0.35 + press * 0.75;
         const float stroke = 1.0 - smoothstep(half_w - 0.4, half_w + 0.4, d);

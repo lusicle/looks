@@ -26,37 +26,37 @@ static const uint kPresets = 17;
 static const float3x3 kMatrix[kPresets] = {
     // neutral
     float3x3(1.00, 0.00, 0.00, 0.00, 1.00, 0.00, 0.00, 0.00, 1.00),
-    // kodachrome: punchy warm reds, deep blue-cyan shadows
+    // kodachrome
     float3x3(1.12, -0.06, -0.02, -0.04, 1.04, -0.02, -0.06, -0.02, 1.02),
-    // portra: gentle, warm, protected skin band
+    // portra
     float3x3(1.04, 0.02, -0.02, 0.00, 1.00, 0.00, -0.02, 0.02, 0.96),
-    // vision3: near-neutral negative, mild teal shadows
+    // vision3
     float3x3(1.02, 0.00, -0.01, 0.00, 1.01, 0.00, 0.00, 0.01, 1.00),
-    // ektachrome: cool clean punch
+    // ektachrome
     float3x3(1.02, -0.02, 0.00, -0.02, 1.02, 0.00, 0.00, 0.02, 1.06),
-    // fuji: green-teal bias
+    // fuji
     float3x3(0.98, 0.02, 0.00, 0.00, 1.06, -0.02, 0.00, 0.04, 1.00),
     // bleach bypass
     float3x3(1.00, 0.00, 0.00, 0.00, 1.00, 0.00, 0.00, 0.00, 1.00),
-    // cross-process: twisted channels
+    // cross-process
     float3x3(1.10, -0.12, 0.02, -0.02, 1.08, -0.06, 0.06, 0.10, 0.84),
-    // technicolor 2-strip: red/cyan only
+    // technicolor 2-strip
     float3x3(1.20, -0.10, -0.10, -0.10, 0.90, 0.20, -0.10, 0.20, 0.90),
-    // ccd video: slight magenta highlights, clipped blue
+    // ccd video
     float3x3(1.06, -0.02, -0.04, -0.02, 1.02, 0.00, -0.04, -0.02, 1.06),
-    // wb failure warm (tungsten left on)
+    // wb failure warm
     float3x3(1.25, 0.05, -0.10, 0.02, 1.02, -0.04, -0.12, -0.06, 0.72),
-    // wb failure cool (daylight indoors)
+    // wb failure cool
     float3x3(0.80, 0.00, 0.10, 0.00, 0.98, 0.04, 0.08, 0.04, 1.28),
     // technicolor 3-strip
     float3x3(1.35, -0.20, -0.15, -0.15, 1.25, -0.10, -0.15, -0.20, 1.35),
-    // expired stock: green-cyan fog, magenta-shifted mids, weak blues
+    // expired stock
     float3x3(0.92, 0.10, -0.02, 0.06, 1.04, 0.04, 0.02, 0.14, 0.78),
-    // aerochrome IR: chlorophyll lands in red
+    // aerochrome IR
     float3x3(0.10, 1.20, -0.10, 0.80, 0.10, 0.05, 0.10, -0.10, 0.90),
-    // b&w infrared: identical rows = mono
+    // b&w infrared
     float3x3(0.40, 0.90, -0.30, 0.40, 0.90, -0.30, 0.40, 0.90, -0.30),
-    // instant film: cool green-cyan shadows, starved blue, creamy flat
+    // instant film
     float3x3(1.02, 0.04, -0.02, 0.02, 1.04, 0.00, -0.04, 0.06, 0.88),
 };
 
@@ -75,10 +75,10 @@ static const float3 kTone[kPresets] = {
     float3(0.05, 0.95, 0.4),   // wb warm
     float3(0.05, 0.95, 0.0),   // wb cool
     float3(0.35, 1.45, 0.0),   // technicolor 3-strip
-    float3(-0.10, 0.80, 0.6),  // expired: flat, desaturated, warm fog
-    float3(0.20, 1.35, 0.0),   // aerochrome: punchy false color
+    float3(-0.10, 0.80, 0.6),  // expired
+    float3(0.20, 1.35, 0.0),   // aerochrome
     float3(0.15, 0.00, 0.0),   // b&w infrared
-    float3(-0.05, 0.90, 0.35), // instant: flat, slightly warm fade
+    float3(-0.05, 0.90, 0.35), // instant
 };
 
 [shader("compute")]
@@ -94,8 +94,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 lin = base.rgb * exp2(push);
     lin = max(mul(kMatrix[p], lin), 0.0);
-    // highlight: positive deepens the filmic shoulder, negative hard-clips
-    // to a sinking white point, 0 keeps the stock shoulder.
+    // A positive highlight deepens the shoulder. A negative one clips white.
     const float knee = 0.8 - saturate(highlight) * 0.45;
     const float soft = 1.6 + saturate(highlight) * 6.0;
     const float3 over = max(lin - knee, 0.0);
@@ -108,7 +107,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     enc = saturate((enc - 0.42) * (1.0 + contrast) + 0.42);
     const float l = fx_luma(enc);
     enc = saturate(lerp(float3(l, l, l), enc, kTone[p].y));
-    // Presets 13 and 16 carry a baked-in base fog on top of the knob.
+    // Presets 13 and 16 add a base fog to the fade knob.
     const float lift =
         saturate(fade + (p == 13u ? 0.45 : (p == 16u ? 0.22 : 0.0))) *
         0.14;

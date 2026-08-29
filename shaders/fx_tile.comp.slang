@@ -1,6 +1,3 @@
-// Mirroring alternate cells makes tile edges continuous, so the grid
-// reads kaleidoscopic rather than cut.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -38,8 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         if ((cell.x & 1) != 0) f.x = 1.0 - f.x;
         if ((cell.y & 1) != 0) f.y = 1.0 - f.y;
     }
-    // The whole sample rides the remap - alpha is the tiled cell's
-    // coverage, never the pre-tile silhouette.
+    // Alpha is the tiled cell coverage, not the pre-tile silhouette.
     const float4 result = input.SampleLevel(clamp(f, 0.0, 1.0), 0);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

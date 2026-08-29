@@ -97,9 +97,7 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
                           uint64_t cache_ctx, uint32_t cache_frame,
                           const Engine::LayerSourceFrame* layer_sources,
                           size_t layer_source_count) {
-    // Output dims follow the engine's divisor (export scale) with the
-    // exact working-target math from Engine::render, so the NV12 planes
-    // match the composite instead of resampling it back up.
+    // w and h must match the working-target math in Engine::render.
     const uint32_t div = engine.preview_divisor();
     const uint32_t w = even_down(canvas_w, div);
     const uint32_t h = even_down(canvas_h, div);
@@ -145,7 +143,7 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1,
                            &copies[0]);
     copies[1].bufferOffset = static_cast<VkDeviceSize>(w) * h;
-    copies[1].bufferRowLength = w / 2;   // texels; R8G8 = 2 bytes each
+    copies[1].bufferRowLength = w / 2;  // texels, not bytes
     copies[1].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copies[1].imageExtent = {w / 2, h / 2, 1};
     vkCmdCopyImageToBuffer(cmd_, uv_image_->image(),

@@ -1,23 +1,4 @@
-// Media Foundation MFT glue: raw MFT path — we own the
-// containers, so no SourceReader/SinkWriter. OS codecs are touched only at
-// import/export edges.
-//
-// Notes:
-// - H.264 ENCODE prefers the hardware path: async MFT unlocked
-//   via MF_TRANSFORM_ASYNC_UNLOCK, driven by the METransformNeedInput /
-//   HaveOutput event pump, with a D3D11 IMFDXGIDeviceManager attached.
-//   Any setup failure logs its stage and falls back to the sync software
-//   encoder — import/export are offline, so fallback is only a speed loss.
-// - H.264 DECODE keeps the sync inbox MFT but attaches an
-//   IMFDXGIDeviceManager when the transform is D3D11-aware: the
-//   pixel work then runs on the GPU (DXVA) and samples come back D3D-backed
-//   with a GPU pitch, which receive() reads via IMF2DBuffer2::Lock2DSize.
-//   Any D3D setup failure silently stays on the pure software path. (There
-//   is no vendor async decoder MFT to prefer — hardware decode on Windows
-//   is DXVA through the inbox decoder, unlike the encode side.)
-// - H.264 input is Annex B: feed() converts the demuxer's length-prefixed
-//   AVCC samples and injects SPS/PPS from avcC before keyframes.
-// - COM/MF lifetime: construct MfSession once per thread that touches MF.
+// Construct an MfSession one time on each thread that uses MF.
 
 #pragma once
 
@@ -28,8 +9,7 @@
 
 namespace looks::platform {
 
-// CoInitializeEx(MTA) + MFStartup, balanced in the destructor. Cheap to
-// nest (refcounted by the OS).
+// This starts COM in MTA mode and MF. The destructor balances both.
 class MfSession {
 public:
     MfSession();
@@ -42,11 +22,8 @@ private:
     bool ok_ = false;
 };
 
-// MFStartup alone, NO COM: the process-lifetime pin main holds so the
-// FINAL MFShutdown never lands on a worker thread while decoder MFTs
-// are still alive (MF forbids that; it hangs or kills the process).
-// Deliberately apartment-neutral - an MTA init on the main thread
-// would break the STA the shell file dialogs put there.
+// The last MFShutdown must not run on a worker thread with live MFTs.
+// This class must not start COM. The main thread stays STA for dialogs.
 class MfLifetime {
 public:
     MfLifetime();
@@ -70,38 +47,26 @@ public:
     H264Decoder();
     ~H264Decoder();
 
-    // avcc = raw AVCDecoderConfigurationRecord from the demuxer.
-    // allow_d3d gates the DXVA path: GPU decode pays a fixed sync-readback
-    // stall per frame, so CPU-consuming callers (import) may prefer the
-    // multithreaded software decoder.
-    // low_latency caps the software decoder's output lag at a couple of
-    // frames (MF_LOW_LATENCY). Without it the inbox MFT pipelines as deep
-    // as the machine has threads - 40+ frames on a big CPU - which is
-    // right for offline transcode and fatal for a playback session that
-    // steers by what has come OUT.
+    // avcc is the raw AVCDecoderConfigurationRecord from the demuxer.
+    // low_latency caps the output lag. Playback needs it.
     bool create(const std::vector<uint8_t>& avcc, uint32_t width,
                 uint32_t height, std::string* error, bool allow_d3d = true,
                 bool low_latency = false);
 
-    // One demuxed sample (length-prefixed NALs). Returns false on hard error.
+    // The data is one sample of length-prefixed NALs.
     bool feed(const uint8_t* data, size_t size, int64_t pts_100ns,
               int64_t duration_100ns, bool keyframe);
 
-    // Pulls one decoded frame if available. Returns false when the decoder
-    // needs more input (not an error).
+    // Returns false when the decoder needs more input. That is not an error.
     bool receive(VideoFrameNV12& out);
 
-    // Signals end of stream; keep calling receive() until it returns false.
+    // After this, call receive() until it returns false.
     void drain();
 
-    // Discards everything in flight and rearms the stream: the seek
-    // primitive. The next feed must start at a keyframe (parameter sets
-    // are re-injected). Also the way back in after a drain() hit the end.
+    // The next feed() must start at a keyframe.
     void flush();
 
-    // Releases the transform and any D3D device (the session's memory
-    // and handles); the object returns to freshly constructed and may
-    // create() again.
+    // After this, create() can run again.
     void destroy();
 
 private:
@@ -133,9 +98,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// MP3 (Layer III) decode through the inbox MFT, fed whole frames by the
-// in-repo frame walker (media/mp3.cpp owns the container exactly as the
-// BMFF demuxer does for AAC).
+// Feed this decoder whole MP3 frames.
 class Mp3Decoder {
 public:
     Mp3Decoder();
@@ -151,8 +114,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// ---- encoders (export edge; also used by the test-fixture generator)
-
 struct EncodedPacket {
     std::vector<uint8_t> data;   // H.264: Annex B; AAC: raw frame
     int64_t pts_100ns = 0;
@@ -165,13 +126,12 @@ public:
     H264Encoder();
     ~H264Encoder();
 
-    // gop_frames > 0 forces the keyframe interval (fixture generation
-    // wants controlled spacing); 0 leaves the encoder's default cadence.
+    // A gop_frames of 0 keeps the default keyframe interval.
     bool create(uint32_t width, uint32_t height, uint32_t fps_num,
                 uint32_t fps_den, uint32_t bitrate_bps, std::string* error,
                 uint32_t gop_frames = 0);
-    // NV12, tightly packed (stride == width). B-frames are disabled at
-    // create time so pts == dts and the muxer needs no ctts.
+    // The input is NV12, tightly packed, with the stride equal to width.
+    // B-frames are off, so pts equals dts and the muxer needs no ctts.
     bool feed_nv12(const uint8_t* data, int64_t pts_100ns,
                    int64_t duration_100ns);
     bool receive(EncodedPacket& out);
@@ -189,7 +149,7 @@ public:
 
     bool create(uint32_t channels, uint32_t sample_rate, uint32_t bitrate_bps,
                 std::string* error);
-    // AudioSpecificConfig for the muxer's esds (valid after create()).
+    // This is valid only after create() succeeds.
     const std::vector<uint8_t>& audio_specific_config() const;
     bool feed(const int16_t* samples, size_t count, int64_t pts_100ns);
     bool receive(EncodedPacket& out);

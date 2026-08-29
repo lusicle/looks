@@ -1,6 +1,3 @@
-// Orthographic front hemisphere: the radial arcsine map magnifies the
-// center and compresses the rim.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -13,12 +10,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float amount;     // 0 flat, 1 full sphere wrap
+    float amount;
     float radius;     // relative to half the short side
     float center_x;   // normalized
     float center_y;
     float shade;
-    float backdrop;   // outside the ball: 0 black, 1 source
+    float backdrop;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,8 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float2 center = float2(center_x, center_y);
     const float half_min = 0.5 * min(size.x, size.y) * max(radius, 1.0e-3);
-    // Normalized so r = 1 on the rim, keeping the ball circular at any
-    // frame aspect.
+    // r is 1 on the rim. This keeps the ball circular at any aspect.
     const float2 d = (uv - center) * size / half_min;
     const float r = length(d);
 
@@ -53,8 +49,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float cosine = sqrt(saturate(1.0 - r * r));
         result.rgb *= lerp(1.0, cosine, saturate(shade) * saturate(amount));
     } else {
-        // Black backdrop keeps the layer's coverage: the effect blanks
-        // color, it never manufactures opacity.
+        // The backdrop keeps the layer coverage. Never add opacity here.
         result = backdrop >= 0.5 ? base : float4(0.0, 0.0, 0.0, base.a);
     }
 

@@ -1,5 +1,4 @@
-// Gather, not scatter: each output pixel scans the candidate source
-// lines whose luma-displaced trace could land on it.
+// Gather, do not scatter. Each pixel scans the candidate lines.
 
 #include "fx_common.slang"
 
@@ -16,7 +15,7 @@ cbuffer Push
     float spacing;   // px
     float amount;    // max displacement, px
     float line_w;    // half-thickness, px
-    float mode;      // 0 rows displaced up, 1 cols displaced left
+    float mode;
     float wiggle;
     float beam;
     float scroll;    // px/s
@@ -37,17 +36,14 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const bool cols = mode >= 0.5;
     const float sp = max(spacing, 2.0);
-    // p is perpendicular to the lines (the displacement axis), along runs
-    // down them (the axis wiggle and beam ride).
+    // p is across the lines. along runs down them.
     const float p = cols ? float(tid.x) + 0.5 : float(tid.y) + 0.5;
     const float along = cols ? float(tid.y) + 0.5 : float(tid.x) + 0.5;
     const float p_max = cols ? size.x : size.y;
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float wig_max = wiggle * amount * 0.4;
-    // Wrapped into one spacing so the crawling grid stays seamless.
     const float phase = frac(t * scroll / sp) * sp;
 
-    // Bounds of the lines whose displaced trace can reach p.
     const int first = int(ceil((p - wig_max - phase) / sp)) - 1;
     const int last = int(floor((p + amount + wig_max - phase) / sp)) + 1;
     float3 col = 0.0;
@@ -70,7 +66,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float displaced = line_p - l * amount + wig;
         const float d = abs(p - displaced);
         if (d < line_w) {
-            // Weak signal shortens the dash duty until the trace beads.
             if (beam > 0.001) {
                 const float period = 3.0 + line_w * 2.0;
                 const float phase_off =
@@ -81,8 +76,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             }
             const float glow = 1.0 - d / line_w;
             col = max(col, src * (0.35 + 0.65 * l) * (glow * glow) * 2.0);
-            // The drawn trace is the content: its coverage is the line
-            // glow gated by the source pixel's own coverage.
+            // The trace coverage is the glow gated by the source coverage.
             col_a = max(col_a,
                         saturate((glow * glow) * 2.0) * src4.a);
         }

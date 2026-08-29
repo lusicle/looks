@@ -1,5 +1,4 @@
-// Draws the state only. The Gray-Scott sim itself runs in rd_step, which
-// the engine steps per instance before this dispatch.
+// This pass draws the state only. rd_step runs the sim.
 
 #include "fx_common.slang"
 
@@ -13,11 +12,11 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float feed;     // sim params, consumed by rd_step, unused here
+    float feed;     // rd_step uses feed, kill, steps and inject
     float kill;
     float steps;
     float inject;
-    float ink;      // 0 dark ink, 1 glowing growth
+    float ink;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -44,8 +43,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col += rim * base.rgb * 0.8 + rim * 0.05;
     } else {
         col = base.rgb + body * (base.rgb * 2.5 + 0.08) + rim * 0.15;
-        // The pattern's own light (the non-content-gated terms) carries
-        // coverage where it crawls past the content.
+        // The pattern's own light carries coverage past the content.
         col_a = max(col_a, saturate(body * 0.08 + rim * 0.15));
     }
 

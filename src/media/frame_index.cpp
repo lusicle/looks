@@ -29,12 +29,7 @@ uint32_t FrameIndex::keyframe_before(uint32_t present) const {
 
 namespace {
 
-// The CFR grid duration: the MEDIAN sample duration. Captures are
-// routinely VFR-flagged with an outlier FIRST frame (doubled while
-// the encoder spins up), and taking samples[0] halved a 120fps
-// probe - the clip then conformed as 60fps and played half speed.
-// The median is the honest grid for near-CFR content and is immune
-// to leading/trailing outliers and occasional dropped-frame doubles.
+// Use the median duration; outlier first frames make a mean or [0] wrong.
 uint32_t grid_duration(const std::vector<SampleInfo>& samples) {
     std::vector<uint32_t> d;
     d.reserve(samples.size());
@@ -91,8 +86,7 @@ bool build_frame_index(const TrackInfo& track, FrameIndex* out,
     }
     for (uint32_t d = 0; d < n; ++d)
         if (idx.samples[d].keyframe) idx.keyframes.push_back(d);
-    // A stream with no marked sync samples decodes from the top or not at
-    // all; sample 0 is the only honest start.
+    // With no marked sync samples, sample 0 is the only valid start.
     if (idx.keyframes.empty()) idx.keyframes.push_back(0);
 
     *out = std::move(idx);

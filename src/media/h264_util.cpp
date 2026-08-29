@@ -12,7 +12,6 @@ struct NalView {
     uint8_t type() const { return size ? data[0] & 0x1F : 0; }
 };
 
-// Splits an Annex B buffer (3- or 4-byte start codes) into NAL units.
 std::vector<NalView> split_annexb(const uint8_t* data, size_t size) {
     std::vector<NalView> nals;
     size_t i = 0;

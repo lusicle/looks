@@ -1,12 +1,5 @@
-// BMFF (MP4/MOV) demuxer — hand-rolled. Parses ftyp/moov and
-// expands the sample tables (stts/ctts/stsc/stsz/stco/co64/stss) into flat
-// per-sample arrays; extracts avcC (H.264 decoder config) and the esds
-// AudioSpecificConfig for the MFT glue. No fragmented MP4 (moof) support —
-// out of scope by design.
-//
-// The parser core works on in-memory bytes (moov is small) so tests can
-// feed synthetic fixtures; BmffFile wraps a file handle, locates moov, and
-// reads sample payloads on demand — mdat is never loaded wholesale.
+// This demuxer does not support fragmented MP4 (moof).
+// BmffFile reads sample payloads on demand; it never loads mdat whole.
 
 #pragma once
 
@@ -19,15 +12,13 @@
 
 namespace looks::media {
 
-// MP4 elementary-stream descriptors (esds): the tag bytes and the 7-bit
-// varlen size coding, shared by this demuxer and the muxer so the two
-// sides cannot drift.
+// esds descriptor tags; the demuxer and the muxer must share these.
 inline constexpr uint8_t kEsdsTagES = 0x03;
 inline constexpr uint8_t kEsdsTagDecoderConfig = 0x04;
 inline constexpr uint8_t kEsdsTagDecoderSpecific = 0x05;
 inline constexpr uint8_t kEsdsTagSLConfig = 0x06;
 
-// Reads a descriptor length: up to 4 continuation bytes per spec.
+// Reads a descriptor length of up to 4 continuation bytes.
 inline uint32_t esds_read_len(bytes::BeReader& r) {
     uint32_t len = 0;
     for (int i = 0; i < 4; ++i) {
@@ -38,9 +29,7 @@ inline uint32_t esds_read_len(bytes::BeReader& r) {
     return len;
 }
 
-// Writes the minimal varlen form. Refuses payloads whose length needs
-// more than two bytes - overflowing the continuation byte silently
-// emits a corrupt length the reader then mis-parses.
+// Writes the minimal varlen form; it refuses lengths above two bytes.
 inline bool esds_write_len(std::vector<uint8_t>& out, size_t len) {
     if (len >= (1u << 14)) return false;
     if (len < 128) {
@@ -70,12 +59,10 @@ struct TrackInfo {
     uint64_t duration = 0;      // track timescale units
     char fourcc[5] = {};        // sample entry type: "avc1", "mp4a", ...
 
-    // Video (avc1)
     uint32_t width = 0;
     uint32_t height = 0;
     std::vector<uint8_t> avcc;  // raw AVCDecoderConfigurationRecord
 
-    // Audio (mp4a)
     uint32_t channels = 0;
     uint32_t sample_rate = 0;
     std::vector<uint8_t> audio_specific_config;  // from esds
@@ -92,8 +79,7 @@ struct MovieInfo {
     const TrackInfo* first_audio() const;
 };
 
-// Parses a complete moov box (header included). Returns false + error on
-// malformed input; tolerates unknown boxes by skipping.
+// The data must contain the moov box header; unknown boxes skip.
 bool parse_moov(const uint8_t* data, size_t size, MovieInfo* out,
                 std::string* error);
 
@@ -101,19 +87,14 @@ class BmffFile {
 public:
     ~BmffFile();
 
-    // Scans top-level boxes, loads + parses moov. `error` gets a reason on
-    // failure. Accepts .mp4/.mov (same box structure).
     bool open(const std::filesystem::path& path, std::string* error);
     void close();
 
     const MovieInfo& movie() const { return movie_; }
 
-    // Reads one sample's payload from mdat.
     bool read_sample(const SampleInfo& sample, std::vector<uint8_t>& out);
 
-    // Reads `size` bytes at `offset` from an open file - the one sample
-    // fetch every consumer (this class, the decode pool's session FILE*)
-    // shares.
+    // file is a FILE* that is open for binary read.
     static bool read_at(void* file, uint64_t offset, uint32_t size,
                         std::vector<uint8_t>& out);
 

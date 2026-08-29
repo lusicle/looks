@@ -1,7 +1,3 @@
-// Emits an ordinary grayscale image, so the result can feed a matte port
-// or simply keep going through the chain. Output mode cutout instead
-// carves the key into premultiplied alpha - the input survives, gated.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -14,14 +10,14 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;       // 0 luma, 1 brightness key, 2 chroma key
+    float mode;
     float key_c;      // luma center, or key hue in chroma mode
     float key_range;
     float black_pt;
     float white_pt;
     float gamma_v;
     float invert_amt;
-    float out_mode;   // 0 grayscale matte image, 1 premultiplied cutout
+    float out_mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -47,8 +43,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (m == 2u)
     {
-        // Distance in chroma only, with luma removed from both sides, so
-        // shading inside the keyed color survives.
+        // Measure the distance in chroma only. Remove luma from both sides.
         const float3 key_rgb = fx_srgb_oetf(saturate(
             0.5 + 0.5 * cos(6.2831853 * (key_c + float3(0.0, -1.0 / 3.0,
                                                         1.0 / 3.0)))));

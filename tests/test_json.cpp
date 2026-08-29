@@ -45,7 +45,6 @@ TEST(json_parse_errors) {
     CHECK(!parse("\"bad\\escape\"").value.has_value());
     CHECK(!parse("\"\\ud800\"").value.has_value());  // unpaired surrogate
     CHECK(!parse("1e999").value.has_value());        // non-finite
-    // Error messages carry position info.
     auto bad = parse("{\n  \"a\": nope\n}");
     CHECK(!bad.value.has_value());
     CHECK(bad.error.find("line 2") != std::string::npos);
@@ -75,7 +74,7 @@ TEST(json_object_preserves_insertion_order) {
     Value doc = Value::make_object();
     doc.set("zebra", 1);
     doc.set("alpha", 2);
-    doc.set("zebra", 3);   // update in place, keeps slot
+    doc.set("zebra", 3);
     const auto& members = doc.object();
     CHECK_EQ(members.size(), size_t{2});
     CHECK_EQ(members[0].first, "zebra");
@@ -86,7 +85,6 @@ TEST(json_object_preserves_insertion_order) {
 TEST(json_number_formatting) {
     CHECK_EQ(write(Value(42.0), false), "42");
     CHECK_EQ(write(Value(-7.0), false), "-7");
-    // Fractional survives round-trip exactly.
     auto v = parse(write(Value(0.1), false));
     CHECK_EQ(v.value->as_number(), 0.1);
 }

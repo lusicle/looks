@@ -1,10 +1,4 @@
-// Undoable mutations of a layer's effect stack (every mutation is
-// a Command). Param drags execute with coalesce=true — SetParamCommand
-// merges consecutive edits of the same knob so a whole gesture is one undo
-// step; the app calls break_coalescing() on mouse-up.
-//
-// Every command names the look it edits: undo must land where the edit was
-// made, not wherever the UI is scoped when it runs.
+// Param edits coalesce per knob. The app calls break_coalescing on mouse-up.
 
 #pragma once
 
@@ -15,19 +9,15 @@
 
 namespace looks::doc {
 
-// param_index addresses EffectInstance::params; the sentinels edit the
-// built-in wet/dry and opacity knobs.
+// param_index addresses EffectInstance::params. These ids are built-ins.
 inline constexpr int kWetParam = -1;
 inline constexpr int kOpacityParam = -2;
 
 std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
                                            size_t effect_index,
                                            int param_index, float new_value);
-// One monitor-gizmo gesture's writes to a single effect: base params and
-// auto-keyed lane replacements land together, so an x/y pair whose axes
-// are independently keyed still coalesces into one undo step. Lane
-// entries replace keys only (loop/mute survive). Merges while the look,
-// effect address and the write shape all match.
+// Base writes and lane writes to one effect land in one undo step.
+// A lane write replaces the keys only. Loop and mute stay as they are.
 struct ParamWrite {
     int param_index;
     float value;
@@ -38,21 +28,18 @@ std::unique_ptr<Command> set_param_gesture_command(
     std::vector<KeyframeLane> lane_writes);
 std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
                                             size_t effect_index, bool bypass);
-// The effect's own blend mode (the canonical composition's blend()).
 std::unique_ptr<Command> set_effect_blend_command(uint64_t look,
                                                   size_t layer_index,
                                                   size_t effect_index,
                                                   BlendMode blend);
-// The Text effect's string — the one non-float param.
 std::unique_ptr<Command> set_effect_text_command(uint64_t look,
                                                  size_t layer_index,
                                                  size_t effect_index,
                                                  std::string text);
-// Solo: any soloed effect mutes the rest of its stack.
+// A soloed effect mutes the other effects in its stack.
 std::unique_ptr<Command> set_solo_command(uint64_t look, size_t layer_index,
                                           size_t effect_index, bool solo);
-// Takes the fully-formed instance (id already assigned via make_effect) so
-// redo re-inserts the identical object.
+// The instance must have its id already, from make_effect.
 std::unique_ptr<Command> add_effect_command(uint64_t look, size_t layer_index,
                                             EffectInstance instance,
                                             size_t insert_index);
@@ -63,56 +50,42 @@ std::unique_ptr<Command> move_effect_command(uint64_t look, size_t layer_index,
                                              size_t from_index,
                                              size_t to_index);
 
-// Node-canvas placement: one command moves any node kind, addressed by
-// document id. Consecutive moves of the same node
-// coalesce so a whole drag is one undo step. Positions are pure UI state
-// on the document — the renderer never reads them.
+// Node positions are UI state. The renderer does not read them.
+// Moves of the same node coalesce into one undo step.
 enum class NodeRef : uint32_t {
     Effect, Layer, Route, Output, Frame, Group,
-    GroupIn, GroupOut,   // a group's boundary nodes (id = the group)
+    GroupIn, GroupOut,   // boundary nodes: the id is the group id
 };
 std::unique_ptr<Command> set_node_pos_command(uint64_t look, NodeRef kind,
                                               uint64_t id, float x, float y);
 
-// TRUE GRAPH link edits. An empty link table means implicit stack-order
-// chain wiring; both materialize that synthesis on first edit, so the
-// table becomes the single topology truth. connect replaces any existing
-// link at
-// (to, port) — except the Output node (to 0), which accepts any number of
-// composite inputs. Callers validate with link_would_cycle FIRST; the
-// commands themselves apply unconditionally.
+// An empty link table means implicit stack-order wiring. An edit freezes it.
+// The caller must check link_would_cycle first: these apply unconditionally.
 std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link);
 std::unique_ptr<Command> disconnect_command(uint64_t look, NodeLink link);
-// Splice rewire: new_link takes old_link's POSITION, so a chain
-// re-terminating through an inserted node keeps its stacking place.
+// new_link takes the position of old_link, thus stacking order stays.
 std::unique_ptr<Command> reconnect_command(uint64_t look, NodeLink old_link,
                                            NodeLink new_link);
-// Swaps the index-th and (index+delta)-th feeds of (to, to_port) in
-// the link vector - the stacking-order permute.
+// Link order in a port fan-in is stacking order. This swaps two feeds.
 std::unique_ptr<Command> move_port_link_command(uint64_t look, uint64_t to,
                                                 uint32_t to_port,
                                                 size_t index, int delta);
-// Freeze the implicit stack-order wiring: run before ANY node add so
-// the newborn spawns unwired instead of being chained in by stack-order
-// synthesis. No-op when links are already materialized (or no layers).
+// Run this before any node add, or stack-order wiring chains the new node.
 std::unique_ptr<Command> materialize_links_command(uint64_t look);
 
-// True when adding from→to would close a cycle: to already reaches from
-// through the (effective) link table. The texed reachability guard.
 bool link_would_cycle(const Look& look, uint64_t from, uint64_t to);
 
-// Canvas frames: titled grouping boxes.
 std::unique_ptr<Command> add_frame_command(uint64_t look, CanvasFrame frame);
 std::unique_ptr<Command> remove_frame_command(uint64_t look,
                                               uint64_t frame_id);
-// Resize coalesces per frame id (corner drag = one undo step).
+// This coalesces per frame id, thus a resize drag is one undo step.
 std::unique_ptr<Command> set_frame_bounds_command(uint64_t look,
                                                   uint64_t frame_id, float w,
                                                   float h);
 std::unique_ptr<Command> set_frame_title_command(uint64_t look,
                                                  uint64_t frame_id,
                                                  std::string title);
-// Colour tag cycle (0 = none, 1..8 = palette hue).
+// A color of 0 is none. Values 1 to 8 are palette hues.
 std::unique_ptr<Command> set_frame_color_command(uint64_t look,
                                                  uint64_t frame_id,
                                                  uint32_t color);

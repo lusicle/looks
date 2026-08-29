@@ -1,8 +1,3 @@
-// Nesting in the compiled graph: one flat node list, one instance per
-// hop, each with its own local clock, state key, and culling. Sequences
-// place with an affine map; look sources run in lockstep; the two nest
-// each other both ways under one cycle guard.
-
 #include "gfx/graph.h"
 
 #include "doc/effects.h"
@@ -20,8 +15,6 @@ using looks::gfx::RenderGraph;
 
 namespace {
 
-// A look holding one gradient generator, plus an effect so the instance
-// emits something identifiable.
 uint64_t add_inner_look(Document& d, EffectType fx_type) {
     looks::doc::Look inner;
     inner.id = d.next_effect_id++;
@@ -35,7 +28,6 @@ uint64_t add_inner_look(Document& d, EffectType fx_type) {
     return d.looks.back().id;
 }
 
-// Places `target` on the root sequence's first lane at [t_in, t_out).
 uint64_t place_block(Document& d, uint64_t target, uint32_t t_in,
                      uint32_t t_out, float speed = 1.0f) {
     looks::doc::Placement place;
@@ -103,9 +95,7 @@ TEST(nesting_culls_instances_that_are_not_playing) {
 }
 
 TEST(nesting_two_blocks_of_one_look_share_razor_stable_keys) {
-    // Two blocks of one look on ONE lane share instance paths (a razored
-    // pair rejoins bit-identically); the same look on ANOTHER lane gets
-    // its own. Paths fold container and target ids, never placement ids.
+    // The path folds container and target ids, never placement ids.
     Document d;
     const uint64_t inner = add_inner_look(d, EffectType::Feedback);
     place_block(d, inner, 0, 10);
@@ -135,8 +125,7 @@ TEST(nesting_two_blocks_of_one_look_share_razor_stable_keys) {
 }
 
 TEST(nesting_lockstep_ref_inside_a_look) {
-    // A look nesting another look runs it 1:1 on the SAME clock - no
-    // affine hop, and the path folds the ref layer and the target.
+    // A look ref runs on the same clock, with no affine hop.
     Document d;
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Layer ref;
@@ -155,8 +144,7 @@ TEST(nesting_lockstep_ref_inside_a_look) {
 }
 
 TEST(nesting_sequence_inside_a_look_carries_its_lanes) {
-    // A SequenceRef source: the only way to put effects over an edit.
-    // The nested sequence resolves its own lanes on the look's clock.
+    // A nested sequence resolves its own lanes on the look's clock.
     Document d;
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Sequence cut;
@@ -184,24 +172,19 @@ TEST(nesting_sequence_inside_a_look_carries_its_lanes) {
     const uint64_t grade_id = grade.id;
     d.looks.push_back(std::move(grade));
 
-    // At 15 the nested sequence's block plays: instances chain
-    // grade -> cut -> inner, and BOTH effects emit (grade's grain over
-    // the cut, inner's vignette inside it).
+    // At 15 the block plays: grade -> cut -> inner, and both effects emit.
     const RenderGraph g = compile_graph(d, grade_id, 15);
     CHECK(g.valid);
     CHECK_EQ(g.instances.size(), size_t{3});
     CHECK_EQ(count_effects(g), 2);
-    // At 25 the inner block ended: the nested sequence resolves to
-    // nothing, so the ref chain is dormant - the inner look's instance
-    // never spawns and no effect runs on a fabricated frame.
+    // At 25 the block ended, so the inner instance never spawns.
     const RenderGraph late = compile_graph(d, grade_id, 25);
     CHECK_EQ(late.instances.size(), size_t{2});
     CHECK_EQ(count_effects(late), 0);
 }
 
 TEST(nesting_stops_at_the_depth_bound) {
-    // A self-cycle cannot be BUILT through commands (nest_reaches), but a
-    // hand-edited file can hold one: the depth guard stops the walk.
+    // Commands cannot build a self-cycle, but a hand-edited file can.
     Document d;
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Layer self_ref;
@@ -231,11 +214,9 @@ TEST(nesting_reaches_spans_both_entity_kinds) {
     Document d;
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     place_block(d, inner, 0, 100);
-    // root sequence -> inner look; not the other way.
     CHECK(looks::doc::nest_reaches(d, d.root_sequence, inner));
     CHECK(!looks::doc::nest_reaches(d, inner, d.root_sequence));
     CHECK(looks::doc::nest_reaches(d, inner, inner));
-    // A look nesting a sequence extends the reach through it.
     looks::doc::Sequence cut;
     cut.id = d.next_effect_id++;
     looks::doc::SeqTrack lane;
@@ -258,8 +239,7 @@ TEST(nesting_reaches_spans_both_entity_kinds) {
 }
 
 TEST(nesting_two_levels_compose_their_maps) {
-    // Sequence block (affine) -> look -> lockstep ref -> generator: the
-    // leaf's clock is the block's affine map passed straight through.
+    // The lockstep ref passes the block's affine map straight through.
     Document d;
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Look mid;

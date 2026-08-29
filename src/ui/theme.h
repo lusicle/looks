@@ -1,6 +1,3 @@
-// Theme — the concrete palette + metrics (dark surface ladder in the
-// reference toolkit's idiom; colors authored as sRGB hex, stored linear).
-
 #pragma once
 
 #include "ui/types.h"
@@ -31,15 +28,12 @@ public:
 
 const Theme& default_theme();
 
-// Built-in palettes: graphite (default), night, ember, paper. The active
-// theme is app-level state — widgets read it through LayoutFrame::theme
-// every frame, so switching takes effect immediately. Persisted by the app
-// (ui.json), not the project.
+// The app persists the active theme in ui.json, not the project.
 int theme_count();
 const char* theme_name(int index);
 const Theme& theme_preset(int index);
 const Theme& active_theme();
-void set_active_theme(int index);   // wrapped into range
+void set_active_theme(int index);   // the index wraps into range
 
 inline Color lerp(Color a, Color b, float t) {
     return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,

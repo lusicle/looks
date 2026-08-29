@@ -12,7 +12,7 @@ cbuffer Push
     float fps;
     float amount;      // px of travel
     float speed;       // hz
-    float mode;        // 0 weave, 1 EIS, 2 VHS tracking, 3 jello
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -40,14 +40,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else if (m == 1)
     {
-        // Mostly steady, with stepped corrective snaps.
         const float phase = t * speed * 2.0;
         const uint step_i = uint(int(floor(phase)) + 1000000);
         const float held_x =
             (fx_hash01(fx_hash3(seed, step_i, 1u)) - 0.5) * 2.0;
         const float held_y =
             (fx_hash01(fx_hash3(seed, step_i, 2u)) - 0.5) * 2.0;
-        // Snap back over the first 20% of each hold.
         const float f = frac(phase);
         const float settle = 1.0 - smoothstep(0.0, 0.2, f) * 0.85;
         offset_px = float2(held_x, held_y) * amount * settle;
@@ -63,8 +61,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else
     {
-        // Each row samples the sway at a slightly later time, which is
-        // what skews the frame.
         const float row_delay = uv.y * 0.6;
         const float sway =
             fx_value_noise1(seed, (t - row_delay / max(speed, 0.1)) * speed) -

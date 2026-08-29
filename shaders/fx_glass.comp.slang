@@ -1,15 +1,6 @@
 #include "fx_common.slang"
 
-// Architectural glass as ONE optical pipeline over per-profile surface
-// slope fields. A profile only answers "what is the surface gradient
-// here"; everything optical is shared and derives from that gradient:
-// refraction (surface angle via atan, exit travel via tan - gentle at
-// flat glass, folding at steep glass, so interiors warp instead of
-// shifting whole cells), chromatic dispersion along the bend, Fresnel
-// transmission loss where the surface turns away, relief lighting, and
-// an environment-lit specular that breaks up along the surface. Adding
-// a profile means adding a slope function, nothing else.
-// Glass is static: nothing here reads the frame clock.
+// Glass is static. Do not read the frame clock.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -35,7 +26,7 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Smoothed 2D value noise in [-1, 1], one octave.
+// The result is in the range -1 to 1.
 float2 glass_noise2(float2 p, uint s)
 {
     const float2 c = floor(p);
@@ -56,9 +47,6 @@ float2 glass_noise2(float2 p, uint s)
     return lerp(nx0, nx1, u.y) * 2.0 - 1.0;
 }
 
-// Cylinder cross-section slope: h = sqrt(1 - n^2) has dh/dn =
-// -n/sqrt(1 - n^2), near-linear at the crown and asymptotic at the
-// edge - the interior nonlinearity fluted glass shows.
 float glass_cyl_slope(float n)
 {
     const float c = clamp(n, -0.985, 0.985);
@@ -84,15 +72,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float wb = saturate(wobble);
     const float2 p = float2(tid.xy) + 0.5;
 
-    // ---- profile: surface slope field + cell bookkeeping
     float2 g = float2(0.0, 0.0);   // surface gradient (unitless slope)
-    float seam = 0.0;              // grout line weight, cell types only
-    float2 nv = float2(0.0, 0.0);  // low-frequency breakup
+    float seam = 0.0;
+    float2 nv = float2(0.0, 0.0);
 
     if (ty == 2) {
-        // Rolled antique glass: crossed low-frequency waves whose
-        // phases wander with noise - straight periodic crests would
-        // fire the specular on a dot lattice instead of streaks.
         const float ph0 = fx_hash01(fx_hash3(seed, 11u, 0u)) * 6.2832;
         const float ph1 = fx_hash01(fx_hash3(seed, 13u, 0u)) * 6.2832;
         const float2 wn =
@@ -103,14 +87,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         g.y = cos(p.y * wy + ph1 + wn.y) * 1.1 * (0.3 + wb);
         nv = glass_noise2(p / (cw * 2.5), fx_hash(seed ^ 0x517Bu));
     } else if (ty == 4) {
-        // Frosted: the noise vector IS the slope; wobble stretches the
-        // grain into brushed streaks.
         const float2 np = p / float2(cw, cw * (1.0 + wb * 2.0));
         g = glass_noise2(np, seed) * 1.6;
         nv = glass_noise2(p / (cw * 2.5), fx_hash(seed ^ 0x517Bu));
     } else {
-        // Cell profiles. Wobble bends the cell axes first so flutes and
-        // courses stop being ruler-straight.
         float2 pw = p;
         pw.x += sin(p.y * 6.2832 / (cw * 9.0)) * wb * cw * 0.25;
         if (cells_y)
@@ -126,19 +106,13 @@ void main(uint3 tid : SV_DispatchThreadID)
         nv = glass_noise2(np, fx_hash(seed ^ 0x517Bu));
 
         if (ty == 0) {
-            // Fluted / domed: cylinder slope per axis.
             g.x = glass_cyl_slope(local.x * 2.0);
             if (cells_y) g.y = glass_cyl_slope(local.y * 2.0);
         } else if (ty == 1) {
-            // Prism: flat triangular facets - constant slope per
-            // facet, so each facet displaces uniformly and flips hard
-            // at the ridge (that IS the prism look; curvature would
-            // make it a lens).
+            // The ridge flip is intended.
             g.x = (local.x < 0.0 ? -1.6 : 1.6);
             if (cells_y) g.y = (local.y < 0.0 ? -1.6 : 1.6);
         } else {
-            // Hammered: one seeded pit or mound per cell, center
-            // jittered by wobble; the dome gradient is the slope.
             const uint hx = uint(int(ci.x) + 4096);
             const uint hy = uint(int(ci.y) + 4096);
             const float2 jit =
@@ -156,28 +130,22 @@ void main(uint3 tid : SV_DispatchThreadID)
                                          cells_y ? abs(local.y) : 0.0));
     }
 
-    // ---- shared optics, all from the slope field
     const float slen = length(g);
     const float2 gdir = slen > 1.0e-4 ? g / slen : float2(1.0, 0.0);
     const float3 nrm = normalize(float3(-g, 1.0));
 
-    // Refraction: surface angle via atan, deviation scaled by the
-    // refract knob (an ior proxy), exit travel via tan. Glass depth
-    // rides the cell size, so coarse glass bends farther.
+    // refract is an ior proxy, not a real index of refraction.
     const float dev = atan(slen) * (0.12 + 0.88 * rf);
     const float travel = tan(min(dev, 1.25)) * cw * 0.45;
     const float2 disp = -gdir * travel;
     const float2 duv = disp / size;
 
-    // Soften: blur along the bend, growing where the surface is steep;
-    // frosted and rolled glass diffuse over their whole face.
     const float sf = saturate(soften);
     const float blur_px =
         celled ? sf * cw * (0.06 + 0.12 * saturate(slen * 0.4))
                : sf * cw * 0.4;
     const float2 buv = gdir * blur_px / size;
 
-    // Dispersion splits the channels along the bend.
     const float dsp = saturate(dispersion) * 0.3;
     const float2 uv_g = clamp(uv + duv, 0.0, 1.0);
     const float2 uv_r = clamp(uv + duv * (1.0 - dsp), 0.0, 1.0);
@@ -189,8 +157,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     col.r = sr.r;
     col.g = sg.g;
     col.b = sb.b;
-    // Refracted coverage: the union of the split rays - the glass moves
-    // the content, so its alpha moves with it.
+    // Alpha moves with the refracted content. Union the split rays.
     float col_a = max(sg.a, max(sr.a, sb.a));
     const float4 s0 = input.SampleLevel(clamp(uv_g - buv, 0.0, 1.0), 0);
     const float4 s1 = input.SampleLevel(clamp(uv_g + buv, 0.0, 1.0), 0);
@@ -199,9 +166,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     col_a = lerp(col_a, (col_a + s0.a + s1.a) * (1.0 / 3.0),
                  saturate(blur_px * 0.6));
 
-    // Fresnel transmission loss + relief lighting + grout, one depth
-    // knob: steep glass passes less light and every facet takes the
-    // fixed top-left key differently.
     const float ed = saturate(edge);
     const float fres = pow(1.0 - saturate(nrm.z), 5.0);
     const float3 key = normalize(float3(-0.45, -0.6, 0.66));
@@ -210,9 +174,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     col *= saturate(1.0 + relief * ed * 0.9);
     col *= 1.0 - seam * ed * 0.55;
 
-    // Specular: Blinn lobe off the same normal, Fresnel-weighted,
-    // responding to what is behind the glass and breaking up along the
-    // surface - a constant band reads as plastic.
+    // Keep the specular breakup. A constant band looks like plastic.
     const float3 half_v = normalize(key + float3(0.0, 0.0, 1.0));
     const float lobe = pow(saturate(dot(nrm, half_v)), 60.0);
     const float grazing = 0.25 + 0.75 * fres;

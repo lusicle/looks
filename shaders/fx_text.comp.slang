@@ -1,7 +1,4 @@
-// The engine rasterizes the string to a signed distance bitmap once per
-// size BUCKET, so keyframed size scales between cached rasters rather
-// than re-rastering. Size reads as px at 1080 frame height, which keeps
-// proxies matching full res.
+// Size is px at a 1080 frame height, so proxies match full resolution.
 
 #include "fx_common.slang"
 
@@ -15,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float font;        // engine-side font pick, unread here
+    float font;        // the engine uses this, not the shader
     float size;        // px at 1080 frame height
     float pos_x;
     float pos_y;
@@ -24,10 +21,10 @@ cbuffer Push
     float sat;
     float lite;
     float outline;
-    float bm_w;        // engine-appended: SDF bitmap px dims
+    float bm_w;        // the engine appends the SDF bitmap dims in px
     float bm_h;
     float spread_px;   // SDF encode range, raster px
-    float raster_px;   // the bucket's font size
+    float raster_px;   // the bucket font size
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -50,7 +47,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float size_px = max(size, 1.0) * (float(height) / 1080.0);
     const float rscale = size_px / max(raster_px, 1.0);
 
-    // Pixel to raster space; the bitmap is centered on the anchor.
+    // Convert pixel space to raster space. The bitmap centers on the anchor.
     float2 p = float2(tid.xy) + 0.5 - float2(pos_x, pos_y) * dim;
     const float a = -angle * 0.01745329252;
     const float ca = cos(a), sa = sin(a);
@@ -71,7 +68,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (cov_out <= 0.0)
         return;
 
-    // Dark rim laid under the fill color.
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float3 fill = lerp(float3(1.0, 1.0, 1.0),
                              fx_hue_to_rgb(hue), saturate(sat)) *
@@ -79,8 +75,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 c = lerp(enc, float3(0.02, 0.02, 0.02), cov_out);
     c = lerp(c, fill, cov);
 
-    // Drawn glyphs union their coverage in - text over transparency
-    // must show through the layer gate.
+    // Drawn glyphs union their coverage into alpha.
     const float4 result = float4(fx_srgb_eotf(saturate(c)),
                                  max(base.a, cov_out));
     const float4 wetted = lerp(base, result, saturate(wet));

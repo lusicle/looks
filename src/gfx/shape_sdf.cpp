@@ -9,18 +9,13 @@ namespace {
 
 constexpr int kSubdiv = kShapeSubdiv;
 constexpr float kBig = 1.0e9f;
-// Exact-distance band around the polyline, texels. Inside it every
-// texel carries true segment distance; outside it the Euclidean
-// transform propagates from the band with error bounded by one texel -
-// flat in the far field where feather gradients are shallow, so the
-// feather never wobbles along the edge.
+// Exact-distance band half-width, texels; outside error is under one texel.
 constexpr int kBand = 3;
 
 struct Seg {
     float x0, y0, x1, y1;
 };
 
-// Exact point-to-segment distance.
 float seg_dist(const Seg& s, float px, float py) {
     const float dx = s.x1 - s.x0, dy = s.y1 - s.y0;
     const float len2 = dx * dx + dy * dy;
@@ -32,10 +27,8 @@ float seg_dist(const Seg& s, float px, float py) {
     return std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
 }
 
-// One squared-distance pass along a line of n samples in INDEX units
-// (Felzenszwalb-Huttenlocher lower envelope of parabolas):
-// out[q] = min_p ((q - p)^2 + g[p]). Exact, O(n), fixed order. No-seed
-// cells carry huge-but-finite g and simply never win the envelope.
+// out[q] = min over p of (q - p)^2 + g[p]; distances are in index units.
+// No-seed cells must hold large finite g, never infinity.
 void edt_1d(const float* g, float* out, int* v, float* z, int n) {
     auto sect = [&](int q, int p) {
         return ((g[q] + static_cast<float>(q) * q) -
@@ -65,8 +58,7 @@ void edt_1d(const float* g, float* out, int* v, float* z, int n) {
     }
 }
 
-// Separable exact squared EDT over an initialized metric^2 field,
-// anisotropy carried by scaling each axis into index units and back.
+// d holds squared metric distances; sx/sy scale each axis to index units.
 void edt_2d(std::vector<float>& d, uint32_t w, uint32_t h, float sx,
             float sy) {
     const int n = static_cast<int>(std::max(w, h));
@@ -90,8 +82,7 @@ void edt_2d(std::vector<float>& d, uint32_t w, uint32_t h, float sx,
     }
 }
 
-// Exact distances stamped in a kBand-texel box around every segment;
-// the far field starts as squared band values for the EDT.
+// band holds linear metric distances near segments, kBig elsewhere.
 void stamp_band(const std::vector<Seg>& segs, uint32_t w, uint32_t h,
                 float sx, float sy, std::vector<float>* band) {
     band->assign(static_cast<size_t>(w) * h, kBig);
@@ -178,15 +169,10 @@ void shape_sdf_raster(const std::vector<doc::PathPoint>& path, bool closed,
     for (size_t i = 0; i + 1 < npts; ++i)
         segs.push_back({poly[i * 2], poly[i * 2 + 1], poly[i * 2 + 2],
                         poly[i * 2 + 3]});
-    const float sx = aspect / static_cast<float>(w);   // texel size, metric
+    const float sx = aspect / static_cast<float>(w);  // texel size, metric
     const float sy = 1.0f / static_cast<float>(h);
 
-    // Exact unsigned distance near the curve, true Euclidean transform
-    // beyond it. Only texels the curve passes THROUGH seed the
-    // transform (the squared form composes seed offsets as
-    // sqrt(D^2 + b^2), so a fat seed offset would sag the far field -
-    // a sub-texel one vanishes into it); the full exact band then
-    // overrides its own ring.
+    // Only near texels seed the EDT; a wide seed band sags the far field.
     std::vector<float> band;
     stamp_band(segs, w, h, sx, sy, &band);
     const float near_thr = 1.5f * std::max(sx, sy);
@@ -202,10 +188,6 @@ void shape_sdf_raster(const std::vector<doc::PathPoint>& path, bool closed,
     }
 
     if (closed && path.size() >= 3) {
-        // Sign per texel from a 2x2 winding supersample (nonzero rule),
-        // scanline crossings per subrow; partial texels sit on the
-        // curve and take their exact band distance with the coverage
-        // sign.
         std::vector<uint8_t> cov(static_cast<size_t>(w) * h, 0);
         std::vector<std::pair<float, int>> cross;
         for (uint32_t y = 0; y < h; ++y) {
@@ -252,7 +234,6 @@ void shape_sdf_raster(const std::vector<doc::PathPoint>& path, bool closed,
                        std::min(u, std::max(sx, sy));
         }
     } else {
-        // Open stroke: the unsigned field IS the answer.
         d = std::move(field);
     }
     encode(d, out);

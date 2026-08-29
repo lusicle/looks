@@ -1,6 +1,4 @@
-// Each frame contributes only a jittered subset of taps, so the trace
-// accumulates over frames on the decaying canvas at binding 1, which is
-// this instance's own previous output.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -14,12 +12,12 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 waveform, 1 rgb parade, 2 vectorscope
+    float mode;
     float gain;
     float glow;
     float persist;
     float graticule;
-    float color;     // 0 green phosphor, 1 signal color
+    float color;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -46,8 +44,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float g = saturate(glow);
 
     if (m <= 1u) {
-        // Sample down this column, light up where the level crosses this
-        // row. Level space is encoded, matching a real meter.
+        // The level space is encoded, not linear.
         const uint third = min(uint(uv.x * 3.0), 2u);
         const float u = m == 1u ? frac(uv.x * 3.0) : uv.x;
         const float level = 1.0 - uv.y;
@@ -79,7 +76,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
         col = max(col, trace_col * acc * 0.35 * g);
 
-        // Level lines at 0, .25, .5, .75, 1.
         const float lf = frac(level * 4.0);
         const float ld = min(lf, 1.0 - lf) * size.y * 0.25;
         col += kPhosphor * saturate(graticule) * 0.10 *
@@ -98,8 +94,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                 input.SampleLevel(float2(su, sv), 0).rgb;
             const float3 enc = fx_srgb_oetf(saturate(rgb));
             const float l = fx_luma(enc);
-            // Same chroma scales as the NV12 encoder: the ring reads in
-            // the units the export actually emits.
+            // The chroma scales match the NV12 encoder units.
             const float2 cbcr = fx_rgb_to_cbcr709(enc, l);
             const float2 pos = float2(cbcr.x, -cbcr.y) * 1.8 * gain;
             const float d_px = length(pos - ndc) * 0.5 * size.y;

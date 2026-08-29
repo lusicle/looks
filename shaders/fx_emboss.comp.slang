@@ -12,7 +12,7 @@ cbuffer Push
     float fps;
     float strength;
     float angle;
-    float mode;     // 0 gray relief, 1 colored relief
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

@@ -1,11 +1,5 @@
-// Mezzanine codec: intra-only, MJPEG-class, YCbCr 4:2:0 (I420
-// planar), 16x16 macroblocks of four 8x8 luma + one 8x8 per chroma over
-// codec_core. Every frame independent -> instant scrub. Decode is CPU-side
-// on worker threads; frames reach the GPU as plain uploads.
-//
-// .mez layout: fixed 64-byte header, then length-prefixed frames, then a
-// u64 offset index (header patched with its position on finish). All
-// integers little-endian.
+// .mez layout: 64-byte header, length-prefixed frames, u64 offset index.
+// All integers are little-endian.
 
 #pragma once
 
@@ -34,16 +28,10 @@ struct DecodedFrame {
     uint32_t height = 0;
     size_t y_stride = 0;
     size_t uv_stride = 0;
-    // Content identity for upload skipping: producers that keep frames
-    // alive across renders (the decode pool) stamp each decode from a
-    // process-wide counter, so a consumer re-fed the SAME frame (stills,
-    // slowed placements, paused re-renders) can skip re-copying megabytes
-    // of identical planes. 0 = unstamped, always treated as fresh.
+    // Decode identity stamp: same stamp = same planes; 0 = always fresh.
     uint64_t stamp = 0;
-    // NV12 carriage (native decode, zero-copy): `y` holds the decoder's
-    // WHOLE buffer - Y rows then interleaved CbCr rows at the same
-    // stride; u/v vectors stay empty and view() points the chroma plane
-    // into the buffer. The codec paths never see NV12 frames.
+    // nv12: y holds Y rows then interleaved CbCr rows at one stride; u/v empty.
+    // The codec paths never see nv12 frames.
     bool nv12 = false;
 
     FrameView view() const {
@@ -56,22 +44,13 @@ struct DecodedFrame {
     }
 };
 
-// Stateless single-frame codec (also the building block for the mosh
-// codec's I-frames). Deterministic: same input + quality => same bytes.
+// Same input and quality give the same bytes.
 void encode_frame(const FrameView& frame, int quality, std::vector<uint8_t>& out);
-// `parallel` splits the pixel reconstruction (dequant+IDCT) across threads
-// after the serial entropy parse — identical pixels, used by the Codec-Box
-// hot path. The player/import keep the default serial path (they already
-// parallelize across frames).
+// parallel splits reconstruction only; pixels stay identical.
 bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
                   uint32_t height, DecodedFrame& out, bool parallel = false);
 
-// Two-phase intra encode (Codec-Box rate loops): the DCT is
-// quality-independent, so transform once (across threads) and re-run
-// only quantize+entropy per quality step. intra_entropy output is
-// byte-identical to encode_frame at the same quality. Import stays on
-// encode_frame — it is already parallel across frames and the coefficient
-// buffer (~12 MB at 1080p) would multiply across its workers.
+// intra_entropy output is byte-identical to encode_frame at equal quality.
 struct IntraDct {
     uint32_t width = 0, height = 0;
     std::vector<int16_t> coeffs;   // 64 per block, bitstream block order
@@ -81,16 +60,10 @@ void intra_dct(const FrameView& frame, IntraDct& out);
 void intra_entropy(const IntraDct& dct, int quality,
                    std::vector<uint8_t>& out);
 
-// Entropy-free reconstruction: quantize + dequantize + IDCT straight from
-// the DCT phase. Entropy is lossless, so pixels are bit-identical to
-// intra_entropy + decode_frame at the same quality — the wire without the
-// bytes, for consumers that never read the stream (the Codec-Box when
-// nothing rate-limits or corrupts it).
+// Pixels match intra_entropy + decode_frame bit for bit at equal quality.
 void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out);
 
-// Exact byte count intra_entropy would produce at this quality, without
-// writing it (parallel AC scan + serial DC-delta chain). Rate loops probe
-// with this and reconstruct once.
+// Must match the byte count intra_entropy writes at this quality.
 size_t intra_entropy_bytes(const IntraDct& dct, int quality);
 
 class MezWriter {
@@ -100,13 +73,11 @@ public:
     bool open(const std::filesystem::path& path, uint32_t width,
               uint32_t height, uint32_t timescale, uint32_t frame_duration,
               int quality);
-    // Frames must arrive in presentation order. Encodes and appends.
+    // Frames must arrive in presentation order.
     bool add_frame(const FrameView& frame);
-    // Still-image media: appends `count` index entries pointing at the
-    // LAST written frame's payload — N timeline frames for one frame of
-    // storage. The reader can't tell the difference.
+    // Appends count index entries that point at the last frame's payload.
     bool add_hold_frames(size_t count);
-    bool finish();   // writes the index, patches the header
+    bool finish();   // the file is incomplete until finish()
 
     uint32_t frame_count() const { return static_cast<uint32_t>(offsets_.size()); }
     int quality() const { return quality_; }
@@ -124,12 +95,8 @@ private:
     bool finished_ = false;
 };
 
-// Rewrites the frame index in place so the media runs `count` frames:
-// entries past the old count repeat the last surviving frame's payload
-// (the add_hold_frames trick, applied after the fact). Still-image media
-// use this to change their timeline duration without re-encoding. The
-// file must not be open in a writer; readers holding the old index keep
-// working (decode bounds-checks) but see the old length until reopened.
+// The file must not be open in a writer.
+// Open readers stay safe but see the old length until reopened.
 bool mez_set_frame_count(const std::filesystem::path& path, uint32_t count);
 
 class MezReader {
@@ -149,13 +116,10 @@ public:
                                : 0.0;
     }
 
-    // Thread-compatible with itself only under external locking (single
-    // FILE*); the player's decode workers each own a reader instance.
+    // Not thread-safe: serialize calls or use one reader per thread.
     bool decode(uint32_t frame_index, DecodedFrame& out);
 
-    // Where a frame's payload lives: hold-frame entries (stills, cover
-    // art) repeat one offset, so a consumer can decode the payload once
-    // and alias every frame that points at it. 0 = out of range.
+    // Hold frames repeat one offset; 0 = out of range.
     uint64_t payload_offset(uint32_t frame_index) const {
         return frame_index < offsets_.size() ? offsets_[frame_index] : 0;
     }

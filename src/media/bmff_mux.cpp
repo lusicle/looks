@@ -11,8 +11,6 @@ namespace looks::media {
 
 namespace {
 
-// Big-endian building on the shared writer; tag() is the only mux-local
-// vocabulary.
 struct Bytes : bytes::BeWriter {
     void tag(const char* s) { raw(s, 4); }
 };
@@ -42,8 +40,7 @@ void write_matrix_identity(Bytes& b) {
     b.u32(0); b.u32(0); b.u32(0x40000000);
 }
 
-// MP4 descriptor over the shared tag + varlen coding (bmff.h): minimal
-// length form; parsers accept both minimal and padded.
+// Writes the minimal length form; parsers accept minimal and padded.
 Bytes descriptor(uint8_t desc_tag, const Bytes& payload) {
     Bytes b;
     b.u8(desc_tag);
@@ -151,7 +148,6 @@ bool BmffMuxer::finish() {
     const uint64_t movie_dur_ms =
         video_dur_ms > audio_dur_ms ? video_dur_ms : audio_dur_ms;
 
-    // ---- ftyp
     Bytes ftyp_payload;
     ftyp_payload.tag("isom");
     ftyp_payload.u32(0x200);
@@ -161,14 +157,11 @@ bool BmffMuxer::finish() {
     ftyp_payload.tag("mp41");
     const Bytes ftyp = box("ftyp", ftyp_payload);
 
-    // ---- moov built with PROVISIONAL chunk offsets (relative to mdat
-    // payload); every stco entry is later shifted by the final header size.
-    // The moov size itself is offset-independent (fixed-width u32 entries),
-    // so one build pass + one patch pass suffices.
+    // moov holds provisional chunk offsets relative to the mdat payload;
+    // the patch pass below shifts every stco entry by the header size.
     auto build_stbl_tables = [](const Track& track, bool with_ctts,
                                 bool with_stss) {
-        // Run-length compress a per-sample field into count/value pairs
-        // (stts durations and ctts offsets share the coding).
+        // Compresses a per-sample field into stts and ctts count/value pairs.
         auto rle_pairs = [&track](auto field) {
             std::vector<std::pair<uint32_t, int64_t>> runs;
             for (const Sample& s : track.samples) {
@@ -380,12 +373,10 @@ bool BmffMuxer::finish() {
         moov_p.append(build_trak(false, 2));
     Bytes moov = box("moov", moov_p);
 
-    // ---- patch stco: absolute offset = header sizes + relative offset.
+    // Patch stco: absolute offset = header sizes + relative offset.
     const uint64_t mdat_payload_start = ftyp.v.size() + moov.v.size() + 8;
     {
-        // Find every stco box inside moov and shift its entries. Boxes were
-        // built by us, so a linear scan for the "stco" tag + size walk is
-        // safe and simple.
+        // This code built the boxes, so a linear scan for the tag is safe.
         std::vector<uint8_t>& m = moov.v;
         for (size_t i = 0; i + 8 <= m.size(); ++i) {
             if (std::memcmp(&m[i], "stco", 4) != 0) continue;
@@ -403,7 +394,7 @@ bool BmffMuxer::finish() {
         }
     }
 
-    // ---- final file: ftyp + moov + mdat(payload streamed from temp)
+    // The final file order is ftyp, then moov, then mdat.
     FILE* out = _wfopen(path_.c_str(), L"wb");
     if (!out) {
         log_warn("mux: cannot open %ls for write (errno %d)", path_.c_str(),

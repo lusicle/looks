@@ -1,5 +1,3 @@
-// BMFF demuxer tests over a synthetic moov fixture built box-by-box.
-
 #include <vector>
 
 #include "media/bmff.h"
@@ -264,7 +262,6 @@ TEST(bmff_sample_table_expansion) {
     CHECK_EQ(video->samples[0].cts_offset, int64_t{1024});
     CHECK_EQ(video->samples[2].cts_offset, int64_t{0});
 
-    // stss: only the first sample is a keyframe.
     CHECK(video->samples[0].keyframe);
     CHECK(!video->samples[1].keyframe);
     CHECK(!video->samples[3].keyframe);

@@ -1,5 +1,3 @@
-// The film counterpart to SyncFail, which is the video roll.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -13,7 +11,7 @@ cbuffer Push
     uint frame;
     float fps;
     float slip;    // 0..1 of a frame height
-    float speed;   // hz, 0 = parked off-register
+    float speed;   // hz
     float blend;
 };
 
@@ -45,7 +43,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         col_a = max(col_a, ghost.a * blend * 0.6);
     }
 
-    // The black frame line rides the wrap seam.
     if (offset > 0.002 && offset < 0.998) {
         const float seam = 1.0 - offset;
         const float d = min(abs(uv.y - seam),

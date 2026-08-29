@@ -1,5 +1,3 @@
-// Glow pass 4: composites the blurred bright field over the dry input.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -15,8 +13,8 @@ cbuffer Push
     float amount;
     float radius;
     float threshold;
-    float mode;        // 0 pro-mist, 1 halation, 2 ccd smear
-    float smear;       // ccd mode only
+    float mode;
+    float smear;
 };
 
 [[vk::binding(0, 0)]] Sampler2D dry;
@@ -43,8 +41,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 lit = base.rgb + bloom * tint * amount;
 
-    // Samples the DRY input down the whole column, since a readout smear
-    // is full-height and near-constant rather than a local bloom.
+    // Sample the dry input down the full column. The smear is not local.
     if (m == 2 && smear > 0.001) {
         const float clip_at = max(threshold, 0.55);
         float3 col_energy = float3(0.0, 0.0, 0.0);
@@ -57,8 +54,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col_energy *= (1.0 / 24.0);
         lit += col_energy * tint * smear * 2.5;
     }
-    // The halo's spread coverage joins the dry coverage - light the
-    // layer gate would otherwise clip at the old silhouette.
+    // The halo coverage joins the dry coverage.
     const float4 result =
         float4(lit, max(base.a, bloom4.a * saturate(amount)));
     const float4 wetted = lerp(base, result, saturate(wet));

@@ -1,10 +1,6 @@
 #include "fx_common.slang"
 
-// Track Pin: the engine composes ONE 3x3 (row-major, output uv ->
-// sample uv) from the plane's per-frame homography and the user adjust.
-// Attach samples the B input through it and lays it premultiplied over
-// the frame; stabilize resamples the frame itself. With no solve the
-// matrix is identity (attach still previews B inside the region).
+// The engine sends one row-major 3x3 that maps output uv to sample uv.
 
 [[vk::push_constant]]
 cbuffer Push
@@ -51,8 +47,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     float4 result;
     if (mode < 0.5)
     {
-        // Attach: B premultiplied over the frame where the mapped uv
-        // lands inside B; outside stays the frame.
         float4 b = float4(0.0, 0.0, 0.0, 0.0);
         if (suv.x >= 0.0 && suv.x <= 1.0 && suv.y >= 0.0 && suv.y <= 1.0)
             b = pin_b.SampleLevel(suv, 0);
@@ -60,9 +54,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else
     {
-        // Stabilize: resample the frame through the plane's motion so
-        // the tracked surface holds still; off-frame reads transparent
-        // black (the closed-gate convention).
+        // Off-frame reads transparent black, the closed-gate convention.
         const bool inside = suv.x >= 0.0 && suv.x <= 1.0 &&
                             suv.y >= 0.0 && suv.y <= 1.0;
         result = inside ? input.SampleLevel(suv, 0)

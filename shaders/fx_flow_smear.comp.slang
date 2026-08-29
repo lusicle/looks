@@ -1,4 +1,4 @@
-// Taps run BACKWARD along the motion vector, so still regions stay sharp.
+// Taps run backward along the motion vector.
 
 #include "fx_common.slang"
 
@@ -13,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;
-    float falloff;     // 0 uniform trail, 1 fast decay
+    float falloff;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

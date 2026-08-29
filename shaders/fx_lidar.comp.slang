@@ -1,5 +1,4 @@
-// The canvas at binding 1 is this instance's own previous output, so the
-// point cloud accumulates under the one-frame-delay rule.
+// Binding 1 is this instance's output from the previous frame.
 
 #include "fx_common.slang"
 
@@ -13,14 +12,14 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 scatter, 1 spinning beam, 2 raster sweep
+    float mode;
     float amount;
     float dot_px;
     float persist;
     float rate;      // hz
     float bias;
     float spin;      // revolutions or crossings per second
-    float color;     // 0 white points, 1 source-colored
+    float color;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -44,8 +43,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const uint tick = uint(t * max(rate, 0.01));
     const float r_dot = max(dot_px, 0.75);
-    // One candidate dot per cell, sized so dots can breathe. The 3x3
-    // neighbourhood below is what lets a dot overlap into this pixel.
     const float cell = max(r_dot * 3.0, 6.0);
     const uint m = uint(mode + 0.5);
     const float2 center = size * 0.5;
@@ -89,7 +86,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float3 dot_col =
                 lerp(float3(1.0, 1.0, 1.0), src * 1.5, saturate(color)) *
                 (0.35 + 0.65 * l);
-            // Max blend keeps points crisp instead of blooming additively.
+            // The max blend keeps the points crisp. Do not add.
             col = max(col, dot_col * fall * fall * 1.4);
         }
     }

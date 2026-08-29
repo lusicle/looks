@@ -1,5 +1,4 @@
-// Atlas tiles MUST be ordered by ink coverage, dark to light: the tile
-// index is a direct luma lookup, with no indirection table.
+// Atlas tiles must go from dark to light. The tile index is the luma.
 
 #include "fx_common.slang"
 
@@ -14,14 +13,14 @@ cbuffer Push
     uint frame;
     float fps;
     float cell;        // px
-    float set_index;   // engine picks the atlas, unread here
-    float mode;        // 0 mono, 1 colored glyphs, 2 glyph * pixel
+    float set_index;   // the engine uses this, not the shader
+    float mode;
     float jitter;
-    // Engine-appended atlas grid.
+    // The engine appends these atlas grid words.
     uint atlas_cols;
     uint atlas_rows;
     float tile_px;
-    uint atlas_color;   // 1 = RGBA tiles: alpha coverage, own hue
+    uint atlas_color;   // 1 means RGBA tiles with alpha coverage
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -43,7 +42,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 cell_center = (float2(cell_id) + 0.5) * cell_px / size;
     const float3 cell_rgb =
         input.SampleLevel(saturate(cell_center), 0).rgb;
-    // Encoded-domain luma, so the glyph ramp is perceptually even.
+    // Use encoded-domain luma so the glyph ramp is even.
     float l = fx_luma(fx_srgb_oetf(saturate(cell_rgb)));
 
     if (jitter > 0.0)
@@ -76,13 +75,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int m = int(mode + 0.5);
     if (m == 0) {
         rgb = glyph_rgb;
-        out_a = max(base.a, g);   // drawn ink unions its coverage in
+        out_a = max(base.a, g);
     } else if (m == 1) {
         rgb = atlas_color != 0u ? glyph_rgb * (0.35 + 0.65 * fx_luma(cell_rgb))
                                 : cell_rgb * g;
         out_a = max(base.a, g);
     } else {
-        rgb = base.rgb * g;   // blackout style dims color only
+        rgb = base.rgb * g;
     }
 
     const float4 result = float4(rgb, out_a);

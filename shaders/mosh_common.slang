@@ -1,8 +1,4 @@
-// codec_core's fixed-point wire, ported once for every mosh kernel:
-// 13-bit DCT constants, int32 accumulators, symmetric rounding, the
-// T.81 Annex K quant tables and the exp-Golomb code lengths. The CPU
-// box (src/codec/core.cpp) is the reference; the two sides must track
-// bit for bit or rate control picks the wrong quality.
+// This fixed-point wire must stay bit-identical to the CPU codec core.
 
 #ifndef MOSH_COMMON_SLANG
 #define MOSH_COMMON_SLANG
@@ -40,7 +36,6 @@ int round13(int acc)
     return clamp((acc + 4096) >> 13, -32768, 32767);
 }
 
-// Even/odd folded 8-point passes, bit-identical to codec_core's.
 void fwd_pass8(inout int blk[64], uint base, uint stride)
 {
     int s[4];
@@ -103,7 +98,6 @@ void dct8x8(inout int blk[64], bool forward)
     }
 }
 
-// Quality -> table scale, then one coefficient's quantizer step.
 int mosh_quant_scale(int quality)
 {
     return quality < 50 ? 5000 / quality : 200 - quality * 2;
@@ -129,7 +123,7 @@ uint se_bits(int v)
     return ue_bits(v > 0 ? uint(v) * 2 - 1 : uint(-v) * 2);
 }
 
-// The quality ladder rides two packed uint4s (std140 stride).
+// The quality ladder uses two packed uint4s for std140 stride.
 uint mosh_rung_at(uint4 lo, uint4 hi, uint r)
 {
     return r < 4 ? lo[r] : hi[r - 4];

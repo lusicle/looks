@@ -10,8 +10,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float position;   // normalized, the frozen row or column
-    float mode;       // 0 smear down, 1 up, 2 right, 3 left
+    float position;   // normalized
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

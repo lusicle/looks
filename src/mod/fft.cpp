@@ -12,7 +12,6 @@ void fft(std::vector<Complex>& data) {
     const size_t n = data.size();
     if (n < 2) return;
 
-    // Bit-reversal permutation.
     for (size_t i = 1, j = 0; i < n; ++i) {
         size_t bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
@@ -48,7 +47,6 @@ std::vector<float> magnitude_spectrum(const float* samples, size_t count,
     std::vector<Complex> data(n);
     for (size_t i = 0; i < n; ++i) {
         const float s = i < count ? samples[i] : 0.0f;
-        // Hann window.
         const float w = 0.5f - 0.5f * static_cast<float>(std::cos(
                                           2.0 * kPi * i / (n - 1)));
         data[i].re = s * w;

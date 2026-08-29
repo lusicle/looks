@@ -10,9 +10,8 @@ namespace looks::ui {
 
 namespace {
 
-// 8x8 debug font, ASCII 32..126. One byte per row, bit 0x80 = leftmost
-// pixel. Baseline sits between rows 6 and 7 (descenders use row 7).
-// Hand-authored in the classic PC pixel-font style.
+// One byte per row, bit 0x80 is the leftmost pixel.
+// The baseline sits between rows 6 and 7.
 constexpr uint8_t kDebugFont[95][8] = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // ' '
     {0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00},  // '!'
@@ -119,10 +118,10 @@ constexpr uint32_t kRows = 6;   // ceil(95 / 16)
 
 Font Font::create_debug() {
     Font font;
-    font.ascender_ = 7.0f / 8.0f;    // baseline between rows 6 and 7
+    font.ascender_ = 7.0f / 8.0f;
     font.line_height_ = 1.25f;
-    font.atlas_width_ = kColumns * kCell;    // 128
-    font.atlas_height_ = kRows * kCell;      // 48
+    font.atlas_width_ = kColumns * kCell;
+    font.atlas_height_ = kRows * kCell;
     font.atlas_.assign(font.atlas_width_ * font.atlas_height_, 0);
 
     const float atlas_w = static_cast<float>(font.atlas_width_);
@@ -145,7 +144,7 @@ Font Font::create_debug() {
         }
         Glyph g;
         g.codepoint = 32 + i;
-        g.advance = 1.0f;   // monospace, one em per cell
+        g.advance = 1.0f;
         g.plane_l = 0.0f;
         g.plane_r = 1.0f;
         g.plane_t = 7.0f / 8.0f;
@@ -185,8 +184,7 @@ std::optional<Font> Font::load_msdf(const std::filesystem::path& atlas_png,
     font.atlas_width_ = image.width;
     font.atlas_height_ = image.height;
     font.atlas_rgba_ = std::move(image.pixels);
-    // -yorigin top flips the metrics' vertical axis to y-down (ascender
-    // comes out negative); our Glyph model is y-up, so negate.
+    // The -yorigin top metrics are y-down; negate into the y-up glyph model.
     font.px_range_ =
         static_cast<float>(atlas.get("distanceRange").as_number(4.0));
     font.ascender_ =
@@ -206,11 +204,10 @@ std::optional<Font> Font::load_msdf(const std::filesystem::path& atlas_png,
         if (pb.is_object() && ab.is_object()) {
             g.plane_l = static_cast<float>(pb.get("left").as_number(0.0));
             g.plane_r = static_cast<float>(pb.get("right").as_number(0.0));
-            // y-down plane bounds -> y-up: negate and swap top/bottom.
+            // Plane bounds are y-down; negate into y-up.
             g.plane_t = -static_cast<float>(pb.get("top").as_number(0.0));
             g.plane_b = -static_cast<float>(pb.get("bottom").as_number(0.0));
-            // -yorigin top: atlas "top" is the smaller y, v-down like our
-            // UV convention.
+            // Atlas bounds are already v-down like the UVs; do not flip.
             g.uv_l = static_cast<float>(ab.get("left").as_number(0.0)) / aw;
             g.uv_r = static_cast<float>(ab.get("right").as_number(0.0)) / aw;
             g.uv_t = static_cast<float>(ab.get("top").as_number(0.0)) / ah;
@@ -273,7 +270,6 @@ uint32_t utf8_decode(const char* text, size_t length, size_t* cursor) {
         }
         cp = (cp << 6) | (b & 0x3F);
     }
-    // Reject overlong encodings, surrogates, and out-of-range values.
     static constexpr uint32_t kMinForExtra[4] = {0, 0x80, 0x800, 0x10000};
     if (cp < kMinForExtra[extra] || cp > 0x10FFFF ||
         (cp >= 0xD800 && cp <= 0xDFFF)) {

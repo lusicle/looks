@@ -32,7 +32,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint period_frames = max(uint(period * fp), 2u);
     const uint in_period = frame % period_frames;
     const uint dwell_f = max(uint(dwell), 1u);
-    // Motor cue at the period start, changeover cue one second later.
     const bool on = in_period < dwell_f ||
                     (in_period >= uint(fp) && in_period < uint(fp) + dwell_f);
 
@@ -41,7 +40,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 center = float2(0.93, 0.09);
         const float2 d = (uv - center) * float2(size.x / size.y, 1.0);
         const float rr = length(d) / max(mark_size, 1.0e-3);
-        // Radius wobbles per angle, re-seeded per event.
         const uint event = frame / period_frames;
         const float ang = atan2(d.y, d.x);
         const float wobble =
@@ -50,7 +48,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 
     float3 enc = fx_srgb_oetf(saturate(base.rgb));
-    enc = lerp(enc, float3(0.10, 0.08, 0.07), mark * 0.9);   // punched dark
+    enc = lerp(enc, float3(0.10, 0.08, 0.07), mark * 0.9);
 
     const float4 result =
         float4(fx_srgb_eotf(enc), max(base.a, mark * 0.9));

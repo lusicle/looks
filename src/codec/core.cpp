@@ -17,7 +17,6 @@ const uint8_t kZigzag[kBlockCoeffs] = {
     35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
 
-// ITU T.81 Annex K example tables (the de-facto JPEG baseline).
 const uint8_t kQuantBaseLuma[kBlockCoeffs] = {
     16, 11, 10, 16, 24,  40,  51,  61,
     12, 12, 14, 19, 26,  58,  60,  55,
@@ -48,19 +47,9 @@ void build_quant_table(const uint8_t* base, int quality,
     }
 }
 
-// ---------------------------------------------------------------- DCT
-//
-// Orthonormal 8-point DCT-II as a fixed-point matrix product: 13-bit
-// coefficients, int32 accumulators, symmetric rounding per pass. Chosen for
-// exact cross-platform determinism and clarity over speed; SIMD/AAN can
-// replace the inner loops later without changing the bitstream (encoder and
-// decoder always ship in the same binary).
-
 namespace {
 
-// C[u][x] = c(u)·cos((2x+1)uπ/16) rounded to 13-bit fixed point. HARDCODED
-// (not computed via cos at init) so the bitstream is bit-exact across
-// platforms/CRTs — a last-ulp libm difference must never change a frame.
+// Keep hardcoded: runtime cos can differ across CRTs and change frames.
 constexpr int32_t kDctFwd[kBlockSize][kBlockSize] = {
     {2896, 2896, 2896, 2896, 2896, 2896, 2896, 2896},
     {4017, 3406, 2276, 799, -799, -2276, -3406, -4017},
@@ -71,20 +60,12 @@ constexpr int32_t kDctFwd[kBlockSize][kBlockSize] = {
     {1567, -3784, 3784, -1567, -1567, 3784, -3784, 1567},
     {799, -2276, 3406, -4017, 4017, -3406, 2276, -799}};
 
-// The passes below exploit the DCT matrix's even/odd symmetry
-// (fwd[u][7-x] = +/-fwd[u][x]) to fold the 8-tap dot products into 4-tap
-// ones over sums/differences. Integer addition is exactly associative and
-// multiplication distributes exactly, so every accumulator holds the SAME
-// int32 value as the plain matrix product — bytes and pixels are
-// bit-identical to the naive walk (test-enforced), at a third of the
-// multiplies.
+// The folded passes must equal the plain matrix product bit for bit.
 
 inline int16_t round13(int32_t acc) {
     return static_cast<int16_t>(std::clamp((acc + 4096) >> 13, -32768, 32767));
 }
 
-// One forward 1D transform of 8 values with stride: out[k] = round(sum_x
-// fwd[k][x] * v[x]). Even k rows are symmetric, odd k antisymmetric.
 inline void fwd_pass8(const int16_t* in, int in_stride, int16_t* out,
                       int out_stride) {
     int32_t s[4], d[4];
@@ -108,20 +89,16 @@ inline void fwd_pass8(const int16_t* in, int in_stride, int16_t* out,
         round13(799 * d[0] - 2276 * d[1] + 3406 * d[2] - 4017 * d[3]);
 }
 
-// One inverse 1D transform: out[x] = round(sum_u fwd[u][x] * v[u]).
-// Outputs pair up (x, 7-x) sharing even/odd partial sums.
 inline void inv_pass8(const int16_t* in, int in_stride, int16_t* out,
                       int out_stride) {
     const int32_t v0 = in[0 * in_stride], v1 = in[1 * in_stride];
     const int32_t v2 = in[2 * in_stride], v3 = in[3 * in_stride];
     const int32_t v4 = in[4 * in_stride], v5 = in[5 * in_stride];
     const int32_t v6 = in[6 * in_stride], v7 = in[7 * in_stride];
-    // Even part for x = 0..3 (fwd[0][x] = 2896, fwd[4][x] = +/-2896).
     const int32_t e0 = 2896 * (v0 + v4) + 3784 * v2 + 1567 * v6;
     const int32_t e1 = 2896 * (v0 - v4) + 1567 * v2 - 3784 * v6;
     const int32_t e2 = 2896 * (v0 - v4) - 1567 * v2 + 3784 * v6;
     const int32_t e3 = 2896 * (v0 + v4) - 3784 * v2 - 1567 * v6;
-    // Odd part for x = 0..3 (columns of the odd fwd rows).
     const int32_t o0 = 4017 * v1 + 3406 * v3 + 2276 * v5 + 799 * v7;
     const int32_t o1 = 3406 * v1 - 799 * v3 - 4017 * v5 - 2276 * v7;
     const int32_t o2 = 2276 * v1 - 4017 * v3 + 799 * v5 + 3406 * v7;
@@ -140,10 +117,8 @@ inline void inv_pass8(const int16_t* in, int in_stride, int16_t* out,
 
 void fdct8x8(int16_t block[kBlockCoeffs]) {
     int16_t tmp[kBlockCoeffs];
-    // Row pass: each row transformed by C (tmp = f · C^T).
     for (int u = 0; u < kBlockSize; ++u)
         fwd_pass8(block + u * kBlockSize, 1, tmp + u * kBlockSize, 1);
-    // Column pass: F = C · tmp.
     for (int k = 0; k < kBlockSize; ++k)
         fwd_pass8(tmp + k, kBlockSize, block + k, kBlockSize);
 }
@@ -155,8 +130,6 @@ void idct8x8(int16_t block[kBlockCoeffs]) {
     for (int k = 0; k < kBlockSize; ++k)
         inv_pass8(tmp + k, kBlockSize, block + k, kBlockSize);
 }
-
-// ---------------------------------------------------------------- quant
 
 void quantize(const int16_t in[kBlockCoeffs], const uint16_t qtab[kBlockCoeffs],
               int16_t out[kBlockCoeffs]) {
@@ -175,10 +148,8 @@ void dequantize(const int16_t in[kBlockCoeffs], const uint16_t qtab[kBlockCoeffs
             std::clamp(in[i] * qtab[i], -32768, 32767));
 }
 
-// ---------------------------------------------------------------- entropy
-
 namespace {
-constexpr uint32_t kEobRun = 63;   // run sentinel: no more nonzero coeffs
+constexpr uint32_t kEobRun = 63;
 }
 
 void encode_block(BitWriter& bw, const int16_t block[kBlockCoeffs],
@@ -260,8 +231,6 @@ bool decode_block(BitReader& br, int16_t block[kBlockCoeffs], int16_t* dc_pred) 
     return true;
 }
 
-// ------------------------------------------------------- pixel pipeline
-
 void encode_pixel_block(BitWriter& bw, const uint8_t* src, size_t stride,
                         int avail_w, int avail_h,
                         const uint16_t qtab[kBlockCoeffs], int16_t* dc_pred) {
@@ -274,7 +243,6 @@ void encode_pixel_block(BitWriter& bw, const uint8_t* src, size_t stride,
 
 void extract_dct_block(const uint8_t* src, size_t stride, int avail_w,
                        int avail_h, int16_t out[kBlockCoeffs]) {
-    // Extract with edge replication for partial edge blocks.
     for (int y = 0; y < kBlockSize; ++y) {
         const int sy = std::min(y, avail_h - 1);
         for (int x = 0; x < kBlockSize; ++x) {
@@ -303,13 +271,7 @@ void residual_dct_block(const uint8_t* cur, size_t cur_stride,
 
 namespace {
 
-// Persistent fork-join pool: spawning ~15 threads per call costs about a
-// millisecond on Windows, which dwarfed the actual work for every codec
-// pass and made the Codec-Box effects insensitive to compiler
-// optimization. Workers park on a condition variable between tasks and
-// pull fixed chunks by atomic index — the chunk ranges are identical to
-// the old spawn-per-call split and writes are disjoint, so results are
-// bit-identical regardless of which worker runs which chunk.
+// Results must not depend on which worker runs which chunk.
 class BlockPool {
 public:
     static BlockPool& instance() {
@@ -330,7 +292,7 @@ public:
             ++generation_;
         }
         cv_.notify_all();
-        work(fn, count, chunk);   // the caller is a worker too
+        work(fn, count, chunk);   // The calling thread also does work.
         std::unique_lock<std::mutex> lock(m_);
         done_cv_.wait(lock, [this] { return active_ == 0; });
         fn_ = nullptr;

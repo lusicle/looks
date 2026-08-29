@@ -10,10 +10,10 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float mode;      // 0 stuck columns, 1 row shear, 2 both
+    float mode;
     float amount;
     float density;
-    float rate;      // hz, 0 = frozen
+    float rate;      // hz
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -35,14 +35,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     float2 suv = uv;
 
     if (m != 1u) {
-        // A stuck 4px lane snaps x to its seeded source column, so that
-        // column repeats across the run.
         const uint lane = tid.x / 4u;
         const uint lh = fx_hash4(seed ^ 0xC01u, tick, lane, 0u);
         if (fx_hash01(lh) < density * 0.5 * amount) {
             const float src_x =
                 fx_hash01(fx_hash(lh ^ 0x77u));
-            // Nearby, so the repeated content still relates to the frame.
             suv.x = clamp(uv.x + (src_x - 0.5) * 0.1 * (1.0 + amount * 3.0),
                           0.0, 1.0);
             suv.x = floor(suv.x * size.x / 4.0) * 4.0 / size.x;
@@ -52,7 +49,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const uint band = tid.y / 8u;
         const uint bh = fx_hash4(seed ^ 0x5EA4u, tick, band, 1u);
         if (fx_hash01(bh) < density) {
-            const float grow = uv.y;   // shear accumulates downward
+            const float grow = uv.y;
             const float shift =
                 (fx_value_noise1(seed ^ tick * 3u, float(band) * 0.37) - 0.5)
                 * amount * 160.0 * grow;

@@ -1,5 +1,4 @@
-// One Gray-Scott step. No randomness anywhere: the sim is deterministic
-// given the sequential frame stream, which is what keeps it replayable.
+// The sim uses no randomness. It must stay deterministic.
 
 #include "fx_common.slang"
 
@@ -33,7 +32,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 e = 1.0 / size;
 
     const float2 c = ab_at(uv);
-    // 3x3 Laplacian: adjacent 0.2, diagonal 0.05, center -1.
     float2 lap = -c;
     lap += 0.2 * ab_at(uv + float2(e.x, 0.0));
     lap += 0.2 * ab_at(uv - float2(e.x, 0.0));
@@ -48,7 +46,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float a = c.x + (1.0 * lap.x - abb + feed * (1.0 - c.x));
     float b = c.y + (0.5 * lap.y + abb - (feed + kill) * c.y);
 
-    // Midtones only: injecting at the extremes floods the sim flat.
+    // Inject in the midtones only. The extremes flood the sim flat.
     const float3 rgb = frame_in.SampleLevel(uv, 0).rgb;
     const float l = fx_luma(rgb);
     const float mid = smoothstep(0.05, 0.25, l) * (1.0 - smoothstep(0.5, 0.9, l));

@@ -1,5 +1,4 @@
-// Point-samples block centers rather than averaging blocks, which is
-// what keeps the mosaic crunchy.
+// Point-sample the block centers. Do not average the blocks.
 
 [[vk::push_constant]]
 cbuffer Push

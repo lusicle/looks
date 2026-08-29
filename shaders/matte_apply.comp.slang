@@ -1,5 +1,4 @@
-// Runs AFTER the effect kernel, which has already folded wet, blend and
-// opacity, so this only chooses between dry and that finished result.
+// This pass runs after the effect kernel folds wet, blend and opacity.
 
 [[vk::push_constant]]
 cbuffer Push

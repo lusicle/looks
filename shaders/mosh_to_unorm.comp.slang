@@ -1,7 +1,3 @@
-// GPU mosh: moshed-state planes (r32ui bytes) to the R8_UNORM upload
-// images the shared ycbcr_to_rgb pass samples. One full-res dispatch;
-// chroma writes ride the half-res guard.
-
 [[vk::push_constant]]
 cbuffer Push
 {

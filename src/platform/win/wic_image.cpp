@@ -19,8 +19,7 @@ bool decode_image_rgba(const uint8_t* bytes, size_t size, uint32_t* width,
     };
     if (!bytes || !size) return fail("empty image");
 
-    // COM may already be up on this thread (MfSession); S_FALSE and
-    // RPC_E_CHANGED_MODE both mean "usable, do not rebalance".
+    // Call CoUninitialize only when CoInitializeEx returns S_OK.
     const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool balance = co == S_OK;
     bool ok = false;

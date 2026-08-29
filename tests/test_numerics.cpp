@@ -37,24 +37,21 @@ TEST(numerics_rodrigues_and_jacobian) {
     m3_mul_v(r, x, y);
     CHECK(std::fabs(y[0]) < 1e-9);
     CHECK(std::fabs(y[1] - 1.0) < 1e-9);
-    // Rotations stay orthonormal: R^T R = I.
     double rt[9], rr[9];
     m3_transpose(r, rt);
     m3_mul(rt, r, rr);
     const double eye[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     CHECK(near9(rr, eye, 1e-12));
-    // The Jacobian is deterministic and matches a coarser difference.
     double r2[9], jac[27], jac2[27];
     rodrigues_jac(aa, r2, jac);
     rodrigues_jac(aa, r2, jac2);
     CHECK(std::memcmp(jac, jac2, sizeof(jac)) == 0);
-    // dR/daa_z at this pose: top-left entries follow -sin/-cos.
-    CHECK(std::fabs(jac[0 * 3 + 2] - (-1.0)) < 1e-5);   // d(R00)/dz
-    CHECK(std::fabs(jac[1 * 3 + 2] - (-0.0)) < 1e-5);   // d(R01)/dz ~ -cos'?
+    // At this pose dR00/dz = -sin = -1 and dR01/dz = 0.
+    CHECK(std::fabs(jac[0 * 3 + 2] - (-1.0)) < 1e-5);
+    CHECK(std::fabs(jac[1 * 3 + 2] - (-0.0)) < 1e-5);
 }
 
 TEST(numerics_jacobi_eigen_and_svd3) {
-    // Symmetric matrix with known spectrum {1, 2, 4} via a rotation.
     const double aa[3] = {0.3, -0.2, 0.5};
     double r[9], rt[9];
     rodrigues(aa, r);
@@ -69,7 +66,6 @@ TEST(numerics_jacobi_eigen_and_svd3) {
     CHECK(std::fabs(evals[1] - 2.0) < 1e-9);
     CHECK(std::fabs(evals[2] - 4.0) < 1e-9);
 
-    // SVD reconstructs, singular values descending.
     const double m[9] = {3, 1, 0, 1, 2, 1, 0, 1, 1};
     double u[9], s[3], vt[9];
     svd3(m, u, s, vt);
@@ -97,7 +93,6 @@ TEST(numerics_rodrigues_inv_roundtrip) {
 }
 
 TEST(numerics_sym_solve) {
-    // SPD system with a known solution: a = L L^T for a chosen L.
     const double L[9] = {2, 0, 0, 1, 3, 0, -1, 2, 4};
     double a[9], lt[9];
     m3_transpose(L, lt);
@@ -107,8 +102,7 @@ TEST(numerics_sym_solve) {
     m3_mul_v(a, x_true, b);
     CHECK(sym_solve(a, 3, b));
     for (int i = 0; i < 3; ++i) CHECK(std::fabs(b[i] - x_true[i]) < 1e-10);
-    // A non-positive matrix refuses.
-    double bad[4] = {1, 2, 2, 1};   // eigenvalues 3, -1
+    double bad[4] = {1, 2, 2, 1};   // eigenvalues 3 and -1: not SPD
     double rhs[2] = {1, 1};
     CHECK(!sym_solve(bad, 2, rhs));
 }
@@ -121,7 +115,6 @@ TEST(numerics_ransac_pick_deterministic) {
     for (int i = 0; i < 4; ++i)
         for (int j = i + 1; j < 4; ++j) CHECK(a[i] != a[j]);
     CHECK(!ransac_pick(1, 1, 3, 4, a));   // n < k refuses
-    // Different iterations pick different sets (overwhelmingly).
     int c[4];
     CHECK(ransac_pick(0x1234, 8, 100, 4, c));
     bool same = true;

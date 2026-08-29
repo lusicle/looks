@@ -12,7 +12,7 @@ cbuffer Push
     float fps;
     float amount;
     float start;    // radius where softness begins
-    float astig;    // 0 round blur, 1 fully tangential smear
+    float astig;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -36,8 +36,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 outc = base.rgb;
     float out_a = base.a;
     if (radius > 0.25) {
-        // Astigmatism squeezes the sampling ellipse onto the tangential
-        // axis, which is what smears corners into arcs.
         const float2 rad_dir = r > 1.0e-4 ? c / length(c) : float2(1.0, 0.0);
         const float2 tan_dir = float2(-rad_dir.y, rad_dir.x);
         const float tan_r = radius * (1.0 + astig * 1.2);

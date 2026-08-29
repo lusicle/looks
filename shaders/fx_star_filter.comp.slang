@@ -38,7 +38,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         [unroll]
         for (int s = 1; s <= 16; ++s) {
             const float f = float(s) / 16.0;
-            const float d = f * f * length_px;   // taps cluster near core
+            const float d = f * f * length_px;
             const float2 p = clamp(uv + dir * d / size, 0.0, 1.0);
             const float3 c = input.SampleLevel(p, 0).rgb;
             const float3 over = max(c - threshold, 0.0);

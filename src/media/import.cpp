@@ -33,13 +33,11 @@ std::wstring lower_ext(const std::filesystem::path& p) {
     return ext;
 }
 
-// An AAC audio track the importer can decode.
 bool aac_track(const TrackInfo* t) {
     return t && std::string(t->fourcc) == "mp4a" && !t->samples.empty() &&
            !t->audio_specific_config.empty();
 }
 
-// Container-level video facts every native import path stamps.
 void stamp_video_facts(const TrackInfo& video, ImportResult* result) {
     result->width = video.width;
     result->height = video.height;
@@ -48,7 +46,7 @@ void stamp_video_facts(const TrackInfo& video, ImportResult* result) {
     result->fps = static_cast<double>(video.timescale) / frame_duration;
 }
 
-// NV12 -> I420: split interleaved UV. Output planes are tightly packed.
+// Splits the interleaved UV; the output planes are tightly packed.
 struct I420Frame {
     std::vector<uint8_t> y, u, v;
     uint32_t width = 0, height = 0;
@@ -83,8 +81,7 @@ void nv12_to_i420(const platform::VideoFrameNV12& src, I420Frame& dst) {
     }
 }
 
-// Half-res proxy downsample: 2x2 box average per plane, even
-// output dims (the codec paths like them and so does NV12 export).
+// 2x2 box average per plane; the output dims must stay even.
 void downsample_half(const I420Frame& src, I420Frame& dst) {
     const uint32_t dw = std::max(2u, (src.width / 2) & ~1u);
     const uint32_t dh = std::max(2u, (src.height / 2) & ~1u);
@@ -116,9 +113,7 @@ void downsample_half(const I420Frame& src, I420Frame& dst) {
     box(src.v, scw, sch, dst.v, dcw, dch);
 }
 
-// Thumbnail strip builder over the shared .thumbs sidecar
-// (media/thumbs.h). Each destination pixel box-averages its source
-// region - a 1920 -> 160 px point sample would alias detail into noise.
+// Each destination pixel box-averages its source region to stop aliasing.
 struct ThumbStrip {
     ThumbStripData data{0, kThumbStripH, 0, {}};
 
@@ -170,7 +165,6 @@ struct ThumbStrip {
     }
 };
 
-// Wall-clock stage accumulator for the import-speed log line.
 struct StageClock {
     double seconds = 0.0;
     std::chrono::steady_clock::time_point mark;
@@ -182,12 +176,8 @@ struct StageClock {
     }
 };
 
-// The background half of video ingest: ONE software decode over the
-// whole track, feeding the motion/brightness/cut curves and the
-// thumbnail strip - the only stages that still need every pixel now that
-// playback decodes the source natively. Nothing is written until the
-// pass completes, so a cancel leaves the fast-stage sidecars intact and
-// the asset stays usable (curves and thumbs just never land).
+// Writes nothing until the pass completes, so a cancel leaves the
+// fast-stage sidecars intact.
 bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
                        const ImportOptions& options,
                        ImportProgress* progress, mod::AnalysisData* analysis,
@@ -195,25 +185,13 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
                        const std::wstring& stem, ImportResult* result) {
     platform::H264Decoder decoder;
     std::string error;
-    // Software decode: every frame is consumed on the CPU, and the DXVA
-    // path's per-frame sync readback stall (~8 ms flat) costs more than
-    // the multithreaded software decoder at any resolution. LOW LATENCY
-    // is load-bearing, not a tuning: without it the software MFT
-    // schedules decode through the process-shared MF work queues, and
-    // with a preview pool's worth of hardware sessions live those can
-    // starve it PERMANENTLY - ProcessOutput then parks forever with
-    // zero CPU (ignoring the cancel poll around it) and the app hangs
-    // at close joining this thread. Synchronous per-frame completion
-    // never touches the shared queues, and a sequential pass loses
-    // nothing to it.
+    // Keep low latency on: without it the software MFT uses the shared MF
+    // work queues and can park forever, which hangs the app at close.
     if (!decoder.create(track.avcc, track.width, track.height, &error,
                         /*allow_d3d=*/false, /*low_latency=*/true)) {
         log_warn("ingest: video pass decoder failed (%s)", error.c_str());
         return false;
     }
-    // Stage breadcrumb: this pass runs on a background thread that the
-    // app JOINS at close - a wedge before the frame loop otherwise
-    // reads as a silent closing hang with no stage to blame.
     log_info("ingest: pass decoder up (%zu samples)", track.samples.size());
     if (progress)
         progress->frames_total.store(
@@ -237,9 +215,8 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
     auto pump_decoder = [&]() {
         while (decoder.receive(nv12)) {
             if (decoded == 0) log_info("ingest: pass first frame");
-            // The analyzer reads the luma plane straight off the NV12
-            // (identical bytes to a converted Y plane, so the curves
-            // match what the old transcode-time analysis produced).
+            // The NV12 luma plane holds the same bytes as a converted Y
+            // plane.
             analyzer.push_frame(nv12.data.data(), nv12.width, nv12.width,
                                 nv12.height);
             if (thumb_every && decoded % thumb_every == 0) {
@@ -286,8 +263,7 @@ bool ingest_video_pass(BmffFile& file, const TrackInfo& track,
     t_pass.end();
     if (decoded == 0) return false;
 
-    // Video curves join the audio set already on disk; one writer, whole
-    // rewrite, so a reader sees old-complete or new-complete.
+    // One writer, whole rewrite: a reader sees old-complete or new-complete.
     analyzer.finish(analysis);
     const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
     if (mod::write_analysis(sc.analysis, *analysis))
@@ -363,25 +339,16 @@ bool import_audio(BmffFile& file, const TrackInfo& track,
     return true;
 }
 
-// Still-image import (PNG/TGA through the in-repo decoders, ):
-// the image is encoded ONCE and every timeline frame's index entry points
-// at that payload — a 10-second stream for one frame of storage. Downstream
-// the bundle is indistinguishable from footage, so the whole rack (mattes,
-// modulation, trim, export) works on stills untouched.
 constexpr uint32_t kStillFps = 30;
 constexpr uint32_t kStillFrames = 300;   // 10 s at 30 fps
 
-// Writes a one-image bundle: the frame encoded once, every index entry
-// pointing at that payload, plus proxy/thumb/analysis sidecars. Shared
-// by still imports and audio cover art (held for the audio's length).
+// Encodes the frame once; every index entry points at that one payload.
 bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
                         const ImportOptions& options, uint32_t hold_frames,
                         ImportResult* result) {
     const std::filesystem::path& mez_path = sc.mez;
-    // sRGB RGB -> BT.709 limited-range I420: the exact inverse of the
-    // engine's frame-fetch matrix (ycbcr_to_rgb), so a still round-trips
-    // through preview/export with no color shift. Even dims for the codec
-    // and NV12 paths.
+    // sRGB RGB to BT.709 limited-range I420; it must invert ycbcr_to_rgb.
+    // The dims must stay even for the codec and NV12 paths.
     I420Frame frame;
     frame.width = std::max(2u, img.width & ~1u);
     frame.height = std::max(2u, img.height & ~1u);
@@ -409,7 +376,6 @@ bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
     }
     for (uint32_t cy = 0; cy < ch; ++cy) {
         for (uint32_t cx = 0; cx < cw; ++cx) {
-            // Box-average the 2x2 RGB block, then convert.
             float r = 0.0f, g = 0.0f, b = 0.0f;
             for (uint32_t sy = 0; sy < 2; ++sy)
                 for (uint32_t sx = 0; sx < 2; ++sx) {
@@ -447,7 +413,6 @@ bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
         return false;
     }
 
-    // Half-res proxy: same one-payload trick.
     if (options.proxy) {
         I420Frame half;
         downsample_half(frame, half);
@@ -459,15 +424,14 @@ bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
             result->proxy_path = sc.proxy;
     }
 
-    // One-thumb filmstrip; the ruler stretches it across the timeline.
+    // One thumb only; the ruler stretches it across the timeline.
     if (options.thumb_count > 0) {
         ThumbStrip strip;
         strip.add(frame);
         if (strip.write(sc.thumbs)) result->thumbs_path = sc.thumbs;
     }
 
-    // Analysis: constant brightness, zero motion/cuts — deterministic
-    // and honest for a static image.
+    // A static image gives constant brightness and zero motion or cuts.
     {
         mod::AnalysisData data;
         data.fps = kStillFps;
@@ -499,9 +463,7 @@ bool import_still(const std::filesystem::path& source,
     ImageRgba img;
     std::string error;
     if (!load_image(source, &img, &error)) {
-        // WIC fallback: variants the in-repo decoders refuse (16-bit,
-        // palette, interlaced) import through the same decoder cover
-        // art already uses - one acceptance set for every image path.
+        // WIC decodes the variants the in-repo decoders refuse.
         const auto bytes = read_file_bytes(source);
         if (!bytes ||
             !platform::decode_image_rgba(bytes->data(), bytes->size(),
@@ -521,12 +483,8 @@ bool import_still(const std::filesystem::path& source,
     return ok;
 }
 
-// Audio import (WAV via the in-repo reader, MP3 via the in-repo frame
-// walker over the inbox MFT): PCM sidecar always; embedded cover art
-// additionally becomes the VIDEO side - a one-image mezzanine held for
-// the audio's length, so the media node shows the art and plays the
-// sound. Without art there is no mez: the node is image-dormant and
-// asset frame_count stays 0 = unbounded, like a generator.
+// Cover art becomes the video side; without art there is no mez.
+// An image-dormant node keeps frame_count 0, which means unbounded.
 bool import_audio_file(const std::filesystem::path& source,
                        const std::filesystem::path& dest_dir,
                        const ImportOptions& options,
@@ -585,8 +543,7 @@ bool import_audio_file(const std::filesystem::path& source,
     result->audio_sample_rate = rate;
     result->audio_frames =
         channels ? samples.size() / channels : 0;
-    // The still grid covering this audio's length: cover art holds this
-    // many frames and the audio curves land on the same grid.
+    // The cover art and the audio curves use this same frame grid.
     const double secs =
         rate ? static_cast<double>(result->audio_frames) / rate : 0.0;
     const uint32_t grid = std::max<uint32_t>(
@@ -615,10 +572,7 @@ bool import_audio_file(const std::filesystem::path& source,
         }
     }
 
-    // Audio curves (bands/onset/bpm) on the still grid - audio files get
-    // the same analysis a video's soundtrack gets, so beat clocks and
-    // the script analysis ops work on them. With cover art the still
-    // bundle wrote brightness/motion/cut at the same grid; merge in.
+    // Merge into the still bundle curves already written on the same grid.
     {
         mod::AnalysisData adata;
         if (!result->analysis_path.empty())
@@ -626,8 +580,7 @@ bool import_audio_file(const std::filesystem::path& source,
         mod::analyze_audio(samples.data(), result->audio_frames, channels,
                            rate, kStillFps, grid, &adata,
                            progress ? &progress->cancel : nullptr);
-        // A cancelled analysis is PARTIAL: persisting it would mark the
-        // bundle analyzed with dead curves.
+        // A cancelled analysis is partial; never persist it.
         if (progress && progress->cancel.load()) return false;
         adata.fps = kStillFps;
         adata.frame_count = grid;
@@ -734,11 +687,8 @@ ImportResult consolidate_video(const std::filesystem::path& source,
         return result;
     }
 
-    // Sequential decode feeding the encoder in lockstep; frames come out
-    // in presentation order, the same order the native path's frame
-    // index serves them. receive() emits tightly packed NV12
-    // (stride == width), exactly what the encoder's feed wants — the
-    // buffer swaps through untouched.
+    // Frames come out in presentation order.
+    // receive() emits tightly packed NV12 with the stride equal to width.
     const double to_100ns = 1.0e7 / video->timescale;
     size_t next_sample = 0;
     bool drained = false;
@@ -773,8 +723,7 @@ ImportResult consolidate_video(const std::filesystem::path& source,
         return true;
     };
 
-    // All-intra needs generous rate to hold quality: ~0.3 bits per pixel
-    // per frame, the ballpark of a decent intra-only intermediate.
+    // All-intra needs about 0.3 bits per pixel per frame to hold quality.
     ExportOptions options;
     options.gop_frames = 1;
     options.video_bitrate_bps = static_cast<uint32_t>(std::clamp(
@@ -835,8 +784,6 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
                                const std::filesystem::path& dest_dir,
                                const ImportOptions& options,
                                ImportProgress* progress) {
-    // Names the background thread's work: a wedge in here otherwise
-    // reads as a silent hang at close (the join in ~ImportJob).
     log_info("ingest: resuming video pass %s",
              path_to_u8(source).c_str());
     ImportResult result;
@@ -861,9 +808,7 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
     }
     stamp_video_facts(*video, &result);
 
-    // The fast-stage sidecar carries the audio curves; the pass rewrites
-    // it with the video curves merged, exactly as first ingest would
-    // have. A missing/unreadable sidecar still gets the video curves.
+    // The pass rewrites the sidecar with the video curves merged in.
     const std::wstring stem = source.stem().wstring();
     const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
     mod::AnalysisData analysis;
@@ -885,8 +830,6 @@ ImportResult import_media(const std::filesystem::path& source,
                           ImportProgress* progress) {
     ImportResult result;
 
-    // Still images (PNG/TGA) skip Media Foundation entirely — the in-repo
-    // decoders and the mezzanine writer are all it takes.
     const std::wstring ext = lower_ext(source);
     if (ext == L".png" || ext == L".tga") {
         import_still(source, dest_dir, options, progress, &result);
@@ -926,11 +869,7 @@ ImportResult import_media(const std::filesystem::path& source,
     std::filesystem::create_directories(dest_dir, ec);
     const std::wstring stem = source.stem().wstring();
 
-    // ---- fast stage: everything the asset needs to be USABLE. Video
-    // facts come from the container (playback decodes the source in
-    // place - no transcode); the AAC decode into the PCM sidecar and the
-    // audio curves are the only real work. `ready` flips here and the
-    // app binds/places the asset while the video pass below still runs.
+    // The fast stage flips ready while the video pass below still runs.
     stamp_video_facts(*video, &result);
 
     const SidecarPaths sc = sidecars_for_stem(dest_dir, stem);
@@ -960,9 +899,7 @@ ImportResult import_media(const std::filesystem::path& source,
         result.error = "cancelled";
         return result;
     }
-    // The analysis sidecar is the READY marker resolve_bundle gates on:
-    // written last in the fast stage, deleted never, rewritten (with the
-    // video curves merged in) when the pass below completes.
+    // The analysis sidecar is the ready marker; write it last in this stage.
     if (mod::write_analysis(sc.analysis, analysis))
         result.analysis_path = sc.analysis;
     else
@@ -976,8 +913,6 @@ ImportResult import_media(const std::filesystem::path& source,
              path_to_u8(source).c_str(), result.frame_count, result.fps,
              result.pcm_path.empty() ? "" : " + audio");
 
-    // ---- background stage, same job: the one full decode feeding the
-    // video curves and the thumbnail strip.
     if (!(progress && progress->cancel.load()))
         ingest_video_pass(file, *video, options, progress, &analysis,
                           dest_dir, stem, &result);

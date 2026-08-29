@@ -1,7 +1,3 @@
-// Single TU compiling miniaudio. Playback only: no decoding,
-// no encoding — miniaudio is strictly the audio OUTPUT device; all decode
-// is ours.
-
 #define MINIAUDIO_IMPLEMENTATION
 #define MA_NO_DECODING
 #define MA_NO_ENCODING

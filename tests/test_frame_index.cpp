@@ -1,7 +1,3 @@
-// Frame-index math: the presentation/decode mapping, keyframe lookup and
-// pts round-trip the native decode sessions steer by. Pure - synthetic
-// TrackInfo in, no decoder, no files.
-
 #include <string>
 
 #include "media/frame_index.h"
@@ -44,7 +40,6 @@ TrackInfo make_track(std::initializer_list<int64_t> cts_offsets,
 }  // namespace
 
 TEST(frame_index_identity_without_reorder) {
-    // No composition offsets: presentation order IS decode order.
     const TrackInfo t = make_track({0, 0, 0, 0, 0, 0}, {0, 3});
     FrameIndex idx;
     std::string error;
@@ -64,17 +59,12 @@ TEST(frame_index_identity_without_reorder) {
 }
 
 TEST(frame_index_presentation_order_resolves_b_frames) {
-    // Decode order I P B B I P with composition offsets shaping the
-    // presentation order I B B P I P - the classic reorder.
-    //   decode:  s0 I (pts  512)   s1 P (pts 2048)  s2 B (pts 1024)
-    //            s3 B (pts 1536)   s4 I (pts 2560)  s5 P (pts 3072)
     const TrackInfo t =
         make_track({512, 1536, 0, 0, 512, 512}, {0, 4});
     FrameIndex idx;
     std::string error;
     CHECK(build_frame_index(t, &idx, &error));
 
-    // presentation -> decode: [s0, s2, s3, s1, s4, s5]
     CHECK_EQ(idx.present_to_decode[0], 0u);
     CHECK_EQ(idx.present_to_decode[1], 2u);
     CHECK_EQ(idx.present_to_decode[2], 3u);
@@ -84,18 +74,14 @@ TEST(frame_index_presentation_order_resolves_b_frames) {
     CHECK_EQ(idx.decode_to_present[1], 3u);
     CHECK_EQ(idx.decode_to_present[2], 1u);
 
-    // Composition times ascend in presentation order.
     for (size_t i = 1; i < idx.present_pts.size(); ++i)
         CHECK(idx.present_pts[i - 1] < idx.present_pts[i]);
 
-    // The roll for presentation 3 (decode s1) starts at s0; the second
-    // GOP's frames start at s4.
     CHECK_EQ(idx.keyframe_before(3), 0u);
     CHECK_EQ(idx.keyframe_before(4), 4u);
     CHECK_EQ(idx.keyframe_before(5), 4u);
 
-    // Output pts maps back to its presentation slot exactly, and a 100ns
-    // rounding wobble still lands on the nearest frame.
+    // present_of_pts must absorb a +/-1 tick rounding wobble.
     for (uint32_t p = 0; p < idx.frame_count(); ++p) {
         CHECK_EQ(idx.present_of_pts(idx.present_pts[p]), p);
         CHECK_EQ(idx.present_of_pts(idx.present_pts[p] + 1), p);
@@ -104,10 +90,7 @@ TEST(frame_index_presentation_order_resolves_b_frames) {
 }
 
 TEST(frame_index_vfr_grid_takes_the_median_duration) {
-    // The CFR grid is the MEDIAN sample duration: captures routinely
-    // flag VFR with an outlier FIRST frame (doubled while the encoder
-    // spins up), and a first-sample grid halved a 120fps probe - the
-    // clip then conformed as 60fps and played half speed.
+    // The grid is the median duration; first frames are often outliers.
     TrackInfo t = make_track({0, 0, 0, 0}, {0}, 512);
     t.samples[2].duration = 1024;
     t.samples[3].duration = 256;
@@ -118,9 +101,8 @@ TEST(frame_index_vfr_grid_takes_the_median_duration) {
     CHECK(idx.fps() == 25.0);
     CHECK_EQ(idx.frame_count(), 4u);
 
-    // The outlier first frame no longer halves the grid.
     TrackInfo hfr = make_track({0, 0, 0, 0, 0}, {0}, 128);
-    hfr.samples[0].duration = 256;   // doubled spin-up frame
+    hfr.samples[0].duration = 256;
     FrameIndex idx2;
     CHECK(build_frame_index(hfr, &idx2, &error));
     CHECK_EQ(idx2.frame_duration, 128u);

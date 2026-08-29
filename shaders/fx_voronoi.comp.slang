@@ -14,7 +14,7 @@ cbuffer Push
     float shatter;   // px
     float edge;
     float drift;     // hz
-    float style;     // 0 voronoi cells, 1 delaunay-style facets
+    float style;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -35,7 +35,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const int2 pc = int2(floor(p));
     const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * drift;
 
-    // Three nearest seeds: the third exists only for the facet style.
     float best = 1.0e9, second = 1.0e9, third = 1.0e9;
     uint best_hash = 0u;
     float2 sp1 = 0.0, sp2 = 0.0, sp3 = 0.0;
@@ -78,7 +77,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // One offset for the whole shard, so it moves as a rigid piece.
+    // Use one offset for the whole shard so it moves as a rigid piece.
     const float2 offset =
         (float2(fx_hash01(fx_hash(best_hash ^ 0x123u)),
                 fx_hash01(fx_hash(best_hash ^ 0x456u))) - 0.5) *
@@ -87,8 +86,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 col;
     float col_a;
     if (style >= 0.5) {
-        // Flat-shade the triangle of the three nearest seeds from its
-        // centroid, and ink the bisector edges as the wireframe.
         const float2 centroid_p = (sp1 + sp2 + sp3) / 3.0;
         const float2 cuv = clamp(
             centroid_p * cell_px / size + offset / size, 0.0, 1.0);

@@ -1,6 +1,3 @@
-// Taking the least-variance quadrant, rather than a plain mean, is what
-// keeps edges crisp while texture flattens.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -13,7 +10,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float radius;   // px, capped at 6 by the unrolled loops below
+    float radius;   // px, capped at 6 by the unrolled loops
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

@@ -73,13 +73,11 @@ QueuePick pick_queues(VkPhysicalDevice pd, VkSurfaceKHR surface) {
         const bool graphics_compute =
             (flags & VK_QUEUE_GRAPHICS_BIT) && (flags & VK_QUEUE_COMPUTE_BIT);
         if (graphics_compute && pick.graphics == VK_QUEUE_FAMILY_IGNORED) {
-            // Headless (no surface): any graphics+compute family will do.
             VkBool32 present = surface == VK_NULL_HANDLE ? VK_TRUE : VK_FALSE;
             if (surface != VK_NULL_HANDLE)
                 vkGetPhysicalDeviceSurfaceSupportKHR(pd, i, surface, &present);
             if (present) pick.graphics = i;
         }
-        // Dedicated DMA family: transfer without graphics/compute.
         const bool dma = (flags & VK_QUEUE_TRANSFER_BIT) &&
                          !(flags & VK_QUEUE_GRAPHICS_BIT) &&
                          !(flags & VK_QUEUE_COMPUTE_BIT);
@@ -96,7 +94,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
 
     auto dev = std::unique_ptr<Device>(new Device());
 
-    // ---- instance
     uint32_t loader_version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion)
         vkEnumerateInstanceVersion(&loader_version);
@@ -154,8 +151,7 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
         vkCreateDebugUtilsMessengerEXT(dev->instance_, &dbg, nullptr, &dev->messenger_);
     }
 
-    // ---- surface (needed before device pick: present support is per-family;
-    // headless callers pass no hwnd and get no surface/swapchain)
+    // Create the surface before the device pick: present support is per-family.
     if (desc.hwnd) {
         auto create_surface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
             vkGetInstanceProcAddr(dev->instance_, "vkCreateWin32SurfaceKHR"));
@@ -170,8 +166,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
         }
     }
 
-    // ---- physical device: discrete preferred, must do swapchain + dynamic
-    // rendering (1.3 core or the KHR extension on 1.2).
     uint32_t pd_count = 0;
     vkEnumeratePhysicalDevices(dev->instance_, &pd_count, nullptr);
     std::vector<VkPhysicalDevice> physicals(pd_count);
@@ -225,12 +219,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
     vkGetPhysicalDeviceProperties(best, &dev->properties_);
     log_info("gpu: %s", dev->properties_.deviceName);
 
-    // ---- logical device
-    // A second graphics-family queue (lower priority) carries the
-    // thumbnail worker's background renders: the driver schedules them
-    // around frame work instead of in line with it. Same family, so
-    // every resource shares with no ownership transfers; one-queue
-    // families fall back to the shared graphics queue.
     uint32_t gfx_queue_count = 1;
     {
         uint32_t n = 0;
@@ -258,9 +246,7 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
     dynrender.dynamicRendering = VK_TRUE;
 
-    // shaderDrawParameters (1.1 core): Slang lowers HLSL SV_VertexID to
-    // gl_VertexIndex - gl_BaseVertex, which declares the DrawParameters
-    // capability — required by the viewport blit's fullscreen triangle.
+    // Slang SPIR-V declares DrawParameters; shaderDrawParameters must stay on.
     VkPhysicalDeviceVulkan11Features features11{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     features11.pNext = &dynrender;
@@ -268,10 +254,7 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
     VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features2.pNext = &features11;
 
-    // Enable samplerAnisotropy when available: we may use it for viewport
-    // sampling later, and injected overlay layers (Steam/vendor OSDs) create
-    // anisotropic samplers on our device — without the feature they trip
-    // validation with errors that aren't ours.
+    // Injected overlays make anisotropic samplers; keep the feature enabled.
     {
         VkPhysicalDeviceVulkan11Features supported11{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
@@ -307,7 +290,6 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
     vkGetDeviceQueue(dev->device_, dev->graphics_family_,
                      gfx_queue_count > 1 ? 1 : 0, &dev->thumb_queue_);
 
-    // ---- VMA
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;

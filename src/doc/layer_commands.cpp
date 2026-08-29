@@ -89,19 +89,11 @@ private:
     Layer old_;
 };
 
-// One half of a razor: the placement being shortened and the fresh right
-// half that resumes at the cut's source frame.
 struct PlacementSplit {
     uint64_t left_id = 0;
     Placement right;
 };
 
-// RAZOR: a cut is two abutting placements on ONE lane. Nothing is
-// cloned and no wiring moves - sequences own no effects, so the cut
-// cannot touch state anywhere and razor identity is structural. The
-// cut applies to the WHOLE LINK GROUP: a linked audio partner splits at
-// the same frame and the right halves link to each other, so picture
-// and sound stay lockstep through the edit.
 class RazorPlacementCommand final : public SequenceCommand {
 public:
     RazorPlacementCommand(uint64_t sequence, uint32_t at,
@@ -145,8 +137,7 @@ private:
 
 namespace {
 
-// The latest-starting placement strictly containing `at` - the one the
-// track shows there.
+// Picks the latest-starting placement, the one the track shows at `at`.
 const Placement* placement_under(const Document& doc,
                                  const std::vector<Placement>& placements,
                                  uint32_t at, double parent_fps) {
@@ -161,21 +152,18 @@ const Placement* placement_under(const Document& doc,
     return place;
 }
 
-// The split for one placement: same target, fresh id, resuming at the
-// cut's source frame so the halves are continuous.
 PlacementSplit split_of(Document& doc, const Placement& place, uint32_t at,
                         double parent_fps) {
     PlacementSplit s;
     s.left_id = place.id;
     s.right = place;
     s.right.id = doc.next_effect_id++;
-    s.right.t_out = place.t_out;   // 0 stays "to the source end"
+    s.right.t_out = place.t_out;   // a t_out of 0 means "to the source end"
     trim_placement_head(s.right, at, placement_ratio(doc, place, parent_fps));
     return s;
 }
 
-// The whole group's splits: the named placement plus every link partner
-// the cut lands strictly inside. Right halves link to each other.
+// The right halves share one fresh link id. A half with no partner gets 0.
 std::unique_ptr<Command> razor_group(Document& doc, uint64_t seq_id,
                                      const Placement& primary, uint32_t at) {
     const double eff = effective_fps(doc, doc.sequence(seq_id));
@@ -248,34 +236,28 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
                   "layer names track the enum");
     layer.name = std::string(kNames[static_cast<size_t>(kind)]) + " " +
                  std::to_string(layer.id);
-    // A media node binds to the project's first asset by default; the
-    // browser retargets it. Nested refs bind when the caller names the
-    // entity (and checks nest_reaches first).
+    // The caller must check nest_reaches before it binds a nested ref.
     if (kind == LayerSourceKind::Media && !doc.assets.empty())
         layer.asset = doc.assets.front().id;
-    // Generators default to half opacity so adding one doesn't blank the
-    // composite.
     if (kind == LayerSourceKind::Solid || kind == LayerSourceKind::Gradient ||
         kind == LayerSourceKind::Noise ||
         kind == LayerSourceKind::TestPattern ||
         kind == LayerSourceKind::Oscillator)
         layer.opacity = 0.5f;
     if (kind == LayerSourceKind::Oscillator) {
-        // Oscillator frequency reads in cycles, not px — a usable default.
+        // For Oscillator, gen_scale is in cycles, not pixels.
         layer.gen_scale = 8.0f;
         layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
     }
     if (kind == LayerSourceKind::TestPattern) {
-        // Checkerboard at a readable cell size, white on black.
+        // For TestPattern, gen_scale is the checker cell size in pixels.
         layer.gen_scale = 64.0f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
         layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
     }
     if (kind == LayerSourceKind::Shape) {
-        // A matte maker: opaque coverage on transparent, a visible size,
-        // a soft edge (gen_scale = size, gen_angle = feather — see
-        // gen.comp.slang).
+        // For Shape, gen_scale is the size and gen_angle is the feather.
         layer.gen_scale = 6.0f;
         layer.gen_angle = 0.35f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;

@@ -69,10 +69,7 @@ void rodrigues(const double aa[3], double r_out[9]) {
 }
 
 void rodrigues_jac(const double aa[3], double r_out[9], double jac[27]) {
-    // Analytic derivative is fiddly near theta = 0; a fixed-step central
-    // difference on doubles is deterministic, symmetric, and accurate to
-    // ~1e-9 - well under the solver's tolerance. The step never adapts,
-    // so the same inputs always produce the same Jacobian bytes.
+    // The step must not adapt. A fixed step keeps the result deterministic.
     rodrigues(aa, r_out);
     constexpr double kStep = 1.0e-6;
     for (int k = 0; k < 3; ++k) {
@@ -89,8 +86,7 @@ void rodrigues_jac(const double aa[3], double r_out[9], double jac[27]) {
 }
 
 void rodrigues_inv(const double r[9], double aa[3]) {
-    // Angle from atan2 of the skew magnitude against the trace cosine
-    // (well-conditioned at both ends, unlike acos near pi).
+    // Use atan2 here. acos loses precision near theta = pi.
     const double sx = r[7] - r[5];
     const double sy = r[2] - r[6];
     const double sz = r[3] - r[1];
@@ -99,21 +95,19 @@ void rodrigues_inv(const double r[9], double aa[3]) {
         1.0, std::max(-1.0, (r[0] + r[4] + r[8] - 1.0) * 0.5));
     const double th = std::atan2(s2, c);
     if (s2 > 1.0e-6) {
-        // aa = th * (skew vector / its magnitude): no cancellation.
         const double k = th / (2.0 * s2);
         aa[0] = k * sx;
         aa[1] = k * sy;
         aa[2] = k * sz;
         return;
     }
-    if (c > 0.0) {   // theta ~ 0: first-order skew read
+    if (c > 0.0) {
         aa[0] = 0.5 * sx;
         aa[1] = 0.5 * sy;
         aa[2] = 0.5 * sz;
         return;
     }
-    // theta at pi: R = I + 2K^2, so a_i^2 = (R_ii + 1)/2 and
-    // a_i a_j = R_ij / 2. Anchor on the largest diagonal.
+    // Use the largest diagonal element to keep the divide stable.
     double ax, ay, az;
     if (r[0] >= r[4] && r[0] >= r[8]) {
         ax = std::sqrt(std::max(0.0, (r[0] + 1.0) * 0.5));
@@ -139,8 +133,7 @@ void jacobi_eigen_sym(const double* a, int n, double* eigvals,
     std::memcpy(m, a, sizeof(double) * static_cast<size_t>(n) * n);
     double v[81] = {};
     for (int i = 0; i < n; ++i) v[i * n + i] = 1.0;
-    // Fixed sweep count, fixed (p, q) order: deterministic and plenty
-    // for n <= 9 (Jacobi converges quadratically).
+    // Keep the sweep count and the (p, q) order fixed for determinism.
     constexpr int kSweeps = 24;
     for (int sweep = 0; sweep < kSweeps; ++sweep) {
         for (int p = 0; p < n - 1; ++p)
@@ -175,7 +168,7 @@ void jacobi_eigen_sym(const double* a, int n, double* eigvals,
                 }
             }
     }
-    // Sort ascending, stable order for ties.
+    // The sort must stay stable so equal eigenvalues keep their order.
     int order[9];
     for (int i = 0; i < n; ++i) order[i] = i;
     std::stable_sort(order, order + n, [&](int x, int y) {
@@ -189,21 +182,18 @@ void jacobi_eigen_sym(const double* a, int n, double* eigvals,
 }
 
 void svd3(const double mm[9], double u[9], double s[3], double vt[9]) {
-    // Eigen of M^T M gives V and the squared singular values; U comes
-    // from M V / s with degenerate columns rebuilt by cross products.
     double mtm[9];
     double mt[9];
     m3_transpose(mm, mt);
     m3_mul(mt, mm, mtm);
     double evals[3], evecs[9];
     jacobi_eigen_sym(mtm, 3, evals, evecs);
-    // Descending singular values.
     for (int i = 0; i < 3; ++i) {
         const double ev = evals[2 - i];
         s[i] = ev > 0.0 ? std::sqrt(ev) : 0.0;
         for (int k = 0; k < 3; ++k) vt[i * 3 + k] = evecs[(2 - i) * 3 + k];
     }
-    // Right-handed V (det +1) keeps downstream decompositions sane.
+    // V must be right-handed with a determinant of +1.
     double vt_det[9];
     std::memcpy(vt_det, vt, sizeof(vt_det));
     if (m3_det(vt_det) < 0.0)
@@ -217,7 +207,6 @@ void svd3(const double mm[9], double u[9], double s[3], double vt[9]) {
             u[1 * 3 + i] = mv[1] / s[i];
             u[2 * 3 + i] = mv[2] / s[i];
         } else {
-            // Rebuild as the cross of the earlier columns.
             const double a0 = u[0], a1 = u[3], a2 = u[6];
             const double b0 = u[1], b1 = u[4], b2 = u[7];
             double cx = a1 * b2 - a2 * b1;
@@ -242,8 +231,6 @@ void svd3(const double mm[9], double u[9], double s[3], double vt[9]) {
 }
 
 bool sym_solve(double* a, int n, double* b) {
-    // In-place Cholesky a = L·Lᵀ (lower triangle), then two triangular
-    // substitutions.
     for (int j = 0; j < n; ++j) {
         double d = a[j * n + j];
         for (int k = 0; k < j; ++k) d -= a[j * n + k] * a[j * n + k];
@@ -285,7 +272,7 @@ bool ransac_pick(uint64_t seed, uint32_t iteration, uint32_t n, int k,
                 out[i] = pick;
                 break;
             }
-            if (attempt > 64) return false;   // n too small in practice
+            if (attempt > 64) return false;
         }
     }
     return true;

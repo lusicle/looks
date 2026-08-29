@@ -1,6 +1,5 @@
-// Display-referred: the kernel converts linear -> sRGB around its core.
-// Dither mode 9 (RD stipple) reads a Gray-Scott sim the engine steps
-// per instance and binds at binding 2; every other mode ignores it.
+// Work in display-referred space, not in linear light.
+// Binding 2 holds the Gray-Scott sim. Only dither mode 9 reads it.
 
 #include "fx_pattern.slang"
 
@@ -18,10 +17,10 @@ cbuffer Push
     float palette;
     float dither;
     float dither_amt;
-    float boil_hz;     // 0 = static
+    float boil_hz;     // hz
     float scroll;
     float warp;
-    float dissolve;    // 1 = fully quantized, 0 reveals the input
+    float dissolve;
     float lock_mode;
     float pat_rotate;  // degrees
     float pat_scale;
@@ -30,8 +29,8 @@ cbuffer Push
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D noise_lut;   // packed LUT, fx_common
-[[vk::binding(2, 0)]] Sampler2D rd_state;    // Gray-Scott (A, B), mode 9
+[[vk::binding(1, 0)]] Sampler2D noise_lut;   // the packed LUT
+[[vk::binding(2, 0)]] Sampler2D rd_state;    // (A, B) state
 [[vk::binding(3, 0)]] Sampler2D flow;
 [[vk::binding(4, 0)]] RWTexture2D<float4> output;
 
@@ -54,13 +53,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         tid.xy, mv, pat_rotate, pat_scale,
         fx_pattern_shift(seed, boil_tick), t, scroll, warp);
 
-    // Selector: 0 none, 1..7 patterns, 8 level cycle, 9 RD stipple,
-    // 10..16 patterns again - the shared engine ids skip the two
-    // specials, hence the -1 / -3 remap.
+    // The shared ids skip two specials, so the remap uses -1 and -3.
     const int dm = int(dither + 0.5);
     float pattern = 0.5;
     if (dm == 9) {
-        // The sim's B concentration: dots land near 0.35, field at 0.
+        // The B concentration is near 0.35 on dots and 0 in the field.
         pattern = saturate(rd_state.SampleLevel(uv, 0).g * 2.5);
     } else if (dm >= 1 && dm != 8) {
         pattern = fx_ordered_pattern(
@@ -75,10 +72,8 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const int pal = int(palette + 0.5);
     const float n = max(levels, 2.0);
-    // Level picks happen in LINEAR light so dithered fields average back
-    // to the source brightness; code-value dithering would lift every
-    // dark region on display. The fixed palettes below deliberately keep
-    // their stylized encoded-domain snap instead.
+    // The level picks use linear light so the dither averages back.
+    // The fixed palettes keep their encoded-domain snap on purpose.
     const float t01 = clamp(0.5 + threshold, 0.0, 1.0);
     float3 result;
     if (pal == 0)
@@ -100,8 +95,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     else
     {
-        // Fixed palettes: luma palettes (DMG, duotone) dither the luma,
-        // color palettes dither the color, then the shared snap.
         float l = saturate(fx_luma(c) + threshold * 0.34);
         float3 dithered = saturate(c + threshold * 0.5);
         if (cycle_step != 0u) {
@@ -113,7 +106,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 
     if (dissolve < 0.999) {
-        // Patternless modes (none, level cycle) gate on a hash instead.
         const float gate = (dm == 0 || dm == 8)
             ? fx_hash01(fx_hash4(seed, 3u, tid.x, tid.y))
             : pattern;

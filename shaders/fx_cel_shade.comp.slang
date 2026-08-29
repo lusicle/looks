@@ -1,4 +1,4 @@
-// Encoded space, so the bands land perceptually even.
+// Band in encoded space so steps land perceptually even.
 
 #include "fx_common.slang"
 
@@ -37,8 +37,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float l = fx_luma(enc);
 
-    // Scaling rgb by the luma ratio is what preserves hue through the
-    // quantization.
     const float n = clamp(round(bands), 2.0, 16.0);
     const float banded = (floor(l * n) + 0.5) / n;
     float3 col = l > 1.0e-4 ? enc * (banded / l) : float3(banded, banded, banded);

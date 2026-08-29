@@ -1,6 +1,3 @@
-// Dividing by the local gradient is what keeps line width uniform across
-// steep and shallow slopes alike.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -15,7 +12,7 @@ cbuffer Push
     float fps;
     float levels;
     float thickness;
-    float mode;   // 0 white-on-black, 1 black-on-white, 2 over image
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -38,7 +35,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float n = clamp(round(levels), 3.0, 32.0);
     const float l = luma_at(uv);
-    // Manual fwidth: compute shaders have no derivatives.
     const float2 e = 1.0 / size;
     const float gx = luma_at(uv + float2(e.x, 0)) - luma_at(uv - float2(e.x, 0));
     const float gy = luma_at(uv + float2(0, e.y)) - luma_at(uv - float2(0, e.y));

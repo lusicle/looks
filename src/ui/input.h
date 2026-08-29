@@ -1,8 +1,3 @@
-// UiInput — per-frame input snapshot in LOGICAL px, decoupled from the
-// platform event queue. Widgets read edges/holds from here and set
-// `consumed` when they claim the pointer (the hit-test winner does this
-// automatically via Context).
-
 #pragma once
 
 #include <cstdint>
@@ -20,11 +15,7 @@ inline constexpr uint8_t kMouseMiddle = 1u << 2;
 struct UiInput {
     Vec2 mouse{};          // logical px; modals may deaden it per frame
     Vec2 mouse_delta{};
-    // Authoritative pointer position - only begin_frame writes it, and
-    // `mouse` rebuilds from it every frame. A modal that deadens
-    // `mouse` for one frame cannot poison the next: the pointer may
-    // rest (no MouseMove arrives) while hover and wheel gates must
-    // still see where it sits.
+    // Only begin_frame writes this; mouse rebuilds from it each frame.
     Vec2 mouse_raw{};
     uint8_t buttons_down = 0;
     uint8_t buttons_pressed = 0;    // edges this frame
@@ -33,8 +24,6 @@ struct UiInput {
     float wheel_x = 0.0f;
     uint32_t mods = 0;              // platform::kModCtrl / Shift / Alt
     std::vector<uint32_t> typed;    // UTF-32 chars this frame
-    // Edit-key edges for widget-owned inline fields (the color picker's
-    // entry boxes); app-level fields keep reading platform events.
     bool backspace_pressed = false;
     bool enter_pressed = false;
     bool consumed = false;          // pointer claimed by UI this frame
@@ -44,8 +33,7 @@ struct UiInput {
     bool left_released() const { return buttons_released & kMouseLeft; }
     bool right_pressed() const { return buttons_pressed & kMouseRight; }
 
-    // Folds the platform events into the snapshot. `to_logical` divides
-    // physical event coordinates by the window's DPI scale.
+    // Divides physical event coordinates by dpi_scale to get logical px.
     void begin_frame(const std::vector<platform::Event>& events, float dpi_scale);
 };
 

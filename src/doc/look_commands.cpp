@@ -8,8 +8,6 @@ namespace looks::doc {
 
 namespace {
 
-// First element whose id matches, removed in place - the shape every
-// push_back-style apply reverts through.
 template <class V>
 void erase_by_id(V& v, uint64_t id) {
     for (auto it = v.begin(); it != v.end(); ++it)
@@ -19,8 +17,6 @@ void erase_by_id(V& v, uint64_t id) {
         }
 }
 
-// Append one document-level entity (bin / look / sequence / asset);
-// undo removes it by id.
 template <class T, std::vector<T> Document::*List>
 class AddEntityCommand final : public Command {
 public:
@@ -37,11 +33,8 @@ private:
     const char* label_;
 };
 
-// Ordered removal of one document-level entity: apply records the
-// index, revert re-inserts at it, clamped - the vector can have shrunk
-// between apply and revert. Index preservation is load-bearing for
-// assets (the FIRST asset drives auto canvas/fps), so the restored
-// entry must land where it was.
+// Revert clamps the index: the vector can shrink between apply and revert.
+// The index matters: the first asset drives the automatic canvas and fps.
 template <class T, std::vector<T> Document::*List>
 class RemoveEntityCommand final : public Command {
 public:
@@ -76,11 +69,7 @@ private:
     bool had_ = false;
 };
 
-// A full deep copy of a look with every id reminted: MAKE UNIQUE's fork.
-// Definitions remint; references remap through the same table so wiring,
-// group faces, mod targets, lanes and snapshots keep pointing at the
-// clone's own nodes. Nested LookRef/SequenceRef targets stay pointing at
-// the SAME shared entities - the fork is one level deep.
+// The fork is one level deep: nested look and sequence targets stay shared.
 Look clone_look_for_unique(Document& doc, const Look& src) {
     Look out = src;
     out.id = doc.next_effect_id++;
@@ -108,8 +97,7 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
     }
     for (CanvasFrame& f : out.frames) f.id = remint(f.id);
 
-    // References resolve through the table; ids the look does not own
-    // (nested targets) pass through unchanged.
+    // An id the look does not own passes through unchanged.
     auto mapped_key = [&](ParamKey k) {
         if (k.effect_id & kLayerParamBit)
             k.effect_id = mapped(k.effect_id & ~kLayerParamBit) |
@@ -133,8 +121,7 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
         l.from = mapped(l.from);
         if (l.to) l.to = mapped(l.to);
     }
-    // Value graph: node ids remint through the same table so routes and
-    // helper inputs keep pointing inside the fork.
+    // Value node ids come from next_route_id but share the same map.
     for (ValueNode& n : out.value_nodes) {
         const uint64_t id = doc.next_route_id++;
         map.emplace(n.id, id);
@@ -160,10 +147,8 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
     return out;
 }
 
-// The sequence fork: lanes, tracks and placements remint; link ids are
-// shared markers, reminted once each so pairs stay pairs inside the
-// copy. Placement targets stay shared - one level deep, like the look
-// clone.
+// A link id remints one time only, thus pairs stay pairs in the copy.
+// Placement targets stay shared: the fork is one level deep.
 Sequence clone_sequence_for_unique(Document& doc, const Sequence& src) {
     Sequence out = src;
     out.id = doc.next_effect_id++;
@@ -214,8 +199,7 @@ public:
                 break;
             }
         if (!had_) return;
-        // Contents climb to the deleted bin's parent - organisation is
-        // never data, so removing a folder must not remove work.
+        // The contents climb to the parent of the deleted bin.
         auto climb = [&](uint64_t id, uint64_t* slot) {
             if (*slot != bin_id_) return;
             moved_.push_back(id);
@@ -279,8 +263,7 @@ public:
         }
     }
 
-    // Coalesce like every other props command: a per-keystroke rename
-    // must land as ONE undo entry.
+    // A rename comes one keystroke at a time: merge it into one undo step.
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetBinPropsCommand*>(&next);
         if (!other || other->bin_id_ != bin_id_) return false;
@@ -363,9 +346,7 @@ private:
     uint32_t old_duration_ = 0;
 };
 
-// Output audio routing (Look::audio_split): combined rides the In wire,
-// split reads the dedicated audio-in. Combining DROPS the audio wire
-// (undo restores it) - a hidden port must not hold a live link.
+// Combining drops the audio wire: a hidden port must not hold a live link.
 class SetLookAudioSplitCommand final : public LookCommand {
 public:
     SetLookAudioSplitCommand(uint64_t look, bool split)
@@ -480,9 +461,7 @@ private:
 };
 
 
-// Every id the selection owns: the chosen layers plus the effects and
-// groups inside them. Links name effects too, so the boundary test has to
-// know the whole subtree or a wire is left dangling in the parent.
+// Links name effects too: the boundary test needs the whole subtree.
 std::vector<uint64_t> owned_ids(const Look& look,
                                 const std::vector<uint64_t>& layer_ids) {
     std::vector<uint64_t> ids;
@@ -497,11 +476,6 @@ std::vector<uint64_t> owned_ids(const Look& look,
     return ids;
 }
 
-// NEST: the selection leaves the parent look and becomes a new one, with
-// a LookRef source standing where it stood. One command, because half a
-// nest is not a document anyone wants to undo into. Everything plays in
-// lockstep, so nothing rebases and no audio moves - a look's sound IS
-// its media's, wherever they sit in the nesting.
 class NestLayersCommand final : public LookCommand {
 public:
     NestLayersCommand(uint64_t look, Look nested, Layer ref,
@@ -516,24 +490,17 @@ public:
         Look& parent = look_of(doc);
         removed_layers_.clear();
         removed_links_.clear();
-        // An EMPTY link table means the wiring is synthesized from stack
-        // order. Pushing the ref's feed below would end that - the table
-        // becomes non-empty, synthesis stops, and every layer we did NOT
-        // nest goes unwired and dormant. Freeze the implied wiring first
-        // so the ones staying behind keep theirs.
+        // An empty link table means the wiring comes from stack order.
+        // Freeze it first, or the layers that stay behind go unwired.
         materialized_ = parent.links.empty();
         if (materialized_) parent.links = synthesize_links(parent);
-        // Pull the selected layers out, remembering where each sat so undo
-        // puts them back in compositing order.
         for (size_t i = parent.layers.size(); i-- > 0;) {
             if (!is_layer(parent.layers[i].id)) continue;
             removed_layers_.push_back({i, parent.layers[i]});
             parent.layers.erase(parent.layers.begin() +
                                 static_cast<ptrdiff_t>(i));
         }
-        // Any link touching the selection goes: the ones that travel are
-        // already copied into the nested look, the rest are the boundary
-        // break. Recorded in order so undo can rebuild the table exactly.
+        // Every link that touches the selection goes. Undo rebuilds them.
         for (size_t i = parent.links.size(); i-- > 0;) {
             const NodeLink& l = parent.links[i];
             if (!selected(l.from) && !selected(l.to)) continue;
@@ -560,8 +527,7 @@ public:
                 break;
             }
         erase_by_id(parent.layers, ref_.id);
-        // Restored back-to-front, so each index is the one it was taken
-        // from (apply() walked the vectors backwards).
+        // Restore back-to-front: apply walked the vectors backwards.
         for (size_t i = removed_layers_.size(); i-- > 0;) {
             const auto& [index, layer] = removed_layers_[i];
             parent.layers.insert(
@@ -578,8 +544,7 @@ public:
                                                     parent.links.size())),
                 link);
         }
-        // Back to synthesized if that is what it was: undo restores the
-        // document, not an equivalent-looking one.
+        // Go back to synthesized wiring if that is what it was.
         if (materialized_) parent.links.clear();
     }
 
@@ -600,14 +565,11 @@ private:
     std::vector<uint64_t> layers_;   // the chosen layers
     std::vector<uint64_t> owned_;    // plus their effects and groups
     size_t insert_index_;
-    bool materialized_ = false;   // this command froze the synthesis
+    bool materialized_ = false;   // this command froze the wiring
     std::vector<std::pair<size_t, Layer>> removed_layers_;
     std::vector<std::pair<size_t, NodeLink>> removed_links_;
 };
 
-// MAKE UNIQUE: the named placement stops sharing - it gets its own fork
-// of the template; every other placement keeps the original. The clone
-// is a look or a sequence, whichever the placement targets.
 class MakeUniqueCommand final : public SequenceCommand {
 public:
     MakeUniqueCommand(uint64_t sequence, uint64_t placement_id, Look look,
@@ -678,7 +640,7 @@ std::unique_ptr<Command> nest_layers_command(
             if (l == id) return true;
         return false;
     };
-    // Resolve the selection against the look, keeping compositing order.
+    // Keep compositing order when you resolve the selection.
     std::vector<const Layer*> members;
     size_t insert_index = 0;
     bool have_index = false;
@@ -694,10 +656,8 @@ std::unique_ptr<Command> nest_layers_command(
 
     Look nested = make_look(doc, std::move(name));
     for (const Layer* l : members) nested.layers.push_back(*l);
-    // Wiring that travels: both ends inside, or a feed to the Output.
-    // Read the EFFECTIVE table - a look whose links are still synthesized
-    // has wiring that is just as real, and the nested look must carry it
-    // explicitly (its layer set no longer synthesizes the same thing).
+    // A link travels if both ends are inside, or if it feeds the Output.
+    // Read the effective table: synthesized wiring must travel too.
     std::vector<NodeLink> synth;
     const std::vector<NodeLink>& table = effective_links(*parent, synth);
     const std::vector<uint64_t> owned = owned_ids(*parent, layer_ids);
@@ -716,7 +676,6 @@ std::unique_ptr<Command> nest_layers_command(
     ref.name = nested.name;
     ref.source = LayerSourceKind::LookRef;
     ref.target = nested.id;
-    // The ref's own canvas position: where the first member sat.
     ref.node_x = members.front()->node_x;
     ref.node_y = members.front()->node_y;
 

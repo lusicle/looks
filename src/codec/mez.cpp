@@ -22,9 +22,7 @@ using bytes::le64;
 using bytes::put_le32;
 using bytes::put_le64;
 
-// Lossless mode: quality 0 skips the DCT entirely — per-plane
-// left/above-predicted residuals, signed exp-Golomb. Bit-exact roundtrip,
-// ~2:1 on natural footage.
+// quality 0 = lossless; roundtrip is bit-exact.
 void encode_plane_lossless(BitWriter& bw, const uint8_t* data, size_t stride,
                            int w, int h) {
     for (int y = 0; y < h; ++y) {
@@ -53,8 +51,6 @@ bool decode_plane_lossless(BitReader& br, uint8_t* data, size_t stride,
 }
 
 }  // namespace
-
-// ------------------------------------------------------------ frame codec
 
 void encode_frame(const FrameView& frame, int quality,
                   std::vector<uint8_t>& out) {
@@ -89,14 +85,12 @@ void encode_frame(const FrameView& frame, int quality,
     int16_t dc_y = 0, dc_u = 0, dc_v = 0;
     for (int my = 0; my < mb_h; ++my) {
         for (int mx = 0; mx < mb_w; ++mx) {
-            // Four luma blocks.
             for (int by = 0; by < 2; ++by) {
                 for (int bx = 0; bx < 2; ++bx) {
                     const int px = mx * 16 + bx * 8;
                     const int py = my * 16 + by * 8;
                     if (px >= w || py >= h) {
-                        // Fully outside (odd MB at edge): encode flat block
-                        // predicted from DC so cost is ~2 bits.
+                        // The decoder parses a block here too; keep the filler.
                         int16_t flat[kBlockCoeffs] = {};
                         flat[0] = dc_y;
                         encode_block(bw, flat, &dc_y);
@@ -106,7 +100,6 @@ void encode_frame(const FrameView& frame, int quality,
                                        frame.y.stride, w - px, h - py, qy, &dc_y);
                 }
             }
-            // Chroma 8x8 each (4:2:0: one per MB).
             const int cx = mx * 8;
             const int cy = my * 8;
             if (cx >= cw || cy >= ch) {
@@ -126,9 +119,7 @@ void encode_frame(const FrameView& frame, int quality,
     bw.finish();
 }
 
-// Two-phase intra. Block order MUST mirror encode_frame
-// exactly — per MB: four luma (row-major), U, V — so intra_entropy's
-// bytes match encode_frame's at the same quality (test-enforced).
+// Block order must mirror encode_frame: per MB four luma, then U, then V.
 void intra_dct(const FrameView& frame, IntraDct& out) {
     const int w = static_cast<int>(frame.width);
     const int h = static_cast<int>(frame.height);
@@ -211,11 +202,7 @@ void intra_entropy(const IntraDct& dct, int quality,
     bw.finish();
 }
 
-// One 8x8 block's destination inside the macroblock grid, plus the
-// +128 clamp write. Both decode paths (intra_recon, the bitstream
-// decode) go through these two - mez.h's guarantee that intra_recon is
-// bit-identical to encode-then-decode rests on the address math and
-// the write being spelled once.
+// Both decode paths must share these helpers to stay bit-identical.
 struct BlockDst {
     uint8_t* plane;
     size_t stride;
@@ -296,8 +283,6 @@ size_t intra_entropy_bytes(const IntraDct& dct, int quality) {
     const int mb_count = mb_w * mb_h;
     const size_t blocks = static_cast<size_t>(mb_count) * 6;
 
-    // Parallel per-block halves; the DC delta chain is the only serial
-    // dependency and reduces to one subtraction per block.
     std::vector<int16_t> dcv(blocks);
     std::vector<uint32_t> acbits(blocks);
     static const int16_t kZeroBlock[kBlockCoeffs] = {};
@@ -338,9 +323,7 @@ size_t intra_entropy_bytes(const IntraDct& dct, int quality) {
 
 namespace {
 
-// Parallel reconstruction: serial entropy parse into a quantized-coeff
-// buffer, then dequant+IDCT+store across threads. Pixels identical to the
-// serial path (same per-block math).
+// Pixels must match the serial path bit for bit.
 bool decode_frame_parallel(const uint8_t* data, size_t size, uint32_t width,
                            uint32_t height, DecodedFrame& out) {
     const int quality = data[0];
@@ -405,8 +388,7 @@ bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
                   uint32_t height, DecodedFrame& out, bool parallel) {
     if (size < 1) return false;
     if (data[0] == 0) {
-        // Lossless: inherently serial (row prediction), so the
-        // parallel flag is ignored.
+        // Lossless is serial; the parallel flag is ignored by intent.
         const int w = static_cast<int>(width);
         const int h = static_cast<int>(height);
         const int cw = (w + 1) / 2;
@@ -487,13 +469,8 @@ bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
     return true;
 }
 
-// ------------------------------------------------------------ MezWriter
-
 MezWriter::~MezWriter() {
-    // An unfinished writer is an ABORTED import (cancel, error,
-    // teardown). Never seal it: a partial mez with a patched header
-    // reads as a valid SHORTER clip and poisons the bundle cache -
-    // close and remove the file so nothing can trust it.
+    // Never seal a partial file: it reads as a valid shorter clip. Remove it.
     const bool partial = file_ && !finished_;
     if (file_) std::fclose(static_cast<FILE*>(file_));
     if (partial) {
@@ -589,7 +566,6 @@ bool mez_set_frame_count(const std::filesystem::path& path, uint32_t count) {
         std::vector<uint8_t> raw(static_cast<size_t>(kept) * 8u);
         if (_fseeki64(f, static_cast<int64_t>(index_offset), SEEK_SET) == 0 &&
             std::fread(raw.data(), 1, raw.size(), f) == raw.size()) {
-            // Extend by repeating the last kept entry, then patch the count.
             const uint64_t tail_end = index_offset + count * 8ull;
             bool wrote = true;
             if (count > kept) {
@@ -606,8 +582,7 @@ bool mez_set_frame_count(const std::filesystem::path& path, uint32_t count) {
                 _fseeki64(f, 16, SEEK_SET);
                 ok = std::fwrite(patch, 1, 4, f) == 4;
                 std::fflush(f);
-                // Shrink: drop index bytes past the new end (harmless if
-                // it fails — the reader consumes exactly `count` entries).
+                // Truncate failure is harmless: readers use count entries only.
                 if (ok && count < old_count)
                     _chsize_s(_fileno(f), static_cast<int64_t>(tail_end));
             }
@@ -616,8 +591,6 @@ bool mez_set_frame_count(const std::filesystem::path& path, uint32_t count) {
     std::fclose(f);
     return ok;
 }
-
-// ------------------------------------------------------------ MezReader
 
 MezReader::~MezReader() { close(); }
 

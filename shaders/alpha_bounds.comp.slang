@@ -1,10 +1,5 @@
-// Alpha bounding box of a working image: two-level min/max reduction.
-// Each 8x8 group reduces through groupshared memory and only its lead
-// thread touches the global 4x1 r32ui bounds image - per-pixel global
-// atomics on four shared cells serialize into tens of milliseconds at
-// frame sizes. The bounds image is cleared to 0xFFFFFFFF beforehand;
-// the two max cells store the complement so a single atomic min serves
-// all four. UI measurement only - render output never reads it.
+// The CPU must clear the bounds image to 0xFFFFFFFF before this dispatch.
+// Cells 2 and 3 hold the complement of max. The reader must decode them.
 
 [[vk::push_constant]]
 cbuffer Push

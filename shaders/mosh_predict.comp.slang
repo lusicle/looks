@@ -1,12 +1,5 @@
-// GPU mosh: motion-compensated prediction, one thread per pixel. Every
-// thread derives its 16x16 macroblock's motion vector independently (a few
-// multiplies - cheaper than sharing), gathers the clamped source texel
-// from the reference planes, and writes the prediction. Chroma rides the
-// same dispatch: threads inside the half-res rect also gather U and V with
-// the halved vector, truncated toward zero like the CPU walk did.
-// mangle = 0 is the encoder's view (raw flow only); 1 applies the field
-// replacement and scale/rotate/random mangling (rotation arrives as
-// cos/sin push values so no trig runs here).
+// mangle 0 is the encoder view and uses the raw flow only.
+// The chroma vector truncates toward zero to match the CPU walk.
 
 #include "fx_common.slang"
 
@@ -20,12 +13,12 @@ cbuffer Push
     uint blocks_w;
     uint blocks_h;
     uint mangle;
-    uint mv_field;        // 0 flow, 1 pan, 2 zoom, 3 swirl
+    uint mv_field;
     float mv_scale;
     float rot_c;
     float rot_s;
-    float mv_random;      // +/- px of seeded randomization
-    float field_amt;      // px at the frame edge (signed)
+    float mv_random;      // px of seeded randomization
+    float field_amt;      // px at the frame edge, signed
     uint seed_mv;
     uint frame;
     uint has_flow;
@@ -39,7 +32,7 @@ cbuffer Push
 [[vk::binding(5, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> pred_u;
 [[vk::binding(6, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> pred_v;
 
-// lround port: half away from zero, truncating int() casts.
+// Round half away from zero to match lround.
 int round_away(float v)
 {
     return v >= 0.0 ? int(v + 0.5) : -int(-v + 0.5);
@@ -98,7 +91,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (tid.x < cw && tid.y < chh)
     {
         const int2 mv = block_mv(tid.x >> 3, tid.y >> 3);
-        const int2 half_mv = int2(mv.x / 2, mv.y / 2);   // trunc, like ivx/2
+        const int2 half_mv = int2(mv.x / 2, mv.y / 2);   // truncate like the CPU
         const int2 src = clamp(int2(tid.xy) - half_mv,
                                int2(0, 0),
                                int2(int(cw) - 1, int(chh) - 1));

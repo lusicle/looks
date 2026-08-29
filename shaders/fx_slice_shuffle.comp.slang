@@ -12,7 +12,7 @@ cbuffer Push
     float fps;
     float slices;
     float amount;   // max displacement, px
-    float rate;     // hz, 0 = static
+    float rate;     // hz
     float prob;
 };
 
@@ -40,7 +40,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         ox = (fx_hash01(fx_hash(h ^ 0xB5297A4Du)) * 2.0 - 1.0) * amount;
 
     float sx = uv.x + ox / size.x;
-    sx -= floor(sx);   // wrap
+    sx -= floor(sx);
     const float4 result = input.SampleLevel(float2(sx, uv.y), 0);
 
     const float4 wetted = lerp(base, result, saturate(wet));

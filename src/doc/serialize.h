@@ -1,17 +1,5 @@
-// Project serialization: the whole Document to/from a single
-// JSON file. Presets reuse the effect/group encoders so a saved group is
-// the same on-disk shape as a group inside a project.
-//
-// Loading is tolerant by construction: missing keys fall back to defaults
-// (json::Value typed reads never throw), unknown effect types are skipped,
-// and id counters are re-derived from the highest id seen so a hand-edited
-// file can never mint duplicate ids.
-//
-// Version 4: two entities. Looks are timeless graphs (media nodes with a
-// slip, generators, nested look/sequence refs - no placements, no audio
-// of their own); sequences arrange placements on video lanes and audio
-// tracks and carry the timeline region. Older files do not load - no
-// userbase, no migration path.
+// Loading is tolerant: a missing key uses a default, unknown types drop.
+// Id counters re-derive from the highest id in the file.
 
 #pragma once
 
@@ -29,14 +17,12 @@ inline constexpr int kProjectVersion = 5;
 json::Value doc_to_json(const Document& doc);
 Document doc_from_json(const json::Value& v);
 
-// Shared with preset files (a preset is a group + its member effects).
+// Preset files share this encoding. A change here changes preset files.
 json::Value effect_to_json(const EffectInstance& fx);
 std::optional<EffectInstance> effect_from_json(const json::Value& v);
 json::Value group_to_json(const Group& g);
-// Pre-slot files carried the In binding as face_in; the reader surfaces
-// it so loaders can run the one-time slot migration.
 struct GroupLegacy {
-    bool migrate = false;   // no "inputs" key: route through normalize
+    bool migrate = false;   // no "inputs" key: send it through normalize
     uint64_t face_in = 0;
 };
 Group group_from_json(const json::Value& v, GroupLegacy* legacy = nullptr);

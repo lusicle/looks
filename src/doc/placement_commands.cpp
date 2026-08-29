@@ -10,8 +10,6 @@ namespace looks::doc {
 
 namespace {
 
-// The placement list of one track, video lane or audio track. Null
-// when the sequence has no such track.
 std::vector<Placement>* track_placements(Sequence& seq, uint64_t track_id,
                                          bool audio) {
     if (audio) {
@@ -24,8 +22,7 @@ std::vector<Placement>* track_placements(Sequence& seq, uint64_t track_id,
     return nullptr;
 }
 
-// Every placement in the sequence sharing `link` (nonzero), the named one
-// included. The group is how one drop's picture and sound stay lockstep.
+// A link of 0 has no group: this returns an empty list.
 std::vector<Placement*> group_members(Sequence& seq, uint64_t link) {
     std::vector<Placement*> out;
     if (!link) return out;
@@ -80,7 +77,7 @@ public:
         if (!target) return;
         old_.clear();
         old_.emplace_back(target->id, *target);
-        // Timing travels with the group; identity and target do not.
+        // Timing fields travel with the group. Identity and target do not.
         for (Placement* p : group_members(seq, target->link)) {
             if (p->id == target->id) continue;
             old_.emplace_back(p->id, *p);
@@ -91,7 +88,7 @@ public:
         }
         const uint64_t id = target->id;
         *target = updated_;
-        target->id = id;   // identity is not editable
+        target->id = id;   // the id is not editable
     }
 
     void revert(Document& doc) override {
@@ -156,9 +153,7 @@ public:
         Placement* target = find_placement(seq, placement_id_);
         if (!target) return;
         const uint64_t link = target->link;
-        // The whole LINK GROUP goes: picture and sound leave together,
-        // exactly as one drop laid them down. Descending index order
-        // keeps every captured index valid at its own removal.
+        // Remove in descending index order to keep each index valid.
         auto take = [&](std::vector<Placement>& list, bool audio,
                         uint64_t container) {
             for (size_t i = list.size(); i-- > 0;) {
@@ -175,9 +170,7 @@ public:
 
     void revert(Document& doc) override {
         Sequence& seq = sequence_of(doc);
-        // Reverse capture order: within a list the lowest index was
-        // captured last, so it re-inserts first and each later one
-        // lands exactly where it was.
+        // Insert in reverse capture order to put each one back at its index.
         for (size_t k = removed_.size(); k-- > 0;) {
             const Slot& s = removed_[k];
             std::vector<Placement>* list =
@@ -223,7 +216,7 @@ public:
             minted_track_ = true;
         }
         Placement p = place_;
-        // The pair links iff both ends exist; sound alone lays unlinked.
+        // The pair links only if both ends are there. Sound alone is free.
         if (video_placement_) {
             if (Placement* v = find_placement(seq, video_placement_)) {
                 v->link = link_id_;
@@ -434,9 +427,7 @@ private:
     size_t at_index_;
 };
 
-// Ordered track removal shared by video lanes and audio tracks: apply
-// records the index, revert re-inserts at it (clamped - the vector can
-// have shrunk between apply and revert).
+// Revert clamps the index: the vector can shrink between apply and revert.
 template <class Track, std::vector<Track> Sequence::*Member>
 class RemoveTrackCommand final : public SequenceCommand {
 public:
@@ -616,7 +607,6 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
                          uint64_t track_id, uint64_t keep_id,
                          uint64_t keep_link, uint32_t t0, uint32_t t1) {
     const uint64_t e1 = t1 ? t1 : UINT64_MAX;
-    // One lane, either kind: the named container's placement list.
     bool audio_lane = false;
     auto lane_of = [&](const Sequence& seq)
         -> const std::vector<Placement>* {
@@ -629,16 +619,14 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
             }
         return nullptr;
     };
-    // Snapshot the victims first: every edit below reshapes the lane
-    // under the loop.
+    // Snapshot the victims first: each edit below reshapes the lane.
     struct Victim {
         uint64_t id;
         uint32_t t_in;
-        uint64_t end;   // UINT64_MAX = unbounded
+        uint64_t end;   // an end of UINT64_MAX is unbounded
     };
     std::vector<Victim> victims;
-    // fps is invariant across everything below: every command executed
-    // here is a placement edit, never a format or asset change.
+    // The fps stays the same below: these commands only edit placements.
     double eff = 0.0;
     {
         const Sequence* seq = doc.find_sequence(sequence);
@@ -657,9 +645,7 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
         }
     }
     for (Victim v : victims) {
-        // Overwriting the linked half of a group already reshaped this
-        // one (timing travels with the group) - re-resolve, skip what no
-        // longer overlaps, and branch on the LIVE span.
+        // A group edit can reshape this one, thus read the live span again.
         {
             const Sequence* seq = doc.find_sequence(sequence);
             const Placement* live =
@@ -678,15 +664,13 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
             continue;
         }
         if (v.t_in < t0 && v.end > e1) {
-            // The newcomer sits strictly inside: razor at its head, then
-            // slide the right half's start past its tail.
             auto cut = audio_lane
                 ? razor_audio_command(doc, sequence, track_id, t0)
                 : razor_track_command(doc, sequence, track_id, t0);
             if (cut)
                 undo.execute(doc, std::move(cut));
             else
-                continue;   // at the lane bound: leave the overlap
+                continue;   // at the lane bound: the overlap stays
             const Sequence* seq = doc.find_sequence(sequence);
             const std::vector<Placement>* lane = lane_of(*seq);
             const Placement* right = nullptr;
@@ -706,10 +690,9 @@ void overwrite_lane_span(Document& doc, UndoStack& undo, uint64_t sequence,
         if (!p) continue;
         Placement np = *p;
         if (v.t_in < t0) {
-            np.t_out = t0;   // its tail sits under the newcomer: cut it
+            np.t_out = t0;
         } else {
-            // Its head sits under: slide the start past the newcomer,
-            // source_in follows so the surviving content holds still.
+            // trim_placement_head moves source_in, thus content holds still.
             trim_placement_head(np, t1, placement_ratio(doc, np, eff));
         }
         undo.execute(doc, set_placement_command(sequence, np));
@@ -722,8 +705,7 @@ void overwrite_group_spans(Document& doc, UndoStack& undo,
     if (!seq) return;
     const Placement* landed = find_placement(*seq, placement_id);
     if (!landed) return;
-    // Snapshot {container, id} pairs first: each overwrite reshapes the
-    // sequence under the walk.
+    // Snapshot the members first: each overwrite reshapes the sequence.
     struct Member {
         uint64_t track;
         uint64_t id;

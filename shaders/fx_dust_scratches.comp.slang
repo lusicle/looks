@@ -1,7 +1,3 @@
-// boil = 0 is a fixed plate: every mark seed-locked in place, no term
-// animated. Above 0 it is the reseed rate in hz, with scratches
-// persisting ~12 ticks and gate hairs ~22.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -19,7 +15,7 @@ cbuffer Push
     float size;
     float hair;
     float tex_amt;
-    float boil;      // 0 = fixed plate, else reseed rate in hz
+    float boil;      // reseed rate, hz
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -39,8 +35,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 enc = fx_srgb_oetf(saturate(base.rgb));
     float dark = 0.0, light = 0.0;
 
-    // bt gates every animated term at once, so boil = 0 freezes marks,
-    // wobble and tremble together.
+    // bt gates all animated terms. boil = 0 must freeze every one.
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float bt = boil > 0.0 ? t : 0.0;
     const uint dust_tick = uint(bt * boil);
@@ -62,7 +57,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (shape > 0.0) {
             const float dens =
                 0.25 + 0.75 * fx_hash01(fx_hash(h ^ 0x66u));
-            // 1 in 5 is a bright fleck: an emulsion gap.
             if (fx_hash01(fx_hash(h ^ 0x55u)) < 0.8)
                 dark = shape * dens;
             else
@@ -99,8 +93,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         dark = max(dark, saturate(1.0 - tv) * tex_amt);
     }
 
-    // Gate hairs: quadratic arcs anchored on a frame edge, measured by
-    // closest approach over sampled arc points.
     if (hair > 0.001) {
         const uint nhair = uint(hair * 3.0 + 0.999);
         for (uint hi = 0u; hi < 3u; ++hi) {
@@ -109,7 +101,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             if (fx_hash01(hh) > hair) continue;
             const uint edge = fx_hash(hh ^ 0x99u) % 4u;
             const float along = fx_hash01(fx_hash(hh ^ 0xAAu));
-            float2 a;   // root on the edge
+            float2 a;
             if (edge == 0u) a = float2(along, 0.0);
             else if (edge == 1u) a = float2(along, 1.0);
             else if (edge == 2u) a = float2(0.0, along);
@@ -117,7 +109,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float2 inward = float2(0.5, 0.5) - a;
             const float reach =
                 0.10 + 0.18 * fx_hash01(fx_hash(hh ^ 0xBBu));
-            const float2 b = a + inward * reach * 2.0;   // tip
+            const float2 b = a + inward * reach * 2.0;
             const float2 side = float2(-inward.y, inward.x);
             const float bow =
                 (fx_hash01(fx_hash(hh ^ 0xCCu)) - 0.5) * 0.25;
@@ -141,13 +133,11 @@ void main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // Multiply then screen, so damage reads as artifacts IN the image
-    // (inheriting its tonality) rather than flat gray stamps on top.
     enc = enc * (1.0 - saturate(dark) * 0.85);
     enc = enc + saturate(light) * 0.7 * (1.0 - enc);
     enc = saturate(enc);
 
-    // Bright damage is its own light; dark damage only stains content.
+    // Only bright damage adds coverage. Dark damage stains content.
     const float4 result =
         float4(fx_srgb_eotf(enc), max(base.a, saturate(light) * 0.7));
     const float4 wetted = lerp(base, result, saturate(wet));

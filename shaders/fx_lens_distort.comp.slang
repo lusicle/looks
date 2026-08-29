@@ -1,5 +1,4 @@
-// Brown-Conrady radial model, aspect-corrected so the distortion stays
-// circular on screen rather than following the frame's aspect.
+// The aspect correction keeps the distortion circular on screen.
 
 #include "fx_common.slang"
 

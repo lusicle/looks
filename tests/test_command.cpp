@@ -7,7 +7,6 @@ using looks::doc::UndoStack;
 
 namespace {
 
-// Test command: sets master_seed, remembers the previous value.
 class SetSeed final : public Command {
 public:
     explicit SetSeed(uint64_t value) : value_(value) {}
@@ -19,7 +18,7 @@ public:
     void revert(Document& doc) override { doc.master_seed = previous_; }
     bool merge(const Command& next) override {
         if (auto* other = dynamic_cast<const SetSeed*>(&next)) {
-            value_ = other->value_;   // keep our `previous_` — gesture start
+            value_ = other->value_;   // keep previous_: the gesture start
             return true;
         }
         return false;
@@ -87,7 +86,6 @@ TEST(command_execute_clears_redo) {
 TEST(command_coalescing) {
     Document doc;
     UndoStack stack;
-    // A drag: many coalesced updates -> one undo entry back to the start.
     stack.execute(doc, std::make_unique<SetSeed>(10), true);
     stack.execute(doc, std::make_unique<SetSeed>(20), true);
     stack.execute(doc, std::make_unique<SetSeed>(30), true);
@@ -96,7 +94,6 @@ TEST(command_coalescing) {
     stack.undo(doc);
     CHECK_EQ(doc.master_seed, uint64_t{0});
 
-    // break_coalescing starts a new gesture.
     stack.redo(doc);
     stack.break_coalescing();
     stack.execute(doc, std::make_unique<SetSeed>(40), true);
@@ -110,14 +107,14 @@ TEST(command_groups) {
     stack.begin_group("Compound Edit");
     stack.execute(doc, std::make_unique<AppendName>("b"));
     stack.execute(doc, std::make_unique<SetSeed>(99));
-    CHECK(!stack.can_undo());   // group still open
+    CHECK(!stack.can_undo());
     stack.end_group();
     CHECK_EQ(doc.name, "ab");
     CHECK_EQ(doc.master_seed, uint64_t{99});
     CHECK_EQ(stack.undo_depth(), size_t{1});
     CHECK_EQ(stack.undo_name(), "Compound Edit");
 
-    stack.undo(doc);   // reverts both, in reverse order
+    stack.undo(doc);
     CHECK_EQ(doc.name, "a");
     CHECK_EQ(doc.master_seed, uint64_t{0});
 

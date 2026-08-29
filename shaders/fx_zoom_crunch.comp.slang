@@ -10,8 +10,8 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float zoom;      // crop factor about center, 1 = none
-    float crunch;    // 0 smooth resample, 1 fully blocky and ringed
+    float zoom;      // crop factor about the center
+    float crunch;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -30,8 +30,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float z = max(zoom, 1.0);
     float2 suv = (uv - 0.5) / z + 0.5;
 
-    // Snapping to the SOURCE grid is what makes the blocks grow with the
-    // zoom, the way a camcorder's digital zoom does.
+    // Snap to the source grid so the blocks grow with the zoom.
     const float2 snapped = (floor(suv * size) + 0.5) / size;
     suv = lerp(suv, snapped, saturate(crunch));
     const float4 zoomed = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);

@@ -1,7 +1,4 @@
-// Downsamples one graph node into its 160x90 atlas cell. The atlas
-// holds LINEAR working-space values like every texture the UI samples;
-// the sRGB swapchain applies the transfer exactly once at composite,
-// so card thumbs match the monitor by construction.
+// The atlas holds linear values. The sRGB swapchain encodes them.
 
 #include "fx_common.slang"
 
@@ -21,9 +18,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= 160 || tid.y >= 90)
         return;
-    // One bilinear tap undersamples big sources (a 4K frame gives each
-    // thumb pixel a 24x24 footprint) and aliases dither into shimmer:
-    // stratified 6x6 box average instead, still linear-space.
+    // Use a stratified 6x6 box average. One bilinear tap aliases.
     const float2 cell = 1.0 / float2(160.0, 90.0);
     const float2 uv0 = float2(tid.xy) * cell;
     float3 acc = float3(0.0, 0.0, 0.0);

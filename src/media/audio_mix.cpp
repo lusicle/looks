@@ -13,13 +13,10 @@ namespace looks::media {
 namespace {
 
 constexpr int kDelayTapMax = 12;  // echoes below ~-48 dB truncate anyway
-// Base fetches per output sample per channel: bounds chained wide ops
-// (filter-into-filter) deterministically instead of letting a
-// pathological chain stall the audio callback.
+// Leaf fetches per output sample per channel; it bounds chained wide ops.
 constexpr int kFetchBudget = 4096;
 
-// Raw s16-scale sample of the source PCM at fractional frame `pos`,
-// channel k; 0 outside - a gap sounds like a gap at every tap depth.
+// Returns a raw s16-scale sample at fractional frame pos; 0 outside.
 float fetch_pcm(const PcmBuffer& pcm, int64_t pcm_frames, double pos,
                 uint32_t k) {
     if (pos < 0.0 || pos >= static_cast<double>(pcm_frames)) return 0.0f;
@@ -35,8 +32,7 @@ float fetch_pcm(const PcmBuffer& pcm, int64_t pcm_frames, double pos,
     return v0 + (v1 - v0) * frac;
 }
 
-// Windowed-sinc (Hann) lowpass, unity DC; highpass by spectral
-// inversion of the same kernel.
+// Windowed-sinc Hann lowpass at unity DC; a highpass inverts the kernel.
 void build_fir(const MixOp& op, float* w) {
     constexpr float kPi = 3.14159265358979f;
     const float fc = 0.002f + std::clamp(op.p[0], 0.0f, 1.0f) * 0.497f;
@@ -64,8 +60,6 @@ void build_fir(const MixOp& op, float* w) {
 float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
                 int& budget);
 
-// The sum of a node's inputs at output position `pos` - the signal an
-// op node processes and re-reads at shifted positions.
 float eval_inputs(const MixState& mix, const MixNode& n, double pos,
                   uint32_t k, int& budget) {
     float v = 0.0f;
@@ -73,12 +67,8 @@ float eval_inputs(const MixState& mix, const MixNode& n, double pos,
     return v;
 }
 
-// The program's value at fractional output sample `pos`, channel k, in
-// raw s16 units. PURE: every node is a function of absolute position -
-// delay taps, sample holds and FIR windows RE-READ the node's input sum
-// at shifted positions instead of carrying state - so any chunking
-// mixes the same bytes and preview equals export. `budget` counts leaf
-// fetches; exhaustion silences the deepest taps deterministically.
+// Returns the program value at fractional output sample pos, in s16 units.
+// Every op must stay a pure function of pos; budget counts leaf fetches.
 float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
                 int& budget) {
     const MixNode& n = mix.nodes[static_cast<size_t>(idx)];
@@ -104,9 +94,8 @@ float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
     const MixOp& o = n.op;
     const float dry = v;
     float fx = dry;
-    // Taps shift in NODE-LOCAL samples; La converts back to output
-    // positions. A frozen clock (La <= 0) has no time axis to tap
-    // along, so time-domain ops act pointwise.
+    // Taps shift in node-local samples; La converts them to output positions.
+    // A frozen clock (La <= 0) has no time axis, so time ops act pointwise.
     const bool ticking = n.La > 1e-12;
     switch (o.kind) {
         case MixOpKind::Gain:
@@ -187,8 +176,7 @@ void prepare_mix(MixState& mix) {
     const double rate = static_cast<double>(mix.rate ? mix.rate : 48000);
     for (MixNode& n : mix.nodes) {
         const double lf = n.local_fps > 0.0 ? n.local_fps : fps;
-        // Node-local sample position (the owning look's clock at the
-        // mix rate): local = La * s + Lb.
+        // Node-local sample position at the mix rate: local = La * s + Lb.
         n.La = n.a * fps / lf;
         n.Lb = n.b * rate / lf;
         if (n.pcm && n.pcm->rate) {
@@ -223,15 +211,12 @@ void render_mix(const MixState& mix, int64_t start, int16_t* out,
         static_cast<size_t>(mix.root) >= mix.nodes.size())
         return;
 
-    // Accumulate in float: fan-ins summing into s16 must clip once, at
-    // the end, not per node.
+    // Accumulate in float; the sum must clip once at the end, not per node.
     const size_t total = static_cast<size_t>(count) * ch;
     if (scratch.size() < total) scratch.resize(total);
     std::vector<float>& acc = scratch;
     std::fill(acc.begin(), acc.begin() + static_cast<ptrdiff_t>(total), 0.0f);
 
-    // The root's window bounds the work; an unwindowed root evaluates
-    // the whole chunk (interior windows still gate their subtrees).
     const MixNode& root = mix.nodes[static_cast<size_t>(mix.root)];
     int64_t lo = start;
     int64_t hi = start + static_cast<int64_t>(count);
@@ -256,9 +241,7 @@ void render_mix(const MixState& mix, int64_t start, int16_t* out,
 
 namespace {
 
-// Chain evaluation over one PCM at native positions, for the analysis
-// path: op < 0 is the buffer itself. Same purity contract as the
-// program evaluator.
+// op < 0 reads the buffer itself; this chain keeps the same purity rule.
 float eval_chain(const PcmBuffer& pcm, int64_t frames,
                  const std::vector<MixOp>& ops,
                  const std::vector<std::array<float, kFirTaps>>& firs,
@@ -363,8 +346,6 @@ void build_wave_pyramid(const MixState& mix, int64_t s0, int64_t s1,
         }
     }
     out->levels.push_back(std::move(l0));
-    // Each level folds 4 spans into 1, so any zoom finds a level at or
-    // just below its samples-per-pixel.
     while (out->levels.back().size() > 4) {
         const std::vector<WaveSpan>& prev = out->levels.back();
         std::vector<WaveSpan> next((prev.size() + 3) / 4,
@@ -395,9 +376,8 @@ void render_node_envelopes(const MixState& mix, int node, int64_t s0,
             s0 + static_cast<int64_t>(span * c / columns);
         int64_t c1 = s0 + static_cast<int64_t>(span * (c + 1) / columns);
         if (c1 <= c0) c1 = c0 + 1;
-        // A card column can cover thousands of samples; probing a
-        // deterministic stride keeps the render bounded while every
-        // rebuild draws the same envelope.
+        // Probe a deterministic stride so every rebuild draws the same
+        // envelope.
         const int64_t stride = std::max<int64_t>(
             1, (c1 - c0) / static_cast<int64_t>(kMaxColumnProbes));
         WaveSpan wi{3.4e38f, -3.4e38f};

@@ -12,8 +12,8 @@ cbuffer Push
     float fps;
     float length_px;
     float angle;
-    float decay;       // per-tap falloff
-    float threshold;   // 0 smears everything, above 0 highlights only
+    float decay;       // per tap
+    float threshold;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

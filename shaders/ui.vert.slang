@@ -1,6 +1,5 @@
-// Positions arrive in PHYSICAL pixels. Vertex color bytes are sRGB RGB
-// with linear alpha, decoded here once so interpolation and blending stay
-// linear.
+// Positions arrive in physical pixels.
+// Vertex colors are sRGB RGB with linear alpha. Decode them here once.
 
 #include "fx_common.slang"
 

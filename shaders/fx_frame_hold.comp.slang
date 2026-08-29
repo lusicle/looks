@@ -1,5 +1,4 @@
-// The engine refreshes the held frame only when the target-fps tick
-// advances; this kernel just mixes held against live.
+// The engine refreshes the held frame on the target-fps tick.
 
 #include "fx_common.slang"
 
@@ -14,7 +13,7 @@ cbuffer Push
     uint frame;
     float fps;
     float hold_fps;
-    float blend;    // 0 pure hold, 1 live
+    float blend;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

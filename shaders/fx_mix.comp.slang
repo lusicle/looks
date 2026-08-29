@@ -1,6 +1,3 @@
-// Applies the canonical composition for CPU-side effects, whose result
-// arrives back from a roundtrip rather than from a kernel.
-
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -25,7 +22,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 b = fx.SampleLevel(uv, 0);
     const float4 wetted = lerp(a, b, saturate(wet));
     const float4 mixed = lerp(a, wetted, saturate(opacity));
-    // Dry alpha survives: the codec/ED roundtrips travel through NV12,
-    // which has no alpha to bring back.
+    // Dry alpha survives. The NV12 roundtrip brings back no alpha.
     output[tid.xy] = float4(mixed.rgb, a.a);
 }

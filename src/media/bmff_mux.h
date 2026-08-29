@@ -1,12 +1,3 @@
-// BMFF muxer: one H.264 video track + optional AAC audio track,
-// avcC/esds, faststart moov.
-//
-// Sample payloads stream to a temp .mdat sidecar while metadata accumulates
-// in memory; finish() builds moov, shifts chunk offsets, and writes the
-// final file as ftyp + moov + mdat (faststart — moov first), then deletes
-// the temp. One sample per chunk keeps the tables trivial; moov overhead is
-// ~20 bytes/sample, irrelevant next to the media.
-
 #pragma once
 
 #include <cstdint>
@@ -36,12 +27,12 @@ public:
     bool open(const std::filesystem::path& path, const MuxVideoParams& video,
               const MuxAudioParams* audio /* null = video only */);
 
-    // AVCC-framed payload (length-prefixed NALs, no SPS/PPS in-band).
-    // dts/duration/cts in the video timescale. Call in decode (dts) order.
+    // Payload is AVCC: length-prefixed NALs, no in-band SPS/PPS.
+    // dts, duration, cts use the video timescale; call in dts order.
     bool add_video_sample(const uint8_t* data, size_t size, uint64_t dts,
                           uint32_t duration, int32_t cts_offset, bool keyframe);
 
-    // Raw AAC frame; dts/duration in audio timescale (1024 per AAC frame).
+    // Raw AAC frame; dts and duration use the audio timescale.
     bool add_audio_sample(const uint8_t* data, size_t size, uint64_t dts,
                           uint32_t duration);
 

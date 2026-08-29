@@ -1,24 +1,15 @@
-// Ordered-pattern threshold engine shared by the Quantizer and Dither:
-// one pattern id table, one coordinate construction. Pattern ids:
-// 0 bayer2, 1 bayer4, 2 bayer8, 3 white hash, 4 blue noise, 5 stbn,
-// 6 moire, 7 spiral, 8 concentric, 9 diamond, 10 cluster dot, 11 lines,
-// 12 checker, 13 ign.
-
 #ifndef FX_PATTERN_SLANG
 #define FX_PATTERN_SLANG
 
 #include "fx_common.slang"
 
-// Boil re-seats the pattern lattice per tick.
 uint2 fx_pattern_shift(uint seed, uint boil_tick)
 {
     return uint2(fx_hash3(seed, boil_tick, 11u) & 127u,
                  fx_hash3(seed, boil_tick, 13u) & 127u);
 }
 
-// Pattern-space coordinates for one pixel. mv is the flow advection
-// (zero when screen-locked): motion lock rides the content instead of
-// the screen.
+// mv is the flow advection in pixels. It is zero when screen-locked.
 float2 fx_pattern_coords(uint2 pix, float2 mv, float pat_rotate,
                          float pat_scale, uint2 shift, float t,
                          float scroll, float warp)
@@ -29,9 +20,7 @@ float2 fx_pattern_coords(uint2 pix, float2 mv, float pat_rotate,
         const float prc = cos(pr), prs = sin(pr);
         pf = float2(pf.x * prc - pf.y * prs, pf.x * prs + pf.y * prc);
     }
-    // Scale floors at 1: one pixel is the finest possible dither
-    // feature, and sub-1 strides alias the matrix onto a near-constant
-    // threshold subset (stride 4 on bayer 8 samples only {0..3}/64).
+    // The scale must floor at 1. A stride below 1 aliases the matrix.
     pf /= clamp(pat_scale, 1.0, 4.0);
     pf += float2(shift);
     pf += t * scroll * float2(1.0, 0.37);
@@ -61,7 +50,6 @@ float fx_ordered_pattern(int id, float2 pf, uint2 pix, uint seed,
     if (id == 5)
         return fx_stbn(noise_lut, p, boil_tick);
     if (id == 6) {
-        // Two ordered patterns at drifting scale/angle, interfering.
         const float ang = t * 0.15;
         const float ca = cos(ang), sa = sin(ang);
         const float2 r1 = float2(pf.x * ca - pf.y * sa,

@@ -26,9 +26,7 @@ GraphNode node(std::initializer_list<int> inputs) {
     return n;
 }
 
-// A registered asset for media binds: a media node naming an id the
-// document cannot resolve is DORMANT (a removed import), so bound
-// fixtures must register what they name.
+// A media node with an unregistered asset id is dormant.
 uint64_t bind_asset(Document& doc, uint32_t frames = 600) {
     Asset a;
     a.id = doc.next_effect_id++;
@@ -40,11 +38,10 @@ uint64_t bind_asset(Document& doc, uint32_t frames = 600) {
 }  // namespace
 
 TEST(graph_topo_linear_chain) {
-    // 0 -> 1 -> 2, emitted out of order.
     std::vector<GraphNode> nodes;
-    nodes.push_back(node({2}));    // 0 depends on 2
-    nodes.push_back(node({}));     // 1 is the source
-    nodes.push_back(node({1}));    // 2 depends on 1
+    nodes.push_back(node({2}));
+    nodes.push_back(node({}));
+    nodes.push_back(node({1}));
     std::vector<int> order;
     CHECK(topo_sort(nodes, order));
     CHECK_EQ(order.size(), size_t{3});
@@ -54,7 +51,6 @@ TEST(graph_topo_linear_chain) {
 }
 
 TEST(graph_topo_diamond) {
-    // 0 source; 1 and 2 read 0; 3 reads both (matte-style join).
     std::vector<GraphNode> nodes;
     nodes.push_back(node({}));
     nodes.push_back(node({0}));
@@ -74,17 +70,13 @@ TEST(graph_topo_detects_cycle) {
     std::vector<int> order;
     CHECK(!topo_sort(nodes, order));
 
-    // Self-loop.
     nodes.clear();
     nodes.push_back(node({0}));
     CHECK(!topo_sort(nodes, order));
 }
 
 TEST(graph_compile_empty_stack) {
-    // A fresh look holds one UNBOUND media node: dormant, so the
-    // composite is the black display generator - never a fabricated
-    // source. Binding a registered asset emits the Source head; an id
-    // the document cannot resolve (a removed import) stays dormant.
+    // Unbound media is dormant; layer_index -1 is the black display generator.
     Document doc;
     RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
@@ -100,9 +92,6 @@ TEST(graph_compile_empty_stack) {
 }
 
 TEST(graph_audio_effects_compile_out_of_the_image_graph) {
-    // Audio modifiers are image-identity: the compiler routes the image
-    // graph around them like bypassed nodes, so the video effect behind
-    // one heads straight at the source.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(
@@ -118,23 +107,19 @@ TEST(graph_audio_effects_compile_out_of_the_image_graph) {
             CHECK(g.nodes[static_cast<size_t>(n.inputs[0])].kind ==
                   GraphNode::Kind::Source);
         }
-    CHECK_EQ(effects, 1);   // posterize only - the delay never dispatches
+    CHECK_EQ(effects, 1);
 }
 
 TEST(graph_compile_layers) {
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    // A noise generator layer with its own effect, screened over the base.
     looks::doc::Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.source = looks::doc::LayerSourceKind::Noise;
     overlay.blend = looks::doc::BlendMode::Screen;
     overlay.stack.push_back(make_effect(doc, EffectType::Pixelate));
     doc.looks[0].layers.push_back(overlay);
-    // A second media tap on top applying grain to the composite (the
-    // adjustment kind died with the flat graph - a media tap merged back
-    // IS an adjustment).
     looks::doc::Layer adjust;
     adjust.id = doc.next_effect_id++;
     adjust.source = looks::doc::LayerSourceKind::Media;
@@ -150,18 +135,14 @@ TEST(graph_compile_layers) {
         if (n.kind == GraphNode::Kind::LayerBlend) ++blends;
     }
     CHECK_EQ(generators, 1);
-    CHECK_EQ(blends, 2);   // overlay over base, adjustment over that
-    // Output is the top blend; its layer_index is the adjustment layer.
+    CHECK_EQ(blends, 2);
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(out.layer_index, 2);
-    // TRUE GRAPH: a media tap's effects wire like
-    // any node and head at its own source when unlinked.
     for (const GraphNode& n : g.nodes)
         if (n.kind == GraphNode::Kind::Effect && n.layer_index == 2)
             CHECK(g.nodes[static_cast<size_t>(n.inputs[0])].kind ==
                   GraphNode::Kind::Source);
-    // Invisible layers compile out entirely.
     doc.looks[0].layers[1].visible = false;
     RenderGraph g2 = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g2.valid);
@@ -172,15 +153,11 @@ TEST(graph_compile_layers) {
 }
 
 TEST(graph_compile_dormant_unwired) {
-    // An effect with NO in-wire is DORMANT — never emitted, nothing
-    // fabricated in its place — and an unwired Output composites nothing
-    // (black display node, which no effect may consume as input).
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
     const uint64_t layer_id = doc.looks[0].layers[0].id;
-    // Explicit links: source -> output. The effect is NOT wired anywhere.
     doc.looks[0].links.push_back({layer_id, 0, 0});
 
     RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
@@ -188,12 +165,10 @@ TEST(graph_compile_dormant_unwired) {
     int effects = 0;
     for (const GraphNode& n : g.nodes)
         if (n.kind == GraphNode::Kind::Effect) ++effects;
-    CHECK_EQ(effects, 0);   // dormant: it must not process anything
-    // Composite = the source head straight through.
+    CHECK_EQ(effects, 0);
     CHECK(g.nodes[static_cast<size_t>(g.output)].kind ==
           GraphNode::Kind::Source);
 
-    // Wire the effect in: it emits and carries the composite.
     doc.looks[0].links.clear();
     doc.looks[0].links.push_back({layer_id, fx_id, 0});
     doc.looks[0].links.push_back({fx_id, 0, 0});
@@ -204,8 +179,7 @@ TEST(graph_compile_dormant_unwired) {
         if (n.kind == GraphNode::Kind::Effect) ++effects2;
     CHECK_EQ(effects2, 1);
 
-    // Nothing wired to Output at all: the composite is the empty-display
-    // generator — never the raw source.
+    // With nothing wired to Output the composite is the empty display.
     doc.looks[0].links.clear();
     doc.looks[0].links.push_back({layer_id, fx_id, 0});   // effect fed, not shown
     RenderGraph g3 = compile_graph(doc, doc.looks[0].id, 0);
@@ -216,9 +190,7 @@ TEST(graph_compile_dormant_unwired) {
 }
 
 TEST(graph_preview_layer_taps_the_chain_end) {
-    // The LAYER tap publishes a layer's whole contribution - the end of
-    // the chain leaving it, pre-blend - where the NODE tap on the same
-    // layer id stays the bare source head. A node tap outranks it.
+    // The layer tap gives the chain end, and the node tap gives the head.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
@@ -253,9 +225,7 @@ TEST(graph_preview_layer_taps_the_chain_end) {
 }
 
 TEST(graph_preview_layer_resolves_a_mask_only_feed) {
-    // A layer wired only as another chain's matte never feeds the
-    // Output, but it still has an output of its own: the tap resolves
-    // the link leaving the layer, Output or not.
+    // The tap resolves the link leaving the layer, Output or not.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
@@ -292,11 +262,9 @@ TEST(graph_compile_chain_and_bypass) {
     CHECK_EQ(graph.nodes[1].effect_index, 0);
     CHECK_EQ(graph.nodes[2].effect_index, 2);
     CHECK_EQ(graph.output, 2);
-    // Chain wiring: each effect reads its predecessor.
     CHECK_EQ(graph.nodes[1].inputs.size(), size_t{1});
     CHECK_EQ(graph.nodes[1].inputs[0], 0);
     CHECK_EQ(graph.nodes[2].inputs[0], 1);
-    // Evaluation order follows the chain.
     CHECK_EQ(graph.order.size(), size_t{3});
     CHECK_EQ(graph.order[0], 0);
     CHECK_EQ(graph.order[2], 2);
@@ -306,9 +274,7 @@ TEST(graph_layer_matte_gates_composite) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    // Two visible layers; a Shape layer wired into the overlay's port 1
-    // gates its whole contribution: the compile must wrap the overlay's
-    // LayerBlend in a MatteApply whose base is the composite below.
+    // A port-1 wire on a layer wraps its LayerBlend in a MatteApply.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     Layer overlay;
@@ -334,7 +300,6 @@ TEST(graph_layer_matte_gates_composite) {
         if (fx.kind == GraphNode::Kind::LayerBlend) saw_matted_blend = true;
     }
     CHECK(saw_matted_blend);
-    // The matted blend is the graph output.
     CHECK(graph.nodes[static_cast<size_t>(graph.output)].kind ==
           GraphNode::Kind::MatteApply);
 }
@@ -343,9 +308,7 @@ TEST(graph_effect_matte_diamond) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    // A port-1 wire on an effect gates it through extract + apply: the
-    // apply joins (dry, fx, matte) and the matte source feeds ONLY the
-    // gate — never the composite.
+    // A port-1 wire on an effect gates it with an extract and an apply.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
@@ -378,10 +341,7 @@ TEST(graph_effect_matte_diamond) {
 }
 
 TEST(graph_layer_transform_and_source_keys) {
-    // Transform: a non-identity crop/flip/scale/rotate inserts a
-    // LayerTransform between the layer source and its stack. Every media
-    // source is private and keyed per instance - there is no shared
-    // playhead source to fall back to.
+    // A non-identity transform inserts a LayerTransform before the stack.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
@@ -415,7 +375,7 @@ TEST(graph_layer_transform_and_source_keys) {
         ++transforms;
         CHECK_EQ(n.layer_index, 0);
         CHECK_EQ(n.inputs.size(), size_t{1});
-        CHECK_EQ(n.inputs[0], source_node);   // reads its own source
+        CHECK_EQ(n.inputs[0], source_node);
     }
     CHECK_EQ(transforms, 1);
     // The stack effect reads the transformed source, not the raw one.
@@ -425,11 +385,7 @@ TEST(graph_layer_transform_and_source_keys) {
 }
 
 TEST(graph_time_culled_matte_reads_as_closed_gate) {
-    // Masking across time: while the mask's media plays, the masked
-    // layer is gated by it; when it ENDS (an explicit duration on the
-    // nested look), the gate closes (black) instead of the wire reading
-    // as unwired — the masked contribution disappears, it does not pop
-    // to full. A mask IS a nested look, playing lockstep.
+    // A time-culled matte closes the gate to black, not to unwired.
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
@@ -461,8 +417,8 @@ TEST(graph_time_culled_matte_reads_as_closed_gate) {
     doc.looks[0].links.push_back({mask_id, base_id, 1});   // layer matte
 
     auto gate_feed = [&](uint32_t frame) -> int {
-        // -2 no gate; else the layer_index of the generator feeding the
-        // extract (-1 = the black stand-in).
+        // Returns -2 for no gate, else the feed generator's layer_index.
+        // Layer index -1 is the black stand-in.
         const RenderGraph g = compile_graph(doc, doc.looks[0].id, frame);
         for (const GraphNode& n : g.nodes) {
             if (n.kind != GraphNode::Kind::MatteExtract) continue;
@@ -474,14 +430,11 @@ TEST(graph_time_culled_matte_reads_as_closed_gate) {
     };
     // Mask playing: the gate reads the nested look's shape (its layer 0).
     CHECK_EQ(gate_feed(5), 0);
-    // Mask's duration over: the gate reads BLACK (closed), not unwired.
     CHECK_EQ(gate_feed(20), -1);
 }
 
 TEST(graph_generator_has_no_when_but_a_placed_look_does) {
-    // Generators are always on - the SEQUENCE holds what has a when, the
-    // graph holds the rest. A span comes from wrapping the generator in
-    // a look and placing that as a block.
+    // A generator is always on: only a placement gives it a time window.
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
@@ -500,8 +453,6 @@ TEST(graph_generator_has_no_when_but_a_placed_look_does) {
     CHECK_EQ(gen_count(doc.looks[0].id, 3), 1);
     CHECK_EQ(gen_count(doc.looks[0].id, 100000), 1);
 
-    // The same solid look placed at [4, 8) on the root sequence culls
-    // outside the block.
     looks::doc::Placement wp;
     wp.id = doc.next_effect_id++;
     wp.target = doc.looks[0].id;
@@ -515,9 +466,7 @@ TEST(graph_generator_has_no_when_but_a_placed_look_does) {
 }
 
 TEST(graph_media_source_culled_past_its_media) {
-    // A media node plays its media in lockstep from local 0: past the
-    // media (through slip) the layer is a closed gate. On the sequence,
-    // a block's own window culls the whole look outside it.
+    // Past the end of the media the source is culled.
     Document doc;
     Asset asset;
     asset.id = doc.next_effect_id++;
@@ -541,7 +490,6 @@ TEST(graph_media_source_culled_past_its_media) {
     CHECK_EQ(source_count(doc.looks[0].id, 6), 0);
     doc.looks[0].layers[0].slip = 0;
 
-    // Placed at [4, 8): the sequence window culls outside the block.
     looks::doc::Placement wp;
     wp.id = doc.next_effect_id++;
     wp.target = doc.looks[0].id;
@@ -555,11 +503,7 @@ TEST(graph_media_source_culled_past_its_media) {
 }
 
 TEST(graph_placement_transform_and_opacity) {
-    // Placement Motion is a COMPOSITION attribute: the lane's over-blend
-    // carries the affine and opacity and samples through it while
-    // compositing. No transform node ever appears in a sequence graph -
-    // sequences own no effect passes. A bottom lane with Motion or
-    // reduced opacity blends over transparent black so both are real.
+    // The lane over-blend carries Motion, so no transform node appears.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Sequence& seq = doc.root();
@@ -608,9 +552,7 @@ TEST(graph_placement_transform_and_opacity) {
 }
 
 TEST(graph_output_stacks_in_link_order) {
-    // STACKING ORDER IS THE LINK ORDER: swapping the two Output links
-    // flips which contribution composites on top while the layer array
-    // stays put (storage order only).
+    // Stacking order is the link order, not the layer array order.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Layer second;
@@ -628,12 +570,11 @@ TEST(graph_output_stacks_in_link_order) {
             if (n.kind == GraphNode::Kind::LayerBlend) li = n.layer_index;
         return li;   // the LAST blend's layer = the top contribution
     };
-    CHECK_EQ(top_layer(), 1);   // l1 is the later link: on top
+    CHECK_EQ(top_layer(), 1);
     doc.looks[0].links = {{l1, 0, 0}, {l0, 0, 0}};
-    CHECK_EQ(top_layer(), 0);   // swapped: l0 composites on top
+    CHECK_EQ(top_layer(), 0);
 
-    // The permute command swaps the fan-in in place, self-inverse
-    // under undo.
+    // The permute command swaps the fan-in in place.
     looks::doc::UndoStack undo;
     undo.execute(doc, looks::doc::move_port_link_command(
                           doc.looks[0].id, 0, 0, 0, 1));
@@ -643,9 +584,7 @@ TEST(graph_output_stacks_in_link_order) {
 }
 
 TEST(graph_effect_port_fan_in_merges_in_link_order) {
-    // Two sources wired into ONE effect In port: the effect consumes
-    // their composite (first link = bottom), each feed blending with
-    // its owner layer's attributes - the same one rule as the Output.
+    // A fan-in port takes the composite, with the first link at the bottom.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Layer second;
@@ -671,15 +610,13 @@ TEST(graph_effect_port_fan_in_merges_in_link_order) {
     const GraphNode& merge = g.nodes[static_cast<size_t>(in)];
     CHECK(merge.kind == GraphNode::Kind::LayerBlend);
     CHECK_EQ(merge.layer_index, 1);   // the top feed wears l1's blend
-    // Below the blend sits the FIRST link's head: l0, the bottom.
     const GraphNode& below = g.nodes[static_cast<size_t>(merge.inputs[0])];
     CHECK(below.kind == GraphNode::Kind::Generator);
     CHECK_EQ(below.layer_index, 0);
 }
 
 TEST(graph_reconnect_lands_in_place) {
-    // reconnect_command replaces a link AT ITS POSITION, so a splice
-    // never restacks a fan-in; undo restores the original in place.
+    // reconnect_command replaces a link at its position in the fan-in.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Layer second;
@@ -704,10 +641,8 @@ TEST(graph_reconnect_lands_in_place) {
 }
 
 TEST(graph_placement_anchor_math) {
-    // Forward map out = a + shift + S*R*(src - a): the anchor is the
-    // FIXED POINT of the scale/rotate, and the anchor alone (identity
-    // S*R, no shift) never moves a pixel. placement_uv_to_block is the
-    // exact inverse the click picker and the overlay run on.
+    // The forward map is out = a + shift + S*R*(src - a).
+    // placement_uv_to_block is its exact inverse.
     const float aspect = 16.0f / 9.0f;
     looks::doc::Placement p;
     p.anchor_x = 0.2f;
@@ -722,15 +657,13 @@ TEST(graph_placement_anchor_math) {
     p.rotate = 33.0f;
     p.pos_x = 0.1f;
     p.pos_y = -0.05f;
-    // The anchor's post-motion position is a + shift, and it inverts
-    // to the anchor itself (the fixed point), at any scale/rotation.
+    // The anchor is the fixed point: a + shift inverts back to the anchor.
     looks::doc::placement_uv_to_block(p, p.anchor_x + p.pos_x,
                                       p.anchor_y + p.pos_y, aspect, &bx,
                                       &by);
     CHECK(std::fabs(bx - (p.anchor_x - 0.5f)) < 1e-5f);
     CHECK(std::fabs(by - (p.anchor_y - 0.5f)) < 1e-5f);
 
-    // Forward -> inverse roundtrip at an arbitrary source point.
     const float sx = 0.31f, sy = -0.12f;   // block-local
     const float rad = p.rotate * looks::doc::kDeg2Rad;
     const float cs = std::cos(rad), sn = std::sin(rad);
@@ -745,9 +678,7 @@ TEST(graph_placement_anchor_math) {
 }
 
 TEST(graph_measure_taps_selected_block_pre_motion) {
-    // The measure tap names the selected block's lane image BEFORE its
-    // placement Motion: the monitor's box applies the transform itself,
-    // so the measured bounds must be the untransformed content.
+    // The measure tap reads the block image before its placement Motion.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Sequence& seq = doc.root();
@@ -761,13 +692,11 @@ TEST(graph_measure_taps_selected_block_pre_motion) {
     RenderGraph g = compile_graph(doc, doc.root_sequence, 0, 0, 0, a.id);
     CHECK(g.valid);
     CHECK(g.measure >= 0);
-    // Pre-Motion: the tap is not the transform node (which IS the
-    // output here - one lane, full opacity).
+    // The transform node is the output here, so the tap differs from it.
     CHECK(g.nodes[static_cast<size_t>(g.measure)].kind !=
           GraphNode::Kind::LayerTransform);
     CHECK(g.measure != g.output);
 
-    // No selection, no tap; an unknown id, no tap.
     RenderGraph off = compile_graph(doc, doc.root_sequence, 0);
     CHECK_EQ(off.measure, -1);
     RenderGraph miss =
@@ -776,9 +705,7 @@ TEST(graph_measure_taps_selected_block_pre_motion) {
 }
 
 TEST(graph_before_strips_effects_keeps_composition) {
-    // The A/B "before" is the same composition minus effect stacks:
-    // arrangement, Motion and opacity are composition attributes and
-    // survive the wipe; effects do not.
+    // The before tree keeps Motion and opacity but drops effect stacks.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     doc.looks[0].layers[0].stack.push_back(
@@ -827,9 +754,7 @@ TEST(graph_before_strips_effects_keeps_composition) {
 }
 
 TEST(graph_source_fit_rect_preserves_aspect) {
-    // Sources never stretch: matching aspects fill exactly (1:1 with
-    // the old normalized sampling), mismatches letterbox/pillarbox
-    // centered, unknown dims fill.
+    // A source never stretches: it letterboxes or pillarboxes, centered.
     float r[4];
     looks::gfx::source_fit_rect(1920, 1080, 1920, 1080, r);
     CHECK_EQ(r[0], 0.0f);
@@ -855,9 +780,8 @@ TEST(graph_source_fit_rect_preserves_aspect) {
 }
 
 TEST(graph_sequence_lanes_stack_alpha_over) {
-    // Lanes composite bottom-up with plain alpha-over: LayerBlend nodes
-    // with layer_index -1 (no look supplies a mode). One lane = no blend
-    // at all. Overlap within a lane shows the LATEST-STARTING block.
+    // A lane blend has layer_index -1 because no look supplies a mode.
+    // One lane makes no blend node at all.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Look second;
@@ -942,8 +866,7 @@ TEST(graph_displace_by_matte_second_input) {
     doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({matte.id, fx_id, 1});
 
-    // map_mode 0: the matte GATES (MatteApply join), displace has one
-    // input.
+    // map_mode 0 makes the matte a gate, so displace keeps one input.
     RenderGraph gated = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(gated.valid);
     bool saw_apply = false;
@@ -954,8 +877,7 @@ TEST(graph_displace_by_matte_second_input) {
     }
     CHECK(saw_apply);
 
-    // map_mode 1: the matte becomes the displacement MAP — the effect
-    // node gains it as a second input and no MatteApply gate is emitted.
+    // map_mode 1 makes the matte the displacement map on a second input.
     doc.looks[0].layers[0].stack[0].params[3] = 1.0f;
     RenderGraph mapped = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(mapped.valid);
@@ -965,7 +887,6 @@ TEST(graph_displace_by_matte_second_input) {
         if (n.kind == GraphNode::Kind::Effect &&
             n.inputs.size() == 2) {
             saw_two_input_fx = true;
-            // Input 1 is the matte gate (extract node).
             const GraphNode& map_node =
                 mapped.nodes[static_cast<size_t>(n.inputs[1])];
             CHECK(map_node.kind == GraphNode::Kind::MatteExtract);
@@ -976,8 +897,7 @@ TEST(graph_displace_by_matte_second_input) {
 
 namespace {
 
-// Every key the compile emits for Source and Effect nodes, sorted - the
-// compile-level fingerprint the engine keys its state on.
+// The sorted keys are the fingerprint the engine hangs state on.
 std::vector<uint64_t> state_fingerprint(const Document& doc, uint64_t root,
                                         uint32_t frame) {
     const RenderGraph g = compile_graph(doc, root, frame);
@@ -993,11 +913,7 @@ std::vector<uint64_t> state_fingerprint(const Document& doc, uint64_t root,
 }  // namespace
 
 TEST(graph_razor_identity_is_structural) {
-    // RAZOR IDENTITY: cutting a block and butting the halves back
-    // together renders bit-identically - the state keys the engine hangs
-    // history on are UNCHANGED by the cut, and with zero effects at
-    // sequence level there is nothing a cut could reset. A cut is a
-    // window onto the target; the target cannot see it.
+    // A cut must not change the state keys, so razored halves render alike.
     Document doc;
     Asset asset;
     asset.id = doc.next_effect_id++;
@@ -1029,8 +945,7 @@ TEST(graph_razor_identity_is_structural) {
         for (size_t i = 0; i < cut.size() && i < before.size(); ++i)
             CHECK_EQ(cut[i], before[i]);
     }
-    // Duplicating the look on ANOTHER lane gets its OWN keys: instances
-    // stay distinct while razored halves share.
+    // The same look on another lane gets its own keys.
     looks::doc::SeqTrack lane2;
     lane2.id = doc.next_effect_id++;
     looks::doc::Placement dup;
@@ -1046,11 +961,7 @@ TEST(graph_source_matte_on_multipass_effect) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    // Exact repro of the monitor matte smoke: gradient -> Glow -> out,
-    // a custom-path shape layer feeding ONLY Glow's port-1 matte, in a
-    // look that is not looks[0]. The gate must compile exactly like the
-    // single-pass case: extract from the shape's generator, apply as
-    // the chain output, every node's inputs already emitted.
+    // A multipass effect gates like the single-pass case, in a later look.
     Document doc;
     doc.looks[0].layers[0].asset = bind_asset(doc);
     looks::doc::Look lab;
@@ -1095,7 +1006,6 @@ TEST(graph_source_matte_on_multipass_effect) {
     CHECK(extract >= 0);
     CHECK(apply >= 0);
     CHECK_EQ(generators, 2);   // gradient + shape, nothing fabricated
-    // The extract reads the SHAPE's generator node.
     const GraphNode& ex = g.nodes[static_cast<size_t>(extract)];
     CHECK_EQ(ex.inputs.size(), size_t{1});
     CHECK(g.nodes[static_cast<size_t>(ex.inputs[0])].kind ==
@@ -1107,9 +1017,7 @@ TEST(graph_source_matte_on_multipass_effect) {
 }
 
 TEST(graph_hidden_lane_leaves_the_composite) {
-    // Hiding the top lane compiles as if the lane were not there: no
-    // blend, no instance - render and export read the same document
-    // flag, so what previews is what exports.
+    // A hidden lane compiles as if it were not there.
     Document doc;
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Look second;

@@ -46,9 +46,7 @@ WidgetId Context::acquire_widget_id(const void* state_ptr) {
 void Context::grow_slots() {
     std::vector<Slot> old = std::move(slots_);
     slots_.assign(old.size() * 2, Slot{});
-    // Rehash: slot indices change, so generations restart — safe because
-    // growth only happens inside acquire, and stale ids from before the
-    // grow fail the state-pointer identity check via id_is_live().
+    // Slot indices change here; id_is_live rejects ids from before the grow.
     const size_t mask = slots_.size() - 1;
     for (const Slot& s : old) {
         if (!s.state) continue;

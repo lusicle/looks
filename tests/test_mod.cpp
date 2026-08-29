@@ -24,8 +24,6 @@ bool near(float a, float b, float eps = 1.0e-4f) {
     return std::fabs(a - b) <= eps;
 }
 
-// A generator node wired onto one param: the wire REPLACES the param's
-// base with the node's output mapped onto its range.
 uint64_t add_valued_route(doc::Document& d, doc::ModSource source,
                           doc::ParamKey target) {
     doc::ValueNode node;
@@ -45,11 +43,7 @@ uint64_t add_valued_route(doc::Document& d, doc::ModSource source,
 TEST(mod_param_table_paths) {
     doc::Document d = make_doc();
     auto table = mod::build_param_table(d, d.looks[0]);
-    // global.morph + vignette (wet, opacity, amount, radius,
-    // softness = 5) + rgb split (4) + layer params (opacity, colors,
-    // gen + phase, transform — the modulatable slots; slip and the
-    // waveform selector are field ids with no slot). Project speed is
-    // a scalar, not a mod target.
+    // 10 = morph + 5 vignette + 4 rgb; slip and waveform selector have no slot.
     CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount - 2});
     CHECK_EQ(table[0].path, "global.morph");
     CHECK_EQ(table[0].key.effect_id, uint64_t{0});
@@ -60,7 +54,6 @@ TEST(mod_param_table_paths) {
     CHECK_EQ(table[8].key.effect_id, d.looks[0].layers[0].stack[1].id);
     CHECK_EQ(table[8].min_value, -64.0f);
     CHECK_EQ(table[8].max_value, 64.0f);
-    // Layer entries carry kLayerParamBit + the layer id.
     CHECK_EQ(table[10].path, "layer0.opacity");
     CHECK_EQ(table[10].key.effect_id,
              d.looks[0].layers[0].id | doc::kLayerParamBit);
@@ -70,9 +63,6 @@ TEST(mod_param_table_paths) {
 }
 
 TEST(mod_resolve_snaps_discrete_params) {
-    // Integer-semantics params (counts, selectors) snap to whole numbers
-    // after lanes/routes/morph — fractional level counts alias the
-    // kernel math (a dither `levels` of 2.2 cuts a band into the frame).
     doc::Document d;
     d.looks[0].layers[0].stack.push_back(
         doc::make_effect(d, doc::EffectType::Dither));
@@ -81,7 +71,7 @@ TEST(mod_resolve_snaps_discrete_params) {
     lane.keys.push_back({0.0, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     lane.keys.push_back({10.0, 7.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     d.looks[0].lanes.push_back(lane);
-    // A continuous param lane stays fractional: dither amount (index 2).
+    // Param 2 (dither amount) is continuous.
     doc::KeyframeLane amt;
     amt.target = {d.looks[0].layers[0].stack[0].id, 2};
     amt.keys.push_back({0.0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
@@ -98,8 +88,6 @@ TEST(mod_resolve_snaps_discrete_params) {
 }
 
 TEST(mod_resolve_layer_params) {
-    // Layer params are mod targets (kLayerParamBit): a lane on the
-    // gradient angle drives the resolved layer field.
     doc::Document d;
     doc::KeyframeLane lane;
     lane.target = {d.looks[0].layers[0].id | doc::kLayerParamBit, 8};   // gen_angle
@@ -130,7 +118,6 @@ TEST(mod_lfo_shapes_deterministic) {
     CHECK(near(mod::eval_source(lfo, 0.1, 0, nullptr), 1.0f));
     CHECK(near(mod::eval_source(lfo, 0.6, 0, nullptr), 0.0f));
 
-    // S&H: constant within a cycle, deterministic across calls.
     lfo.shape = doc::LfoShape::SampleHold;
     lfo.seed = 42;
     const float a = mod::eval_source(lfo, 0.1, 0, nullptr);
@@ -142,8 +129,7 @@ TEST(mod_lfo_shapes_deterministic) {
 }
 
 TEST(mod_video_sampling_sources) {
-    // Synthetic I420 frame: left half black, right half white, flat gray
-    // chroma. 32x16 keeps the tap grids exact.
+    // 32x16 keeps the tap grids exact.
     constexpr int W = 32, H = 16;
     uint8_t y_plane[W * H];
     uint8_t u_plane[(W / 2) * (H / 2)];
@@ -164,14 +150,14 @@ TEST(mod_video_sampling_sources) {
 
     doc::ModSource s;
     s.type = doc::ModSourceType::VideoSample;
-    s.px = 0.85f;   // deep inside the white half (clear of the box blur)
+    s.px = 0.85f;   // clear of the box blur
     s.py = 0.5f;
     CHECK(mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view) >
           0.95f);
     s.px = 0.15f;
     CHECK(mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view) <
           0.05f);
-    // No frame view -> inert 0 (the speed target contract).
+    // With no frame view the source reads 0.
     CHECK_EQ(mod::eval_source(s, 0.0, 0, nullptr), 0.0f);
 
     // Region mean over the full frame straddles both halves.
@@ -185,9 +171,7 @@ TEST(mod_video_sampling_sources) {
     CHECK_EQ(mean,
              mod::eval_source(s, 0.0, 0, nullptr, 30.0, 0.0, -1.0, &view));
 
-    // A route on a video source resolves through the same view: the
-    // wire replaces wet with the region mean; without a view the source
-    // reads 0 and drives wet to the range floor.
+    // Without a view the source reads 0, so wet lands on the range floor.
     doc::Document d = make_doc();
     add_valued_route(d, s,
                      {d.looks[0].layers[0].stack[0].id, doc::kWetParam});
@@ -204,10 +188,9 @@ TEST(mod_lane_eval) {
     lane.keys.push_back({10.0, 1.0f});
     // Zero handles = linear.
     CHECK(near(mod::eval_lane(lane, 5.0), 0.5f));
-    CHECK(near(mod::eval_lane(lane, -3.0), 0.0f));   // clamp before
-    CHECK(near(mod::eval_lane(lane, 20.0), 1.0f));   // clamp after
+    CHECK(near(mod::eval_lane(lane, -3.0), 0.0f));
+    CHECK(near(mod::eval_lane(lane, 20.0), 1.0f));
 
-    // Hold key steps.
     lane.keys[0].hold = true;
     CHECK(near(mod::eval_lane(lane, 9.9), 0.0f));
     CHECK(near(mod::eval_lane(lane, 10.0), 1.0f));
@@ -219,7 +202,6 @@ TEST(mod_lane_eval) {
     const float eased = mod::eval_lane(lane, 5.0);
     CHECK(eased < 0.5f);
     CHECK(eased > 0.0f);
-    // Endpoints exact.
     CHECK(near(mod::eval_lane(lane, 0.0), 0.0f));
     CHECK(near(mod::eval_lane(lane, 10.0), 1.0f));
 }
@@ -228,7 +210,6 @@ TEST(mod_resolve_lane_and_route) {
     doc::Document d = make_doc();
     const uint64_t vignette_id = d.looks[0].layers[0].stack[0].id;
 
-    // Lane drives vignette amount from 0 to 1 over 10 frames.
     doc::KeyframeLane lane;
     lane.target = {vignette_id, 0};   // amount
     lane.keys.push_back({0.0, 0.0f});
@@ -242,9 +223,7 @@ TEST(mod_resolve_lane_and_route) {
     // Source doc untouched.
     CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.6f));
 
-    // Route: square LFO at 1 Hz REPLACES wet. Frame 0: square=1 →
-    // wet 1. Frame 15 (t=0.5s): square=0 → wet 0 (the stored base 1 is
-    // ignored while wired).
+    // A wire replaces wet: at 1 Hz frame 15 is t = 0.5 s and reads 0.
     doc::ModSource lfo;
     lfo.type = doc::ModSourceType::Lfo;
     lfo.shape = doc::LfoShape::Square;
@@ -256,8 +235,7 @@ TEST(mod_resolve_lane_and_route) {
     CHECK(near(ra.looks[0].layers[0].stack[0].wet, 1.0f));
     CHECK(near(rb.looks[0].layers[0].stack[0].wet, 0.0f));
 
-    // A chain past the range clamps at the param's edge: constant 2
-    // through a math node still lands wet on 1.
+    // A value past the range clamps at the param edge.
     doc::ValueNode big;
     big.id = d.next_route_id++;
     big.source.type = doc::ModSourceType::Math;
@@ -271,8 +249,6 @@ TEST(mod_resolve_lane_and_route) {
 }
 
 TEST(mod_resolve_group_wet_and_opacity) {
-    // Group composite knobs are full mod targets: lanes set the base,
-    // wires replace it - keyed with kGroupParamBit, like layer params.
     doc::Document d = make_doc();
     doc::Group g;
     g.id = d.next_effect_id++;
@@ -299,7 +275,6 @@ TEST(mod_resolve_group_wet_and_opacity) {
     doc::Document rb = mod::resolve(d, 15, 30.0, nullptr);
     CHECK(near(ra.looks[0].layers[0].groups[0].wet, 1.0f));
     CHECK(near(rb.looks[0].layers[0].groups[0].wet, 0.0f));
-    // Opacity rides the same addressing, lanes only here.
     doc::KeyframeLane olane;
     olane.target = {g.id | doc::kGroupParamBit, doc::kOpacityParam};
     olane.keys.push_back({0.0, 0.25f});
@@ -309,10 +284,8 @@ TEST(mod_resolve_group_wet_and_opacity) {
 }
 
 TEST(mod_wired_analysis_node_reads_its_connection) {
-    // An analysis node REQUIRES its input: the wired connection's
-    // curves sample at the look clock plus the chain's slip; a wire
-    // with no entry and an unwired node both read 0 - never the
-    // global set.
+    // The node samples its wired curves at the look clock plus the slip.
+    // An unwired node reads 0, never the global curves.
     doc::Document d;
     doc::Look& look = d.looks[0];
     look.layers[0].asset = d.next_effect_id++;
@@ -346,9 +319,7 @@ TEST(mod_wired_analysis_node_reads_its_connection) {
 }
 
 TEST(mod_resolve_analysis_sources) {
-    // Analysis nodes require their input: the wired connection's
-    // curves drive the param through resolve(); unwired reads 0 (the
-    // range floor) even with global curves present.
+    // An unwired node reads 0, so the param lands on the range floor.
     doc::Document d = make_doc();
     doc::ModSource low;
     low.type = doc::ModSourceType::AudioLow;
@@ -395,8 +366,7 @@ TEST(mod_route_commands_undo) {
     undo.execute(d, doc::add_route_command(d.looks[0].id,route));
     CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
 
-    // One wire per param: wiring another node onto the same target
-    // REPLACES the wire; undo brings the first one back.
+    // One wire per param: a second wire on the target replaces the first.
     doc::ValueNode node2;
     node2.id = d.next_route_id++;
     undo.execute(d, doc::add_value_node_command(d.looks[0].id, node2));
@@ -413,7 +383,6 @@ TEST(mod_route_commands_undo) {
     undo.redo(d);
     CHECK_EQ(d.looks[0].mod_routes[0].node, node2.id);
 
-    // Node edits: whole-struct replace, coalescing per id.
     doc::ValueNode edit = d.looks[0].value_nodes[0];
     edit.source.rate_hz = 3.0f;
     undo.execute(d, doc::set_value_node_command(d.looks[0].id, edit), true);
@@ -475,8 +444,7 @@ TEST(mod_value_math_and_normalise) {
     look.value_nodes[1].in_max = look.value_nodes[1].in_min;
     CHECK_EQ(mod::eval_value_node(env, 2), 0.0f);
 
-    // The multiplier scales the window: bounds stay -1..1, magnitude
-    // rides const_b. [-0.02, 1] x50 = an effective [-1, 50] window.
+    // const_b scales the window: [-0.02, 1] times 50 gives [-1, 50].
     look.value_nodes[1].in_min = -0.02f;
     look.value_nodes[1].in_max = 1.0f;
     look.value_nodes[1].const_b = 50.0f;
@@ -496,8 +464,6 @@ TEST(mod_value_chain_and_fanout) {
     const uint64_t vignette_id = d.looks[0].layers[0].stack[0].id;
     const uint64_t rgb_id = d.looks[0].layers[0].stack[1].id;
 
-    // Square LFO (0/1) -> math (multiply by 0.5) -> two wires: one on
-    // vignette wet, one on rgb wet. Fan-out from one shared chain.
     doc::ValueNode lfo;
     lfo.id = d.next_route_id++;
     lfo.source.type = doc::ModSourceType::Lfo;
@@ -521,8 +487,7 @@ TEST(mod_value_chain_and_fanout) {
         d.looks[0].mod_routes.push_back(r);
     }
 
-    // Frame 0: square = 1 -> chain = 0.5 -> wet REPLACED to 0.5 on
-    // BOTH. Frame 15 (t = 0.5 s): square = 0 -> wet 0 on both.
+    // At 30 fps frame 15 is t = 0.5 s, where the square LFO reads 0.
     doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
     CHECK(near(r0.looks[0].layers[0].stack[0].wet, 0.5f));
     CHECK(near(r0.looks[0].layers[0].stack[1].wet, 0.5f));
@@ -578,13 +543,11 @@ TEST(mod_remove_value_node_cascades) {
     CHECK_EQ(d.looks[0].value_nodes.size(), size_t{1});
     CHECK(d.looks[0].mod_routes.empty());
     CHECK_EQ(d.looks[0].value_nodes[0].in_a, uint64_t{0});
-    // One undo restores the node, the wire, and the input.
     undo.undo(d);
     CHECK_EQ(d.looks[0].value_nodes.size(), size_t{2});
     CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
     CHECK_EQ(d.looks[0].value_nodes[1].in_a, lfo.id);
 
-    // wire_value_input swaps helper inputs undoably.
     undo.execute(d, doc::wire_value_input_command(look.id,
                      d.looks[0].value_nodes[1].id, 1, lfo.id));
     CHECK_EQ(d.looks[0].value_nodes[1].in_b, lfo.id);
@@ -607,20 +570,18 @@ TEST(mod_lane_command_and_snapshots) {
     undo.undo(d);
     CHECK_EQ(d.looks[0].lanes.size(), size_t{1});
 
-    // Snapshots: store A, mutate, apply A restores params.
     undo.execute(d, doc::store_snapshot_command(d.looks[0].id,0));
     CHECK(d.looks[0].snapshots[0].valid);
     undo.execute(d, doc::set_param_command(d.looks[0].id,0, 0, 0, 0.11f));
     CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.11f));
     undo.execute(d, doc::apply_snapshot_command(d.looks[0].id,0));
     CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.6f));
-    undo.undo(d);   // un-apply
+    undo.undo(d);
     CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.11f));
 }
 
 TEST(mod_fft_sine_bin) {
-    // 1 kHz sine at 48 kHz, 1024-point FFT → energy concentrated at bin
-    // round(1000/46.875) = 21.
+    // 1 kHz at 48 kHz with 1024 bins lands on bin 1000/46.875 = 21.
     constexpr size_t kN = 1024;
     std::vector<float> signal(kN);
     for (size_t i = 0; i < kN; ++i)
@@ -631,7 +592,6 @@ TEST(mod_fft_sine_bin) {
     for (size_t i = 1; i < mags.size(); ++i)
         if (mags[i] > mags[peak]) peak = i;
     CHECK(peak >= 20 && peak <= 22);
-    // Peak dominates the far spectrum.
     CHECK(mags[peak] > 20.0f * mags[400]);
 }
 
@@ -660,11 +620,10 @@ TEST(mod_analysis_roundtrip) {
     CHECK(loaded.onset == data.onset);
     CHECK(loaded.motion == data.motion);
     CHECK(loaded.cut == data.cut);
-    std::filesystem::remove(path);   // test-owned temp fixture
+    std::filesystem::remove(path);
 }
 
 TEST(mod_analyze_audio_bands) {
-    // 2 s of 100 Hz sine → low band lights up, high stays near zero.
     constexpr uint32_t kRate = 48000;
     constexpr uint32_t kFrames = 60;   // 2 s at 30 fps
     std::vector<int16_t> pcm(kRate * 2);
@@ -680,7 +639,7 @@ TEST(mod_analyze_audio_bands) {
         low_sum += data.low[f];
         high_sum += data.high[f];
     }
-    CHECK(low_sum > 20.0f);          // sustained low-band energy
+    CHECK(low_sum > 20.0f);
     CHECK(high_sum < low_sum * 0.1f);
 }
 
@@ -719,10 +678,7 @@ TEST(mod_time_remap_identity_and_modes) {
 }
 
 TEST(mod_time_remap_seek_matches_sequential) {
-    // A non-unit project speed: the prefix sum after a cold seek must
-    // equal the incrementally-accumulated one (determinism). Sequences
-    // carry no keyframes, so the project speed is the scalar - ramps
-    // live per-block or inside looks.
+    // A cold seek must give the same prefix sum as the sequential walk.
     doc::Document d;
     d.speed = 1.7f;
     CHECK(mod::time_remap_active(d));
@@ -731,12 +687,10 @@ TEST(mod_time_remap_seek_matches_sequential) {
     std::vector<uint32_t> expect;
     for (uint32_t f = 0; f <= 40; ++f)
         expect.push_back(sequential.source_frame(d, f, 30.0, nullptr, 90));
-    // Cold instance jumping straight to each frame — identical mapping.
     for (uint32_t f = 0; f <= 40; f += 7) {
         mod::TimeRemap cold;
         CHECK_EQ(cold.source_frame(d, f, 30.0, nullptr, 90), expect[f]);
     }
-    // Backward seek on a warm instance recomputes correctly.
     CHECK_EQ(seek.source_frame(d, 40, 30.0, nullptr, 90), expect[40]);
     CHECK_EQ(seek.source_frame(d, 12, 30.0, nullptr, 90), expect[12]);
     CHECK_EQ(seek.source_frame(d, 13, 30.0, nullptr, 90), expect[13]);
@@ -755,9 +709,8 @@ TEST(mod_speed_at_is_the_project_scalar) {
 }
 
 TEST(mod_envelope_source) {
-    // Envelope's onset trigger is audio-driven: it REQUIRES the wired
-    // media input and fires from the chain's onset curve at the MEDIA
-    // position. The cut trigger stays video-derived (global curves).
+    // The onset trigger needs the wired media input and reads its curve.
+    // The cut trigger stays video-derived and reads the global curves.
     doc::Document d;
     doc::Look& look = d.looks[0];
     look.layers[0].asset = d.next_effect_id++;
@@ -784,15 +737,14 @@ TEST(mod_envelope_source) {
         env.t = f / 30.0;
         return mod::eval_value_node(env, n.id);
     };
-    CHECK_EQ(at(5), 0.0f);            // before the trigger
-    CHECK(at(10) > 0.5f);             // burst on the trigger frame
-    CHECK(at(11) > at(20));           // decaying
+    CHECK_EQ(at(5), 0.0f);
+    CHECK(at(10) > 0.5f);
+    CHECK(at(11) > at(20));
     CHECK(at(20) > at(30));
     CHECK(at(30) > 0.0f);
-    // Deterministic: a cold re-evaluation matches (pure function of frame).
+    // The node is a pure function of the frame.
     CHECK_EQ(at(20), at(20));
 
-    // Unwired = never fires, global curves or not.
     mod::AnalysisCurves global;
     global.onset.assign(40, 1.0f);
     env.analysis = &global;
@@ -800,12 +752,10 @@ TEST(mod_envelope_source) {
     CHECK_EQ(at(10), 0.0f);
     look.value_nodes[0].audio_src = look.layers[0].id;
 
-    // The onset trigger reads 0 through eval_source: no wire there.
+    // eval_source has no wire, so the onset trigger reads 0.
     doc::ModSource envs = n.source;
     CHECK_EQ(mod::eval_source(envs, 10 / 30.0, 10, &global, 30.0), 0.0f);
 
-    // Scene-cut trigger: video-derived, fires from the global curves
-    // with no wire at all.
     envs.trigger = 1;
     mod::AnalysisCurves vid;
     vid.cut.assign(40, 0.0f);
@@ -815,9 +765,8 @@ TEST(mod_envelope_source) {
 }
 
 TEST(mod_lfo_beat_synced) {
-    // Beat-synced kinds REQUIRE the wired input, take their BPM from
-    // its curves, and anchor phase on the MEDIA position (local + slip
-    // + offset) - cuts of one media beat-match by construction.
+    // A beat-synced node needs its wired input and takes the BPM from it.
+    // The phase anchors on the media position: local plus slip plus offset.
     doc::Document d;
     doc::Look& look = d.looks[0];
     look.layers[0].asset = d.next_effect_id++;
@@ -851,15 +800,14 @@ TEST(mod_lfo_beat_synced) {
     CHECK_EQ(at(9), 1.0f);
     look.value_nodes[0].source.rate_hz = 1.0f;
 
-    // MEDIA anchoring: slip shifts the phase - local 3 with slip 6
-    // reads the beat grid at media frame 9.
+    // Slip shifts the phase: local 3 with slip 6 reads media frame 9.
     map[n.id] = {curves, 6};
     CHECK_EQ(at(3), 0.0f);
     // An Offset shim on the chain shifts it the same way.
     map[n.id] = {curves, 0, 9};
     CHECK_EQ(at(0), 0.0f);
 
-    // Unwired reads 0 - eval_source carries no beat clock anymore.
+    // eval_source has no beat clock, so an unwired node reads 0.
     doc::ModSource lfo = look.value_nodes[0].source;
     CHECK_EQ(mod::eval_source(lfo, 0.1, 3, nullptr, 30.0), 0.0f);
     mod::AnalysisCurves gcurves;

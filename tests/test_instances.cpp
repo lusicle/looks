@@ -1,12 +1,3 @@
-// Instance flatten (doc/instances.h): the nesting tree reduced to leaf
-// sources in root-local frames.
-//
-// The load-bearing property is AGREEMENT: the decode pool decodes from
-// the flatten while the engine renders from the compiler, and neither
-// sees the other. If their keys or their active sets ever diverge, a
-// source shows the wrong frame - so that agreement is tested directly,
-// frame by frame.
-
 #include "doc/instances.h"
 
 #include <algorithm>
@@ -27,8 +18,6 @@ using doc::Document;
 
 namespace {
 
-// One asset, one wrapper look (media node bound to it), one block of
-// that look on the root sequence's first lane.
 struct Rig {
     Document doc;
     uint64_t asset = 0;
@@ -67,7 +56,6 @@ TEST(flatten_block_spans_its_target) {
     CHECK_EQ(c.t_in, 0.0);
     CHECK_EQ(c.t_out, 90.0);
     CHECK_EQ(c.speed, 1.0);
-    // The key folds the whole chain: lane, target, media node, asset.
     const uint64_t path = hash_combine(
         hash_combine(rig.doc.root_sequence, rig.lane), rig.look);
     const uint64_t layer_id = rig.doc.looks[0].layers[0].id;
@@ -86,28 +74,24 @@ TEST(flatten_composes_block_map_and_slip_in_closed_form) {
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
     CHECK_EQ(sources.size(), size_t{1});
     const MediaInstance& c = sources[0];
-    // Root 10 -> look local 4 -> media 10 (slip 6 applied post-rate).
+    // Slip applies after the rate step.
     CHECK_EQ(c.t_in, 10.0);
     CHECK_EQ(doc::media_asset_frame(c, 10.0), 10.0);
     CHECK_EQ(doc::media_asset_frame(c, 20.0), 30.0);
-    // Media ends at 100: playable 94 past the slip, entered at local 4,
-    // so 90 local frames remain = 45 root frames at 2x from t_in 10.
+    // 90 local frames at 2x speed from t_in 10 end at root 55.
     CHECK_EQ(c.t_out, 55.0);
     CHECK(doc::media_active(c, 54.9));
     CHECK(!doc::media_active(c, 55.0));
 }
 
 TEST(flatten_offset_shim_emits_a_shifted_stream) {
-    // An Offset wired directly onto a media node adds a SHIFTED read
-    // of that source: its own window, its own stream key, and the
-    // compiler consumes the shifted head while the base one idles.
     Rig rig(100);
     doc::Look& look = rig.doc.looks[0];
     const uint64_t layer_id = look.layers[0].id;
     doc::EffectInstance off =
         doc::make_effect(rig.doc, doc::EffectType::Offset);
     off.params[0] = 10.0f;   // +10 frames
-    off.params[1] = 2.0f;    // both
+    off.params[1] = 2.0f;    // 2 = shift video and audio
     const uint64_t off_id = off.id;
     look.layers[0].stack.push_back(off);
     look.links = {{layer_id, off_id, 0}, {off_id, 0, 0}};
@@ -130,11 +114,9 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
     const MediaInstance& sh = sources[1];
     CHECK_EQ(doc::media_asset_frame(base, 0.0), 0.0);
     CHECK_EQ(doc::media_asset_frame(sh, 0.0), 10.0);
-    CHECK_EQ(sh.t_out, 90.0);   // 100-frame media, entered 10 in
+    CHECK_EQ(sh.t_out, 90.0);   // 100 frames minus the 10 frame shift
     CHECK(sh.key != base.key);
 
-    // The composite consumes the SHIFTED stream (the Output wire runs
-    // through the shim), and both keys agree with the flatten's.
     const gfx::RenderGraph g =
         gfx::compile_graph(rig.doc, rig.doc.root_sequence, 20);
     std::vector<uint64_t> compiled;
@@ -148,9 +130,7 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
           compiled.end());
     CHECK_EQ(g.nodes[static_cast<size_t>(g.output)].key, sh.key);
 
-    // Past the shifted media's end the shim is a CLOSED GATE: the
-    // flatten window closes and the compiler's composite goes black
-    // while the (unconsumed) base head still exists.
+    // Closed gate: the output goes black while the unused base stays active.
     CHECK(!doc::media_active(sh, 95.0));
     CHECK(doc::media_active(base, 95.0));
     const gfx::RenderGraph g2 =
@@ -158,14 +138,12 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
     CHECK_EQ(g2.nodes[static_cast<size_t>(g2.output)].kind,
              gfx::GraphNode::Kind::Generator);
 
-    // The AUDIO walk applies the same shift to the voice.
     const auto voice =
         doc::flatten_audio_sources(rig.doc, rig.doc.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});
     if (voice.empty()) return;
     CHECK_EQ(doc::media_asset_frame(voice[0], 0.0), 10.0);
 
-    // The closed-form chain the analysis keys on carries it too.
     const doc::AudioChain chain =
         doc::resolve_audio_chain(rig.doc, look, off_id);
     CHECK_EQ(chain.asset, rig.asset);
@@ -176,9 +154,7 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
 }
 
 TEST(flatten_offset_shim_off_the_source_is_inert) {
-    // Wired mid-chain (behind an effect) the shim passes through: no
-    // shifted stream, no audio shift - it applies ONLY sitting directly
-    // on a source node.
+    // The shim applies only when it sits directly on a source node.
     Rig rig(100);
     doc::Look& look = rig.doc.looks[0];
     const uint64_t layer_id = look.layers[0].id;
@@ -216,10 +192,8 @@ TEST(flatten_offset_shim_off_the_source_is_inert) {
 }
 
 TEST(flatten_audio_only_asset_is_image_dormant) {
-    // An asset with no picture (audio import without cover art: zero
-    // frames and dimensions) emits NOTHING on the picture walk and no
-    // compiler Source head; the audio walk still carries the voice,
-    // unbounded (the block windows it).
+    // An asset with no picture emits nothing on the picture walk.
+    // The audio walk still carries the voice, unbounded.
     Rig rig(0);
     doc::Placement ap;
     ap.id = rig.doc.next_effect_id++;
@@ -245,9 +219,7 @@ TEST(flatten_audio_only_asset_is_image_dormant) {
 }
 
 TEST(flatten_timeline_lock_reads_the_root_clock) {
-    // A locked media node ignores the composed placement map: every
-    // block reads media = root + slip, so two placements of the look
-    // share one stream key and identical positions.
+    // A locked media node reads media = root + slip, so blocks share a key.
     Rig rig(200);
     rig.placement().t_in = 40;
     rig.placement().source_in = 25;
@@ -275,7 +247,6 @@ TEST(flatten_timeline_lock_reads_the_root_clock) {
     // One stream: the key drops the instance path.
     CHECK_EQ(a.key, b.key);
 
-    // Compiler agreement at a frame where one block plays.
     const gfx::RenderGraph g =
         gfx::compile_graph(rig.doc, rig.doc.root_sequence, 50);
     int found = 0;
@@ -292,16 +263,13 @@ TEST(flatten_and_compiler_agree_frame_by_frame) {
     rig.doc.fps = 60.0;
     rig.placement().t_in = 5;
     rig.placement().t_out = 30;
-    // A second block of the same look later on the lane (a razor's
-    // shape): distinct windows, the SAME razor-stable key.
     doc::Placement second;
     second.id = rig.doc.next_effect_id++;
     second.target = rig.look;
     second.t_in = 40;
     second.source_in = 10;
     rig.doc.root().tracks[0].placements.push_back(second);
-    // A MISMATCHED-RATE asset (24 in 60): its conformed window must
-    // close on the same fractional bound in both walks.
+    // A 24 fps asset in a 60 fps project must conform alike in both walks.
     doc::Asset slow;
     slow.id = rig.doc.next_effect_id++;
     slow.frame_count = 10;   // 25 clock frames at rate 0.4
@@ -340,8 +308,7 @@ TEST(flatten_and_compiler_agree_frame_by_frame) {
                 from_compile.push_back(n.key);
         std::sort(from_flatten.begin(), from_flatten.end());
         std::sort(from_compile.begin(), from_compile.end());
-        // Duplicate keys collapse (two blocks of one look share a
-        // stream); the compiler shows at most one.
+        // Two blocks of one look share a stream, so duplicate keys collapse.
         from_flatten.erase(
             std::unique(from_flatten.begin(), from_flatten.end()),
             from_flatten.end());
@@ -353,8 +320,7 @@ TEST(flatten_and_compiler_agree_frame_by_frame) {
 }
 
 TEST(flatten_same_lane_overlap_emits_both_compiles_the_winner) {
-    // Overlap on one lane: the flatten emits BOTH (the pool prewarms
-    // both streams), the compiler shows the LATEST-STARTING one.
+    // On an overlap the flatten emits both and the compiler shows the later.
     Rig rig(100);
     doc::Look second;
     second.id = rig.doc.next_effect_id++;
@@ -391,8 +357,6 @@ TEST(flatten_same_lane_overlap_emits_both_compiles_the_winner) {
 }
 
 TEST(flatten_audio_reads_audio_tracks_only) {
-    // Video lanes are silent - sound rides audio placements, and a look
-    // target contributes its sources' PCM in lockstep through the map.
     Rig rig(80);
     const auto none =
         doc::flatten_audio_sources(rig.doc, rig.doc.root_sequence);
@@ -424,8 +388,6 @@ TEST(flatten_audio_reads_audio_tracks_only) {
              size_t{0});
 }
 
-// Lays the standard audio path: one audio placement of `target` on the
-// root sequence, unity gains.
 static void lay_audio_block(Document& d, uint64_t target) {
     doc::AudioTrack at;
     at.id = d.next_effect_id++;
@@ -438,9 +400,7 @@ static void lay_audio_block(Document& d, uint64_t target) {
 }
 
 TEST(flatten_audio_sums_every_output_chain) {
-    // Combine all: the synthesized table fans every chain into the
-    // Output and EVERY live chain sounds, bottom-first - the same
-    // connection rule as the video composite, mux by summing.
+    // The synthesized table fans every live chain into the Output.
     Rig rig(60);
     doc::Asset b;
     b.id = rig.doc.next_effect_id++;
@@ -467,11 +427,7 @@ TEST(flatten_audio_sums_every_output_chain) {
 }
 
 TEST(flatten_audio_fan_in_sums_at_the_op_node) {
-    // Two sources fanning into ONE audio hop: the program lands both
-    // leaves as inputs of the SAME op node, bottom-first - the op
-    // processes the summed signal it is wired to. Rewiring one source
-    // straight to the Output moves it out from under the op into the
-    // root sum.
+    // An op with a fan-in processes the summed signal wired to it.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -507,7 +463,7 @@ TEST(flatten_audio_fan_in_sums_at_the_op_node) {
     CHECK_EQ(prog.nodes[op.inputs[0]].asset, rig.asset);
     CHECK_EQ(prog.nodes[op.inputs[1]].asset, b.id);
 
-    // Both leaves still show in the leaf view, bottom-first.
+    // The leaf view lists both, bottom first.
     const auto voice = doc::flatten_audio_sources(d, d.root_sequence);
     CHECK_EQ(voice.size(), size_t{2});
     if (voice.size() < 2) return;
@@ -531,10 +487,7 @@ TEST(flatten_audio_fan_in_sums_at_the_op_node) {
 }
 
 TEST(flatten_audio_voice_skips_dangling_feeds) {
-    // Deletes tolerate dangling links (a removed group leaves its old
-    // wires behind), so a dead wire at the BOTTOM of a fan-in must not
-    // swallow the voice while a live chain sits above it - the image
-    // side already skips dead feeds; audio must match.
+    // A dead wire at the bottom of a fan-in must not swallow the voice.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -546,8 +499,7 @@ TEST(flatten_audio_voice_skips_dangling_feeds) {
     CHECK_EQ(voice.size(), size_t{1});
     CHECK_EQ(voice[0].layer, media_layer);
 
-    // Slot variant: a dangling exterior feed below the live one in a
-    // group input's fan-in - the hop must pick the live producer.
+    // In a group input fan-in the hop must pick the live producer.
     doc::UndoStack undo;
     look.layers[0].stack.push_back(
         doc::make_effect(d, doc::EffectType::Grain));
@@ -568,11 +520,7 @@ TEST(flatten_audio_voice_skips_dangling_feeds) {
 }
 
 TEST(flatten_audio_voice_survives_a_preset_splice) {
-    // Splicing a preset into a chain re-terminates it through the
-    // group. Stacking order IS the link order, so the splice must land
-    // IN PLACE (reconnect_command): the chain keeps its fan-in
-    // position and the voice walk hops through the group's In slot -
-    // append semantics would restack the composite under a gesture.
+    // A splice lands in place, so the chain keeps its fan-in position.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -593,9 +541,6 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     const uint64_t gid = g.id;
     undo.execute(d, doc::insert_group_command(rig.look, 0, g,
                                               std::move(members), m0));
-    // The drop gesture's splice: the chain end re-terminates through
-    // the group IN PLACE, then the feed wires into the group's In slot
-    // (the voice walk must hop through it).
     const doc::Group* placed = doc::find_group(look, gid);
     CHECK(placed && !placed->inputs.empty());
     const uint64_t slot0 = placed->inputs.front();
@@ -607,7 +552,6 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     CHECK_EQ(voice.size(), size_t{1});
     CHECK_EQ(voice[0].asset, rig.asset);
     CHECK_EQ(voice[0].layer, media_layer);
-    // The spliced chain kept the BOTTOM position of the Output fan-in.
     uint64_t bottom_out = 0;
     for (const doc::NodeLink& l : look.links)
         if (l.to == 0 && l.to_port == 0) {
@@ -616,7 +560,6 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
         }
     CHECK_EQ(bottom_out, m1);
 
-    // Undoing the whole splice restores the voice unchanged.
     while (undo.can_undo()) undo.undo(d);
     const auto voice2 = doc::flatten_audio_sources(d, d.root_sequence);
     CHECK_EQ(voice2.size(), size_t{1});
@@ -624,9 +567,8 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
 }
 
 TEST(flatten_audio_chains_ops_in_wire_order) {
-    // The program chains op nodes exactly as wired, source-first; video
-    // effects in the chain pass audio through (no node); a bypassed hop
-    // drops out while the chain keeps flowing through it.
+    // Video effects in the chain pass audio through and make no node.
+    // A bypassed hop drops out and the chain keeps flowing through it.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -676,8 +618,7 @@ TEST(flatten_audio_chains_ops_in_wire_order) {
 }
 
 TEST(flatten_audio_split_output_reads_its_own_port) {
-    // SPLIT: the Output's dedicated audio-in (port 1) is the voice;
-    // unwired means SILENT, never a fallback onto the image chain.
+    // With split on, port 1 is the voice and unwired means silent.
     Rig rig(60);
     Document& d = rig.doc;
     lay_audio_block(d, rig.look);
@@ -694,9 +635,7 @@ TEST(flatten_audio_split_output_reads_its_own_port) {
 }
 
 TEST(flatten_audio_nested_program_composes_through_the_hop) {
-    // The enclosing look's DSP sits ABOVE the nested hop, the inner
-    // look's below it - the program nests the way the clocks do, and
-    // the leaf view still reaches the media.
+    // The outer DSP sits above the nested hop and the inner DSP below it.
     Rig rig(60);
     Document& d = rig.doc;
     d.looks[0].layers[0].stack.push_back(
@@ -740,10 +679,8 @@ TEST(flatten_audio_nested_program_composes_through_the_hop) {
 }
 
 TEST(resolve_audio_chain_composes_to_closed_form) {
-    // The audio chain FEEDING a node: the wired hop itself counts,
-    // video effects pass through, nested refs resolve through their
-    // own Output with inner hops first; a sequence ref has no single
-    // voice and reads silent.
+    // The chain feeding a node counts the wired hop itself.
+    // A sequence ref has no single voice and reads silent.
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
@@ -752,8 +689,7 @@ TEST(resolve_audio_chain_composes_to_closed_form) {
         doc::make_effect(d, doc::EffectType::AudioDelay));
     const uint64_t delay_id = look.layers[0].stack[0].id;
 
-    // Synthesized chain media -> delay -> Output: from the delay the
-    // chain includes it; from the layer it is the raw media.
+    // The synthesized chain is media -> delay -> Output.
     const doc::AudioChain from_delay =
         doc::resolve_audio_chain(d, look, delay_id);
     CHECK_EQ(from_delay.asset, rig.asset);
@@ -806,8 +742,7 @@ TEST(flatten_skips_hidden_and_dangling_sources) {
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
         size_t{0});
     rig.placement().target = rig.look;
-    // Dangling ASSET id (media removed): dormant like an unbound node
-    // (emit_media guards both walks).
+    // A dangling asset id is dormant, like an unbound node.
     rig.doc.looks[0].layers[0].asset = 888888;
     CHECK_EQ(
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
@@ -836,9 +771,8 @@ TEST(canvas_size_derives_from_the_first_asset) {
 }
 
 TEST(flatten_conforms_mismatched_media_rate) {
-    // 30fps media in a 60fps project: the media frame advances at half
-    // the clock (1x in TIME, each frame held twice), slip stays
-    // media-frame-exact past the rate, and derived lengths double.
+    // A 30 fps media in a 60 fps project holds each frame twice.
+    // The slip stays exact in media frames, so derived lengths double.
     Rig rig(100);
     rig.doc.fps = 60.0;
     rig.doc.assets[0].fps = 30.0;
@@ -865,7 +799,6 @@ TEST(flatten_conforms_mismatched_media_rate) {
     CHECK_EQ(doc::media_asset_frame(c, 179.0), 99.0);
     CHECK(!doc::media_active(c, 180.0));
 
-    // The compiler windows the head on the same conformed bounds.
     const gfx::RenderGraph g_on =
         gfx::compile_graph(rig.doc, rig.doc.root_sequence, 179);
     bool has_src = false;
@@ -877,9 +810,7 @@ TEST(flatten_conforms_mismatched_media_rate) {
     for (const gfx::GraphNode& n : g_off.nodes)
         CHECK(n.kind != gfx::GraphNode::Kind::Source);
 
-    // The AUDIO walk carries the same clock-domain affine (the mix maps
-    // by seconds and must not double-conform) with the media-frame
-    // shift held on the instance, not folded in.
+    // The mix maps by seconds, so the audio walk must not conform twice.
     doc::AudioTrack at;
     at.id = rig.doc.next_effect_id++;
     doc::Placement ap;
@@ -897,9 +828,7 @@ TEST(flatten_conforms_mismatched_media_rate) {
 }
 
 TEST(flatten_conform_razor_identity) {
-    // Cutting a conformed block and butting the halves is bit-identical:
-    // the right half's trimmed head lands on the same media frames the
-    // whole block showed, through the same stream key.
+    // A cut conformed block keeps the same media frames and stream key.
     Rig rig(100);
     rig.doc.fps = 60.0;
     rig.doc.assets[0].fps = 30.0;
@@ -917,16 +846,14 @@ TEST(flatten_conform_razor_identity) {
     CHECK_EQ(sources.size(), size_t{2});
     const MediaInstance& a = sources[0];
     const MediaInstance& b = sources[1];
-    CHECK_EQ(a.key, b.key);   // razored halves share one stream
+    CHECK_EQ(a.key, b.key);
     for (uint32_t f = 91; f < 97; ++f)
         CHECK_EQ(doc::media_asset_frame(b, static_cast<double>(f)),
                  std::floor(static_cast<double>(f) * 0.5));
 }
 
 TEST(pinned_fps_look_conforms_through_the_hop) {
-    // A 30fps-PINNED look in a 60fps project: its own clock ticks 30
-    // (media at 30fps maps 1:1 inside it), the hop ratio rides the
-    // affine, and derived spans double on the parent timeline.
+    // A pinned 30 fps look in a 60 fps project ticks its own clock.
     Rig rig(90);
     rig.doc.fps = 60.0;
     rig.doc.assets[0].fps = 30.0;
@@ -946,9 +873,7 @@ TEST(pinned_fps_look_conforms_through_the_hop) {
     CHECK_EQ(doc::media_asset_frame(c, 3.0), 1.0);
     CHECK_EQ(doc::media_asset_frame(c, 179.0), 89.0);
 
-    // The compiler's nested instance ticks the PINNED clock: at root
-    // frame 100 the look's local frame is 50 - lanes, value graph and
-    // stateful effects all clock on it.
+    // The nested instance ticks the pinned clock: root 100 is local 50.
     const gfx::RenderGraph g =
         gfx::compile_graph(rig.doc, rig.doc.root_sequence, 100);
     bool found = false;
@@ -959,10 +884,7 @@ TEST(pinned_fps_look_conforms_through_the_hop) {
         }
     CHECK(found);
 
-    // Razor identity across the pinned hop: a cut on a child-frame
-    // boundary reproduces the uncut media frames exactly (an off-grid
-    // cut truncates source_in - the same ONE rounding rule fractional
-    // speeds follow).
+    // A cut on a child-frame boundary keeps the same media frames.
     doc::UndoStack undo;
     if (auto cut = doc::razor_track_command(rig.doc, rig.doc.root_sequence,
                                             rig.lane, 62))
@@ -979,9 +901,7 @@ TEST(pinned_fps_look_conforms_through_the_hop) {
 }
 
 TEST(still_assets_never_conform) {
-    // A true still's frame count is authored on the PROJECT clock (the
-    // duration entry), so the conform rate must stay 1 even though the
-    // mezzanine stamps its synthetic 30fps.
+    // A still counts frames on the project clock, so its rate stays 1.
     Rig rig(150);
     rig.doc.fps = 60.0;
     rig.doc.assets[0].fps = 30.0;
@@ -1024,10 +944,7 @@ TEST(sequence_duration_is_the_timeline_length) {
 }
 
 TEST(flatten_hidden_lane_leaves_the_video_walk) {
-    // A hidden lane's blocks leave the video flatten entirely (the
-    // compiler skips them identically, so the pool never prewarms a
-    // ghost). The AUDIO walk ignores hidden - video lanes carry no
-    // sound either way.
+    // A hidden lane's blocks leave the video flatten entirely.
     Rig rig(100);
     CHECK_EQ(
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),

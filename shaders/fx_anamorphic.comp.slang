@@ -1,5 +1,4 @@
-// Linear light throughout: the flare gather has to sum energy, not code
-// values, or highlights streak dull.
+// Sum the flare energy in linear light. Encoded sums make dull streaks.
 
 #include "fx_common.slang"
 
@@ -38,7 +37,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 col = squeezed.rgb;
     float col_a = squeezed.a;
 
-    const float gate = threshold * threshold;   // approx linear-domain
+    const float gate = threshold * threshold;
     float3 flare = 0.0;
     const int kTaps = 24;
     [unroll]
@@ -54,10 +53,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     flare /= float(kTaps);
     const float3 blue_tint = float3(0.35, 0.55, 1.0);
     col += flare * blue_tint * streak * 6.0;
-    // Streak light is content: its coverage rides its energy.
     col_a = max(col_a, saturate(fx_luma(flare) * streak * 6.0));
 
-    // 12 taps on a 2:1 tall ellipse.
     if (bokeh > 0.001) {
         float3 oval = 0.0;
         [unroll]

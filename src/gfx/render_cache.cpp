@@ -36,7 +36,7 @@ void RenderCache::insert(uint64_t context, uint32_t frame, uint32_t width,
     entry.height = height;
     entry.stamp = ++clock_;
     total_bytes_ += bytes;
-    // The fresh entry carries the newest stamp, so it is evicted last.
+    // The fresh entry has the newest stamp; eviction takes it last.
     evict_to(budget_);
 }
 

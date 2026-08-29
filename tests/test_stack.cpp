@@ -30,7 +30,6 @@ TEST(stack_make_effect_defaults) {
     CHECK_EQ(fx.wet, 1.0f);
     CHECK_EQ(fx.opacity, 1.0f);
     CHECK(!fx.bypass);
-    // Stable ids are unique and monotonic.
     EffectInstance fx2 = make_effect(doc, EffectType::Pixelate);
     CHECK(fx2.id > fx.id);
 }
@@ -53,11 +52,11 @@ TEST(stack_add_remove_undo) {
     undo.execute(doc, remove_effect_command(doc.looks[0].id, 0, 1));
     CHECK_EQ(doc.looks[0].layers[0].stack.size(), size_t{1});
 
-    undo.undo(doc);   // un-remove
+    undo.undo(doc);
     CHECK_EQ(doc.looks[0].layers[0].stack.size(), size_t{2});
-    CHECK_EQ(doc.looks[0].layers[0].stack[1].id, pixelate_id);   // identity survives undo
+    CHECK_EQ(doc.looks[0].layers[0].stack[1].id, pixelate_id);
 
-    undo.undo(doc);   // un-add rgb split
+    undo.undo(doc);
     CHECK_EQ(doc.looks[0].layers[0].stack.size(), size_t{1});
     CHECK(doc.looks[0].layers[0].stack[0].type == EffectType::Pixelate);
 
@@ -92,18 +91,15 @@ TEST(stack_param_drag_coalesces) {
     UndoStack undo;
     const float original = doc.looks[0].layers[0].stack[0].params[0];
 
-    // A drag: many coalesced edits -> one undo entry back to the start.
     undo.execute(doc, set_param_command(doc.looks[0].id,0, 0, 0, 10.0f), /*coalesce=*/true);
     undo.execute(doc, set_param_command(doc.looks[0].id,0, 0, 0, 20.0f), /*coalesce=*/true);
     undo.execute(doc, set_param_command(doc.looks[0].id,0, 0, 0, 30.0f), /*coalesce=*/true);
     CHECK_EQ(doc.looks[0].layers[0].stack[0].params[0], 30.0f);
     CHECK_EQ(undo.undo_depth(), size_t{1});
 
-    // Different knob must NOT merge.
     undo.execute(doc, set_param_command(doc.looks[0].id,0, 0, 1, 5.0f), /*coalesce=*/true);
     CHECK_EQ(undo.undo_depth(), size_t{2});
 
-    // Gesture end: same knob again starts a fresh entry.
     undo.break_coalescing();
     undo.execute(doc, set_param_command(doc.looks[0].id,0, 0, 1, 8.0f), /*coalesce=*/true);
     CHECK_EQ(undo.undo_depth(), size_t{3});
@@ -118,8 +114,6 @@ TEST(stack_param_drag_coalesces) {
 TEST(stack_randomize) {
     Document doc;
     UndoStack undo;
-    // Quantizer: has a selector ("palette", "dither" is randomizable? no —
-    // "dither" is not in the frozen list but "palette" is) and ranges.
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Quantize));
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const std::vector<float> before_q = doc.looks[0].layers[0].stack[0].params;
@@ -133,7 +127,7 @@ TEST(stack_randomize) {
         CHECK(q[p] >= qinfo.params[p].min_value);
         CHECK(q[p] <= qinfo.params[p].max_value);
         if (!param_randomizable(qinfo.params[p]))
-            CHECK_EQ(q[p], before_q[p]);   // selectors stay put
+            CHECK_EQ(q[p], before_q[p]);
         else if (q[p] != before_q[p])
             any_changed = true;
     }
@@ -142,7 +136,6 @@ TEST(stack_randomize) {
     CHECK(!param_randomizable(qinfo.params[1]));
     CHECK(param_randomizable(qinfo.params[0]));
 
-    // Whole gesture = one undo step; undo restores everything.
     CHECK_EQ(undo.undo_depth(), size_t{1});
     undo.undo(doc);
     CHECK(doc.looks[0].layers[0].stack[0].params == before_q);
@@ -155,7 +148,7 @@ TEST(stack_randomize) {
     randomize_effect(doc, undo, doc.looks[0].id,0, 1, 0.7f, 42);
     CHECK(doc.looks[0].layers[0].stack[1].params == first);
 
-    // Intensity 0 = no-op (and must not leave an empty undo entry applied).
+    // Intensity 0 makes no change and leaves no undo entry.
     const size_t depth = undo.undo_depth();
     randomize_effect(doc, undo, doc.looks[0].id,0, 1, 0.0f, 99);
     CHECK(doc.looks[0].layers[0].stack[1].params == first);
@@ -181,9 +174,7 @@ TEST(stack_bypass_and_move) {
 }
 
 TEST(stack_connect_output_replaces_same_layer_end) {
-    // The Output composites ONE contribution per owner layer; wiring a
-    // new chain end must replace the same layer's old link (the ghost
-    // double-composited the chain prefix) and keep other layers'.
+    // The Output takes one contribution per layer, so a new end replaces it.
     Document doc = make_doc_with_two();          // layer 0: rgb, vignette
     doc.looks[0].layers.push_back(make_layer(doc, LayerSourceKind::Solid));
     doc.looks[0].layers[1].stack.push_back(make_effect(doc, EffectType::Pixelate));
@@ -207,8 +198,7 @@ TEST(stack_connect_output_replaces_same_layer_end) {
     CHECK(std::find(ends.begin(), ends.end(), fx0) != ends.end());
     CHECK(std::find(ends.begin(), ends.end(), other_end) != ends.end());
     CHECK(std::find(ends.begin(), ends.end(), fx1) == ends.end());
-    // IN PLACE: stacking order is the link order, so the re-terminated
-    // chain keeps the bottom position it had.
+    // Stacking order is the link order, so the chain keeps its position.
     CHECK_EQ(ends[0], fx0);
 
     CHECK(undo.undo(doc));
@@ -219,9 +209,7 @@ TEST(stack_connect_output_replaces_same_layer_end) {
 }
 
 TEST(stack_param_gesture_coalesces_mixed) {
-    // A gizmo drag writes an x/y pair per frame, one axis keyed: every
-    // frame is one command, the whole drag merges to ONE undo entry, and
-    // that entry restores base param and lane together.
+    // The drag writes one command per frame and merges to one undo entry.
     Document doc;
     UndoStack undo;
     doc.looks[0].layers[0].stack.push_back(
@@ -258,7 +246,7 @@ TEST(stack_param_gesture_coalesces_mixed) {
     CHECK(undo.undo(doc));
     CHECK_EQ(look.layers[0].stack[0].params[2], 0.5f);
     CHECK_EQ(look.lanes[0].keys[0].value, 0.25f);
-    CHECK(!undo.can_undo());   // the drag was ONE entry
+    CHECK(!undo.can_undo());
 
     CHECK(undo.redo(doc));
     CHECK_EQ(look.layers[0].stack[0].params[2], 0.8f);
@@ -266,9 +254,8 @@ TEST(stack_param_gesture_coalesces_mixed) {
 }
 
 TEST(stack_param_gesture_shape_guard) {
-    // Different write shapes never merge (a base-only frame cannot fold
-    // into a base+lane entry), and reverting a command that CREATED a
-    // lane removes it again.
+    // Different write shapes never merge into one undo entry.
+    // Reverting a command that created a lane removes the lane.
     Document doc;
     UndoStack undo;
     doc.looks[0].layers[0].stack.push_back(
@@ -292,9 +279,9 @@ TEST(stack_param_gesture_shape_guard) {
     CHECK_EQ(look.layers[0].stack[0].params[2], 0.65f);
     CHECK_EQ(look.lanes.size(), size_t{1});
 
-    CHECK(undo.undo(doc));   // second entry: base back, created lane gone
+    CHECK(undo.undo(doc));
     CHECK_EQ(look.layers[0].stack[0].params[2], 0.6f);
     CHECK_EQ(look.lanes.size(), size_t{0});
-    CHECK(undo.undo(doc));   // first entry existed separately
+    CHECK(undo.undo(doc));
     CHECK_EQ(look.layers[0].stack[0].params[2], 0.5f);
 }

@@ -1,7 +1,3 @@
-// A scanline carrier whose frequency and phase are modulated by image
-// luma. Unlike Engraver this is a closed form per pixel, with no
-// accumulated phase field, so the carrier is exact rather than marched.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -19,7 +15,7 @@ cbuffer Push
     float pm;
     float depth;   // warp displacement px, or ring-mod depth
     float speed;   // hz
-    float mode;    // 0 h warp, 1 v warp, 2 ring mod
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;

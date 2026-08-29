@@ -1,4 +1,4 @@
-// Display-referred.
+// Operate on the encoded signal, not on linear light.
 
 #include "fx_common.slang"
 
@@ -12,7 +12,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float r_from;   // 0 r, 1 g, 2 b, 3 luma
+    float r_from;
     float g_from;
     float b_from;
     float amount;
@@ -26,7 +26,7 @@ float pick_channel(float4 src, float sel)
     const int s = int(sel + 0.5);
     if (s == 1) return src.g;
     if (s == 2) return src.b;
-    if (s == 3) return src.a;   // luma is packed into .a by the caller
+    if (s == 3) return src.a;   // the caller packs luma into .a
     return src.r;
 }
 

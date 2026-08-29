@@ -123,15 +123,14 @@ void Canvas2D::draw_rect_corners(const Rect& r, Color c00, Color c10,
 
 void Canvas2D::draw_rect_outline(const Rect& r, float stroke, Color color) {
     if (r.empty() || stroke <= 0.0f) return;
-    // Collapses to a fill when the stroke swallows the interior.
     if (stroke * 2.0f >= r.w || stroke * 2.0f >= r.h) {
         draw_rect(r, color);
         return;
     }
-    draw_rect({r.x, r.y, r.w, stroke}, color);                                  // top
-    draw_rect({r.x, r.bottom() - stroke, r.w, stroke}, color);                  // bottom
-    draw_rect({r.x, r.y + stroke, stroke, r.h - 2 * stroke}, color);            // left
-    draw_rect({r.right() - stroke, r.y + stroke, stroke, r.h - 2 * stroke},     // right
+    draw_rect({r.x, r.y, r.w, stroke}, color);
+    draw_rect({r.x, r.bottom() - stroke, r.w, stroke}, color);
+    draw_rect({r.x, r.y + stroke, stroke, r.h - 2 * stroke}, color);
+    draw_rect({r.right() - stroke, r.y + stroke, stroke, r.h - 2 * stroke},
               color);
 }
 
@@ -157,14 +156,7 @@ void Canvas2D::draw_triangle(Vec2 a, Vec2 b, Vec2 c, Color color) {
 
 void Canvas2D::draw_line(Vec2 a, Vec2 b, float thickness, Color color) {
     if (thickness <= 0.0f) return;
-    // An SDF capsule: a rotated quad whose shape attributes carry the
-    // segment's true half extents while the quad itself is padded one
-    // physical pixel for the feather ramp. The rounded-box SDF with
-    // radius = half thickness gives analytic anti-aliasing and round
-    // caps, so chained polyline segments join without notches and
-    // sub-pixel thicknesses fade instead of flickering. The fragment
-    // shader reconstructs local position from UV * half_size, so the
-    // padded corners must map UV past [0,1] by pad/extent.
+    // The shader maps UV * half_size, so padded corners push UV past [0,1].
     const Vec2 pa = to_physical(a);
     const Vec2 pb = to_physical(b);
     const Vec2 d{pb.x - pa.x, pb.y - pa.y};
@@ -198,8 +190,7 @@ void Canvas2D::draw_polyline(const Vec2* pts, int count, float thickness,
                              Color color, bool closed) {
     if (!pts || count < 2 || thickness <= 0.0f) return;
     if (clip_collapsed()) return;
-    // Physical points, consecutive duplicates dropped (a zero-length
-    // span has no normal).
+    // Drop duplicate points: a zero-length span has no normal.
     std::vector<Vec2> p;
     p.reserve(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) {
@@ -221,8 +212,7 @@ void Canvas2D::draw_polyline(const Vec2* pts, int count, float thickness,
         }
         return;
     }
-    // A sub-pixel stroke keeps a half-pixel core and fades by width
-    // instead of flickering.
+    // A sub-pixel stroke keeps a half-pixel core and fades with alpha.
     float alpha = color.a;
     float hw = thickness * 0.5f * scale_;
     if (hw < 0.5f) {
@@ -246,9 +236,7 @@ void Canvas2D::draw_polyline(const Vec2* pts, int count, float thickness,
     const uint16_t base = static_cast<uint16_t>(vertices_.size());
     const float shape[4] = {0, 0, 0, 0};
     for (size_t i = 0; i < n; ++i) {
-        // The joint normal averages its two segments' normals; the
-        // miter scale keeps the stroke width constant through the bend,
-        // clamped so a hairpin cannot spike.
+        // Clamp the miter scale so a hairpin joint cannot spike.
         Vec2 m;
         if (!closed && i == 0) {
             m = seg_normal(0);

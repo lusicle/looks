@@ -9,7 +9,7 @@ cbuffer Push
     uint frame;
     float fps;
     float amount;
-    float radius;      // where falloff starts
+    float radius;
     float softness;
 };
 

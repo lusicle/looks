@@ -1,9 +1,3 @@
-// Node canvas implementation. Everything draws
-// in graph space through one screen transform; interaction resolves
-// geometrically against the same transform. One WidgetId owns the whole
-// surface; drags hold ctx capture with the element remembered in
-// CanvasState.
-
 #include "app/flow_canvas.h"
 
 #include <algorithm>
@@ -12,7 +6,7 @@
 #include <cstring>
 #include <string>
 
-#include "doc/effects.h"   // param_option_count/_at (dropdown rows)
+#include "doc/effects.h"
 #include "ui/probe.h"
 #include "ui/text.h"
 #include "ui/theme.h"
@@ -25,19 +19,18 @@ namespace {
 using ui::Color;
 using ui::Rect;
 
-// Card geometry, graph units at zoom 1.
+// Card geometry in graph units at zoom 1.
 constexpr float kNodeW = 200.0f;
 constexpr float kTitleH = 24.0f;
-constexpr float kPrevH = 106.0f;   // 16:9 inside the 188 px inner width
-constexpr float kScopeH = 32.0f;   // value-node signal strip
+constexpr float kPrevH = 106.0f;   // 16:9 in the 188 px inner width
+constexpr float kScopeH = 32.0f;
 constexpr float kRowH = 18.0f;
 constexpr float kPadB = 8.0f;
 constexpr float kGridMinor = 24.0f;
 constexpr float kGridMajor = 120.0f;
 constexpr size_t kMaxNodes = 512;
 
-// One subdued hue per FxCategory (enum order: Time, Warp, Mosaic, Optics,
-// Color, Texture, Overlay, Codec) for the title strip.
+// One hue per FxCategory, in enum order.
 const Color* tint_palette() {
     static const Color palette[8] = {
         Color::hex(0x7E57C2), Color::hex(0x26A69A), Color::hex(0xEC7063),
@@ -54,8 +47,6 @@ struct CanvasUser {
 };
 
 bool node_has_preview(const Node& nd) {
-    // Every kind gets a preview slot; mod sources and the subgraph
-    // boundary nodes stay compact.
     return nd.kind != NodeKind::ModSource &&
            nd.kind != NodeKind::GroupIn && nd.kind != NodeKind::GroupOut;
 }
@@ -64,27 +55,21 @@ bool is_boundary(const Node& nd) {
     return nd.kind == NodeKind::GroupIn || nd.kind == NodeKind::GroupOut;
 }
 
-// Matte/aux ports get dedicated strip rows between the preview and the
-// param rows — a port pinned at a fixed offset lands on top of row 0
-// (the port label painted over wet/dry shipped once). Group input slots
-// are NOT rows: they stack as plain dots on the card's left edge,
-// centred where a single In sits. A GroupIn boundary card's exit dots
-// ride strip rows on the right edge (label-free).
+// Port strip rows sit between the preview and the param rows.
+// Group input slots are dots, not rows, so they do not count here.
 int port_row_count(const Node& nd) {
-    // A GroupIn card's ghost EXIT (interior minting) takes a row too.
     return nd.exit_rows +
            (nd.kind == NodeKind::GroupIn && nd.ghost_in ? 1 : 0) +
            (nd.has_matte_port ? 1 : 0) + (nd.has_aux_port ? 1 : 0);
 }
 
-// Vertical pitch of the input dot stack (slots + the ghost).
+// Input dot stack pitch, graph units.
 constexpr float kInPitch = 14.0f;
 
 void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<CanvasUser*>(node.user);
     ui::register_rect_hit(node, frame, u->state);
-    // An open card swatch owns its picker rect on the popup layer, so
-    // clicks over it never reach the nodes underneath.
+    // The open swatch takes the popup layer so clicks miss the cards below.
     if (u->state->swatch_open)
         frame.ctx.add_hit(
             ui::swatch_popup_rect(u->state->swatch_anchor, frame),
@@ -92,10 +77,7 @@ void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             ui::HitLayer::Popup);
 }
 
-// The wire bezier's control points (horizontal tangents) and its point
-// eval: the ONE derivation the stroke, the splice hit, the marquee scan
-// and the port pick share - geometry drift between draw and hit makes
-// wires unclickable where they render.
+// Draw and hit tests must share this geometry or wires miss the cursor.
 void wire_controls(Vec2 p0, Vec2 p3, Vec2* p1, Vec2* p2) {
     const float reach =
         std::clamp(std::fabs(p3.x - p0.x) * 0.5f, 24.0f, 140.0f);
@@ -111,8 +93,7 @@ Vec2 wire_point(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, float t) {
                 t * t * t * p3.y};
 }
 
-// Squared distance from `probe` to the wire at the hit-test sampling
-// (24 segments; the stroke itself draws finer).
+// Returns the squared distance. The hit test samples 24 segments.
 float wire_dist2(Vec2 p0, Vec2 p3, Vec2 probe) {
     Vec2 p1, p2;
     wire_controls(p0, p3, &p1, &p2);
@@ -126,9 +107,7 @@ float wire_dist2(Vec2 p0, Vec2 p3, Vec2 probe) {
     return best;
 }
 
-// Cubic bezier with horizontal tangents — the wire idiom, drawn as ONE
-// anti-aliased polyline (per-segment strokes bead at the joints).
-// Dashes fall out as isolated two-point strips.
+// Draw one polyline: per segment strokes make beads at the joints.
 void draw_wire(ui::Canvas2D& canvas, Vec2 p0, Vec2 p3, float thickness,
                Color color, bool dashed) {
     Vec2 p1, p2;
@@ -168,13 +147,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     ui::Canvas2D& canvas = frame.canvas;
     const size_t n = std::min(g.node_count, kMaxNodes);
 
-    // Wall-clock for the double-click windows: frame-count windows
-    // shrink with the UI rate (24 frames at 150 fps is 160 ms - under
-    // any real mouse double-click), so every detector below measures
-    // SECONDS on this accumulated clock instead.
     st.clock += frame.dt;
 
-    // ---- view transform
     if (!st.view_inited) {
         st.view_inited = true;
         if (n) {
@@ -203,17 +177,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return Vec2{(sp.x - r.x - st.pan_x) / st.zoom,
                     (sp.y - r.y - st.pan_y) / st.zoom};
     };
-    // NOT const: the wheel handler below updates the zoom mid-frame and
-    // every size derived from z must follow, or content draws one frame
-    // with new positions and old metrics (a direction-specific one-frame
-    // misalignment shipped exactly that way).
+    // Not const: the wheel handler updates z in the middle of the frame.
     float z = st.zoom;
 
-    auto node_rect_s = [&](const Node& nd) {   // screen-space card rect
+    auto node_rect_s = [&](const Node& nd) {   // screen space card rect
         const Vec2 tl = to_screen({nd.x, nd.y});
         return Rect{tl.x, tl.y, kNodeW * z, node_height_of(nd) * z};
     };
-    // Top of the port strip / param rows, graph units from the card top.
+    // Graph units from the card top.
     auto strip_top = [](const Node& nd) {
         return kTitleH + (node_has_preview(nd) ? kPrevH + 6.0f
                           : nd.scope && nd.scope_count > 1
@@ -224,16 +195,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return strip_top(nd) +
                static_cast<float>(port_row_count(nd)) * kRowH;
     };
-    // Group-card input stack: slots + the ghost as plain dots on the
-    // LEFT edge, centred where a single node's In sits (preview mid) -
-    // no rows, no labels. Stack index: 0 = slots[0] (the In), k =
-    // slots[k], last = the ghost while it shows.
+    // Stack index 0 is the In dot, k is slot k, the last one is the ghost.
     auto in_stack_count = [](const Node& nd) {
         return (nd.has_in ? 1 + nd.slot_rows : 0) +
                (nd.ghost_in ? 1 : 0);
     };
-    // The input dot stack lives on GROUP cards; on a GroupIn card
-    // ghost_in means the ghost EXIT instead (interior minting).
+    // ghost_in means a ghost exit on a GroupIn card, not an input dot.
     auto in_stacked = [](const Node& nd) {
         return (nd.ghost_in && nd.kind == NodeKind::Group) ||
                nd.slot_rows > 0;
@@ -277,14 +244,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             {nd.x, nd.y + strip_top(nd) +
                        (nd.has_matte_port ? 1.5f : 0.5f) * kRowH});
     };
-    // GroupIn exit rows: right-edge anchors, one per input slot.
     auto port_exit = [&](const Node& nd, int k) {
         return to_screen(
             {nd.x + kNodeW, nd.y + strip_top(nd) +
                                 (static_cast<float>(k) + 0.5f) * kRowH});
     };
-    // Left-edge anchor of a param row — where mod wires land (routes
-    // wire into the PARAM, not the card).
     auto row_anchor = [&](const Node& nd, int row) {
         return to_screen({nd.x, nd.y + rows_top_g(nd) +
                                     (static_cast<float>(row) + 0.5f) *
@@ -296,17 +260,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return nullptr;
     };
 
-    // ---- interaction
     const ui::WidgetId wid = frame.ctx.acquire_widget_id(&st);
     const bool owns = frame.ctx.widget_owns_mouse(wid);
     const Vec2 mouse = frame.input.mouse;
     Vec2 gmouse = to_graph(mouse);
-    // Published cursor: paste-at-cursor and the find anchor read these.
     st.last_mouse = mouse;
     st.last_gx = gmouse.x;
     st.last_gy = gmouse.y;
 
-    // Find jump: center the view on the requested node once.
     if (st.center_on) {
         for (size_t i = 0; i < n; ++i)
             if (g.nodes[i].id == st.center_on) {
@@ -320,8 +281,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.center_on = 0;
     }
 
-    // Routable row under the cursor on a card: route_clicked marks
-    // param rows, value_input marks helper operand rows; -1 = none.
     auto row_under_mouse = [&](const Node& nd) {
         const Rect cr = node_rect_s(nd);
         if (!cr.contains(mouse)) return -1;
@@ -333,11 +292,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                    ? row
                    : -1;
     };
-    // Which node outputs may feed a given input port — one truth for the
-    // reverse wire drag's candidate rings and its drop resolution.
-    // port 1 (matte): ANY image out — masks ARE images. Image In / aux:
-    // Source, Effect, Group (boundary proxy), or GroupIn outs. Value
-    // nodes never feed image ports; only image nodes feed GroupOut.
+    // The drag rings and the drop must use this same rule.
     auto out_feeds_input = [](const Node& src_nd, const Node& to_nd,
                               uint32_t port) {
         if (!src_nd.has_out && src_nd.exit_rows == 0) return false;
@@ -354,8 +309,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return true;
     };
 
-    // A wire's screen endpoints — one truth for draw, splice hit, and
-    // click-select.
+    // Draw, splice hit and click select must use these endpoints.
     auto wire_ends = [&](const Wire& w, Vec2* p0, Vec2* p3) {
         const Node* a = find_node(w.from);
         const Node* b = find_node(w.to);
@@ -378,7 +332,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return true;
     };
 
-    // Missed release: pointer left with a drag armed.
+    // Clear a drag if the pointer left the window with the button down.
     if (st.drag_kind && !frame.input.left_down() &&
         !frame.input.left_released() &&
         !(frame.input.buttons_down & ui::kMouseMiddle)) {
@@ -387,7 +341,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.drag_row = -1;
     }
 
-    // Hover: topmost card under the cursor (last drawn wins).
+    // The last card in array order wins: it draws on top.
     st.hover = 0;
     int hover_i = -1;
     if (owns && st.drag_kind == 0) {
@@ -398,14 +352,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
     }
 
-    // Add-menu geometry (screen-space popup, texed openAddMenu). Defined
-    // BEFORE the zoom handler: the wheel over the open menu scrolls its
-    // list — zoom used to consume the wheel first, so the popup never
-    // scrolled at all.
-    // Category mode (user request): while the filter is empty the menu
-    // lists CATEGORY rows; the hovered one opens a flyout submenu with
-    // its items. Typing collapses to the flat filtered list. Find mode
-    // has no headers, so it stays flat automatically.
+    // Keep this before the zoom handler so the menu wheel wins.
     int cat_rows[32];
     int cat_count = 0;
     if (g.add_headers && (!g.add_filter || g.add_filter[0] == '\0'))
@@ -418,7 +365,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         (st.add_cat >= static_cast<int>(g.add_count) ||
          !g.add_headers[st.add_cat]))
         st.add_cat = -1;
-    // The open category's item range [fly0, fly1) in the flat list.
     int fly0 = 0, fly1 = 0;
     if (cat_mode && st.add_cat >= 0) {
         fly0 = st.add_cat + 1;
@@ -434,8 +380,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                          14));
     const float menu_h = 26.0f + menu_visible * 18.0f + 6.0f;
     auto menu_rect = [&]() {
-        // Clamped INSIDE the canvas on both ends: a short canvas must
-        // pin the menu to its top, never push it above the panel.
         return Rect{
             std::max(r.x + 4.0f,
                      std::min(st.add_anchor.x, r.right() - kMenuW - 8.0f)),
@@ -443,7 +387,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                      std::min(st.add_anchor.y, r.bottom() - menu_h - 8.0f)),
             kMenuW, menu_h};
     };
-    // Flyout beside the open category row; flips left when clipped.
     auto fly_rect = [&]() {
         const Rect mr = menu_rect();
         int vis_row = 0;
@@ -466,8 +409,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.input.wheel_y = 0.0f;
     }
 
-    // Wheel: zoom around the cursor. z and gmouse are refreshed so the
-    // REST OF THIS FRAME draws and hit-tests with the new transform.
     if (owns && frame.input.wheel_y != 0.0f) {
         const float nz =
             std::clamp(z * std::pow(1.15f, frame.input.wheel_y), 0.25f,
@@ -481,10 +422,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.input.wheel_y = 0.0f;
     }
 
-    // Row hit helper: which row + zone is under the mouse for a card.
-    // zone: 0 none, 1 slider strip (incl. the value — still-click types),
-    // 3 the PERSISTENT keyframe toggle at the row's left, 4 the expose
-    // toggle beside it (scoped member rows — the group FACE, v5.3).
+    // zone: 0 none, 1 slider, 2 value text, 3 key toggle, 4 expose toggle.
     struct RowHit {
         int row = -1;
         int zone = 0;
@@ -497,19 +435,18 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const int row = static_cast<int>((mouse.y - rows_top) / (kRowH * z));
         if (row < 0 || row >= nd.row_count) return h;
         h.row = row;
-        const float lx = (mouse.x - cr.x) / z;   // graph units into card
+        const float lx = (mouse.x - cr.x) / z;   // graph units into the card
         if (nd.rows[row].key_clicked && lx >= 3.0f && lx < 15.0f)
             h.zone = 3;
         else if (nd.rows[row].expose_clicked && lx >= 15.0f && lx < 27.0f)
             h.zone = 4;
         else if (lx >= 64.0f && lx < kNodeW - 46.0f)
-            h.zone = 1;   // the slider track — press jumps + drags
+            h.zone = 1;
         else if (lx >= kNodeW - 46.0f && lx <= kNodeW - 8.0f)
-            h.zone = 2;   // the value text — click types
+            h.zone = 2;
         return h;
     };
-    // Screen rect of a non-slider row's FIELD (dropdown/text, v5.6):
-    // the slider + value span, edit-box height.
+    // Field rect in screen space.
     auto row_field_rect = [&](const Node& nd, int row) {
         const Rect cr = node_rect_s(nd);
         const float ry = cr.y + rows_top_g(nd) * z +
@@ -524,14 +461,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             ((mouse.x - cr.x) / z - 64.0f) / (kNodeW - 46.0f - 64.0f), 0.0f,
             1.0f);
         const ParamRow& pr = nd.rows[row];
-        // Stored == displayed: drags land on the readout's precision.
+        // Snap to the readout format: the stored value equals the shown one.
         return std::clamp(
             ui::snap_to_format(pr.min_v + t * (pr.max_v - pr.min_v),
                                pr.format),
             pr.min_v, pr.max_v);
     };
 
-    // Middle-drag pan.
     if (owns && (frame.input.buttons_pressed & ui::kMouseMiddle) &&
         st.drag_kind == 0) {
         st.drag_kind = 2;
@@ -549,14 +485,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return dx * dx + dy * dy < r2;
     };
 
-    // Distance from the cursor to a wire's bezier (sampled) — the splice
-    // target for a right-click on a wire (texed contextmenu).
     auto wire_near = [&](Vec2 p0, Vec2 p3) {
         return wire_dist2(p0, p3, mouse);
     };
     auto open_add_menu = [&]() {
-        // Nothing to add (sequence scope): no menu - an empty popup is
-        // worse than none.
         if (!g.add_count) return;
         st.add_open = true;
         st.add_anchor = mouse;
@@ -566,8 +498,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.add_cat = -1;
         st.splice_from = st.splice_to = 0;
         st.splice_port = 0;
-        // Wire under the cursor → the added node splices into it
-        // (endpoints from wire_ends, the one derivation).
         float best = 10.0f * 10.0f;
         for (size_t w = 0; w < g.wire_count; ++w) {
             if (g.wires[w].data || g.wires[w].to_port == 1) continue;
@@ -584,7 +514,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         out.add_menu_opened = true;
     };
 
-    // Context-menu geometry (texed popupMenu): plain rows, no filter.
     const float kCtxW = 170.0f;
     const float ctx_h = static_cast<float>(g.ctx_count) * 20.0f + 8.0f;
     auto ctx_rect = [&]() {
@@ -596,9 +525,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             kCtxW, ctx_h};
     };
 
-    // Right-click: a card or frame title gets its CONTEXT menu (texed
-    // openNodeMenu/openFrameMenu); anywhere else gets the add menu (a
-    // wire under the cursor arms the splice as before).
     if (owns && st.drag_kind == 0 &&
         (frame.input.buttons_pressed & ui::kMouseRight)) {
         st.add_open = false;
@@ -619,8 +545,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.ctx_open = true;
             st.ctx_anchor = mouse;
             st.ctx_target = target;
-            // The menu applies to the selection when the card is in it;
-            // otherwise the click selects the card first (texed).
             if (target == kOutNodeId ||
                 node_kind_of(target) != NodeKind::Frame)
                 out.clicked = target;
@@ -629,7 +553,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Open context menu: clicks route to it first; outside closes.
     bool menu_swallowed_press = false;
     if (st.ctx_open) {
         const Rect mr = ctx_rect();
@@ -647,10 +570,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Port STACK popup: feeds of (node, port) in link order, top row =
-    // drawn last (the top of the stack). Arrow clicks emit a reorder
-    // and the popup stays open - the rows re-read the wires, so the
-    // move shows immediately. Any other click closes it.
     auto port_feed_count = [&]() -> size_t {
         size_t feeds = 0;
         for (size_t w = 0; w < g.wire_count; ++w)
@@ -676,13 +595,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     const int index =
                         static_cast<int>(feeds) - 1 - row;
                     if (mouse.x >= mr.right() - 20.0f) {
-                        out.port_reorder = true;   // v: toward bottom
+                        out.port_reorder = true;
                         out.reorder_node = st.port_menu_node;
                         out.reorder_port = st.port_menu_port;
                         out.reorder_index = index;
                         out.reorder_delta = -1;
                     } else if (mouse.x >= mr.right() - 40.0f) {
-                        out.port_reorder = true;   // ^: toward top
+                        out.port_reorder = true;
                         out.reorder_node = st.port_menu_node;
                         out.reorder_port = st.port_menu_port;
                         out.reorder_index = index;
@@ -695,10 +614,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Param dropdown popup: resolve the open field's row each
-    // frame (pointers are per-frame); a pick stages the option index
-    // exactly like a slider release, so the existing param appliers and
-    // undo coalescing do the rest. Clicks route here before the nodes.
+    // Row pointers live one frame: resolve the open row again each frame.
     const Node* dd_node_p = nullptr;
     const ParamRow* dd_row_p = nullptr;
     if (st.dd_open) {
@@ -744,9 +660,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         dd_row_p = nullptr;
     }
 
-    // Card swatch popup: resolve the open swatch's row each frame (row
-    // pointers are per-frame). Owner loss or a press the popup layer
-    // did not swallow closes it - landing any typed field first.
     const ParamRow* sw_row = nullptr;
     if (st.swatch_open) {
         for (size_t i = 0; i < g.node_count && !sw_row; ++i) {
@@ -777,17 +690,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Open menu: clicks route to it before anything else; wheel scrolls
-    // its list; clicking outside closes and swallows the press. In
-    // category mode the HOVERED category opens its flyout; a click in
-    // the flyout picks the item.
     if (st.add_open) {
         const Rect mr = menu_rect();
         const bool have_fly =
             cat_mode && st.add_cat >= 0 && fly1 > fly0;
         const Rect fr2 = have_fly ? fly_rect() : Rect{};
-        // Hover-open (standard menu feel): a category row under the
-        // cursor opens its submenu; the flyout keeps itself open.
         if (cat_mode && mr.contains(mouse) &&
             mouse.y >= mr.y + 26.0f) {
             const int row =
@@ -812,16 +719,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         !(g.add_headers && g.add_headers[row]))
                         out.add_pick = row;
                 }
-                // Category rows just keep/open the flyout (hover
-                // already set add_cat) — the click stays swallowed.
+                // A click on a category row does nothing: hover opened it.
             } else {
                 st.add_open = false;
             }
         }
     }
 
-    // Breadcrumb (texed #crumbs): "main > group" chip row while a group
-    // is open; clicking the "main" half exits the subgraph view.
     auto crumb_main_rect = [&]() {
         return Rect{r.x + 10.0f, r.y + 8.0f,
                     ui::measure_text(frame.font, "main", 11.0f).x + 16.0f,
@@ -838,11 +742,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         !menu_swallowed_press) {
         st.drag_moved = false;
         st.press_screen = mouse;
-        // Port grabs win over everything: Out starts a wire, a FED In or
-        // matte port grabs its wire for rewiring (texed editor idiom).
+        // Port grabs come before card hits.
         bool port_handled = false;
-        // Out-side grabs first, NEAREST anchor wins (GroupIn exit rows
-        // sit one row apart, inside each other's grab radius).
+        // The nearest anchor wins: exits sit inside each other's grab radius.
         {
             float best_d2 = 81.0f;
             const Node* best_nd = nullptr;
@@ -860,8 +762,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     }
                 };
                 if (nd.has_out) consider(port_out(nd), 0);
-                // Exit rows plus the ghost exit (index exit_rows):
-                // dragging from it mints the next input interiorly.
                 for (int k = 0; k < exit_count(nd); ++k)
                     consider(port_exit(nd, k),
                              static_cast<uint32_t>(k));
@@ -875,13 +775,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
         }
         if (!port_handled) {
-            // Input ports: a FED port picks its wire up (rewire, texed
-            // pick-up-from-source); an EMPTY one extends a new wire whose
-            // fixed end is the input, seeking an Out port (kind 8). A
-            // DOUBLE-CLICK on a port with two or more feeds opens the
-            // STACK popup instead (link-order reordering). NEAREST
-            // anchor wins across every node - strip rows sit one row
-            // apart, inside each other's grab radius.
             float best_d2 = 81.0f;
             const Node* best_nd = nullptr;
             uint32_t best_port = 0;
@@ -955,9 +848,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 frame.ctx.set_capture(wid);
                 port_handled = true;
             };
-            // Slot rows carry doc ports k+1; the ghost row
-            // (port slot_rows+2) never holds a wire, so a press on it
-            // always starts the reverse drag that mints the slot.
             grab_input(best_port);
             }
         }
@@ -965,13 +855,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             const Node& nd = g.nodes[static_cast<size_t>(hover_i)];
             const Rect cr = node_rect_s(nd);
             bool handled = false;
-            // Shift-click: toggle membership in the multi selection.
             if (frame.input.mods & platform::kModShift) {
                 out.clicked = nd.id;
                 out.clicked_shift = true;
                 handled = true;
             }
-            // Title-bar controls: X, then the enable dot.
             if (mouse.y < cr.y + kTitleH * z) {
                 const float lx = (mouse.x - cr.x) / z;
                 if (nd.remove_clicked && lx > kNodeW - 20.0f) {
@@ -995,9 +883,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     handled = true;
                 } else if (rh.row >= 0 && nd.rows[rh.row].kind != 0 &&
                            (rh.zone == 1 || rh.zone == 2)) {
-                    // Non-slider rows: the whole field is one
-                    // control — dropdowns open their option popup, text
-                    // rows open the shared inline editor.
                     const ParamRow& pr = nd.rows[rh.row];
                     if (pr.kind == 1 && pr.staged) {
                         st.dd_open = true;
@@ -1007,7 +892,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     } else if (pr.kind == 2) {
                         out.text_edit = nd.id;
                     } else if (pr.kind == 3 && pr.swatch && pr.staged) {
-                        // Swatch row: the shared color picker popup.
                         st.swatch_open = pr.swatch;
                         st.swatch_anchor = row_field_rect(nd, rh.row);
                         pr.swatch->open = true;
@@ -1018,7 +902,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         pr.swatch->edit_len = 0;
                         frame.ctx.set_popup_owner(pr.swatch);
                     } else if (pr.kind == 4 && pr.changed) {
-                        // Button row: the click IS the action.
                         *pr.changed = true;
                     }
                     handled = true;
@@ -1026,8 +909,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                            nd.rows[rh.row].staged &&
                            nd.rows[rh.row].format &&
                            std::strstr(nd.rows[rh.row].format, "deg")) {
-                    // Dial rows: angular drag around the knob,
-                    // RELATIVE - a press never jumps the angle.
+                    // A dial press must not jump the angle: the drag is
+                    // relative.
                     const ParamRow& pr = nd.rows[rh.row];
                     st.drag_kind = 8;
                     st.drag_id = nd.id;
@@ -1043,8 +926,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 1 &&
                            nd.rows[rh.row].staged) {
-                    // Press JUMPS the handle to the clicked point and
-                    // starts the drag (standard slider feel).
                     st.drag_kind = 3;
                     st.drag_id = nd.id;
                     st.drag_row = rh.row;
@@ -1055,16 +936,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 2 &&
                            nd.rows[rh.row].staged) {
-                    // The VALUE text opens the inline editor — only the
-                    // text area, never the track.
                     out.value_edit_node = nd.id;
                     out.value_edit_row = rh.row;
                     handled = true;
                 }
             }
             if (!handled) {
-                // Body press: select now, drag moves the node. A double
-                // click on a folded Group card enters it (subgraphs).
                 const bool second =
                     st.last_click_time >= 0.0 &&
                     st.clock - st.last_click_time < 0.4;
@@ -1073,8 +950,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     std::fabs(mouse.y - st.last_click_pos.y);
                 if (nd.kind == NodeKind::Group && second && dd < 8.0f &&
                     st.last_click_id == nd.id) {
-                    // Title double-click renames, body opens (texed
-                    // subgraph: title = rename, body = enter).
                     if (mouse.y < cr.y + kTitleH * z)
                         out.group_rename = nd.id;
                     else
@@ -1083,14 +958,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 } else if (nd.is_look && second && dd < 8.0f &&
                            st.last_click_id == nd.id &&
                            mouse.y >= cr.y + kTitleH * z) {
-                    // A look instance: enter the look it plays.
                     out.look_open = nd.id;
                     st.last_click_time = -1.0;
                 } else if (nd.text_edit && second && dd < 8.0f &&
                            st.last_click_id == nd.id &&
                            mouse.y < cr.y + kTitleH * z) {
-                    // Text card: title double-click edits the
-                    // string through the shared inline editor.
                     out.text_edit = nd.id;
                     st.last_click_time = -1.0;
                 } else {
@@ -1098,9 +970,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     st.last_click_pos = mouse;
                     st.last_click_id = nd.id;
                     out.clicked = nd.id;
-                    // Cards move by their TITLE BAR only — a body press
-                    // just selects (sliders, ports, and preview clicks
-                    // must never fling the card).
+                    // Only the title bar drags a card: a body press must not
+                    // move it.
                     if (mouse.y < cr.y + kTitleH * z) {
                         st.drag_kind = 1;
                         st.drag_id = nd.id;
@@ -1113,15 +984,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
         } else if (!port_handled &&
                    (frame.input.mods & platform::kModShift)) {
-            // Shift+drag on empty canvas: marquee selection.
             st.drag_kind = 6;
             st.node_grab_x = gmouse.x;
             st.node_grab_y = gmouse.y;
             frame.ctx.set_capture(wid);
         } else if (!port_handled) {
-            // Frame title strips: X removes, double-click renames,
-            // elsewhere drags; the bottom-right corner resizes (texed
-            // frame-resize handle).
             bool frame_handled = false;
             for (size_t f = 0; f < g.frame_count && !frame_handled; ++f) {
                 const FrameBox& fb = g.frames[f];
@@ -1145,7 +1012,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 } else if (fb.color_clicked &&
                            mouse.x > title.right() - 38.0f * z &&
                            mouse.x <= title.right() - 20.0f * z) {
-                    *fb.color_clicked = true;   // cycles the colour tag
+                    *fb.color_clicked = true;
                 } else {
                     const uint64_t fid = node_id(NodeKind::Frame, fb.id);
                     const float dd =
@@ -1162,7 +1029,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         st.last_click_id = fid;
                         st.drag_kind = 1;
                         st.drag_id = fid;
-                        // Alt: the frame moves ALONE (texed alt+drag).
                         st.drag_alt =
                             (frame.input.mods & platform::kModAlt) != 0;
                         st.node_grab_x = gmouse.x - fb.x;
@@ -1173,8 +1039,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 frame_handled = true;
             }
             if (!frame_handled) {
-                // Empty canvas: pan; a still click deselects;
-                // double-click requests the add popup.
                 st.drag_kind = 2;
                 st.drag_id = kEmptyPress;
                 frame.ctx.set_capture(wid);
@@ -1191,9 +1055,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             out.moved_x = gmouse.x - st.node_grab_x;
             out.moved_y = gmouse.y - st.node_grab_y;
             out.moved_alt = st.drag_alt;
-            // Splice-on-drop (texed): a single UNFED effect or group
-            // card dragged over a wire arms that wire; the drop splices
-            // it in (a group splices through its boundary members).
             st.drag_splice_from = st.drag_splice_to = 0;
             st.drag_splice_port = 0;
             const Node* dn = find_node(st.drag_id);
@@ -1202,7 +1063,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                  dn->kind == NodeKind::Group) &&
                 dn->has_in && g.multi_count <= 1) {
                 bool fed = false;
-                // Fed = any non-matte media wire in, slot ports included.
                 for (size_t w = 0; w < g.wire_count; ++w)
                     fed = fed || (!g.wires[w].data &&
                                   g.wires[w].to_port != 1 &&
@@ -1248,8 +1108,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 st.dial_last = a;
                 const float ds =
                     pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
-                // Knob radians -> display degrees -> the row's stored
-                // unit; the accumulator stays unsnapped.
+                // Knob radians go to display degrees, then to the stored unit.
                 st.dial_accum = std::clamp(
                     st.dial_accum + delta * 57.29578f / ds, pr.min_v,
                     pr.max_v);
@@ -1273,10 +1132,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
     if (frame.input.left_released() && st.drag_kind != 0) {
         if (st.drag_kind == 8) {
-            // Reverse wire drop: the fixed end is an input; connect from
-            // the Out port (or an In-node exit / ghost exit) under the
-            // cursor - NEAREST anchor wins, exits sit one row apart
-            // inside each other's pick radius.
+            // The nearest anchor wins: exits sit inside each other's radius.
             const Node* to_nd = find_node(st.wire_old_to);
             if (to_nd) {
                 float best_d2 = 324.0f;
@@ -1313,9 +1169,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.wire_old_to = 0;
             st.wire_old_port = 0;
         } else if (st.drag_kind == 4 || st.drag_kind == 5) {
-            // Drop resolution: nearest compatible port under the cursor.
-            // Mod sources wire into a PARAM ROW; everything else into
-            // In / aux / matte.
             const Node* from_nd = find_node(st.wire_from);
             const bool from_mod =
                 from_nd && from_nd->kind == NodeKind::ModSource;
@@ -1335,11 +1188,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     break;
                 }
             }
-            // NEAREST anchor wins, never list order: strip rows sit one
-            // row (18 px) apart, inside the pick radius of their
-            // neighbours - priority chains sent ghost drops to the
-            // matte. (Matte anchors: ANY image out — masks ARE images;
-            // the ghost "new input" mints its slot in one undo step.)
+            // The nearest anchor wins, never list order: rows sit 18 px apart.
             float best_d2 = 324.0f;
             for (size_t i = 0; i < n && !from_mod; ++i) {
                 const Node& nd = g.nodes[i];
@@ -1398,8 +1247,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             out.mq_y0 = std::min(st.node_grab_y, gmouse.y);
             out.mq_x1 = std::max(st.node_grab_x, gmouse.x);
             out.mq_y1 = std::max(st.node_grab_y, gmouse.y);
-            // Wires whose stroke crosses the rect join the selection
-            // (texed link marquee) — sampled in screen space.
             const Vec2 ra = to_screen({out.mq_x0, out.mq_y0});
             const Vec2 rb = to_screen({out.mq_x1, out.mq_y1});
             for (size_t w = 0;
@@ -1420,9 +1267,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
         } else if (st.drag_kind == 3 || st.drag_kind == 8) {
-            // A press always wrote a value (jump-to-point), so the
-            // release always breaks undo coalescing. Dial drags share
-            // the contract.
             const Node* nd = find_node(st.drag_id);
             if (nd && st.drag_row >= 0 && st.drag_row < nd->row_count &&
                 nd->rows[st.drag_row].released)
@@ -1442,8 +1286,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             out.frame_resize_released = true;
         } else if (st.drag_kind == 2 && !st.drag_moved &&
                    st.drag_id == kEmptyPress && owns) {
-            // Still click on empty canvas: a wire under the cursor gets
-            // selected (texed sel.links); else deselect; double = add.
             const float dd =
                 std::fabs(mouse.x - st.last_click_pos.x) +
                 std::fabs(mouse.y - st.last_click_pos.y);
@@ -1474,7 +1316,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     out.wire_to_port = g.wires[hit].to_port;
                     out.wire_data = g.wires[hit].data;
                     out.wire_to_row = g.wires[hit].to_row;
-                    st.last_click_id = 1;   // wire marker, not empty
+                    st.last_click_id = 1;   // 1 marks a wire click, not a node
                 } else {
                     out.clicked_empty = true;
                     st.last_click_id = kEmptyPress;
@@ -1489,7 +1331,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.clear_capture();
     }
 
-    // ---- draw
     canvas.draw_rect(r, theme.window_bg);
     canvas.push_clip(r);
 
@@ -1501,7 +1342,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                       theme.font_size_small, theme.text_disabled);
     }
 
-    // Grid, screen-space lines derived from the graph transform.
     {
         const Color minor = theme.hairline.with_alpha(0.35f);
         const Color major = theme.hairline.with_alpha(0.8f);
@@ -1523,7 +1363,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             canvas.draw_rect({r.x, r.y + y, r.w, 1.0f}, major);
     }
 
-    // Frames: titled grouping boxes behind everything else.
     for (size_t f = 0; f < g.frame_count; ++f) {
         const FrameBox& fb = g.frames[f];
         float fx = fb.x, fy = fb.y;
@@ -1541,7 +1380,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         const Vec2 tl = to_screen({fx, fy});
         const Rect box{tl.x, tl.y, fw * z, fh * z};
-        // Colour tag (texed frame colour): tint fill + outline.
         const bool tinted = fb.color >= 1 && fb.color <= 8;
         const Color fcol =
             tinted ? tint_palette()[(fb.color - 1) & 7] : theme.hairline;
@@ -1553,7 +1391,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                             : theme.hairline);
         canvas.draw_rect({box.x, box.y, box.w, 20.0f * z},
                          theme.control_bg.with_alpha(0.5f));
-        // Colour dot (cycles on click), left of the X.
         {
             const float dr = 3.5f * z;
             const Vec2 dc{box.right() - 29.0f * z, box.y + 10.0f * z};
@@ -1577,7 +1414,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                       {box.x + 8.0f * z, box.y + 4.0f * z}, 11.0f * z,
                       renaming ? theme.text : theme.text_dim);
         canvas.pop_clip();
-        // Corner resize handle: two diagonal ticks (texed frame-resize).
         for (int t = 0; t < 2; ++t) {
             const float o = (5.0f + t * 4.0f) * z;
             canvas.draw_line({box.right() - o, box.bottom() - 2.0f * z},
@@ -1592,10 +1428,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                          theme.text_disabled);
     }
 
-    // Wires under the cards. Mod wires land on the driven param's row
-    // gutter with a terminal dot; the rest end on ports. Endpoints come
-    // from wire_ends - the ONE derivation draw, hit and marquee share
-    // (an inline copy here drew slot wires on the wrong rows).
     for (size_t w = 0; w < g.wire_count; ++w) {
         const Node* a = find_node(g.wires[w].from);
         const Node* b = find_node(g.wires[w].to);
@@ -1607,9 +1439,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                              g.wires[w].to_row < b->row_count;
         const bool hot = st.hover == a->id || st.hover == b->id ||
                          g.selected == a->id || g.selected == b->id;
-        // TWO families only: MEDIA (chain/matte/aux/audio - one generic
-        // solid style, whatever the port) and DATA (the value graph,
-        // dashed dim). Selection alone wears the accent.
         Color col = theme.text_disabled.with_alpha(0.7f);
         bool dashed = false;
         if (g.wires[w].data) {
@@ -1628,9 +1457,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 (g.sel_wires[sw].to_row < 0 ||
                  g.sel_wires[sw].to_row == g.wires[w].to_row))
                 col = theme.accent;
-        // Armed splice target under the drag: exactly the ONE wire the
-        // drop will cut - same endpoints AND same port (image and audio
-        // wires share endpoints on the Output), never a data wire.
+        // Match the port too: image and audio wires share endpoints.
         if (st.drag_kind == 1 && st.drag_splice_to && !g.wires[w].data &&
             g.wires[w].from == st.drag_splice_from &&
             g.wires[w].to == st.drag_splice_to &&
@@ -1644,10 +1471,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Cards. Array order = z-order; the dragged card renders last.
+    // Array order is z order. The dragged card draws last.
     ui::probe_add("canvas", r);
-    const float ts = 12.0f * z;    // title em
-    const float rs = 10.0f * z;    // row em
+    const float ts = 12.0f * z;
+    const float rs = 10.0f * z;
     for (int pass = 0; pass < 2; ++pass) {
         for (size_t i = 0; i < n; ++i) {
             const Node& nd = g.nodes[i];
@@ -1663,9 +1490,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (cr.right() < r.x || cr.x > r.right() || cr.bottom() < r.y ||
                 cr.y > r.bottom())
                 continue;
-            // Script probes: cards by document id ("node:<id>", the
-            // Output as "node:output") plus their wire ports, so scripts
-            // click and drag canvas objects without coordinates.
+            // Scripts address these probe names. Keep them stable.
             {
                 const std::string pname =
                     nd.id == kOutNodeId
@@ -1686,8 +1511,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             for (size_t m = 0; m < g.multi_count && !in_multi; ++m)
                 in_multi = g.multi[m] == nd.id;
 
-            // Chrome: fill, title bar INSIDE the outline (it was painting
-            // over it), then the outline last so it always reads.
+            // Draw the outline last so the title bar does not cover it.
             canvas.draw_sdf_rect(cr, 5.0f * z,
                                  nd.bypassed ? theme.control_bg_active
                                              : theme.panel_bg);
@@ -1708,8 +1532,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                      : (hovered ? theme.text_disabled
                                                 : theme.hairline)));
             canvas.push_clip({tb.x, tb.y, tb.w - 40.0f * z, tb.h});
-            // Cards with a TEXT row edit in the row, not the
-            // title — suppress the title editor there.
             bool has_text_row = false;
             for (int tr = 0; tr < nd.row_count; ++tr)
                 if (nd.rows[tr].kind == 2) has_text_row = true;
@@ -1726,7 +1548,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                           {tb.x + 8.0f * z, tb.y + (tb.h - ts) * 0.4f}, ts,
                           nd.bypassed ? theme.text_disabled : theme.text);
             canvas.pop_clip();
-            float tcx = tb.right() - 12.0f * z;   // control cursor
+            float tcx = tb.right() - 12.0f * z;
             if (nd.remove_clicked) {
                 const float s = 3.2f * z;
                 const Vec2 c{tcx, tb.y + tb.h * 0.5f};
@@ -1763,18 +1585,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                 4.0f * z, theme.text_dim,
                                 theme.control_bg);
 
-            // Preview slot, then the port strip (matte/aux live in their
-            // own rows so their labels never overlap params).
             float cy = cr.y + kTitleH * z;
             if (node_has_preview(nd)) {
                 const Rect pv{cr.x + 6.0f * z, cy + 3.0f * z,
                               cr.w - 12.0f * z, kPrevH * z - 6.0f * z};
                 if (nd.wave_card) {
-                    // Audio card: a waveform graph in the preview slot.
-                    // Two traces on one axis - the input sum behind in
-                    // the dim tone, the node's OUTPUT in front in the
-                    // accent - each an exact min/max envelope column
-                    // fill. No traces yet = the empty graph.
+                    // Draw the input trace first: the output stays in front.
                     canvas.draw_sdf_rect(pv, 3.0f * z,
                                          theme.control_bg_active);
                     const float mid = pv.y + pv.h * 0.5f;
@@ -1822,8 +1638,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
                 cy += (kPrevH + 6.0f) * z;
             } else if (nd.scope && nd.scope_count > 1) {
-                // Signal strip: the node's output from NOW (left edge)
-                // across the sampled window, auto-framed by lo/hi.
                 const Rect sv{cr.x + 6.0f * z, cy + 3.0f * z,
                               cr.w - 12.0f * z, kScopeH * z - 6.0f * z};
                 canvas.draw_sdf_rect(sv, 3.0f * z, theme.control_bg);
@@ -1858,7 +1672,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
             cy += static_cast<float>(port_row_count(nd)) * kRowH * z;
 
-            // Param rows.
             const RowHit rh = hovered ? hit_row(nd) : RowHit{};
             for (int row = 0; row < nd.row_count; ++row) {
                 const ParamRow& pr = nd.rows[row];
@@ -1867,9 +1680,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 Color lab = theme.text_dim;
                 if (pr.keyed) lab = theme.accent;
                 else if (pr.modulated) lab = theme.accent_dim;
-                // Persistent keyframe toggle (no hover hotspots): filled
-                // accent = the param is keyed (click removes its lane),
-                // hollow = unkeyed (click starts one at the playhead).
                 float label_x = cr.x + 8.0f * z;
                 if (pr.key_clicked) {
                     const float kr2 = 3.0f * z;
@@ -1888,8 +1698,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                 : theme.text_disabled);
                     label_x = cr.x + 17.0f * z;
                 }
-                // Expose toggle (group face): square dot beside the
-                // key dot on scoped member rows — filled = on the face.
                 if (pr.expose_clicked) {
                     const float er = 2.8f * z;
                     const Vec2 ec{cr.x + 21.0f * z,
@@ -1912,8 +1720,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                               rs, lab);
                 canvas.pop_clip();
                 if (pr.kind != 0) {
-                    // Dropdown / text FIELD spanning the slider + value
-                    // area — same row height and margins.
+                    // Keep this rect equal to row_field_rect: hits use that.
                     const float fx0 = cr.x + 64.0f * z;
                     const Rect fr{fx0, ry + 1.5f * z,
                                   (cr.right() - 8.0f * z) - fx0,
@@ -1921,8 +1728,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     const bool field_hot =
                         row_hot && (rh.zone == 1 || rh.zone == 2);
                     if (pr.kind == 5) {
-                        // Status label: text only, no field chrome, no
-                        // interaction.
                         canvas.push_clip({fx0, ry,
                                           (cr.right() - 8.0f * z) - fx0,
                                           kRowH * z});
@@ -1934,8 +1739,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         continue;
                     }
                     if (pr.kind == 4) {
-                        // Button row: one full-width action, probed by
-                        // its label for scripted clicks.
                         canvas.draw_sdf_rect(fr, 2.0f * z,
                                              field_hot
                                                  ? theme.control_bg_hover
@@ -1956,8 +1759,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         continue;
                     }
                     if (pr.kind == 3 && pr.staged) {
-                        // Swatch: the field IS the color; a click opens
-                        // the shared picker popup.
                         canvas.draw_sdf_rect(
                             fr, 2.0f * z,
                             Color{pr.staged[0], pr.staged[1],
@@ -2029,7 +1830,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     }
                     canvas.pop_clip();
                     if (pr.kind == 1) {
-                        // Chevron at the field's right edge.
                         const float cx2 = fr.right() - 8.0f * z;
                         const float cy2 = ry + kRowH * z * 0.5f - 1.0f * z;
                         const float cs = 2.6f * z;
@@ -2042,7 +1842,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     }
                     continue;
                 }
-                // Slider strip - or the angle DIAL for deg rows.
                 const float sx0 = cr.x + 64.0f * z;
                 const float sx1 = cr.x + (kNodeW - 46.0f) * z;
                 const float sy = ry + kRowH * z * 0.5f;
@@ -2051,7 +1850,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 const float row_ds =
                     pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
                 if (dial_row) {
-                    // Knob ring + needle; 0 deg points up, cw positive.
+                    // 0 degrees points up and clockwise is positive.
                     const float kcx = sx0 + 7.0f * z;
                     const float kr = 5.5f * z;
                     canvas.draw_sdf_rect_outline(
@@ -2091,8 +1890,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                          row_hot ? theme.text
                                                  : theme.text_dim);
                 }
-                // Live tick: where the driven value actually sits this
-                // frame — the handle keeps editing the stored base.
                 if (pr.has_live) {
                     const float lt = std::clamp(
                         (pr.live - pr.min_v) /
@@ -2105,14 +1902,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                      theme.accent);
                 }
                 }
-                // Value text — ALWAYS visible (the typed buffer replaces
-                // it only while this row is being edited).
                 const bool row_editing = g.value_edit_node == nd.id &&
                                          g.value_edit_row == row;
                 if (row_editing) {
-                    // Text field matching the value column: text RIGHT-
-                    // justified to the same 8-unit margin the value uses,
-                    // padded box, blinking caret at the insertion point.
                     const char* etext =
                         g.value_edit_text ? g.value_edit_text : "";
                     const Vec2 es =
@@ -2149,9 +1941,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
 
-            // Ports. Connected ports draw FILLED, empty ones as rings;
-            // the port under the cursor lights accent (texed port hover
-            // + connected-port fill).
             const float pr2 = 4.0f * z;
             bool in_fed = false, matte_fed = false, aux_fed = false,
                  out_fed = false;
@@ -2179,9 +1968,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                      in_fed);
             if (nd.has_out) draw_port(port_out(nd), theme.text_disabled,
                                       out_fed);
-            // Group input slots past the first: plain dots stacked down
-            // the edge, then the faded ghost ring that mints the next
-            // slot when wired. No rows, no labels.
             for (int k = 1; k <= nd.slot_rows; ++k) {
                 bool fed = false;
                 for (size_t w = 0; w < g.wire_count; ++w)
@@ -2200,10 +1986,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     {p.x - pr2, p.y - pr2, pr2 * 2, pr2 * 2}, pr2, 1.3f,
                     gc);
             }
-            // GroupIn exits: one dot per input slot, matching their
-            // order - LABELLED, so fan-in stacking order stays legible
-            // inside the group editor (the collapsed card's stack stays
-            // label-free). The faded ghost exit mints interiorly.
             for (int k = 0; k < nd.exit_rows; ++k) {
                 bool fed = false;
                 for (size_t w = 0; w < g.wire_count; ++w)
@@ -2250,7 +2032,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Breadcrumb chips over everything but the menus.
     if (g.crumb) {
         const Rect mr2 = crumb_main_rect();
         const bool hot = mr2.contains(mouse);
@@ -2268,7 +2049,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                       theme.text);
     }
 
-    // Marquee rectangle while dragging.
     if (st.drag_kind == 6) {
         const Vec2 a = to_screen({st.node_grab_x, st.node_grab_y});
         const Rect mq{std::min(a.x, mouse.x), std::min(a.y, mouse.y),
@@ -2277,9 +2057,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         canvas.draw_rect_outline(mq, 1.0f, theme.accent_dim);
     }
 
-    // Live wire drag: rubber band from the origin Out port + accent rings
-    // on every compatible drop port (a mod source targets param ROWS —
-    // the hovered row lights up).
     if (st.drag_kind == 4 || st.drag_kind == 5) {
         const Node* from_nd = find_node(st.wire_from);
         if (from_nd) {
@@ -2345,8 +2122,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Reverse wire drag (kind 8): rubber band into the fixed input port +
-    // rings on every Out port that may feed it.
     if (st.drag_kind == 8) {
         const Node* to_nd = find_node(st.wire_old_to);
         if (to_nd) {
@@ -2373,9 +2148,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (nd.id == st.wire_old_to) continue;
                 if (!out_feeds_input(nd, *to_nd, st.wire_old_port))
                     continue;
-                // Ring the anchors that ACTUALLY exist: a multi-exit
-                // card (the In node) rings its exit dots + ghost, never
-                // the single-out anchor it no longer has.
                 auto ring = [&](Vec2 p) {
                     canvas.draw_sdf_rect_outline(
                         {p.x - pr3, p.y - pr3, pr3 * 2, pr3 * 2}, pr3,
@@ -2390,8 +2162,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Add menu at the cursor (texed): filter header + scrolling list; the
-    // splice-target wire redraws highlighted while it is open.
     if (st.add_open) {
         if (st.splice_to) {
             Wire sw{st.splice_from, st.splice_to, st.splice_port};
@@ -2418,7 +2188,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         canvas.push_clip({mr.x, mr.y + 26.0f, mr.w,
                           mr.h - 32.0f});
         if (cat_mode) {
-            // Category rows; the open/hovered one carries a ▸ flyout.
             for (int c = 0; c < cat_count; ++c) {
                 const float ry = mr.y + 26.0f + c * 18.0f;
                 const bool open = cat_rows[c] == st.add_cat;
@@ -2466,7 +2235,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
         }
         canvas.pop_clip();
-        // Overflow scrollbar (flat mode): track + proportional thumb.
         const float content_h = static_cast<float>(g.add_count) * 18.0f;
         const float view_h = menu_visible * 18.0f;
         if (!cat_mode && content_h > view_h) {
@@ -2485,7 +2253,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             ui::draw_text(canvas, frame.font, "no match",
                           {mr.x + 10.0f, mr.y + 30.0f}, 11.0f,
                           theme.text_disabled);
-        // Flyout submenu for the open category.
         if (cat_mode && st.add_cat >= 0 && fly1 > fly0) {
             const Rect fr2 = fly_rect();
             canvas.draw_sdf_rect(fr2, 5.0f, theme.control_bg);
@@ -2508,7 +2275,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Context menu (texed popupMenu): plain hover rows at the cursor.
     if (st.ctx_open && g.ctx_count) {
         const Rect mr = ctx_rect();
         canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
@@ -2526,8 +2292,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Port stack popup: feeder titles top-first (row 0 = the top of the
-    // stack) with ^/v arrows on the right.
     if (st.port_menu_open) {
         const size_t feeds = port_feed_count();
         const Rect mr = port_menu_rect(feeds);
@@ -2539,12 +2303,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (wr.data || wr.to != st.port_menu_node ||
                 wr.to_port != st.port_menu_port)
                 continue;
-            // Feed index `seen` (bottom-first) draws at the mirrored row.
+            // The feed index counts from the bottom, so mirror the row.
             const size_t row = feeds - 1 - seen;
             const float ry = mr.y + 4.0f + static_cast<float>(row) * 20.0f;
-            // Multi-exit feeders (the In node) name the EXIT, not the
-            // card - every exit carries different media, and five rows
-            // all reading "input" order nothing.
             const char* title = "?";
             char exit_title[16];
             for (size_t i = 0; i < g.node_count; ++i)
@@ -2583,8 +2344,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Param dropdown popup: options under the field, current one
-    // in accent, hover fill — the ctx menu's visual language.
     if (dd_row_p) {
         const int n = doc::param_option_count(dd_row_p->options);
         const Rect mr = dd_rect();
@@ -2615,8 +2374,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    // Open card swatch: hand the shared color picker its per-frame out
-    // pointers; the popup pass draws and edits it above everything.
     if (st.swatch_open && sw_row) {
         ui::Context::PopupRequest req;
         req.kind = ui::Context::PopupKind::Color;
@@ -2645,7 +2402,7 @@ float node_height_of(const Node& nd) {
     float h = node_height(nd.row_count, node_has_preview(nd),
                           port_row_count(nd));
     if (!node_has_preview(nd) && nd.scope && nd.scope_count > 1)
-        h += kScopeH + 6.0f - 2.0f;   // scope strip replaces the 2px gap
+        h += kScopeH + 6.0f - 2.0f;   // the scope strip replaces the 2 px gap
     return h;
 }
 
@@ -2661,8 +2418,6 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
             if (g.nodes[i].id == id) return &g.nodes[i];
         return nullptr;
     };
-    // Same geometry the draw uses: ports sit on the title/preview band,
-    // the aux input below the strip top.
     auto strip_top = [](const Node& nd) {
         return kTitleH + (node_has_preview(nd) ? kPrevH + 6.0f
                           : nd.scope && nd.scope_count > 1 ? kScopeH + 6.0f
@@ -2676,12 +2431,11 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
     bool found = false;
     for (size_t w = 0; w < g.wire_count; ++w) {
         const Wire& wr = g.wires[w];
-        if (wr.data || wr.to_port == 1) continue;   // image chain + aux only
+        if (wr.data || wr.to_port == 1) continue;
         const Node* a = find_node(wr.from);
         const Node* b = find_node(wr.to);
         if (!a || !b) continue;
-        // Mirrors the canvas's own anchors (port_stack/port_exit) - a
-        // free function cannot share the lambdas, so keep in sync.
+        // Keep in sync with port_stack and port_exit in the canvas.
         auto stack_y = [](const Node& nd, int i) {
             const float cy = node_has_preview(nd)
                 ? kTitleH + kPrevH * 0.5f
@@ -2714,7 +2468,6 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
                 : stacked && wr.to_port == 0 && b->has_in
                 ? to_screen({b->x, b->y + stack_y(*b, 0)})
                 : to_screen({b->x, b->y + port_y(*b)});
-        // Sampled bezier distance, matching the canvas's own splice hit.
         const float d2 = wire_dist2(p0, p3, screen);
         if (d2 < best) {
             best = d2;

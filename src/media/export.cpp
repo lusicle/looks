@@ -53,7 +53,7 @@ ExportResult export_movie_impl(uint32_t width, uint32_t height,
         return result;
     }
 
-    // ---- video: produce -> encode -> AVCC packets (pts == dts, no B).
+    // The encoder emits no B-frames, so pts == dts.
     platform::H264Encoder video_encoder;
     if (!video_encoder.create(width, height, fps_num, fps_den,
                               options.video_bitrate_bps, &result.error,
@@ -105,7 +105,6 @@ ExportResult export_movie_impl(uint32_t width, uint32_t height,
         return result;
     }
 
-    // ---- audio: the project mix -> AAC packets.
     std::vector<AudioPacket> audio_packets;
     std::vector<uint8_t> audio_asc;
     uint32_t audio_channels = 0;
@@ -124,11 +123,8 @@ ExportResult export_movie_impl(uint32_t width, uint32_t height,
             while (audio_encoder.receive(packet))
                 audio_packets.push_back({packet.data, packet.pts_100ns});
         };
-        // Export exactly the video's duration of audio, measured by the
-        // same frame->sample rule the monitor cursor uses. The skip maps
-        // output sample s to mix position s + skip; anything outside
-        // every source is silence (a gap, a negative nudge, trim past
-        // the end).
+        // Use the same frame-to-sample rule as the monitor; sample s
+        // reads mix position s + skip.
         const double vfps =
             static_cast<double>(fps_num) / static_cast<double>(fps_den);
         const uint64_t total_frames = static_cast<uint64_t>(
@@ -156,7 +152,6 @@ ExportResult export_movie_impl(uint32_t width, uint32_t height,
         pump_audio();
     }
 
-    // ---- mux (faststart)
     MuxVideoParams video_params;
     video_params.width = width;
     video_params.height = height;
@@ -209,8 +204,7 @@ ExportResult export_movie_impl(uint32_t width, uint32_t height,
 
 }  // namespace
 
-// Every failure exits through here so the log always carries the reason,
-// not just the status line.
+// Every failure exits through here so the log carries the reason.
 ExportResult export_movie(uint32_t width, uint32_t height, uint32_t fps_num,
                           uint32_t fps_den, uint32_t frame_count,
                           const FrameProducer& producer,

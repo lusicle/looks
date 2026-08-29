@@ -75,8 +75,6 @@ void GpuImage::transition(VkCommandBuffer cmd, VkImageLayout new_layout) {
     layout_ = new_layout;
 }
 
-// ------------------------------------------------------------ staging
-
 StagingBuffer::~StagingBuffer() {
     reset();
     if (buffer_)
@@ -92,9 +90,7 @@ void StagingBuffer::reset() {
 
 bool StagingBuffer::ensure(size_t needed) {
     if (capacity_ >= needed) return true;
-    // Growth retires the old buffer instead of destroying it: copies
-    // recorded earlier this frame still reference it, so it must survive
-    // until the slot's fence proves the frame executed (next reset()).
+    // Recorded copies use the old buffer; it must live until the slot fence.
     if (buffer_) retired_.push_back({buffer_, allocation_});
     size_t capacity = 4u << 20;
     while (capacity < needed) capacity *= 2;
@@ -139,8 +135,6 @@ bool StagingBuffer::upload_image(VkCommandBuffer cmd, const void* data,
     return true;
 }
 
-// -------------------------------------------------------------- pool
-
 GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
     for (Entry& e : entries_) {
         if (!e.in_use && e.image->width() == width &&
@@ -150,8 +144,7 @@ GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
             return e.image.get();
         }
     }
-    // TRANSFER_DST: the render cache's hit path re-uploads a stored frame
-    // straight into a pooled target.
+    // The render cache uploads into pooled targets; keep TRANSFER_DST.
     auto image = GpuImage::create(
         device_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -170,8 +163,7 @@ void TargetPool::release(GpuImage* image) {
 void TargetPool::release_all() {
     ++gen_;
     for (Entry& e : entries_) e.in_use = false;
-    // Retire sizes nothing acquired lately; the slot fence the caller
-    // just waited on proves free entries are GPU-idle here.
+    // The caller's slot fence wait proves free entries are GPU idle here.
     entries_.erase(
         std::remove_if(entries_.begin(), entries_.end(),
                        [&](const Entry& e) {

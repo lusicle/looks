@@ -123,8 +123,8 @@ void Renderer::notify_resize(uint32_t width, uint32_t height) {
 bool Renderer::begin_frame(FrameContext& out) {
     if (needs_recreate_) {
         if (pending_width_ == 0 || pending_height_ == 0)
-            return false;   // minimized — nothing to render
-        // Semaphores may be pending from the destroyed images; rebuild all.
+            return false;
+        // Semaphores can still be pending on old images; rebuild them all.
         device_->wait_idle();
         swapchain_->recreate(pending_width_, pending_height_);
         create_per_image_sync();
@@ -164,7 +164,6 @@ bool Renderer::begin_frame(FrameContext& out) {
 
 void Renderer::begin_present_pass(const FrameContext& frame,
                                   const VkClearColorValue& clear) {
-    // Swapchain image: undefined -> color attachment.
     VkImageMemoryBarrier to_color{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_color.srcAccessMask = 0;
     to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -207,13 +206,11 @@ void Renderer::end_frame(const FrameContext& frame) {
 
     vkCmdEndRendering(f.cmd);
 
-    // Screenshot capture: route the finished image through TRANSFER_SRC
-    // and copy it out before the present transition.
     const size_t cap_bytes = size_t{frame.extent.width} *
                              frame.extent.height * 4;
     const bool capturing =
         capture_pending_ && ensure_capture_buffer(cap_bytes);
-    capture_pending_ = false;   // a failed alloc drops the request, logged
+    capture_pending_ = false;  // a failed alloc drops the request
     if (capturing) {
         VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -267,7 +264,6 @@ void Renderer::end_frame(const FrameContext& frame) {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &render_done;
 
-    // Queue access is shared with export workers — serialize.
     std::lock_guard<std::mutex> lock(device_->queue_mutex());
     vk_check(vkQueueSubmit(device_->graphics_queue(), 1, &submit, f.in_flight),
              "vkQueueSubmit(frame)");
@@ -282,10 +278,7 @@ void Renderer::end_frame(const FrameContext& frame) {
     ++frame_counter_;
 
     if (capturing) {
-        // One blocking fence wait on the capturing frame only; then the
-        // bytes convert to RGBA rows (swapchain formats are BGRA-ordered
-        // on this platform; sRGB-encoded bytes are exactly what the PNG
-        // wants).
+        // Bytes stay sRGB encoded; the PNG writer expects that.
         vk_check(vkWaitForFences(device_->device(), 1, &f.in_flight, VK_TRUE,
                                  UINT64_MAX),
                  "vkWaitForFences(capture)");
@@ -301,8 +294,7 @@ void Renderer::end_frame(const FrameContext& frame) {
             for (size_t i = 0; i < cap_bytes; i += 4)
                 std::swap(p[i], p[i + 2]);
         }
-        // The UI composites opaque; force alpha so viewers ignore
-        // whatever the blend left in the channel.
+        // Force opaque alpha; the blend leaves garbage in the channel.
         for (size_t i = 3; i < cap_bytes; i += 4) capture_rgba_[i] = 255;
         capture_w_ = frame.extent.width;
         capture_h_ = frame.extent.height;

@@ -1,4 +1,4 @@
-// Gradients are taken in encoded space, since edges are perceptual.
+// Take the gradients in encoded space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,9 +13,9 @@ cbuffer Push
     uint frame;
     float fps;
     float threshold;
-    float mode;        // 0 white-on-black, 1 black-on-white, 2 over image
+    float mode;
     float thickness;   // sample radius, px
-    float algo;        // 0 sobel, 1 difference of gaussians
+    float algo;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -39,7 +39,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 e = thickness / size;
     float mag;
     if (algo >= 0.5) {
-        // Band-pass rather than a gradient ramp, so edges come out softer.
         float inner = 0.0, outer = 0.0;
         [unroll]
         for (int dy = -1; dy <= 1; ++dy)

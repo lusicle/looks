@@ -33,7 +33,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 q = uv * scale * 3.0;
     const float drift = t * 0.07;
 
-    // Two offset noise fields give a slow curl-like displacement.
     const float wx = fx_vnoise2(seed ^ 0x11u, q + drift) - 0.5;
     const float wy = fx_vnoise2(seed ^ 0x22u, q + 17.3 - drift) - 0.5;
     const float2 suv =
@@ -41,7 +40,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 weaved = input.SampleLevel(suv, 0);
     float3 col = weaved.rgb;
 
-    // Decorrelated per channel, so layers fade at different rates.
     if (mottle > 0.001) {
         const float mr = fx_vnoise2(seed ^ 0x33u, q * 1.7 + drift) - 0.5;
         const float mg = fx_vnoise2(seed ^ 0x44u, q * 1.7 + 31.0) - 0.5;
@@ -49,7 +47,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         col *= 1.0 + float3(mr, mg * 0.6, mb) * mottle * 0.7;
     }
 
-    // Dark olive blob centers with a bleached halo at the lifted edge.
     if (mold > 0.001) {
         const float n = fx_vnoise2(seed ^ 0x66u, q * 2.3 + drift * 0.4) * 0.65 +
                         fx_vnoise2(seed ^ 0x77u, q * 6.1) * 0.35;

@@ -1,16 +1,5 @@
-// Frame render cache: CPU-side store of final rendered frames
-// keyed on (frame index, upstream-graph hash) with an LRU byte budget
-// (default 2 GB). The "upstream graph" of the final frame is the whole
-// document plus everything else that shapes the output (proxy divisor,
-// preview tap, media identity); callers fold all of it into one context
-// hash. A context change flushes the cache wholesale — an entry from an
-// edited document can never be served.
-//
-// Only pure frames belong here: anything history-bearing (feedback,
-// slit-scan, Codec-Box, ...) is not a function of (document, frame index)
-// and must bypass the cache — see doc::document_uses_history.
-//
-// Vulkan-free on purpose: unit-tested without a GPU, like graph.cpp.
+// History-bearing frames must bypass the cache: see document_uses_history.
+// Keep this file Vulkan-free; unit tests link it without a GPU.
 
 #pragma once
 
@@ -24,10 +13,10 @@ namespace looks::gfx {
 class RenderCache {
 public:
     struct Frame {
-        std::vector<uint16_t> halves;   // RGBA16F, tightly packed
+        std::vector<uint16_t> halves;  // RGBA16F, tightly packed
         uint32_t width = 0;
         uint32_t height = 0;
-        uint64_t stamp = 0;             // LRU clock
+        uint64_t stamp = 0;
     };
 
     // Changing the context invalidates every entry.
@@ -41,13 +30,11 @@ public:
     size_t count() const { return frames_.size(); }
     uint64_t hits() const { return hits_; }
 
-    // Freshens the entry's LRU stamp. Pointer valid until the next
-    // insert/set_budget/set_context/clear.
+    // The pointer stays valid only until the next mutating call.
     const Frame* find(uint32_t frame);
 
-    // Takes ownership of `halves` (width*height*4 values). Dropped when
-    // `context` is stale, the cache is disabled, or the single frame
-    // exceeds the whole budget; otherwise evicts LRU entries to fit.
+    // halves holds width*height*4 values.
+    // Stale context, disabled cache, or oversize frame drops inserts silently.
     void insert(uint64_t context, uint32_t frame, uint32_t width,
                 uint32_t height, std::vector<uint16_t> halves);
 
@@ -58,7 +45,7 @@ private:
 
     std::unordered_map<uint32_t, Frame> frames_;
     uint64_t context_ = 0;
-    size_t budget_ = size_t{2048} << 20;   // default 2 GB
+    size_t budget_ = size_t{2048} << 20;
     size_t total_bytes_ = 0;
     uint64_t clock_ = 0;
     uint64_t hits_ = 0;

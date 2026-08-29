@@ -1,24 +1,6 @@
-// Decode pool: one decoded frame per PLACEMENT.
-//
-// The single Player owned one reader and one playhead, which is exactly as
-// many sources as a rack could show. A look tree can have several playing at
-// once - at different source frames, at different speeds, nested - so the
-// pool keeps a stream per active placement, keyed by the same instance key
-// compile_graph stamps on the matching Source node.
-//
-// What plays when is a closed form (doc/instances.h), not a walk, so the
-// pool can evaluate any frame directly. PREWARM uses that: it asks what
-// will be playing a second from now and decodes into those streams early,
-// which is what makes a cut - or a nested look's in-point - land without a
-// hitch instead of stalling on a cold file open.
-//
-// Decode is exact, never nearest-available: a frame the render cache stores
-// must be the frame that was asked for. Streams decode in parallel across
-// worker threads; within a stream, order is serial.
-//
-// One pool per consumer thread (preview worker / export worker) - the
-// public calls are single-threaded by design; only the internal workers are
-// concurrent.
+// Decode is exact, never nearest available.
+// Streams decode in parallel; inside one stream, decode order is serial.
+// Use one pool per consumer thread; the public calls are single-threaded.
 
 #pragma once
 
@@ -48,69 +30,45 @@ struct SourceFrame {
 
 class DecodePool {
 public:
-    // The name prefixes this pool's log lines (preview / export / ...):
-    // several pools share one log and their stalls read identically
-    // without it.
     explicit DecodePool(const char* name = "pool");
     ~DecodePool();
 
     DecodePool(const DecodePool&) = delete;
     DecodePool& operator=(const DecodePool&) = delete;
 
-    // Re-flattens the look tree when `revision` moves; cheap otherwise, so
-    // callers hand it the document every frame without checking.
+    // Re-flattens only when revision moves; callers can call this per frame.
     void set_document(const doc::Document& doc, uint64_t look_id,
                       const std::vector<AssetBundle>& bundles,
                       uint64_t revision);
 
     struct Request {
         uint64_t key = 0;
-        // Decode-stream identity: the CANONICAL key from set_document's
-        // fold - one stream per instance key, with keys whose whole
-        // mapping sets match (matte arms, locked feeds, forked
-        // duplicates) folded onto one, so identical decodes never run
-        // twice and a stream never splits per block.
+        // Canonical stream key: keys with the same mapping set fold onto one.
         uint64_t alias = 0;
         size_t source = 0;      // index into sources()
         uint32_t frame = 0;   // asset frame, clamped into the media
     };
-    // Every placement playing at a root frame. Pure - no decode, no state.
+    // Pure: it does no decode and changes no state.
     std::vector<Request> plan(uint32_t root_frame) const;
 
-    // Loop wrap window [in, out) for the prewarm horizon: when looping
-    // playback approaches `out`, the frames after the wrap play next -
-    // without this every lap re-entered the loop start cold. 0/0 = off
-    // (also the right call under an active time remap, whose wrap
-    // target is not the raw loop frame).
+    // Loop wrap window [in, out) for the prewarm horizon; 0/0 turns it off.
+    // Keep it off under a time remap, which does not wrap to a loop frame.
     void set_loop(uint32_t in_frame, uint32_t out_frame);
 
-    // Decodes the whole plan (blocking on a miss) and queues the prewarm
-    // for the frames after it. Frames stay alive until the next collect().
-    // `scrub` marks an in-progress playhead DRAG: every position is
-    // disposable, so a native ask that would cost a keyframe roll snaps
-    // to the nearest frame the session serves in one feed instead of
-    // stalling the caller per position. The gesture's end re-renders the
-    // exact frame; the caller must gate its frame cache while scrubbing
-    // so approximate pixels are never stored (which is what the
-    // exact-decode rule exists to protect).
+    // Frames stay alive until the next collect().
+    // With scrub, a frame can be approximate; the caller must not store it.
     const std::vector<SourceFrame>& collect(uint32_t root_frame,
                                             bool scrub = false);
 
-    // Shutdown point of no return: every in-flight and future roll bails
-    // at its next sample and misses return null, so a stopping consumer
-    // never waits out a keyframe roll.
+    // Point of no return: every roll bails and later misses return null.
     void abort();
 
     const std::vector<doc::MediaInstance>& sources() const { return sources_; }
 
-    // Frames decoded from disk since the last reset - a decode this frame
-    // that prewarm did not already have. Playback smoothness, measurable.
+    // Frames decoded from disk that prewarm did not already hold.
     uint64_t misses() const { return misses_; }
 
-    // True when the LAST collect served any scrub-approximated frame
-    // (nearest ringed, or a snapped roll floor). The caller must treat
-    // that render as UNSETTLED — re-collect until exact — and must not
-    // store it anywhere durable.
+    // True when the last collect served an approximate frame; do not store it.
     bool approximated() const { return approximated_; }
 
 private:
@@ -118,18 +76,13 @@ private:
         std::filesystem::path path;   // decodable file: source (native) or mez
         bool native = false;
         uint32_t frames = 0;
-        uint64_t key = 0;             // the instance key, for log lines
-        // `m` guards the ring/want and is only ever held briefly - a
-        // ring PROBE must never wait behind a decode in flight. `cv`
-        // fires on every ring insert: a consumer whose frame is already
-        // on a supplier's in-flight roll waits HERE, not on the session
-        // mutex - seizing the session serialized all decode into the
-        // consumer's blocked window and pinned supply to the playhead.
+        uint64_t key = 0;             // the instance key
+        // m guards the ring and want; hold it briefly, never across a decode.
+        // cv fires on every ring insert; a consumer waits here, not on a
+        // session mutex.
         std::mutex m;
         std::condition_variable cv;
-        // Mez reader BANK (stills, cover art, direct .mez): intra-only,
-        // so frames decode independently - each slot owns its own FILE* +
-        // scratch and several frames of one stream decode concurrently.
+        // Each slot owns its FILE* and scratch, so slots decode concurrently.
         struct Slot {
             std::mutex m;
             codec::MezReader reader;
@@ -138,18 +91,12 @@ private:
         };
         static constexpr size_t kSlots = 4;
         Slot slots[kSlots];
-        // Hold-frame alias (stills, cover art): the payload decoded last
-        // and where it lives, guarded by `m`. A frame pointing at the
-        // same offset reuses the decoded pixels instead of re-decoding
-        // an identical payload every timeline frame.
+        // The last decoded payload and its offset, guarded by m. An equal
+        // offset reuses the pixels.
         uint64_t last_payload_off = 0;
         std::shared_ptr<const codec::DecodedFrame> last_payload_frame;
-        // Native SESSION bank: a session is a demux cursor over the frame
-        // index plus an H.264 decoder rolling forward through the source.
-        // The playback session tracks the playhead; the second serves a
-        // seek or a prewarmed cut without disturbing it. Same locking
-        // shape as the slots: one mutex per session, held across a
-        // decode; the ring mutex stays brief.
+        // One mutex per session, held across a decode; the ring mutex
+        // stays brief.
         struct Session {
             std::mutex m;
             platform::H264Decoder dec;
@@ -157,23 +104,16 @@ private:
             bool created = false;         // guarded by the session mutex
             bool ok = false;
             uint32_t next_decode = 0;     // next decode-order sample to feed
-            // Expected next output (-1 = must seek) and the keyframe run
-            // the session currently sits in (its start, decode order).
-            // Written under the session mutex; read lock-free as routing
-            // HINTS: an ask inside a session's run WAITS on that session
-            // - duplicating its roll on the idle one is what turned one
-            // miss into two concurrent full-GOP decodes.
+            // -1 means the session must seek; run_key is its keyframe run
+            // start, in decode order. The session mutex guards the writes;
+            // reads are lock-free routing hints.
             std::atomic<int64_t> next_present{-1};
             std::atomic<int64_t> run_key{-1};
-            // One advisory waiter may queue behind a busy owner: with a
-            // plain try-lock, the consumer's own roll starved every
-            // prewarm worker and ended up doing all decode serially
-            // inside collect; with unbounded waiters, workers convoy.
+            // At most one advisory waiter may queue behind a busy owner.
             std::atomic<bool> waiter{false};
             bool draining = false;        // end of stream was signalled
-            // Receive scratch: capacity survives across fetches, so the
-            // decoder fills it without a fresh multi-MB allocation per
-            // frame.
+            // Capacity must survive across fetches to stop a per-frame
+            // allocation.
             platform::VideoFrameNV12 scratch;
 
             ~Session();
@@ -188,35 +128,26 @@ private:
         // Decoded frames by index, newest last. Bounded by ring_depth_.
         std::deque<std::pair<uint32_t, std::shared_ptr<const codec::DecodedFrame>>>
             ring;
-        // The ringed frame, or null. Caller holds `m`.
+        // Returns the ringed frame or null; the caller holds m.
         std::shared_ptr<const codec::DecodedFrame> ringed(uint32_t frame) const {
             for (const auto& e : ring)
                 if (e.first == frame) return e.second;
             return nullptr;
         }
-        // Evicted frames nobody else holds recycle here (guarded by `m`):
-        // their vectors keep capacity, so the next decode reuses pages
-        // instead of paying an ~18 MB alloc + fault per 4K frame.
+        // Recycled frames, guarded by m; they keep capacity for the next
+        // decode.
         std::vector<std::shared_ptr<codec::DecodedFrame>> spare;
         uint32_t want = 0;       // the frame the consumer last asked for
         uint32_t last_want = 0;  // previous ask: backward motion widens rolls
-        // Upcoming block entries on this stream (same key, different
-        // placements: blocks of one look share a stream whose position
-        // JUMPS at every cut). Their windows are protected from
-        // eviction so the cut prerolls survive until the playhead
-        // arrives - dense stutter cuts put SEVERAL entries inside the
-        // prewarm horizon at once. 0xFFFFFFFF = empty slot.
+        // Upcoming block entries on this stream; 0xFFFFFFFF is an empty slot.
+        // Their windows stay protected from eviction.
         static constexpr size_t kEntryMarks = 4;
         uint32_t next_entries[kEntryMarks] = {0xFFFFFFFFu, 0xFFFFFFFFu,
                                               0xFFFFFFFFu, 0xFFFFFFFFu};
-        // Ring depth THIS stream needs (guarded by `m`): the live
-        // window plus a window per entry mark. Key folding concentrates
-        // several blocks' protection into one stream, and the global
-        // flow depth alone let a long entry roll evict its own en-route
-        // frames - the playhead then re-rolled them seconds later.
+        // Ring depth this stream needs, guarded by m: the live window plus
+        // one window per entry mark.
         uint32_t ring_target = 0;
-        // Idle-close bookkeeping, consumer thread only (written by
-        // stream_for and the scan, both inside collect, under map_m_).
+        // Idle-close bookkeeping; the consumer thread owns it, under map_m_.
         uint64_t last_touch = 0;
         bool idle_closed = false;
     };
@@ -225,27 +156,20 @@ private:
         uint64_t key = 0;
         uint32_t frame = 0;
         uint64_t gen = 0;
-        // A CUT PREROLL: the stream is not playing yet, its entry sits
-        // wherever the arrangement put it - exempt from the cold-seek
-        // distance gate (which exists to stop mid-run re-decodes of the
-        // stream the playhead is already inside).
+        // A cut preroll is exempt from the cold-seek distance gate.
         bool preroll = false;
-        // Root frame the decoded frames are needed by. The queue runs
-        // NEAREST DEADLINE FIRST: flatten order let far-future prerolls
-        // starve the boundary about to play.
+        // Root frame the decode is needed by; the queue runs nearest
+        // deadline first.
         uint32_t deadline = 0;
     };
 
-    // Stream identity for an instance key (the canonical fold, or the
-    // key itself for keys outside the current flatten).
+    // Returns the canonical key, or the key itself when it is not in the fold.
     uint64_t alias_of(uint64_t key) const {
         const auto it = canonical_.find(key);
         return it != canonical_.end() ? it->second : key;
     }
     Stream* stream_for(const Request& req);
-    // Returns the decoded frame; a ring miss decodes on a free slot or
-    // session (waiting at most one in-flight decode, never the prewarm
-    // backlog).
+    // A ring miss waits at most one in-flight decode, never the backlog.
     std::shared_ptr<const codec::DecodedFrame> fetch(Stream& s, uint32_t frame,
                                                      bool* was_miss,
                                                      bool scrub = false,
@@ -267,8 +191,7 @@ private:
 
     const char* name_;
     std::vector<doc::MediaInstance> sources_;
-    // Instance key -> stream identity, rebuilt per flatten (consumer
-    // thread only; plan() reads it on the same thread).
+    // Instance key to stream identity; the consumer thread owns it.
     std::unordered_map<uint64_t, uint64_t> canonical_;
     // Loop wrap window, consumer thread only. out > in = active.
     uint32_t loop_in_ = 0;
@@ -279,8 +202,7 @@ private:
     std::vector<SourceFrame> frames_;
     uint64_t misses_ = 0;
     bool approximated_ = false;   // consumer thread only
-    // Read by the decode workers: a size hint, sized to how many streams
-    // are live so the frame budget divides across them.
+    // The decode workers read this size hint.
     std::atomic<uint32_t> ring_depth_{4};
 
     std::mutex map_m_;
@@ -294,14 +216,8 @@ private:
     uint64_t gen_ = 0;
     int busy_ = 0;
     bool quit_ = false;
-    // Scrub state. While the playhead is DRAGGED, the CONSUMER never
-    // decodes (it serves the nearest ringed frame instantly) and the
-    // plan queues one advisory CHASER per stream toward the drag
-    // target — a worker session rolls at full decode rate, decoupled
-    // from the render cadence. The epoch marks the drag's start:
-    // advisories from BEFORE it bail at their next sample (they hold
-    // the sessions the chase needs), while chasers queued during the
-    // drag carry the current epoch and run to completion.
+    // While scrub is set, the consumer never decodes; the workers chase
+    // the target. Advisories from before the epoch bail at the next sample.
     std::atomic<bool> scrub_{false};
     std::atomic<uint64_t> scrub_epoch_{0};
     bool prev_scrub_ = false;

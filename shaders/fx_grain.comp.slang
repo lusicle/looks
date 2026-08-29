@@ -12,8 +12,8 @@ cbuffer Push
     float fps;
     float amount;
     float size;        // cell size, px
-    float color;       // 0 mono, 1 fully per-channel
-    float mode;        // 0 film grain, 1 CCD sensor noise
+    float color;
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -28,9 +28,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    // CCD noise is per-pixel; film grain is smooth CLUMPS, not square
-    // cells: two value-noise octaves per dye layer, the blue layer
-    // coarsest and strongest, all re-rolled every frame.
     const bool ccd = mode >= 0.5;
     float3 grain;
     if (ccd) {
@@ -69,14 +66,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float l = fx_luma(encoded);
     float weight;
     if (ccd) {
-        // Sensor noise is strongest in the shadows, plus a per-row
-        // readout banding term.
         weight = 0.25 + 0.75 * (1.0 - l);
         const float row =
             fx_hash01(fx_hash3(seed, frame, tid.y)) - 0.5;
         grain += float3(row, row, row) * 0.3;
     } else {
-        // Midtone weighted, since grain lives on film density.
         weight = 4.0 * l * (1.0 - l);
     }
 

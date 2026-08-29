@@ -1,5 +1,4 @@
-// The shared ordered-pattern threshold engine, standalone. Binding 2
-// is the flow field, bound as the LUT dummy unless motion lock wired it.
+// Binding 2 is a dummy unless motion lock wires a real flow field.
 
 #include "fx_pattern.slang"
 
@@ -16,12 +15,12 @@ cbuffer Push
     float levels;
     float pattern_m;
     float amount;
-    float boil_hz;     // 0 = static
+    float boil_hz;     // hz
     float scroll;      // px/s
     float pat_rotate;  // degrees
     float pat_scale;
-    float lock_mode;   // 0 screen-locked, 1 motion-locked
-    float mode;        // 0 per-channel rgb, 1 grayscale
+    float lock_mode;
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -49,13 +48,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float pattern = fx_ordered_pattern(
         int(pattern_m + 0.5), pf, tid.xy, seed, boil_tick, t,
         float2(float(width), float(height)), noise_lut);
-    // amount narrows the threshold toward a plain midpoint round.
     const float t01 =
         clamp(0.5 + (pattern - 0.5) * saturate(amount), 0.0, 1.0);
 
-    // The level pick happens in LINEAR light so the dithered field
-    // averages back to the source brightness; code-value dithering would
-    // lift every dark region on display.
+    // Quantize in linear light so the dither averages to source brightness.
     const float n = max(levels, 2.0);
     float3 result;
     if (mode >= 0.5) {

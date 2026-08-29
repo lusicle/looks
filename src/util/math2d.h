@@ -1,5 +1,3 @@
-// Small 2D math shared by UI and (later) the render graph's 2D passes.
-
 #pragma once
 
 #include <cmath>
@@ -26,7 +24,7 @@ struct Vec2 {
         float len = length();
         return len > 1e-8f ? Vec2{x / len, y / len} : Vec2{};
     }
-    // 90° counter-clockwise perpendicular (screen space, Y-down).
+    // Counter-clockwise in screen space, where Y points down.
     constexpr Vec2 perp_ccw() const { return {y, -x}; }
 };
 

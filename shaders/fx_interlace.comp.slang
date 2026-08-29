@@ -1,8 +1,4 @@
-// Field weave is the honest model: odd lines show the PREVIOUS frame,
-// so combing appears exactly where motion is and nowhere else - a
-// still frame weaves back to itself untouched. Comb keeps the old
-// constant parity shift as a deliberate artifact; lines-only just
-// darkens the odd field.
+// The comb parity shift is a deliberate artifact.
 
 #include "fx_common.slang"
 
@@ -18,11 +14,11 @@ cbuffer Push
     float fps;
     float shift;    // comb offset, px
     float darken;
-    float mode;     // 0 field weave, 1 comb, 2 lines only
+    float mode;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] Sampler2D prev;   // previous frame (ring delay 1)
+[[vk::binding(1, 0)]] Sampler2D prev;   // the previous frame, ring delay 1
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]

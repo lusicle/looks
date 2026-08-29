@@ -16,8 +16,7 @@ json::Value preset_to_json(const Preset& p) {
     for (const std::string& t : p.tags) tags.push(json::Value(t));
     v.set("tags", std::move(tags));
     json::Value gv = group_to_json(p.group);
-    // The In seed rides the group object under the same key the
-    // pre-slot files used, so shipped presets read back unchanged.
+    // The In seed goes in the group object, under the key "face_in".
     if (p.face_in) gv.set("face_in", static_cast<int64_t>(p.face_in));
     v.set("group", std::move(gv));
     json::Value effects = json::Value::make_array();
@@ -38,12 +37,12 @@ std::optional<Preset> preset_from_json(const json::Value& v) {
     GroupLegacy legacy;
     p.group = group_from_json(v.get("group"), &legacy);
     p.face_in = legacy.face_in;
-    // Slots never travel in a preset file - they mint at instantiation.
+    // A preset file has no slots. They mint at instantiation.
     p.group.inputs.clear();
     for (const json::Value& fv : v.get("effects").array())
         if (auto fx = effect_from_json(fv)) p.effects.push_back(std::move(*fx));
     if (p.effects.empty()) return std::nullopt;
-    // Normalize: members carry the group's file-local id.
+    // Members must carry the file-local id of the group.
     for (EffectInstance& fx : p.effects) fx.group_id = p.group.id;
     return p;
 }
@@ -71,8 +70,7 @@ std::vector<Preset> scan_presets(const std::filesystem::path& dir,
     std::error_code ec;
     std::filesystem::recursive_directory_iterator it(dir, ec), end;
     while (!ec && it != end) {
-        // Subdirectories are the browser's bins; a few levels bound the
-        // walk against link loops and stray deep trees.
+        // The depth bound keeps link loops and deep trees out of the walk.
         if (it.depth() > 3) it.disable_recursion_pending();
         std::error_code fec;
         if (it->is_regular_file(fec) &&
@@ -80,7 +78,7 @@ std::vector<Preset> scan_presets(const std::filesystem::path& dir,
             if (auto p = load_preset(it->path()))
                 out.push_back(std::move(*p));
             else if (failed)
-                ++*failed;   // a corrupt preset must not vanish silently
+                ++*failed;   // a bad preset must not go away silently
         }
         it.increment(ec);
     }
@@ -101,8 +99,7 @@ Preset make_preset_from_group(const Look& look, size_t layer_index,
     p.name = p.group.name.empty() ? "preset" : p.group.name;
     for (const EffectInstance& fx : layer.stack)
         if (fx.group_id == group_id) p.effects.push_back(fx);
-    // The In seed = where the live group's In slot lands interiorly.
-    // Slots themselves stay behind (file carries the chain only).
+    // The In seed is the interior end of the In slot of the live group.
     if (!p.group.inputs.empty()) {
         std::vector<NodeLink> synth;
         for (const NodeLink& l : effective_links(look, synth))
@@ -112,7 +109,7 @@ Preset make_preset_from_group(const Look& look, size_t layer_index,
             }
     }
     p.group.inputs.clear();
-    // Keep only exposed face params that point at captured members.
+    // Keep only the face params that point at a captured member.
     std::vector<ParamKey> kept;
     for (const ParamKey& k : p.group.exposed)
         for (const EffectInstance& fx : p.effects)
@@ -130,8 +127,8 @@ void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
     std::unordered_map<uint64_t, uint64_t> remap;
     Group group = p.group;
     group.id = doc.next_effect_id++;
-    group.folded = true;   // presets land collapsed, macros up front
-    group.inputs.clear();  // slots mint when insert_group_command seeds
+    group.folded = true;
+    group.inputs.clear();  // insert_group_command mints the slots
 
     std::vector<EffectInstance> effects = p.effects;
     for (EffectInstance& fx : effects) {
@@ -148,7 +145,7 @@ void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
         exposed.push_back(k);
     }
     group.exposed = std::move(exposed);
-    // Boundary bindings remap too; default to the chain ends.
+    // A boundary binding that does not remap defaults to a chain end.
     uint64_t face_in = 0;
     if (auto it = remap.find(p.face_in); it != remap.end())
         face_in = it->second;

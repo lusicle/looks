@@ -1,8 +1,4 @@
-// Export readback: offline frame-by-frame graph evaluation at
-// full res with a fenced staging readback. Owns its own command pool/fence
-// and NV12 conversion targets so an export worker can drive a private
-// Engine instance concurrently with the preview loop (queue submissions are
-// serialized by Device::queue_mutex).
+// Safe on an export thread; queue submits take Device::queue_mutex.
 
 #pragma once
 
@@ -23,13 +19,8 @@ public:
     Nv12Readback(const Nv12Readback&) = delete;
     Nv12Readback& operator=(const Nv12Readback&) = delete;
 
-    // Evaluates one look at one frame through `engine`, converts to NV12,
-    // and blocks on the fence. `out` receives packed NV12 (stride ==
-    // width; Y plane then interleaved UV). Canvas dimensions must be even.
-    // Media pixels arrive through `layer_sources` (the caller's decode
-    // pool), exactly as in preview.
-    // cache_ctx passes through to Engine::render (0 = bypass the frame
-    // render cache — the default for export, which visits each frame once).
+    // out gets packed NV12: Y plane, then interleaved UV; stride == width.
+    // Canvas dimensions must be even. cache_ctx 0 bypasses the render cache.
     bool render(Engine& engine, const doc::Document& doc, uint64_t look_id,
                 uint32_t timeline_frame, double fps, uint32_t canvas_w,
                 uint32_t canvas_h, std::vector<uint8_t>& out,

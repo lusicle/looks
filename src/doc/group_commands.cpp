@@ -25,9 +25,8 @@ public:
             old_group_ids_.push_back(layer.stack[i].group_id);
             layer.stack[i].group_id = group_.id;
         }
-        // The Out binding defaults to the span's end; the In side is
-        // slots. Slot ids mint on the FIRST apply and replay verbatim on
-        // redo, so undo/redo never grows the id space.
+        // face_out defaults to the last effect of the span.
+        // Slot ids mint on the first apply and replay on redo.
         if (group_.face_out == 0) group_.face_out = layer.stack[to_].id;
         old_links_ = look.links;
         if (!planned_) {
@@ -83,10 +82,8 @@ public:
                                    static_cast<ptrdiff_t>(i));
                 break;
             }
-        // Splice the input slots back out: each interior wire becomes
-        // direct links from the slot's exterior producers (in their
-        // fan-in order, at the interior wire's position), and the
-        // group-matte wire dies with the card it gated.
+        // Splice the slots out: the producers wire direct to the members.
+        // The matte wire on port 1 goes away with the group card.
         old_links_ = look.links;
         auto is_slot = [&](uint64_t id) {
             for (uint64_t s : removed_.inputs)
@@ -96,7 +93,7 @@ public:
         std::vector<NodeLink> next;
         for (const NodeLink& l : look.links) {
             if (is_slot(l.to) || (l.to == group_id_ && l.to_port == 1))
-                continue;   // exterior side re-lands via the splice below
+                continue;   // the exterior side comes back in the splice
             if (is_slot(l.from)) {
                 for (const NodeLink& e : look.links)
                     if (e.to == l.from && e.to_port == 0)
@@ -195,9 +192,7 @@ private:
     Group old_;
 };
 
-// The group FACE (texed expose): toggle one member param's presence in
-// Group::exposed. Symmetric add/remove keeps position on re-add simple —
-// re-exposure appends (face order = expose order).
+// Face order is expose order: a param that comes back goes to the end.
 class SetGroupExposedCommand final : public LookCommand {
 public:
     SetGroupExposedCommand(uint64_t look, size_t layer_index,
@@ -257,11 +252,8 @@ public:
     std::string name() const override { return "Add Preset"; }
 
     void apply(Document& doc) override {
-        // Materialize FIRST: with the table empty, stack-order
-        // synthesis would chain the newcomers straight into the
-        // composite. The members chain INTERNALLY only — the group card
-        // lands DORMANT; wiring it into the graph is the user's wire
-        // gesture, never a side effect of adding a preset.
+        // Materialize first, or stack-order wiring chains the new effects.
+        // The members chain internally only. The group card lands unwired.
         Look& look = look_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
@@ -269,8 +261,7 @@ public:
         insert_at_ = layer.stack.size();
         layer.stack.insert(layer.stack.end(), effects_.begin(),
                            effects_.end());
-        // The In slot seeds interior-only (the preset lands unwired
-        // outside); its id mints once and replays on redo.
+        // The slot id mints one time and replays on redo.
         if (group_.inputs.empty() && !effects_.empty()) {
             if (!slot_) slot_ = doc.next_effect_id++;
             group_.inputs.push_back(slot_);
@@ -485,9 +476,7 @@ void normalize_group_inputs(Document& doc, Look& look, size_t layer_index,
         return l.from && is_member(l.to) && !is_member(l.from) &&
                !is_slot(l.from) && !link_is_tombstone(l);
     };
-    // Work against the EFFECTIVE table; touch the document only when a
-    // crossing or the seed actually changes wiring, so untouched looks
-    // keep their synthesized chains.
+    // Touch the document only if wiring changes: keep synthesized chains.
     bool any_crossing = false;
     {
         std::vector<NodeLink> synth;
@@ -500,10 +489,8 @@ void normalize_group_inputs(Document& doc, Look& look, size_t layer_index,
     if (!any_crossing && !seed_member) return;
     ensure_links(look);
 
-    // Crossings reroute per (member, port), the In pair first so its
-    // slot lands at inputs[0]. The slot takes the FIRST crossing's
-    // position in the member port's fan-in; the producers append as the
-    // slot's own fan-in in their old relative order.
+    // The In pair sorts first, thus its slot lands at inputs[0].
+    // A slot takes the position of the first crossing in the fan-in.
     uint64_t in_member = 0;
     if (seed_member) {
         in_member = is_member(seed_member) ? seed_member : 0;
@@ -546,7 +533,7 @@ void normalize_group_inputs(Document& doc, Look& look, size_t layer_index,
                 l = {slot, k.member, k.port};
                 first = false;
             } else {
-                l = {0, 0, 9999};   // tombstone-shaped, pruned below
+                l = {0, 0, 9999};   // tombstone shape, removed just below
             }
         }
         look.links.erase(std::remove_if(look.links.begin(), look.links.end(),
@@ -557,9 +544,7 @@ void normalize_group_inputs(Document& doc, Look& look, size_t layer_index,
         for (uint64_t p : producers) look.links.push_back({p, slot, 0});
     }
 
-    // Seed: a group whose slots never reached a port 0 still gets its
-    // In - interior-only, matching the boundary picture every group has
-    // always shown.
+    // A group with no slot on a member port 0 gets an interior In slot.
     if (in_member) {
         bool has_in = false;
         for (const NodeLink& l : look.links)

@@ -1,5 +1,5 @@
-// Inks multiply as transmittance, the way stencil printing stacks them.
-// Display-referred, self-converting.
+// The inks multiply as transmittance.
+// Work in display-referred space, not in linear light.
 
 #include "fx_common.slang"
 
@@ -13,7 +13,7 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float inks;      // 1-3
+    float inks;      // 1 to 3
     float hue1;
     float hue2;
     float misreg;    // px
@@ -24,7 +24,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Each ink taps at its own seeded misregistration offset.
 float riso_luma(Sampler2D tex, float2 uv, float2 size, uint seed_v,
                 uint ink, float misreg_px)
 {
@@ -49,14 +48,13 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const uint n_inks = uint(clamp(inks, 1.0, 3.0) + 0.5);
 
-    // Static per seed: riso grain sits in the print, not the video.
+    // The grain is static per seed. Do not add a time term.
     const float gn =
         fx_hash01(fx_hash4(seed ^ 0x515Fu, tid.x, tid.y, 3u)) - 0.5;
 
     const float pw = saturate(paper);
     float3 enc = float3(1.0, 1.0 - 0.05 * pw, 1.0 - 0.14 * pw);
 
-    // Ink 1 carries shadows and detail.
     {
         const float l = riso_luma(input, uv, size, seed, 0u, misreg);
         float c = smoothstep(0.9, 0.12, l);
@@ -64,7 +62,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float3 ink = fx_hue_to_rgb(hue1) * 0.75 + 0.05;
         enc *= lerp(float3(1.0, 1.0, 1.0), ink, c);
     }
-    // Ink 2 floods the midtones on a flatter curve.
     if (n_inks >= 2u) {
         const float l = riso_luma(input, uv, size, seed, 1u, misreg);
         float c = smoothstep(0.95, 0.3, l) * 0.85;
@@ -72,7 +69,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float3 ink = fx_hue_to_rgb(hue2) * 0.8 + 0.1;
         enc *= lerp(float3(1.0, 1.0, 1.0), ink, c);
     }
-    // Ink 3 lifts highlights and is always yellow.
     if (n_inks >= 3u) {
         const float l = riso_luma(input, uv, size, seed, 2u, misreg);
         float c = smoothstep(0.25, 0.85, l) * 0.6;

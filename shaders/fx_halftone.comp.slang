@@ -1,5 +1,4 @@
-// Display-referred: dots live on the print, so the kernel screens in the
-// encoded domain.
+// The screen runs in the encoded domain, not in linear light.
 
 #include "fx_common.slang"
 
@@ -14,19 +13,17 @@ cbuffer Push
     uint frame;
     float fps;
     float dot_px;
-    float angle;    // degrees, offsets every screen
-    float mode;     // 0 ink-on-paper, 1 paper-on-ink, 2 cmyk
+    float angle;    // degrees
+    float mode;
     float gain;
     float soft;
-    float shape;    // 0 dots, 1 lines, 2 spiral
+    float shape;
     float wave;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-// Ink coverage of a rotated screen at px for tone v, 0 = none, 1 = solid.
-// wob bows the screen coordinate.
 float screen_cov(float2 px, float ang, float cell, float v, float g,
                  float s, uint shp, float2 center, float wob)
 {
@@ -53,7 +50,7 @@ float screen_cov(float2 px, float ang, float cell, float v, float g,
                              px.x * sa + px.y * ca + wob) / c;
     const float2 f = frac(rp) - 0.5;
     const float d = length(f);
-    // Solid tone must reach the cell corner (~0.707).
+    // Radius 0.72 lets full tone reach the cell corner at 0.707.
     const float r = sqrt(saturate(v)) * 0.72 * g;
     const float e = s * 0.35 + 0.02;
     return 1.0 - smoothstep(r - e, r + e, d);
@@ -85,8 +82,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         outc = lerp(float3(1.0, 1.0, 1.0), float3(0.02, 0.02, 0.02), ink);
         if (m == 1u) outc = 1.0 - outc;
     } else {
-        // Press angles C15 M75 Y0 K45 relative to angle; their
-        // interference is what produces the rosette. GCR black.
+        // The screen angles are C 15, M 75, Y 0 and K 45 degrees.
         const float3 cmy = 1.0 - enc;
         const float k = min(min(cmy.x, cmy.y), cmy.z);
         const float denom = max(1.0 - k, 1.0e-3);
@@ -100,9 +96,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float cov_k = screen_cov(px, base_ang + 0.7854, dot_px, k,
                                        gain, soft, shp, center, wob);
         outc = float3(1.0, 1.0, 1.0);
-        outc *= 1.0 - cov_c * float3(0.95, 0.10, 0.05);   // cyan absorbs R
-        outc *= 1.0 - cov_m * float3(0.10, 0.95, 0.10);   // magenta absorbs G
-        outc *= 1.0 - cov_y * float3(0.02, 0.05, 0.90);   // yellow absorbs B
+        outc *= 1.0 - cov_c * float3(0.95, 0.10, 0.05);
+        outc *= 1.0 - cov_m * float3(0.10, 0.95, 0.10);
+        outc *= 1.0 - cov_y * float3(0.02, 0.05, 0.90);
         outc *= 1.0 - cov_k * float3(0.97, 0.97, 0.97);
     }
 

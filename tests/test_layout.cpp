@@ -1,5 +1,3 @@
-// Layout engine + Context tests — pure CPU, real Font/Canvas/Theme.
-
 #include "test_framework.h"
 #include "ui/layout.h"
 #include "ui/widgets.h"
@@ -39,7 +37,6 @@ TEST(layout_vstack_fixed_and_fill) {
     CHECK_EQ(c->rect.h, 75.0f);
     CHECK_EQ(b->rect.y, 30.0f);
     CHECK_EQ(c->rect.y, 55.0f);
-    // Cross axis stretches by default.
     CHECK_EQ(b->rect.w, 200.0f);
     CHECK_EQ(a->rect.w, 200.0f);   // stretch overrides fixed cross size
 }
@@ -100,7 +97,6 @@ TEST(layout_auto_stack_hugs_content) {
 TEST(layout_percent_in_stack_and_padding_stretch) {
     Fixture f;
     LayoutArena arena;
-    // Percent resolves against the stack's bounded cross axis.
     LayoutNode* inner = SizedBox(arena, SizeSpec::percent(0.5f),
                                  SizeSpec::fixed(40), nullptr);
     StackOpts opts;
@@ -113,8 +109,7 @@ TEST(layout_percent_in_stack_and_padding_stretch) {
     CHECK_EQ(inner->rect.w, 100.0f);   // 50% of (220 - 20)
     CHECK_EQ(inner->rect.h, 40.0f);
 
-    // Padding (and ZStack) give the child the full inset rect — stretch
-    // semantics; use stacks/Align for positioning.
+    // Padding stretches the child to the full inset rect.
     LayoutNode* boxed = SizedBox(arena, SizeSpec::fixed(30),
                                  SizeSpec::fixed(30), nullptr);
     LayoutNode* padded = Padding_(arena, Edges::all(10), boxed);
@@ -136,7 +131,6 @@ TEST(layout_scroll_clamps_offset) {
     CHECK_EQ(tall->rect.y, -700.0f);
     CHECK_EQ(scroll.content, 1000.0f);
     CHECK_EQ(scroll.viewport, 300.0f);
-    // Scroll area narrows the clip to its own rect.
     CHECK((root->clip == Rect{0, 0, 200, 300}));
     CHECK_EQ(tall->clip == root->clip, true);
 }
@@ -177,13 +171,11 @@ TEST(context_hit_winner_order_and_capture) {
     CHECK(ctx.widget_owns_mouse(b));
     CHECK(!ctx.widget_owns_mouse(a));
 
-    // Capture overrides the winner.
     ctx.set_capture(a);
     CHECK(ctx.widget_owns_mouse(a));
     CHECK(!ctx.widget_owns_mouse(b));
     ctx.clear_capture();
 
-    // Outside both rects: no winner.
     ctx.finalize_hits({500, 500});
     CHECK(!ctx.any_hit());
     ctx.gc_widget_slots();
@@ -212,19 +204,15 @@ TEST(widget_button_click_flow) {
         run_frame(root, {0, 0, 800, 600}, f.frame);
     };
 
-    // Hover only.
     build_and_run({30, 10}, 0, 0, 0);
     CHECK(!clicked);
     CHECK(f.input.consumed);       // hovering a widget claims the pointer
-    // Press inside.
     build_and_run({30, 10}, kMouseLeft, 0, kMouseLeft);
     CHECK(bstate.pressed);
     CHECK(!clicked);
-    // Release inside -> click.
     build_and_run({30, 10}, 0, kMouseLeft, 0);
     CHECK(clicked);
     CHECK(!bstate.pressed);
-    // Press inside, release outside -> no click.
     build_and_run({30, 10}, kMouseLeft, 0, kMouseLeft);
     build_and_run({700, 500}, 0, kMouseLeft, 0);
     CHECK(!clicked);

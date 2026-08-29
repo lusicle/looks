@@ -1,20 +1,5 @@
-// Transport: the TIMELINE's master clock.
-//
-// This used to be a clip player - it owned a mezzanine reader, a decode
-// ring, and a clock driven by one clip's PCM. None of that survives the
-// look model: a look tree has many media sources playing at once (decode_pool.h
-// serves their frames) and its audio is a mix over the whole instance tree
-// (audio_mix.h). What is left here is the part that was always a transport:
-// a frame-indexed position over the PROJECT's length, advanced by the audio
-// device callback, with the mix pulled through it.
-//
-// The clock no longer belongs to a media file, so a project with no audio, no
-// media, or several sources all behave the same way. When no audio device
-// opens, a wall-clock fallback steps the same cursor with identical
-// semantics - callers tick() it and cannot tell the difference.
-//
-// Threads: audio callback (clock + mix), callers (render/UI thread) via
-// the transport calls, all of which are safe to call at any time.
+// Threads: the audio callback owns clock and mix; transport calls are
+// safe from any thread at any time.
 
 #pragma once
 
@@ -27,9 +12,7 @@ namespace looks::media {
 
 class Player {
 public:
-    // The monitor's fixed clock: the sample cursor rate and channel
-    // count. Export mixes at the same pair so what was heard is what
-    // is written.
+    // Export mixes at the same rate and channel pair as the monitor.
     static constexpr uint32_t kClockRate = 48000;
     static constexpr uint32_t kChannels = 2;
 
@@ -39,15 +22,12 @@ public:
     Player(const Player&) = delete;
     Player& operator=(const Player&) = delete;
 
-    // The timeline being played: its length in frames and the project
-    // frame rate. Safe to call every frame - a no-op when unchanged.
-    // frames == 0 parks the transport (nothing to play).
+    // No-op when unchanged; frames == 0 parks the transport.
     void configure(double fps, uint32_t frames);
     bool active() const;
 
-    // Publishes the mix the monitor pulls from. The previous state is held
-    // one swap longer so the audio callback can never be the last owner of
-    // a PCM buffer (freeing megabytes in the callback is a dropout).
+    // Holds the old state one swap longer; the audio callback must not
+    // become the last owner of a PCM buffer.
     void set_mix(std::shared_ptr<const MixState> mix);
 
     void play();
@@ -55,37 +35,30 @@ public:
     bool playing() const;
     void set_looping(bool loop);
 
-    // Monitor gain: 0 = mute, 1 = unity, up to 2. Never touches the
-    // clock - silence still advances the timeline.
+    // Range 0..2. Gain never touches the clock; silence still advances.
     void set_gain(float gain);
     float gain() const;
 
-    // Advances the wall-clock fallback (no-op with an audio device).
-    // Polling threads must call this even on cycles they skip - the clock
-    // only moves when someone ticks it.
+    // No-op with an audio device. Callers must tick every cycle;
+    // the fallback clock moves only when ticked.
     void tick();
 
-    // Frame-index timeline (deterministic: fixed-timestep on frame index).
     uint32_t frame_count() const;
     double fps() const;
     double duration_seconds() const;
 
-    // Trim region [in, out) in frame indices; playback and loop stay
-    // inside. Clamped to the configured length.
+    // [in, out) frame indices, clamped; playback and loop stay inside.
     void set_trim(uint32_t in_frame, uint32_t out_frame);
     uint32_t trim_in() const;
     uint32_t trim_out() const;
 
-    // Loop region: looping playback wraps inside [in, out) when
-    // out > in (clamped to the trim); 0/0 loops the whole trim.
+    // Wraps in [in, out) when out > in; 0/0 loops the whole trim.
     void set_loop_region(uint32_t in_frame, uint32_t out_frame);
     bool looping() const;
-    // The effective wrap window [in, out): the loop region clamped
-    // inside the trim when set, else the trim. Readers ahead of the
-    // playhead (the decode pool's prewarm) use it to warm the wrap.
+    // The effective wrap window [in, out): loop clamped to trim, else trim.
     void loop_bounds(uint32_t* in_frame, uint32_t* out_frame) const;
 
-    // Audio nudge: positive delays monitored audio against video.
+    // Positive delays monitored audio against video.
     void set_audio_offset(double seconds);
 
     void seek_frame(uint32_t frame_index);

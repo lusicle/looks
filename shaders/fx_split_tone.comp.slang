@@ -35,14 +35,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float w_hi = smoothstep(pivot - 0.35, pivot + 0.35, l);
     const float w_sh = 1.0 - w_hi;
 
-    // Hue minus neutral gray gives a signed vector, so the tint adds
-    // without lifting exposure.
     const float3 sh_vec = fx_hue_to_rgb(sh_hue) - float3(0.5, 0.5, 0.5);
     const float3 hi_vec = fx_hue_to_rgb(hi_hue) - float3(0.5, 0.5, 0.5);
     enc += sh_vec * w_sh * sh_amt * 0.35;
     enc += hi_vec * w_hi * hi_amt * 0.35;
 
-    // Re-anchor luma so the tone shift stays chroma-only.
+    // Re-anchor the luma so the tone shift stays chroma only.
     const float l2 = fx_luma(saturate(enc));
     enc = saturate(enc + (l - l2));
 
