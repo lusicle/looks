@@ -311,30 +311,16 @@ bool video_pass_incomplete(const std::filesystem::path& source) {
            head.h < media::kThumbStripH;
 }
 
-// The doc-side wire end a GROUP card stands for: its bound face member
-// when set, else the chain end (first member entering, last leaving).
-// 0 = no members. Shared by the canvas node splice and the preset-drop
-// splice — the link table stores members, never the card.
+// The doc-side wire ends a GROUP card stands for. Leaving: the face
+// member (doc::group_face_member). Entering: an INPUT SLOT id — port k
+// of the card is inputs[k], and wires target the slot itself. 0 = no
+// members / no such slot.
 uint64_t group_boundary_member(const doc::Look& look, uint64_t gid,
-                               bool is_from) {
-    const doc::Group* gr = nullptr;
-    const doc::Layer* gl = nullptr;
-    for (const doc::Layer& l : look.layers)
-        for (const doc::Group& g : l.groups)
-            if (g.id == gid) {
-                gr = &g;
-                gl = &l;
-            }
-    if (!gl) return 0;
-    uint64_t first = 0, last = 0, bind = 0;
-    for (const doc::EffectInstance& e : gl->stack)
-        if (e.group_id == gid) {
-            if (!first) first = e.id;
-            last = e.id;
-            if (gr && e.id == (is_from ? gr->face_out : gr->face_in))
-                bind = e.id;
-        }
-    return bind ? bind : (is_from ? last : first);
+                               bool is_from, size_t slot_index = 0) {
+    if (is_from) return doc::group_face_member(look, gid);
+    const doc::Group* gr = doc::find_group(look, gid);
+    if (!gr || slot_index >= gr->inputs.size()) return 0;
+    return gr->inputs[slot_index];
 }
 
 // Still-image media (import scope: PNG/TGA) get different media UI:
@@ -2056,7 +2042,8 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
             lk.layers[0].osc_shape = 4;   // smpte bars
             doc::Group g;
             std::vector<doc::EffectInstance> nfx;
-            doc::instantiate_preset(pd, *pp, &g, &nfx);
+            uint64_t g_face_in = 0;
+            doc::instantiate_preset(pd, *pp, &g, &nfx, &g_face_in);
             for (doc::EffectInstance& f : nfx)
                 lk.layers[0].stack.push_back(std::move(f));
             lk.layers[0].groups.push_back(std::move(g));
@@ -2407,6 +2394,10 @@ struct EffectUiState {
 struct GroupUiState {
     ui::ButtonState fold_button, ungroup_button, save_button;
     ui::ButtonState bypass_check;
+    // The group's OWN composite knobs (wet/opacity) with their gutter
+    // micros — the same pair every effect panel leads with.
+    ui::SliderState own_sliders[2];
+    ui::ButtonState own_route[2], own_key[2];
     // Face rows: exposed member params as direct aliases.
     ui::SliderState face_sliders[8];
     ui::ButtonState face_remove[8];
@@ -3031,7 +3022,6 @@ struct AppState {
     // In-place rename (preset file stem or bin directory name).
     uint64_t preset_rename_key = 0;
     std::string preset_rename_buf;
-    bool preset_rename_commit = false;
     // Bumps every rescan: gallery thumbnails of presets key on it.
     uint64_t preset_scan_stamp = 1;
     ui::ButtonState preset_new_bin_btn;
@@ -3254,7 +3244,6 @@ struct AppState {
     std::unordered_set<uint64_t> bin_closed;
     uint64_t browser_rename_id = 0;
     std::string browser_rename_buf;
-    bool browser_rename_commit = false;
     uint64_t browser_drag_id = 0;
     bool browser_drag_is_bin = false;
     bool browser_drag_live = false;
@@ -3519,7 +3508,12 @@ void validate_selection(AppState& app) {
             }
             case flow::NodeKind::ModSource:
                 return doc::find_value_node(d, did) != nullptr;
-            case flow::NodeKind::Group: {
+            case flow::NodeKind::Group:
+            // Boundary in/out cards live exactly as long as their
+            // group: without these cases the prune stripped them from
+            // every marquee/select-all the frame after it landed.
+            case flow::NodeKind::GroupIn:
+            case flow::NodeKind::GroupOut: {
                 size_t li = 0;
                 return find_group_by_id(d, did, &li);
             }
@@ -5332,18 +5326,16 @@ void preset_new_bin(AppState& app) {
         app.preset_sel = preset_bin_key(rel);
         app.preset_rename_key = app.preset_sel;
         app.preset_rename_buf = rel;
-        app.preset_rename_commit = false;
         return;
     }
 }
 
-// Enter on the preset rename field: renames the preset FILE (stem, and
+// Commits the preset rename field: renames the preset FILE (stem, and
 // the name stored inside it) or the bin DIRECTORY's last segment.
 void preset_rename_apply(AppState& app) {
     const uint64_t key = app.preset_rename_key;
     std::string nm = app.preset_rename_buf;
     app.preset_rename_key = 0;
-    app.preset_rename_commit = false;
     app.preset_rename_buf.clear();
     for (char& c : nm)
         if (c == '/' || c == '\\' || c == ':') c = '-';
@@ -5380,6 +5372,38 @@ void preset_rename_apply(AppState& app) {
     }
     rescan_presets(app);
     app.preset_sel = 0;
+}
+
+// Commits the project-browser rename field: look / sequence / asset /
+// bin, matched by id. The ONE apply path - Enter, click-away and
+// field-switch all land here.
+void browser_rename_apply(AppState& app) {
+    const uint64_t rid = app.browser_rename_id;
+    const std::string nm = app.browser_rename_buf;
+    app.browser_rename_id = 0;
+    app.browser_rename_buf.clear();
+    if (!rid || nm.empty()) return;
+    if (const doc::Bin* b = app.document.find_bin(rid)) {
+        app.undo.execute(app.document,
+                         doc::set_bin_props_command(rid, nm, b->parent));
+    } else if (const doc::Look* l = app.document.find_look(rid)) {
+        app.undo.execute(app.document,
+                         doc::set_look_props_command(rid, nm,
+                                                     l->duration));
+    } else if (const doc::Sequence* s = app.document.find_sequence(rid)) {
+        app.undo.execute(app.document,
+                         doc::set_sequence_props_command(rid, nm,
+                                                         s->duration));
+    } else {
+        for (const doc::Asset& a2 : app.document.assets)
+            if (a2.id == rid) {
+                doc::Asset up = a2;
+                up.name = nm;
+                app.undo.execute(app.document,
+                                 doc::set_asset_command(std::move(up)));
+                break;
+            }
+    }
 }
 
 // Cache footprint: summed on demand — startup and after clears —
@@ -6290,6 +6314,10 @@ struct ParamStage {
     float original;
     bool* changed;
     bool* released;
+    // Group composite knob: the stage edits this group's wet/opacity
+    // (param_index kWetParam/kOpacityParam) instead of an effect's;
+    // fx_index is unused. 0 = effect target.
+    uint64_t group_id = 0;
 };
 
 struct FxRowActions {
@@ -10517,6 +10545,43 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
     LayoutNode* hdr_stack = HStackDyn(arena, hdr, hdr_cells);
     rows.push_back(hdr_stack);
 
+    // The group's OWN wet/opacity — the composite pair every effect
+    // panel leads with, group-keyed so wires/lanes/autokey land on the
+    // group itself.
+    {
+        const uint64_t gkey_id = group.id | doc::kGroupParamBit;
+        const float gvals[2] = {group.wet, group.opacity};
+        const int gidx[2] = {doc::kWetParam, doc::kOpacityParam};
+        const char* gname[2] = {"wet/dry", "opacity"};
+        for (int gi = 0; gi < 2; ++gi) {
+            const doc::ParamKey gkey{gkey_id, gidx[gi]};
+            bool keyed = false, routed = false;
+            for (const doc::KeyframeLane& l : app.look().lanes)
+                if (l.target == gkey && !l.keys.empty()) keyed = true;
+            for (const doc::ModRoute& r : app.look().mod_routes)
+                if (r.target == gkey && r.node) routed = true;
+            ParamStage stage{0, SIZE_MAX, gidx[gi], arena.alloc<float>(),
+                             gvals[gi], arena.alloc<bool>(),
+                             arena.alloc<bool>(), group.id};
+            *stage.staged = gvals[gi];
+            out.params.push_back(stage);
+            FrameUi::AddRoute wire{gkey, arena.alloc<bool>()};
+            out.add_routes.push_back(wire);
+            FrameUi::KeyToggle ktog{gkey, gvals[gi], arena.alloc<bool>()};
+            out.key_toggles.push_back(ktog);
+            SliderOpts opts;
+            opts.format = "%.2f";
+            opts.out_changed = stage.changed;
+            opts.out_released = stage.released;
+            rows.push_back(param_row(
+                arena, gname[gi],
+                SliderF(arena, stage.staged, 0.0f, 1.0f,
+                        &state.own_sliders[gi], opts),
+                &state.own_route[gi], wire.clicked, &state.own_key[gi],
+                ktog.clicked, nullptr, nullptr, nullptr, keyed, routed));
+        }
+    }
+
     // The FACE: exposed member params as DIRECT aliases — same
     // ParamStage path as any effect slider, the x hides from the face.
     size_t face_i = 0;
@@ -10800,6 +10865,10 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     std::vector<flow::Node> nodes;
     std::vector<flow::Wire> wires;
     std::unordered_map<uint64_t, uint64_t> fx_node;   // effect id → node id
+    // Group input slots: slot id → (owning card, slot index). Main view
+    // anchors slots on the collapsed card's ports; the scoped view
+    // anchors them on the In boundary card's exit rows.
+    std::unordered_map<uint64_t, std::pair<uint64_t, int>> slot_anchor;
     // Folded groups (subgraphs): members collapse into ONE card that
     // shows the exposed face; links crossing the boundary re-anchor there.
     std::unordered_set<uint64_t> emitted_groups;
@@ -10865,6 +10934,13 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     venv.node_audio = app.node_audio_map.get();
     venv.node_camera = app.node_camera_map.get();
     auto resolved_fx_value = [&](uint64_t eid, int pi, float* out_v) {
+        if (eid & doc::kGroupParamBit) {
+            const doc::Group* rg =
+                doc::find_group(resolved, eid & ~doc::kGroupParamBit);
+            if (!rg) return false;
+            *out_v = pi == doc::kWetParam ? rg->wet : rg->opacity;
+            return true;
+        }
         size_t rli = 0, rfi = 0;
         if (!find_effect_by_id(resolved, eid, &rli, &rfi)) return false;
         *out_v = mod::param_value(resolved.layers[rli].stack[rfi], pi);
@@ -11149,13 +11225,57 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 fx_node[fx.id] = gid;
                 if (!emitted_groups.insert(folded->id).second) continue;
 
+                // Rows 0/1: the group's OWN wet/opacity — the same
+                // built-in pair every effect card leads with, group-
+                // keyed (kGroupParamBit) so wires/lanes/autokey land on
+                // the group. Face rows follow at 2+.
+                flow::ParamRow* rows = arena.alloc<flow::ParamRow>(8);
+                int slot = 0;
+                {
+                    const uint64_t gkey_id =
+                        folded->id | doc::kGroupParamBit;
+                    const float gvals[2] = {folded->wet, folded->opacity};
+                    const int gidx[2] = {doc::kWetParam,
+                                         doc::kOpacityParam};
+                    const char* gname[2] = {"wet/dry", "opacity"};
+                    for (int gi = 0; gi < 2; ++gi) {
+                        ParamStage stage{li, SIZE_MAX, gidx[gi],
+                                         arena.alloc<float>(), gvals[gi],
+                                         arena.alloc<bool>(),
+                                         arena.alloc<bool>(),
+                                         folded->id};
+                        *stage.staged = gvals[gi];
+                        out.params.push_back(stage);
+                        FrameUi::KeyToggle ktog{{gkey_id, gidx[gi]},
+                                                gvals[gi],
+                                                arena.alloc<bool>()};
+                        out.key_toggles.push_back(ktog);
+                        rows[slot].label = gname[gi];
+                        rows[slot].min_v = 0.0f;
+                        rows[slot].max_v = 1.0f;
+                        rows[slot].format = "%.2f";
+                        rows[slot].staged = stage.staged;
+                        rows[slot].changed = stage.changed;
+                        rows[slot].released = stage.released;
+                        rows[slot].key_clicked = ktog.clicked;
+                        rows[slot].route_clicked = arena.alloc<bool>();
+                        rows[slot].modulated =
+                            param_modulated(gkey_id, gidx[gi]);
+                        rows[slot].keyed = param_keyed(gkey_id, gidx[gi]);
+                        float glv = 0.0f;
+                        if ((rows[slot].modulated || rows[slot].keyed) &&
+                            resolved_fx_value(gkey_id, gidx[gi], &glv)) {
+                            rows[slot].live = glv;
+                            rows[slot].has_live = true;
+                        }
+                        ++slot;
+                    }
+                }
                 // Face rows: exposed member params as DIRECT
                 // aliases — the same ParamStage path as effect cards,
                 // keyed/modulated tints included.
-                flow::ParamRow* rows = arena.alloc<flow::ParamRow>(6);
-                int slot = 0;
                 for (const doc::ParamKey& fkey : folded->exposed) {
-                    if (slot >= 6) break;
+                    if (slot >= 8) break;
                     size_t ffi = SIZE_MAX;
                     for (size_t s = 0; s < layer.stack.size(); ++s)
                         if (layer.stack[s].id == fkey.effect_id) ffi = s;
@@ -11219,8 +11339,22 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     : arena.dup(folded->name.c_str(),
                                 folded->name.size());
                 gn.bypassed = folded->bypass;
-                gn.has_in = true;
+                gn.has_in = !folded->inputs.empty();
                 gn.has_out = true;
+                // Composite parity with effect cards: a port-1 matte
+                // (link target = the GROUP id), one edge dot per input
+                // slot, and the faded ghost dot that mints the next
+                // slot when wired - capped at 5 inputs so the stack
+                // never outgrows the card edge.
+                gn.has_matte_port = true;
+                gn.slot_rows = folded->inputs.empty()
+                    ? 0
+                    : static_cast<int>(folded->inputs.size()) - 1;
+                gn.ghost_in = folded->inputs.size() < 5;
+                fx_node[folded->id] = gid;
+                for (size_t k = 0; k < folded->inputs.size(); ++k)
+                    slot_anchor[folded->inputs[k]] = {
+                        gid, static_cast<int>(k)};
                 gn.remove_clicked = arena.alloc<bool>();
                 out.group_removes.push_back(
                     {folded->id, gn.remove_clicked});
@@ -11238,11 +11372,10 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 gn.bypass_clicked = gact.bypass_changed;
                 gn.rows = rows;
                 gn.row_count = slot;
-                // Preview: the LAST member's tap ≈ the group's output.
-                uint64_t last_member = fx.id;
-                for (const doc::EffectInstance& e : layer.stack)
-                    if (e.group_id == folded->id) last_member = e.id;
-                set_preview(gn, last_member);
+                // Preview: the FACE member's tap — the same node the
+                // monitor previews, so card and monitor always agree.
+                set_preview(gn,
+                            doc::group_face_member(layer, *folded));
                 if (folded->node_x != 0.0f || folded->node_y != 0.0f) {
                     gn.x = folded->node_x;
                     gn.y = folded->node_y;
@@ -11435,8 +11568,15 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         flow::Node gin{};
         gin.id = flow::node_id(flow::NodeKind::GroupIn, scope);
         gin.kind = flow::NodeKind::GroupIn;
-        gin.title = "in";
-        gin.has_out = true;
+        gin.title = "input";
+        // One exit row per input slot, plus the ghost exit: wiring it
+        // into a member mints the next input interiorly, exactly as the
+        // collapsed card's ghost dot mints exteriorly (same 5 cap).
+        gin.exit_rows = static_cast<int>(scope_group->inputs.size());
+        gin.ghost_in = scope_group->inputs.size() < 5;
+        for (size_t k = 0; k < scope_group->inputs.size(); ++k)
+            slot_anchor[scope_group->inputs[k]] = {gin.id,
+                                                   static_cast<int>(k)};
         if (scope_group->in_x != 0.0f || scope_group->in_y != 0.0f) {
             gin.x = scope_group->in_x;
             gin.y = scope_group->in_y;
@@ -11454,7 +11594,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         flow::Node gout{};
         gout.id = flow::node_id(flow::NodeKind::GroupOut, scope);
         gout.kind = flow::NodeKind::GroupOut;
-        gout.title = "out";
+        gout.title = "output";
         gout.has_in = true;
         if (scope_group->out_x != 0.0f || scope_group->out_y != 0.0f) {
             gout.x = scope_group->out_x;
@@ -11470,23 +11610,12 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 }
         }
         nodes.push_back(gout);
-        // Boundary wires come from the persistent BINDINGS (v5.3
-        // intermediaries), never from the outer links — the internal
-        // picture holds whether or not anything is connected outside.
-        uint64_t first_m = 0, last_m = 0, bind_in = 0, bind_out = 0;
-        for (const doc::EffectInstance& e : d.layers[scope_li].stack)
-            if (e.group_id == scope) {
-                if (!first_m) first_m = e.id;
-                last_m = e.id;
-                if (scope_group && e.id == scope_group->face_in)
-                    bind_in = e.id;
-                if (scope_group && e.id == scope_group->face_out)
-                    bind_out = e.id;
-            }
-        const uint64_t in_m = bind_in ? bind_in : first_m;
-        const uint64_t out_m = bind_out ? bind_out : last_m;
-        if (auto it = fx_node.find(in_m); it != fx_node.end())
-            wires.push_back({gin.id, it->second, 0});
+        // The In side is REAL LINKS (slot -> member, drawn in the link
+        // loop below); only the Out side is still a persistent BINDING,
+        // so its wire derives here and holds whether or not anything is
+        // connected outside.
+        const uint64_t out_m =
+            doc::group_face_member(d.layers[scope_li], *scope_group);
         if (auto it = fx_node.find(out_m); it != fx_node.end())
             wires.push_back({it->second, gout.id, 0});
     }
@@ -11511,22 +11640,45 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 continue;
             uint64_t cf = canvas_id_of(l.from);
             uint64_t ct = canvas_id_of(l.to);
+            uint32_t port = l.to_port;
+            uint32_t from_port = 0;
+            // Slot endpoints: an interior wire's FROM is a slot (its
+            // card's exit/port row), an exterior wire's TO is one (the
+            // group card port for that slot: 0 for the first, strip
+            // rows 3+k for the rest). The matte targets the group id.
+            if (auto sf = slot_anchor.find(l.from);
+                sf != slot_anchor.end()) {
+                cf = sf->second.first;
+                from_port = static_cast<uint32_t>(sf->second.second);
+            }
+            if (auto st = slot_anchor.find(l.to);
+                st != slot_anchor.end()) {
+                // Card port scheme: 0 = slots[0], 1 = matte, k+1 =
+                // slots[k] - the one mapping flow ports and slot
+                // indices share (ghost = inputs.size() + 1).
+                ct = st->second.first;
+                port = st->second.second == 0
+                    ? 0u
+                    : static_cast<uint32_t>(st->second.second + 1);
+            }
             if (scope) {
-                const bool from_in = fx_node.count(l.from) != 0;
+                const bool from_in = fx_node.count(l.from) != 0 ||
+                                     slot_anchor.count(l.from) != 0;
                 const bool to_in = fx_node.count(l.to) != 0;
-                if (!from_in && !to_in) continue;
-                // Port-0 boundary crossings are represented by the
-                // persistent binding wires (drawn above) — link-derived
-                // duplicates would vanish when the outer side unplugs.
-                if ((!from_in || !to_in) && l.to_port == 0) continue;
-                if (!from_in)
-                    cf = flow::node_id(flow::NodeKind::GroupIn, scope);
-                if (!to_in)
-                    ct = flow::node_id(flow::NodeKind::GroupOut, scope);
+                if (!from_in || !to_in) {
+                    // Crossings stay outside the scope: the Out side
+                    // draws from its binding wire above, the In side
+                    // from the slot's interior links - the exterior
+                    // halves have no cards here.
+                    continue;
+                }
             }
             // Same-card links are group internals — invisible.
-            if (cf && ct && cf != ct)
-                wires.push_back({cf, ct, l.to_port});
+            if (cf && ct && cf != ct) {
+                flow::Wire w{cf, ct, port};
+                w.from_port = from_port;
+                wires.push_back(w);
+            }
         }
     }
 
@@ -11815,6 +11967,15 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     if (map[rr] == r.target.param_index)
                         to_row = static_cast<int>(rr);
             }
+        } else if (r.target.effect_id & doc::kGroupParamBit) {
+            // Group composite knobs: rows 0/1 on the group card.
+            const uint64_t gid = r.target.effect_id & ~doc::kGroupParamBit;
+            if (doc::find_group(d, gid)) {
+                target = flow::node_id(flow::NodeKind::Group, gid);
+                to_row = r.target.param_index == doc::kWetParam ? 0
+                    : r.target.param_index == doc::kOpacityParam ? 1
+                                                                 : -1;
+            }
         } else if (r.target.effect_id == 0) {
             if (r.target.param_index == 0) target = flow::kOutNodeId;
         } else if (auto it = fx_node.find(r.target.effect_id);
@@ -11920,14 +12081,19 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     }
 
     // Folded groups fold many links onto one card edge — identical
-    // strokes would over-ink the feathered halo, so dedup exact repeats.
+    // strokes would over-ink the feathered halo, so dedup exact
+    // repeats. from_port is part of the identity: the In node's exits
+    // carry DIFFERENT media, so several exits fanning into one member
+    // port are distinct wires, never repeats.
     {
         std::vector<flow::Wire> unique_wires;
         for (const flow::Wire& w : wires) {
             bool dup = false;
             for (const flow::Wire& e : unique_wires)
-                dup = dup || (e.from == w.from && e.to == w.to &&
-                              e.data == w.data && e.to_port == w.to_port &&
+                dup = dup || (e.from == w.from &&
+                              e.from_port == w.from_port &&
+                              e.to == w.to && e.data == w.data &&
+                              e.to_port == w.to_port &&
                               e.to_row == w.to_row);
             if (!dup) unique_wires.push_back(w);
         }
@@ -14261,6 +14427,98 @@ void commit_key_edit(AppState& app) {
     }
 }
 
+// ONE-CARET COMMIT: lands whichever inline text field is active and
+// clears it - the app-wide blur-commit rule. Enter and click-away both
+// route through here, so every field commits the same way; only Escape
+// (per-field) abandons. Flag-based fields (value/rail/browser/preset)
+// stage their commit for their existing appliers; the rest apply
+// directly.
+void commit_text_entry(AppState& app) {
+    if (app.frame_rename_id) {
+        app.undo.execute(app.document,
+                         doc::set_frame_title_command(
+                             app.scope_look, app.frame_rename_id,
+                             app.frame_rename_buf));
+        app.frame_rename_id = 0;
+        app.frame_rename_buf.clear();
+    }
+    if (app.group_rename_id) {
+        size_t gli = 0;
+        if (find_group_by_id(app.look(), app.group_rename_id, &gli))
+            for (const doc::Group& gr : app.look().layers[gli].groups)
+                if (gr.id == app.group_rename_id) {
+                    doc::Group edited = gr;
+                    edited.name = app.group_rename_buf;
+                    app.undo.execute(app.document,
+                                     doc::set_group_props_command(
+                                         app.scope_look, gli, edited));
+                    break;
+                }
+        app.group_rename_id = 0;
+        app.group_rename_buf.clear();
+    }
+    if (app.text_edit_id) {
+        size_t li = 0, fi = 0;
+        if (find_effect_by_id(app.look(), app.text_edit_id, &li, &fi))
+            app.undo.execute(app.document,
+                             doc::set_effect_text_command(
+                                 app.scope_look, li, fi,
+                                 app.text_edit_buf));
+        app.text_edit_id = 0;
+        app.text_edit_buf.clear();
+    }
+    if (app.key_edit_mode != 0) commit_key_edit(app);
+    if (app.duration_focus) {
+        if (!app.duration_edit.empty())
+            apply_still_duration(app,
+                                 std::atof(app.duration_edit.c_str()));
+        app.duration_focus = false;
+        app.duration_edit.clear();
+    }
+    if (app.value_edit_node) app.value_commit = true;
+    if (app.rail_edit_key.effect_id != 0) app.rail_edit_commit = true;
+    if (app.browser_rename_id) browser_rename_apply(app);
+    if (app.preset_rename_key) preset_rename_apply(app);
+    app.browser_search_focus = false;
+    app.preset_search_focus = false;
+    app.fx_search_focus = false;
+}
+
+// The click-away gate's identity snapshot: a press commits only fields
+// that were ALREADY active before this frame's open sites ran, so the
+// press that opens an editor never instantly lands it.
+struct TextEntrySnapshot {
+    uint64_t frame_rename, group_rename, text_edit;
+    uint64_t browser_rename, preset_rename, value_edit;
+    doc::ParamKey rail_edit;
+    int key_edit_mode;
+    bool duration;
+};
+TextEntrySnapshot snapshot_text_entry(const AppState& app) {
+    return {app.frame_rename_id, app.group_rename_id, app.text_edit_id,
+            app.browser_rename_id, app.preset_rename_key,
+            app.value_edit_node,  app.rail_edit_key,
+            app.key_edit_mode,    app.duration_focus};
+}
+bool text_entry_unchanged(const AppState& app,
+                          const TextEntrySnapshot& s) {
+    return app.frame_rename_id == s.frame_rename &&
+           app.group_rename_id == s.group_rename &&
+           app.text_edit_id == s.text_edit &&
+           app.browser_rename_id == s.browser_rename &&
+           app.preset_rename_key == s.preset_rename &&
+           app.value_edit_node == s.value_edit &&
+           app.rail_edit_key == s.rail_edit &&
+           app.key_edit_mode == s.key_edit_mode &&
+           app.duration_focus == s.duration;
+}
+bool any_text_entry(const TextEntrySnapshot& s) {
+    return s.frame_rename || s.group_rename || s.text_edit ||
+           s.browser_rename || s.preset_rename || s.value_edit ||
+           s.rail_edit.effect_id != 0 || s.key_edit_mode != 0 ||
+           s.duration;
+}
+
 // Auto-key: a KEYED param's control write moves the key at the
 // playhead (the lane re-writes the base every frame, so a base write
 // reads as a dead control). ONE definition of the write: the driving
@@ -15288,7 +15546,15 @@ ui::Rect settings_btn(const SettingsRow& r, int slot, float w) {
     return {right, r.rect.y + 2.0f, w, kSetBtnH};
 }
 
+void settings_commit_name(AppState& app);
+void settings_commit_step(AppState& app);
+
+// Closing the popup blur-commits any pending entry first (the same
+// click-away rule as the in-panel caret).
 void settings_close(AppState& app) {
+    SettingsUi& s = app.settings;
+    if (s.adding || !s.rename_macro.empty()) settings_commit_name(app);
+    if (!s.step_edit_macro.empty()) settings_commit_step(app);
     app.settings.open = false;
     settings_end_entry(app.settings);
 }
@@ -15498,10 +15764,16 @@ void settings_interact(AppState& app, const ui::UiInput& input,
             }
         return;
     }
-    // One caret: a click anywhere else cancels the open entry (same
-    // click-away rule as the app's inline editors); the handlers
+    // One caret: a click anywhere else COMMITS the open entry (the
+    // app-wide blur-commit rule); an invalid step reports and is
+    // dropped - Escape/Enter remain the in-field paths. The handlers
     // below reopen their own.
-    if (clicked) settings_end_entry(s);
+    if (clicked) {
+        if (s.adding || !s.rename_macro.empty())
+            settings_commit_name(app);
+        if (!s.step_edit_macro.empty()) settings_commit_step(app);
+        settings_end_entry(s);
+    }
     if (sl.tab_keys.contains(m)) {
         s.hover = "tab:keybinds";
         if (clicked) s.tab = 0;
@@ -16006,17 +16278,12 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             FrameUi::TlTab tab{id, arena.alloc<bool>(),
                                arena.alloc<bool>()};
             out.tl_tabs.push_back(tab);
+            // One visual unit: the close X lives INSIDE the chip.
             tab_cells.push_back(Chip(
                 arena, arena.dup(nm.c_str(), nm.size()), id == active,
                 &tui.chip, tab.activate,
-                tl ? "edit this look" : "edit this sequence"));
-            ButtonOpts xopts;
-            xopts.flat = true;
-            xopts.width = SizeSpec::fixed(16);
-            xopts.tooltip = "close tab";
-            tab_cells.push_back(
-                IconButton(arena, Icon::Close, &tui.close, tab.close,
-                           xopts));
+                tl ? "edit this look" : "edit this sequence", &tui.close,
+                tab.close));
         }
         StackOpts tab_row;
         tab_row.gap = 2.0f;
@@ -19008,8 +19275,8 @@ void register_ops_graph(ScriptHost& sh) {
                 return id_list(ids);
             });
     env.add("group_info",
-            "group_info(look, group) -> {name,layer,bypass,folded,"
-            "members}",
+            "group_info(look, group) -> {name,layer,bypass,folded,wet,"
+            "opacity,inputs,members}",
             2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
                 doc::Look* lk = arg_look(sh, vm, a[0]);
                 if (!lk) return Value::nil();
@@ -19022,6 +19289,10 @@ void register_ops_graph(ScriptHost& sh) {
                         map_num(m, "layer", static_cast<double>(l.id));
                         map_bool(m, "bypass", g->bypass);
                         map_bool(m, "folded", g->folded);
+                        map_num(m, "wet", static_cast<double>(g->wet));
+                        map_num(m, "opacity",
+                                static_cast<double>(g->opacity));
+                        map_put(m, "inputs", id_list(g->inputs));
                         std::vector<uint64_t> members;
                         for (const doc::EffectInstance& fx : l.stack)
                             if (fx.group_id == g->id)
@@ -19069,8 +19340,9 @@ void register_ops_graph(ScriptHost& sh) {
                 return op_err(vm, "no such group");
             });
     env.add("set_group",
-            "set_group(look, group, {name?, bypass?, folded?})", 3, 3,
-            [&sh](Vm& vm, std::vector<Value>& a) {
+            "set_group(look, group, {name?, bypass?, folded?, wet?, "
+            "opacity?})",
+            3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
                 doc::Look* lk = arg_look(sh, vm, a[0]);
                 if (!lk) return Value::nil();
                 if (a[2].kind != Value::Kind::Map)
@@ -19081,11 +19353,18 @@ void register_ops_graph(ScriptHost& sh) {
                         doc::Group up = *g;
                         std::string s;
                         bool b = false;
+                        double num = 0.0;
                         if (map_get_str(a[2], "name", &s)) up.name = s;
                         if (map_get_bool(a[2], "bypass", &b))
                             up.bypass = b;
                         if (map_get_bool(a[2], "folded", &b))
                             up.folded = b;
+                        if (map_get_num(a[2], "wet", &num))
+                            up.wet = std::clamp(
+                                static_cast<float>(num), 0.0f, 1.0f);
+                        if (map_get_num(a[2], "opacity", &num))
+                            up.opacity = std::clamp(
+                                static_cast<float>(num), 0.0f, 1.0f);
                         sh.app->undo.execute(
                             sh.app->document,
                             doc::set_group_props_command(lk->id, li,
@@ -19156,10 +19435,10 @@ void register_ops_graph(ScriptHost& sh) {
                 AppState& app = *sh.app;
                 doc::Group group;
                 std::vector<doc::EffectInstance> effects;
+                uint64_t face_in = 0;
                 doc::instantiate_preset(app.document, *preset, &group,
-                                        &effects);
+                                        &effects, &face_in);
                 const uint64_t gid = group.id;
-                const uint64_t face_in = group.face_in;
                 const uint64_t face_out = group.face_out;
                 const bool wired = !lk->links.empty();
                 doc::NodeLink tail_out{};
@@ -19173,9 +19452,15 @@ void register_ops_graph(ScriptHost& sh) {
                                  doc::insert_group_command(
                                      lk->id, static_cast<size_t>(li),
                                      std::move(group),
-                                     std::move(effects)));
-                if (wired && face_in && face_out &&
-                    !doc::link_would_cycle(*lk, tail, face_in)) {
+                                     std::move(effects), face_in));
+                // The exterior wire lands on the seeded In slot.
+                const doc::Group* placed = doc::find_group(*lk, gid);
+                const uint64_t in_slot =
+                    placed && !placed->inputs.empty()
+                        ? placed->inputs.front()
+                        : 0;
+                if (wired && in_slot && face_out &&
+                    !doc::link_would_cycle(*lk, tail, in_slot)) {
                     if (tail_feeds &&
                         !doc::link_would_cycle(*lk, face_out,
                                                tail_out.to))
@@ -19191,7 +19476,7 @@ void register_ops_graph(ScriptHost& sh) {
                                                                  tail_out));
                     app.undo.execute(app.document,
                                      doc::connect_command(
-                                         lk->id, {tail, face_in, 0}));
+                                         lk->id, {tail, in_slot, 0}));
                 }
                 app.undo.end_group();
                 return Value::number(static_cast<double>(gid));
@@ -19270,7 +19555,21 @@ bool resolve_param_key(ScriptHost& sh, script::Vm& vm,
         out->param_index = pi;
         return true;
     }
-    vm.set_error("no effect or layer with id " +
+    // Group composite knobs: wet/opacity by name, group-keyed.
+    if (doc::find_group(lk, id)) {
+        const std::string pname = param.is_str() ? param.as_str() : "";
+        const int pi = pname == "wet"       ? doc::kWetParam
+                       : pname == "opacity" ? doc::kOpacityParam
+                                            : INT_MIN;
+        if (pi == INT_MIN) {
+            vm.set_error("group params are \"wet\" and \"opacity\"");
+            return false;
+        }
+        out->effect_id = id | doc::kGroupParamBit;
+        out->param_index = pi;
+        return true;
+    }
+    vm.set_error("no effect, layer or group with id " +
                  script::to_display(target));
     return false;
 }
@@ -21008,26 +21307,37 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<char>(e.codepoint));
                         break;
                     }
+                    // The remaining fields swallow the keystroke like
+                    // every field above - one caret means one buffer,
+                    // never a shared keystroke.
                     // Browser inline rename: printable ASCII only.
-                    if (app.browser_rename_id && e.codepoint >= 32 &&
-                        e.codepoint < 127)
-                        app.browser_rename_buf.push_back(
-                            static_cast<char>(e.codepoint));
+                    if (app.browser_rename_id) {
+                        if (e.codepoint >= 32 && e.codepoint < 127)
+                            app.browser_rename_buf.push_back(
+                                static_cast<char>(e.codepoint));
+                        break;
+                    }
                     // Preset inline rename: printable ASCII only.
-                    if (app.preset_rename_key && e.codepoint >= 32 &&
-                        e.codepoint < 127)
-                        app.preset_rename_buf.push_back(
-                            static_cast<char>(e.codepoint));
+                    if (app.preset_rename_key) {
+                        if (e.codepoint >= 32 && e.codepoint < 127)
+                            app.preset_rename_buf.push_back(
+                                static_cast<char>(e.codepoint));
+                        break;
+                    }
                     // Browser search typing: printable ASCII only.
-                    if (app.browser_search_focus && e.codepoint >= 32 &&
-                        e.codepoint < 127)
-                        app.browser_filter.push_back(
-                            static_cast<char>(e.codepoint));
+                    if (app.browser_search_focus) {
+                        if (e.codepoint >= 32 && e.codepoint < 127)
+                            app.browser_filter.push_back(
+                                static_cast<char>(e.codepoint));
+                        break;
+                    }
                     // Preset search typing: printable ASCII only.
-                    if (app.preset_search_focus && e.codepoint >= 32 &&
-                        e.codepoint < 127)
-                        app.preset_filter.push_back(
-                            static_cast<char>(e.codepoint));
+                    if (app.preset_search_focus) {
+                        if (e.codepoint >= 32 && e.codepoint < 127)
+                            app.preset_filter.push_back(
+                                static_cast<char>(e.codepoint));
+                        break;
+                    }
                     // Add-node search.
                     if (app.fx_search_focus && e.codepoint >= 32 &&
                         e.codepoint < 127)
@@ -21049,7 +21359,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             !app.browser_rename_buf.empty())
                             app.browser_rename_buf.pop_back();
                         else if (e.key == platform::Key::Enter)
-                            app.browser_rename_commit = true;
+                            commit_text_entry(app);
                         else if (e.key == platform::Key::Escape)
                             app.browser_rename_id = 0;
                         break;
@@ -21059,7 +21369,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             !app.preset_rename_buf.empty())
                             app.preset_rename_buf.pop_back();
                         else if (e.key == platform::Key::Enter)
-                            app.preset_rename_commit = true;
+                            commit_text_entry(app);
                         else if (e.key == platform::Key::Escape)
                             app.preset_rename_key = 0;
                         break;
@@ -21084,11 +21394,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             !app.duration_edit.empty()) {
                             app.duration_edit.pop_back();
                         } else if (e.key == platform::Key::Enter) {
-                            if (!app.duration_edit.empty())
-                                apply_still_duration(
-                                    app, std::atof(app.duration_edit.c_str()));
-                            app.duration_focus = false;
-                            app.duration_edit.clear();
+                            commit_text_entry(app);
                         } else if (e.key == platform::Key::Escape) {
                             app.duration_focus = false;
                             app.duration_edit.clear();
@@ -21117,13 +21423,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             !app.frame_rename_buf.empty()) {
                             app.frame_rename_buf.pop_back();
                         } else if (e.key == platform::Key::Enter) {
-                            app.undo.execute(
-                                app.document,
-                                doc::set_frame_title_command(app.scope_look,
-                                    app.frame_rename_id,
-                                    app.frame_rename_buf));
-                            app.frame_rename_id = 0;
-                            app.frame_rename_buf.clear();
+                            commit_text_entry(app);
                         } else if (e.key == platform::Key::Escape) {
                             app.frame_rename_id = 0;
                             app.frame_rename_buf.clear();
@@ -21137,24 +21437,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             !app.group_rename_buf.empty()) {
                             app.group_rename_buf.pop_back();
                         } else if (e.key == platform::Key::Enter) {
-                            size_t gli = 0;
-                            if (find_group_by_id(app.look(),
-                                                 app.group_rename_id,
-                                                 &gli)) {
-                                for (const doc::Group& gr :
-                                     app.look().layers[gli].groups)
-                                    if (gr.id == app.group_rename_id) {
-                                        doc::Group edited = gr;
-                                        edited.name = app.group_rename_buf;
-                                        app.undo.execute(
-                                            app.document,
-                                            doc::set_group_props_command(app.scope_look,
-                                                gli, edited));
-                                        break;
-                                    }
-                            }
-                            app.group_rename_id = 0;
-                            app.group_rename_buf.clear();
+                            commit_text_entry(app);
                         } else if (e.key == platform::Key::Escape) {
                             app.group_rename_id = 0;
                             app.group_rename_buf.clear();
@@ -21168,16 +21451,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             !app.text_edit_buf.empty()) {
                             app.text_edit_buf.pop_back();
                         } else if (e.key == platform::Key::Enter) {
-                            size_t li = 0, fi = 0;
-                            if (find_effect_by_id(app.look(),
-                                                  app.text_edit_id, &li,
-                                                  &fi))
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_effect_text_command(app.scope_look,
-                                        li, fi, app.text_edit_buf));
-                            app.text_edit_id = 0;
-                            app.text_edit_buf.clear();
+                            commit_text_entry(app);
                         } else if (e.key == platform::Key::Escape) {
                             app.text_edit_id = 0;
                             app.text_edit_buf.clear();
@@ -21191,7 +21465,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             if (!app.key_edit_buf.empty())
                                 app.key_edit_buf.pop_back();
                         } else if (e.key == platform::Key::Enter) {
-                            commit_key_edit(app);
+                            commit_text_entry(app);
                         } else if (e.key == platform::Key::Escape) {
                             app.key_edit_mode = 0;
                         }
@@ -21554,6 +21828,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<float>(frame.extent.height) / scale};
 
         input.begin_frame(events, scale);
+        // One-caret click-away: fields active BEFORE this frame's open
+        // sites ran are the ones a press may blur-commit (the gate after
+        // the canvas handlers compares against this snapshot, so the
+        // press that OPENS an editor never instantly lands it).
+        const TextEntrySnapshot text_entry_before =
+            snapshot_text_entry(app);
         // Modal confirm: interacts with the live pointer NOW, then the
         // frame under the scrim gets dead input — no hover, no clicks,
         // no wheel, no capture churn.
@@ -22952,6 +23232,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     request_browser_delete(app, m.a);
                     break;
                 case kActRename: {
+                    // One caret: whatever field was live blur-commits
+                    // before this rename arms.
+                    commit_text_entry(app);
                     if (m.kind == kCtxPreset || m.kind == kCtxPresetBin) {
                         std::string cur;
                         if (const std::string* bin =
@@ -22968,11 +23251,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                         app.preset_rename_key = m.a;
                         app.preset_rename_buf = cur;
-                        app.preset_rename_commit = false;
-                        app.browser_rename_id = 0;
-                        app.fx_search_focus = false;
-                        app.preset_search_focus = false;
-                        app.duration_focus = false;
                         break;
                     }
                     std::string cur;
@@ -22989,12 +23267,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             if (a2.id == m.a) cur = a2.name;
                     app.browser_rename_id = m.a;
                     app.browser_rename_buf = cur;
-                    app.browser_rename_commit = false;
-                    // The rename field owns the keyboard; no other
-                    // capture field may stay live under it.
-                    app.fx_search_focus = false;
-                    app.preset_search_focus = false;
-                    app.duration_focus = false;
                     break;
                 }
                 case kActMoveToRoot:
@@ -23051,7 +23323,37 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         bool did_break = false;
 
         for (const ParamStage& stage : frame_ui.params) {
-            if (*stage.changed && *stage.staged != stage.original &&
+            // Group composite knobs ride their own coalescing command
+            // (whole-struct per group id); everything else is the
+            // effect-param path. Both auto-key the same way.
+            if (stage.group_id && *stage.changed &&
+                *stage.staged != stage.original) {
+                const doc::ParamKey pk{
+                    stage.group_id | doc::kGroupParamBit,
+                    stage.param_index};
+                std::vector<doc::Keyframe> keys2;
+                if (autokey_lane(app, pk, *stage.staged, &keys2)) {
+                    app.undo.execute(app.document,
+                                     doc::set_lane_command(app.scope_look,
+                                         pk, std::move(keys2)),
+                                     /*coalesce=*/true);
+                } else {
+                    size_t gli = 0;
+                    if (doc::Group* g = doc::find_group(
+                            app.look(), stage.group_id, &gli)) {
+                        doc::Group edited = *g;
+                        (stage.param_index == doc::kWetParam
+                             ? edited.wet
+                             : edited.opacity) = *stage.staged;
+                        app.undo.execute(
+                            app.document,
+                            doc::set_group_props_command(app.scope_look,
+                                                         gli, edited),
+                            /*coalesce=*/true);
+                    }
+                }
+            } else if (*stage.changed && *stage.staged != stage.original &&
+                !stage.group_id &&
                 stage.layer_index < app.look().layers.size() &&
                 stage.fx_index <
                     app.look().layers[stage.layer_index].stack.size()) {
@@ -23768,147 +24070,127 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 auto doc_id_of = [&](uint64_t cid) {
                     return cid == flow::kOutNodeId ? 0ull : tag_doc(cid);
                 };
-                // Group cards proxy their BOUNDARY members (texed: the
-                // subgraph node IS its boundary): the card's In is the
-                // first member's In, its Out the last member's out. The
-                // scoped view's In/Out boundary nodes rewire the
-                // boundary links themselves (handled below).
+                // Group cards proxy their boundary: the card's Out is
+                // the face member; each input port is an INPUT SLOT
+                // (port 0 = slots[0], k = slots[k-1], the ghost mints).
+                // The scoped view's In node exits ARE the slots; only
+                // GroupOut still retargets a binding (face_out).
                 auto is_kind = [&](uint64_t cid, flow::NodeKind k) {
                     return cid != 0 && cid != flow::kOutNodeId &&
                            tag_kind(cid) == k;
                 };
-                auto resolve_src = [&](uint64_t cid) -> uint64_t {
-                    return is_kind(cid, flow::NodeKind::Group)
-                               ? group_boundary_member(app.look(),
-                                                       tag_doc(cid), true)
-                               : doc_id_of(cid);
+                auto resolve_src = [&](uint64_t cid,
+                                       uint32_t from_port) -> uint64_t {
+                    if (is_kind(cid, flow::NodeKind::Group))
+                        return group_boundary_member(app.look(),
+                                                     tag_doc(cid), true);
+                    if (is_kind(cid, flow::NodeKind::GroupIn)) {
+                        const doc::Group* g =
+                            doc::find_group(app.look(), tag_doc(cid));
+                        return g && from_port < g->inputs.size()
+                                   ? g->inputs[from_port]
+                                   : 0;
+                    }
+                    return doc_id_of(cid);
                 };
-                auto resolve_dst = [&](uint64_t cid) -> uint64_t {
-                    return is_kind(cid, flow::NodeKind::Group)
-                               ? group_boundary_member(app.look(),
-                                                       tag_doc(cid), false)
-                               : doc_id_of(cid);
+                // Group-card input ports resolve to slot ids (mint = the
+                // ghost row: one past the last slot). port 1 stays the
+                // group id itself - its matte.
+                bool want_mint = false;
+                auto resolve_dst = [&](uint64_t cid,
+                                       uint32_t port) -> uint64_t {
+                    if (!is_kind(cid, flow::NodeKind::Group))
+                        return doc_id_of(cid);
+                    const doc::Group* g =
+                        doc::find_group(app.look(), tag_doc(cid));
+                    if (!g) return 0;
+                    if (port == 1) return g->id;
+                    const size_t k = port == 0
+                        ? 0
+                        : static_cast<size_t>(port - 1);
+                    if (k < g->inputs.size()) return g->inputs[k];
+                    // Past the slots, the only anchor the canvas emits
+                    // is the ghost dot (which hides at the 5-input cap).
+                    if (port >= 2 && g->inputs.size() < 5)
+                        want_mint = true;
+                    return 0;
                 };
-                // Members of the OPEN group, for boundary-link lookups.
-                std::unordered_set<uint64_t> scope_members;
-                if (app.open_group)
-                    for (const doc::Layer& sl : app.look().layers)
-                        for (const doc::EffectInstance& e : sl.stack)
-                            if (e.group_id == app.open_group)
-                                scope_members.insert(e.id);
-                const auto boundary_links = [&]() {
-                    return app.look().links.empty()
-                               ? doc::synthesize_links(app.look())
-                               : app.look().links;
+                // A slot lives while ANY wire touches it - exterior
+                // feed or interior consumer; only a slot with ZERO
+                // connections is removed (later slots compact down one
+                // port, their wires following, id-keyed). Interior
+                // wiring is never severed from outside.
+                auto maybe_gc_slot = [&](uint64_t slot_id) {
+                    if (!slot_id) return;
+                    size_t gli = 0;
+                    doc::Group* owner = doc::group_of_input(
+                        app.look(), slot_id, &gli);
+                    if (!owner) return;
+                    std::vector<doc::NodeLink> gcsynth;
+                    for (const doc::NodeLink& l :
+                         doc::effective_links(app.look(), gcsynth))
+                        if (l.from == slot_id || l.to == slot_id) return;
+                    app.undo.execute(
+                        app.document,
+                        doc::remove_group_input_command(
+                            app.scope_look, gli, owner->id, slot_id));
                 };
-                const bool boundary_edit =
-                    is_kind(fe.connect_from, flow::NodeKind::GroupIn) ||
+                const bool out_boundary =
                     is_kind(fe.connect_to, flow::NodeKind::GroupOut) ||
-                    is_kind(fe.disconnect_from,
-                            flow::NodeKind::GroupIn) ||
                     is_kind(fe.disconnect_to, flow::NodeKind::GroupOut);
-                if (boundary_edit) {
-                    // Boundary edits from inside the scoped view (v5.3
-                    // intermediaries): rewiring In/Out RETARGETS the
-                    // persistent binding; any outer links follow it.
-                    // Unplugging a boundary wire cuts only the OUTER
-                    // link — the internal picture never changes from
-                    // outside edits, and vice versa.
+                if (out_boundary) {
+                    // The Out side is still a persistent BINDING:
+                    // rewiring member -> Out RETARGETS face_out and
+                    // every outer consumer link follows in place.
+                    // Unplugging is inert - the binding always shows.
                     size_t bgli = 0;
                     const doc::Group* bgroup = nullptr;
                     if (find_group_by_id(app.look(), app.open_group,
                                          &bgli))
-                        for (const doc::Group& g :
-                             app.look().layers[bgli].groups)
-                            if (g.id == app.open_group) bgroup = &g;
-                    app.undo.begin_group("Rewire Boundary");
-                    if (is_kind(fe.disconnect_from,
-                                flow::NodeKind::GroupIn) &&
-                        !fe.connect_requested) {
-                        for (const doc::NodeLink& l :
-                             boundary_links())
-                            if (l.to_port == 0 &&
-                                scope_members.count(l.to) &&
-                                !scope_members.count(l.from)) {
+                        bgroup = doc::find_group(
+                            app.look().layers[bgli], app.open_group);
+                    const uint64_t from2 =
+                        resolve_src(fe.connect_from,
+                                    fe.connect_from_port);
+                    const doc::EffectInstance* from_fx =
+                        from2 ? doc::find_effect(app.look(), from2)
+                              : nullptr;
+                    if (bgroup && fe.connect_requested && from_fx &&
+                        from_fx->group_id == app.open_group) {
+                        app.undo.begin_group("Rewire Boundary");
+                        doc::Group edited = *bgroup;
+                        edited.face_out = from2;
+                        app.undo.execute(
+                            app.document,
+                            doc::set_group_props_command(app.scope_look,
+                                                         bgli, edited));
+                        // Every outer consumer's link follows (the
+                        // composite link included), in place.
+                        std::vector<doc::NodeLink> bsynth;
+                        const std::vector<doc::NodeLink> blinks =
+                            doc::effective_links(app.look(), bsynth);
+                        for (const doc::NodeLink& l : blinks) {
+                            const doc::EffectInstance* lf =
+                                doc::find_effect(app.look(), l.from);
+                            const doc::EffectInstance* lt =
+                                doc::find_effect(app.look(), l.to);
+                            if (lf && lf->group_id == app.open_group &&
+                                !(lt &&
+                                  lt->group_id == app.open_group) &&
+                                !doc::group_of_input(app.look(), l.to))
                                 app.undo.execute(
                                     app.document,
-                                    doc::disconnect_command(app.scope_look,l));
-                                break;
-                            }
-                    } else if (is_kind(fe.disconnect_to,
-                                       flow::NodeKind::GroupOut) &&
-                               !fe.connect_requested) {
-                        for (const doc::NodeLink& l :
-                             boundary_links())
-                            if (l.to_port == 0 &&
-                                scope_members.count(l.from) &&
-                                !scope_members.count(l.to)) {
-                                app.undo.execute(
-                                    app.document,
-                                    doc::disconnect_command(app.scope_look,l));
-                                break;
-                            }
-                    }
-                    if (bgroup &&
-                        is_kind(fe.connect_from,
-                                flow::NodeKind::GroupIn) &&
-                        fe.connect_port == 0) {
-                        const uint64_t to2 = resolve_dst(fe.connect_to);
-                        if (to2 && scope_members.count(to2)) {
-                            doc::Group edited = *bgroup;
-                            edited.face_in = to2;
-                            app.undo.execute(
-                                app.document,
-                                doc::set_group_props_command(app.scope_look,bgli,
-                                                             edited));
-                            // The outer producer's link follows, in
-                            // place.
-                            for (const doc::NodeLink& l :
-                                 boundary_links())
-                                if (l.to_port == 0 &&
-                                    scope_members.count(l.to) &&
-                                    !scope_members.count(l.from)) {
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::reconnect_command(
-                                            app.scope_look, l,
-                                            {l.from, to2, 0}));
-                                    break;
-                                }
+                                    doc::reconnect_command(
+                                        app.scope_look, l,
+                                        {from2, l.to, l.to_port}));
                         }
-                    } else if (bgroup &&
-                               is_kind(fe.connect_to,
-                                       flow::NodeKind::GroupOut) &&
-                               fe.connect_port == 0) {
-                        const uint64_t from2 =
-                            resolve_src(fe.connect_from);
-                        if (from2 && scope_members.count(from2)) {
-                            doc::Group edited = *bgroup;
-                            edited.face_out = from2;
-                            app.undo.execute(
-                                app.document,
-                                doc::set_group_props_command(app.scope_look,bgli,
-                                                             edited));
-                            // Every outer consumer's link follows (the
-                            // composite link included), in place.
-                            for (const doc::NodeLink& l :
-                                 boundary_links())
-                                if (l.to_port == 0 &&
-                                    scope_members.count(l.from) &&
-                                    !scope_members.count(l.to)) {
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::reconnect_command(
-                                            app.scope_look, l,
-                                            {from2, l.to, 0}));
-                                }
-                        }
+                        app.undo.end_group();
                     }
-                    app.undo.end_group();
                     structure_done = true;
                 } else {
                 const bool grouped =
                     fe.connect_requested && fe.disconnect_requested;
+                uint64_t gc_pending = 0, gc_from_pending = 0;
                 if (grouped) app.undo.begin_group("Rewire");
                 if (fe.disconnect_requested) {
                     if (is_kind(fe.disconnect_to,
@@ -23926,36 +24208,116 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     app.scope_look, up));
                         }
                     } else if (fe.disconnect_port == 1) {
-                        // Image matte: a plain port-1 link cut.
+                        // Image matte: a plain port-1 link cut (a group
+                        // card's matte target is the group id itself).
+                        // A slot on the FROM side (an In-node exit fed
+                        // a member matte) gets the zero-connection
+                        // check like any other unwire.
+                        const uint64_t df =
+                            resolve_src(fe.disconnect_from,
+                                        fe.disconnect_from_port);
+                        const bool slot_df =
+                            doc::group_of_input(app.look(), df) != nullptr;
+                        const bool own_group =
+                            slot_df && !fe.connect_requested;
+                        if (own_group) app.undo.begin_group("Disconnect");
                         app.undo.execute(
                             app.document,
                             doc::disconnect_command(app.scope_look,
-                                {resolve_src(fe.disconnect_from),
-                                 doc_id_of(fe.disconnect_to), 1}));
+                                {df, doc_id_of(fe.disconnect_to), 1}));
+                        if (own_group) {
+                            maybe_gc_slot(df);
+                            app.undo.end_group();
+                        } else if (slot_df) {
+                            gc_from_pending = df;
+                        }
                     } else {
+                        const uint64_t df =
+                            resolve_src(fe.disconnect_from,
+                                        fe.disconnect_from_port);
+                        const uint64_t dt =
+                            resolve_dst(fe.disconnect_to,
+                                        fe.disconnect_port);
+                        // Slots hold their wires on port 0 whatever card
+                        // row displays them. An unwire on EITHER side of
+                        // a slot runs the zero-connection check in the
+                        // same undo step - rewires included, after their
+                        // connect lands so a re-drop on the same slot
+                        // stays a no-op.
+                        const bool slot_dt =
+                            doc::group_of_input(app.look(), dt) != nullptr;
+                        const bool slot_df =
+                            doc::group_of_input(app.look(), df) != nullptr;
+                        const uint32_t dport =
+                            slot_dt ? 0u : fe.disconnect_port;
+                        const bool own_group =
+                            (slot_dt || slot_df) && !fe.connect_requested;
+                        if (own_group) app.undo.begin_group("Disconnect");
                         app.undo.execute(
                             app.document,
                             doc::disconnect_command(app.scope_look,
-                                {resolve_src(fe.disconnect_from),
-                                 resolve_dst(fe.disconnect_to),
-                                 fe.disconnect_port}));
+                                {df, dt, dport}));
+                        if (own_group) {
+                            maybe_gc_slot(dt);
+                            maybe_gc_slot(df);
+                            app.undo.end_group();
+                        } else {
+                            if (slot_dt) gc_pending = dt;
+                            if (slot_df) gc_from_pending = df;
+                        }
                     }
                 }
                 if (fe.connect_requested) {
                     const uint64_t tdoc2 = doc_id_of(fe.connect_to);
+                    // Dragged from the In node's GHOST exit: mint the
+                    // next slot and land the interior wire on it, one
+                    // undo step (the exterior ghost's mirror).
+                    uint64_t from_mint = 0;
+                    size_t from_mint_li = 0;
+                    if (is_kind(fe.connect_from, flow::NodeKind::GroupIn)) {
+                        const doc::Group* g = doc::find_group(
+                            app.look(), tag_doc(fe.connect_from),
+                            &from_mint_li);
+                        if (g &&
+                            fe.connect_from_port >= g->inputs.size() &&
+                            g->inputs.size() < 5)
+                            from_mint = g->id;
+                    }
+                    auto mint_from_slot = [&]() -> uint64_t {
+                        const uint64_t slot = app.document.next_effect_id++;
+                        app.undo.execute(
+                            app.document,
+                            doc::add_group_input_command(
+                                app.scope_look, from_mint_li, from_mint,
+                                slot));
+                        return slot;
+                    };
                     if (fe.connect_port == 1) {
                         if (tag_kind(fe.connect_from) ==
                                 flow::NodeKind::Source ||
                             tag_kind(fe.connect_from) ==
                                 flow::NodeKind::Effect ||
                             tag_kind(fe.connect_from) ==
-                                flow::NodeKind::Group) {
+                                flow::NodeKind::Group ||
+                            tag_kind(fe.connect_from) ==
+                                flow::NodeKind::GroupIn) {
                             // Masks ARE images: the matte anchor is a
                             // plain port-1 image link — the engine reads
-                            // the wired image's luma as the gate.
+                            // the wired image's luma as the gate. A
+                            // group card's matte lands on the GROUP id.
                             const uint64_t rf =
-                                resolve_src(fe.connect_from);
-                            if (!rf) {
+                                resolve_src(fe.connect_from,
+                                            fe.connect_from_port);
+                            if (from_mint) {
+                                app.undo.begin_group("Connect");
+                                const uint64_t slot = mint_from_slot();
+                                app.undo.execute(
+                                    app.document,
+                                    doc::connect_command(
+                                        app.scope_look,
+                                        {slot, tdoc2, 1}));
+                                app.undo.end_group();
+                            } else if (!rf) {
                                 app.status = "that group has no members";
                             } else if (doc::link_would_cycle(
                                            app.look(), rf, tdoc2)) {
@@ -23975,7 +24337,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                tag_kind(fe.connect_from) !=
                                    flow::NodeKind::Effect &&
                                tag_kind(fe.connect_from) !=
-                                   flow::NodeKind::Group) {
+                                   flow::NodeKind::Group &&
+                               tag_kind(fe.connect_from) !=
+                                   flow::NodeKind::GroupIn) {
                         app.status = "only image nodes feed In ports";
                     } else if (tag_kind(fe.connect_to) ==
                                flow::NodeKind::ModSource) {
@@ -23992,7 +24356,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 "only audio-driven nodes take a media "
                                 "input";
                         } else if (tag_kind(fe.connect_from) ==
-                                   flow::NodeKind::Group) {
+                                       flow::NodeKind::Group ||
+                                   tag_kind(fe.connect_from) ==
+                                       flow::NodeKind::GroupIn) {
                             app.status =
                                 "wire from a media or effect node";
                         } else {
@@ -24004,27 +24370,67 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     app.scope_look, up));
                         }
                     } else {
-                        // Group cards resolve to their boundary members
-                        // before the link edit + cycle guard.
-                        const uint64_t rf = resolve_src(fe.connect_from);
-                        const uint64_t rt = resolve_dst(fe.connect_to);
-                        if (!rf || (fe.connect_to != flow::kOutNodeId &&
-                                    !rt &&
-                                    is_kind(fe.connect_to,
-                                            flow::NodeKind::Group))) {
+                        // Group cards resolve to slots / face members
+                        // before the link edit + cycle guard; the ghost
+                        // row mints its slot and lands the wire on it in
+                        // one undo step.
+                        const uint64_t rf =
+                            resolve_src(fe.connect_from,
+                                        fe.connect_from_port);
+                        uint64_t rt =
+                            resolve_dst(fe.connect_to, fe.connect_port);
+                        if (from_mint && rt) {
+                            app.undo.begin_group("Connect");
+                            const uint64_t slot = mint_from_slot();
+                            app.undo.execute(
+                                app.document,
+                                doc::connect_command(
+                                    app.scope_look,
+                                    {slot, rt, fe.connect_port}));
+                            app.undo.end_group();
+                        } else if (!rf ||
+                            (fe.connect_to != flow::kOutNodeId && !rt &&
+                             !want_mint &&
+                             is_kind(fe.connect_to,
+                                     flow::NodeKind::Group))) {
                             app.status = "that group has no members";
+                        } else if (want_mint && rf) {
+                            size_t mgli = 0;
+                            const doc::Group* mg = doc::find_group(
+                                app.look(), tag_doc(fe.connect_to),
+                                &mgli);
+                            if (mg) {
+                                const uint64_t slot =
+                                    app.document.next_effect_id++;
+                                app.undo.begin_group("Connect");
+                                app.undo.execute(
+                                    app.document,
+                                    doc::add_group_input_command(
+                                        app.scope_look, mgli, mg->id,
+                                        slot));
+                                app.undo.execute(
+                                    app.document,
+                                    doc::connect_command(app.scope_look,
+                                                         {rf, slot, 0}));
+                                app.undo.end_group();
+                            }
                         } else if (doc::link_would_cycle(app.look(),
                                                          rf, rt)) {
                             app.status =
                                 "refused: that connection would loop";
                         } else {
+                            const uint32_t cport =
+                                doc::group_of_input(app.look(), rt)
+                                    ? 0u
+                                    : fe.connect_port;
                             app.undo.execute(app.document,
                                              doc::connect_command(app.scope_look,
-                                                 {rf, rt,
-                                                  fe.connect_port}));
+                                                 {rf, rt, cport}));
                         }
                     }
                 }
+                if (gc_pending) maybe_gc_slot(gc_pending);
+                if (gc_from_pending) maybe_gc_slot(gc_from_pending);
                 if (grouped) app.undo.end_group();
                 structure_done = true;
                 }
@@ -24049,13 +24455,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     nid_out =
                         group_boundary_member(app.look(), gid, true);
                 }
-                auto splice_end = [&](uint64_t cid,
-                                      bool is_from) -> uint64_t {
+                // Wire ends resolve through the same card-port scheme
+                // as connects: a group card's non-matte ports are its
+                // slots (doc port 0), port 1 its matte (the group id).
+                auto splice_end = [&](uint64_t cid, bool is_from,
+                                      uint32_t port,
+                                      uint32_t* doc_port) -> uint64_t {
+                    if (doc_port) *doc_port = port;
                     if (cid == flow::kOutNodeId) return 0;
                     if (tag_kind(cid) != flow::NodeKind::Group)
                         return tag_doc(cid);
-                    return group_boundary_member(app.look(),
-                                                 tag_doc(cid), is_from);
+                    if (is_from)
+                        return group_boundary_member(app.look(),
+                                                     tag_doc(cid), true);
+                    if (port == 1) return tag_doc(cid);
+                    const doc::Group* g =
+                        doc::find_group(app.look(), tag_doc(cid));
+                    const size_t k =
+                        port == 0 ? 0 : static_cast<size_t>(port - 1);
+                    if (!g || k >= g->inputs.size()) return 0;
+                    if (doc_port) *doc_port = 0;
+                    return g->inputs[k];
                 };
                 auto bkind = [&](uint64_t cid) {
                     return cid != flow::kOutNodeId &&
@@ -24063,8 +24483,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             tag_kind(cid) == flow::NodeKind::GroupOut);
                 };
                 const uint64_t wf =
-                    splice_end(fe.splice_wire_from, true);
-                const uint64_t wt = splice_end(fe.splice_wire_to, false);
+                    splice_end(fe.splice_wire_from, true, 0, nullptr);
+                uint32_t wt_port = fe.splice_wire_port;
+                const uint64_t wt =
+                    splice_end(fe.splice_wire_to, false,
+                               fe.splice_wire_port, &wt_port);
                 if (bkind(fe.splice_wire_from) ||
                     bkind(fe.splice_wire_to)) {
                     app.status =
@@ -24086,8 +24509,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.undo.execute(
                         app.document,
                         doc::reconnect_command(app.scope_look,
-                            {wf, wt, fe.splice_wire_port},
-                            {nid_out, wt, fe.splice_wire_port}));
+                            {wf, wt, wt_port},
+                            {nid_out, wt, wt_port}));
                     app.undo.execute(
                         app.document,
                         doc::connect_command(app.scope_look,
@@ -24102,13 +24525,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (fe.port_reorder && !structure_done &&
                 fe.reorder_index >= 0) {
                 uint64_t to = 0;
+                uint32_t port = fe.reorder_port;
                 bool ok = true;
                 if (fe.reorder_node == flow::kOutNodeId) {
                     to = 0;
                 } else if (tag_kind(fe.reorder_node) ==
                            flow::NodeKind::Group) {
-                    to = group_boundary_member(
-                        app.look(), tag_doc(fe.reorder_node), false);
+                    // Card ports map to slots (fan-in on the slot's own
+                    // port 0); port 1 reorders the group matte's fan-in.
+                    if (fe.reorder_port == 1) {
+                        to = tag_doc(fe.reorder_node);
+                    } else {
+                        to = group_boundary_member(
+                            app.look(), tag_doc(fe.reorder_node), false,
+                            fe.reorder_port == 0
+                                ? 0
+                                : static_cast<size_t>(fe.reorder_port -
+                                                      1));
+                        port = 0;
+                    }
                     ok = to != 0;
                 } else {
                     to = tag_doc(fe.reorder_node);
@@ -24117,7 +24552,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.undo.execute(
                         app.document,
                         doc::move_port_link_command(
-                            app.scope_look, to, fe.reorder_port,
+                            app.scope_look, to, port,
                             static_cast<size_t>(fe.reorder_index),
                             fe.reorder_delta));
                     structure_done = true;
@@ -24196,15 +24631,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                 } else if (tag_kind(fe.route_drop_to) ==
                            flow::NodeKind::Group) {
-                    // Face rows are member-param ALIASES: the drop
-                    // targets the row'th valid exposed key.
+                    // Rows 0/1 are the group's OWN wet/opacity (group-
+                    // keyed); face rows follow as member-param ALIASES -
+                    // the drop targets the (row-2)'th valid exposed key.
                     const uint64_t gid = tag_doc(fe.route_drop_to);
                     size_t gli = 0;
-                    if (find_group_by_id(app.look(), gid, &gli)) {
+                    if (fe.route_drop_row < 2) {
+                        if (doc::find_group(app.look(), gid)) {
+                            key = {gid | doc::kGroupParamBit,
+                                   fe.route_drop_row == 0
+                                       ? doc::kWetParam
+                                       : doc::kOpacityParam};
+                            have_key = true;
+                        }
+                    } else if (find_group_by_id(app.look(), gid, &gli)) {
                         const doc::Layer& gl = app.look().layers[gli];
                         for (const doc::Group& gr : gl.groups) {
                             if (gr.id != gid) continue;
-                            int vrow = -1;
+                            int vrow = 1;
                             for (const doc::ParamKey& k : gr.exposed) {
                                 bool member = false;
                                 for (const doc::EffectInstance& e :
@@ -24321,11 +24765,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
                 }
             }
-            // Click-away commits the open value editor (texed blur
-            // commit) — any left press that didn't OPEN it this frame.
-            if (app.value_edit_node && !fe.value_edit_node &&
-                input.left_pressed())
-                app.value_commit = true;
+            // THE click-away gate: any left press while a text field
+            // that predates this frame is still active COMMITS it (the
+            // one blur-commit rule for every inline editor - renames,
+            // type-ins, the key readout, the duration field, browser
+            // and preset renames alike). Escape remains the only
+            // abandon.
+            if (input.left_pressed() && any_text_entry(text_entry_before) &&
+                text_entry_unchanged(app, text_entry_before))
+                commit_text_entry(app);
             if (app.value_commit) {
                 app.value_commit = false;
                 for (size_t i = 0; i < flow_ui.graph->node_count; ++i) {
@@ -24360,22 +24808,30 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         // param. Other card kinds' appliers run later —
                         // their staged writes still land.
                         bool applied = false;
-                        // Group face rows are member-param ALIASES
-                        //: resolve the row to its exposed key so
+                        // Group rows: 0/1 are the group's own knobs
+                        // (group-keyed), face rows follow as member-
+                        // param ALIASES - resolve the row to its key so
                         // typed values commit through the same direct
                         // path as effect rows.
                         doc::ParamKey face_key{0, 0};
                         bool face = false;
+                        bool own_knob = false;
                         if (tag_kind(nd.id) == flow::NodeKind::Group) {
                             const uint64_t gid = tag_doc(nd.id);
                             size_t gli = 0;
-                            if (find_group_by_id(app.look(), gid,
-                                                 &gli)) {
+                            if (app.value_edit_row < 2) {
+                                face_key = {gid | doc::kGroupParamBit,
+                                            app.value_edit_row == 0
+                                                ? doc::kWetParam
+                                                : doc::kOpacityParam};
+                                own_knob = true;
+                            } else if (find_group_by_id(app.look(), gid,
+                                                        &gli)) {
                                 const doc::Layer& gl =
                                     app.look().layers[gli];
                                 for (const doc::Group& gr : gl.groups) {
                                     if (gr.id != gid) continue;
-                                    int vrow = -1;
+                                    int vrow = 1;
                                     for (const doc::ParamKey& k :
                                          gr.exposed) {
                                         bool member = false;
@@ -24394,6 +24850,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     break;
                                 }
                             }
+                        }
+                        if (own_knob) {
+                            std::vector<doc::Keyframe> keys2;
+                            if (autokey_lane(app, face_key, v, &keys2)) {
+                                app.undo.execute(
+                                    app.document,
+                                    doc::set_lane_command(app.scope_look,
+                                        face_key, std::move(keys2)));
+                            } else {
+                                size_t gli2 = 0;
+                                if (doc::Group* gset = doc::find_group(
+                                        app.look(),
+                                        face_key.effect_id &
+                                            ~doc::kGroupParamBit,
+                                        &gli2)) {
+                                    doc::Group edited = *gset;
+                                    (face_key.param_index ==
+                                             doc::kWetParam
+                                         ? edited.wet
+                                         : edited.opacity) = v;
+                                    app.undo.execute(
+                                        app.document,
+                                        doc::set_group_props_command(
+                                            app.scope_look, gli2,
+                                            edited));
+                                }
+                            }
+                            applied = true;
                         }
                         if (tag_kind(nd.id) == flow::NodeKind::Effect ||
                             face) {
@@ -25182,6 +25666,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 auto wire_live = [&](const flow::Wire& sw) {
                     for (size_t w = 0; w < flow_ui.graph->wire_count; ++w)
                         if (flow_ui.graph->wires[w].from == sw.from &&
+                            flow_ui.graph->wires[w].from_port ==
+                                sw.from_port &&
                             flow_ui.graph->wires[w].to == sw.to &&
                             flow_ui.graph->wires[w].data == sw.data &&
                             flow_ui.graph->wires[w].to_port == sw.to_port)
@@ -25195,32 +25681,45 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         for (const doc::EffectInstance& e : sl.stack)
                             if (e.group_id == app.open_group)
                                 del_members.insert(e.id);
+                // Slots whose wires were cut: reaped after the loop when
+                // nothing references them anymore, same undo step.
+                std::vector<uint64_t> gc_slots;
                 app.undo.begin_group("Delete Selection");
                 for (const flow::Wire& sw : app.sel_wires) {
                     if (!wire_live(sw)) continue;
                     // Boundary wires in the scoped view cut the REAL
                     // outer link they visualize.
-                    if (is_cid_kind(sw.from, flow::NodeKind::GroupIn) ||
-                        is_cid_kind(sw.to, flow::NodeKind::GroupOut)) {
-                        const auto links =
-                            app.look().links.empty()
-                                ? doc::synthesize_links(app.look())
-                                : app.look().links;
+                    if (is_cid_kind(sw.from, flow::NodeKind::GroupIn)) {
+                        // Interior slot wire: a REAL link from the slot
+                        // (the exit row names it); a fully-unwired slot
+                        // dies with its last wire.
+                        const doc::Group* sg = doc::find_group(
+                            app.look(), tag_doc(sw.from));
+                        if (sg && sw.from_port < sg->inputs.size()) {
+                            const uint64_t slot =
+                                sg->inputs[sw.from_port];
+                            app.undo.execute(
+                                app.document,
+                                doc::disconnect_command(
+                                    app.scope_look,
+                                    {slot, tag_doc(sw.to),
+                                     sw.to_port}));
+                            gc_slots.push_back(slot);
+                        }
+                        continue;
+                    }
+                    if (is_cid_kind(sw.to, flow::NodeKind::GroupOut)) {
+                        // The Out binding wire visualizes the outer
+                        // links: cutting it cuts the first of them.
+                        std::vector<doc::NodeLink> synth;
+                        const std::vector<doc::NodeLink>& links =
+                            doc::effective_links(app.look(), synth);
                         for (const doc::NodeLink& l : links) {
                             if (l.to_port != 0) continue;
-                            const bool in_cut =
-                                is_cid_kind(sw.from,
-                                            flow::NodeKind::GroupIn) &&
-                                !del_members.count(l.from) &&
-                                del_members.count(l.to) &&
-                                l.to == tag_doc(sw.to);
-                            const bool out_cut =
-                                is_cid_kind(sw.to,
-                                            flow::NodeKind::GroupOut) &&
-                                del_members.count(l.from) &&
+                            if (del_members.count(l.from) &&
                                 !del_members.count(l.to) &&
-                                l.from == tag_doc(sw.from);
-                            if (in_cut || out_cut) {
+                                !doc::group_of_input(app.look(), l.to) &&
+                                l.from == tag_doc(sw.from)) {
                                 app.undo.execute(
                                     app.document,
                                     doc::disconnect_command(app.scope_look,l));
@@ -25234,13 +25733,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             ? group_boundary_member(app.look(),
                                                     tag_doc(sw.from), true)
                             : tag_doc(sw.from);
+                    uint32_t wport = sw.to_port;
                     uint64_t wt = sw.to == flow::kOutNodeId
                         ? 0ull
-                        : (is_cid_kind(sw.to, flow::NodeKind::Group)
-                               ? group_boundary_member(app.look(),
-                                                       tag_doc(sw.to),
-                                                       false)
-                               : tag_doc(sw.to));
+                        : tag_doc(sw.to);
+                    if (is_cid_kind(sw.to, flow::NodeKind::Group) &&
+                        sw.to_port != 1) {
+                        // Card ports name slots; their wires live on the
+                        // slot's own port 0.
+                        const doc::Group* sg =
+                            doc::find_group(app.look(), tag_doc(sw.to));
+                        const size_t sk = sw.to_port == 0
+                            ? 0
+                            : static_cast<size_t>(sw.to_port - 1);
+                        wt = sg && sk < sg->inputs.size()
+                            ? sg->inputs[sk]
+                            : 0;
+                        wport = 0;
+                        if (wt) gc_slots.push_back(wt);
+                    }
                     if (!sw.data &&
                         is_cid_kind(sw.to, flow::NodeKind::ModSource)) {
                         // Media wire into an analysis card: clearing
@@ -25262,7 +25773,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.undo.execute(
                             app.document,
                             doc::disconnect_command(
-                                app.scope_look, {wf, wt, sw.to_port}));
+                                app.scope_look, {wf, wt, wport}));
                     } else {
                         // Value wires: into a helper's operand row =
                         // unwire that input; onto a param row = remove
@@ -25318,6 +25829,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                         if (map[rr] ==
                                             r.target.param_index)
                                             row = static_cast<int>(rr);
+                                } else if (r.target.effect_id &
+                                           doc::kGroupParamBit) {
+                                    cid = flow::node_id(
+                                        flow::NodeKind::Group,
+                                        r.target.effect_id &
+                                            ~doc::kGroupParamBit);
+                                    row = r.target.param_index ==
+                                                  doc::kWetParam
+                                        ? 0
+                                        : r.target.param_index ==
+                                                  doc::kOpacityParam
+                                            ? 1
+                                            : -1;
                                 } else if (r.target.effect_id == 0) {
                                     if (r.target.param_index == 0)
                                         cid = flow::kOutNodeId;
@@ -25364,6 +25888,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     doc::remove_route_command(app.scope_look,rid2));
                         }
                     }
+                }
+                // Cutting a slot's last exterior feed removes the slot
+                // outright (interior severed, later slots compact).
+                for (const uint64_t slot : gc_slots) {
+                    size_t sgli = 0;
+                    doc::Group* owner = doc::group_of_input(
+                        app.look(), slot, &sgli);
+                    if (!owner) continue;
+                    bool fed = false;
+                    std::vector<doc::NodeLink> gcsynth;
+                    for (const doc::NodeLink& l :
+                         doc::effective_links(app.look(), gcsynth))
+                        fed = fed || l.to == slot;
+                    if (!fed)
+                        app.undo.execute(
+                            app.document,
+                            doc::remove_group_input_command(
+                                app.scope_look, sgli, owner->id, slot));
                 }
                 for (const uint64_t cid : app.multi_sel) {
                     const uint64_t did = tag_doc(cid);
@@ -25798,8 +26340,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 std::min(ui_layer, app.look().layers.size() - 1);
             doc::Group group;
             std::vector<doc::EffectInstance> effects;
+            uint64_t face_in = 0;
             doc::instantiate_preset(app.document, app.presets[pi],
-                                    &group, &effects);
+                                    &group, &effects, &face_in);
             float gx = 0.0f, gy = 0.0f;
             const ui::Rect cr = frame_ui.canvas_node
                                     ? frame_ui.canvas_node->rect
@@ -25812,11 +26355,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 group.node_y = gy - 60.0f;
             }
             const uint64_t new_gid = group.id;
-            const uint64_t face_in = group.face_in;
             const uint64_t face_out = group.face_out;
             // Dropped ON A WIRE: splice the preset chain into it. The
             // members already chain internally (insert wires them), so
-            // the gesture is boundary wiring — wf → face_in,
+            // the gesture is boundary wiring — wf → the seeded In slot,
             // face_out → wt — resolved and cycle-guarded exactly like
             // the canvas node splice.
             uint64_t swf = 0, swt = 0;
@@ -25829,34 +26371,52 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.execute(app.document,
                              doc::insert_group_command(app.scope_look,
                                  target_layer, std::move(group),
-                                 std::move(effects)));
-            if (over_wire && face_in && face_out) {
-                auto wire_end_doc = [&](uint64_t cid,
-                                        bool is_from) -> uint64_t {
+                                 std::move(effects), face_in));
+            const doc::Group* placed =
+                doc::find_group(app.look(), new_gid);
+            const uint64_t in_slot = placed && !placed->inputs.empty()
+                ? placed->inputs.front()
+                : 0;
+            if (over_wire && in_slot && face_out) {
+                auto wire_end_doc = [&](uint64_t cid, bool is_from,
+                                        uint32_t port,
+                                        uint32_t* doc_port) -> uint64_t {
+                    if (doc_port) *doc_port = port;
                     if (cid == flow::kOutNodeId) return 0;
                     const auto k = flow::node_kind_of(cid);
                     const uint64_t did = flow::node_doc_id(cid);
-                    return k == flow::NodeKind::Group
-                               ? group_boundary_member(app.look(), did,
-                                                       is_from)
-                               : did;
+                    if (k != flow::NodeKind::Group) return did;
+                    if (is_from)
+                        return group_boundary_member(app.look(), did,
+                                                     true);
+                    if (port == 1) return did;
+                    const doc::Group* g =
+                        doc::find_group(app.look(), did);
+                    const size_t sk =
+                        port == 0 ? 0 : static_cast<size_t>(port - 1);
+                    if (!g || sk >= g->inputs.size()) return 0;
+                    if (doc_port) *doc_port = 0;
+                    return g->inputs[sk];
                 };
-                const uint64_t wf = wire_end_doc(swf, true);
-                const uint64_t wt = wire_end_doc(swt, false);
+                const uint64_t wf =
+                    wire_end_doc(swf, true, 0, nullptr);
+                uint32_t wt_port = sport;
+                const uint64_t wt =
+                    wire_end_doc(swt, false, sport, &wt_port);
                 if (wf &&
-                    !doc::link_would_cycle(app.look(), wf, face_in) &&
+                    !doc::link_would_cycle(app.look(), wf, in_slot) &&
                     !doc::link_would_cycle(app.look(), face_out, wt)) {
                     // The spliced feed keeps the old wire's stacking
                     // position in (wt, port)'s fan-in.
                     app.undo.execute(
                         app.document,
                         doc::reconnect_command(app.scope_look,
-                                               {wf, wt, sport},
-                                               {face_out, wt, sport}));
+                                               {wf, wt, wt_port},
+                                               {face_out, wt, wt_port}));
                     app.undo.execute(
                         app.document,
                         doc::connect_command(app.scope_look,
-                                             {wf, face_in, 0}));
+                                             {wf, in_slot, 0}));
                 }
             }
             app.undo.end_group();
@@ -25966,18 +26526,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (frame_ui.preset_new_bin_clicked &&
             *frame_ui.preset_new_bin_clicked)
             preset_new_bin(app);
-        // Click-away releases the preset selection and an uncommitted
-        // rename, mirroring the project browser.
+        // Click-away releases the preset selection; the rename commits
+        // through the one text-entry gate above.
         if (input.left_pressed() && !app.ctx_menu.kind &&
             !app.confirm.open()) {
             bool on_row = false;
             for (const FrameUi::BrowserNode& pn : frame_ui.preset_nodes_r)
                 if (pn.rect->contains(input.mouse)) on_row = true;
             if (!on_row && app.preset_sel) app.preset_sel = 0;
-            if (app.preset_rename_key && !app.preset_rename_commit)
-                app.preset_rename_key = 0;
         }
-        if (app.preset_rename_commit) preset_rename_apply(app);
         if (frame_ui.tag_selected && *frame_ui.tag_selected >= 0)
             app.preset_tag_index = *frame_ui.tag_selected - 1;   // 0 = all
         if (frame_ui.preset_search_clicked && *frame_ui.preset_search_clicked) {
@@ -26196,12 +26753,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             rail_opened = true;
             break;
         }
-        // Click-away commits the open rail editor (blur commit, same
-        // contract as the canvas value editor): any left press that did
-        // not open one this frame lands the typed value.
-        if (!rail_opened && app.rail_edit_key.effect_id != 0 &&
-            input.left_pressed())
-            app.rail_edit_commit = true;
+        // (Rail click-away rides the one text-entry gate; rail_opened
+        // still guards the open-click via the snapshot comparison.)
+        (void)rail_opened;
 
         if (frame_ui.add_layer_open && *frame_ui.add_layer_open)
             app.sel = {SelKind::AddLayer, 0};
@@ -26904,15 +27458,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             else
                 app.bin_closed.insert(br.id);
         }
-        // Click-away drops the browser keyboard captures FIRST: an
-        // invisible rename or search field must never keep swallowing
-        // Delete and friends after the user moved on (the field's own
-        // click below re-arms it in the same frame).
-        if (input.left_pressed()) {
-            if (app.browser_rename_id && !app.browser_rename_commit)
-                app.browser_rename_id = 0;
-            app.browser_search_focus = false;
-        }
+        // Click-away lands through the one text-entry gate (rename
+        // COMMITS, search defocuses); the field's own click below
+        // re-arms the search in the same frame.
         if (frame_ui.browser_search_clicked &&
             *frame_ui.browser_search_clicked) {
             app.browser_search_focus = true;
@@ -26925,40 +27473,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.execute(
                 app.document,
                 doc::add_bin_command(doc::make_bin(app.document, "")));
-        if (app.browser_rename_commit) {
-            const uint64_t rid = app.browser_rename_id;
-            const std::string nm = app.browser_rename_buf;
-            if (rid && !nm.empty()) {
-                if (const doc::Bin* b = app.document.find_bin(rid)) {
-                    app.undo.execute(app.document,
-                                     doc::set_bin_props_command(
-                                         rid, nm, b->parent));
-                } else if (const doc::Look* l =
-                               app.document.find_look(rid)) {
-                    app.undo.execute(app.document,
-                                     doc::set_look_props_command(
-                                         rid, nm, l->duration));
-                } else if (const doc::Sequence* s =
-                               app.document.find_sequence(rid)) {
-                    app.undo.execute(app.document,
-                                     doc::set_sequence_props_command(
-                                         rid, nm, s->duration));
-                } else {
-                    for (const doc::Asset& a2 : app.document.assets)
-                        if (a2.id == rid) {
-                            doc::Asset up = a2;
-                            up.name = nm;
-                            app.undo.execute(
-                                app.document,
-                                doc::set_asset_command(std::move(up)));
-                            break;
-                        }
-                }
-            }
-            app.browser_rename_id = 0;
-            app.browser_rename_commit = false;
-            app.browser_rename_buf.clear();
-        }
         if (frame_ui.browser_new_look_clicked &&
             *frame_ui.browser_new_look_clicked) {
             doc::Look fresh = doc::make_look(app.document, "");

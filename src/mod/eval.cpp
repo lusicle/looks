@@ -490,6 +490,15 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                 for (const doc::SnapshotEntry& e : b.entries)
                     if (e.effect_id == ea.effect_id) eb = &e;
                 if (!eb) continue;
+                if (ea.effect_id & doc::kGroupParamBit) {
+                    doc::Group* g = doc::find_group(
+                        out, ea.effect_id & ~doc::kGroupParamBit);
+                    if (!g) continue;
+                    g->wet = ea.wet + (eb->wet - ea.wet) * pos;
+                    g->opacity =
+                        ea.opacity + (eb->opacity - ea.opacity) * pos;
+                    continue;
+                }
                 size_t layer = 0, index = 0;
                 if (!find_effect(out, ea.effect_id, &layer, &index)) continue;
                 doc::EffectInstance& fx = out.layers[layer].stack[index];
@@ -517,6 +526,20 @@ void resolve_look(const doc::Look& look, doc::Look& out,
             }
         return nullptr;
     };
+    // Group targets: keys carry kGroupParamBit + the group id; the only
+    // slots are the composite's own wet/opacity, both 0..1.
+    auto group_slot = [&](const doc::ParamKey& key, float* min_v,
+                          float* max_v) -> float* {
+        if (!(key.effect_id & doc::kGroupParamBit)) return nullptr;
+        const uint64_t id = key.effect_id & ~doc::kGroupParamBit;
+        doc::Group* g = doc::find_group(out, id);
+        if (!g) return nullptr;
+        *min_v = 0.0f;
+        *max_v = 1.0f;
+        if (key.param_index == doc::kWetParam) return &g->wet;
+        if (key.param_index == doc::kOpacityParam) return &g->opacity;
+        return nullptr;
+    };
 
     // Keyframe lanes set the base (muted lanes keep keys, drive nothing).
     for (const doc::KeyframeLane& lane : look.lanes) {
@@ -524,6 +547,10 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         float min_v = 0.0f, max_v = 1.0f;
         if (float* lslot = layer_slot(lane.target, &min_v, &max_v)) {
             *lslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
+            continue;
+        }
+        if (float* gslot = group_slot(lane.target, &min_v, &max_v)) {
+            *gslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
             continue;
         }
         size_t layer = 0, index = 0;
@@ -543,6 +570,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         if (!route.node) continue;
         float min_v = 0.0f, max_v = 1.0f;
         float* slot = layer_slot(route.target, &min_v, &max_v);
+        if (!slot) slot = group_slot(route.target, &min_v, &max_v);
         if (!slot) {
             size_t layer = 0, index = 0;
             if (!find_effect(out, route.target.effect_id, &layer, &index))

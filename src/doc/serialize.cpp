@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "doc/effects.h"
+#include "doc/group_commands.h"
 #include "util/file.h"
 
 namespace looks::doc {
@@ -82,10 +83,12 @@ float num(const Value& obj, std::string_view key, float fallback) {
 
 Value param_key_to_json(const ParamKey& k) {
     Value v = Value::make_object();
-    // Layer keys carry bit 62, past the JSON number's 2^53 exact-integer
-    // range — store the bare id in its own field instead.
+    // Layer/group keys carry bits 62/61, past the JSON number's 2^53
+    // exact-integer range — store the bare id in its own field instead.
     if (k.effect_id & kLayerParamBit)
         v.set("layer", static_cast<int64_t>(k.effect_id & ~kLayerParamBit));
+    else if (k.effect_id & kGroupParamBit)
+        v.set("group", static_cast<int64_t>(k.effect_id & ~kGroupParamBit));
     else
         v.set("effect", static_cast<int64_t>(k.effect_id));
     v.set("param", k.param_index);
@@ -95,8 +98,11 @@ Value param_key_to_json(const ParamKey& k) {
 ParamKey param_key_from_json(const Value& v) {
     ParamKey k;
     const int64_t layer_id = v.get("layer").as_int(-1);
+    const int64_t group_id = v.get("group").as_int(-1);
     if (layer_id >= 0)
         k.effect_id = static_cast<uint64_t>(layer_id) | kLayerParamBit;
+    else if (group_id >= 0)
+        k.effect_id = static_cast<uint64_t>(group_id) | kGroupParamBit;
     else
         k.effect_id = static_cast<uint64_t>(v.get("effect").as_int(0));
     k.param_index = static_cast<int>(v.get("param").as_int(0));
@@ -270,7 +276,13 @@ Value snapshot_to_json(const Snapshot& s) {
     Value entries = Value::make_array();
     for (const SnapshotEntry& e : s.entries) {
         Value ev = Value::make_object();
-        ev.set("effect", static_cast<int64_t>(e.effect_id));
+        // Group entries carry kGroupParamBit, past JSON's exact-integer
+        // range - bare id in its own field, like param keys.
+        if (e.effect_id & kGroupParamBit)
+            ev.set("group",
+                   static_cast<int64_t>(e.effect_id & ~kGroupParamBit));
+        else
+            ev.set("effect", static_cast<int64_t>(e.effect_id));
         Array params;
         for (float p : e.params) params.push_back(Value(static_cast<double>(p)));
         ev.set("params", Value(std::move(params)));
@@ -287,7 +299,11 @@ Snapshot snapshot_from_json(const Value& v) {
     s.valid = v.get("valid").as_bool(false);
     for (const Value& ev : v.get("entries").array()) {
         SnapshotEntry e;
-        e.effect_id = static_cast<uint64_t>(ev.get("effect").as_int(0));
+        const int64_t group_id = ev.get("group").as_int(-1);
+        e.effect_id =
+            group_id >= 0
+                ? static_cast<uint64_t>(group_id) | kGroupParamBit
+                : static_cast<uint64_t>(ev.get("effect").as_int(0));
         for (const Value& p : ev.get("params").array())
             e.params.push_back(static_cast<float>(p.as_number(0.0)));
         e.wet = num(ev, "wet", 1.0f);
@@ -415,7 +431,16 @@ Value layer_to_json(const Layer& l) {
     return v;
 }
 
-Layer layer_from_json(const Value& v) {
+// One pre-slot group met by the loader: which group, and the face_in id
+// its In slot seeds from (normalize_group_inputs runs after id counters
+// are restored, so slot minting can't collide).
+struct GroupMigration {
+    uint64_t group = 0;
+    uint64_t face_in = 0;
+};
+
+Layer layer_from_json(const Value& v,
+                      std::vector<GroupMigration>* migrations) {
     Layer l;
     l.id = static_cast<uint64_t>(v.get("id").as_int(0));
     l.name = v.get("name").as_string();
@@ -472,8 +497,12 @@ Layer layer_from_json(const Value& v) {
     l.node_y = num(v, "node_y", 0.0f);
     for (const Value& fv : v.get("stack").array())
         if (auto fx = effect_from_json(fv)) l.stack.push_back(std::move(*fx));
-    for (const Value& gv : v.get("groups").array())
-        l.groups.push_back(group_from_json(gv));
+    for (const Value& gv : v.get("groups").array()) {
+        GroupLegacy legacy;
+        l.groups.push_back(group_from_json(gv, &legacy));
+        if (legacy.migrate && migrations)
+            migrations->push_back({l.groups.back().id, legacy.face_in});
+    }
     return l;
 }
 
@@ -610,7 +639,8 @@ Value look_to_json(const Look& look) {
     return v;
 }
 
-Look look_from_json(const Value& v) {
+Look look_from_json(const Value& v,
+                    std::vector<GroupMigration>* migrations) {
     Look look;
     look.id = static_cast<uint64_t>(v.get("id").as_int(0));
     look.name = v.get("name").as_string();
@@ -623,7 +653,7 @@ Look look_from_json(const Value& v) {
 
     for (const Value& lv : v.get("layers").array()) {
         if (look.layers.size() >= kMaxLayers) break;
-        look.layers.push_back(layer_from_json(lv));
+        look.layers.push_back(layer_from_json(lv, migrations));
     }
     for (const Value& nv : v.get("value_nodes").array())
         look.value_nodes.push_back(value_node_from_json(nv));
@@ -670,7 +700,10 @@ uint64_t max_node_id(const Look& look) {
         max_id = std::max(max_id, l.id);
         for (const EffectInstance& fx : l.stack)
             max_id = std::max(max_id, fx.id);
-        for (const Group& g : l.groups) max_id = std::max(max_id, g.id);
+        for (const Group& g : l.groups) {
+            max_id = std::max(max_id, g.id);
+            for (uint64_t s : g.inputs) max_id = std::max(max_id, s);
+        }
     }
     for (const CanvasFrame& f : look.frames) max_id = std::max(max_id, f.id);
     return max_id;
@@ -877,7 +910,15 @@ json::Value group_to_json(const Group& g) {
         exposed.push(std::move(ev));
     }
     v.set("exposed", std::move(exposed));
-    if (g.face_in) v.set("face_in", static_cast<int64_t>(g.face_in));
+    v.set("wet", static_cast<double>(g.wet));
+    v.set("opacity", static_cast<double>(g.opacity));
+    // Always emitted, empty included: presence is what marks a file as
+    // slot-aware (absence routes the loader through the legacy face_in
+    // migration in normalize_group_inputs).
+    Value inputs = Value::make_array();
+    for (uint64_t s : g.inputs)
+        inputs.push(Value(static_cast<int64_t>(s)));
+    v.set("inputs", std::move(inputs));
     if (g.face_out) v.set("face_out", static_cast<int64_t>(g.face_out));
     if (g.in_x != 0.0f || g.in_y != 0.0f) {
         v.set("in_x", static_cast<double>(g.in_x));
@@ -890,7 +931,7 @@ json::Value group_to_json(const Group& g) {
     return v;
 }
 
-Group group_from_json(const json::Value& v) {
+Group group_from_json(const json::Value& v, GroupLegacy* legacy) {
     Group g;
     g.id = static_cast<uint64_t>(v.get("id").as_int(0));
     g.name = v.get("name").as_string();
@@ -902,7 +943,18 @@ Group group_from_json(const json::Value& v) {
         g.exposed.push_back(
             {static_cast<uint64_t>(ev.get("effect").as_int(0)),
              static_cast<int>(ev.get("param").as_int(0))});
-    g.face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
+    g.wet = num(v, "wet", 1.0f);
+    g.opacity = num(v, "opacity", 1.0f);
+    for (const Value& sv : v.get("inputs").array())
+        g.inputs.push_back(static_cast<uint64_t>(sv.as_int(0)));
+    // Pre-slot files bound the In through face_in; the caller feeds it
+    // to normalize_group_inputs, which seeds slot 0 from it exactly
+    // once. Slot-aware files carry the "inputs" key (even empty) and
+    // skip the migration.
+    if (legacy) {
+        legacy->migrate = !v.get("inputs").is_array();
+        legacy->face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
+    }
     g.face_out = static_cast<uint64_t>(v.get("face_out").as_int(0));
     g.in_x = num(v, "in_x", 0.0f);
     g.in_y = num(v, "in_y", 0.0f);
@@ -999,9 +1051,10 @@ Document doc_from_json(const json::Value& v) {
     for (const Value& av : v.get("assets").array())
         doc.assets.push_back(asset_from_json(av));
 
+    std::vector<GroupMigration> migrations;
     for (const Value& lv : v.get("looks").array()) {
         if (doc.looks.size() >= kMaxLooks) break;
-        doc.looks.push_back(look_from_json(lv));
+        doc.looks.push_back(look_from_json(lv, &migrations));
     }
     for (const Value& sv : v.get("sequences").array()) {
         if (doc.sequences.size() >= kMaxLooks) break;
@@ -1052,6 +1105,25 @@ Document doc_from_json(const json::Value& v) {
     doc.next_route_id =
         std::max(static_cast<uint64_t>(v.get("next_route_id").as_int(1)),
                  max_route_id + 1);
+
+    // Pre-slot groups migrate exactly once: crossings reroute through
+    // minted slots and face_in seeds the In. Runs after the counter
+    // restore above so fresh slot ids can never collide.
+    for (const GroupMigration& m : migrations)
+        for (Look& look : doc.looks) {
+            size_t li = 0;
+            if (Group* g = find_group(look, m.group, &li)) {
+                uint64_t seed = m.face_in;
+                if (!seed)
+                    for (const EffectInstance& e : look.layers[li].stack)
+                        if (e.group_id == g->id) {
+                            seed = e.id;
+                            break;
+                        }
+                normalize_group_inputs(doc, look, li, *g, seed);
+                break;
+            }
+        }
 
     // A document always holds at least one look holding at least one
     // layer, and at least one sequence holding at least one lane.

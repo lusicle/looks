@@ -109,6 +109,15 @@ struct Node {
     const char* matte_label = nullptr;
     bool has_aux_port = false;   // second image input (N-ports)
     const char* aux_label = "b"; // port name on the card ("b", "map")
+    // GROUP card input slots past the first: strip rows with left
+    // anchors, flow port = slot index + 1 (0 = the In anchor, 1 =
+    // matte). ghost_in appends the dashed "new input" row - wiring it
+    // mints the next slot (flow port = slot_rows + 2).
+    int slot_rows = 0;
+    bool ghost_in = false;
+    // GroupIn boundary card: one right-anchored EXIT row per input slot
+    // (row k = slot k). Wires leaving row k carry from_port = k.
+    int exit_rows = 0;
     bool has_out = false;
     // Live preview: an atlas cell (draw_image_quad); null = flat slot.
     const ui::UiTexture* preview = nullptr;
@@ -145,6 +154,9 @@ struct Wire {
     // Data wires land on the driven PARAM's row instead of the card
     // edge; -1 = no row (card-edge fallback).
     int to_row = -1;
+    // Multi-exit producers (GroupIn slot rows): which exit the wire
+    // leaves. 0 for every single-out card.
+    uint32_t from_port = 0;
 };
 
 // Titled grouping box (texed frames): drawn behind the cards, dragged by
@@ -218,6 +230,7 @@ struct CanvasState {
     uint64_t drag_id = 0;
     int drag_row = -1;
     uint64_t wire_from = 0;          // wire drag origin node
+    uint32_t wire_from_port = 0;     // origin exit row (multi-exit cards)
     uint64_t wire_old_to = 0;        // rewire: the grabbed link's consumer
     uint32_t wire_old_port = 0;
     Vec2 press_screen{};
@@ -316,12 +329,15 @@ struct Output {
     int add_pick = -1;
     // Wire edits: connect from→(to, port); port 0 = In, 1 = matte.
     // A rewire release emits disconnect (the grabbed link) + connect.
+    // *_from_port names the exit row on a multi-exit origin (GroupIn).
     bool connect_requested = false;
     uint64_t connect_from = 0, connect_to = 0;
     uint32_t connect_port = 0;
+    uint32_t connect_from_port = 0;
     bool disconnect_requested = false;
     uint64_t disconnect_from = 0, disconnect_to = 0;
     uint32_t disconnect_port = 0;
+    uint32_t disconnect_from_port = 0;
     // Value-node wiring: a ModSource out wire dropped on a param row
     // retargets that route to the row's param.
     bool route_drop_requested = false;
@@ -336,6 +352,7 @@ struct Output {
     bool wire_clicked_shift = false;
     uint64_t wire_from = 0, wire_to = 0;
     uint32_t wire_to_port = 0;
+    uint32_t wire_from_port = 0;
     bool wire_data = false;
     int wire_to_row = -1;
     // Context menu: item picked this frame (index into Graph::ctx_items;

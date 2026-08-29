@@ -30,6 +30,7 @@ add_slang_shaders(looks_shaders
         fx_flow_smear.comp.slang
         fx_motion_extract.comp.slang
         fx_mix.comp.slang
+        group_mix.comp.slang
         fx_echo.comp.slang
         fx_feedback.comp.slang
         fx_glyph.comp.slang

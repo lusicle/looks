@@ -488,19 +488,31 @@ TEST(preset_insert_lands_dormant) {
     members.push_back(make_effect(d, EffectType::Grain));
     members.push_back(make_effect(d, EffectType::Posterize));
     const uint64_t m0 = members[0].id, m1 = members[1].id;
-    undo.execute(d, doc::insert_group_command(d.looks[0].id,0, g, std::move(members)));
+    const uint64_t gid = g.id;
+    undo.execute(d, doc::insert_group_command(d.looks[0].id, 0, g,
+                                              std::move(members), m0));
 
-    // The old chain froze: source -> vignette -> output.
+    // The old chain froze: source -> vignette -> output. The group
+    // seeds its In slot (interior-only wire onto m0) but nothing
+    // EXTERIOR touches the newcomers.
     CHECK(!d.looks[0].links.empty());
-    bool internal = false, boundary = false, chain_out = false;
+    const doc::Group* placed = doc::find_group(d.looks[0], gid);
+    CHECK(placed && placed->inputs.size() == size_t{1});
+    const uint64_t slot0 = placed->inputs.front();
+    bool internal = false, seeded = false, boundary = false,
+         chain_out = false;
     for (const doc::NodeLink& l : d.looks[0].links) {
         if (l.from == m0 && l.to == m1 && l.to_port == 0) internal = true;
+        if (l.from == slot0 && l.to == m0 && l.to_port == 0) seeded = true;
         if ((l.from == m1 || l.from == m0) && l.to == 0) boundary = true;
-        if (l.to == m0) boundary = true;   // nothing feeds the group
+        if (l.to == m0 && l.from != slot0)
+            boundary = true;   // nothing exterior feeds the group
+        if (l.to == slot0) boundary = true;   // the slot sits unwired
         if (l.to == 0 && l.from == d.looks[0].layers[0].stack[0].id)
             chain_out = true;
     }
     CHECK(internal);
+    CHECK(seeded);
     CHECK(!boundary);
     CHECK(chain_out);
 
@@ -628,6 +640,233 @@ TEST(group_bypass_compiles_out) {
     CHECK_EQ(graph.nodes[1].effect_index, 1);
 }
 
+TEST(group_creation_slotifies_crossings) {
+    // Ctrl+G over a wired chain: the exterior feed reroutes through a
+    // minted In slot at the crossing's fan-in position; undo restores
+    // the link table exactly.
+    Document d;
+    doc::UndoStack undo;
+    doc::Layer& layer = d.looks[0].layers[0];
+    layer.stack.push_back(make_effect(d, EffectType::Vignette));
+    layer.stack.push_back(make_effect(d, EffectType::Grain));
+    const uint64_t src = layer.id;
+    const uint64_t f0 = layer.stack[0].id, f1 = layer.stack[1].id;
+    doc::ensure_links(d.looks[0]);
+    const std::vector<doc::NodeLink> before = d.looks[0].links;
+
+    doc::Group g = doc::make_group(d, "wrap");
+    const uint64_t gid = g.id;
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, 0, g, 0, 1));
+    const doc::Group* placed = doc::find_group(d.looks[0], gid);
+    CHECK(placed && placed->inputs.size() == size_t{1});
+    const uint64_t slot = placed->inputs.front();
+    bool exterior = false, interior = false, raw_crossing = false;
+    for (const doc::NodeLink& l : d.looks[0].links) {
+        if (l.from == src && l.to == slot && l.to_port == 0)
+            exterior = true;
+        if (l.from == slot && l.to == f0 && l.to_port == 0)
+            interior = true;
+        if (l.from == src && l.to == f0) raw_crossing = true;
+    }
+    CHECK(exterior);
+    CHECK(interior);
+    CHECK(!raw_crossing);
+    // The graph still compiles to the same chain shape through the
+    // slot splice: source -> vignette -> grain -> composite.
+    (void)f1;
+    doc::Asset media;
+    media.id = d.next_effect_id++;
+    media.frame_count = 100;
+    d.assets.push_back(media);
+    d.looks[0].layers[0].asset = media.id;
+    gfx::RenderGraph graph = gfx::compile_graph(d, d.looks[0].id, 0);
+    CHECK(graph.valid);
+    CHECK_EQ(graph.nodes.size(), size_t{3});
+
+    undo.undo(d);
+    CHECK_EQ(d.looks[0].links.size(), before.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+        CHECK_EQ(d.looks[0].links[i].from, before[i].from);
+        CHECK_EQ(d.looks[0].links[i].to, before[i].to);
+        CHECK_EQ(d.looks[0].links[i].to_port, before[i].to_port);
+    }
+    CHECK(d.looks[0].layers[0].groups.empty());
+    undo.redo(d);
+    const doc::Group* again = doc::find_group(d.looks[0], gid);
+    CHECK(again && again->inputs.size() == size_t{1});
+    // Redo replays the SAME slot id - undo/redo never grows the space.
+    CHECK_EQ(again->inputs.front(), slot);
+}
+
+TEST(group_legacy_face_in_migrates_on_load) {
+    // Pre-slot file: crossing links target members and the group binds
+    // its In through face_in. The loader reroutes through minted slots
+    // exactly once - a re-save carries "inputs" and skips migration.
+    const char* text = R"({
+        "looks_project": 5,
+        "looks": [{"id": 100,
+        "layers": [{"id": 1, "stack": [
+            {"type": "vignette", "id": 2, "group": 9},
+            {"type": "grain", "id": 3, "group": 9}
+        ],
+        "groups": [{"id": 9, "name": "era", "face_in": 2,
+                    "face_out": 3, "exposed": []}]}],
+        "links": [
+            {"from": 1, "to": 2, "port": 0},
+            {"from": 3, "to": 0, "port": 0}
+        ]}]
+    })";
+    json::ParseResult parsed = json::parse(text);
+    CHECK(parsed.value.has_value());
+    Document d = doc::doc_from_json(*parsed.value);
+    const doc::Group* g = doc::find_group(d.looks[0], 9);
+    CHECK(g && g->inputs.size() == size_t{1});
+    const uint64_t slot = g->inputs.front();
+    CHECK(slot > uint64_t{9});
+    bool exterior = false, interior = false;
+    for (const doc::NodeLink& l : d.looks[0].links) {
+        if (l.from == 1 && l.to == slot && l.to_port == 0)
+            exterior = true;
+        if (l.from == slot && l.to == 2 && l.to_port == 0)
+            interior = true;
+        CHECK(!(l.from == 1 && l.to == 2));
+    }
+    CHECK(exterior);
+    CHECK(interior);
+    // Round-trip: slot-aware files re-load identically (idempotent).
+    json::Value out = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(out);
+    const doc::Group* g2 = doc::find_group(d2.looks[0], 9);
+    CHECK(g2 && g2->inputs.size() == size_t{1});
+    CHECK_EQ(g2->inputs.front(), slot);
+    CHECK(doc::doc_to_json(d2) == out);
+}
+
+TEST(group_wet_serializes_and_snapshots) {
+    Document d;
+    doc::UndoStack undo;
+    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
+    doc::Group g = doc::make_group(d, "wetter");
+    g.wet = 0.25f;
+    g.opacity = 0.5f;
+    const uint64_t gid = g.id;
+    d.looks[0].layers[0].stack[0].group_id = gid;
+    d.looks[0].layers[0].groups.push_back(g);
+
+    // Round-trip keeps the composite knobs.
+    json::Value out = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(out);
+    const doc::Group* g2 = doc::find_group(d2.looks[0], gid);
+    CHECK(g2);
+    CHECK(std::fabs(g2->wet - 0.25f) < 1e-6f);
+    CHECK(std::fabs(g2->opacity - 0.5f) < 1e-6f);
+
+    // Snapshots capture and restore group knobs (group-keyed entries).
+    undo.execute(d, doc::store_snapshot_command(d.looks[0].id, 0));
+    doc::find_group(d.looks[0], gid)->wet = 1.0f;
+    undo.execute(d, doc::apply_snapshot_command(d.looks[0].id, 0));
+    CHECK(std::fabs(doc::find_group(d.looks[0], gid)->wet - 0.25f) <
+          1e-6f);
+    // Snapshot entries survive serialization with the id bit split out.
+    json::Value snap = doc::doc_to_json(d);
+    Document d3 = doc::doc_from_json(snap);
+    bool found = false;
+    for (const doc::SnapshotEntry& e : d3.looks[0].snapshots[0].entries)
+        if (e.effect_id == (gid | doc::kGroupParamBit)) {
+            found = true;
+            CHECK(std::fabs(e.wet - 0.25f) < 1e-6f);
+        }
+    CHECK(found);
+}
+
+TEST(group_wet_compiles_the_mix_wrapper) {
+    Document d;
+    doc::Asset media;
+    media.id = d.next_effect_id++;
+    media.frame_count = 100;
+    d.assets.push_back(media);
+    doc::Layer& layer = d.looks[0].layers[0];
+    layer.asset = media.id;
+    layer.stack.push_back(make_effect(d, EffectType::Vignette));
+    doc::UndoStack undo;
+    doc::Group g = doc::make_group(d, "mixed");
+    const uint64_t gid = g.id;
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, 0, g, 0, 0));
+
+    // Identity knobs, no matte: no wrapper node.
+    gfx::RenderGraph plain = gfx::compile_graph(d, d.looks[0].id, 0);
+    CHECK(plain.valid);
+    for (const gfx::GraphNode& n : plain.nodes)
+        CHECK(n.kind != gfx::GraphNode::Kind::GroupMix);
+
+    // wet 0.5: the face re-lands as GroupMix{dry, face}; the composite
+    // reads the wrapped output.
+    doc::find_group(d.looks[0], gid)->wet = 0.5f;
+    gfx::RenderGraph mixed = gfx::compile_graph(d, d.looks[0].id, 0);
+    CHECK(mixed.valid);
+    int mix_at = -1, fx_at = -1, src_at = -1;
+    for (size_t i = 0; i < mixed.nodes.size(); ++i) {
+        if (mixed.nodes[i].kind == gfx::GraphNode::Kind::GroupMix)
+            mix_at = static_cast<int>(i);
+        if (mixed.nodes[i].kind == gfx::GraphNode::Kind::Effect)
+            fx_at = static_cast<int>(i);
+        if (mixed.nodes[i].kind == gfx::GraphNode::Kind::Source)
+            src_at = static_cast<int>(i);
+    }
+    CHECK(mix_at >= 0 && fx_at >= 0 && src_at >= 0);
+    CHECK_EQ(mixed.nodes[static_cast<size_t>(mix_at)].inputs.size(),
+             size_t{2});
+    CHECK_EQ(mixed.nodes[static_cast<size_t>(mix_at)].inputs[0], src_at);
+    CHECK_EQ(mixed.nodes[static_cast<size_t>(mix_at)].inputs[1], fx_at);
+    CHECK_EQ(mixed.nodes[static_cast<size_t>(mix_at)].effect_index, 0);
+    CHECK_EQ(mixed.output, mix_at);
+
+    // A group matte (port 1 on the GROUP id) gates the composite
+    // through the same extract/apply diamond as any effect.
+    doc::Layer matte_layer;
+    matte_layer.id = d.next_effect_id++;
+    matte_layer.source = doc::LayerSourceKind::Shape;
+    d.looks[0].layers.push_back(matte_layer);
+    d.looks[0].links.push_back({matte_layer.id, gid, 1});
+    gfx::RenderGraph gated = gfx::compile_graph(d, d.looks[0].id, 0);
+    CHECK(gated.valid);
+    bool extract = false, apply = false;
+    for (const gfx::GraphNode& n : gated.nodes) {
+        if (n.kind == gfx::GraphNode::Kind::MatteExtract) extract = true;
+        if (n.kind == gfx::GraphNode::Kind::MatteApply) apply = true;
+    }
+    CHECK(extract);
+    CHECK(apply);
+}
+
+TEST(ungroup_splices_slots_back_to_direct_links) {
+    Document d;
+    doc::UndoStack undo;
+    doc::Layer& layer = d.looks[0].layers[0];
+    layer.stack.push_back(make_effect(d, EffectType::Vignette));
+    const uint64_t src = layer.id;
+    const uint64_t f0 = layer.stack[0].id;
+    doc::ensure_links(d.looks[0]);
+    doc::Group g = doc::make_group(d, "temp");
+    const uint64_t gid = g.id;
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, 0, g, 0, 0));
+    const uint64_t slot =
+        doc::find_group(d.looks[0], gid)->inputs.front();
+
+    undo.execute(d, doc::ungroup_command(d.looks[0].id, 0, gid));
+    bool direct = false, slotted = false;
+    for (const doc::NodeLink& l : d.looks[0].links) {
+        if (l.from == src && l.to == f0 && l.to_port == 0) direct = true;
+        if (l.from == slot || l.to == slot) slotted = true;
+    }
+    CHECK(direct);
+    CHECK(!slotted);
+    undo.undo(d);
+    const doc::Group* back = doc::find_group(d.looks[0], gid);
+    CHECK(back && back->inputs.size() == size_t{1} &&
+          back->inputs.front() == slot);
+}
+
 TEST(preset_capture_and_instantiate) {
     Document d;
     doc::UndoStack undo;
@@ -658,15 +897,18 @@ TEST(preset_capture_and_instantiate) {
     Document target;
     doc::Group ng;
     std::vector<doc::EffectInstance> nfx;
-    doc::instantiate_preset(target, *p2, &ng, &nfx);
+    uint64_t nface_in = 0;
+    doc::instantiate_preset(target, *p2, &ng, &nfx, &nface_in);
     CHECK_EQ(nfx.size(), size_t{2});
     CHECK(nfx[0].id != p2->effects[0].id);
     CHECK_EQ(nfx[0].group_id, ng.id);
     CHECK_EQ(ng.exposed.size(), size_t{1});
     CHECK_EQ(ng.exposed[0].effect_id, nfx[0].id);
+    CHECK_EQ(nface_in, nfx[0].id);
     CHECK(ng.folded);
 
-    undo.execute(target, doc::insert_group_command(d.looks[0].id,0, ng, nfx));
+    undo.execute(target, doc::insert_group_command(d.looks[0].id, 0, ng,
+                                                   nfx, nface_in));
     CHECK_EQ(target.looks[0].layers[0].stack.size(), size_t{2});
     CHECK_EQ(target.looks[0].layers[0].groups.size(), size_t{1});
     undo.undo(target);

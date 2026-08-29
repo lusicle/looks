@@ -925,6 +925,11 @@ bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
             }
         if (visited) continue;
         seen.push_back(n);
+        // A group id as a link target (its port-1 matte) has no outgoing
+        // links of its own: the wrapper it feeds flows into the face
+        // member's consumers, so the walk continues there.
+        if (const uint64_t face = group_face_member(look, n))
+            stack.push_back(face);
         for (const NodeLink& l : links)
             if (l.from == n && l.to != 0) stack.push_back(l.to);
     }

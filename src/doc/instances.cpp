@@ -68,10 +68,19 @@ void walk(const Document& doc, const Cursor& cur, bool audio,
 // source-first order; every other node passes audio through on its
 // port-0 input. The chain ends at a layer: media is the voice, a nested
 // ref recurses, a generator is silence. Visibility never gates audio.
-uint64_t link_into(const std::vector<NodeLink>& links, uint64_t to,
-                   uint32_t port) {
-    for (const NodeLink& l : links)
-        if (l.to == to && l.to_port == port) return l.from;
+// The port's BOTTOM LIVE feed: fan-in order picks the first link whose
+// producer still exists. Deletes tolerate dangling links, so a dead
+// wire (removed effect, reaped slot) at the bottom of a fan-in must
+// not swallow the voice while a live feed sits above it - the
+// compiler's merge skips dead feeds the same way.
+uint64_t link_into(const Look& look, const std::vector<NodeLink>& links,
+                   uint64_t to, uint32_t port) {
+    for (const NodeLink& l : links) {
+        if (l.to != to || l.to_port != port || !l.from) continue;
+        if (find_layer(look, l.from) || find_effect(look, l.from) ||
+            group_of_input(look, l.from))
+            return l.from;
+    }
     return 0;
 }
 
@@ -96,7 +105,15 @@ void walk_chain(const Look& look, const std::vector<NodeLink>& links,
         }
         const Layer* owner = nullptr;
         const EffectInstance* fx = find_fx(cur, &owner);
-        if (!fx) return;   // dangling id: silent
+        if (!fx) {
+            // A group input slot passes audio through like any wire
+            // hop: the voice continues on its exterior feed.
+            if (group_of_input(look, cur)) {
+                cur = link_into(look, links, cur, 0);
+                continue;
+            }
+            return;   // dangling id: silent
+        }
         if (is_audio_effect(fx->type) && !fx->bypass &&
             !group_bypassed(*owner, fx->group_id) &&
             rev.size() < kMaxVoiceOps) {
@@ -107,10 +124,13 @@ void walk_chain(const Look& look, const std::vector<NodeLink>& links,
             op.wet = fx->wet;
             rev.push_back(op);
         }
-        const uint64_t next = link_into(links, fx->id, 0);
+        const uint64_t next = link_into(look, links, fx->id, 0);
+        // Source-adjacency looks THROUGH slots: an Offset just inside a
+        // group boundary still sits directly on the wired source.
         if (audio_off && fx->type == EffectType::Offset && !fx->bypass &&
             !group_bypassed(*owner, fx->group_id) &&
-            offset_targets_audio(*fx) && find_layer(look, next))
+            offset_targets_audio(*fx) &&
+            find_layer(look, hop_group_inputs(look, links, next)))
             *audio_off += offset_frames(*fx);
         cur = next;
     }
@@ -132,7 +152,8 @@ Voice resolve_voice(const Look& look) {
     // IS the link-vector order, and splices/rewires replace links in
     // place, so the voice never moves under a gesture. The compiler
     // stacks the composite by the same rule.
-    walk_chain(look, links, link_into(links, 0, look.audio_split ? 1u : 0u),
+    walk_chain(look, links,
+               link_into(look, links, 0, look.audio_split ? 1u : 0u),
                &v.root, rev, &v.audio_off);
     v.ops.assign(rev.rbegin(), rev.rend());
     return v;
@@ -268,7 +289,10 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                 if (!offset_targets_video(fx)) continue;
                 const int64_t off = offset_frames(fx);
                 if (!off) continue;
-                const uint64_t src = link_into(links, fx.id, 0);
+                // Adjacency looks THROUGH group input slots, matching
+                // the compiler's shim pass.
+                const uint64_t src = hop_group_inputs(
+                    look, links, link_into(look, links, fx.id, 0));
                 for (const Layer& l : look.layers)
                     if (l.id == src) vshifts.emplace_back(src, off);
             }
@@ -422,7 +446,7 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
         if (!t) return {};   // sequence ref: no single voice
         std::vector<NodeLink> tsynth;
         const std::vector<NodeLink>& tlinks = effective_links(*t, tsynth);
-        start = link_into(tlinks, 0, t->audio_split ? 1u : 0u);
+        start = link_into(*t, tlinks, 0, t->audio_split ? 1u : 0u);
         cur = t;
     }
     return {};

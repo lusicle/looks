@@ -169,6 +169,25 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc,
             add(static_cast<int>(p), info.params[p].id, info.params[p].label,
                 fx.params[p]);
     }
+    // Group composites: wet/opacity, addressed with kGroupParamBit —
+    // mod targets exactly like a node's built-ins.
+    for (size_t l = 0; l < look.layers.size(); ++l)
+        for (const doc::Group& g : look.layers[l].groups) {
+            const std::string gname = g.name.empty() ? "group" : g.name;
+            auto add = [&](int param_index, const char* id,
+                           const char* label, float value) {
+                ParamEntry e;
+                e.key = {g.id | doc::kGroupParamBit, param_index};
+                e.path = "group" + std::to_string(g.id) + "." + id;
+                e.label = gname + " " + label;
+                e.min_value = 0.0f;
+                e.max_value = 1.0f;
+                e.base = value;
+                table.push_back(std::move(e));
+            };
+            add(doc::kWetParam, "wet", "wet/dry", g.wet);
+            add(doc::kOpacityParam, "opacity", "opacity", g.opacity);
+        }
     // Layer params: opacity, generator fields, and the transform —
     // mod targets exactly like effect params.
     for (size_t l = 0; l < look.layers.size(); ++l) {

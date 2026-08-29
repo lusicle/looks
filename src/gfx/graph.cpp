@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "doc/instances.h"
 #include "util/hash.h"
@@ -382,7 +383,12 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 if (!doc::offset_targets_video(fx)) continue;
                 const int64_t off = doc::offset_frames(fx);
                 if (!off) continue;
-                const uint64_t src = link_into(fx.id, 0);
+                // Adjacency looks THROUGH group input slots: an Offset
+                // just inside a boundary still sits on the wired source
+                // (the flatten's vshifts hop identically).
+                const uint64_t src =
+                    doc::hop_group_inputs(look, links,
+                                          link_into(fx.id, 0));
                 const doc::Layer* sl = nullptr;
                 size_t sli = 0;
                 for (size_t k = 0; k < look.layers.size(); ++k)
@@ -498,6 +504,45 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             if (look.layers[k].id == id) return k;
         return SIZE_MAX;
     };
+    // GROUP COMPOSITE bookkeeping. Input slots resolve like inactive
+    // effects (the merge of their own exterior fan-in); the face member
+    // of a live group re-lands wrapped: mix(dry, face, wet/opacity)
+    // when the knobs bite, gated by the group's port-1 matte - exactly
+    // a single node's composite, with the subgraph as its kernel.
+    std::unordered_map<uint64_t, char> slot_ids;
+    struct FaceWrap {
+        size_t layer_index;
+        size_t group_index;
+        const doc::Group* group;
+        bool mixes;
+    };
+    std::unordered_map<uint64_t, FaceWrap> face_wraps;
+    {
+        std::unordered_set<uint64_t> driven_groups;
+        for (const doc::KeyframeLane& l : look.lanes)
+            if ((l.target.effect_id & doc::kGroupParamBit) &&
+                !l.keys.empty() && !l.muted)
+                driven_groups.insert(l.target.effect_id &
+                                     ~doc::kGroupParamBit);
+        for (const doc::ModRoute& r : look.mod_routes)
+            if ((r.target.effect_id & doc::kGroupParamBit) && r.node)
+                driven_groups.insert(r.target.effect_id &
+                                     ~doc::kGroupParamBit);
+        for (size_t li = 0; li < look.layers.size(); ++li)
+            for (size_t gi = 0; gi < look.layers[li].groups.size();
+                 ++gi) {
+                const doc::Group& g = look.layers[li].groups[gi];
+                for (uint64_t s : g.inputs) slot_ids[s] = 1;
+                if (g.bypass || strip_effects) continue;
+                const bool mixes = g.wet != 1.0f || g.opacity != 1.0f ||
+                                   driven_groups.count(g.id) != 0;
+                const bool matted = !links_into_port(g.id, 1).empty();
+                if (!mixes && !matted) continue;
+                const uint64_t face =
+                    doc::group_face_member(look.layers[li], g);
+                if (face) face_wraps[face] = {li, gi, &g, mixes};
+            }
+    }
     // Does this feed hang (possibly through effects, settled or starved
     // alike) from a producer that is merely OFF right now? Culled reads
     // as a CLOSED GATE (black), never as unwired.
@@ -506,7 +551,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (time_culled.count(id)) return true;
         if (depth > 64) return false;
         if (offset_terminal.count(id)) return false;
-        if (owner.count(id) && !fx_out.count(id)) {
+        if ((owner.count(id) && !fx_out.count(id)) || slot_ids.count(id)) {
             for (uint64_t from : links_into_port(id, 0))
                 if (id_culled(from, depth + 1)) return true;
         }
@@ -526,6 +571,10 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (fx_out.count(id) || offset_terminal.count(id)) return false;
         if (auto it = owner.find(id); it != owner.end()) {
             if (effect_active(id)) return true;
+            for (uint64_t from : links_into_port(id, 0))
+                if (id_pending(from, depth + 1)) return true;
+        } else if (slot_ids.count(id)) {
+            // Slots settle when their exterior fan-in settles.
             for (uint64_t from : links_into_port(id, 0))
                 if (id_pending(from, depth + 1)) return true;
         }
@@ -550,8 +599,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         // ends here - never fall through to the unshifted layer.
         if (offset_terminal.count(id)) return -1;
         if (auto it = heads.find(id); it != heads.end()) return it->second;
-        if (owner.count(id)) {
-            if (effect_active(id)) return -1;   // starved: never emitted
+        if (owner.count(id) || slot_ids.count(id)) {
+            // Inactive effects and group input slots both pass their
+            // own port-0 merge through.
+            if (owner.count(id) && effect_active(id))
+                return -1;   // starved: never emitted
             if (depth > 64) return -1;
             return merge_port(id, 0, depth + 1);
         }
@@ -692,6 +744,52 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             const doc::EffectInstance& fx = look.layers[li].stack[i];
             if (effect_active(fx.id)) pending.emplace_back(li, i);
         }
+    // The group's dry side: its first slot's exterior feed, closed-gate
+    // black when culled, black when unwired (the same base the matte
+    // diamond reveals).
+    auto group_dry = [&](const doc::Group& g) {
+        if (g.inputs.empty()) return black();
+        const uint64_t slot0 = g.inputs.front();
+        int dry = merge_port(slot0, 0, 0);
+        if (dry < 0) dry = black();
+        return dry;
+    };
+    // Face members of live groups re-land wrapped (the group's own
+    // composite): mix against the dry feed when wet/opacity bite, then
+    // the port-1 matte gates through the same extract/apply diamond as
+    // any effect. Consumers everywhere read the wrapped output.
+    auto wrap_group_face = [&](uint64_t face_id) {
+        const auto wit = face_wraps.find(face_id);
+        if (wit == face_wraps.end()) return;
+        const FaceWrap& fw = wit->second;
+        const int raw = fx_out[face_id];
+        const int dry = group_dry(*fw.group);
+        int out = raw;
+        if (fw.mixes) {
+            GraphNode mix;
+            mix.kind = GraphNode::Kind::GroupMix;
+            mix.layer_index = static_cast<int>(fw.layer_index);
+            mix.effect_index = static_cast<int>(fw.group_index);
+            mix.inputs = {dry, raw};
+            out = add(std::move(mix), inst);
+        }
+        int matte_node = merge_port(fw.group->id, 1, 0);
+        if (matte_node < 0 &&
+            !links_into_port(fw.group->id, 1).empty() &&
+            port_culled(fw.group->id, 1))
+            matte_node = black();
+        if (matte_node >= 0) {
+            GraphNode ex;
+            ex.kind = GraphNode::Kind::MatteExtract;
+            ex.inputs.push_back(matte_node);
+            const int gate = add(std::move(ex), inst);
+            GraphNode apply;
+            apply.kind = GraphNode::Kind::MatteApply;
+            apply.inputs = {dry, out, gate};
+            out = add(std::move(apply), inst);
+        }
+        fx_out[face_id] = out;
+    };
     for (int phase = 0; phase < 2; ++phase) {
         bool progress = true;
         while (progress && !pending.empty()) {
@@ -707,6 +805,21 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                                    port_pending(fx.id, 1))) {
                     ++it;
                     continue;
+                }
+                // A group face also waits for the group's dry feed and
+                // matte (optional, like aux: phase 1 stops waiting).
+                if (phase == 0) {
+                    const auto wit = face_wraps.find(fx.id);
+                    if (wit != face_wraps.end()) {
+                        const doc::Group& wg = *wit->second.group;
+                        const bool dry_wait =
+                            !wg.inputs.empty() &&
+                            port_pending(wg.inputs.front(), 0);
+                        if (dry_wait || port_pending(wg.id, 1)) {
+                            ++it;
+                            continue;
+                        }
+                    }
                 }
                 const int in_node = merge_port(fx.id, 0, 0);
                 if (in_node < 0) {
@@ -733,6 +846,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     matte_node = black();
                 emit_one(it->first, it->second, in_node, aux_node,
                          matte_node);
+                wrap_group_face(fx.id);
                 it = pending.erase(it);
                 progress = true;
             }
@@ -760,19 +874,12 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (auto ith = heads.find(preview_node); ith != heads.end()) {
             idx = ith->second;   // a source node: its transformed head
         } else {
-            // Effect — or a group, which previews its bound out member.
+            // Effect — or a group, which previews its face member (the
+            // wrapped output, wet/matte included, via fx_out).
             uint64_t id = preview_node;
-            for (const doc::Layer& l : look.layers)
-                for (const doc::Group& g : l.groups)
-                    if (g.id == preview_node) {
-                        uint64_t last_m = 0, bind = 0;
-                        for (const doc::EffectInstance& e : l.stack)
-                            if (e.group_id == g.id) {
-                                last_m = e.id;
-                                if (e.id == g.face_out) bind = e.id;
-                            }
-                        id = bind ? bind : last_m;
-                    }
+            if (const uint64_t face =
+                    doc::group_face_member(look, preview_node))
+                id = face;
             idx = resolve(id);
         }
         if (idx >= 0) graph.preview = idx;

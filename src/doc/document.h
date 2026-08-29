@@ -176,6 +176,11 @@ enum class LayerSourceKind : uint32_t {
 // OUTPUT node port 1 is the split-mode audio-in instead (Look
 // .audio_split) - the Output has no matte. While a look's links are
 // empty the loader and engine synthesize them from stack order.
+// Two GROUP endpoints extend the id set: a group INPUT SLOT id acts as
+// a one-port passthrough (exterior wires target {slot, port 0}, interior
+// wires read `from = slot` - the compiler splices them), and a group id
+// itself may be a `to` at port 1 ONLY - the group card's matte, gating
+// the group composite exactly as an effect's port-1 matte gates it.
 struct NodeLink {
     uint64_t from = 0;
     uint64_t to = 0;
@@ -193,10 +198,11 @@ struct CanvasFrame {
     uint32_t color = 0;
 };
 
-// Groups: a Group collapses a sub-stack into one card;
-// a saved group IS an "era preset". Membership is a tag on the effect
-// (EffectInstance::group_id) - groups don't change render order, only
-// the card view, shared bypass, and the exposed face.
+// Groups: a Group collapses a sub-stack into one card
+// that composes like a single node; a saved group IS an "era preset".
+// Membership is a tag on the effect (EffectInstance::group_id) - groups
+// don't change render order, only the card view, shared bypass, the
+// exposed face, and the composite wrapper below.
 struct Group {
     uint64_t id = 0;
     std::string name;
@@ -206,12 +212,25 @@ struct Group {
     // collapsed card as DIRECT aliases - same value, same command path,
     // no hidden offsets. Motion comes from value nodes wired inside.
     std::vector<ParamKey> exposed;
-    // Boundary BINDINGS: which member receives the card's In and
-    // which feeds its Out. Persistent INTERMEDIARIES - the scoped view's
-    // In/Out nodes wire to these regardless of whether anything is
-    // connected outside; external link edits route through them and
-    // never rewrite the internal picture. 0 = first/last member.
-    uint64_t face_in = 0;
+    // The group's OWN composite knobs, identical to a node's built-ins:
+    // out = mix(in, mix(in, group(in), wet), opacity) against the first
+    // input slot's exterior feed. Mod wires and lanes address them as
+    // ParamKey{id | kGroupParamBit, kWetParam / kOpacityParam}.
+    float wet = 1.0f;
+    float opacity = 1.0f;
+    // INPUT SLOTS, ordered: each id is a one-port passthrough in the
+    // link table - exterior wires land on {slot, 0}, interior wires read
+    // `from = slot` (the open view's In node shows one exit per slot,
+    // the collapsed card one port per slot plus the ghost "new input").
+    // Slot 0 is the card's In and the composite's dry side. Interior
+    // wiring is never severed by unwiring the outside: a slot is
+    // removed only when its LAST connection - exterior or interior -
+    // goes, and later slots compact down one port (their wires follow:
+    // ports are index-derived, links are id-keyed).
+    std::vector<uint64_t> inputs;
+    // Boundary BINDING: which member feeds the card's Out. A persistent
+    // INTERMEDIARY - the scoped view's Out node wires to it regardless
+    // of whether anything is connected outside. 0 = last member.
     uint64_t face_out = 0;
     // Node-canvas position of the FOLDED group's card; (0,0) = unplaced.
     float node_x = 0.0f;
@@ -917,6 +936,82 @@ inline bool group_bypassed(const Layer& layer, uint64_t group_id) {
     if (group_id == 0) return false;
     const Group* g = find_group(layer, group_id);
     return g && g->bypass;
+}
+
+// The group behind an id anywhere in the look; optionally its layer.
+inline Group* find_group(Look& look, uint64_t group_id,
+                         size_t* layer_index = nullptr) {
+    for (size_t li = 0; li < look.layers.size(); ++li)
+        if (Group* g = find_group(look.layers[li], group_id)) {
+            if (layer_index) *layer_index = li;
+            return g;
+        }
+    return nullptr;
+}
+inline const Group* find_group(const Look& look, uint64_t group_id,
+                               size_t* layer_index = nullptr) {
+    return find_group(const_cast<Look&>(look), group_id, layer_index);
+}
+
+// The member feeding a group's Out: its face_out binding while that id
+// is a live member, else the last member in stack order. 0 = empty
+// group. The ONE definition of the card's out end - the compiler's
+// wrapper, the preview tap and every canvas splice resolve through it.
+inline uint64_t group_face_member(const Layer& layer, const Group& g) {
+    uint64_t last = 0, bind = 0;
+    for (const EffectInstance& e : layer.stack)
+        if (e.group_id == g.id) {
+            last = e.id;
+            if (e.id == g.face_out) bind = e.id;
+        }
+    return bind ? bind : last;
+}
+inline uint64_t group_face_member(const Look& look, uint64_t group_id) {
+    for (const Layer& l : look.layers)
+        if (const Group* g = find_group(l, group_id))
+            return group_face_member(l, *g);
+    return 0;
+}
+
+// The group owning an INPUT SLOT id; null when the id is no slot.
+inline Group* group_of_input(Look& look, uint64_t slot_id,
+                             size_t* layer_index = nullptr) {
+    if (!slot_id) return nullptr;
+    for (size_t li = 0; li < look.layers.size(); ++li)
+        for (Group& g : look.layers[li].groups)
+            for (uint64_t s : g.inputs)
+                if (s == slot_id) {
+                    if (layer_index) *layer_index = li;
+                    return &g;
+                }
+    return nullptr;
+}
+inline const Group* group_of_input(const Look& look, uint64_t slot_id,
+                                   size_t* layer_index = nullptr) {
+    return group_of_input(const_cast<Look&>(look), slot_id, layer_index);
+}
+
+// Resolves an id through group input slots to the real producer: a slot
+// reads its exterior port-0 feed (bottom LIVE chain first, matching
+// every other single-producer walk - deletes tolerate dangling links,
+// so a dead wire must not shadow a live feed above it). Non-slot ids
+// pass through; a dangling slot chain resolves to 0.
+inline uint64_t hop_group_inputs(const Look& look,
+                                 const std::vector<NodeLink>& links,
+                                 uint64_t id) {
+    for (int guard = 0; guard < 16 && id; ++guard) {
+        if (!group_of_input(look, id)) return id;
+        uint64_t next = 0;
+        for (const NodeLink& l : links)
+            if (l.to == id && l.to_port == 0 && l.from &&
+                (find_layer(look, l.from) || find_effect(look, l.from) ||
+                 group_of_input(look, l.from))) {
+                next = l.from;
+                break;
+            }
+        id = next;
+    }
+    return id;
 }
 
 // The value node behind an id. Null when the look holds no such node.

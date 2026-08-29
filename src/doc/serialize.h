@@ -33,7 +33,13 @@ Document doc_from_json(const json::Value& v);
 json::Value effect_to_json(const EffectInstance& fx);
 std::optional<EffectInstance> effect_from_json(const json::Value& v);
 json::Value group_to_json(const Group& g);
-Group group_from_json(const json::Value& v);
+// Pre-slot files carried the In binding as face_in; the reader surfaces
+// it so loaders can run the one-time slot migration.
+struct GroupLegacy {
+    bool migrate = false;   // no "inputs" key: route through normalize
+    uint64_t face_in = 0;
+};
+Group group_from_json(const json::Value& v, GroupLegacy* legacy = nullptr);
 
 bool save_document(const std::filesystem::path& path, const Document& doc);
 std::optional<Document> load_document(const std::filesystem::path& path,

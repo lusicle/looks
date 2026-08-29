@@ -42,6 +42,11 @@ inline constexpr uint64_t kLayerParamBit = 1ull << 62;
 // FIELD ids (view rows, not modulatable slots), 17 is the oscillator
 // phase.
 inline constexpr int kLayerParamCount = 20;
+// Group params ride the same addressing: keys set kGroupParamBit and
+// carry the GROUP id; param_index is kWetParam / kOpacityParam only (a
+// group's composite knobs are exactly a node's built-ins). JSON stores
+// the bare id in its own field, like layer keys.
+inline constexpr uint64_t kGroupParamBit = 1ull << 61;
 
 struct ParamKey {
     uint64_t effect_id = 0;

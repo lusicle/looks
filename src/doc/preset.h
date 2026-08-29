@@ -23,6 +23,10 @@ struct Preset {
     std::vector<std::string> tags;
     Group group;                          // file-local ids
     std::vector<EffectInstance> effects;  // stack order, file-local ids
+    // Member the In slot seeds to at instantiation (file-local id, 0 =
+    // first member). Presets carry the chain, not slot wiring - slots
+    // mint fresh when the group lands.
+    uint64_t face_in = 0;
     std::filesystem::path path;           // where the browser found it
 };
 
@@ -44,8 +48,10 @@ Preset make_preset_from_group(const Look& look, size_t layer_index,
                               uint64_t group_id);
 
 // Mint fresh ids from doc.next_effect_id and rewrite group_id / face
-// keys; the results feed insert_group_command.
+// keys; the results feed insert_group_command (`out_face_in` is its
+// seed-member argument, already remapped).
 void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
-                        std::vector<EffectInstance>* out_effects);
+                        std::vector<EffectInstance>* out_effects,
+                        uint64_t* out_face_in);
 
 }  // namespace looks::doc

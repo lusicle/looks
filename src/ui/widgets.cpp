@@ -500,19 +500,33 @@ struct ChipUser {
     ButtonState* state;
     bool* out_clicked;
     const char* tooltip;
+    // Trailing close X inside the chip; null = plain chip.
+    ButtonState* close_state;
+    bool* out_close;
 };
+
+constexpr float kChipCloseW = 16.0f;
+
+Rect chip_close_rect(const Rect& r) {
+    return {r.right() - kChipCloseW, r.y, kChipCloseW, r.h};
+}
 
 Vec2 measure_chip(LayoutNode& node, const Constraints&,
                   const LayoutFrame& frame) {
     const auto* u = static_cast<const ChipUser*>(node.user);
     const float text_w = measure_text(frame.font, {u->label, u->length},
                                       frame.theme.font_size_small).x;
-    return {text_w + 16.0f, frame.theme.control_height};
+    return {text_w + 16.0f + (u->close_state ? kChipCloseW : 0.0f),
+            frame.theme.control_height};
 }
 
 void hit_chip(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const ChipUser*>(node.user);
     register_rect_hit(node, frame, u->state);
+    // The close zone registers AFTER the body so it wins their overlap.
+    if (u->close_state)
+        frame.ctx.add_hit(chip_close_rect(node.rect),
+                          frame.ctx.acquire_widget_id(u->close_state));
 }
 
 void draw_chip(LayoutNode& node, LayoutFrame& frame) {
@@ -536,13 +550,28 @@ void draw_chip(LayoutNode& node, LayoutFrame& frame) {
     const Color fg =
         u->on ? theme.accent
               : lerp(theme.text_dim, theme.text, u->state->hover_t);
+    const float label_w =
+        r.w - (u->close_state ? kChipCloseW : 0.0f);
     const Vec2 ts = measure_text(frame.font, {u->label, u->length},
                                  theme.font_size_small);
     draw_text(frame.canvas, frame.font, {u->label, u->length},
-              {r.x + (r.w - ts.x) * 0.5f,
+              {r.x + (label_w - ts.x) * 0.5f,
                r.y + (r.h - frame.font.line_height() *
                                 theme.font_size_small) * 0.5f},
               theme.font_size_small, fg);
+    if (u->close_state) {
+        const Rect cr = chip_close_rect(r);
+        const WidgetId cid = frame.ctx.acquire_widget_id(u->close_state);
+        if (tick_press_release(*u->close_state, cid, cr, frame) &&
+            u->out_close)
+            *u->out_close = true;
+        maybe_tooltip(*u->close_state, "close tab", frame);
+        draw_icon_glyph(frame.canvas, frame.font, Icon::Close,
+                        {cr.x + cr.w * 0.5f - 1.0f, cr.y + cr.h * 0.5f},
+                        lerp(theme.text_disabled, theme.text,
+                             u->close_state->hover_t),
+                        theme.font_size_small);
+    }
 }
 
 // ---- IconButton
@@ -1580,7 +1609,8 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
 }
 
 LayoutNode* Chip(LayoutArena& arena, std::string_view label, bool on,
-                 ButtonState* state, bool* out_clicked, const char* tooltip) {
+                 ButtonState* state, bool* out_clicked, const char* tooltip,
+                 ButtonState* close_state, bool* out_close) {
     LayoutNode* n = make_node(arena, NodeKind::Leaf);
     auto* u = arena.alloc<ChipUser>();
     u->label = arena.dup(label.data(), label.size());
@@ -1589,6 +1619,8 @@ LayoutNode* Chip(LayoutArena& arena, std::string_view label, bool on,
     u->state = state;
     u->out_clicked = out_clicked;
     u->tooltip = tooltip;
+    u->close_state = close_state;
+    u->out_close = out_close;
     n->user = u;
     n->measure_fn = measure_chip;
     n->draw_fn = draw_chip;

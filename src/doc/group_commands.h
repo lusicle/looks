@@ -50,9 +50,37 @@ std::unique_ptr<Command> set_group_exposed_command(uint64_t look,
 
 // Append a whole group (its member effects + the Group entry) to a layer's
 // stack — the preset-instantiation path. Effects must already carry
-// group.id in their group_id and fresh document ids.
+// group.id in their group_id and fresh document ids. `face_in` names the
+// member the seeded In slot wires to (0 = first member).
 std::unique_ptr<Command> insert_group_command(uint64_t look,
                                               size_t layer_index, Group group,
-                                              std::vector<EffectInstance> effects);
+                                              std::vector<EffectInstance> effects,
+                                              uint64_t face_in);
+
+// Append one input slot to a group (id pre-minted from next_effect_id).
+// The slot arrives unwired; the caller's connect lands the exterior
+// wire, interior wiring is the user's gesture in the open view.
+std::unique_ptr<Command> add_group_input_command(uint64_t look,
+                                                 size_t layer_index,
+                                                 uint64_t group_id,
+                                                 uint64_t slot_id);
+
+// Remove one input slot and every link touching it (both sides).
+std::unique_ptr<Command> remove_group_input_command(uint64_t look,
+                                                    size_t layer_index,
+                                                    uint64_t group_id,
+                                                    uint64_t slot_id);
+
+// Gives a group its input slots: every crossing link (outside producer
+// into a member port) reroutes through a slot - the slot takes the
+// crossing's position in the member port's fan-in, the producers append
+// as the slot's own fan-in in their old order - and when no slot ends up
+// wired to a member's port 0, `seed_member` (0 = skip) gets an
+// interior-only In slot at inputs[0]. Idempotent: slotted wiring has no
+// crossings left. Mints ids from next_effect_id; materializes
+// synthesized links first when it changes anything. Shared by group
+// creation and the loader's legacy migration.
+void normalize_group_inputs(Document& doc, Look& look, size_t layer_index,
+                            Group& g, uint64_t seed_member);
 
 }  // namespace looks::doc

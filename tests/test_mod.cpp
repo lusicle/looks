@@ -270,6 +270,44 @@ TEST(mod_resolve_lane_and_route) {
     CHECK(near(rc.looks[0].layers[0].stack[0].wet, 1.0f));
 }
 
+TEST(mod_resolve_group_wet_and_opacity) {
+    // Group composite knobs are full mod targets: lanes set the base,
+    // wires replace it - keyed with kGroupParamBit, like layer params.
+    doc::Document d = make_doc();
+    doc::Group g;
+    g.id = d.next_effect_id++;
+    d.looks[0].layers[0].stack[0].group_id = g.id;
+    d.looks[0].layers[0].groups.push_back(g);
+    const doc::ParamKey wet_key{g.id | doc::kGroupParamBit,
+                                doc::kWetParam};
+
+    doc::KeyframeLane lane;
+    lane.target = wet_key;
+    lane.keys.push_back({0.0, 0.0f});
+    lane.keys.push_back({10.0, 1.0f});
+    d.looks[0].lanes.push_back(lane);
+    doc::Document r5 = mod::resolve(d, 5, 30.0, nullptr);
+    CHECK(near(r5.looks[0].layers[0].groups[0].wet, 0.5f));
+
+    // A wire REPLACES: square LFO at 1 Hz, frame 15 reads 0.
+    doc::ModSource lfo;
+    lfo.type = doc::ModSourceType::Lfo;
+    lfo.shape = doc::LfoShape::Square;
+    lfo.rate_hz = 1.0f;
+    add_valued_route(d, lfo, wet_key);
+    doc::Document ra = mod::resolve(d, 0, 30.0, nullptr);
+    doc::Document rb = mod::resolve(d, 15, 30.0, nullptr);
+    CHECK(near(ra.looks[0].layers[0].groups[0].wet, 1.0f));
+    CHECK(near(rb.looks[0].layers[0].groups[0].wet, 0.0f));
+    // Opacity rides the same addressing, lanes only here.
+    doc::KeyframeLane olane;
+    olane.target = {g.id | doc::kGroupParamBit, doc::kOpacityParam};
+    olane.keys.push_back({0.0, 0.25f});
+    d.looks[0].lanes.push_back(olane);
+    doc::Document ro = mod::resolve(d, 0, 30.0, nullptr);
+    CHECK(near(ro.looks[0].layers[0].groups[0].opacity, 0.25f));
+}
+
 TEST(mod_wired_analysis_node_reads_its_connection) {
     // An analysis node REQUIRES its input: the wired connection's
     // curves sample at the look clock plus the chain's slip; a wire

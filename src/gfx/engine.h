@@ -300,6 +300,8 @@ private:
     };
     std::unordered_map<uint64_t, MoshSlot> mosh_state_;
     std::unique_ptr<ComputePipeline> to_nv12_, fx_mix_;
+    // Group composite (GraphNode::Kind::GroupMix): dry vs face two-lerp.
+    std::unique_ptr<ComputePipeline> group_mix_;
     // GPU mosh pipelines + per-instance chain state. Planes are r32ui
     // storage images holding one byte value per texel; state lives on the
     // GPU across timeline frames (the whole point — no readback). The CPU

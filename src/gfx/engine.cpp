@@ -426,6 +426,11 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     to_nv12_ = mk("export_nv12.comp.spv", 1, 2, 2 * sizeof(uint32_t));
     fx_mix_ = mk("fx_mix.comp.spv", 2, 1, 4 * sizeof(uint32_t));
     if (!to_nv12_ || !fx_mix_) return false;
+    // Group composite: the standard two-lerp tail over {dry, face},
+    // full RGBA (a group's interior may carve alpha; wet 1 must return
+    // the face exactly).
+    group_mix_ = mk("group_mix.comp.spv", 2, 1, 4 * sizeof(uint32_t));
+    if (!group_mix_) return false;
 
     // GPU mosh: the codec box stays on the GPU whenever no bitstream is
     // rate-limited or corrupted (entropy is lossless, so the wire is just
@@ -3194,6 +3199,22 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 matte_apply_->dispatch(rec, arena_, frame_index, sampled, 3,
                                        &dst, 1, push, sizeof(push), w, h,
                                        linear_sampler_);
+                break;
+            }
+            case GraphNode::Kind::GroupMix: {
+                // The group's composite knobs read from the RESOLVED
+                // look per frame (lanes + wires baked), exactly like
+                // effect params.
+                const doc::Group& grp =
+                    look.layers[static_cast<size_t>(node.layer_index)]
+                        .groups[static_cast<size_t>(node.effect_index)];
+                const uint32_t push[4] = {w, h, as_bits(grp.wet),
+                                          as_bits(grp.opacity)};
+                const GpuImage* sampled[2] = {input_image(0),
+                                              input_image(1)};
+                group_mix_->dispatch(rec, arena_, frame_index, sampled, 2,
+                                     &dst, 1, push, sizeof(push), w, h,
+                                     linear_sampler_);
                 break;
             }
         }

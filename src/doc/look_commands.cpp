@@ -101,7 +101,10 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
     for (Layer& l : out.layers) {
         l.id = remint(l.id);
         for (EffectInstance& fx : l.stack) fx.id = remint(fx.id);
-        for (Group& g : l.groups) g.id = remint(g.id);
+        for (Group& g : l.groups) {
+            g.id = remint(g.id);
+            for (uint64_t& s : g.inputs) s = remint(s);
+        }
     }
     for (CanvasFrame& f : out.frames) f.id = remint(f.id);
 
@@ -111,6 +114,9 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
         if (k.effect_id & kLayerParamBit)
             k.effect_id = mapped(k.effect_id & ~kLayerParamBit) |
                           kLayerParamBit;
+        else if (k.effect_id & kGroupParamBit)
+            k.effect_id = mapped(k.effect_id & ~kGroupParamBit) |
+                          kGroupParamBit;
         else if (k.effect_id)
             k.effect_id = mapped(k.effect_id);
         return k;
@@ -119,7 +125,6 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
         for (EffectInstance& fx : l.stack)
             fx.group_id = mapped(fx.group_id);
         for (Group& g : l.groups) {
-            g.face_in = mapped(g.face_in);
             g.face_out = mapped(g.face_out);
             for (ParamKey& k : g.exposed) k = mapped_key(k);
         }
@@ -148,7 +153,10 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
         lane.target = mapped_key(lane.target);
     for (Snapshot& s : out.snapshots)
         for (SnapshotEntry& e : s.entries)
-            e.effect_id = mapped(e.effect_id);
+            e.effect_id =
+                e.effect_id & kGroupParamBit
+                    ? mapped(e.effect_id & ~kGroupParamBit) | kGroupParamBit
+                    : mapped(e.effect_id);
     return out;
 }
 

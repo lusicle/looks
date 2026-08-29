@@ -34,6 +34,10 @@ struct GraphNode {
         LayerBlend,    // inputs: below, over. layer_index >= 0 reads the
                        // owning look layer's mode/opacity; -1 is a
                        // SEQUENCE lane stack: plain alpha-over, no modes.
+        GroupMix,      // group composite: inputs {dry, face}; reads
+                       // layers[layer_index].groups[effect_index]'s
+                       // wet/opacity from the resolved look - the same
+                       // two-lerp tail every effect kernel folds.
     };
     Kind kind = Kind::Source;
     int layer_index = -1;      // owning layer (Effect/Generator/LayerBlend)

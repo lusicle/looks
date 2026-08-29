@@ -464,6 +464,43 @@ TEST(flatten_audio_voice_is_the_bottom_output_chain) {
     CHECK_EQ(voice[0].op_count, uint32_t{0});
 }
 
+TEST(flatten_audio_voice_skips_dangling_feeds) {
+    // Deletes tolerate dangling links (a removed group leaves its old
+    // wires behind), so a dead wire at the BOTTOM of a fan-in must not
+    // swallow the voice while a live chain sits above it - the image
+    // side already skips dead feeds; audio must match.
+    Rig rig(60);
+    Document& d = rig.doc;
+    doc::Look& look = d.looks[0];
+    const uint64_t media_layer = look.layers[0].id;
+    lay_audio_block(d, rig.look);
+    doc::ensure_links(look);
+    look.links.insert(look.links.begin(), {99991, 0, 0});
+    auto voice = doc::flatten_audio_sources(d, d.root_sequence);
+    CHECK_EQ(voice.size(), size_t{1});
+    CHECK_EQ(voice[0].layer, media_layer);
+
+    // Slot variant: a dangling exterior feed below the live one in a
+    // group input's fan-in - the hop must pick the live producer.
+    doc::UndoStack undo;
+    look.layers[0].stack.push_back(
+        doc::make_effect(d, doc::EffectType::Grain));
+    const uint64_t fx0 = look.layers[0].stack[0].id;
+    look.links.clear();
+    look.links.push_back({media_layer, fx0, 0});
+    look.links.push_back({fx0, 0, 0});
+    doc::Group g = doc::make_group(d, "wrap");
+    const uint64_t gid = g.id;
+    undo.execute(d, doc::group_effects_command(rig.look, 0, g, 0, 0));
+    const doc::Group* placed = doc::find_group(look, gid);
+    CHECK(placed && !placed->inputs.empty());
+    const uint64_t slot0 = placed->inputs.front();
+    look.links.insert(look.links.begin(), {99992, slot0, 0});
+    voice = doc::flatten_audio_sources(d, d.root_sequence);
+    CHECK_EQ(voice.size(), size_t{1});
+    CHECK_EQ(voice[0].layer, media_layer);
+}
+
 TEST(flatten_audio_voice_survives_a_preset_splice) {
     // Splicing a preset into the BOTTOM chain re-terminates it through
     // the group. Stacking order IS the link order, so the splice must
@@ -487,13 +524,18 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     members.push_back(doc::make_effect(d, doc::EffectType::Grain));
     members.push_back(doc::make_effect(d, doc::EffectType::Posterize));
     const uint64_t m0 = members[0].id, m1 = members[1].id;
+    const uint64_t gid = g.id;
     undo.execute(d, doc::insert_group_command(rig.look, 0, g,
-                                              std::move(members)));
+                                              std::move(members), m0));
     // The drop gesture's splice: the chain end re-terminates through
-    // the group IN PLACE, then the feed wires into the group's head.
+    // the group IN PLACE, then the feed wires into the group's In slot
+    // (the voice walk must hop through it).
+    const doc::Group* placed = doc::find_group(look, gid);
+    CHECK(placed && !placed->inputs.empty());
+    const uint64_t slot0 = placed->inputs.front();
     undo.execute(d, doc::reconnect_command(rig.look, {media_layer, 0, 0},
                                            {m1, 0, 0}));
-    undo.execute(d, doc::connect_command(rig.look, {media_layer, m0, 0}));
+    undo.execute(d, doc::connect_command(rig.look, {media_layer, slot0, 0}));
 
     const auto voice = doc::flatten_audio_sources(d, d.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});

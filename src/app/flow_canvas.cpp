@@ -66,10 +66,19 @@ bool is_boundary(const Node& nd) {
 
 // Matte/aux ports get dedicated strip rows between the preview and the
 // param rows — a port pinned at a fixed offset lands on top of row 0
-// (the port label painted over wet/dry shipped once).
+// (the port label painted over wet/dry shipped once). Group input slots
+// are NOT rows: they stack as plain dots on the card's left edge,
+// centred where a single In sits. A GroupIn boundary card's exit dots
+// ride strip rows on the right edge (label-free).
 int port_row_count(const Node& nd) {
-    return (nd.has_matte_port ? 1 : 0) + (nd.has_aux_port ? 1 : 0);
+    // A GroupIn card's ghost EXIT (interior minting) takes a row too.
+    return nd.exit_rows +
+           (nd.kind == NodeKind::GroupIn && nd.ghost_in ? 1 : 0) +
+           (nd.has_matte_port ? 1 : 0) + (nd.has_aux_port ? 1 : 0);
 }
+
+// Vertical pitch of the input dot stack (slots + the ghost).
+constexpr float kInPitch = 14.0f;
 
 void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<CanvasUser*>(node.user);
@@ -221,7 +230,35 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return strip_top(nd) +
                static_cast<float>(port_row_count(nd)) * kRowH;
     };
+    // Group-card input stack: slots + the ghost as plain dots on the
+    // LEFT edge, centred where a single node's In sits (preview mid) -
+    // no rows, no labels. Stack index: 0 = slots[0] (the In), k =
+    // slots[k], last = the ghost while it shows.
+    auto in_stack_count = [](const Node& nd) {
+        return (nd.has_in ? 1 + nd.slot_rows : 0) +
+               (nd.ghost_in ? 1 : 0);
+    };
+    // The input dot stack lives on GROUP cards; on a GroupIn card
+    // ghost_in means the ghost EXIT instead (interior minting).
+    auto in_stacked = [](const Node& nd) {
+        return (nd.ghost_in && nd.kind == NodeKind::Group) ||
+               nd.slot_rows > 0;
+    };
+    auto exit_count = [](const Node& nd) {
+        return nd.exit_rows +
+               (nd.kind == NodeKind::GroupIn && nd.ghost_in ? 1 : 0);
+    };
+    auto port_stack = [&](const Node& nd, int i) {
+        const float cy = node_has_preview(nd) ? kTitleH + kPrevH * 0.5f
+                                              : kTitleH * 0.5f;
+        const float off =
+            (static_cast<float>(i) -
+             static_cast<float>(in_stack_count(nd) - 1) * 0.5f) *
+            kInPitch;
+        return to_screen({nd.x, nd.y + cy + off});
+    };
     auto port_in = [&](const Node& nd) {
+        if (in_stacked(nd) && nd.has_in) return port_stack(nd, 0);
         const float py = node_has_preview(nd) ? kTitleH + kPrevH * 0.5f
                                               : kTitleH * 0.5f;
         return to_screen({nd.x, nd.y + py});
@@ -231,6 +268,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                               : kTitleH * 0.5f;
         return to_screen({nd.x + kNodeW, nd.y + py});
     };
+    auto port_slot = [&](const Node& nd, int slot_index) {
+        return port_stack(nd, slot_index);
+    };
+    auto port_ghost = [&](const Node& nd) {
+        return port_stack(nd, nd.has_in ? 1 + nd.slot_rows : 0);
+    };
     auto port_matte = [&](const Node& nd) {
         return to_screen(
             {nd.x, nd.y + strip_top(nd) + 0.5f * kRowH});
@@ -239,6 +282,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return to_screen(
             {nd.x, nd.y + strip_top(nd) +
                        (nd.has_matte_port ? 1.5f : 0.5f) * kRowH});
+    };
+    // GroupIn exit rows: right-edge anchors, one per input slot.
+    auto port_exit = [&](const Node& nd, int k) {
+        return to_screen(
+            {nd.x + kNodeW, nd.y + strip_top(nd) +
+                                (static_cast<float>(k) + 0.5f) * kRowH});
     };
     // Left-edge anchor of a param row — where mod wires land (routes
     // wire into the PARAM, not the card).
@@ -297,12 +346,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // nodes never feed image ports; only image nodes feed GroupOut.
     auto out_feeds_input = [](const Node& src_nd, const Node& to_nd,
                               uint32_t port) {
-        if (!src_nd.has_out) return false;
+        if (!src_nd.has_out && src_nd.exit_rows == 0) return false;
         if (src_nd.kind == NodeKind::ModSource) return false;
-        if (port == 1)
+        if (port == 1 || to_nd.kind == NodeKind::Group)
             return src_nd.kind == NodeKind::Source ||
                    src_nd.kind == NodeKind::Effect ||
-                   src_nd.kind == NodeKind::Group;
+                   src_nd.kind == NodeKind::Group ||
+                   src_nd.kind == NodeKind::GroupIn;
         if (to_nd.kind == NodeKind::GroupOut)
             return src_nd.kind == NodeKind::Effect;
         if (src_nd.kind == NodeKind::GroupIn)
@@ -316,10 +366,18 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const Node* a = find_node(w.from);
         const Node* b = find_node(w.to);
         if (!a || !b) return false;
-        *p0 = port_out(*a);
+        *p0 = a->exit_rows > 0
+            ? port_exit(*a,
+                        std::min(static_cast<int>(w.from_port),
+                                 a->exit_rows - 1))
+            : port_out(*a);
         const bool row_end =
             w.data && w.to_row >= 0 && w.to_row < b->row_count;
+        const bool slot_end = !w.data && w.to_port >= 2 &&
+                              static_cast<int>(w.to_port) - 1 <=
+                                  b->slot_rows;
         *p3 = !w.data && w.to_port == 1 ? port_matte(*b)
+            : slot_end ? port_slot(*b, static_cast<int>(w.to_port) - 1)
             : !w.data && w.to_port == 2 ? port_aux(*b)
             : row_end     ? row_anchor(*b, w.to_row)
                           : port_in(*b);
@@ -514,16 +572,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.add_cat = -1;
         st.splice_from = st.splice_to = 0;
         st.splice_port = 0;
-        // Wire under the cursor → the added node splices into it.
+        // Wire under the cursor → the added node splices into it
+        // (endpoints from wire_ends, the one derivation).
         float best = 10.0f * 10.0f;
         for (size_t w = 0; w < g.wire_count; ++w) {
             if (g.wires[w].data || g.wires[w].to_port == 1) continue;
-            const Node* a = find_node(g.wires[w].from);
-            const Node* b = find_node(g.wires[w].to);
-            if (!a || !b) continue;
-            const Vec2 p3 = g.wires[w].to_port == 2 ? port_aux(*b)
-                                                 : port_in(*b);
-            const float d = wire_near(port_out(*a), p3);
+            Vec2 p0, p3;
+            if (!wire_ends(g.wires[w], &p0, &p3)) continue;
+            const float d = wire_near(p0, p3);
             if (d < best) {
                 best = d;
                 st.splice_from = g.wires[w].from;
@@ -791,23 +847,75 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         // Port grabs win over everything: Out starts a wire, a FED In or
         // matte port grabs its wire for rewiring (texed editor idiom).
         bool port_handled = false;
-        for (size_t i = 0; i < n && !port_handled; ++i) {
-            const Node& nd = g.nodes[i];
-            if (nd.has_out && near2(port_out(nd), 81.0f)) {
+        // Out-side grabs first, NEAREST anchor wins (GroupIn exit rows
+        // sit one row apart, inside each other's grab radius).
+        {
+            float best_d2 = 81.0f;
+            const Node* best_nd = nullptr;
+            uint32_t best_port = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const Node& nd = g.nodes[i];
+                auto consider = [&](Vec2 p, uint32_t pt) {
+                    const float dx = mouse.x - p.x;
+                    const float dy = mouse.y - p.y;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        best_nd = &nd;
+                        best_port = pt;
+                    }
+                };
+                if (nd.has_out) consider(port_out(nd), 0);
+                // Exit rows plus the ghost exit (index exit_rows):
+                // dragging from it mints the next input interiorly.
+                for (int k = 0; k < exit_count(nd); ++k)
+                    consider(port_exit(nd, k),
+                             static_cast<uint32_t>(k));
+            }
+            if (best_nd) {
                 st.drag_kind = 4;
-                st.wire_from = nd.id;
+                st.wire_from = best_nd->id;
+                st.wire_from_port = best_port;
                 frame.ctx.set_capture(wid);
                 port_handled = true;
-                break;
             }
+        }
+        if (!port_handled) {
             // Input ports: a FED port picks its wire up (rewire, texed
             // pick-up-from-source); an EMPTY one extends a new wire whose
             // fixed end is the input, seeking an Out port (kind 8). A
             // DOUBLE-CLICK on a port with two or more feeds opens the
-            // STACK popup instead (link-order reordering).
-            auto grab_input = [&](Vec2 p,
-                                  uint32_t port) {
-                if (!near2(p, 81.0f)) return;
+            // STACK popup instead (link-order reordering). NEAREST
+            // anchor wins across every node - strip rows sit one row
+            // apart, inside each other's grab radius.
+            float best_d2 = 81.0f;
+            const Node* best_nd = nullptr;
+            uint32_t best_port = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const Node& nd2 = g.nodes[i];
+                auto consider = [&](Vec2 p, uint32_t pt) {
+                    const float dx = mouse.x - p.x;
+                    const float dy = mouse.y - p.y;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        best_nd = &nd2;
+                        best_port = pt;
+                    }
+                };
+                if (nd2.has_in) consider(port_in(nd2), 0);
+                if (nd2.has_matte_port) consider(port_matte(nd2), 1);
+                if (nd2.has_aux_port) consider(port_aux(nd2), 2);
+                for (int k = 1; k <= nd2.slot_rows; ++k)
+                    consider(port_slot(nd2, k),
+                             static_cast<uint32_t>(k + 1));
+                if (nd2.ghost_in && nd2.kind == NodeKind::Group)
+                    consider(port_ghost(nd2),
+                             static_cast<uint32_t>(nd2.slot_rows + 2));
+            }
+            if (best_nd) {
+            const Node& nd = *best_nd;
+            auto grab_input = [&](uint32_t port) {
                 size_t feeds = 0;
                 for (size_t w = 0; w < g.wire_count; ++w)
                     if (!g.wires[w].data && g.wires[w].to == nd.id &&
@@ -838,6 +946,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         g.wires[w].to == nd.id) {
                         st.drag_kind = 5;
                         st.wire_from = g.wires[w].from;
+                        st.wire_from_port = g.wires[w].from_port;
                         st.wire_old_to = nd.id;
                         st.wire_old_port = port;
                         frame.ctx.set_capture(wid);
@@ -846,16 +955,17 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     }
                 st.drag_kind = 8;
                 st.wire_from = 0;
+                st.wire_from_port = 0;
                 st.wire_old_to = nd.id;
                 st.wire_old_port = port;
                 frame.ctx.set_capture(wid);
                 port_handled = true;
             };
-            if (!port_handled && nd.has_in) grab_input(port_in(nd), 0);
-            if (!port_handled && nd.has_matte_port)
-                grab_input(port_matte(nd), 1);
-            if (!port_handled && nd.has_aux_port)
-                grab_input(port_aux(nd), 2);
+            // Slot rows carry doc ports k+1; the ghost row
+            // (port slot_rows+2) never holds a wire, so a press on it
+            // always starts the reverse drag that mints the slot.
+            grab_input(best_port);
+            }
         }
         if (!port_handled && hover_i >= 0) {
             const Node& nd = g.nodes[static_cast<size_t>(hover_i)];
@@ -1098,9 +1208,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                  dn->kind == NodeKind::Group) &&
                 dn->has_in && g.multi_count <= 1) {
                 bool fed = false;
+                // Fed = any non-matte media wire in, slot ports included.
                 for (size_t w = 0; w < g.wire_count; ++w)
-                    fed = fed || ((!g.wires[w].data && (g.wires[w].to_port == 0 ||
-                                   g.wires[w].to_port == 2)) &&
+                    fed = fed || (!g.wires[w].data &&
+                                  g.wires[w].to_port != 1 &&
                                   g.wires[w].to == dn->id);
                 if (!fed) {
                     float best = 12.0f * 12.0f;
@@ -1169,19 +1280,41 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (frame.input.left_released() && st.drag_kind != 0) {
         if (st.drag_kind == 8) {
             // Reverse wire drop: the fixed end is an input; connect from
-            // the Out port under the cursor.
+            // the Out port (or an In-node exit / ghost exit) under the
+            // cursor - NEAREST anchor wins, exits sit one row apart
+            // inside each other's pick radius.
             const Node* to_nd = find_node(st.wire_old_to);
-            for (size_t i = 0; to_nd && i < n; ++i) {
-                const Node& nd = g.nodes[i];
-                if (nd.id == st.wire_old_to) continue;
-                if (!out_feeds_input(nd, *to_nd, st.wire_old_port))
-                    continue;
-                if (!near2(port_out(nd), 324.0f)) continue;
-                out.connect_requested = true;
-                out.connect_from = nd.id;
-                out.connect_to = st.wire_old_to;
-                out.connect_port = st.wire_old_port;
-                break;
+            if (to_nd) {
+                float best_d2 = 324.0f;
+                const Node* best_nd = nullptr;
+                uint32_t best_port = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const Node& nd = g.nodes[i];
+                    if (nd.id == st.wire_old_to) continue;
+                    if (!out_feeds_input(nd, *to_nd, st.wire_old_port))
+                        continue;
+                    auto consider = [&](Vec2 p, uint32_t pt) {
+                        const float dx = mouse.x - p.x;
+                        const float dy = mouse.y - p.y;
+                        const float d2 = dx * dx + dy * dy;
+                        if (d2 < best_d2) {
+                            best_d2 = d2;
+                            best_nd = &nd;
+                            best_port = pt;
+                        }
+                    };
+                    if (nd.has_out) consider(port_out(nd), 0);
+                    for (int k = 0; k < exit_count(nd); ++k)
+                        consider(port_exit(nd, k),
+                                 static_cast<uint32_t>(k));
+                }
+                if (best_nd) {
+                    out.connect_requested = true;
+                    out.connect_from = best_nd->id;
+                    out.connect_from_port = best_port;
+                    out.connect_to = st.wire_old_to;
+                    out.connect_port = st.wire_old_port;
+                }
             }
             st.wire_old_to = 0;
             st.wire_old_port = 0;
@@ -1208,26 +1341,35 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     break;
                 }
             }
-            for (size_t i = 0; i < n && !found && !from_mod; ++i) {
+            // NEAREST anchor wins, never list order: strip rows sit one
+            // row (18 px) apart, inside the pick radius of their
+            // neighbours - priority chains sent ghost drops to the
+            // matte. (Matte anchors: ANY image out — masks ARE images;
+            // the ghost "new input" mints its slot in one undo step.)
+            float best_d2 = 324.0f;
+            for (size_t i = 0; i < n && !from_mod; ++i) {
                 const Node& nd = g.nodes[i];
                 if (nd.id == st.wire_from) continue;
-                if (nd.has_in && near2(port_in(nd), 324.0f)) {
-                    to = nd.id;
-                    port = 0;
-                    found = true;
-                } else if (nd.has_aux_port &&
-                           near2(port_aux(nd), 324.0f)) {
-                    to = nd.id;
-                    port = 2;
-                    found = true;
-                } else if (nd.has_matte_port &&
-                           near2(port_matte(nd), 324.0f)) {
-                    // ANY image out on a matte anchor (masks ARE images)
-                    // — the app wires a plain port-1 link.
-                    to = nd.id;
-                    port = 1;
-                    found = true;
-                }
+                auto consider = [&](Vec2 p, uint32_t pt) {
+                    const float dx = mouse.x - p.x;
+                    const float dy = mouse.y - p.y;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < best_d2) {
+                        best_d2 = d2;
+                        to = nd.id;
+                        port = pt;
+                        found = true;
+                    }
+                };
+                if (nd.has_in) consider(port_in(nd), 0);
+                if (nd.has_aux_port) consider(port_aux(nd), 2);
+                if (nd.has_matte_port) consider(port_matte(nd), 1);
+                for (int k = 1; k <= nd.slot_rows; ++k)
+                    consider(port_slot(nd, k),
+                             static_cast<uint32_t>(k + 1));
+                if (nd.ghost_in && nd.kind == NodeKind::Group)
+                    consider(port_ghost(nd),
+                             static_cast<uint32_t>(nd.slot_rows + 2));
             }
             if (found) {
                 const bool same = st.drag_kind == 5 &&
@@ -1237,21 +1379,25 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     if (st.drag_kind == 5) {
                         out.disconnect_requested = true;
                         out.disconnect_from = st.wire_from;
+                        out.disconnect_from_port = st.wire_from_port;
                         out.disconnect_to = st.wire_old_to;
                         out.disconnect_port = st.wire_old_port;
                     }
                     out.connect_requested = true;
                     out.connect_from = st.wire_from;
+                    out.connect_from_port = st.wire_from_port;
                     out.connect_to = to;
                     out.connect_port = port;
                 }
             } else if (st.drag_kind == 5) {
                 out.disconnect_requested = true;
                 out.disconnect_from = st.wire_from;
+                out.disconnect_from_port = st.wire_from_port;
                 out.disconnect_to = st.wire_old_to;
                 out.disconnect_port = st.wire_old_port;
             }
             st.wire_from = 0;
+            st.wire_from_port = 0;
         } else if (st.drag_kind == 6) {
             out.marquee_done = true;
             out.mq_x0 = std::min(st.node_grab_x, gmouse.x);
@@ -1329,6 +1475,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     out.wire_clicked_shift =
                         (frame.input.mods & platform::kModShift) != 0;
                     out.wire_from = g.wires[hit].from;
+                    out.wire_from_port = g.wires[hit].from_port;
                     out.wire_to = g.wires[hit].to;
                     out.wire_to_port = g.wires[hit].to_port;
                     out.wire_data = g.wires[hit].data;
@@ -1452,21 +1599,18 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 
     // Wires under the cards. Mod wires land on the driven param's row
-    // gutter with a terminal dot; the rest end on ports.
+    // gutter with a terminal dot; the rest end on ports. Endpoints come
+    // from wire_ends - the ONE derivation draw, hit and marquee share
+    // (an inline copy here drew slot wires on the wrong rows).
     for (size_t w = 0; w < g.wire_count; ++w) {
         const Node* a = find_node(g.wires[w].from);
         const Node* b = find_node(g.wires[w].to);
         if (!a || !b) continue;
-        const Vec2 p0 = port_out(*a);
+        Vec2 p0, p3;
+        if (!wire_ends(g.wires[w], &p0, &p3)) continue;
         const bool row_end = g.wires[w].data &&
                              g.wires[w].to_row >= 0 &&
                              g.wires[w].to_row < b->row_count;
-        const Vec2 p3 = !g.wires[w].data && g.wires[w].to_port == 1
-            ? port_matte(*b)
-            : (!g.wires[w].data && g.wires[w].to_port == 2
-                   ? port_aux(*b)
-                   : (row_end ? row_anchor(*b, g.wires[w].to_row)
-                              : port_in(*b)));
         const bool hot = st.hover == a->id || st.hover == b->id ||
                          g.selected == a->id || g.selected == b->id;
         // TWO families only: MEDIA (chain/matte/aux/audio - one generic
@@ -1483,6 +1627,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         for (size_t sw = 0; sw < g.sel_wire_count; ++sw)
             if (g.sel_wires[sw].from == g.wires[w].from &&
+                g.sel_wires[sw].from_port == g.wires[w].from_port &&
                 g.sel_wires[sw].to == g.wires[w].to &&
                 g.sel_wires[sw].data == g.wires[w].data &&
                 g.sel_wires[sw].to_port == g.wires[w].to_port &&
@@ -2000,6 +2145,58 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                      in_fed);
             if (nd.has_out) draw_port(port_out(nd), theme.text_disabled,
                                       out_fed);
+            // Group input slots past the first: plain dots stacked down
+            // the edge, then the faded ghost ring that mints the next
+            // slot when wired. No rows, no labels.
+            for (int k = 1; k <= nd.slot_rows; ++k) {
+                bool fed = false;
+                for (size_t w = 0; w < g.wire_count; ++w)
+                    if (!g.wires[w].data && g.wires[w].to == nd.id &&
+                        g.wires[w].to_port ==
+                            static_cast<uint32_t>(k + 1))
+                        fed = true;
+                draw_port(port_slot(nd, k), theme.text_disabled, fed);
+            }
+            if (nd.ghost_in && nd.kind == NodeKind::Group) {
+                const Vec2 p = port_ghost(nd);
+                const Color gc =
+                    (near2(p, 100.0f) ? theme.accent : theme.text_disabled)
+                        .with_alpha(0.55f);
+                canvas.draw_sdf_rect_outline(
+                    {p.x - pr2, p.y - pr2, pr2 * 2, pr2 * 2}, pr2, 1.3f,
+                    gc);
+            }
+            // GroupIn exits: one dot per input slot, matching their
+            // order - LABELLED, so fan-in stacking order stays legible
+            // inside the group editor (the collapsed card's stack stays
+            // label-free). The faded ghost exit mints interiorly.
+            for (int k = 0; k < nd.exit_rows; ++k) {
+                bool fed = false;
+                for (size_t w = 0; w < g.wire_count; ++w)
+                    if (!g.wires[w].data && g.wires[w].from == nd.id &&
+                        g.wires[w].from_port == static_cast<uint32_t>(k))
+                        fed = true;
+                const Vec2 p = port_exit(nd, k);
+                draw_port(p, theme.text_disabled, fed);
+                char exit_buf[16];
+                std::snprintf(exit_buf, sizeof(exit_buf), "in %d", k + 1);
+                ui::draw_text(canvas, frame.font, exit_buf,
+                              {cr.x + 8.0f * z, p.y - rs * 0.5f},
+                              rs * 0.9f, theme.text_disabled);
+            }
+            if (nd.ghost_in && nd.kind == NodeKind::GroupIn) {
+                const Vec2 p = port_exit(nd, nd.exit_rows);
+                const Color gc =
+                    (near2(p, 100.0f) ? theme.accent : theme.text_disabled)
+                        .with_alpha(0.55f);
+                canvas.draw_sdf_rect_outline(
+                    {p.x - pr2, p.y - pr2, pr2 * 2, pr2 * 2}, pr2, 1.3f,
+                    gc);
+                ui::draw_text(canvas, frame.font, "new input",
+                              {cr.x + 8.0f * z, p.y - rs * 0.5f},
+                              rs * 0.9f,
+                              theme.text_disabled.with_alpha(0.55f));
+            }
             if (nd.has_matte_port) {
                 draw_port(port_matte(nd), theme.accent_dim, matte_fed);
                 ui::draw_text(canvas, frame.font,
@@ -2053,18 +2250,28 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const Node* from_nd = find_node(st.wire_from);
         if (from_nd) {
             const bool from_mod = from_nd->kind == NodeKind::ModSource;
-            draw_wire(canvas, port_out(*from_nd), mouse,
+            const Vec2 origin = exit_count(*from_nd) > 0
+                ? port_exit(*from_nd,
+                            std::min(static_cast<int>(st.wire_from_port),
+                                     exit_count(*from_nd) - 1))
+                : port_out(*from_nd);
+            draw_wire(canvas, origin, mouse,
                       std::max(1.4f, 1.8f * z), theme.accent, from_mod);
             const float pr3 = 6.0f * z;
             for (size_t i = 0; i < n && !from_mod; ++i) {
                 const Node& nd = g.nodes[i];
                 if (nd.id == st.wire_from) continue;
-                Vec2 candidates[3]{};
+                Vec2 candidates[12]{};
                 int n_cand = 0;
                 if (nd.has_in) candidates[n_cand++] = port_in(nd);
                 if (nd.has_aux_port) candidates[n_cand++] = port_aux(nd);
                 if (nd.has_matte_port)
                     candidates[n_cand++] = port_matte(nd);
+                for (int k = 1; k <= nd.slot_rows && n_cand < 11; ++k)
+                    candidates[n_cand++] = port_slot(nd, k);
+                if (nd.ghost_in && nd.kind == NodeKind::Group &&
+                    n_cand < 12)
+                    candidates[n_cand++] = port_ghost(nd);
                 for (int c = 0; c < n_cand; ++c) {
                     const Vec2 p = candidates[c];
                     canvas.draw_sdf_rect_outline(
@@ -2109,10 +2316,21 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (st.drag_kind == 8) {
         const Node* to_nd = find_node(st.wire_old_to);
         if (to_nd) {
+            const bool slot_fixed =
+                st.wire_old_port >= 2 &&
+                static_cast<int>(st.wire_old_port) - 1 <=
+                    to_nd->slot_rows + (to_nd->ghost_in ? 1 : 0);
             const Vec2 fixed_p = st.wire_old_port == 1
                 ? port_matte(*to_nd)
-                : (st.wire_old_port == 2 ? port_aux(*to_nd)
-                                         : port_in(*to_nd));
+                : slot_fixed
+                    ? (static_cast<int>(st.wire_old_port) - 1 <=
+                               to_nd->slot_rows
+                           ? port_slot(*to_nd,
+                                       static_cast<int>(
+                                           st.wire_old_port) - 1)
+                           : port_ghost(*to_nd))
+                    : (st.wire_old_port == 2 ? port_aux(*to_nd)
+                                             : port_in(*to_nd));
             draw_wire(canvas, mouse, fixed_p, std::max(1.4f, 1.8f * z),
                       theme.accent, st.wire_old_port == 1);
             const float pr3 = 6.0f * z;
@@ -2121,10 +2339,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (nd.id == st.wire_old_to) continue;
                 if (!out_feeds_input(nd, *to_nd, st.wire_old_port))
                     continue;
-                const Vec2 p = port_out(nd);
-                canvas.draw_sdf_rect_outline(
-                    {p.x - pr3, p.y - pr3, pr3 * 2, pr3 * 2}, pr3, 1.5f,
-                    near2(p, 324.0f) ? theme.accent : theme.accent_dim);
+                // Ring the anchors that ACTUALLY exist: a multi-exit
+                // card (the In node) rings its exit dots + ghost, never
+                // the single-out anchor it no longer has.
+                auto ring = [&](Vec2 p) {
+                    canvas.draw_sdf_rect_outline(
+                        {p.x - pr3, p.y - pr3, pr3 * 2, pr3 * 2}, pr3,
+                        1.5f,
+                        near2(p, 324.0f) ? theme.accent
+                                         : theme.accent_dim);
+                };
+                if (nd.has_out) ring(port_out(nd));
+                for (int k = 0; k < exit_count(nd); ++k)
+                    ring(port_exit(nd, k));
             }
         }
     }
@@ -2133,12 +2360,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     // splice-target wire redraws highlighted while it is open.
     if (st.add_open) {
         if (st.splice_to) {
-            const Node* a = find_node(st.splice_from);
-            const Node* b = find_node(st.splice_to);
-            if (a && b)
-                draw_wire(canvas, port_out(*a),
-                          st.splice_port == 2 ? port_aux(*b) : port_in(*b),
-                          std::max(2.2f, 2.4f * z), theme.accent, false);
+            Wire sw{st.splice_from, st.splice_to, st.splice_port};
+            Vec2 p0, p3;
+            if (wire_ends(sw, &p0, &p3))
+                draw_wire(canvas, p0, p3, std::max(2.2f, 2.4f * z),
+                          theme.accent, false);
         }
         const Rect mr = menu_rect();
         canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
@@ -2282,9 +2508,21 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             // Feed index `seen` (bottom-first) draws at the mirrored row.
             const size_t row = feeds - 1 - seen;
             const float ry = mr.y + 4.0f + static_cast<float>(row) * 20.0f;
+            // Multi-exit feeders (the In node) name the EXIT, not the
+            // card - every exit carries different media, and five rows
+            // all reading "input" order nothing.
             const char* title = "?";
+            char exit_title[16];
             for (size_t i = 0; i < g.node_count; ++i)
-                if (g.nodes[i].id == wr.from) title = g.nodes[i].title;
+                if (g.nodes[i].id == wr.from) {
+                    if (g.nodes[i].exit_rows > 0) {
+                        std::snprintf(exit_title, sizeof(exit_title),
+                                      "in %u", wr.from_port + 1);
+                        title = exit_title;
+                    } else {
+                        title = g.nodes[i].title;
+                    }
+                }
             ui::probe_add("stack:" + std::string(title),
                           {mr.x, ry, mr.w, 20.0f});
             const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
@@ -2408,12 +2646,39 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
         const Node* a = find_node(wr.from);
         const Node* b = find_node(wr.to);
         if (!a || !b) continue;
-        const Vec2 p0 = to_screen({a->x + kNodeW, a->y + port_y(*a)});
+        // Mirrors the canvas's own anchors (port_stack/port_exit) - a
+        // free function cannot share the lambdas, so keep in sync.
+        auto stack_y = [](const Node& nd, int i) {
+            const float cy = node_has_preview(nd)
+                ? kTitleH + kPrevH * 0.5f
+                : kTitleH * 0.5f;
+            const int count = (nd.has_in ? 1 + nd.slot_rows : 0) +
+                              (nd.ghost_in ? 1 : 0);
+            return cy + (static_cast<float>(i) -
+                         static_cast<float>(count - 1) * 0.5f) * kInPitch;
+        };
+        const Vec2 p0 =
+            a->exit_rows > 0
+                ? to_screen({a->x + kNodeW,
+                             a->y + strip_top(*a) +
+                                 (static_cast<float>(wr.from_port) +
+                                  0.5f) * kRowH})
+                : to_screen({a->x + kNodeW, a->y + port_y(*a)});
+        const bool slot_end = wr.to_port >= 2 &&
+                              static_cast<int>(wr.to_port) - 1 <=
+                                  b->slot_rows;
+        const bool stacked = b->ghost_in || b->slot_rows > 0;
         const Vec2 p3 =
-            wr.to_port == 2
+            slot_end
+                ? to_screen({b->x,
+                             b->y + stack_y(*b, static_cast<int>(
+                                                    wr.to_port) - 1)})
+                : wr.to_port == 2
                 ? to_screen({b->x, b->y + strip_top(*b) +
                                        (b->has_matte_port ? 1.5f : 0.5f) *
                                            kRowH})
+                : stacked && wr.to_port == 0 && b->has_in
+                ? to_screen({b->x, b->y + stack_y(*b, 0)})
                 : to_screen({b->x, b->y + port_y(*b)});
         // Sampled bezier distance, matching the canvas's own splice hit.
         const float d2 = wire_dist2(p0, p3, screen);

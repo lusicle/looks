@@ -15,7 +15,11 @@ json::Value preset_to_json(const Preset& p) {
     json::Value tags = json::Value::make_array();
     for (const std::string& t : p.tags) tags.push(json::Value(t));
     v.set("tags", std::move(tags));
-    v.set("group", group_to_json(p.group));
+    json::Value gv = group_to_json(p.group);
+    // The In seed rides the group object under the same key the
+    // pre-slot files used, so shipped presets read back unchanged.
+    if (p.face_in) gv.set("face_in", static_cast<int64_t>(p.face_in));
+    v.set("group", std::move(gv));
     json::Value effects = json::Value::make_array();
     for (const EffectInstance& fx : p.effects)
         effects.push(effect_to_json(fx));
@@ -31,7 +35,11 @@ std::optional<Preset> preset_from_json(const json::Value& v) {
     if (p.name.empty()) p.name = "preset";
     for (const json::Value& t : v.get("tags").array())
         if (t.is_string()) p.tags.push_back(t.as_string());
-    p.group = group_from_json(v.get("group"));
+    GroupLegacy legacy;
+    p.group = group_from_json(v.get("group"), &legacy);
+    p.face_in = legacy.face_in;
+    // Slots never travel in a preset file - they mint at instantiation.
+    p.group.inputs.clear();
     for (const json::Value& fv : v.get("effects").array())
         if (auto fx = effect_from_json(fv)) p.effects.push_back(std::move(*fx));
     if (p.effects.empty()) return std::nullopt;
@@ -93,6 +101,17 @@ Preset make_preset_from_group(const Look& look, size_t layer_index,
     p.name = p.group.name.empty() ? "preset" : p.group.name;
     for (const EffectInstance& fx : layer.stack)
         if (fx.group_id == group_id) p.effects.push_back(fx);
+    // The In seed = where the live group's In slot lands interiorly.
+    // Slots themselves stay behind (file carries the chain only).
+    if (!p.group.inputs.empty()) {
+        std::vector<NodeLink> synth;
+        for (const NodeLink& l : effective_links(look, synth))
+            if (l.from == p.group.inputs.front() && l.to_port == 0) {
+                p.face_in = l.to;
+                break;
+            }
+    }
+    p.group.inputs.clear();
     // Keep only exposed face params that point at captured members.
     std::vector<ParamKey> kept;
     for (const ParamKey& k : p.group.exposed)
@@ -106,11 +125,13 @@ Preset make_preset_from_group(const Look& look, size_t layer_index,
 }
 
 void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
-                        std::vector<EffectInstance>* out_effects) {
+                        std::vector<EffectInstance>* out_effects,
+                        uint64_t* out_face_in) {
     std::unordered_map<uint64_t, uint64_t> remap;
     Group group = p.group;
     group.id = doc.next_effect_id++;
     group.folded = true;   // presets land collapsed, macros up front
+    group.inputs.clear();  // slots mint when insert_group_command seeds
 
     std::vector<EffectInstance> effects = p.effects;
     for (EffectInstance& fx : effects) {
@@ -128,16 +149,18 @@ void instantiate_preset(Document& doc, const Preset& p, Group* out_group,
     }
     group.exposed = std::move(exposed);
     // Boundary bindings remap too; default to the chain ends.
-    if (auto it = remap.find(group.face_in); it != remap.end())
-        group.face_in = it->second;
+    uint64_t face_in = 0;
+    if (auto it = remap.find(p.face_in); it != remap.end())
+        face_in = it->second;
     else
-        group.face_in = effects.empty() ? 0 : effects.front().id;
+        face_in = effects.empty() ? 0 : effects.front().id;
     if (auto it = remap.find(group.face_out); it != remap.end())
         group.face_out = it->second;
     else
         group.face_out = effects.empty() ? 0 : effects.back().id;
     *out_group = std::move(group);
     *out_effects = std::move(effects);
+    *out_face_in = face_in;
 }
 
 }  // namespace looks::doc

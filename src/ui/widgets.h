@@ -123,9 +123,13 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
 
 // Toggle chip — view-state switches (loop, live, a/b). Flat: dim text when
 // off, accent text on a quiet fill when on. Never looks like an action.
+// close_state/out_close (both or neither) grow a trailing X INSIDE the
+// chip - one visual unit, two hit zones (the timeline's entity tabs).
 LayoutNode* Chip(LayoutArena& arena, std::string_view label, bool on,
                  ButtonState* state, bool* out_clicked,
-                 const char* tooltip = nullptr);
+                 const char* tooltip = nullptr,
+                 ButtonState* close_state = nullptr,
+                 bool* out_close = nullptr);
 
 // Segmented toggle — ONE outlined control split into labeled segments,
 // exactly one active. The active segment is the LIT one (lighter fill,

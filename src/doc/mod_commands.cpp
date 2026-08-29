@@ -729,6 +729,8 @@ private:
 };
 
 // The snapshot of a look's current effect state (params, wet, opacity).
+// Group composites snapshot their wet/opacity the same way, keyed with
+// kGroupParamBit.
 Snapshot capture_snapshot(const Look& look) {
     Snapshot snapshot;
     snapshot.valid = true;
@@ -739,6 +741,13 @@ Snapshot capture_snapshot(const Look& look) {
             entry.params = fx.params;
             entry.wet = fx.wet;
             entry.opacity = fx.opacity;
+            snapshot.entries.push_back(std::move(entry));
+        }
+        for (const Group& g : layer.groups) {
+            SnapshotEntry entry;
+            entry.effect_id = g.id | kGroupParamBit;
+            entry.wet = g.wet;
+            entry.opacity = g.opacity;
             snapshot.entries.push_back(std::move(entry));
         }
     }
@@ -788,6 +797,14 @@ private:
     static void restore(Look& look, const Snapshot& snapshot) {
         if (!snapshot.valid) return;
         for (const SnapshotEntry& entry : snapshot.entries) {
+            if (entry.effect_id & kGroupParamBit) {
+                if (Group* g = find_group(
+                        look, entry.effect_id & ~kGroupParamBit)) {
+                    g->wet = entry.wet;
+                    g->opacity = entry.opacity;
+                }
+                continue;
+            }
             for (Layer& layer : look.layers) {
                 for (EffectInstance& fx : layer.stack) {
                     if (fx.id != entry.effect_id) continue;
