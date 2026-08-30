@@ -255,6 +255,58 @@ bool cache_coherence_check(gfx::Device& device,
     return ok;
 }
 
+// A matte reveals premultiplied zero, so a masked block must not cover the
+// canvas in alpha. Opaque ground would measure the full frame instead.
+bool matte_alpha_check(gfx::Device& device,
+                       const std::filesystem::path& shader_dir) {
+    doc::Document doc;
+    doc::Look seed = doc::make_look(doc, "masked");
+    seed.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
+    doc::Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.name = "matte";
+    matte.source = doc::LayerSourceKind::Shape;
+    matte.gen_scale = 6.0f;
+    matte.gen_angle = 0.05f;
+    seed.links.push_back({seed.layers[0].id, 0, 0});
+    seed.links.push_back({matte.id, seed.layers[0].id, 1});
+    seed.layers.push_back(std::move(matte));
+    doc.looks.push_back(std::move(seed));
+
+    doc::Placement block;
+    block.id = doc.next_effect_id++;
+    block.target = doc.looks[0].id;
+    doc.root().tracks[0].placements.push_back(block);
+
+    auto engine = gfx::Engine::create(device, shader_dir);
+    auto readback = gfx::Nv12Readback::create(device, shader_dir);
+    if (!engine || !readback) {
+        std::fprintf(stderr, "matte: engine/readback init failed\n");
+        return false;
+    }
+    std::vector<uint8_t> nv12;
+    if (!readback->render(*engine, doc, doc.root_sequence, 0, 30.0, kWidth,
+                          kHeight, nv12, 0, 0, nullptr, 0, block.id))
+        return false;
+    float rect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (!engine->read_measure_bounds(rect)) {
+        std::fprintf(stderr, "matte: no alpha bounds measured\n");
+        return false;
+    }
+    std::printf("matte alpha bounds: x %.3f y %.3f w %.3f h %.3f\n", rect[0],
+                rect[1], rect[2], rect[3]);
+    if (rect[2] < 0.1f || rect[3] < 0.1f) {
+        std::fprintf(stderr, "matte: the shape gated everything away\n");
+        return false;
+    }
+    if (rect[2] > 0.9f || rect[3] > 0.9f) {
+        std::fprintf(stderr,
+                     "matte: the reveal is opaque, not premultiplied zero\n");
+        return false;
+    }
+    return true;
+}
+
 bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
                  const doc::Document& doc, uint32_t frames,
                  std::vector<uint64_t>& hashes) {
@@ -480,6 +532,11 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!cache_coherence_check(*device, shader_dir, frames)) {
         std::fprintf(stderr, "RENDER CACHE FAILURE\n");
+        return 1;
+    }
+
+    if (!matte_alpha_check(*device, shader_dir)) {
+        std::fprintf(stderr, "MATTE ALPHA FAILURE\n");
         return 1;
     }
 

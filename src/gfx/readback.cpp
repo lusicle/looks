@@ -96,7 +96,8 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
                           std::vector<uint8_t>& out,
                           uint64_t cache_ctx, uint32_t cache_frame,
                           const Engine::LayerSourceFrame* layer_sources,
-                          size_t layer_source_count) {
+                          size_t layer_source_count,
+                          uint64_t measure_placement) {
     // w and h must match the working-target math in Engine::render.
     const uint32_t div = engine.preview_divisor();
     const uint32_t w = even_down(canvas_w, div);
@@ -117,7 +118,8 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
     GpuImage* final_image =
         engine.render(cmd_, 0, doc, look_id, timeline_frame, fps, canvas_w,
                       canvas_h, cache_ctx, cache_frame, nullptr,
-                      layer_sources, layer_source_count);
+                      layer_sources, layer_source_count, 0, 0,
+                      measure_placement);
     if (!final_image) {
         vkEndCommandBuffer(cmd_);
         return false;

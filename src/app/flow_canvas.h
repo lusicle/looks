@@ -141,6 +141,8 @@ struct Graph {
     size_t add_count = 0;
     const char* add_filter = "";
     const uint8_t* add_headers = nullptr;
+    // Rows the unfiltered menu shows. A filtered list never exceeds it.
+    size_t add_rows = 0;
     const char* const* ctx_items = nullptr;
     size_t ctx_count = 0;
     // Wires match on endpoints and kind. A to_row of -1 matches any row.

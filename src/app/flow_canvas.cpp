@@ -374,17 +374,23 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             ++fly1;
     }
     const float kMenuW = 190.0f;
-    const int menu_visible = static_cast<int>(
-        std::min<size_t>(cat_mode ? static_cast<size_t>(cat_count)
-                                  : g.add_count,
-                         14));
+    // A search never makes the menu taller than the list it replaced.
+    const int menu_rows =
+        std::min(g.add_rows ? static_cast<int>(g.add_rows) : 14, 14);
+    const int menu_visible = std::min(
+        static_cast<int>(std::min<size_t>(
+            cat_mode ? static_cast<size_t>(cat_count) : g.add_count, 14)),
+        menu_rows);
     const float menu_h = 26.0f + menu_visible * 18.0f + 6.0f;
+    // The clamp uses the tallest the menu can get, so the top never moves.
+    const float menu_h_max = 26.0f + menu_rows * 18.0f + 6.0f;
     auto menu_rect = [&]() {
         return Rect{
             std::max(r.x + 4.0f,
                      std::min(st.add_anchor.x, r.right() - kMenuW - 8.0f)),
             std::max(r.y + 4.0f,
-                     std::min(st.add_anchor.y, r.bottom() - menu_h - 8.0f)),
+                     std::min(st.add_anchor.y,
+                              r.bottom() - menu_h_max - 8.0f)),
             kMenuW, menu_h};
     };
     auto fly_rect = [&]() {

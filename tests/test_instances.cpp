@@ -219,6 +219,48 @@ TEST(flatten_audio_only_asset_is_image_dormant) {
         CHECK(n.kind != gfx::GraphNode::Kind::Source);
 }
 
+TEST(entity_has_image_follows_the_wiring_not_the_layers) {
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
+
+    // Media with pixels, wired to the Output's video port: an image.
+    Rig rig(100);
+    rig.doc.looks[0].links.push_back({rig.doc.looks[0].layers[0].id, 0, 0});
+    CHECK(doc::entity_has_image(rig.doc, rig.look));
+
+    // The same wiring with an asset that has no picture: no image. This is
+    // the combined routing, where sound rides the video wire.
+    Rig audio(0);
+    audio.doc.looks[0].links.push_back(
+        {audio.doc.looks[0].layers[0].id, 0, 0});
+    CHECK(!doc::entity_has_image(audio.doc, audio.look));
+
+    // Split routing sends the voice to port 1, so port 0 stays unwired.
+    Rig split(0);
+    split.doc.looks[0].audio_split = true;
+    split.doc.looks[0].links.push_back(
+        {split.doc.looks[0].layers[0].id, 0, 1});
+    CHECK(!doc::entity_has_image(split.doc, split.look));
+
+    // A drawable layer that reaches nothing still shows nothing.
+    Rig unwired(100);
+    unwired.doc.looks[0].links.push_back({0, 0, 9999});   // tombstone
+    CHECK(!doc::entity_has_image(unwired.doc, unwired.look));
+
+    // A generator always draws, and the walk crosses an effect chain.
+    Document gen = doc_with_look();
+    gen.looks[0].layers[0].source = LayerSourceKind::Gradient;
+    gen.looks[0].layers[0].stack.push_back(
+        doc::make_effect(gen, doc::EffectType::Vignette));
+    const uint64_t fx = gen.looks[0].layers[0].stack[0].id;
+    gen.looks[0].links.push_back({gen.looks[0].layers[0].id, fx, 0});
+    gen.looks[0].links.push_back({fx, 0, 0});
+    CHECK(doc::entity_has_image(gen, gen.looks[0].id));
+    // A sequence reports what its video lanes carry.
+    CHECK(!doc::entity_has_image(audio.doc, audio.doc.root_sequence));
+    CHECK(doc::entity_has_image(rig.doc, rig.doc.root_sequence));
+}
+
 TEST(flatten_timeline_lock_reads_the_root_clock) {
     // A locked media node reads media = root + slip, so blocks share a key.
     Rig rig(200);

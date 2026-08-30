@@ -123,6 +123,10 @@ std::vector<MediaInstance> flatten_media_sources(const Document& doc,
 std::vector<MediaInstance> flatten_audio_sources(const Document& doc,
                                                 uint64_t root_id);
 
+// True when something drawable reaches the Output's video port. A look
+// with a split audio-only wiring reports false, like a silent look does.
+bool entity_has_image(const Document& doc, uint64_t root_id);
+
 // Keeps the bottom-most resolvable path: analysis needs one stream.
 // asset 0 = nothing resolvable behind the wire.
 struct AudioChain {

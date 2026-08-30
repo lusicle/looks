@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include "codec/core.h"
@@ -1780,6 +1781,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         remaining_uses[static_cast<size_t>(graph.before)]++;
     if (graph.measure >= 0)
         remaining_uses[static_cast<size_t>(graph.measure)]++;
+    // One node can end several cards, so the keys collect per node.
+    std::unordered_map<int, std::vector<uint64_t>> tap_keys;
+    for (const auto& tap : graph.thumb_taps)
+        tap_keys[tap.second].push_back(tap.first);
 
     for (int index : graph.order) {
         const GraphNode& node = graph.nodes[static_cast<size_t>(index)];
@@ -1942,11 +1947,19 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         sdf_tex = slot.tex.get();
                     }
                 } else {
-                    // An unwired Output renders black, never the source.
-                    push[2] = static_cast<uint32_t>(
-                        doc::LayerSourceKind::Solid);
-                    push[4] = timeline_frame;
-                    push[11] = as_bits(24.0f);
+                    // Premultiplied zero, never opaque black: a ground and
+                    // a matte reveal must composite as absent, not as a
+                    // hole that hides whatever sits below.
+                    dst->transition(rec,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    const VkClearColorValue zero{};
+                    const VkImageSubresourceRange range{
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdClearColorImage(
+                        rec, dst->image(),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1,
+                        &range);
+                    break;
                 }
                 const GpuImage* sampled[1] = {sdf_tex};
                 generator_->dispatch(rec, arena_, frame_index, sampled, 1,
@@ -2995,25 +3008,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         }
 
         results[static_cast<size_t>(index)] = dst;
-        // Tap the root instance only; nested taps would fill the grid.
-        // Effects key on their id, layer sources on layer.id plus bit 62.
-        constexpr uint64_t kThumbSourceBit = 1ull << 62;
-        if (node.instance == 0 && node.kind == GraphNode::Kind::Effect &&
-            node.effect_index >= 0 && node.layer_index >= 0) {
-            const doc::EffectInstance& tfx =
-                look.layers[static_cast<size_t>(node.layer_index)]
-                    .stack[static_cast<size_t>(node.effect_index)];
-            record_thumb_tap(rec, frame_index, dst, tfx.id);
-        } else if (node.instance == 0 &&
-                   (node.kind == GraphNode::Kind::Source ||
-                    node.kind == GraphNode::Kind::Generator ||
-                    node.kind == GraphNode::Kind::LayerTransform)) {
-            if (node.layer_index >= 0)
-                record_thumb_tap(
-                    rec, frame_index, dst,
-                    look.layers[static_cast<size_t>(node.layer_index)].id |
-                        kThumbSourceBit);
-        }
+        // A card ends where the compiler says, never where the kind hints:
+        // a matte or a group wrap sits past the effect that named the card.
+        if (const auto tit = tap_keys.find(index); tit != tap_keys.end())
+            for (uint64_t key : tit->second)
+                record_thumb_tap(rec, frame_index, dst, key);
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
                 pool_->release(results[static_cast<size_t>(input)]);

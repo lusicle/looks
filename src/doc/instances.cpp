@@ -605,6 +605,70 @@ AudioProgram flatten_audio_program(const Document& doc, uint64_t root_id) {
     return prog;
 }
 
+namespace {
+
+bool entity_has_image_at(const Document& doc, uint64_t id, int depth);
+
+// A layer draws when its own source can make pixels.
+bool layer_draws(const Document& doc, const Layer& l, int depth) {
+    if (!l.visible) return false;
+    if (layer_is_media(l)) {
+        const Asset* a = l.asset ? doc.find_asset(l.asset) : nullptr;
+        return a && (a->frame_count || a->width || a->height);
+    }
+    if (layer_is_nested(l))
+        return l.target && entity_has_image_at(doc, l.target, depth + 1);
+    return true;   // a generator always draws
+}
+
+// Walks back from the Output's video port, so a look whose image side is
+// unwired reports no image even when it holds drawable layers.
+bool feed_draws(const Document& doc, const Look& look,
+                const std::vector<NodeLink>& links, uint64_t id,
+                std::vector<uint64_t>& seen, int depth) {
+    if (depth >= kMaxLookDepth * 8) return false;
+    for (uint64_t s : seen)
+        if (s == id) return false;
+    seen.push_back(id);
+    for (const Layer& l : look.layers)
+        if (l.id == id) return layer_draws(doc, l, depth);
+    for (const NodeLink& l : links)
+        if (l.to == id && l.to_port == 0 &&
+            feed_draws(doc, look, links, l.from, seen, depth + 1))
+            return true;
+    return false;
+}
+
+bool entity_has_image_at(const Document& doc, uint64_t id, int depth) {
+    if (depth >= kMaxLookDepth) return false;
+    if (const Look* look = doc.find_look(id)) {
+        std::vector<NodeLink> synth;
+        const std::vector<NodeLink>& links = effective_links(*look, synth);
+        for (const NodeLink& l : links) {
+            if (l.to != 0 || l.to_port != 0) continue;
+            std::vector<uint64_t> seen;
+            if (feed_draws(doc, *look, links, l.from, seen, depth))
+                return true;
+        }
+        return false;
+    }
+    if (const Sequence* seq = doc.find_sequence(id)) {
+        for (const SeqTrack& t : seq->tracks) {
+            if (t.hidden) continue;
+            for (const Placement& p : t.placements)
+                if (p.target && entity_has_image_at(doc, p.target, depth + 1))
+                    return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool entity_has_image(const Document& doc, uint64_t root_id) {
+    return entity_has_image_at(doc, root_id, 0);
+}
+
 std::vector<MediaInstance> flatten_audio_sources(const Document& doc,
                                                 uint64_t root_id) {
     const AudioProgram prog = flatten_audio_program(doc, root_id);

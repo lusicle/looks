@@ -26,7 +26,8 @@ public:
                 uint32_t canvas_h, std::vector<uint8_t>& out,
                 uint64_t cache_ctx = 0, uint32_t cache_frame = 0,
                 const Engine::LayerSourceFrame* layer_sources = nullptr,
-                size_t layer_source_count = 0);
+                size_t layer_source_count = 0,
+                uint64_t measure_placement = 0);
 
 private:
     explicit Nv12Readback(Device& device) : device_(device) {}

@@ -3,16 +3,20 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "doc/document.h"
 
 namespace looks::gfx {
 
+// A source card taps on its layer id with this bit; other cards use a bare id.
+inline constexpr uint64_t kThumbSourceBit = 1ull << 62;
+
 struct GraphNode {
     enum class Kind : uint8_t {
         Source,        // decode pool feeds it under this node's key
-        Generator,     // layer source; layer_index -1 = black
+        Generator,     // layer source; layer_index -1 = premultiplied zero
         LayerTransform,// pre-stack crop/flip/scale/rotate
         Effect,
         Flow,          // motion vectors; the engine feeds the planes
@@ -65,6 +69,9 @@ struct RenderGraph {
     int source = -1;
     // Viewport preview tap, root instance only; -1 = show the output.
     int preview = -1;
+    // Card thumbnails, root instance only: card id to the node that makes
+    // that card's output. Only the compiler knows where a card really ends.
+    std::vector<std::pair<uint64_t, int>> thumb_taps;
     // Selected block's lane image before its Motion, root sequence only.
     // UI-only: rendered pixels never depend on the measurement.
     int measure = -1;

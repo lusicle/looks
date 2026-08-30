@@ -271,38 +271,51 @@ TEST(graph_compile_chain_and_bypass) {
     CHECK_EQ(graph.order[2], 2);
 }
 
-TEST(graph_layer_matte_gates_composite) {
+TEST(graph_layer_matte_gates_the_head) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    // A port-1 wire on a layer wraps its LayerBlend in a MatteApply.
+    // A port-1 wire gates the layer HEAD, so its whole stack sees the crop.
     Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     Layer overlay;
     overlay.id = doc.next_effect_id++;
     overlay.source = LayerSourceKind::Noise;
+    overlay.stack.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = overlay.stack[0].id;
     doc.looks[0].layers.push_back(overlay);
     Layer matte;
     matte.id = doc.next_effect_id++;
     matte.source = LayerSourceKind::Shape;
     doc.looks[0].layers.push_back(matte);
     doc.looks[0].links.push_back({doc.looks[0].layers[0].id, 0, 0});
-    doc.looks[0].links.push_back({overlay.id, 0, 0});
+    doc.looks[0].links.push_back({overlay.id, fx_id, 0});
+    doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({matte.id, overlay.id, 1});
 
     RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
-    bool saw_matted_blend = false;
-    for (const GraphNode& n : graph.nodes) {
+    // The gate sits between the generator and the effect that reads it.
+    int gated = -1;
+    for (size_t i = 0; i < graph.nodes.size(); ++i) {
+        const GraphNode& n = graph.nodes[i];
         if (n.kind != GraphNode::Kind::MatteApply) continue;
         CHECK_EQ(n.inputs.size(), size_t{3});
-        const GraphNode& fx =
-            graph.nodes[static_cast<size_t>(n.inputs[1])];
-        if (fx.kind == GraphNode::Kind::LayerBlend) saw_matted_blend = true;
+        if (graph.nodes[static_cast<size_t>(n.inputs[1])].kind ==
+            GraphNode::Kind::Generator)
+            gated = static_cast<int>(i);
     }
-    CHECK(saw_matted_blend);
+    CHECK(gated >= 0);
+    bool fx_reads_the_gate = false;
+    for (const GraphNode& n : graph.nodes) {
+        if (n.kind != GraphNode::Kind::Effect) continue;
+        for (int in : n.inputs)
+            if (in == gated) fx_reads_the_gate = true;
+    }
+    CHECK(fx_reads_the_gate);
+    // Nothing gates at the composite now: alpha-over reveals what is below.
     CHECK(graph.nodes[static_cast<size_t>(graph.output)].kind ==
-          GraphNode::Kind::MatteApply);
+          GraphNode::Kind::LayerBlend);
 }
 
 TEST(graph_effect_matte_diamond) {
@@ -339,6 +352,48 @@ TEST(graph_effect_matte_diamond) {
     CHECK(saw_apply);
     CHECK(graph.nodes[static_cast<size_t>(graph.output)].kind ==
           GraphNode::Kind::MatteApply);
+}
+
+TEST(graph_thumb_tap_follows_the_matte) {
+    using looks::doc::Layer;
+    using looks::doc::LayerSourceKind;
+
+    // A card ends past its matte, so the thumbnail must tap the apply.
+    Document doc = doc_with_look();
+    doc.looks[0].layers[0].asset = bind_asset(doc);
+    doc.looks[0].layers[0].stack.push_back(
+        make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
+    const uint64_t src_id = doc.looks[0].layers[0].id;
+    Layer matte;
+    matte.id = doc.next_effect_id++;
+    matte.source = LayerSourceKind::Shape;
+    doc.looks[0].layers.push_back(matte);
+    doc.looks[0].links.push_back({src_id, fx_id, 0});
+    doc.looks[0].links.push_back({fx_id, 0, 0});
+    doc.looks[0].links.push_back({matte.id, fx_id, 1});
+
+    RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
+    CHECK(graph.valid);
+    int fx_tap = -1, src_tap = -1, matte_tap = -1;
+    for (const auto& t : graph.thumb_taps) {
+        if (t.first == fx_id) fx_tap = t.second;
+        if (t.first == (src_id | looks::gfx::kThumbSourceBit))
+            src_tap = t.second;
+        if (t.first == (matte.id | looks::gfx::kThumbSourceBit))
+            matte_tap = t.second;
+    }
+    CHECK(fx_tap >= 0);
+    CHECK_EQ(fx_tap, graph.output);
+    CHECK(graph.nodes[static_cast<size_t>(fx_tap)].kind ==
+          GraphNode::Kind::MatteApply);
+    // Each source card still ends at its own head, matte included.
+    CHECK(src_tap >= 0);
+    CHECK(graph.nodes[static_cast<size_t>(src_tap)].kind ==
+          GraphNode::Kind::Source);
+    CHECK(matte_tap >= 0);
+    CHECK(graph.nodes[static_cast<size_t>(matte_tap)].kind ==
+          GraphNode::Kind::Generator);
 }
 
 TEST(graph_layer_transform_and_source_keys) {

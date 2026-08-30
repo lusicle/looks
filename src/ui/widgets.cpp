@@ -669,7 +669,11 @@ void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
     const char* current =
         u->selected >= 0 && u->selected < u->count ? u->items[u->selected]
                                                    : "-";
-    const Rect text_clip = node.clip.empty() ? r : r.intersect(node.clip);
+    // The gutter holds the chevron; text stops before it, never under it.
+    Rect text_r = r;
+    text_r.w = std::max(0.0f, text_r.w - 19.0f);
+    const Rect text_clip =
+        node.clip.empty() ? text_r : text_r.intersect(node.clip);
     frame.canvas.push_clip(text_clip);
     draw_text(frame.canvas, frame.font, current,
               {r.x + 8.0f,

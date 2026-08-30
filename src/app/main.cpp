@@ -4287,18 +4287,30 @@ uint64_t lay_block(AppState& app, uint64_t sequence, uint64_t track_id,
     if (!lane || lane->placements.size() >= doc::kMaxPlacementsPerTrack)
         return 0;
     const uint64_t lane_id = lane->id;
+    // A block claims only the lanes its target can fill. Sound with no
+    // image, or image with no sound, must not lay an empty other half.
+    const bool has_image = doc::entity_has_image(app.document, target_id);
+    const bool has_audio =
+        !doc::flatten_audio_sources(app.document, target_id).empty();
+    if (!has_image && !has_audio) return 0;
     app.undo.begin_group("Place Block");
-    doc::Placement block;
-    block.id = app.document.next_effect_id++;
-    block.target = target_id;
-    block.t_in = at_frame;
-    const uint64_t video_place_id = block.id;
-    app.undo.execute(app.document,
-                     doc::add_placement_command(seq.id, lane_id, block));
-    if (!doc::flatten_audio_sources(app.document, target_id).empty()) {
+    uint64_t video_place_id = 0;
+    if (has_image) {
+        doc::Placement block;
+        block.id = app.document.next_effect_id++;
+        block.target = target_id;
+        block.t_in = at_frame;
+        video_place_id = block.id;
+        app.undo.execute(app.document,
+                         doc::add_placement_command(seq.id, lane_id, block));
+    }
+    uint64_t audio_place_id = 0;
+    if (has_audio) {
         doc::Placement ap;
+        ap.id = app.document.next_effect_id++;
         ap.target = target_id;
         ap.t_in = at_frame;
+        audio_place_id = ap.id;
         if (!audio_track)
             audio_track = mirror_audio_track(app, seq.id, lane_id);
         app.undo.execute(app.document,
@@ -4308,9 +4320,10 @@ uint64_t lay_block(AppState& app, uint64_t sequence, uint64_t track_id,
     }
     // The landing overwrites the span it covers on both lanes.
     doc::overwrite_group_spans(app.document, app.undo, seq.id,
-                               video_place_id);
+                               video_place_id ? video_place_id
+                                              : audio_place_id);
     app.undo.end_group();
-    return video_place_id;
+    return video_place_id ? video_place_id : audio_place_id;
 }
 
 // Returns false only when nothing was consumed and a fallback fits.
@@ -10045,7 +10058,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             src.row_count = srow;
             src.bypass_clicked = lrow.visible_changed;
             src.remove_clicked = lrow.remove;
-            set_preview(src, layer.id | (1ull << 62));
+            set_preview(src, layer.id | gfx::kThumbSourceBit);
             if (layer.node_x != 0.0f || layer.node_y != 0.0f) {
                 src.x = layer.node_x;
                 src.y = layer.node_y;
@@ -11070,6 +11083,18 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         graph->add_count = items.size();
         graph->add_filter =
             arena.dup(app.fx_filter.c_str(), app.fx_filter.size());
+        // What the menu shows with no filter: the search must not outgrow it.
+        if (app.find_mode) {
+            graph->add_rows = nodes.size();
+        } else {
+            size_t rows = scope ? 0u : 3u;   // layout, sources, values
+            for (size_t c = 0;
+                 c < static_cast<size_t>(doc::FxCategory::Count); ++c)
+                if (!category_effects_sorted(
+                         static_cast<doc::FxCategory>(c)).empty())
+                    ++rows;
+            graph->add_rows = rows;
+        }
         add_actions = action_arr;
     }
     // Keep the label array and the action array in lockstep.
@@ -11265,6 +11290,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                              &app.browser_search_btn,
                              out.browser_search_clicked, so),
                       well);
+            // Fill, or the well hugs the text and resizes on every keypress.
+            well_node->width = SizeSpec::fill();
             static const char* kViewLabels[2] = {"list", "grid"};
             static const char* kViewTips[2] = {"tree list view",
                                                "thumbnail gallery view"};
@@ -13146,12 +13173,15 @@ struct TextEntrySnapshot {
     doc::ParamKey rail_edit;
     int key_edit_mode;
     bool duration;
+    bool browser_search, preset_search, fx_search;
 };
 TextEntrySnapshot snapshot_text_entry(const AppState& app) {
-    return {app.frame_rename_id, app.group_rename_id, app.text_edit_id,
-            app.browser_rename_id, app.preset_rename_key,
-            app.value_edit_node,  app.rail_edit_key,
-            app.key_edit_mode,    app.duration_focus};
+    return {app.frame_rename_id,       app.group_rename_id,
+            app.text_edit_id,          app.browser_rename_id,
+            app.preset_rename_key,     app.value_edit_node,
+            app.rail_edit_key,         app.key_edit_mode,
+            app.duration_focus,        app.browser_search_focus,
+            app.preset_search_focus,   app.fx_search_focus};
 }
 bool text_entry_unchanged(const AppState& app,
                           const TextEntrySnapshot& s) {
@@ -13163,13 +13193,17 @@ bool text_entry_unchanged(const AppState& app,
            app.value_edit_node == s.value_edit &&
            app.rail_edit_key == s.rail_edit &&
            app.key_edit_mode == s.key_edit_mode &&
-           app.duration_focus == s.duration;
+           app.duration_focus == s.duration &&
+           app.browser_search_focus == s.browser_search &&
+           app.preset_search_focus == s.preset_search &&
+           app.fx_search_focus == s.fx_search;
 }
 bool any_text_entry(const TextEntrySnapshot& s) {
     return s.frame_rename || s.group_rename || s.text_edit ||
            s.browser_rename || s.preset_rename || s.value_edit ||
            s.rail_edit.effect_id != 0 || s.key_edit_mode != 0 ||
-           s.duration;
+           s.duration || s.browser_search || s.preset_search ||
+           s.fx_search;
 }
 
 // Returns false when no lane drives the param: the caller writes the base.
