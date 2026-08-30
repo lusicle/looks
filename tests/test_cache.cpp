@@ -1,3 +1,4 @@
+#include "doc_fixture.h"
 #include "test_framework.h"
 
 #include "doc/effects.h"
@@ -86,7 +87,7 @@ TEST(cache_replace_same_frame_updates_bytes) {
 }
 
 TEST(history_scan_gates_cache) {
-    doc::Document doc;
+    doc::Document doc = doc_with_look();
     CHECK(!doc::document_uses_history(doc));
     doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Vignette));
@@ -102,7 +103,7 @@ TEST(history_scan_gates_cache) {
 
 TEST(history_scan_quantize_rd_stipple) {
     // params[2] is the dither mode; only mode 9 (RD stipple) has state.
-    doc::Document doc;
+    doc::Document doc = doc_with_look();
     doc.looks[0].layers[0].stack.push_back(
         doc::make_effect(doc, doc::EffectType::Quantize));
     CHECK(!doc::document_uses_history(doc));

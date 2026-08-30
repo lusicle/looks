@@ -1112,7 +1112,8 @@ Document doc_from_json(const json::Value& v) {
         }
     }
     if (!doc.find_sequence(doc.root_sequence))
-        doc.root_sequence = doc.sequences.front().id;
+        doc.root_sequence =
+            doc.sequences.empty() ? 0 : doc.sequences.front().id;
 
     // An unbound placement is deliberate: it loads back as written.
     for (Asset& a : doc.assets)

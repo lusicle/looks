@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <crtdbg.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -9,6 +10,8 @@
 
 #include "doc/document.h"
 #include "doc/effects.h"
+#include "doc/layer_commands.h"
+#include "doc/look_commands.h"
 #include "app/dev_synth.h"
 #include "gfx/engine.h"
 #include "gfx/readback.h"
@@ -25,6 +28,15 @@ using namespace looks;
 
 constexpr uint32_t kWidth = 320;
 constexpr uint32_t kHeight = 240;
+
+// A new project holds no look, so every fixture seeds its own.
+doc::Document doc_with_media_look() {
+    doc::Document doc;
+    doc::Look seed = doc::make_look(doc, "look 1");
+    seed.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Media));
+    doc.looks.push_back(std::move(seed));
+    return doc;
+}
 
 // The key must match the Source key that compile_graph stamps.
 gfx::Engine::LayerSourceFrame media_frame(const doc::Document& doc,
@@ -70,7 +82,7 @@ struct SyntheticSource {
 };
 
 doc::Document make_document() {
-    doc::Document doc;
+    doc::Document doc = doc_with_media_look();
     doc.master_seed = 1234;
     // The asset id has no Asset entry on purpose: unknown length plays always.
     doc.looks[0].layers[0].asset = doc.next_effect_id++;
@@ -157,7 +169,7 @@ doc::Document make_document() {
 
 // Every effect here must stay a pure function of document and frame.
 doc::Document make_cacheable_document() {
-    doc::Document doc;
+    doc::Document doc = doc_with_media_look();
     doc.master_seed = 555;
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
     doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
@@ -330,7 +342,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
             std::fprintf(stderr, "bench: engine init failed\n");
             return 1;
         }
-        doc::Document doc;
+        doc::Document doc = doc_with_media_look();
         doc.master_seed = 77;
         doc.canvas_w = source.w;
         doc.canvas_h = source.h;
@@ -349,7 +361,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
     // row for the Error Diffusion exact mode.
     const int kTypes = static_cast<int>(doc::EffectType::Count);
     for (int t = -1; t <= kTypes; ++t) {
-        doc::Document doc;
+        doc::Document doc = doc_with_media_look();
         doc.master_seed = 77;
         doc.canvas_w = source.w;
         doc.canvas_h = source.h;
@@ -408,6 +420,12 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    // A crash must report, not raise a modal box that stalls the runner.
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     uint32_t frames = 12;
     bool bench = false;
     std::filesystem::path export_path;

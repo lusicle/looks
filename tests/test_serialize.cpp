@@ -12,6 +12,7 @@
 #include "doc/stack_commands.h"
 #include "gfx/graph.h"
 #include "mod/eval.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 
 using namespace looks;
@@ -22,7 +23,7 @@ using doc::make_effect;
 namespace {
 
 Document make_rich_doc() {
-    Document d;
+    Document d = doc_with_look();
     d.name = "rich";
     doc::Asset media;
     media.id = d.next_effect_id++;
@@ -150,7 +151,7 @@ Document make_rich_doc() {
 }  // namespace
 
 TEST(serialize_placement_transform_roundtrip) {
-    Document d;
+    Document d = doc_with_look();
     doc::Placement p;
     p.id = d.next_effect_id++;
     p.target = d.looks[0].id;
@@ -182,7 +183,7 @@ TEST(serialize_placement_transform_roundtrip) {
 }
 
 TEST(serialize_shape_path_roundtrip) {
-    Document d;
+    Document d = doc_with_look();
     doc::Layer& l = d.looks[0].layers[0];
     l.source = doc::LayerSourceKind::Shape;
     l.osc_shape = 3;
@@ -210,14 +211,14 @@ TEST(serialize_shape_path_roundtrip) {
     CHECK_EQ(l2.path[2].ay, 0.8f);
     CHECK(!l2.path_closed);
     // Pathless layers stay pathless (and closed by default) on reload.
-    Document d3;
+    Document d3 = doc_with_look();
     Document d4 = doc::doc_from_json(doc::doc_to_json(d3));
     CHECK(d4.looks[0].layers[0].path.empty());
     CHECK(d4.looks[0].layers[0].path_closed);
 }
 
 TEST(serialize_camera_node_roundtrip) {
-    Document d;
+    Document d = doc_with_look();
     doc::ValueNode n;
     n.id = d.next_route_id++;
     n.source.type = doc::ModSourceType::Camera;
@@ -237,7 +238,7 @@ TEST(serialize_camera_node_roundtrip) {
 }
 
 TEST(serialize_bins_roundtrip_and_heal) {
-    Document d;
+    Document d = doc_with_look();
     doc::Bin media = doc::make_bin(d, "media");
     doc::Bin cuts = doc::make_bin(d, "cuts");
     cuts.parent = media.id;
@@ -255,7 +256,7 @@ TEST(serialize_bins_roundtrip_and_heal) {
     CHECK_EQ(d2.sequences[0].bin, media.id);
 
     // Heals: a dangling membership and a parent loop both fall to root.
-    Document h;
+    Document h = doc_with_look();
     doc::Bin a1 = doc::make_bin(h, "a");
     doc::Bin b1 = doc::make_bin(h, "b");
     a1.parent = b1.id;
@@ -273,7 +274,7 @@ TEST(serialize_bins_roundtrip_and_heal) {
 
 TEST(serialize_audio_voice_roundtrip) {
     // Defaults stay absent from the JSON.
-    Document d;
+    Document d = doc_with_look();
     d.looks[0].audio_split = true;
     d.looks[0].layers[0].asset = d.next_effect_id++;
     d.looks[0].layers[0].timeline_lock = true;
@@ -309,7 +310,7 @@ TEST(serialize_audio_voice_roundtrip) {
     CHECK_EQ(d2.looks[0].value_nodes[0].audio_src,
              d2.looks[0].layers[0].id);
 
-    Document plain;
+    Document plain = doc_with_look();
     CHECK(!doc::doc_from_json(doc::doc_to_json(plain)).looks[0].audio_split);
     CHECK(!doc::doc_from_json(doc::doc_to_json(plain))
                .looks[0]
@@ -431,7 +432,7 @@ TEST(serialize_tolerant_load) {
 }
 
 TEST(serialize_v57_roundtrip) {
-    Document d;
+    Document d = doc_with_look();
     d.root().markers = {12, 45, 90};
     d.export_bitrate_mbps = 22.0f;
     d.export_scale = 2;
@@ -459,7 +460,7 @@ TEST(serialize_v57_roundtrip) {
 
 TEST(preset_insert_lands_dormant) {
     // Adding a preset never wires it: the members chain internally only.
-    Document d;
+    Document d = doc_with_look();
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
     doc::UndoStack undo;
 
@@ -563,7 +564,7 @@ TEST(serialize_lane_keys_sorted_on_load) {
 }
 
 TEST(group_commands_lifecycle) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
@@ -597,7 +598,7 @@ TEST(group_commands_lifecycle) {
 }
 
 TEST(group_bypass_compiles_out) {
-    Document d;
+    Document d = doc_with_look();
     doc::Asset media;
     media.id = d.next_effect_id++;
     media.frame_count = 100;
@@ -619,7 +620,7 @@ TEST(group_bypass_compiles_out) {
 
 TEST(group_creation_slotifies_crossings) {
     // The exterior feed reroutes through a minted In slot.
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Layer& layer = d.looks[0].layers[0];
     layer.stack.push_back(make_effect(d, EffectType::Vignette));
@@ -715,7 +716,7 @@ TEST(group_legacy_face_in_migrates_on_load) {
 }
 
 TEST(group_wet_serializes_and_snapshots) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
     doc::Group g = doc::make_group(d, "wetter");
@@ -750,7 +751,7 @@ TEST(group_wet_serializes_and_snapshots) {
 }
 
 TEST(group_wet_compiles_the_mix_wrapper) {
-    Document d;
+    Document d = doc_with_look();
     doc::Asset media;
     media.id = d.next_effect_id++;
     media.frame_count = 100;
@@ -808,7 +809,7 @@ TEST(group_wet_compiles_the_mix_wrapper) {
 }
 
 TEST(ungroup_splices_slots_back_to_direct_links) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Layer& layer = d.looks[0].layers[0];
     layer.stack.push_back(make_effect(d, EffectType::Vignette));
@@ -836,7 +837,7 @@ TEST(ungroup_splices_slots_back_to_direct_links) {
 }
 
 TEST(preset_capture_and_instantiate) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::FilmStock));
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
@@ -860,7 +861,7 @@ TEST(preset_capture_and_instantiate) {
     CHECK(p2.has_value());
     CHECK(doc::preset_to_json(*p2) == pj);
 
-    Document target;
+    Document target = doc_with_look();
     doc::Group ng;
     std::vector<doc::EffectInstance> nfx;
     uint64_t nface_in = 0;
@@ -885,7 +886,7 @@ TEST(preset_capture_and_instantiate) {
 }
 
 TEST(morph_interpolates_snapshots) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
 
@@ -947,7 +948,7 @@ TEST(era_presets_ship_valid) {
 
 TEST(serialize_lane_flags_roundtrip) {
     // The hidden flag changes what exports, so it is document state.
-    Document d;
+    Document d = doc_with_look();
     d.root().tracks[0].hidden = true;
     d.root().tracks[0].lock = true;
     d.root().audio[0].lock = true;

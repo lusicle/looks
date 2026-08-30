@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -11,12 +12,15 @@
 namespace looks::mod {
 
 // An empty curve reads as 0. A missing sidecar turns those sources off.
+// beat_phase returns the beat count at t, interpolated between grid
+// entries, so a drifting tempo stays locked.
 struct AnalysisCurves {
     std::vector<float> low, mid, high;   // band energy, normalized 0..1
     std::vector<float> onset;            // 0/1-ish spectral-flux peaks
     std::vector<float> motion;           // mean |frame delta|, 0..1
     std::vector<float> brightness;       // mean luma, 0..1
     std::vector<float> cut;              // 1 at detected scene cuts
+    std::vector<float> beats;
     float bpm = 0.0f;
     // The curves' frame grid rate.
     double fps = 0.0;
@@ -24,6 +28,57 @@ struct AnalysisCurves {
     float sample(const std::vector<float>& curve, uint32_t frame) const {
         if (curve.empty()) return 0.0f;
         return curve[frame < curve.size() ? frame : curve.size() - 1];
+    }
+    double beat_span(double t) const {
+        const size_t n = beats.size();
+        if (n < 2) return bpm > 1.0f ? 60.0 / bpm : 0.5;
+        if (t <= beats[0]) return beats[1] - beats[0];
+        if (t >= beats[n - 1]) return beats[n - 1] - beats[n - 2];
+        size_t lo = 0, hi = n - 1;
+        while (hi - lo > 1) {
+            const size_t mid = (lo + hi) / 2;
+            if (beats[mid] <= t) lo = mid; else hi = mid;
+        }
+        const double sp = beats[hi] - beats[lo];
+        return sp > 0.0 ? sp : 0.5;
+    }
+
+    double beat_phase(double t) const {
+        const size_t n = beats.size();
+        if (n < 2) {
+            const double b = bpm > 1.0f ? bpm : 120.0;
+            return t * b / 60.0;
+        }
+        if (t <= beats[0]) {
+            const double sp = beats[1] - beats[0];
+            return sp > 0.0 ? (t - beats[0]) / sp : 0.0;
+        }
+        if (t >= beats[n - 1]) {
+            const double sp = beats[n - 1] - beats[n - 2];
+            return sp > 0.0
+                       ? static_cast<double>(n - 1) + (t - beats[n - 1]) / sp
+                       : static_cast<double>(n - 1);
+        }
+        size_t lo = 0, hi = n - 1;
+        while (hi - lo > 1) {
+            const size_t mid = (lo + hi) / 2;
+            if (beats[mid] <= t) lo = mid; else hi = mid;
+        }
+        const double sp = beats[hi] - beats[lo];
+        return static_cast<double>(lo) +
+               (sp > 0.0 ? (t - beats[lo]) / sp : 0.0);
+    }
+
+    float sample_lerp(const std::vector<float>& curve, double frame) const {
+        if (curve.empty()) return 0.0f;
+        if (frame <= 0.0) return curve[0];
+        const size_t last = curve.size() - 1;
+        const double base = std::floor(frame);
+        if (base >= static_cast<double>(last)) return curve[last];
+        const size_t i = static_cast<size_t>(base);
+        const float a = curve[i];
+        const float b = curve[i + 1];
+        return a + (b - a) * static_cast<float>(frame - base);
     }
 };
 
@@ -88,6 +143,7 @@ struct ValueEnv {
     const doc::Look* look = nullptr;
     double t = 0.0;
     uint32_t frame = 0;
+    double frame_f = -1.0;
     const AnalysisCurves* analysis = nullptr;
     double fps = 30.0;
     double audio_off = 0.0;

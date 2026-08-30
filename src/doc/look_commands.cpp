@@ -1,5 +1,7 @@
 #include "doc/look_commands.h"
 
+#include <type_traits>
+
 #include <cassert>
 #include <unordered_map>
 #include <utility>
@@ -52,6 +54,12 @@ public:
                 v.erase(v.begin() + static_cast<ptrdiff_t>(i));
                 break;
             }
+        if constexpr (std::is_same_v<T, Sequence>) {
+            prev_root_ = doc.root_sequence;
+            if (had_ && doc.root_sequence == id_)
+                doc.root_sequence =
+                    doc.sequences.empty() ? 0 : doc.sequences.front().id;
+        }
     }
 
     void revert(Document& doc) override {
@@ -59,6 +67,8 @@ public:
         std::vector<T>& v = doc.*List;
         const size_t at = std::min(index_, v.size());
         v.insert(v.begin() + static_cast<ptrdiff_t>(at), removed_);
+        if constexpr (std::is_same_v<T, Sequence>)
+            doc.root_sequence = prev_root_;
     }
 
 private:
@@ -66,6 +76,7 @@ private:
     const char* label_;
     size_t index_ = 0;
     T removed_{};
+    uint64_t prev_root_ = 0;
     bool had_ = false;
 };
 

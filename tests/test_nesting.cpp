@@ -2,6 +2,7 @@
 
 #include "doc/effects.h"
 #include "doc/layer_commands.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 #include "util/hash.h"
 
@@ -50,7 +51,7 @@ int count_effects(const RenderGraph& g) {
 }  // namespace
 
 TEST(nesting_inlines_the_placed_look) {
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     place_block(d, inner, 0, 100);
     const RenderGraph g = compile_graph(d, d.root_sequence, 5);
@@ -62,7 +63,7 @@ TEST(nesting_inlines_the_placed_look) {
 }
 
 TEST(nesting_instances_carry_local_clocks) {
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     place_block(d, inner, 10, 100);
     const RenderGraph g = compile_graph(d, d.root_sequence, 25);
@@ -72,7 +73,7 @@ TEST(nesting_instances_carry_local_clocks) {
 }
 
 TEST(nesting_speed_scales_the_local_clock) {
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     place_block(d, inner, 10, 100, 2.0f);
     const RenderGraph g = compile_graph(d, d.root_sequence, 25);
@@ -81,7 +82,7 @@ TEST(nesting_speed_scales_the_local_clock) {
 }
 
 TEST(nesting_culls_instances_that_are_not_playing) {
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     place_block(d, inner, 10, 20);
     CHECK_EQ(compile_graph(d, d.root_sequence, 9).instances.size(),
@@ -96,7 +97,7 @@ TEST(nesting_culls_instances_that_are_not_playing) {
 
 TEST(nesting_two_blocks_of_one_look_share_razor_stable_keys) {
     // The path folds container and target ids, never placement ids.
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Feedback);
     place_block(d, inner, 0, 10);
     place_block(d, inner, 20, 30);
@@ -126,7 +127,7 @@ TEST(nesting_two_blocks_of_one_look_share_razor_stable_keys) {
 
 TEST(nesting_lockstep_ref_inside_a_look) {
     // A look ref runs on the same clock, with no affine hop.
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Layer ref;
     ref.id = d.next_effect_id++;
@@ -145,7 +146,7 @@ TEST(nesting_lockstep_ref_inside_a_look) {
 
 TEST(nesting_sequence_inside_a_look_carries_its_lanes) {
     // A nested sequence resolves its own lanes on the look's clock.
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Sequence cut;
     cut.id = d.next_effect_id++;
@@ -185,7 +186,7 @@ TEST(nesting_sequence_inside_a_look_carries_its_lanes) {
 
 TEST(nesting_stops_at_the_depth_bound) {
     // Commands cannot build a self-cycle, but a hand-edited file can.
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Layer self_ref;
     self_ref.id = d.next_effect_id++;
@@ -200,7 +201,7 @@ TEST(nesting_stops_at_the_depth_bound) {
 }
 
 TEST(nesting_dangling_reference_is_dormant) {
-    Document d;
+    Document d = doc_with_look();
     place_block(d, 999999, 0, 100);
     const RenderGraph g = compile_graph(d, d.root_sequence, 5);
     CHECK(g.valid);
@@ -211,7 +212,7 @@ TEST(nesting_dangling_reference_is_dormant) {
 }
 
 TEST(nesting_reaches_spans_both_entity_kinds) {
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     place_block(d, inner, 0, 100);
     CHECK(looks::doc::nest_reaches(d, d.root_sequence, inner));
@@ -240,7 +241,7 @@ TEST(nesting_reaches_spans_both_entity_kinds) {
 
 TEST(nesting_two_levels_compose_their_maps) {
     // The lockstep ref passes the block's affine map straight through.
-    Document d;
+    Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Look mid;
     mid.id = d.next_effect_id++;

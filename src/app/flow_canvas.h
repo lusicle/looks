@@ -94,6 +94,8 @@ struct Node {
     int wave_count = 0;
     // scope[0] is the value at the playhead. The window goes forward in time.
     const float* scope = nullptr;
+    const float* scope_min = nullptr;
+    const float* scope_max = nullptr;
     int scope_count = 0;
     float scope_lo = 0.0f, scope_hi = 1.0f;
     const ParamRow* rows = nullptr;

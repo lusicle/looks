@@ -1331,6 +1331,15 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.clear_capture();
     }
 
+    if (st.drag_kind == 2 &&
+        !(frame.input.buttons_down &
+          (ui::kMouseMiddle | ui::kMouseLeft))) {
+        st.drag_kind = 0;
+        st.drag_id = 0;
+        st.drag_row = -1;
+        frame.ctx.clear_capture();
+    }
+
     canvas.draw_rect(r, theme.window_bg);
     canvas.push_clip(r);
 
@@ -1659,8 +1668,17 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         sv.x + sv.w * static_cast<float>(si) /
                                    static_cast<float>(nd.scope_count - 1),
                         sy_of(nd.scope[si])};
-                canvas.draw_polyline(spts.data(), nd.scope_count,
-                                     std::max(1.0f, 1.2f * z),
+                const float sw = std::max(1.0f, 1.2f * z);
+                if (nd.scope_min && nd.scope_max)
+                    for (int si = 0; si < nd.scope_count; ++si) {
+                        const float y0 = sy_of(nd.scope_max[si]);
+                        const float y1 = sy_of(nd.scope_min[si]);
+                        if (y1 - y0 <= sw) continue;
+                        canvas.draw_line({spts[static_cast<size_t>(si)].x, y0},
+                                         {spts[static_cast<size_t>(si)].x, y1},
+                                         sw, theme.accent_dim);
+                    }
+                canvas.draw_polyline(spts.data(), nd.scope_count, sw,
                                      theme.accent_dim);
                 const float dy = sy_of(nd.scope[0]);
                 canvas.draw_sdf_rect({sv.x - 1.0f, dy - 2.0f * z,

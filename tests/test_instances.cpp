@@ -9,6 +9,7 @@
 #include "doc/layer_commands.h"
 #include "doc/stack_commands.h"
 #include "gfx/graph.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 #include "util/hash.h"
 
@@ -19,7 +20,7 @@ using doc::Document;
 namespace {
 
 struct Rig {
-    Document doc;
+    Document doc = doc_with_look();
     uint64_t asset = 0;
     uint64_t look = 0;
     uint64_t lane = 0;
@@ -750,7 +751,7 @@ TEST(flatten_skips_hidden_and_dangling_sources) {
 }
 
 TEST(canvas_size_derives_from_the_first_asset) {
-    Document d;
+    Document d = doc_with_look();
     uint32_t w = 0, h = 0;
     doc::canvas_size(d, &w, &h);
     CHECK_EQ(w, uint32_t{1920});

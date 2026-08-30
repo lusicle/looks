@@ -7,6 +7,7 @@
 #include "mod/eval.h"
 #include "mod/fft.h"
 #include "mod/param_table.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 
 using namespace looks;
@@ -14,7 +15,7 @@ using namespace looks;
 namespace {
 
 doc::Document make_doc() {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     d.looks[0].layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::Vignette));
     d.looks[0].layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::RgbSplit));
     return d;
@@ -63,7 +64,7 @@ TEST(mod_param_table_paths) {
 }
 
 TEST(mod_resolve_snaps_discrete_params) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     d.looks[0].layers[0].stack.push_back(
         doc::make_effect(d, doc::EffectType::Dither));
     doc::KeyframeLane lane;
@@ -88,7 +89,7 @@ TEST(mod_resolve_snaps_discrete_params) {
 }
 
 TEST(mod_resolve_layer_params) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::KeyframeLane lane;
     lane.target = {d.looks[0].layers[0].id | doc::kLayerParamBit, 8};   // gen_angle
     lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
@@ -286,7 +287,7 @@ TEST(mod_resolve_group_wet_and_opacity) {
 TEST(mod_wired_analysis_node_reads_its_connection) {
     // The node samples its wired curves at the look clock plus the slip.
     // An unwired node reads 0, never the global curves.
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
     look.layers[0].asset = d.next_effect_id++;
     doc::ValueNode n;
@@ -399,7 +400,7 @@ TEST(mod_route_commands_undo) {
 }
 
 TEST(mod_value_math_and_normalise) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
     // Constants through every math op: a = 0.6, b = 0.25.
     doc::ValueNode m;
@@ -497,7 +498,7 @@ TEST(mod_value_chain_and_fanout) {
 }
 
 TEST(mod_value_cycle_guard) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
     doc::ValueNode a, b;
     a.id = 1;
@@ -644,7 +645,7 @@ TEST(mod_analyze_audio_bands) {
 }
 
 TEST(mod_time_remap_identity_and_modes) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     mod::TimeRemap remap;
     // 1x forward = identity (and clamps to the last frame).
     CHECK(!mod::time_remap_active(d));
@@ -679,7 +680,7 @@ TEST(mod_time_remap_identity_and_modes) {
 
 TEST(mod_time_remap_seek_matches_sequential) {
     // A cold seek must give the same prefix sum as the sequential walk.
-    doc::Document d;
+    doc::Document d = doc_with_look();
     d.speed = 1.7f;
     CHECK(mod::time_remap_active(d));
 
@@ -697,7 +698,7 @@ TEST(mod_time_remap_seek_matches_sequential) {
 }
 
 TEST(mod_speed_at_is_the_project_scalar) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     CHECK(near(mod::speed_at(d, 0, 30.0, nullptr), 1.0f));
     CHECK(!mod::time_remap_active(d));
     d.speed = 2.5f;
@@ -711,7 +712,7 @@ TEST(mod_speed_at_is_the_project_scalar) {
 TEST(mod_envelope_source) {
     // The onset trigger needs the wired media input and reads its curve.
     // The cut trigger stays video-derived and reads the global curves.
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
     look.layers[0].asset = d.next_effect_id++;
     doc::ValueNode n;
@@ -767,7 +768,7 @@ TEST(mod_envelope_source) {
 TEST(mod_lfo_beat_synced) {
     // A beat-synced node needs its wired input and takes the BPM from it.
     // The phase anchors on the media position: local plus slip plus offset.
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
     look.layers[0].asset = d.next_effect_id++;
     doc::ValueNode n;
@@ -826,7 +827,7 @@ TEST(mod_video_cut_source) {
 }
 
 TEST(mod_set_lanes_command_atomic) {
-    doc::Document d;
+    doc::Document d = doc_with_look();
     doc::UndoStack undo;
     const doc::ParamKey kx{7ull, 0};
     const doc::ParamKey ky{7ull, 1};
@@ -846,4 +847,64 @@ TEST(mod_set_lanes_command_atomic) {
     undo.redo(d);
     CHECK_EQ(d.looks[0].lanes.size(), size_t{2});
     CHECK(near(d.looks[0].lanes[0].keys[0].value, 0.2f));
+}
+
+TEST(mod_estimate_tempo_from_clicks) {
+    constexpr uint32_t kRate = 48000;
+    constexpr double kBpm = 120.0;
+    constexpr double kSecs = 12.0;
+    const size_t n = static_cast<size_t>(kRate * kSecs);
+    std::vector<int16_t> pcm(n, 0);
+    const double period = 60.0 / kBpm * kRate;
+    uint32_t seed = 12345u;
+    for (size_t i = 0; i < n; ++i) {
+        const double phase = std::fmod(static_cast<double>(i), period);
+        const double env = std::exp(-phase / (kRate * 0.02));
+        seed = seed * 1664525u + 1013904223u;
+        const double noise =
+            static_cast<double>((seed >> 16) & 0xFFFFu) / 32768.0 - 1.0;
+        pcm[i] = static_cast<int16_t>(noise * env * 12000.0);
+    }
+    mod::AnalysisData data;
+    mod::analyze_audio(pcm.data(), n, 1, kRate, 30.0,
+                       static_cast<uint32_t>(kSecs * 30.0), &data);
+    CHECK(std::fabs(data.bpm - static_cast<float>(kBpm)) < 3.0f);
+}
+
+TEST(mod_beat_grid_locks_phase_and_drift) {
+    constexpr uint32_t kRate = 48000;
+    constexpr double kSecs = 20.0;
+    const size_t n = static_cast<size_t>(kRate * kSecs);
+    std::vector<int16_t> pcm(n, 0);
+    std::vector<double> want;
+    double t = 0.37;
+    double period = 60.0 / 120.0;
+    while (t < kSecs - 0.2) {
+        want.push_back(t);
+        const uint32_t at = static_cast<uint32_t>(t * kRate);
+        uint32_t sd = 7u + static_cast<uint32_t>(want.size());
+        for (uint32_t i = 0; i < 2400 && at + i < n; ++i) {
+            sd = sd * 1664525u + 1013904223u;
+            const double nz =
+                static_cast<double>((sd >> 16) & 0xFFFFu) / 32768.0 - 1.0;
+            pcm[at + i] = static_cast<int16_t>(
+                nz * std::exp(-static_cast<double>(i) / 500.0) * 14000.0);
+        }
+        t += period;
+        period *= 1.004;
+    }
+    mod::AnalysisData d;
+    mod::analyze_audio(pcm.data(), n, 1, kRate, 30.0,
+                       static_cast<uint32_t>(kSecs * 30.0), &d);
+    CHECK(d.beats.size() + 3 >= want.size());
+    size_t matched = 0;
+    double worst = 0.0;
+    for (double w : want) {
+        double best = 1e9;
+        for (float b : d.beats)
+            best = std::min(best, std::fabs(static_cast<double>(b) - w));
+        if (best < 0.05) { ++matched; worst = std::max(worst, best); }
+    }
+    CHECK(matched * 10 >= want.size() * 9);
+    CHECK(worst < 0.05);
 }

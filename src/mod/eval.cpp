@@ -42,9 +42,8 @@ float eval_lfo(const doc::ModSource& s, double t) {
 // rate_hz holds beats per cycle. No analysis falls back to 120 BPM.
 float eval_lfo_beat(const doc::ModSource& s, double t,
                     const AnalysisCurves* analysis) {
-    const double bpm =
-        analysis && analysis->bpm > 1.0f ? analysis->bpm : 120.0;
-    const double beats = bpm / 60.0 * t;
+    const double beats =
+        analysis ? analysis->beat_phase(t) : t * 2.0;
     const double per_cycle =
         std::max(static_cast<double>(s.rate_hz), 0.0625);
     return lfo_shape_at(s, beats / per_cycle + static_cast<double>(s.phase));
@@ -52,20 +51,19 @@ float eval_lfo_beat(const doc::ModSource& s, double t,
 
 float eval_beat(const doc::ModSource& s, double t,
                 const AnalysisCurves* analysis) {
-    const double bpm =
-        analysis && analysis->bpm > 1.0f ? analysis->bpm : 120.0;
-    const double beat_len = 60.0 / bpm;
-    double dt = std::fmod(t, beat_len);
-    if (dt < 0.0) dt += beat_len;
+    const double phase = analysis ? analysis->beat_phase(t) : t * 2.0;
+    const double span = analysis ? analysis->beat_span(t) : 0.5;
+    const double frac = phase - std::floor(phase);
+    const double dt = frac * span;
     const double attack =
-        std::clamp(static_cast<double>(s.attack), 1e-4, beat_len * 0.5);
+        std::clamp(static_cast<double>(s.attack), 1e-4, span * 0.5);
     const double decay = std::max(static_cast<double>(s.decay), 1e-3);
     if (dt < attack) return static_cast<float>(dt / attack);
     return static_cast<float>(std::exp(-(dt - attack) / decay));
 }
 
 // Onset/cut/beat variants are pure functions of the frame index.
-float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
+float eval_envelope(const doc::ModSource& s, double frame_pos,
                     const AnalysisCurves* analysis, double fps,
                     double t_seconds, double key_time) {
     if (s.trigger == 2) return eval_beat(s, t_seconds, analysis);
@@ -82,14 +80,17 @@ float eval_envelope(const doc::ModSource& s, uint32_t frame_index,
         s.trigger == 1 ? analysis->cut : analysis->onset;
     if (trig.empty()) return 0.0f;
     const uint32_t last = static_cast<uint32_t>(trig.size()) - 1;
-    const uint32_t start = std::min(frame_index, last);
+    const double clamped =
+        std::min(std::max(frame_pos, 0.0), static_cast<double>(last));
+    const uint32_t start = static_cast<uint32_t>(std::floor(clamped));
+    const double frac = clamped - static_cast<double>(start);
     // After about 6 decay constants the burst is silent, so stop the scan.
     const uint32_t window = std::min<uint32_t>(
         600, static_cast<uint32_t>((s.attack + 6.0f * s.decay) * fps) + 2);
     for (uint32_t k = 0; k <= std::min(start, window); ++k) {
         if (trig[start - k] <= 0.5f) continue;
         // Sample mid-frame so a sub-frame attack peaks on the trigger frame.
-        const double dt = k / fps + 0.5 / fps;
+        const double dt = (static_cast<double>(k) + frac) / fps + 0.5 / fps;
         const double attack = std::max(static_cast<double>(s.attack), 1e-4);
         const double decay = std::max(static_cast<double>(s.decay), 1e-3);
         if (dt < attack) return static_cast<float>(dt / attack);
@@ -325,37 +326,41 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
                 return 0.0f;
             const AnalysisCurves& c = *it->second.curves;
             // The nudge applies in clock seconds, before the conform rate.
-            const double shifted = static_cast<double>(env.frame) -
-                                   env.audio_off * env.fps;
-            const uint32_t local =
-                shifted <= 0.0 ? 0u
-                               : static_cast<uint32_t>(shifted + 0.5);
-            const int64_t pos =
-                static_cast<int64_t>(std::floor(
-                    static_cast<double>(local) * it->second.rate)) +
-                static_cast<int64_t>(it->second.slip) +
-                it->second.offset;
-            const uint32_t mf =
-                pos < 0 ? 0u : static_cast<uint32_t>(pos);
+            const double off = env.audio_off * env.fps;
+            double scaled;
+            if (env.frame_f >= 0.0) {
+                const double sub = env.frame_f - off;
+                scaled = (sub <= 0.0 ? 0.0 : sub) * it->second.rate;
+            } else {
+                const double shifted =
+                    static_cast<double>(env.frame) - off;
+                const double local =
+                    shifted <= 0.0 ? 0.0 : std::floor(shifted + 0.5);
+                scaled = std::floor(local * it->second.rate);
+            }
+            const double posd = scaled +
+                                static_cast<double>(it->second.slip) +
+                                static_cast<double>(it->second.offset);
+            const double mfd = posd < 0.0 ? 0.0 : posd;
+            const uint32_t mf = static_cast<uint32_t>(mfd);
             switch (n->source.type) {
                 case doc::ModSourceType::AudioLow:
-                    return c.sample(c.low, mf);
+                    return c.sample_lerp(c.low, mfd);
                 case doc::ModSourceType::AudioMid:
-                    return c.sample(c.mid, mf);
+                    return c.sample_lerp(c.mid, mfd);
                 case doc::ModSourceType::AudioHigh:
-                    return c.sample(c.high, mf);
+                    return c.sample_lerp(c.high, mfd);
                 case doc::ModSourceType::AudioOnset:
                     return c.sample(c.onset, mf);
                 default: {
                     // Beat clocks anchor on media seconds: grid is rate * fps.
                     const double cfps = it->second.rate * env.fps;
-                    const double tm =
-                        cfps > 0.0 ? static_cast<double>(mf) / cfps : 0.0;
+                    const double tm = cfps > 0.0 ? mfd / cfps : 0.0;
                     if (n->source.type == doc::ModSourceType::LfoBeat)
                         return eval_lfo_beat(n->source, tm, &c);
                     if (n->source.type == doc::ModSourceType::Beat)
                         return eval_beat(n->source, tm, &c);
-                    return eval_envelope(n->source, mf, &c, cfps, tm,
+                    return eval_envelope(n->source, mfd, &c, cfps, tm,
                                          env.key_time);
                 }
             }
@@ -412,9 +417,9 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                          ? live_seconds
                          : (fps > 0.0 ? frame_index / fps : 0.0);
     // Value nodes read the pre-resolve look so resolution never feeds back.
-    const ValueEnv env{&look, t,         frame_index, analysis,
-                       fps,   audio_off, key_time,    video,
-                       node_audio, node_camera};
+    const ValueEnv env{&look,     t,         frame_index, -1.0,
+                       analysis,  fps,       audio_off,   key_time,
+                       video,     node_audio, node_camera};
 
     auto param_slot = [](doc::EffectInstance& fx, int param_index) -> float* {
         if (param_index == doc::kWetParam) return &fx.wet;

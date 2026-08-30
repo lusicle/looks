@@ -8,6 +8,7 @@
 #include "doc/placement_commands.h"
 #include "doc/serialize.h"
 #include "doc/stack_commands.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 #include "util/file.h"
 
@@ -16,12 +17,18 @@ using doc::Document;
 using doc::EffectType;
 using doc::make_effect;
 
-TEST(look_fresh_document_has_look_and_sequence) {
+TEST(look_fresh_document_has_a_sequence_and_no_look) {
     Document d;
-    CHECK_EQ(d.looks.size(), size_t{1});
+    CHECK(d.looks.empty());
     CHECK_EQ(d.sequences.size(), size_t{1});
     CHECK_EQ(d.sequences[0].id, d.root_sequence);
     CHECK_EQ(d.sequences[0].tracks.size(), size_t{1});
+    CHECK_EQ(d.sequences[0].audio.size(), size_t{1});
+}
+
+TEST(look_fixture_ids_are_unique_across_kinds) {
+    Document d = doc_with_look();
+    CHECK_EQ(d.looks.size(), size_t{1});
     CHECK_EQ(d.looks[0].layers.size(), size_t{1});
     CHECK(doc::layer_is_media(d.looks[0].layers[0]));
     // Ids are unique across kinds: one counter for everything.
@@ -30,7 +37,7 @@ TEST(look_fresh_document_has_look_and_sequence) {
 }
 
 TEST(look_add_remove_undo) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Look fresh = doc::make_look(d, "second");
     const uint64_t id = fresh.id;
@@ -51,7 +58,7 @@ TEST(look_add_remove_undo) {
 }
 
 TEST(look_audio_split_toggle_undo) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     const uint64_t id = d.looks[0].id;
     CHECK(!d.looks[0].audio_split);
@@ -78,7 +85,7 @@ TEST(look_audio_split_toggle_undo) {
 
 TEST(look_disconnect_last_wire_stays_deleted) {
     // An empty link table means synthesized wiring, so the delete seals it.
-    Document d;
+    Document d = doc_with_look();
     d.looks[0].layers[0].asset = d.next_effect_id++;
     doc::UndoStack undo;
     const uint64_t lid = d.looks[0].layers[0].id;
@@ -97,7 +104,7 @@ TEST(look_disconnect_last_wire_stays_deleted) {
 }
 
 TEST(sequence_add_remove_undo) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Sequence fresh = doc::make_sequence(d, "cut 2");
     const uint64_t id = fresh.id;
@@ -118,7 +125,7 @@ TEST(sequence_add_remove_undo) {
 }
 
 TEST(asset_add_remove_undo) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Asset a = doc::make_asset(d, "clip", "clip.mp4");
     doc::Asset b = doc::make_asset(d, "roll", "roll.mp4");
@@ -137,7 +144,7 @@ TEST(asset_add_remove_undo) {
 }
 
 TEST(sequence_track_commands_undo) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     const uint64_t sid = d.sequences[0].id;
     CHECK_EQ(d.sequence(sid).tracks.size(), size_t{1});
@@ -188,7 +195,7 @@ TEST(sequence_track_commands_undo) {
 }
 
 TEST(sequence_overwrite_claims_span) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     const uint64_t sid = d.sequences[0].id;
     const uint64_t lane = d.sequence(sid).tracks[0].id;
@@ -235,7 +242,7 @@ TEST(sequence_overwrite_claims_span) {
 }
 
 TEST(bin_commands_organise_the_browser) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Bin top = doc::make_bin(d, "top");
     const uint64_t top_id = top.id;
@@ -271,7 +278,7 @@ TEST(bin_commands_organise_the_browser) {
 
 TEST(look_commands_stay_on_their_own_look) {
     // A command captures the look it edits, so undo lands there.
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Look second = doc::make_look(d, "second");
     doc::Layer l;
@@ -330,7 +337,7 @@ TEST(look_placement_maps_local_to_source) {
 }
 
 TEST(look_duration_is_lockstep_content) {
-    Document d;
+    Document d = doc_with_look();
     doc::Asset a;
     a.id = d.next_effect_id++;
     a.frame_count = 90;
@@ -359,7 +366,7 @@ namespace {
 
 // The rig holds one look, one video block, and a linked audio block.
 struct SeqRig {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     uint64_t asset = 0;
     uint64_t look = 0;
@@ -488,7 +495,7 @@ TEST(sequence_remove_placement_takes_the_link_group) {
 }
 
 TEST(look_nest_wraps_graph_selection_in_a_lockstep_ref) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Look& base = d.looks[0];
     base.layers[0].asset = d.next_effect_id++;
@@ -550,7 +557,7 @@ TEST(look_make_unique_forks_the_template) {
 }
 
 TEST(sequence_make_unique_forks_a_nested_cut) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Sequence cut = doc::make_sequence(d, "cut");
     const uint64_t cut_id = cut.id;
@@ -595,7 +602,7 @@ TEST(look_version_gate_refuses_older_projects) {
 }
 
 TEST(fresh_sequences_carry_a_default_audio_track) {
-    Document d;
+    Document d = doc_with_look();
     CHECK_EQ(d.root().audio.size(), size_t{1});
     CHECK_EQ(d.root().audio[0].name, "a1");
     CHECK(d.root().audio[0].placements.empty());
@@ -605,7 +612,7 @@ TEST(fresh_sequences_carry_a_default_audio_track) {
 }
 
 TEST(lane_props_commands_toggle_hidden_and_lock) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     const uint64_t sid = d.root_sequence;
     const uint64_t lane = d.root().tracks[0].id;
@@ -627,7 +634,7 @@ TEST(lane_props_commands_toggle_hidden_and_lock) {
 }
 
 TEST(move_placement_lands_on_a_same_kind_lane) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     const uint64_t sid = d.root_sequence;
     const uint64_t v1 = d.root().tracks[0].id;
@@ -666,7 +673,7 @@ TEST(move_placement_lands_on_a_same_kind_lane) {
 }
 
 TEST(audio_overwrite_claims_span_like_video) {
-    Document d;
+    Document d = doc_with_look();
     doc::UndoStack undo;
     const uint64_t sid = d.root_sequence;
     const uint64_t atrack = d.root().audio[0].id;
@@ -733,4 +740,27 @@ TEST(linked_pair_lands_claiming_both_lanes) {
     CHECK_EQ(doc::find_placement(rig.d.root(), rig.video)->t_out,
              uint32_t{60});
     CHECK_EQ(rig.d.root().audio[0].placements[0].t_out, uint32_t{60});
+}
+
+TEST(document_survives_losing_every_entity) {
+    Document d = doc_with_look();
+    doc::UndoStack undo;
+    const uint64_t root_id = d.root_sequence;
+    CHECK(root_id != 0);
+    while (!d.looks.empty())
+        undo.execute(d, doc::remove_look_command(d.looks[0].id));
+    CHECK(d.looks.empty());
+    CHECK_EQ(d.look(root_id).id, uint64_t{0});
+    while (!d.sequences.empty())
+        undo.execute(d, doc::remove_sequence_command(d.sequences[0].id));
+    CHECK(d.sequences.empty());
+    CHECK_EQ(d.root_sequence, uint64_t{0});
+    CHECK_EQ(d.root().id, uint64_t{0});
+    CHECK(d.root().tracks.empty());
+    undo.undo(d);
+    CHECK_EQ(d.sequences.size(), size_t{1});
+    CHECK_EQ(d.root_sequence, root_id);
+    undo.undo(d);
+    CHECK_EQ(d.looks.size(), size_t{1});
+    CHECK_EQ(d.root_sequence, root_id);
 }

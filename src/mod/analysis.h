@@ -20,6 +20,7 @@ struct AnalysisData {
     std::vector<float> onset;              // 1 at onset frames, else 0
     std::vector<float> motion, brightness; // video curves, 0..1
     std::vector<float> cut;                // 1 at detected scene cuts
+    std::vector<float> beats;
 
     AnalysisCurves curves() const {
         AnalysisCurves c;
@@ -30,6 +31,7 @@ struct AnalysisData {
         c.motion = motion;
         c.brightness = brightness;
         c.cut = cut;
+        c.beats = beats;
         c.bpm = bpm;
         c.fps = fps;
         return c;

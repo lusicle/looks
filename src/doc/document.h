@@ -324,15 +324,6 @@ struct Document {
         seq.audio.push_back(std::move(atrack));
         root_sequence = seq.id;
         sequences.push_back(std::move(seq));
-
-        Look look;
-        look.id = next_effect_id++;
-        look.name = "look 1";
-        Layer base;
-        base.id = next_effect_id++;
-        base.name = "layer 1";
-        look.layers.push_back(std::move(base));
-        looks.push_back(std::move(look));
     }
 
     Look* find_look(uint64_t id) {
@@ -366,21 +357,31 @@ struct Document {
         return nullptr;
     }
     // For live ids only: a stale id falls back to the first entity.
+    // A project may hold no looks and no sequences. These fall back to a
+    // shared empty entity, so a stale id reads empty and never aborts.
+    static Look& empty_look() {
+        static Look none;
+        return none;
+    }
+    static Sequence& empty_sequence() {
+        static Sequence none;
+        return none;
+    }
     Look& look(uint64_t id) {
         Look* l = find_look(id);
-        return l ? *l : looks.front();
+        return l ? *l : empty_look();
     }
     const Look& look(uint64_t id) const {
         const Look* l = find_look(id);
-        return l ? *l : looks.front();
+        return l ? *l : empty_look();
     }
     Sequence& sequence(uint64_t id) {
         Sequence* s = find_sequence(id);
-        return s ? *s : sequences.front();
+        return s ? *s : empty_sequence();
     }
     const Sequence& sequence(uint64_t id) const {
         const Sequence* s = find_sequence(id);
-        return s ? *s : sequences.front();
+        return s ? *s : empty_sequence();
     }
     Sequence& root() { return sequence(root_sequence); }
     const Sequence& root() const { return sequence(root_sequence); }

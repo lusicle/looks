@@ -1,4 +1,5 @@
 #include "doc/command.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 
 using looks::doc::Command;
@@ -45,7 +46,7 @@ private:
 }  // namespace
 
 TEST(command_execute_undo_redo) {
-    Document doc;
+    Document doc = doc_with_look();
     UndoStack stack;
     CHECK(!stack.can_undo());
     CHECK(!stack.can_redo());
@@ -72,7 +73,7 @@ TEST(command_execute_undo_redo) {
 }
 
 TEST(command_execute_clears_redo) {
-    Document doc;
+    Document doc = doc_with_look();
     UndoStack stack;
     stack.execute(doc, std::make_unique<SetSeed>(1));
     stack.execute(doc, std::make_unique<SetSeed>(2));
@@ -84,7 +85,7 @@ TEST(command_execute_clears_redo) {
 }
 
 TEST(command_coalescing) {
-    Document doc;
+    Document doc = doc_with_look();
     UndoStack stack;
     stack.execute(doc, std::make_unique<SetSeed>(10), true);
     stack.execute(doc, std::make_unique<SetSeed>(20), true);
@@ -101,7 +102,7 @@ TEST(command_coalescing) {
 }
 
 TEST(command_groups) {
-    Document doc;
+    Document doc = doc_with_look();
     doc.name = "a";
     UndoStack stack;
     stack.begin_group("Compound Edit");
@@ -124,7 +125,7 @@ TEST(command_groups) {
 }
 
 TEST(command_empty_group_pushes_nothing) {
-    Document doc;
+    Document doc = doc_with_look();
     UndoStack stack;
     stack.begin_group("Nothing");
     stack.end_group();
@@ -132,7 +133,7 @@ TEST(command_empty_group_pushes_nothing) {
 }
 
 TEST(command_revision_bumps) {
-    Document doc;
+    Document doc = doc_with_look();
     UndoStack stack;
     const uint64_t r0 = doc.revision;
     stack.execute(doc, std::make_unique<SetSeed>(1));

@@ -233,6 +233,7 @@ BundlePaths resolve_bundle(const std::filesystem::path& source,
                 out.pcm = cache.pcm;
             else
                 return out;
+            if (!bundle_is_fresh(cache.analysis, source)) return out;
             out.base = cache.mez;
             out.ready = true;
         }
@@ -1812,8 +1813,11 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
         if (pp) {
             // Pin the pattern shape: the source default can change.
             doc::Document pd;
+            doc::Look seed = doc::make_look(pd, "preset");
+            seed.layers.push_back(
+                doc::make_layer(pd, doc::LayerSourceKind::TestPattern));
+            pd.looks.push_back(std::move(seed));
             doc::Look& lk = pd.looks[0];
-            lk.layers[0].source = doc::LayerSourceKind::TestPattern;
             lk.layers[0].osc_shape = 4;   // smpte bars
             doc::Group g;
             std::vector<doc::EffectInstance> nfx;
@@ -2389,11 +2393,11 @@ struct AppState {
     // The fallback keeps a stale id harmless mid-frame.
     doc::Look& look() {
         if (doc::Look* l = document.find_look(scope_look)) return *l;
-        return document.looks.front();
+        return doc::Document::empty_look();
     }
     const doc::Look& look() const {
         const doc::Look* l = document.find_look(scope_look);
-        return l ? *l : document.looks.front();
+        return l ? *l : doc::Document::empty_look();
     }
     // Returns the root when a look is scoped or the id is stale.
     doc::Sequence& sequence() {
@@ -5054,10 +5058,6 @@ bool guard_unsaved_changes(AppState& app, ConfirmDialog::Action action,
 // References go dormant. Removing media un-imports the entry only.
 void request_browser_delete(AppState& app, uint64_t id) {
     if (app.confirm.open()) return;
-    if (id == app.document.root_sequence) {
-        app.status = "the root sequence cannot be deleted";
-        return;
-    }
     std::string name;
     const char* kind = nullptr;
     if (const doc::Bin* b = app.document.find_bin(id)) {
@@ -5239,8 +5239,7 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
                 } else if (app.document.find_look(d.id)) {
                     app.undo.execute(app.document,
                                      doc::remove_look_command(d.id));
-                } else if (app.document.find_sequence(d.id) &&
-                           d.id != app.document.root_sequence) {
+                } else if (app.document.find_sequence(d.id)) {
                     app.undo.execute(app.document,
                                      doc::remove_sequence_command(d.id));
                 } else if (app.document.find_asset(d.id)) {
@@ -10724,8 +10723,11 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         // scrolls in whole columns. Video-sampling nodes skip the scope.
         if (!is_video) {
             constexpr int kScopeN = 192;
+            constexpr int kScopeSub = 8;
             constexpr double kScopeSeconds = 4.0;
             float* samples = arena.alloc<float>(kScopeN);
+            float* smin = arena.alloc<float>(kScopeN);
+            float* smax = arena.alloc<float>(kScopeN);
             float lo = 0.0f, hi = 1.0f;
             mod::ValueEnv senv = venv;
             const double step =
@@ -10733,13 +10735,29 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             const double base = std::floor(play_frame / step) * step;
             for (int si = 0; si < kScopeN; ++si) {
                 const double f = base + step * si;
-                senv.t = f / live_fps;
-                senv.frame = static_cast<uint32_t>(f);
-                samples[si] = mod::eval_value_node(senv, vn.id);
-                lo = std::min(lo, samples[si]);
-                hi = std::max(hi, samples[si]);
+                double acc = 0.0;
+                float mn = 0.0f, mx = 0.0f;
+                for (int sub = 0; sub < kScopeSub; ++sub) {
+                    const double sf =
+                        f + step * sub / static_cast<double>(kScopeSub);
+                    senv.t = sf / live_fps;
+                    senv.frame = static_cast<uint32_t>(sf);
+                    senv.frame_f = sf;
+                    const float v = mod::eval_value_node(senv, vn.id);
+                    acc += v;
+                    if (sub == 0 || v < mn) mn = v;
+                    if (sub == 0 || v > mx) mx = v;
+                }
+                samples[si] =
+                    static_cast<float>(acc / static_cast<double>(kScopeSub));
+                smin[si] = mn;
+                smax[si] = mx;
+                lo = std::min(lo, mn);
+                hi = std::max(hi, mx);
             }
             rn.scope = samples;
+            rn.scope_min = smin;
+            rn.scope_max = smax;
             rn.scope_count = kScopeN;
             rn.scope_lo = lo;
             rn.scope_hi = hi;
@@ -14777,7 +14795,10 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
         const uint64_t active = app.scope_is_look()
             ? app.scope_look
             : app.sequence().id;
-        if (std::find(app.open_tabs.begin(), app.open_tabs.end(),
+        if (active &&
+            (app.document.find_look(active) ||
+             app.document.find_sequence(active)) &&
+            std::find(app.open_tabs.begin(), app.open_tabs.end(),
                       active) == app.open_tabs.end())
             app.open_tabs.push_back(active);
         std::vector<LayoutNode*> tab_cells;
@@ -14785,6 +14806,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
             const doc::Look* tl = app.document.find_look(id);
             const doc::Sequence* ts =
                 tl ? nullptr : app.document.find_sequence(id);
+            if (!tl && !ts) continue;
             const std::string& nm = tl ? tl->name : ts->name;
             AppState::TabUi& tui = app.tab_ui[id];
             FrameUi::TlTab tab{id, arena.alloc<bool>(),
@@ -15224,6 +15246,7 @@ struct AudioCurveView {
     const std::vector<float>* mid = nullptr;
     const std::vector<float>* high = nullptr;
     const std::vector<float>* onset = nullptr;
+    const std::vector<float>* beats = nullptr;
     float bpm = 0.0f;
     double fps = 0.0;
     uint32_t frames = 0;
@@ -15237,12 +15260,9 @@ script::Value audio_query_value(const AudioCurveView& v, int kind,
     if (kind == 1) return Value::number(static_cast<double>(v.bpm));
     if (kind == 2) {
         Value out = Value::make_list();
-        if (v.bpm > 1.0f && v.fps > 0.0) {
-            const double dur = static_cast<double>(v.frames) / v.fps;
-            const double step = 60.0 / static_cast<double>(v.bpm);
-            for (double bt = 0.0; bt < dur; bt += step)
-                out.list->push_back(Value::number(bt));
-        }
+        if (v.beats)
+            for (float bt : *v.beats)
+                out.list->push_back(Value::number(static_cast<double>(bt)));
         return out;
     }
     if (kind == 3) {
@@ -15288,6 +15308,7 @@ int audio_view_state(AppState& app, uint64_t id, AudioCurveView* out) {
             out->mid = &c.mid;
             out->high = &c.high;
             out->onset = &c.onset;
+            out->beats = &c.beats;
             out->bpm = c.bpm;
             // The sidecar grid wins: audio-only assets have no video fps.
             out->fps = c.fps > 0.0 ? c.fps : (a.fps > 0.0 ? a.fps : 30.0);
@@ -15304,6 +15325,7 @@ int audio_view_state(AppState& app, uint64_t id, AudioCurveView* out) {
     out->mid = &d.mid;
     out->high = &d.high;
     out->onset = &d.onset;
+    out->beats = &d.beats;
     out->bpm = d.bpm;
     out->fps = d.fps;
     out->frames = d.frame_count;
@@ -16794,11 +16816,9 @@ void register_ops_entities(ScriptHost& sh) {
                     doc::remove_look_command(a[0].as_id()));
                 return Value::boolean(true);
             });
-    env.add("remove_sequence", "remove_sequence(id) - never the root", 1,
+    env.add("remove_sequence", "remove_sequence(id)", 1,
             1, [&sh](Vm& vm, std::vector<Value>& a) {
                 if (!arg_seq(sh, vm, a[0])) return Value::nil();
-                if (a[0].as_id() == sh.app->document.root_sequence)
-                    return op_err(vm, "the root sequence stays");
                 sh.app->undo.execute(
                     sh.app->document,
                     doc::remove_sequence_command(a[0].as_id()));
@@ -17976,8 +17996,7 @@ void register_ops_mod(ScriptHost& sh) {
                                             0.0);
             });
     env.add("beats",
-            "beats(id) -> beat times in SECONDS (the Beat node's grid: "
-            "k * 60/bpm from 0)",
+            "beats(id) -> tracked beat times in SECONDS",
             1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
                 return audio_analysis_query(sh, vm, a[0].as_id(), 2, 0,
                                             0.0);
@@ -20518,8 +20537,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                              app.document.find_sequence(ba.id))
                     cur_bin = s->bin;
                 if (cur_bin) ctx_item("move to root", kActMoveToRoot);
-                if (!is_seq || ba.id != app.document.root_sequence)
-                    ctx_item("delete (del)", kActRemoveEntity);
+                ctx_item("delete (del)", kActRemoveEntity);
                 break;
             }
             for (const FrameUi::BrowserAction& ba :

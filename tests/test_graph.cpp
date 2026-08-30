@@ -6,6 +6,7 @@
 #include "doc/effects.h"
 #include "doc/layer_commands.h"
 #include "doc/stack_commands.h"
+#include "doc_fixture.h"
 #include "test_framework.h"
 
 using looks::doc::Asset;
@@ -77,7 +78,7 @@ TEST(graph_topo_detects_cycle) {
 
 TEST(graph_compile_empty_stack) {
     // Unbound media is dormant; layer_index -1 is the black display generator.
-    Document doc;
+    Document doc = doc_with_look();
     RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
     CHECK_EQ(graph.nodes.size(), size_t{1});
@@ -92,7 +93,7 @@ TEST(graph_compile_empty_stack) {
 }
 
 TEST(graph_audio_effects_compile_out_of_the_image_graph) {
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(
         make_effect(doc, EffectType::AudioDelay));
@@ -111,7 +112,7 @@ TEST(graph_audio_effects_compile_out_of_the_image_graph) {
 }
 
 TEST(graph_compile_layers) {
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     looks::doc::Layer overlay;
@@ -153,7 +154,7 @@ TEST(graph_compile_layers) {
 }
 
 TEST(graph_compile_dormant_unwired) {
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
@@ -191,7 +192,7 @@ TEST(graph_compile_dormant_unwired) {
 
 TEST(graph_preview_layer_taps_the_chain_end) {
     // The layer tap gives the chain end, and the node tap gives the head.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Grain));
@@ -226,7 +227,7 @@ TEST(graph_preview_layer_taps_the_chain_end) {
 
 TEST(graph_preview_layer_resolves_a_mask_only_feed) {
     // The tap resolves the link leaving the layer, Output or not.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t base_id = doc.looks[0].layers[0].id;
@@ -248,7 +249,7 @@ TEST(graph_preview_layer_resolves_a_mask_only_feed) {
 }
 
 TEST(graph_compile_chain_and_bypass) {
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::RgbSplit));
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
@@ -275,7 +276,7 @@ TEST(graph_layer_matte_gates_composite) {
     using looks::doc::LayerSourceKind;
 
     // A port-1 wire on a layer wraps its LayerBlend in a MatteApply.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     Layer overlay;
     overlay.id = doc.next_effect_id++;
@@ -309,7 +310,7 @@ TEST(graph_effect_matte_diamond) {
     using looks::doc::LayerSourceKind;
 
     // A port-1 wire on an effect gates it with an extract and an apply.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
@@ -342,7 +343,7 @@ TEST(graph_effect_matte_diamond) {
 
 TEST(graph_layer_transform_and_source_keys) {
     // A non-identity transform inserts a LayerTransform before the stack.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
 
@@ -389,7 +390,7 @@ TEST(graph_time_culled_matte_reads_as_closed_gate) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    Document doc;
+    Document doc = doc_with_look();
     Asset asset;
     asset.id = doc.next_effect_id++;
     asset.frame_count = 100;
@@ -438,7 +439,7 @@ TEST(graph_generator_has_no_when_but_a_placed_look_does) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = LayerSourceKind::Solid;
 
     auto gen_count = [&](uint64_t root, uint32_t frame) {
@@ -467,7 +468,7 @@ TEST(graph_generator_has_no_when_but_a_placed_look_does) {
 
 TEST(graph_media_source_culled_past_its_media) {
     // Past the end of the media the source is culled.
-    Document doc;
+    Document doc = doc_with_look();
     Asset asset;
     asset.id = doc.next_effect_id++;
     asset.frame_count = 10;
@@ -504,7 +505,7 @@ TEST(graph_media_source_culled_past_its_media) {
 
 TEST(graph_placement_transform_and_opacity) {
     // The lane over-blend carries Motion, so no transform node appears.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Sequence& seq = doc.root();
     looks::doc::Placement a;
@@ -553,7 +554,7 @@ TEST(graph_placement_transform_and_opacity) {
 
 TEST(graph_output_stacks_in_link_order) {
     // Stacking order is the link order, not the layer array order.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Layer second;
     second.id = doc.next_effect_id++;
@@ -585,7 +586,7 @@ TEST(graph_output_stacks_in_link_order) {
 
 TEST(graph_effect_port_fan_in_merges_in_link_order) {
     // A fan-in port takes the composite, with the first link at the bottom.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Layer second;
     second.id = doc.next_effect_id++;
@@ -617,7 +618,7 @@ TEST(graph_effect_port_fan_in_merges_in_link_order) {
 
 TEST(graph_reconnect_lands_in_place) {
     // reconnect_command replaces a link at its position in the fan-in.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Layer second;
     second.id = doc.next_effect_id++;
@@ -679,7 +680,7 @@ TEST(graph_placement_anchor_math) {
 
 TEST(graph_measure_taps_selected_block_pre_motion) {
     // The measure tap reads the block image before its placement Motion.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Sequence& seq = doc.root();
     looks::doc::Placement a;
@@ -706,7 +707,7 @@ TEST(graph_measure_taps_selected_block_pre_motion) {
 
 TEST(graph_before_strips_effects_keeps_composition) {
     // The before tree keeps Motion and opacity but drops effect stacks.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     doc.looks[0].layers[0].stack.push_back(
         make_effect(doc, EffectType::Posterize));
@@ -782,7 +783,7 @@ TEST(graph_source_fit_rect_preserves_aspect) {
 TEST(graph_sequence_lanes_stack_alpha_over) {
     // A lane blend has layer_index -1 because no look supplies a mode.
     // One lane makes no blend node at all.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Look second;
     second.id = doc.next_effect_id++;
@@ -854,7 +855,7 @@ TEST(graph_displace_by_matte_second_input) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Displace));
     const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
@@ -914,7 +915,7 @@ std::vector<uint64_t> state_fingerprint(const Document& doc, uint64_t root,
 
 TEST(graph_razor_identity_is_structural) {
     // A cut must not change the state keys, so razored halves render alike.
-    Document doc;
+    Document doc = doc_with_look();
     Asset asset;
     asset.id = doc.next_effect_id++;
     asset.frame_count = 200;
@@ -962,7 +963,7 @@ TEST(graph_source_matte_on_multipass_effect) {
     using looks::doc::LayerSourceKind;
 
     // A multipass effect gates like the single-pass case, in a later look.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     looks::doc::Look lab;
     lab.id = doc.next_effect_id++;
@@ -1018,7 +1019,7 @@ TEST(graph_source_matte_on_multipass_effect) {
 
 TEST(graph_hidden_lane_leaves_the_composite) {
     // A hidden lane compiles as if it were not there.
-    Document doc;
+    Document doc = doc_with_look();
     doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
     looks::doc::Look second;
     second.id = doc.next_effect_id++;

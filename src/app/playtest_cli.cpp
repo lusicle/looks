@@ -1,15 +1,24 @@
 #include <windows.h>
 
+#include <crtdbg.h>
 #include <cstdio>
 #include <string>
 
 #include "codec/mez.h"
 #include "doc/document.h"
+#include "doc/layer_commands.h"
+#include "doc/look_commands.h"
 #include "media/audio_mix.h"
 #include "media/decode_pool.h"
 #include "media/player.h"
 
 int wmain(int argc, wchar_t** argv) {
+    // A crash must report, not raise a modal box that stalls the runner.
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: looks_playtest <bundle.mez> [bundle.pcm]\n");
@@ -25,6 +34,12 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     doc::Document doc;
+    {
+        doc::Look seed = doc::make_look(doc, "look 1");
+        seed.layers.push_back(
+            doc::make_layer(doc, doc::LayerSourceKind::Media));
+        doc.looks.push_back(std::move(seed));
+    }
     doc::Asset asset;
     asset.id = doc.next_effect_id++;
     asset.name = "media";
