@@ -188,6 +188,14 @@ constexpr FxShaderDesc kFxShaders[] = {
     {nullptr, 0},
     {"fx_track_pin.comp.spv", 2},       // input + pinned B
     {"fx_vhs.comp.spv", 1},
+    {"fx_morphology.comp.spv", 1},
+    {"fx_drip.comp.spv", 2},
+    {"fx_burn_in.comp.spv", 2},
+    {"fx_aperture.comp.spv", 2},
+    {"fx_parallax.comp.spv", 2},
+    {"fx_patch_weave.comp.spv", 1},
+    {"fx_halation.comp.spv", 1},
+    {"fx_rolling_shutter.comp.spv", 2},
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -419,7 +427,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     if (!dummy_flow_) return false;
 
     // The generator's one sampled input is the custom-shape SDF.
-    generator_ = mk("gen.comp.spv", 1, 1, 15 * sizeof(uint32_t));
+    generator_ = mk("gen.comp.spv", 2, 1, 20 * sizeof(uint32_t));
     layer_blend_ = mk("layer_blend.comp.spv", 2, 1, 11 * sizeof(uint32_t));
     layer_transform_ =
         mk("layer_transform.comp.spv", 1, 1, 11 * sizeof(uint32_t));
@@ -1231,6 +1239,198 @@ void Engine::codec_flush_segment() {
 }
 
 // Taps past the fixed grid drop silently.
+namespace {
+
+void hsl_of(const float rgb[3], float* h, float* s, float* l) {
+    const float mx = std::max(rgb[0], std::max(rgb[1], rgb[2]));
+    const float mn = std::min(rgb[0], std::min(rgb[1], rgb[2]));
+    const float d = mx - mn;
+    *l = (mx + mn) * 0.5f;
+    *s = d < 1e-6f ? 0.0f
+                   : d / (1.0f - std::fabs(2.0f * *l - 1.0f) + 1e-6f);
+    if (d < 1e-6f) {
+        *h = 0.0f;
+    } else if (mx == rgb[0]) {
+        *h = std::fmod((rgb[1] - rgb[2]) / d, 6.0f) / 6.0f;
+    } else if (mx == rgb[1]) {
+        *h = ((rgb[2] - rgb[0]) / d + 2.0f) / 6.0f;
+    } else {
+        *h = ((rgb[0] - rgb[1]) / d + 4.0f) / 6.0f;
+    }
+    if (*h < 0.0f) *h += 1.0f;
+}
+
+float hue_channel(float p, float q, float t) {
+    if (t < 0.0f) t += 1.0f;
+    if (t > 1.0f) t -= 1.0f;
+    if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+    if (t < 0.5f) return q;
+    if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+    return p;
+}
+
+void hsl_to_rgb(float h, float s, float l, float* out) {
+    if (s < 1e-6f) {
+        out[0] = out[1] = out[2] = l;
+        return;
+    }
+    const float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+    const float p = 2.0f * l - q;
+    out[0] = hue_channel(p, q, h + 1.0f / 3.0f);
+    out[1] = hue_channel(p, q, h);
+    out[2] = hue_channel(p, q, h - 1.0f / 3.0f);
+}
+
+void oklab_of(const float lin[3], float* out) {
+    const float l = 0.4122214708f * lin[0] + 0.5363325363f * lin[1] +
+                    0.0514459929f * lin[2];
+    const float m = 0.2119034982f * lin[0] + 0.6806995451f * lin[1] +
+                    0.1073969566f * lin[2];
+    const float s = 0.0883024619f * lin[0] + 0.2817188376f * lin[1] +
+                    0.6299787005f * lin[2];
+    const float l_ = std::cbrt(l), m_ = std::cbrt(m), s_ = std::cbrt(s);
+    out[0] = 0.2104542553f * l_ + 0.7936177850f * m_ - 0.0040720468f * s_;
+    out[1] = 1.9779984951f * l_ - 2.4285922050f * m_ + 0.4505937099f * s_;
+    out[2] = 0.0259040371f * l_ + 0.7827717662f * m_ - 0.8086757660f * s_;
+}
+
+void oklab_to_linear(const float lab[3], float* out) {
+    const float l_ = lab[0] + 0.3963377774f * lab[1] + 0.2158037573f * lab[2];
+    const float m_ = lab[0] - 0.1055613458f * lab[1] - 0.0638541728f * lab[2];
+    const float s_ = lab[0] - 0.0894841775f * lab[1] - 1.2914855480f * lab[2];
+    const float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
+    out[0] = 4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s;
+    out[1] = -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s;
+    out[2] = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
+}
+
+}  // namespace
+
+const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
+                                             StagingBuffer& staging,
+                                             const doc::Layer& layer) {
+    if (layer.stops.empty()) return nullptr;
+    // Row 0 is the axial ramp, keyed on where each stop projects onto the
+    // axis. Row 1 is the raw stop table that Mesh weights per pixel.
+    std::vector<std::pair<float, doc::GradientStop>> stops;
+    stops.reserve(layer.stops.size());
+    for (const doc::GradientStop& s : layer.stops)
+        stops.emplace_back(std::clamp(s.t, 0.0f, 1.0f), s);
+    std::sort(stops.begin(), stops.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    uint64_t hash = hash_combine(0x6A0Dull,
+                                 static_cast<uint64_t>(layer.gradient_space));
+    hash = hash_combine(hash, static_cast<uint64_t>(layer.gradient));
+    hash = hash_combine(hash, as_bits(layer.gradient_len));
+    hash = hash_combine(hash, as_bits(layer.gen_angle));
+    hash = hash_combine(hash, as_bits(layer.gradient_x));
+    hash = hash_combine(hash, as_bits(layer.gradient_y));
+    for (const auto& [t, s] : stops) {
+        hash = hash_combine(hash, as_bits(t));
+        hash = hash_combine(hash, as_bits(s.x));
+        hash = hash_combine(hash, as_bits(s.y));
+        for (float c : s.color) hash = hash_combine(hash, as_bits(c));
+    }
+
+    RampSlot& slot = ramp_state_[layer.id];
+    if (slot.tex && slot.hash == hash) return slot.tex.get();
+    if (!slot.tex) {
+        slot.tex = GpuImage::create(
+            device_, VK_FORMAT_R32G32B32A32_SFLOAT, kRampTexels, 2,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        if (!slot.tex) return nullptr;
+    }
+
+    // Stops hold sRGB, like every other colour the UI writes. Convert to
+    // the blend space, interpolate, and leave the ramp linear.
+    const doc::GradientSpace space = layer.gradient_space;
+    auto encode = [&](const doc::GradientStop& s, float* out) {
+        float lin[3];
+        for (int i = 0; i < 3; ++i) lin[i] = color::srgb_eotf(s.color[i]);
+        if (space == doc::GradientSpace::Hsl)
+            hsl_of(s.color, &out[0], &out[1], &out[2]);
+        else if (space == doc::GradientSpace::Oklab)
+            oklab_of(lin, out);
+        else
+            for (int i = 0; i < 3; ++i) out[i] = lin[i];
+    };
+    auto decode = [&](const float* v, float* out) {
+        if (space == doc::GradientSpace::Hsl) {
+            float srgb[3];
+            hsl_to_rgb(v[0], v[1], v[2], srgb);
+            for (int i = 0; i < 3; ++i) out[i] = color::srgb_eotf(srgb[i]);
+        } else if (space == doc::GradientSpace::Oklab) {
+            oklab_to_linear(v, out);
+        } else {
+            for (int i = 0; i < 3; ++i) out[i] = v[i];
+        }
+    };
+
+    std::vector<float> texels(kRampTexels * 2 * 4);
+    for (uint32_t i = 0; i < kRampTexels; ++i) {
+        const float t = (static_cast<float>(i) + 0.5f) / kRampTexels;
+        size_t hi = 0;
+        while (hi < stops.size() && stops[hi].first < t) ++hi;
+        float mixed[3];
+        if (hi == 0) {
+            encode(stops.front().second, mixed);
+        } else if (hi >= stops.size()) {
+            encode(stops.back().second, mixed);
+        } else {
+            const doc::GradientStop& a = stops[hi - 1].second;
+            const doc::GradientStop& b = stops[hi].second;
+            const float span = stops[hi].first - stops[hi - 1].first;
+            const float f =
+                span > 1e-6f ? (t - stops[hi - 1].first) / span : 0.0f;
+            float ea[3], eb[3];
+            encode(a, ea);
+            encode(b, eb);
+            if (space == doc::GradientSpace::Hsl) {
+                // Take the short way round the hue circle.
+                float d = eb[0] - ea[0];
+                if (d > 0.5f) d -= 1.0f;
+                if (d < -0.5f) d += 1.0f;
+                mixed[0] = ea[0] + d * f;
+                if (mixed[0] < 0.0f) mixed[0] += 1.0f;
+                if (mixed[0] > 1.0f) mixed[0] -= 1.0f;
+                mixed[1] = ea[1] + (eb[1] - ea[1]) * f;
+                mixed[2] = ea[2] + (eb[2] - ea[2]) * f;
+            } else {
+                for (int k = 0; k < 3; ++k)
+                    mixed[k] = ea[k] + (eb[k] - ea[k]) * f;
+            }
+        }
+        float lin[3];
+        decode(mixed, lin);
+        for (int k = 0; k < 3; ++k)
+            texels[i * 4 + k] = std::max(0.0f, lin[k]);
+        texels[i * 4 + 3] = 1.0f;
+    }
+
+    // Row 1: two texels per stop, position then linear colour.
+    const size_t row1 = static_cast<size_t>(kRampTexels) * 4;
+    const size_t n_mesh = std::min<size_t>(stops.size(), kRampTexels / 2);
+    for (size_t i = 0; i < n_mesh; ++i) {
+        const doc::GradientStop& s = stops[i].second;
+        texels[row1 + i * 8 + 0] = s.x;
+        texels[row1 + i * 8 + 1] = s.y;
+        float lin[3];
+        for (int k = 0; k < 3; ++k) lin[k] = color::srgb_eotf(s.color[k]);
+        for (int k = 0; k < 3; ++k)
+            texels[row1 + i * 8 + 4 + k] = std::max(0.0f, lin[k]);
+        texels[row1 + i * 8 + 7] = 1.0f;
+    }
+
+    if (!staging.upload_image(rec, texels.data(),
+                              texels.size() * sizeof(float), kRampTexels,
+                              *slot.tex))
+        return nullptr;
+    slot.tex->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    slot.hash = hash;
+    return slot.tex.get();
+}
+
 void Engine::record_thumb_tap(VkCommandBuffer rec, uint32_t frame_index,
                               GpuImage* src, uint64_t key) {
     if (!thumb_tap_ || !thumb_atlas_ || !src) return;
@@ -1870,13 +2070,14 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::Generator: {
-                uint32_t push[15] = {};
+                uint32_t push[20] = {};
                 push[0] = w;
                 push[1] = h;
                 // The dummy starts UNDEFINED, so give the sampler a layout.
                 dummy_flow_->transition(
                     rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 const GpuImage* sdf_tex = dummy_flow_.get();
+                const GpuImage* ramp_tex = dummy_flow_.get();
                 if (node.layer_index >= 0) {
                     const doc::Layer& layer =
                         look.layers[static_cast<size_t>(node.layer_index)];
@@ -1892,6 +2093,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[12] = as_bits(layer.gen_angle);
                     push[13] = layer.osc_shape;
                     push[14] = as_bits(layer.gen_phase);
+                    if (layer.source == doc::LayerSourceKind::Gradient) {
+                        push[15] = static_cast<uint32_t>(layer.gradient);
+                        push[16] = as_bits(layer.gradient_len);
+                        push[17] = as_bits(layer.gradient_x);
+                        push[18] = as_bits(layer.gradient_y);
+                        push[19] = static_cast<uint32_t>(
+                            std::min<size_t>(layer.stops.size(), 32));
+                        if (const GpuImage* r =
+                                ensure_gradient_ramp(rec, staging, layer))
+                            ramp_tex = r;
+                    }
                     if (layer.source == doc::LayerSourceKind::Shape &&
                         layer.osc_shape == 3u && !layer.path.empty()) {
                         // The raster re-runs only on a path or size change.
@@ -1961,8 +2173,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         &range);
                     break;
                 }
-                const GpuImage* sampled[1] = {sdf_tex};
-                generator_->dispatch(rec, arena_, frame_index, sampled, 1,
+                const GpuImage* sampled[2] = {sdf_tex, ramp_tex};
+                generator_->dispatch(rec, arena_, frame_index, sampled, 2,
                                      &dst, 1, push, sizeof(push), w, h,
                                      linear_sampler_);
                 break;
@@ -2915,7 +3127,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes +
                             9u * static_cast<uint32_t>(sizeof(uint32_t)),
                         w, h, linear_sampler_);
-                } else if (fx.type == doc::EffectType::BlendNode) {
+                } else if (fx.type == doc::EffectType::BlendNode ||
+                           fx.type == doc::EffectType::Aperture ||
+                           fx.type == doc::EffectType::Parallax ||
+                           fx.type == doc::EffectType::RollingShutter) {
                     // B is input 1; an unwired B falls back to In.
                     const GpuImage* b = node.inputs.size() > 1
                         ? input_image(1)

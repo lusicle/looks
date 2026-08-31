@@ -74,6 +74,7 @@ struct Compiler {
             fx.type == doc::EffectType::Datamosh ||
             fx.type == doc::EffectType::FlowParticles ||
             fx.type == doc::EffectType::FlowPaint ||
+            fx.type == doc::EffectType::RollingShutter ||
             (fx.type == doc::EffectType::Quantize && fx.params.size() > 8 &&
              fx.params[8] >= 0.5f) ||
             (fx.type == doc::EffectType::Dither && fx.params.size() > 7 &&

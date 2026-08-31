@@ -28,7 +28,7 @@ const char* const kModSourceNames[] = {
     "audio_high",  "audio_onset", "video_motion", "video_brightness",
     "lfo_beat",    "envelope",    "video_cut",    "beat",
     "video_sample", "video_region", "math",       "normalise",
-    "camera"};
+    "camera",      "hold",        "sequence"};
 static_assert(sizeof(kModSourceNames) / sizeof(kModSourceNames[0]) ==
                   static_cast<size_t>(ModSourceType::Count),
               "mod source names track the enum");
@@ -383,6 +383,26 @@ Value layer_to_json(const Layer& l) {
         v.set("path", std::move(pts));
         if (!l.path_closed) v.set("path_open", true);
     }
+    if (!l.stops.empty()) {
+        Value arr = Value::make_array();
+        for (const GradientStop& s : l.stops) {
+            Value st = Value::make_object();
+            st.set("id", static_cast<int64_t>(s.id));
+            st.set("x", static_cast<double>(s.x));
+            st.set("y", static_cast<double>(s.y));
+            Value col = Value::make_array();
+            for (float c : s.color) col.push(static_cast<double>(c));
+            st.set("color", std::move(col));
+            arr.push(std::move(st));
+        }
+        v.set("stops", std::move(arr));
+        v.set("gradient", static_cast<int64_t>(l.gradient));
+        v.set("gradient_space", static_cast<int64_t>(l.gradient_space));
+        v.set("gradient_len", static_cast<double>(l.gradient_len));
+        v.set("gradient_x", static_cast<double>(l.gradient_x));
+        v.set("gradient_y", static_cast<double>(l.gradient_y));
+    }
+
     v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
@@ -461,6 +481,28 @@ Layer layer_from_json(const Value& v,
             l.path.push_back(p);
         }
         l.path_closed = !v.get("path_open").as_bool(false);
+    }
+    if (const Value& sv = v.get("stops"); sv.is_array()) {
+        for (const Value& e : sv.array()) {
+            if (!e.is_object()) continue;
+            GradientStop s;
+            s.id = static_cast<uint64_t>(e.get("id").as_number(0.0));
+            s.x = num(e, "x", 0.5f);
+            s.y = num(e, "y", 0.5f);
+            if (const Value& col = e.get("color"); col.is_array()) {
+                const Array& c = col.array();
+                for (size_t i = 0; i < 3 && i < c.size(); ++i)
+                    s.color[i] = static_cast<float>(c[i].as_number(0.0));
+            }
+            if (s.id) l.stops.push_back(s);
+        }
+        l.gradient = static_cast<GradientKind>(
+            static_cast<uint32_t>(v.get("gradient").as_number(0.0)));
+        l.gradient_space = static_cast<GradientSpace>(
+            static_cast<uint32_t>(v.get("gradient_space").as_number(0.0)));
+        l.gradient_len = num(v, "gradient_len", 1.0f);
+        l.gradient_x = num(v, "gradient_x", 0.5f);
+        l.gradient_y = num(v, "gradient_y", 0.5f);
     }
     l.blend = static_cast<BlendMode>(
         enum_index(kBlendNames, v.get("blend").as_string()));

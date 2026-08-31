@@ -17,6 +17,9 @@ constexpr ParamDesc kVignetteParams[] = {
 
 constexpr ParamDesc kPixelateParams[] = {
     {"block_size", "block size", 1.0f, 128.0f, 12.0f, "%.0f px"},
+    {"sample", "samples", 0.0f, 5.0f, 0.0f, "%.0f",
+     "centre|average|brightest|darkest|median|corner"},
+    {"shape", "cell", 0.0f, 2.0f, 0.0f, "%.0f", "square|column|row"},
 };
 
 constexpr ParamDesc kGrainParams[] = {
@@ -228,6 +231,81 @@ constexpr ParamDesc kVhsParams[] = {
     {"dropouts", "dropouts", 0.0f, 1.0f, 0.12f, "%.2f"},
     {"tbe", "line jitter", 0.0f, 8.0f, 1.2f, "%.1f px"},
     {"skew", "top flagging", 0.0f, 1.0f, 0.15f, "%.2f"},
+};
+
+constexpr ParamDesc kMorphologyParams[] = {
+    {"op", "operation", 0.0f, 1.0f, 0.0f, "%.0f", "dilate|erode"},
+    {"radius", "radius", 0.0f, 6.0f, 2.0f, "%.1f px"},
+    {"shape", "kernel", 0.0f, 3.0f, 0.0f, "%.0f",
+     "disc|square|cross|line"},
+    {"angle", "line angle", 0.0f, 3.14159265f, 0.0f, "%.0f", nullptr, false,
+     2, 1u << 3, true},
+    {"channels", "channels", 0.0f, 2.0f, 1.0f, "%.0f", "luma|rgb|alpha"},
+};
+
+constexpr ParamDesc kDripParams[] = {
+    {"rate", "fall rate", 0.0f, 24.0f, 4.0f, "%.1f px"},
+    {"threshold", "threshold", 0.0f, 1.0f, 0.6f, "%.2f"},
+    {"pick", "picks", 0.0f, 1.0f, 0.0f, "%.0f", "bright|dark"},
+    {"viscosity", "viscosity", 0.0f, 1.0f, 0.88f, "%.2f"},
+    {"angle", "fall angle", -3.14159265f, 3.14159265f, 1.5707963f, "%.0f",
+     nullptr, false, -1, 0, true},
+    {"spread", "spread", 0.0f, 1.0f, 0.25f, "%.2f"},
+};
+
+constexpr ParamDesc kBurnInParams[] = {
+    {"mode", "latches", 0.0f, 2.0f, 0.0f, "%.0f", "brightest|darkest|first"},
+    {"threshold", "threshold", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"bleed", "bleed back", 0.0f, 1.0f, 0.0f, "%.3f"},
+    {"tint", "scar tint", 0.0f, 1.0f, 0.0f, "%.2f"},
+};
+
+constexpr ParamDesc kApertureParams[] = {
+    {"radius", "radius", 0.0f, 48.0f, 10.0f, "%.1f px"},
+    {"blades", "blades", 3.0f, 9.0f, 6.0f, "%.0f", nullptr, true},
+    {"rotation", "iris angle", 0.0f, 3.14159265f, 0.0f, "%.0f", nullptr,
+     false, -1, 0, true},
+    {"cat_eye", "cat's eye", 0.0f, 1.0f, 0.35f, "%.2f"},
+    {"depth", "depth from", 0.0f, 2.0f, 0.0f, "%.0f", "luma|radius|input b"},
+    {"focus", "focus at", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"highlight", "highlight gain", 1.0f, 4.0f, 1.6f, "%.2f"},
+};
+
+constexpr ParamDesc kParallaxParams[] = {
+    {"depth", "depth from", 0.0f, 1.0f, 0.0f, "%.0f", "luma|input b"},
+    {"pan", "pan", -1.0f, 1.0f, 0.0f, "%.2f"},
+    {"tilt", "tilt", -1.0f, 1.0f, 0.0f, "%.2f"},
+    {"skew", "skew", -1.0f, 1.0f, 0.0f, "%.2f"},
+    {"scale", "dolly", -1.0f, 1.0f, 0.0f, "%.2f"},
+    {"strength", "depth scale", 0.0f, 1.0f, 0.25f, "%.2f"},
+    {"gamma", "depth gamma", 0.25f, 4.0f, 1.0f, "%.2f"},
+    {"fill", "uncovered", 0.0f, 1.0f, 0.0f, "%.0f", "stretch|clear"},
+};
+
+constexpr ParamDesc kPatchWeaveParams[] = {
+    {"block", "block", 4.0f, 64.0f, 16.0f, "%.0f px", nullptr, true},
+    {"candidates", "candidates", 1.0f, 8.0f, 4.0f, "%.0f", nullptr, true},
+    {"reach", "search reach", 0.0f, 0.5f, 0.15f, "%.2f"},
+    {"bias", "match bias", 0.0f, 1.0f, 0.5f, "%.2f"},
+    {"hold", "hold frames", 0.0f, 30.0f, 0.0f, "%.0f", nullptr, true},
+    {"blend", "seam blend", 0.0f, 1.0f, 0.2f, "%.2f"},
+};
+
+constexpr ParamDesc kHalationParams[] = {
+    {"threshold", "threshold", 0.0f, 1.0f, 0.72f, "%.2f"},
+    {"radius", "radius", 0.0f, 64.0f, 16.0f, "%.1f px"},
+    {"hue", "tint hue", 0.0f, 1.0f, 0.03f, "%.2f"},
+    {"sat", "tint depth", 0.0f, 1.0f, 0.7f, "%.2f"},
+    {"strength", "strength", 0.0f, 2.0f, 0.8f, "%.2f"},
+    {"absorb", "backing absorb", 0.0f, 1.0f, 0.25f, "%.2f"},
+};
+
+constexpr ParamDesc kRollingShutterParams[] = {
+    {"readout", "readout", 0.0f, 2.0f, 0.6f, "%.2f"},
+    {"axis", "scan axis", 0.0f, 1.0f, 0.0f, "%.0f", "rows|columns"},
+    {"gain", "motion gain", 0.0f, 8.0f, 2.0f, "%.2f"},
+    {"anchor", "anchor line", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"wobble", "jelly", 0.0f, 1.0f, 0.0f, "%.2f"},
 };
 
 constexpr ParamDesc kSnowParams[] = {
@@ -1004,7 +1082,7 @@ constexpr ParamDesc kOffsetParams[] = {
 constexpr EffectInfo kEffectInfos[] = {
     {"rgb_split", "RGB Split", kRgbSplitParams, 2, FxCategory::Signal},
     {"vignette", "Vignette", kVignetteParams, 3, FxCategory::Optics},
-    {"pixelate", "Pixelate", kPixelateParams, 1, FxCategory::Texture},
+    {"pixelate", "Pixelate", kPixelateParams, 3, FxCategory::Texture},
     {"grain", "Grain", kGrainParams, 4, FxCategory::Texture},
     {"jitter", "Jitter", kJitterParams, 3, FxCategory::Time},
     {"quantize", "Quantizer", kQuantizeParams, 13, FxCategory::Color},
@@ -1164,6 +1242,15 @@ constexpr EffectInfo kEffectInfos[] = {
     {"offset", "Offset", kOffsetParams, 2, FxCategory::Time},
     {"track_pin", "Track Pin", kTrackPinParams, 9, FxCategory::Warp},
     {"vhs", "VHS Tape", kVhsParams, 9, FxCategory::Signal},
+    {"morphology", "Morphology", kMorphologyParams, 5, FxCategory::Texture},
+    {"drip", "Drip", kDripParams, 6, FxCategory::Texture},
+    {"burn_in", "Burn In", kBurnInParams, 4, FxCategory::Time},
+    {"aperture", "Aperture", kApertureParams, 7, FxCategory::Optics},
+    {"parallax", "Parallax", kParallaxParams, 8, FxCategory::Warp},
+    {"patch_weave", "Patch Weave", kPatchWeaveParams, 6, FxCategory::Mosaic},
+    {"halation", "Halation", kHalationParams, 6, FxCategory::Optics},
+    {"rolling_shutter", "Rolling Shutter", kRollingShutterParams, 5,
+     FxCategory::Warp},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));
@@ -1222,6 +1309,9 @@ bool effect_uses_history(EffectType type) {
         case EffectType::ScopeMonitor:
         case EffectType::SecurityMux:
         case EffectType::FrameDelay:
+        case EffectType::Drip:
+        case EffectType::BurnIn:
+        case EffectType::RollingShutter:
             return true;
         default:
             return false;

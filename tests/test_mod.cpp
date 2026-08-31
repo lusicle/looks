@@ -44,8 +44,9 @@ uint64_t add_valued_route(doc::Document& d, doc::ModSource source,
 TEST(mod_param_table_paths) {
     doc::Document d = make_doc();
     auto table = mod::build_param_table(d, d.looks[0]);
-    // 10 = morph + 5 vignette + 4 rgb; slip and waveform selector have no slot.
-    CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount - 2});
+    // 10 = morph + 5 vignette + 4 rgb. Slip, waveform, gradient shape and
+    // gradient blend are selectors or field ids, so they have no slot.
+    CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount - 4});
     CHECK_EQ(table[0].path, "global.morph");
     CHECK_EQ(table[0].key.effect_id, uint64_t{0});
     CHECK_EQ(table[1].path, "layer0.fx0.wet");

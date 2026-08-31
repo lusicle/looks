@@ -2156,9 +2156,10 @@ struct LayerUiState {
     ui::SwatchState swatch_a, swatch_b;
     // One popup owner per anchor: the card needs its own swatch state.
     ui::SwatchState card_swatch_a, card_swatch_b;
-    ui::SliderState sliders[12];
+    std::unordered_map<uint64_t, ui::SwatchState> stop_swatch;
+    ui::SliderState sliders[56];
     ui::ButtonState value_edit_button;
-    ui::ButtonState route_buttons[12], key_buttons[12];
+    ui::ButtonState route_buttons[56], key_buttons[56];
     bool xf_open = false;
     ui::ButtonState xf_header, flip_h_btn, flip_v_btn, lock_btn;
     ui::ButtonState anchor_centre_btn;
@@ -2935,6 +2936,7 @@ struct AppState {
     // Offset masked anchors from this snapshot so the set moves rigidly.
     std::vector<doc::PathPoint> giz_path_orig;
     uint64_t giz_path_layer = 0;   // resets the selection on layer change
+    bool giz_stop_delete = false;
     bool giz_layer_staged = false;
     bool giz_layer_coalesce = false;
     doc::Layer giz_layer_write;
@@ -3070,9 +3072,7 @@ void refresh_node_audio(AppState& app) {
     const double fps = project_fps(app.document, app.bundles);
     for (const doc::Look& look : app.document.looks)
         for (const doc::ValueNode& vn : look.value_nodes) {
-            if (!doc::value_kind_wants_audio(vn.source.type) ||
-                !vn.audio_src)
-                continue;
+            if (!doc::value_node_wants_media(vn) || !vn.audio_src) continue;
             const doc::AudioChain chain =
                 doc::resolve_audio_chain(app.document, look, vn.audio_src);
             if (!chain.asset) continue;   // no entry: the node reads 0
@@ -5773,6 +5773,7 @@ struct FrameUi {
         Phase,
         // Transform scale/rotate pivot (frame fractions, 0.5 = centre).
         AnchorX, AnchorY,
+        GradKind, GradSpace, GradLen, GradX, GradY, GradCount,
     };
     struct LayerStage {
         uint64_t layer_id;
@@ -5895,12 +5896,24 @@ struct FrameUi {
     struct ColorStage {
         uint64_t layer_id;
         bool color_b;
+        // Non-zero targets a gradient stop instead of color_a / color_b.
+        uint64_t stop_id = 0;
         float* staged;   // [3]
         float original[3];
         bool* changed;
         bool* released;
     };
     std::vector<ColorStage> color_stages;
+    struct StopStage {
+        uint64_t layer_id;
+        uint64_t stop_id;
+        int channel;   // 0 t, 1 x, 2 y
+        float* staged;
+        float original;
+        bool* changed;
+        bool* released;
+    };
+    std::vector<StopStage> stop_stages;
     struct LayerRow {
         size_t index;
         uint64_t id;
@@ -6600,6 +6613,261 @@ const GizmoDesc* gizmo_desc_for(doc::EffectType type) {
 
 // An open path appends on click. Creation is document state.
 // Structural clicks do not coalesce. Drags coalesce per layer id.
+// One monitor handle editor. A caller supplies the handle list and the
+// four edits; the driver owns hit-test, capture, drag and selection.
+// giz_mode 8 is a handle drag, 9 an auxiliary (centre) drag.
+struct HandleSet {
+    uint64_t owner = 0;
+    int count = 0;
+    std::function<Vec2(int)> uv;
+    std::function<ui::Color(int)> tint;
+    std::function<void(int, Vec2)> move;
+    std::function<void(Vec2)> insert;
+    struct Control {
+        Vec2 uv;
+        std::function<void(Vec2)> move;
+    };
+    std::vector<Control> controls;
+    std::function<void(int)> remove;
+    std::function<bool(Vec2, Vec2*)> on_connector;
+    std::function<void(ui::Canvas2D&)> draw_connector;
+    bool empty_click_inserts = false;
+};
+
+void run_handle_gizmo(AppState& app, ui::LayoutFrame& frame, ui::Rect r,
+                      const HandleSet& hs) {
+    if (app.giz_path_layer != hs.owner) {
+        app.giz_path_layer = hs.owner;
+        app.giz_path_sel = -1;
+    }
+    const Vec2 mouse = frame.input.mouse;
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
+    const bool owns = frame.ctx.widget_owns_mouse(id);
+    const ui::Theme& theme = ui::active_theme();
+
+    auto to_px = [&](Vec2 u) -> Vec2 {
+        return {r.x + u.x * r.w, r.y + u.y * r.h};
+    };
+    auto to_uv = [&](Vec2 p) -> Vec2 {
+        return {std::clamp((p.x - r.x) / r.w, 0.0f, 1.0f),
+                std::clamp((p.y - r.y) / r.h, 0.0f, 1.0f)};
+    };
+    auto near_px = [&](Vec2 p) {
+        return std::fabs(mouse.x - p.x) <= 7.0f &&
+               std::fabs(mouse.y - p.y) <= 7.0f;
+    };
+
+    if ((app.giz_mode == 8 || app.giz_mode == 9) &&
+        (!frame.input.left_down() || app.giz_fx != hs.owner)) {
+        app.giz_mode = 0;
+        app.giz_released = true;
+        frame.ctx.clear_capture();
+    }
+
+    if (owns && frame.input.left_pressed() && app.giz_mode == 0) {
+        for (size_t k = 0; k < hs.controls.size(); ++k)
+            if (near_px(to_px(hs.controls[k].uv))) {
+                app.giz_mode = 9;
+                app.giz_fx = hs.owner;
+                app.giz_slot = static_cast<int>(k);
+                frame.ctx.set_capture(id);
+                break;
+            }
+        for (int i = 0; app.giz_mode == 0 && i < hs.count; ++i)
+            if (near_px(to_px(hs.uv(i)))) {
+                app.giz_mode = 8;
+                app.giz_fx = hs.owner;
+                app.giz_slot = i;
+                app.giz_path_sel = i;
+                frame.ctx.set_capture(id);
+            }
+        if (app.giz_mode == 0 && hs.insert) {
+            Vec2 at{};
+            if (hs.empty_click_inserts) {
+                hs.insert(to_uv(mouse));
+            } else if (hs.on_connector && hs.on_connector(mouse, &at)) {
+                hs.insert(at);
+            }
+        }
+    }
+    if (hs.remove && app.giz_stop_delete && app.giz_path_sel >= 0 &&
+        app.giz_path_sel < hs.count) {
+        app.giz_stop_delete = false;
+        hs.remove(app.giz_path_sel);
+    }
+
+    if (app.giz_mode == 8 && app.giz_fx == hs.owner && app.giz_slot >= 0 &&
+        app.giz_slot < hs.count)
+        hs.move(app.giz_slot, to_uv(mouse));
+    else if (app.giz_mode == 9 && app.giz_fx == hs.owner &&
+             app.giz_slot >= 0 &&
+             app.giz_slot < static_cast<int>(hs.controls.size()))
+        hs.controls[static_cast<size_t>(app.giz_slot)].move(to_uv(mouse));
+
+    ui::Canvas2D& canvas = frame.canvas;
+    if (hs.draw_connector) hs.draw_connector(canvas);
+    for (const HandleSet::Control& c : hs.controls) {
+        const Vec2 p = to_px(c.uv);
+        canvas.draw_sdf_rect({p.x - 4.0f, p.y - 4.0f, 8.0f, 8.0f}, 2.0f,
+                             theme.accent);
+    }
+    for (int i = 0; i < hs.count; ++i) {
+        const Vec2 p = to_px(hs.uv(i));
+        const bool sel = i == app.giz_path_sel;
+        canvas.draw_sdf_rect({p.x - 5.0f, p.y - 5.0f, 10.0f, 10.0f}, 5.0f,
+                             sel ? theme.accent : theme.hairline);
+        canvas.draw_sdf_rect({p.x - 3.5f, p.y - 3.5f, 7.0f, 7.0f}, 3.5f,
+                             hs.tint(i));
+    }
+}
+
+void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
+                          ui::Rect r) {
+    doc::Layer* lay = doc::find_layer(app.look(), app.sel.id);
+    if (!lay || lay->source != doc::LayerSourceKind::Gradient) return;
+    const doc::Layer snap = *lay;
+    auto stage = [&](doc::Layer up, bool coalesce) {
+        app.giz_layer_write = std::move(up);
+        app.giz_layer_staged = true;
+        app.giz_layer_coalesce = coalesce;
+    };
+
+    const bool mesh = snap.gradient == doc::GradientKind::Mesh;
+    HandleSet hs;
+    hs.owner = lay->id;
+    hs.count = static_cast<int>(snap.stops.size());
+    hs.uv = [&snap, mesh](int i) -> Vec2 {
+        const doc::GradientStop& s = snap.stops[static_cast<size_t>(i)];
+        if (mesh) return {s.x, s.y};
+        float ux = 0.0f, uy = 0.0f;
+        doc::gradient_lever_uv(snap, s.t, &ux, &uy);
+        return {ux, uy};
+    };
+    hs.tint = [&snap](int i) -> ui::Color {
+        const float* c = snap.stops[static_cast<size_t>(i)].color;
+        return {c[0], c[1], c[2], 1.0f};
+    };
+    hs.move = [&, mesh](int i, Vec2 u) {
+        doc::Layer up = snap;
+        doc::GradientStop& s = up.stops[static_cast<size_t>(i)];
+        if (mesh) {
+            s.x = u.x;
+            s.y = u.y;
+        } else {
+            s.t = doc::gradient_lever_t(snap, u.x, u.y);
+        }
+        stage(std::move(up), true);
+    };
+    hs.insert = [&](Vec2 u) {
+        doc::Layer up = snap;
+        doc::GradientStop ns;
+        ns.id = app.document.next_effect_id++;
+        ns.x = u.x;
+        ns.y = u.y;
+        // Take the colour of whatever the click landed nearest.
+        float best = 1e9f;
+        for (const doc::GradientStop& s : snap.stops) {
+            const float dx = s.x - u.x, dy = s.y - u.y;
+            const float d = dx * dx + dy * dy;
+            if (d < best) {
+                best = d;
+                for (int c = 0; c < 3; ++c) ns.color[c] = s.color[c];
+            }
+        }
+        up.stops.push_back(ns);
+        app.giz_path_sel = static_cast<int>(up.stops.size()) - 1;
+        stage(std::move(up), false);
+    };
+    if (mesh) {
+        hs.insert = [&](Vec2 u) {
+            if (snap.stops.size() >= doc::kMaxMeshStops) return;
+            doc::Layer up = snap;
+            doc::GradientStop ns;
+            ns.id = app.document.next_effect_id++;
+            ns.x = u.x;
+            ns.y = u.y;
+            float best = 1e9f;
+            for (const doc::GradientStop& s : snap.stops) {
+                const float dx = s.x - u.x, dy = s.y - u.y;
+                if (dx * dx + dy * dy < best) {
+                    best = dx * dx + dy * dy;
+                    for (int c = 0; c < 3; ++c) ns.color[c] = s.color[c];
+                }
+            }
+            up.stops.push_back(ns);
+            app.giz_path_sel = static_cast<int>(up.stops.size()) - 1;
+            stage(std::move(up), false);
+        };
+        hs.remove = [&](int i) {
+            if (snap.stops.size() <= 1) return;
+            doc::Layer up = snap;
+            up.stops.erase(up.stops.begin() + static_cast<ptrdiff_t>(i));
+            app.giz_path_sel = -1;
+            stage(std::move(up), false);
+        };
+        hs.empty_click_inserts = true;
+    } else {
+        float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f;
+        doc::gradient_lever_uv(snap, 0.0f, &ax, &ay);
+        doc::gradient_lever_uv(snap, 1.0f, &bx, &by);
+        auto set_ends = [&](Vec2 p0, Vec2 p1) {
+            doc::Layer up = snap;
+            up.gradient_x = (p0.x + p1.x) * 0.5f;
+            up.gradient_y = (p0.y + p1.y) * 0.5f;
+            const float dx = p1.x - p0.x, dy = p1.y - p0.y;
+            up.gen_angle = std::atan2(dy, dx);
+            up.gradient_len =
+                std::clamp(std::sqrt(dx * dx + dy * dy), 0.05f, 4.0f);
+            stage(std::move(up), true);
+        };
+        if (snap.gradient == doc::GradientKind::Linear) {
+            hs.controls.push_back(
+                {{ax, ay}, [&, bx, by](Vec2 u) {
+                     set_ends(u, {bx, by});
+                 }});
+            hs.controls.push_back(
+                {{bx, by}, [&, ax, ay](Vec2 u) {
+                     set_ends({ax, ay}, u);
+                 }});
+        } else {
+            const float ca = std::cos(snap.gen_angle);
+            const float sa = std::sin(snap.gen_angle);
+            hs.controls.push_back(
+                {{snap.gradient_x, snap.gradient_y}, [&](Vec2 u) {
+                     doc::Layer up = snap;
+                     up.gradient_x = u.x;
+                     up.gradient_y = u.y;
+                     stage(std::move(up), true);
+                 }});
+            hs.controls.push_back(
+                {{bx + ca * 0.06f, by + sa * 0.06f}, [&](Vec2 u) {
+                     doc::Layer up = snap;
+                     const float dx = u.x - snap.gradient_x;
+                     const float dy = u.y - snap.gradient_y;
+                     const float d = std::sqrt(dx * dx + dy * dy);
+                     up.gen_angle = std::atan2(dy, dx);
+                     up.gradient_len = std::clamp((d - 0.06f) * 2.0f, 0.05f,
+                                                 4.0f);
+                     stage(std::move(up), true);
+                 }});
+        }
+        hs.draw_connector = [&snap, r](ui::Canvas2D& canvas) {
+            const ui::Theme& th = ui::active_theme();
+            float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f;
+            doc::gradient_lever_uv(snap, 0.0f, &ax, &ay);
+            doc::gradient_lever_uv(snap, 1.0f, &bx, &by);
+            const Vec2 a{r.x + ax * r.w, r.y + ay * r.h};
+            const Vec2 b{r.x + bx * r.w, r.y + by * r.h};
+            canvas.draw_line(a, b, 1.5f, th.text_dim);
+            const float ca2 = std::cos(snap.gen_angle);
+            const float sa2 = std::sin(snap.gen_angle);
+            const Vec2 g{b.x + ca2 * 0.06f * r.w, b.y + sa2 * 0.06f * r.h};
+            canvas.draw_line(b, g, 1.0f, th.text_disabled);
+        };
+    }
+    run_handle_gizmo(app, frame, r, hs);
+}
+
 void draw_path_editor(AppState& app, ui::LayoutNode& node,
                       ui::LayoutFrame& frame, ui::Rect r,
                       bool fit_clicked) {
@@ -7037,7 +7305,11 @@ void draw_look_gizmos(AppState& app, ui::LayoutNode& node,
     if (r.w < 8.0f || r.h < 8.0f) return;
     r = monitor_content_rect(app, r);
     if (app.sel.kind == SelKind::LayerSource) {
-        draw_path_editor(app, node, frame, r, fit_clicked);
+        const doc::Layer* sl = doc::find_layer(app.look(), app.sel.id);
+        if (sl && sl->source == doc::LayerSourceKind::Gradient)
+            draw_gradient_editor(app, frame, r);
+        else
+            draw_path_editor(app, node, frame, r, fit_clicked);
         return;
     }
     if (app.sel.kind == SelKind::ModSource) {
@@ -9613,6 +9885,8 @@ static const doc::ModSourceType kFamNorm[] = {
     doc::ModSourceType::Normalise};
 static const doc::ModSourceType kFamCamera[] = {
     doc::ModSourceType::Camera};
+static const doc::ModSourceType kFamStep[] = {
+    doc::ModSourceType::Hold, doc::ModSourceType::Sequence};
 static const ModFamily kModFamilies[] = {
     {"generator", kFamGenerator, 2, "lfo|drift"},
     {"analysis", kFamAnalysis, 7,
@@ -9622,8 +9896,9 @@ static const ModFamily kModFamilies[] = {
     {"math", kFamMath, 1, "math"},
     {"norm", kFamNorm, 1, "norm"},
     {"camera", kFamCamera, 1, "camera"},
+    {"step", kFamStep, 2, "hold|sequence"},
 };
-static_assert(2 + 7 + 3 + 2 + 1 + 1 + 1 ==
+static_assert(2 + 7 + 3 + 2 + 1 + 1 + 1 + 2 ==
                   static_cast<size_t>(doc::ModSourceType::Count),
               "every mod kind lives in exactly one family");
 static const ModFamily& mod_family_of(doc::ModSourceType t, int* local) {
@@ -9641,44 +9916,71 @@ static const ModFamily& mod_family_of(doc::ModSourceType t, int* local) {
 static const char* kValAddLabels[] = {
     "value: generator", "value: analysis", "value: video",
     "value: sampler",   "value: math",     "value: normalise",
-    "value: camera"};
+    "value: camera",    "value: hold",     "value: sequence"};
 static const doc::ModSourceType kValAddTypes[] = {
     doc::ModSourceType::Lfo,         doc::ModSourceType::AudioLow,
     doc::ModSourceType::VideoMotion, doc::ModSourceType::VideoSample,
     doc::ModSourceType::Math,        doc::ModSourceType::Normalise,
-    doc::ModSourceType::Camera};
+    doc::ModSourceType::Camera,      doc::ModSourceType::Hold,
+    doc::ModSourceType::Sequence};
 constexpr int kValAddCount =
     static_cast<int>(sizeof(kValAddLabels) / sizeof(kValAddLabels[0]));
 
 // Maps row index to layer param index. -1 is a selector, not a target.
 // This must mirror the source card builder row order.
-static std::vector<int> layer_mod_row_map(const doc::Layer& sl) {
+static std::vector<doc::ParamKey> layer_mod_row_map(const doc::Layer& sl) {
     using LSK = doc::LayerSourceKind;
-    std::vector<int> map;
-    map.push_back(0);   // opacity
-    if (sl.source == LSK::Solid || sl.source == LSK::Gradient ||
-        sl.source == LSK::Noise || sl.source == LSK::Oscillator) {
-        map.push_back(1);
-        map.push_back(2);
-        map.push_back(3);
-    }
-    if (sl.source == LSK::Gradient || sl.source == LSK::Noise ||
+    std::vector<doc::ParamKey> map;
+    const uint64_t lk = sl.id | doc::kLayerParamBit;
+    auto lay = [&](int p) { map.push_back({lk, p}); };
+    auto none = [&]() { map.push_back({0, -1}); };
+    auto stop = [&](uint64_t sid, int p) {
+        map.push_back({sid | doc::kStopParamBit, p});
+    };
+    lay(0);
+    if (sl.source == LSK::Solid || sl.source == LSK::Noise ||
         sl.source == LSK::Oscillator) {
-        map.push_back(4);
-        map.push_back(5);
-        map.push_back(6);
+        lay(1);
+        lay(2);
+        lay(3);
     }
-    if (sl.source == LSK::Gradient || sl.source == LSK::Oscillator)
-        map.push_back(8);
-    if (sl.source == LSK::Noise) map.push_back(7);
+    if (sl.source == LSK::Noise || sl.source == LSK::Oscillator) {
+        lay(4);
+        lay(5);
+        lay(6);
+    }
+    if (sl.source == LSK::Gradient) {
+        none();   // shape dropdown
+        none();   // blend dropdown
+        const bool mesh = sl.gradient == doc::GradientKind::Mesh;
+        if (!mesh) {
+            lay(23);
+            lay(24);
+            lay(8);
+            lay(22);
+            none();   // stop count
+        }
+        for (const doc::GradientStop& s : sl.stops) {
+            stop(s.id, 3);
+            if (mesh) {
+                stop(s.id, 1);
+                stop(s.id, 2);
+            } else {
+                stop(s.id, 0);
+            }
+        }
+        return map;
+    }
+    if (sl.source == LSK::Noise) lay(7);
     if (sl.source == LSK::Oscillator) {
-        map.push_back(7);
-        map.push_back(-1);   // wave dropdown
+        lay(8);
+        lay(7);
+        none();   // wave dropdown
     }
     if (sl.source == LSK::Shape) {
-        map.push_back(7);
-        map.push_back(8);
-        map.push_back(-1);   // shape dropdown
+        lay(7);
+        lay(8);
+        none();   // shape dropdown
     }
     return map;
 }
@@ -9859,7 +10161,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             lrow.down = arena.alloc<bool>();
             out.layer_rows.push_back(lrow);
 
-            flow::ParamRow* rows = arena.alloc<flow::ParamRow>(12);
+            flow::ParamRow* rows = arena.alloc<flow::ParamRow>(56);
             int srow = 0;
             auto layer_row = [&](FrameUi::LayerField field,
                                  const char* label, float min_v,
@@ -9867,7 +10169,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                  const char* options = nullptr,
                                  float hard_max = 0.0f,
                                  float display_scale = 1.0f) {
-                if (srow >= 12) return;
+                if (srow >= 56) return;
                 FrameUi::LayerStage lstage{};
                 lstage.layer_id = layer.id;
                 lstage.field = field;
@@ -9923,7 +10225,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             // Colors edit through the swatch only, never channel sliders.
             auto swatch_row = [&](const char* label, const float* rgb,
                                   bool is_b, ui::SwatchState* sw) {
-                if (srow >= 12) return;
+                if (srow >= 56) return;
                 FrameUi::ColorStage cstage{};
                 cstage.layer_id = layer.id;
                 cstage.color_b = is_b;
@@ -9944,22 +10246,102 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 ++srow;
             };
             LayerUiState& lui = app.layer_ui[layer.id];
+            auto stop_swatch_row = [&](const char* label,
+                                       const doc::GradientStop& gs,
+                                       ui::SwatchState* sw) {
+                if (srow >= 56) return;
+                FrameUi::ColorStage cstage{};
+                cstage.layer_id = layer.id;
+                cstage.stop_id = gs.id;
+                cstage.staged = arena.alloc<float>(3);
+                for (int c = 0; c < 3; ++c) {
+                    cstage.staged[c] = gs.color[c];
+                    cstage.original[c] = gs.color[c];
+                }
+                cstage.changed = arena.alloc<bool>();
+                cstage.released = arena.alloc<bool>();
+                out.color_stages.push_back(cstage);
+                rows[srow].label = label;
+                rows[srow].kind = 3;
+                rows[srow].swatch = sw;
+                rows[srow].staged = cstage.staged;
+                rows[srow].changed = cstage.changed;
+                rows[srow].released = cstage.released;
+                ++srow;
+            };
+            auto stop_pos_row = [&](const char* label,
+                                    const doc::GradientStop& gs, int chan,
+                                    float value, float lo, float hi) {
+                if (srow >= 56) return;
+                FrameUi::StopStage ss{};
+                ss.layer_id = layer.id;
+                ss.stop_id = gs.id;
+                ss.channel = chan;
+                ss.staged = arena.alloc<float>();
+                *ss.staged = value;
+                ss.original = value;
+                ss.changed = arena.alloc<bool>();
+                ss.released = arena.alloc<bool>();
+                out.stop_stages.push_back(ss);
+                rows[srow].label = label;
+                rows[srow].min_v = lo;
+                rows[srow].max_v = hi;
+                rows[srow].format = "%.3f";
+                rows[srow].staged = ss.staged;
+                rows[srow].changed = ss.changed;
+                rows[srow].released = ss.released;
+                ++srow;
+            };
             // SMPTE bars keep fixed colors, so the color rows hide.
             const bool pattern_two_color =
                 layer.source == LSK::TestPattern && layer.osc_shape != 4;
             if (layer.source == LSK::Solid ||
-                layer.source == LSK::Gradient ||
                 layer.source == LSK::Noise ||
                 layer.source == LSK::Oscillator || pattern_two_color)
                 swatch_row("color a", layer.color_a, false,
                            &lui.card_swatch_a);
-            if (layer.source == LSK::Gradient ||
-                layer.source == LSK::Noise ||
+            if (layer.source == LSK::Noise ||
                 layer.source == LSK::Oscillator || pattern_two_color)
                 swatch_row("color b", layer.color_b, true,
                            &lui.card_swatch_b);
-            if (layer.source == LSK::Gradient ||
-                layer.source == LSK::Oscillator)
+            if (layer.source == LSK::Gradient) {
+                const bool mesh = layer.gradient == doc::GradientKind::Mesh;
+                layer_row(LFs::GradKind, "shape", 0.0f, 4.0f,
+                          static_cast<float>(layer.gradient), "%.0f",
+                          "linear|radial|diamond|angular|mesh");
+                layer_row(LFs::GradSpace, "blend", 0.0f, 2.0f,
+                          static_cast<float>(layer.gradient_space), "%.0f",
+                          "rgb|hsl|oklab");
+                if (!mesh) {
+                    layer_row(LFs::GradX, "centre x", 0.0f, 1.0f,
+                              layer.gradient_x, "%.3f");
+                    layer_row(LFs::GradY, "centre y", 0.0f, 1.0f,
+                              layer.gradient_y, "%.3f");
+                    layer_row(LFs::Angle, "angle", -3.1416f, 3.1416f,
+                              layer.gen_angle, "%.0f deg", nullptr, 0.0f,
+                              57.29578f);
+                    layer_row(LFs::GradLen, "scale", 0.05f, 4.0f,
+                              layer.gradient_len, "%.2f");
+                    layer_row(LFs::GradCount, "stops", 2.0f,
+                              static_cast<float>(doc::kMaxGradientStops),
+                              static_cast<float>(layer.stops.size()),
+                              "%.0f");
+                }
+                for (size_t si = 0; si < layer.stops.size(); ++si) {
+                    const doc::GradientStop& gs = layer.stops[si];
+                    char lbl[24];
+                    std::snprintf(lbl, sizeof(lbl), "stop %zu", si + 1);
+                    stop_swatch_row(arena.dup(lbl, std::strlen(lbl)), gs,
+                                    &lui.stop_swatch[gs.id]);
+                    if (mesh) {
+                        stop_pos_row("  x", gs, 1, gs.x, 0.0f, 1.0f);
+                        stop_pos_row("  y", gs, 2, gs.y, 0.0f, 1.0f);
+                    } else {
+                        stop_pos_row("  at", gs, 0, gs.t, 0.0f, 1.0f);
+                    }
+                }
+            }
+            if (layer.source == LSK::Oscillator)
                 // Radians in the doc, degrees on the dial.
                 layer_row(LFs::Angle, "angle", -3.1416f, 3.1416f,
                           layer.gen_angle, "%.0f deg", nullptr, 0.0f,
@@ -10602,6 +10984,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         const bool is_pulse =
             vn.source.type == doc::ModSourceType::Envelope ||
             vn.source.type == doc::ModSourceType::Beat;
+        const bool is_step =
+            doc::value_kind_is_triggered(vn.source.type);
         const bool has_rate =
             is_lfo || is_pulse ||
             vn.source.type == doc::ModSourceType::Drift;
@@ -10613,6 +10997,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      static_cast<int>(vn.source.shape));
         else if (vn.source.type == doc::ModSourceType::Envelope)
             pick_row(1, "trigger", "onset|cut|beat|key",
+                     static_cast<int>(vn.source.trigger % 4));
+        else if (is_step)
+            pick_row(1, "trigger", "rate|beat|onset|cut",
                      static_cast<int>(vn.source.trigger % 4));
         else if (is_video)
             pick_row(1, "channel", "luma|red|green|blue",
@@ -10711,6 +11098,20 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             slider_row(2, "max", -1.0f, 1.0f, vn.in_max, "%.2f");
             slider_row(3, "mult", 0.01f, 100.0f, vn.const_b, "%.2f x");
         }
+        if (is_step) {
+            slider_row(0, vn.source.trigger == 1 ? "beats" : "rate",
+                       0.05f, 16.0f, vn.source.rate_hz,
+                       vn.source.trigger == 1 ? "%.2f" : "%.2f hz");
+            if (vn.source.type == doc::ModSourceType::Hold) {
+                slider_row(1, "in", -4.0f, 4.0f, vn.const_a, "%.2f");
+                rows[slot - 1].value_input = true;
+                input_tick(slot - 1, vn.in_a);
+            } else {
+                slider_row(1, "steps", 1.0f, 32.0f, vn.const_b, "%.0f");
+                slider_row(2, "min", -1.0f, 1.0f, vn.in_min, "%.2f");
+                slider_row(3, "max", -1.0f, 1.0f, vn.in_max, "%.2f");
+            }
+        }
         if (is_video) {
             // Sampling window rows: point x/y, region w/h.
             static const char* kPosLabels[4] = {"x", "y", "w", "h"};
@@ -10786,8 +11187,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
         // Media-driven kinds require their input, so the card grows an
         // In pin.
-        const bool analysis_kind =
-            doc::value_kind_wants_media(vn.source.type);
+        const bool analysis_kind = doc::value_node_wants_media(vn);
         rn.has_in = analysis_kind;
         aux_x += kAutoPitch;
         nodes.push_back(rn);
@@ -10829,11 +11229,20 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             const int lidx = layer_index_by_id(d, lid);
             if (lidx >= 0) {
                 target = flow::node_id(flow::NodeKind::Source, lid);
-                const std::vector<int> map = layer_mod_row_map(
+                const auto map = layer_mod_row_map(
                     d.layers[static_cast<size_t>(lidx)]);
                 for (size_t rr = 0; rr < map.size(); ++rr)
-                    if (map[rr] == r.target.param_index)
-                        to_row = static_cast<int>(rr);
+                    if (map[rr] == r.target) to_row = static_cast<int>(rr);
+            }
+        } else if (r.target.effect_id & doc::kStopParamBit) {
+            const uint64_t sid = r.target.effect_id & ~doc::kStopParamBit;
+            for (const doc::Layer& sl : d.layers) {
+                if (!doc::find_gradient_stop(sl, sid)) continue;
+                target = flow::node_id(flow::NodeKind::Source, sl.id);
+                const auto map = layer_mod_row_map(sl);
+                for (size_t rr = 0; rr < map.size(); ++rr)
+                    if (map[rr] == r.target) to_row = static_cast<int>(rr);
+                break;
             }
         } else if (r.target.effect_id & doc::kGroupParamBit) {
             const uint64_t gid = r.target.effect_id & ~doc::kGroupParamBit;
@@ -12683,7 +13092,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                          "motion", "bright", "lfo.bpm",
                                          "env",    "cut",    "beat",
                                          "sample", "region", "math",
-                                         "norm",   "camera"};
+                                         "norm",   "camera", "hold",
+                                         "seq"};
     static_assert(sizeof(kSourceNames) / sizeof(kSourceNames[0]) ==
                       static_cast<size_t>(doc::ModSourceType::Count),
                   "route-panel source names track the enum");
@@ -13651,6 +14061,10 @@ void delete_selected(AppState& a, KeyIntents& k) {
                a.giz_path_sel >= 0) {
         // Delete removes the selected control points, never the layer.
         doc::Layer* pl = doc::find_layer(a.look(), a.sel.id);
+        if (pl && pl->source == doc::LayerSourceKind::Gradient) {
+            a.giz_stop_delete = true;
+            return;
+        }
         if (pl && pl->source == doc::LayerSourceKind::Shape &&
             pl->osc_shape == 3u) {
             uint64_t mask = a.giz_path_mask;
@@ -17072,6 +17486,29 @@ void register_ops_graph(ScriptHost& sh) {
                 map_num(m, "angle", l->gen_angle);
                 map_num(m, "phase", l->gen_phase);
                 map_num(m, "waveform", l->osc_shape);
+                if (l->source == doc::LayerSourceKind::Gradient) {
+                    map_num(m, "grad_kind",
+                            static_cast<double>(l->gradient));
+                    map_num(m, "grad_space",
+                            static_cast<double>(l->gradient_space));
+                    map_num(m, "grad_len", l->gradient_len);
+                    map_num(m, "grad_x", l->gradient_x);
+                    map_num(m, "grad_y", l->gradient_y);
+                    Value st = Value::make_list();
+                    for (const doc::GradientStop& s : l->stops) {
+                        Value one = Value::make_map();
+                        map_num(one, "id", static_cast<double>(s.id));
+                        map_num(one, "t", s.t);
+                        map_num(one, "x", s.x);
+                        map_num(one, "y", s.y);
+                        Value col = Value::make_list();
+                        for (float c : s.color)
+                            col.list->push_back(Value::number(c));
+                        map_put(one, "color", col);
+                        st.list->push_back(std::move(one));
+                    }
+                    map_put(m, "stops", st);
+                }
                 if (!l->path.empty()) {
                     Value pts = Value::make_list();
                     for (const doc::PathPoint& p : l->path) {
@@ -17155,6 +17592,47 @@ void register_ops_graph(ScriptHost& sh) {
                 if (map_get_num(m, "waveform", &n))
                     up.osc_shape = static_cast<uint32_t>(
                         std::max(0.0, n));
+                if (map_get_num(m, "grad_kind", &n))
+                    up.gradient = static_cast<doc::GradientKind>(
+                        std::clamp(n, 0.0, 4.0));
+                if (map_get_num(m, "grad_space", &n))
+                    up.gradient_space = static_cast<doc::GradientSpace>(
+                        std::clamp(n, 0.0, 2.0));
+                if (map_get_num(m, "grad_len", &n))
+                    up.gradient_len = static_cast<float>(n);
+                if (map_get_num(m, "grad_x", &n))
+                    up.gradient_x = static_cast<float>(n);
+                if (map_get_num(m, "grad_y", &n))
+                    up.gradient_y = static_cast<float>(n);
+                if (const auto sit = m.map->find("stops");
+                    sit != m.map->end() &&
+                    sit->second.kind == Value::Kind::List) {
+                    up.stops.clear();
+                    for (const Value& sv : *sit->second.list) {
+                        if (sv.kind != Value::Kind::Map) continue;
+                        doc::GradientStop s;
+                        double d = 0.0;
+                        if (map_get_num(sv, "id", &d))
+                            s.id = static_cast<uint64_t>(d);
+                        if (!s.id) s.id = sh.app->document.next_effect_id++;
+                        if (map_get_num(sv, "t", &d))
+                            s.t = static_cast<float>(d);
+                        if (map_get_num(sv, "x", &d))
+                            s.x = static_cast<float>(d);
+                        if (map_get_num(sv, "y", &d))
+                            s.y = static_cast<float>(d);
+                        if (const auto cit = sv.map->find("color");
+                            cit != sv.map->end() &&
+                            cit->second.kind == Value::Kind::List) {
+                            const auto& c = *cit->second.list;
+                            for (size_t i = 0; i < 3 && i < c.size(); ++i)
+                                if (c[i].is_num())
+                                    s.color[i] =
+                                        static_cast<float>(c[i].num);
+                        }
+                        up.stops.push_back(s);
+                    }
+                }
                 if (const auto pit = m.map->find("path");
                     pit != m.map->end() &&
                     pit->second.kind == Value::Kind::List) {
@@ -17891,7 +18369,7 @@ const char* kModKindNames[] = {
     "lfo",    "drift",  "audio_low", "audio_mid", "audio_high",
     "onset",  "motion", "brightness", "lfo_beat", "envelope",
     "cut",    "beat",   "sample",    "region",    "math",
-    "normalise", "camera"};
+    "normalise", "camera", "hold",   "sequence"};
 
 // Layer keys carry kLayerParamBit; effect keys use the ParamDesc index.
 bool resolve_param_key(ScriptHost& sh, script::Vm& vm,
@@ -22390,9 +22868,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         // This wire writes audio_src, not a graph link.
                         const doc::ValueNode* tn = doc::find_value_node(
                             app.look(), tag_doc(fe.connect_to));
-                        const bool ok =
-                            tn &&
-                            doc::value_kind_wants_audio(tn->source.type);
+                        const bool ok = tn && doc::value_node_wants_media(*tn);
                         if (!ok) {
                             app.status =
                                 "only audio-driven nodes take a media "
@@ -22641,12 +23117,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     if (idx >= 0) {
                         const doc::Layer& sl =
                             app.look().layers[static_cast<size_t>(idx)];
-                        const std::vector<int> map = layer_mod_row_map(sl);
+                        const auto map = layer_mod_row_map(sl);
                         const int row = fe.route_drop_row;
-                        if (row < static_cast<int>(map.size()) &&
-                            map[static_cast<size_t>(row)] >= 0) {
-                            key = {sl.id | doc::kLayerParamBit,
-                                   map[static_cast<size_t>(row)]};
+                        if (row >= 0 && row < static_cast<int>(map.size()) &&
+                            map[static_cast<size_t>(row)].param_index >= 0) {
+                            key = map[static_cast<size_t>(row)];
                             have_key = true;
                         }
                     }
@@ -23713,15 +24188,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                     if (idx < 0) continue;
                                     cid = flow::node_id(
                                         flow::NodeKind::Source, lid);
-                                    const std::vector<int> map =
+                                    const auto map =
                                         layer_mod_row_map(
                                             app.look().layers
                                                 [static_cast<size_t>(
                                                     idx)]);
                                     for (size_t rr = 0; rr < map.size();
                                          ++rr)
-                                        if (map[rr] ==
-                                            r.target.param_index)
+                                        if (map[rr] == r.target)
                                             row = static_cast<int>(rr);
                                 } else if (r.target.effect_id &
                                            doc::kGroupParamBit) {
@@ -24446,6 +24920,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 else if (n.source.type == MST::Math)
                     n.op = static_cast<doc::ValueOp>(
                         sel % static_cast<int>(doc::ValueOp::Count));
+                else if (doc::value_kind_is_triggered(n.source.type))
+                    n.source.trigger = static_cast<uint32_t>(sel % 4);
                 else
                     apply = false;
                 if (apply)
@@ -24477,6 +24953,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                      : si == 1 ? n.source.py
                      : si == 2 ? n.source.pw
                                : n.source.ph) = val;
+                } else if (n.source.type == MST::Hold) {
+                    (si == 0 ? n.source.rate_hz : n.const_a) = val;
+                } else if (n.source.type == MST::Sequence) {
+                    (si == 0 ? n.source.rate_hz
+                     : si == 1 ? n.const_b
+                     : si == 2 ? n.in_min
+                               : n.in_max) = val;
                 } else if (n.source.type == MST::Envelope ||
                            n.source.type == MST::Beat) {
                     n.source.decay = val;
@@ -25002,6 +25485,41 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case LF::Phase:
                         edited.gen_phase = std::max(v, 0.0f);
                         break;
+                    case LF::GradKind:
+                        edited.gradient = static_cast<doc::GradientKind>(
+                            std::clamp(v, 0.0f, 4.0f) + 0.5f);
+                        break;
+                    case LF::GradSpace:
+                        edited.gradient_space =
+                            static_cast<doc::GradientSpace>(
+                                std::clamp(v, 0.0f, 2.0f) + 0.5f);
+                        break;
+                    case LF::GradLen: edited.gradient_len = v; break;
+                    case LF::GradX: edited.gradient_x = v; break;
+                    case LF::GradY: edited.gradient_y = v; break;
+                    case LF::GradCount: {
+                        const size_t want = static_cast<size_t>(
+                            std::clamp(v, 2.0f,
+                                       static_cast<float>(
+                                           doc::kMaxGradientStops)) +
+                            0.5f);
+                        while (edited.stops.size() > want)
+                            edited.stops.pop_back();
+                        while (edited.stops.size() < want) {
+                            doc::GradientStop ns;
+                            ns.id = app.document.next_effect_id++;
+                            ns.t = edited.stops.empty()
+                                ? 0.0f
+                                : std::min(1.0f,
+                                           edited.stops.back().t + 0.25f);
+                            for (int c = 0; c < 3; ++c)
+                                ns.color[c] = edited.stops.empty()
+                                    ? 1.0f
+                                    : edited.stops.back().color[c];
+                            edited.stops.push_back(ns);
+                        }
+                        break;
+                    }
                 }
                 app.undo.execute(app.document,
                                  doc::set_layer_props_command(app.scope_look,std::move(edited)),
@@ -25011,6 +25529,30 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.undo.break_coalescing();
                 did_break = true;
             }
+        }
+        for (const FrameUi::StopStage& stage : frame_ui.stop_stages) {
+            if (!*stage.changed || *stage.staged == stage.original) {
+                if (stage.released && *stage.released && !did_break) {
+                    app.undo.break_coalescing();
+                    did_break = true;
+                }
+                continue;
+            }
+            doc::Layer* layer = nullptr;
+            for (doc::Layer& l : app.look().layers)
+                if (l.id == stage.layer_id) layer = &l;
+            if (!layer) continue;
+            doc::Layer edited = *layer;
+            for (doc::GradientStop& s : edited.stops) {
+                if (s.id != stage.stop_id) continue;
+                if (stage.channel == 0) s.t = *stage.staged;
+                else if (stage.channel == 1) s.x = *stage.staged;
+                else s.y = *stage.staged;
+            }
+            app.undo.execute(app.document,
+                             doc::set_layer_props_command(app.scope_look,
+                                                          std::move(edited)),
+                             /*coalesce=*/true);
         }
         for (const FrameUi::ColorStage& stage : frame_ui.color_stages) {
             if (*stage.changed &&
@@ -25024,6 +25566,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     doc::Layer edited = *layer;
                     float* dst =
                         stage.color_b ? edited.color_b : edited.color_a;
+                    if (stage.stop_id) {
+                        dst = nullptr;
+                        for (doc::GradientStop& s : edited.stops)
+                            if (s.id == stage.stop_id) dst = s.color;
+                    }
+                    if (!dst) continue;
                     dst[0] = stage.staged[0];
                     dst[1] = stage.staged[1];
                     dst[2] = stage.staged[2];

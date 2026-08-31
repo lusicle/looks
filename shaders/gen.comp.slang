@@ -16,6 +16,11 @@ cbuffer Push
     float angle;       // radians
     uint shape;
     float phase;       // percent of one period, wraps at 100
+    uint grad_kind;
+    float grad_len;
+    float grad_cx;
+    float grad_cy;
+    uint grad_stops;
 };
 
 // The SDF uses canvas uv. 0.5 is on the curve, the span is +-0.25 heights.
@@ -78,7 +83,10 @@ float gen_worley(float2 p, uint seed, uint t)
     return saturate(sqrt(md));
 }
 
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+// The ramp holds resolved stop colours, already in the linear working
+// space. The engine dummy-binds it for every other generator kind.
+[[vk::binding(1, 0)]] Sampler2D grad_ramp;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -94,9 +102,46 @@ void main(uint3 tid : SV_DispatchThreadID)
     float alpha = 1.0;
     if (kind == 2)
     {
-        const float2 dir = float2(cos(angle), sin(angle));
-        const float t = saturate(dot(uv - 0.5, dir) + 0.5);
-        rgb = lerp(color_a, color_b, t);
+        const float aspect = float(width) / max(float(height), 1.0);
+        const float2 c = float2(grad_cx, grad_cy);
+        const float2 d = (uv - c) * float2(aspect, 1.0);
+        const float len = max(grad_len, 1.0e-3);
+        float t;
+        if (grad_kind == 4u)
+        {
+            // Shepard weighting: every stop pulls by inverse square
+            // distance, so the placement itself is the whole shape.
+            const uint n = min(grad_stops, 32u);
+            const float2 tx = float2(1.0 / 256.0, 0.5);
+            float3 acc = float3(0.0, 0.0, 0.0);
+            float wsum = 0.0;
+            for (uint i = 0u; i < n; ++i)
+            {
+                const float4 p = grad_ramp.SampleLevel(
+                    float2((float(i * 2u) + 0.5) / 256.0, 0.75), 0);
+                const float4 col = grad_ramp.SampleLevel(
+                    float2((float(i * 2u + 1u) + 0.5) / 256.0, 0.75), 0);
+                const float2 dd = (uv - p.xy) * float2(aspect, 1.0);
+                const float w = 1.0 / (dot(dd, dd) / (len * len) + 1.0e-4);
+                acc += col.rgb * w;
+                wsum += w;
+            }
+            rgb = wsum > 0.0 ? acc / wsum : float3(0.0, 0.0, 0.0);
+            output[tid.xy] = float4(rgb, alpha);
+            return;
+        }
+        if (grad_kind == 1u)
+            t = length(d) * 2.0 / len;
+        else if (grad_kind == 2u)
+            t = (abs(d.x) + abs(d.y)) * 2.0 / len;
+        else if (grad_kind == 3u)
+            t = frac((atan2(d.y, d.x) - angle) / 6.2831853 + 1.0) / len;
+        else
+        {
+            const float2 dir = float2(cos(angle), sin(angle));
+            t = dot(uv - c, dir) / len + 0.5;
+        }
+        rgb = grad_ramp.SampleLevel(float2(saturate(t), 0.25), 0).rgb;
     }
     else if (kind == 3)
     {

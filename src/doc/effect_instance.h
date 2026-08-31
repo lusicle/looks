@@ -134,6 +134,14 @@ enum class EffectType : uint32_t {
     Offset,
     TrackPin,
     Vhs,
+    Morphology,
+    Drip,
+    BurnIn,
+    Aperture,
+    Parallax,
+    PatchWeave,
+    Halation,
+    RollingShutter,
     Count,
 };
 
@@ -146,7 +154,8 @@ inline bool is_stateful_feedback(EffectType type) {
     return type == EffectType::Echo || type == EffectType::Feedback ||
            type == EffectType::Lidar || type == EffectType::SlowScan ||
            type == EffectType::VectorTrace ||
-           type == EffectType::ScopeMonitor;
+           type == EffectType::ScopeMonitor || type == EffectType::Drip ||
+           type == EffectType::BurnIn;
 }
 
 // null = no aux port. A wired aux input wins over the matte-as-map.
@@ -156,6 +165,8 @@ inline const char* effect_aux_port(EffectType type) {
         case EffectType::Displace: return "map";
         case EffectType::TimeDisplace: return "map";
         case EffectType::TrackPin: return "b";
+        case EffectType::Aperture: return "depth";
+        case EffectType::Parallax: return "depth";
         default: return nullptr;
     }
 }

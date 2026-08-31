@@ -140,6 +140,14 @@ add_slang_shaders(looks_shaders
         gallery_tap.comp.slang
         fx_track_pin.comp.slang
         fx_vhs.comp.slang
+        fx_morphology.comp.slang
+        fx_drip.comp.slang
+        fx_burn_in.comp.slang
+        fx_aperture.comp.slang
+        fx_parallax.comp.slang
+        fx_patch_weave.comp.slang
+        fx_halation.comp.slang
+        fx_rolling_shutter.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang

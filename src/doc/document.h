@@ -146,6 +146,31 @@ struct PathPoint {
     float out_dx = 0.0f, out_dy = 0.0f;
 };
 
+// A stop carries an id so a keyframe lane survives an insert before it.
+// x and y are canvas uv. Axial shapes project them onto the axis; Mesh
+// weights every stop by its distance, so the placement is the whole shape.
+struct GradientStop {
+    uint64_t id = 0;
+    float t = 0.0f;
+    float x = 0.5f;
+    float y = 0.5f;
+    float color[3] = {0.0f, 0.0f, 0.0f};
+};
+
+inline constexpr size_t kMaxGradientStops = 8;
+inline constexpr size_t kMaxMeshStops = 16;
+
+enum class GradientKind : uint32_t {
+    Linear = 0,
+    Radial,
+    Diamond,
+    Angular,
+    Mesh,
+    Count,
+};
+
+enum class GradientSpace : uint32_t { Rgb = 0, Hsl, Oklab, Count };
+
 struct Layer {
     uint64_t id = 0;
     std::string name;
@@ -169,6 +194,13 @@ struct Layer {
     // Custom shape path: closed = a filled matte, open = a feathered stroke.
     std::vector<PathPoint> path;
     bool path_closed = true;
+    // Gradient ramp, sorted by pos at resolve time, never on edit.
+    std::vector<GradientStop> stops;
+    GradientKind gradient = GradientKind::Linear;
+    GradientSpace gradient_space = GradientSpace::Rgb;
+    float gradient_len = 1.0f;
+    float gradient_x = 0.5f;
+    float gradient_y = 0.5f;
     BlendMode blend = BlendMode::Normal;
     float opacity = 1.0f;
     bool visible = true;
@@ -187,6 +219,29 @@ struct Layer {
     std::vector<EffectInstance> stack;
     std::vector<Group> groups;
 };
+
+inline const GradientStop* find_gradient_stop(const Layer& l, uint64_t id) {
+    for (const GradientStop& s : l.stops)
+        if (s.id == id) return &s;
+    return nullptr;
+}
+
+inline void gradient_lever_uv(const Layer& l, float t, float* ux,
+                              float* uy) {
+    const float ca = std::cos(l.gen_angle), sa = std::sin(l.gen_angle);
+    const float u = l.gradient == GradientKind::Linear ? t - 0.5f : t * 0.5f;
+    *ux = l.gradient_x + ca * l.gradient_len * u;
+    *uy = l.gradient_y + sa * l.gradient_len * u;
+}
+
+inline float gradient_lever_t(const Layer& l, float ux, float uy) {
+    const float ca = std::cos(l.gen_angle), sa = std::sin(l.gen_angle);
+    const float len = l.gradient_len > 1e-4f ? l.gradient_len : 1e-4f;
+    const float u = ((ux - l.gradient_x) * ca + (uy - l.gradient_y) * sa) /
+                    len;
+    return std::clamp(l.gradient == GradientKind::Linear ? u + 0.5f : u * 2.0f,
+                      0.0f, 1.0f);
+}
 
 inline bool layer_has_transform(const Layer& l) {
     return l.crop_l > 0.0f || l.crop_r > 0.0f || l.crop_t > 0.0f ||

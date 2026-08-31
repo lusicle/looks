@@ -244,6 +244,21 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
         kind == LayerSourceKind::TestPattern ||
         kind == LayerSourceKind::Oscillator)
         layer.opacity = 0.5f;
+    if (kind == LayerSourceKind::Gradient) {
+        GradientStop a;
+        a.id = doc.next_effect_id++;
+        a.t = 0.0f;
+        a.x = 0.35f;
+        a.y = 0.35f;
+        a.color[0] = a.color[1] = a.color[2] = 1.0f;
+        GradientStop b;
+        b.id = doc.next_effect_id++;
+        b.t = 1.0f;
+        b.x = 0.65f;
+        b.y = 0.65f;
+        layer.stops.push_back(a);
+        layer.stops.push_back(b);
+    }
     if (kind == LayerSourceKind::Oscillator) {
         // For Oscillator, gen_scale is in cycles, not pixels.
         layer.gen_scale = 8.0f;

@@ -11,10 +11,13 @@ namespace looks::doc {
 // param_index >= 0 indexes params; negatives are built-ins (stack_commands.h).
 // A layer key sets this bit and carries the layer id.
 inline constexpr uint64_t kLayerParamBit = 1ull << 62;
-// Slots 15 and 16 are field ids only, never modulatable.
-inline constexpr int kLayerParamCount = 20;
+// Slots 15, 16, 20 and 21 are field ids only, never modulatable.
+inline constexpr int kLayerParamCount = 25;
 // A group key sets this bit and carries the group id; wet/opacity only.
 inline constexpr uint64_t kGroupParamBit = 1ull << 61;
+// A gradient stop key sets this bit and carries the stop id.
+// param_index: 0 position, 1 red, 2 green, 3 blue.
+inline constexpr uint64_t kStopParamBit = 1ull << 60;
 
 struct ParamKey {
     uint64_t effect_id = 0;
@@ -44,8 +47,14 @@ enum class ModSourceType : uint32_t {
     Normalise,
     // Camera: channel picks stab x/y/rot/scale or an anchor projection.
     Camera,
+    Hold,
+    Sequence,
     Count,
 };
+
+inline bool value_kind_is_triggered(ModSourceType t) {
+    return t == ModSourceType::Hold || t == ModSourceType::Sequence;
+}
 
 // These kinds need audio_src wired. Unwired reads 0, never a global curve.
 inline bool value_kind_wants_audio(ModSourceType t) {
@@ -101,6 +110,12 @@ struct ValueNode {
     float node_x = 0.0f;
     float node_y = 0.0f;
 };
+
+inline bool value_node_wants_media(const ValueNode& n) {
+    if (value_kind_wants_media(n.source.type)) return true;
+    return value_kind_is_triggered(n.source.type) &&
+           (n.source.trigger == 1 || n.source.trigger == 2);
+}
 
 // node 0 = dangling: inert, kept so undo can restore its source.
 struct ModRoute {

@@ -288,6 +288,15 @@ private:
         uint32_t w = 0, h = 0;
     };
     std::unordered_map<uint64_t, ShapeSlot> shape_state_;
+    static constexpr uint32_t kRampTexels = 256;
+    struct RampSlot {
+        uint64_t hash = 0;
+        std::unique_ptr<GpuImage> tex;
+    };
+    std::unordered_map<uint64_t, RampSlot> ramp_state_;
+    const GpuImage* ensure_gradient_ramp(VkCommandBuffer rec,
+                                         StagingBuffer& staging,
+                                         const doc::Layer& layer);
     std::shared_ptr<const PinPlaneMap> pin_planes_;
 
     std::unique_ptr<GpuImage> noise_lut_;

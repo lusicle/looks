@@ -1337,7 +1337,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.clear_capture();
     }
 
-    if (st.drag_kind == 2 &&
+    if (st.drag_kind != 0 &&
         !(frame.input.buttons_down &
           (ui::kMouseMiddle | ui::kMouseLeft))) {
         st.drag_kind = 0;

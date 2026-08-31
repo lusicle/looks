@@ -87,6 +87,10 @@ float* layer_param_slot(doc::Layer& layer, int param_index) {
         case 17: return &layer.gen_phase;
         case 18: return &layer.xf_anchor_x;
         case 19: return &layer.xf_anchor_y;
+        // 20 gradient kind / 21 space: field ids only, never modulatable.
+        case 22: return &layer.gradient_len;
+        case 23: return &layer.gradient_x;
+        case 24: return &layer.gradient_y;
         default: return nullptr;
     }
 }
@@ -108,6 +112,7 @@ void layer_param_range(int param_index, float* min_value, float* max_value) {
         case 14: *min_value = -180.0f; *max_value = 180.0f; break;
         // Phase wraps in the kernel; the large max lets loops run many periods.
         case 17: *max_value = 1.0e6f; break;
+        case 22: *min_value = 0.05f; *max_value = 4.0f; break;
         default: break;   // opacity + colors, normalized 0..1
     }
 }
@@ -118,14 +123,16 @@ constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
     "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
     "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
     "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
-    "slip",    "waveform",  "phase",     "xf_anchor_x", "xf_anchor_y"};
+    "slip",    "waveform",  "phase",     "xf_anchor_x", "xf_anchor_y",
+    "grad_kind", "grad_space", "grad_len", "grad_x", "grad_y"};
 
 constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
     "opacity", "color a r", "color a g", "color a b", "color b r",
     "color b g", "color b b", "scale",   "angle",     "crop left",
     "crop right", "crop top", "crop bottom", "transform scale",
     "transform rotate", "slip", "waveform", "phase", "anchor x",
-    "anchor y"};
+    "anchor y", "gradient shape", "gradient blend", "gradient length",
+    "gradient x", "gradient y"};
 
 }  // namespace
 

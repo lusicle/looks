@@ -274,6 +274,70 @@ float eval_value_node(const ValueEnv& env, uint64_t node_id, int depth) {
                 default: return a;
             }
         }
+        case doc::ModSourceType::Hold:
+        case doc::ModSourceType::Sequence: {
+            const AnalysisCurves* c = env.analysis;
+            if (n->audio_src && env.node_audio) {
+                const auto it = env.node_audio->find(n->id);
+                if (it != env.node_audio->end() && it->second.curves)
+                    c = it->second.curves.get();
+            }
+            const double t = env.frame_f >= 0.0 && env.fps > 0.0
+                                 ? env.frame_f / env.fps
+                                 : env.t;
+            const double rate = std::max(0.001, static_cast<double>(
+                                                    n->source.rate_hz));
+            double index = 0.0;
+            double held_t = 0.0;
+            if (n->source.trigger == 1 && c) {
+                const double ph = c->beat_phase(t) / rate;
+                index = std::floor(ph);
+                held_t = t - (ph - index) * rate * c->beat_span(t);
+            } else if (n->source.trigger == 2 || n->source.trigger == 3) {
+                const std::vector<float>* curve =
+                    !c ? nullptr
+                       : (n->source.trigger == 2 ? &c->onset : &c->cut);
+                const uint32_t here = env.frame;
+                uint32_t last = 0;
+                double count = 0.0;
+                if (curve) {
+                    const uint32_t end = static_cast<uint32_t>(
+                        std::min<size_t>(curve->size(),
+                                         static_cast<size_t>(here) + 1));
+                    for (uint32_t f = 0; f < end; ++f)
+                        if ((*curve)[f] >= 0.5f) {
+                            last = f;
+                            count += 1.0;
+                        }
+                }
+                index = count;
+                held_t = env.fps > 0.0 ? last / env.fps : 0.0;
+            } else {
+                const double period = 1.0 / rate;
+                index = std::floor(t / period);
+                held_t = index * period;
+            }
+            if (n->source.type == doc::ModSourceType::Hold) {
+                if (!n->in_a) return n->const_a;
+                ValueEnv at = env;
+                at.t = held_t;
+                at.frame_f = env.fps > 0.0 ? held_t * env.fps : -1.0;
+                at.frame = held_t <= 0.0
+                    ? 0u
+                    : static_cast<uint32_t>(held_t * env.fps);
+                return eval_value_node(at, n->in_a, depth + 1);
+            }
+            const int len = std::max(
+                1, static_cast<int>(n->const_b + 0.5f));
+            int pos = static_cast<int>(std::fmod(index, len));
+            if (pos < 0) pos += len;
+            const uint64_t h = hash_combine(
+                hash_combine(n->source.seed, n->id),
+                static_cast<uint64_t>(pos));
+            const float u = static_cast<float>(
+                (h >> 11) * (1.0 / 9007199254740992.0));
+            return n->in_min + (n->in_max - n->in_min) * u;
+        }
         case doc::ModSourceType::Normalise: {
             const float a = input(n->in_a, n->const_a);
             const float m = n->const_b;
@@ -489,6 +553,24 @@ void resolve_look(const doc::Look& look, doc::Look& out,
             }
         return nullptr;
     };
+    auto stop_slot = [&](const doc::ParamKey& key, float* min_v,
+                         float* max_v) -> float* {
+        if (!(key.effect_id & doc::kStopParamBit)) return nullptr;
+        const uint64_t id = key.effect_id & ~doc::kStopParamBit;
+        *min_v = 0.0f;
+        *max_v = 1.0f;
+        for (doc::Layer& l : out.layers)
+            for (doc::GradientStop& s : l.stops) {
+                if (s.id != id) continue;
+                if (key.param_index == 0) return &s.t;
+                if (key.param_index == 1) return &s.x;
+                if (key.param_index == 2) return &s.y;
+                if (key.param_index >= 3 && key.param_index <= 5)
+                    return &s.color[key.param_index - 3];
+                return nullptr;
+            }
+        return nullptr;
+    };
     // Group keys carry kGroupParamBit + group id; slots are wet/opacity 0..1.
     auto group_slot = [&](const doc::ParamKey& key, float* min_v,
                           float* max_v) -> float* {
@@ -515,6 +597,10 @@ void resolve_look(const doc::Look& look, doc::Look& out,
             *gslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
             continue;
         }
+        if (float* sslot = stop_slot(lane.target, &min_v, &max_v)) {
+            *sslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
+            continue;
+        }
         size_t layer = 0, index = 0;
         if (!find_effect(out, lane.target.effect_id, &layer, &index)) continue;
         doc::EffectInstance& fx = out.layers[layer].stack[index];
@@ -530,6 +616,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         float min_v = 0.0f, max_v = 1.0f;
         float* slot = layer_slot(route.target, &min_v, &max_v);
         if (!slot) slot = group_slot(route.target, &min_v, &max_v);
+        if (!slot) slot = stop_slot(route.target, &min_v, &max_v);
         if (!slot) {
             size_t layer = 0, index = 0;
             if (!find_effect(out, route.target.effect_id, &layer, &index))
