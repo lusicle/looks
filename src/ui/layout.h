@@ -49,7 +49,6 @@ struct ScrollState {
     float offset = 0.0f;        // px scrolled along the main axis
     float content = 0.0f;       // measured content extent (set by layout)
     float viewport = 0.0f;      // visible extent (set by layout)
-    bool dragging_thumb = false;
     float drag_grab = 0.0f;     // offset of grab point within the thumb
 };
 

@@ -1,5 +1,7 @@
 #include "mod/param_table.h"
 
+#include <climits>
+
 #include "doc/effects.h"
 #include "doc/stack_commands.h"
 
@@ -91,6 +93,8 @@ float* layer_param_slot(doc::Layer& layer, int param_index) {
         case 22: return &layer.gradient_len;
         case 23: return &layer.gradient_x;
         case 24: return &layer.gradient_y;
+        case 25: return &layer.color_a[3];
+        case 26: return &layer.color_b[3];
         default: return nullptr;
     }
 }
@@ -124,7 +128,8 @@ constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
     "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
     "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
     "slip",    "waveform",  "phase",     "xf_anchor_x", "xf_anchor_y",
-    "grad_kind", "grad_space", "grad_len", "grad_x", "grad_y"};
+    "grad_kind", "grad_space", "grad_len", "grad_x", "grad_y",
+    "color_a.a", "color_b.a"};
 
 constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
     "opacity", "color a r", "color a g", "color a b", "color b r",
@@ -132,9 +137,15 @@ constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
     "crop right", "crop top", "crop bottom", "transform scale",
     "transform rotate", "slip", "waveform", "phase", "anchor x",
     "anchor y", "gradient shape", "gradient blend", "gradient length",
-    "gradient x", "gradient y"};
+    "gradient x", "gradient y", "color a alpha", "color b alpha"};
 
 }  // namespace
+
+int layer_param_index_of(const std::string& id) {
+    for (int i = 0; i < doc::kLayerParamCount; ++i)
+        if (id == kLayerParamIds[i]) return i;
+    return INT_MIN;
+}
 
 std::vector<ParamEntry> build_param_table(const doc::Document& doc,
                                           const doc::Look& look) {

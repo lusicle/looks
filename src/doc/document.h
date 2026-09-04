@@ -154,7 +154,7 @@ struct GradientStop {
     float t = 0.0f;
     float x = 0.5f;
     float y = 0.5f;
-    float color[3] = {0.0f, 0.0f, 0.0f};
+    float color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 inline constexpr size_t kMaxGradientStops = 8;
@@ -183,8 +183,8 @@ struct Layer {
     bool timeline_lock = false;
     uint64_t target = 0;
     // Generators: color_a start, color_b end, gen_scale cells, gen_angle dir.
-    float color_a[3] = {0.5f, 0.5f, 0.5f};
-    float color_b[3] = {0.1f, 0.1f, 0.1f};
+    float color_a[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+    float color_b[4] = {0.1f, 0.1f, 0.1f, 1.0f};
     float gen_scale = 6.0f;
     float gen_angle = 0.0f;
     // Oscillator phase in percent of one period. Values can pass 100.

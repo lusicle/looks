@@ -69,4 +69,25 @@ inline float srgb_oetf(float lin) {
                              : 1.055f * std::pow(lin, 1.0f / 2.4f) - 0.055f;
 }
 
+inline float hsl_channel(float p, float q, float t) {
+    if (t < 0.0f) t += 1.0f;
+    if (t > 1.0f) t -= 1.0f;
+    if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+    if (t < 0.5f) return q;
+    if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+    return p;
+}
+
+inline void hsl_to_rgb(float h, float s, float l, float* out) {
+    if (s < 1e-6f) {
+        out[0] = out[1] = out[2] = l;
+        return;
+    }
+    const float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
+    const float p = 2.0f * l - q;
+    out[0] = hsl_channel(p, q, h + 1.0f / 3.0f);
+    out[1] = hsl_channel(p, q, h);
+    out[2] = hsl_channel(p, q, h - 1.0f / 3.0f);
+}
+
 }  // namespace looks::color

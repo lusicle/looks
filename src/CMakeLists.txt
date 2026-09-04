@@ -154,6 +154,7 @@ add_library(looks_ui_core STATIC
     ui/canvas2d.cpp
     ui/font.cpp
     ui/input.cpp
+    ui/interact.cpp
     ui/layout.cpp
     ui/probe.cpp
     ui/text.cpp

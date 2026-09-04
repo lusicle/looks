@@ -565,7 +565,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                 if (key.param_index == 0) return &s.t;
                 if (key.param_index == 1) return &s.x;
                 if (key.param_index == 2) return &s.y;
-                if (key.param_index >= 3 && key.param_index <= 5)
+                if (key.param_index >= 3 && key.param_index <= 6)
                     return &s.color[key.param_index - 3];
                 return nullptr;
             }

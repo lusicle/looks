@@ -8,10 +8,6 @@
 
 namespace looks::ui {
 
-inline constexpr uint8_t kMouseLeft = 1u << 0;
-inline constexpr uint8_t kMouseRight = 1u << 1;
-inline constexpr uint8_t kMouseMiddle = 1u << 2;
-
 struct UiInput {
     Vec2 mouse{};          // logical px; modals may deaden it per frame
     Vec2 mouse_delta{};
@@ -20,13 +16,10 @@ struct UiInput {
     uint8_t buttons_down = 0;
     uint8_t buttons_pressed = 0;    // edges this frame
     uint8_t buttons_released = 0;
-    float wheel_y = 0.0f;           // scroll notches; consumer zeroes it
-    float wheel_x = 0.0f;
+    float wheel_y = 0.0f;           // scroll notches; the Context owns it
     uint32_t mods = 0;              // platform::kModCtrl / Shift / Alt
-    std::vector<uint32_t> typed;    // UTF-32 chars this frame
-    bool backspace_pressed = false;
-    bool enter_pressed = false;
-    bool consumed = false;          // pointer claimed by UI this frame
+    // What the key chain did not take, for the focused widget to read.
+    std::vector<platform::Event> keys;
 
     bool left_down() const { return buttons_down & kMouseLeft; }
     bool left_pressed() const { return buttons_pressed & kMouseLeft; }

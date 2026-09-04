@@ -965,3 +965,41 @@ TEST(serialize_lane_flags_roundtrip) {
     CHECK(!plain2.root().tracks[0].lock);
     CHECK(!plain2.root().audio[0].lock);
 }
+
+TEST(serialize_gradient_stops_roundtrip) {
+    Document d = doc_with_look();
+    doc::Layer& l = d.looks[0].layers[0];
+    l.source = doc::LayerSourceKind::Gradient;
+    l.color_a[3] = 0.25f;
+    l.color_b[3] = 0.5f;
+    doc::GradientStop a;
+    a.id = 41;
+    a.t = 0.25f;
+    a.x = 0.2f;
+    a.y = 0.8f;
+    a.color[0] = 1.0f;
+    a.color[3] = 0.0f;
+    doc::GradientStop b;
+    b.id = 42;
+    b.t = 0.75f;
+    b.x = 0.6f;
+    b.y = 0.4f;
+    b.color[2] = 1.0f;
+    b.color[3] = 0.5f;
+    l.stops.push_back(a);
+    l.stops.push_back(b);
+
+    json::Value v = doc::doc_to_json(d);
+    Document d2 = doc::doc_from_json(v);
+    const doc::Layer& g = d2.looks[0].layers[0];
+    CHECK_EQ(g.stops.size(), size_t{2});
+    CHECK_EQ(g.stops[0].t, 0.25f);
+    CHECK_EQ(g.stops[1].t, 0.75f);
+    CHECK_EQ(g.stops[0].x, 0.2f);
+    CHECK_EQ(g.stops[1].y, 0.4f);
+    CHECK_EQ(g.stops[0].color[3], 0.0f);
+    CHECK_EQ(g.stops[1].color[3], 0.5f);
+    CHECK_EQ(g.color_a[3], 0.25f);
+    CHECK_EQ(g.color_b[3], 0.5f);
+    CHECK(doc::doc_to_json(d2) == v);
+}

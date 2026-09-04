@@ -8,6 +8,7 @@ add_executable(looks_tests
     test_nesting.cpp
     test_instances.cpp
     test_audio_mix.cpp
+    test_interact.cpp
     test_layout.cpp
     test_ui.cpp
     test_bmff.cpp

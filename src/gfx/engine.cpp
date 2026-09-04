@@ -427,7 +427,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     if (!dummy_flow_) return false;
 
     // The generator's one sampled input is the custom-shape SDF.
-    generator_ = mk("gen.comp.spv", 2, 1, 20 * sizeof(uint32_t));
+    generator_ = mk("gen.comp.spv", 2, 1, 24 * sizeof(uint32_t));
     layer_blend_ = mk("layer_blend.comp.spv", 2, 1, 11 * sizeof(uint32_t));
     layer_transform_ =
         mk("layer_transform.comp.spv", 1, 1, 11 * sizeof(uint32_t));
@@ -1260,27 +1260,6 @@ void hsl_of(const float rgb[3], float* h, float* s, float* l) {
     if (*h < 0.0f) *h += 1.0f;
 }
 
-float hue_channel(float p, float q, float t) {
-    if (t < 0.0f) t += 1.0f;
-    if (t > 1.0f) t -= 1.0f;
-    if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
-    if (t < 0.5f) return q;
-    if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
-    return p;
-}
-
-void hsl_to_rgb(float h, float s, float l, float* out) {
-    if (s < 1e-6f) {
-        out[0] = out[1] = out[2] = l;
-        return;
-    }
-    const float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
-    const float p = 2.0f * l - q;
-    out[0] = hue_channel(p, q, h + 1.0f / 3.0f);
-    out[1] = hue_channel(p, q, h);
-    out[2] = hue_channel(p, q, h - 1.0f / 3.0f);
-}
-
 void oklab_of(const float lin[3], float* out) {
     const float l = 0.4122214708f * lin[0] + 0.5363325363f * lin[1] +
                     0.0514459929f * lin[2];
@@ -1302,6 +1281,26 @@ void oklab_to_linear(const float lab[3], float* out) {
     out[0] = 4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s;
     out[1] = -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s;
     out[2] = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
+}
+
+float mesh_stop_spacing(const doc::Layer& layer, uint32_t w, uint32_t h) {
+    const size_t n = layer.stops.size();
+    if (n < 2) return 1.0f;
+    const float aspect = static_cast<float>(w) /
+                         std::max(1.0f, static_cast<float>(h));
+    float total = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        float nearest = 1e30f;
+        for (size_t j = 0; j < n; ++j) {
+            if (j == i) continue;
+            const float dx =
+                (layer.stops[i].x - layer.stops[j].x) * aspect;
+            const float dy = layer.stops[i].y - layer.stops[j].y;
+            nearest = std::min(nearest, dx * dx + dy * dy);
+        }
+        total += std::sqrt(nearest);
+    }
+    return std::max(1e-3f, total / static_cast<float>(n));
 }
 
 }  // namespace
@@ -1358,7 +1357,7 @@ const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
     auto decode = [&](const float* v, float* out) {
         if (space == doc::GradientSpace::Hsl) {
             float srgb[3];
-            hsl_to_rgb(v[0], v[1], v[2], srgb);
+            color::hsl_to_rgb(v[0], v[1], v[2], srgb);
             for (int i = 0; i < 3; ++i) out[i] = color::srgb_eotf(srgb[i]);
         } else if (space == doc::GradientSpace::Oklab) {
             oklab_to_linear(v, out);
@@ -1373,10 +1372,13 @@ const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
         size_t hi = 0;
         while (hi < stops.size() && stops[hi].first < t) ++hi;
         float mixed[3];
+        float mixed_a;
         if (hi == 0) {
             encode(stops.front().second, mixed);
+            mixed_a = stops.front().second.color[3];
         } else if (hi >= stops.size()) {
             encode(stops.back().second, mixed);
+            mixed_a = stops.back().second.color[3];
         } else {
             const doc::GradientStop& a = stops[hi - 1].second;
             const doc::GradientStop& b = stops[hi].second;
@@ -1386,6 +1388,7 @@ const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
             float ea[3], eb[3];
             encode(a, ea);
             encode(b, eb);
+            mixed_a = a.color[3] + (b.color[3] - a.color[3]) * f;
             if (space == doc::GradientSpace::Hsl) {
                 // Take the short way round the hue circle.
                 float d = eb[0] - ea[0];
@@ -1405,21 +1408,20 @@ const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
         decode(mixed, lin);
         for (int k = 0; k < 3; ++k)
             texels[i * 4 + k] = std::max(0.0f, lin[k]);
-        texels[i * 4 + 3] = 1.0f;
+        texels[i * 4 + 3] = std::clamp(mixed_a, 0.0f, 1.0f);
     }
 
-    // Row 1: two texels per stop, position then linear colour.
+    // Row 1: two texels per stop, position then blend-space colour.
     const size_t row1 = static_cast<size_t>(kRampTexels) * 4;
     const size_t n_mesh = std::min<size_t>(stops.size(), kRampTexels / 2);
     for (size_t i = 0; i < n_mesh; ++i) {
         const doc::GradientStop& s = stops[i].second;
         texels[row1 + i * 8 + 0] = s.x;
         texels[row1 + i * 8 + 1] = s.y;
-        float lin[3];
-        for (int k = 0; k < 3; ++k) lin[k] = color::srgb_eotf(s.color[k]);
-        for (int k = 0; k < 3; ++k)
-            texels[row1 + i * 8 + 4 + k] = std::max(0.0f, lin[k]);
-        texels[row1 + i * 8 + 7] = 1.0f;
+        float enc[3];
+        encode(s, enc);
+        for (int k = 0; k < 3; ++k) texels[row1 + i * 8 + 4 + k] = enc[k];
+        texels[row1 + i * 8 + 7] = std::clamp(s.color[3], 0.0f, 1.0f);
     }
 
     if (!staging.upload_image(rec, texels.data(),
@@ -2070,7 +2072,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::Generator: {
-                uint32_t push[20] = {};
+                uint32_t push[24] = {};
                 push[0] = w;
                 push[1] = h;
                 // The dummy starts UNDEFINED, so give the sampler a layout.
@@ -2085,21 +2087,25 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[3] = static_cast<uint32_t>(
                         hash_combine(doc.master_seed, layer.id));
                     push[4] = timeline_frame;
-                    for (int c = 0; c < 3; ++c) {
+                    for (int c = 0; c < 4; ++c) {
                         push[5 + c] = as_bits(layer.color_a[c]);
-                        push[8 + c] = as_bits(layer.color_b[c]);
+                        push[9 + c] = as_bits(layer.color_b[c]);
                     }
-                    push[11] = as_bits(layer.gen_scale);
-                    push[12] = as_bits(layer.gen_angle);
-                    push[13] = layer.osc_shape;
-                    push[14] = as_bits(layer.gen_phase);
+                    push[13] = as_bits(layer.gen_scale);
+                    push[14] = as_bits(layer.gen_angle);
+                    push[15] = layer.osc_shape;
+                    push[16] = as_bits(layer.gen_phase);
                     if (layer.source == doc::LayerSourceKind::Gradient) {
-                        push[15] = static_cast<uint32_t>(layer.gradient);
-                        push[16] = as_bits(layer.gradient_len);
-                        push[17] = as_bits(layer.gradient_x);
-                        push[18] = as_bits(layer.gradient_y);
-                        push[19] = static_cast<uint32_t>(
+                        push[17] = static_cast<uint32_t>(layer.gradient);
+                        push[18] = as_bits(layer.gradient_len);
+                        push[19] = as_bits(layer.gradient_x);
+                        push[20] = as_bits(layer.gradient_y);
+                        push[21] = static_cast<uint32_t>(
                             std::min<size_t>(layer.stops.size(), 32));
+                        push[22] = as_bits(layer.gradient_len *
+                                           mesh_stop_spacing(layer, w, h));
+                        push[23] = static_cast<uint32_t>(
+                            layer.gradient_space);
                         if (const GpuImage* r =
                                 ensure_gradient_ramp(rec, staging, layer))
                             ramp_tex = r;

@@ -23,7 +23,10 @@ struct ParamDesc {
     uint32_t vis_mask = 0;
     // The value is in radians; the row shows degrees.
     bool display_deg = false;
+    float hue_bar = -1.0f;
 };
+
+inline bool param_is_hue(const ParamDesc& d) { return d.hue_bar >= 0.0f; }
 
 inline bool param_visible(const EffectInstance& fx, const ParamDesc& d) {
     if (d.vis_param < 0) return true;

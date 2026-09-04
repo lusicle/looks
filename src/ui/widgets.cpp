@@ -241,24 +241,15 @@ float transition_step(float current, bool on, float dt) {
 // Returns true when a press releases inside the rect.
 bool tick_press_release(ButtonState& state, WidgetId id, const Rect& rect,
                         LayoutFrame& frame) {
-    const bool owns = frame.ctx.widget_owns_mouse(id);
-    bool clicked = false;
-    if (frame.input.left_pressed() && owns && !state.pressed) {
-        state.pressed = true;
-        frame.ctx.set_capture(id);
-    }
-    if (state.pressed && frame.input.left_released()) {
-        if (rect.contains(frame.input.mouse)) clicked = true;
-        state.pressed = false;
-        frame.ctx.clear_capture();
-    }
-    const bool hovered = owns;
-    state.hover_t = transition_step(state.hover_t, hovered && !state.pressed,
-                                    frame.dt);
+    const Gesture g = frame.ctx.gesture(id, rect);
+    if (g.pressed) state.pressed = true;
+    if (g.drag_released) state.pressed = false;
+    state.hover_t = transition_step(state.hover_t,
+                                    g.hovered && !state.pressed, frame.dt);
     state.press_t = transition_step(state.press_t, state.pressed, frame.dt);
     state.hover_seconds =
-        hovered && !state.pressed ? state.hover_seconds + frame.dt : 0.0f;
-    return clicked;
+        g.hovered && !state.pressed ? state.hover_seconds + frame.dt : 0.0f;
+    return g.clicked;
 }
 
 void maybe_tooltip(const ButtonState& state, const char* tooltip,
@@ -629,9 +620,8 @@ void hit_dropdown(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const DropdownUser*>(node.user);
     register_rect_hit(node, frame, &u->state->button);
     if (u->state->open)   // the popup owns everything under it while open
-        frame.ctx.add_hit(dropdown_popup_rect(*u, node.rect, frame),
-                          frame.ctx.acquire_widget_id(u->state),
-                          HitLayer::Popup);
+        frame.ctx.push_overlay(dropdown_popup_rect(*u, node.rect, frame),
+                               frame.ctx.acquire_widget_id(u->state), false);
 }
 
 void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
@@ -726,12 +716,11 @@ void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
     ScrubberState& s = *u->state;
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
-    const bool owns = frame.ctx.widget_owns_mouse(id);
-    if (frame.input.left_pressed() && owns && !s.dragging) {
+    const Gesture g = frame.ctx.gesture(id, r);
+    if (g.pressed) {
         s.dragging = true;
         s.moved = false;
         s.press_value = -1.0f;
-        frame.ctx.set_capture(id);
     }
     if (s.dragging) {
         const float last = std::max(0.0f, u->frame_count - 1.0f);
@@ -745,9 +734,8 @@ void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
             *u->frame_value = next;
             if (u->out_changed) *u->out_changed = true;
         }
-        if (frame.input.left_released()) {
+        if (g.drag_released) {
             s.dragging = false;
-            frame.ctx.clear_capture();
         }
     }
 
@@ -854,17 +842,15 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     const float value_zone_x = r.right() - text_w - 10.0f;
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
-    const bool owns = frame.ctx.widget_owns_mouse(id);
-    if (u->out_ctx && frame.input.right_pressed() && owns && !s.dragging)
-        *u->out_ctx = true;
-    if (frame.input.left_pressed() && owns && !s.dragging) {
+    const Gesture g = frame.ctx.gesture(id, r);
+    if (u->out_ctx && g.right_clicked && !s.dragging) *u->out_ctx = true;
+    if (g.pressed) {
         if (u->out_value_clicked && u->format &&
             frame.input.mouse.x >= value_zone_x) {
             *u->out_value_clicked = true;
         } else {
             s.dragging = true;
             s.fine = false;
-            frame.ctx.set_capture(id);
         }
     }
     if (s.dragging) {
@@ -902,15 +888,14 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
             *u->value = next;
             if (u->out_changed) *u->out_changed = true;
         }
-        if (frame.input.left_released()) {
+        if (g.drag_released) {
             s.dragging = false;
             s.fine = false;
-            frame.ctx.clear_capture();
             if (u->out_released) *u->out_released = true;
         }
     }
     s.hover_seconds =
-        owns && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
+        g.hovered && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
     if (u->tooltip && s.hover_seconds > 0.5f)
         frame.ctx.set_tooltip(u->tooltip,
                               {frame.input.mouse.x + 12.0f,
@@ -993,10 +978,9 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
     const Vec2 center{r.x + kDialRadius + 3.0f, r.y + r.h * 0.5f};
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
-    const bool owns = frame.ctx.widget_owns_mouse(id);
-    if (u->out_ctx && frame.input.right_pressed() && owns && !s.dragging)
-        *u->out_ctx = true;
-    if (frame.input.left_pressed() && owns && !s.dragging) {
+    const Gesture g = frame.ctx.gesture(id, r);
+    if (u->out_ctx && g.right_clicked && !s.dragging) *u->out_ctx = true;
+    if (g.pressed) {
         if (u->out_value_clicked && u->format &&
             frame.input.mouse.x >= value_zone_x) {
             *u->out_value_clicked = true;
@@ -1005,7 +989,7 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
             s.dial_angle = dial_mouse_angle(frame.input.mouse, center);
             // Integrate unsnapped, or sub-step drags never accumulate.
             s.fine_anchor_value = *u->value;
-            frame.ctx.set_capture(id);
+            frame.ctx.begin_drag(id);
         }
     }
     if (s.dragging) {
@@ -1029,13 +1013,13 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
             *u->value = next;
             if (u->out_changed) *u->out_changed = true;
         }
-        if (frame.input.left_released()) {
+        if (g.drag_released) {
             s.dragging = false;
-            frame.ctx.clear_capture();
             if (u->out_released) *u->out_released = true;
         }
     }
-    s.hover_seconds = owns && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
+    s.hover_seconds =
+        g.hovered && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
     if (u->tooltip && s.hover_seconds > 0.5f)
         frame.ctx.set_tooltip(u->tooltip,
                               {frame.input.mouse.x + 12.0f,
@@ -1105,9 +1089,9 @@ void rgb_to_hsv(const float rgb[3], float& h, float& s, float& v) {
 namespace {
 
 struct SwatchUser {
-    float rgb[3];
+    float rgba[4];
     SwatchState* state;
-    float* out_rgb;
+    float* out_rgba;
     bool* out_changed;
     bool* out_released;
 };
@@ -1116,18 +1100,85 @@ constexpr float kPickerW = 192.0f;
 constexpr float kPickerSvH = 128.0f;
 constexpr float kPickerHueH = 12.0f;
 constexpr float kPickerFieldH = 17.0f;
-constexpr float kPickerH = 6.0f + kPickerSvH + 6.0f + kPickerHueH + 6.0f +
-                           kPickerFieldH + 4.0f + kPickerFieldH + 6.0f;
+constexpr int kSvCells = 16;
+constexpr int kHueCells = 96;
+constexpr float kCheckerCell = 5.0f;
+
+float picker_height(SwatchMode mode) {
+    if (mode == SwatchMode::Hue)
+        return 6.0f + kPickerHueH + 6.0f + kPickerFieldH + 6.0f;
+    float h = 6.0f + kPickerSvH + 6.0f + kPickerHueH + 6.0f +
+              kPickerFieldH + 4.0f + kPickerFieldH + 6.0f;
+    if (mode == SwatchMode::Rgba) h += kPickerHueH + 6.0f;
+    return h;
+}
+
+void draw_checker(Canvas2D& canvas, const Rect& r) {
+    canvas.push_clip(r);
+    const Color light = Color::srgb(0.62f, 0.62f, 0.62f);
+    const Color dark = Color::srgb(0.42f, 0.42f, 0.42f);
+    canvas.draw_rect(r, light);
+    const int cols =
+        static_cast<int>(std::ceil(r.w / kCheckerCell));
+    const int rows = static_cast<int>(std::ceil(r.h / kCheckerCell));
+    for (int y = 0; y < rows; ++y)
+        for (int x = (y & 1); x < cols; x += 2)
+            canvas.draw_rect({r.x + static_cast<float>(x) * kCheckerCell,
+                              r.y + static_cast<float>(y) * kCheckerCell,
+                              kCheckerCell, kCheckerCell},
+                             dark);
+    canvas.pop_clip();
+}
 
 }  // namespace
 
-Rect swatch_popup_rect(const Rect& anchor, const LayoutFrame& frame) {
+Color hue_bar_color(float hue01, float lightness) {
+    float rgb[3];
+    color::hsl_to_rgb(hue01 - std::floor(hue01), 1.0f,
+                      std::clamp(lightness, 0.02f, 0.98f), rgb);
+    return Color::srgb(rgb[0], rgb[1], rgb[2]);
+}
+
+void swatch_seed_from(SwatchState& st, const float rgba[4]) {
+    if (st.mode == SwatchMode::Hue) {
+        st.hue = std::clamp(rgba[0], 0.0f, 1.0f) * 360.0f;
+        st.sat = 1.0f;
+        st.val = 1.0f;
+        st.alpha = 1.0f;
+    } else {
+        rgb_to_hsv(rgba, st.hue, st.sat, st.val);
+        st.alpha = st.mode == SwatchMode::Rgba
+                       ? std::clamp(rgba[3], 0.0f, 1.0f)
+                       : 1.0f;
+    }
+    st.drag_zone = 0;
+    st.field_edit = -1;
+    st.edit.set("");
+}
+
+void draw_swatch_face(Canvas2D& canvas, const Rect& r, float radius,
+                      SwatchMode mode, const float rgba[4],
+                      float hue_light) {
+    if (mode == SwatchMode::Hue) {
+        canvas.draw_sdf_rect(r, radius, hue_bar_color(rgba[0], hue_light));
+        return;
+    }
+    const float a =
+        mode == SwatchMode::Rgba ? std::clamp(rgba[3], 0.0f, 1.0f) : 1.0f;
+    if (a < 1.0f) draw_checker(canvas, r);
+    canvas.draw_sdf_rect(r, radius,
+                         Color::srgb(rgba[0], rgba[1], rgba[2], a));
+}
+
+Rect swatch_popup_rect(const Rect& anchor, const SwatchState& st,
+                       const LayoutFrame& frame) {
+    const float h = picker_height(st.mode);
     float y = anchor.bottom() + 2.0f;
     const Vec2 view = frame.canvas.viewport();
-    if (y + kPickerH > view.y - 4.0f) y = anchor.y - kPickerH - 2.0f;
+    if (y + h > view.y - 4.0f) y = anchor.y - h - 2.0f;
     const float x =
         std::max(4.0f, std::min(anchor.x, view.x - kPickerW - 4.0f));
-    return {x, y, kPickerW, kPickerH};
+    return {x, y, kPickerW, h};
 }
 
 namespace {
@@ -1140,9 +1191,9 @@ void hit_swatch(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const SwatchUser*>(node.user);
     register_rect_hit(node, frame, &u->state->button);
     if (u->state->open)   // the popup owns everything under it while open
-        frame.ctx.add_hit(swatch_popup_rect(node.rect, frame),
-                          frame.ctx.acquire_widget_id(u->state),
-                          HitLayer::Popup);
+        frame.ctx.push_overlay(
+            swatch_popup_rect(node.rect, *u->state, frame),
+            frame.ctx.acquire_widget_id(u->state), false);
 }
 
 void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
@@ -1156,17 +1207,15 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
     if (tick_press_release(st.button, id, r, frame)) {
         st.open = !st.open;
         if (st.open) {
-            rgb_to_hsv(u->rgb, st.hue, st.sat, st.val);
-            st.drag_zone = 0;
-            st.field_edit = -1;
-            st.edit_len = 0;
+            swatch_seed_from(st, u->rgba);
             frame.ctx.set_popup_owner(&st);
         }
     }
     // Closing commits the typed field first, so no value is lost.
     const auto close = [&] {
-        swatch_commit_field(st, u->out_rgb, u->out_changed,
+        swatch_commit_field(st, u->out_rgba, u->out_changed,
                             u->out_released);
+        frame.ctx.clear_focus();
         st.open = false;
     };
     if (st.open && frame.ctx.popup_owner() != &st) close();
@@ -1176,8 +1225,7 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
     if (st.open && !owns && !over_popup && frame.input.left_pressed())
         close();
 
-    frame.canvas.draw_sdf_rect(r, 3.0f,
-                               Color{u->rgb[0], u->rgb[1], u->rgb[2], 1.0f});
+    draw_swatch_face(frame.canvas, r, 3.0f, st.mode, u->rgba, st.hue_light);
     frame.canvas.draw_sdf_rect_outline(
         r, 3.0f, theme.stroke_width,
         lerp(theme.hairline, theme.text_dim, st.button.hover_t));
@@ -1186,9 +1234,9 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
         Context::PopupRequest req;
         req.kind = Context::PopupKind::Color;
         req.anchor = r;
-        req.rect = swatch_popup_rect(r, frame);
+        req.rect = swatch_popup_rect(r, st, frame);
         req.state = &st;
-        req.out_rgb = u->out_rgb;
+        req.out_rgb = u->out_rgba;
         req.out_changed = u->out_changed;
         req.out_released = u->out_released;
         frame.ctx.set_popup(req);
@@ -1197,78 +1245,132 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
 
 }  // namespace
 
-// The R/G/B fields take 0-255 bytes; hex takes rrggbb or the shorthand.
-void swatch_commit_field(SwatchState& st, float* out_rgb,
+// R/G/B/A fields take 0-255 bytes. Hex takes rgb, rrggbb or rrggbbaa.
+void swatch_commit_field(SwatchState& st, float* out_rgba,
                          bool* out_changed, bool* out_released) {
     if (st.field_edit < 0) return;
-    st.edit_buf[std::min(st.edit_len,
-                         static_cast<int>(sizeof(st.edit_buf)) - 1)] = 0;
+    const std::string& text = st.edit.buf;
+    const size_t len = text.size();
     float rgb[3];
     hsv_to_rgb(st.hue, st.sat, st.val, rgb);
+    float alpha = st.alpha;
     bool valid = false;
-    if (st.field_edit < 3) {
-        if (st.edit_len > 0) {
-            rgb[st.field_edit] =
-                std::clamp(std::atoi(st.edit_buf), 0, 255) / 255.0f;
+    if (st.mode == SwatchMode::Hue) {
+        if (len > 0) {
+            st.hue = std::clamp(static_cast<float>(std::atof(text.c_str())),
+                                0.0f, 1.0f) *
+                     360.0f;
             valid = true;
         }
-    } else if (st.edit_len == 6 || st.edit_len == 3) {
+        st.field_edit = -1;
+        st.edit.set("");
+        if (!valid) return;
+        if (out_rgba) out_rgba[0] = st.hue / 360.0f;
+        if (out_changed) *out_changed = true;
+        if (out_released) *out_released = true;
+        return;
+    }
+    if (st.field_edit < 3) {
+        if (len > 0) {
+            rgb[st.field_edit] =
+                std::clamp(std::atoi(text.c_str()), 0, 255) / 255.0f;
+            valid = true;
+        }
+    } else if (st.field_edit == 3) {
+        if (len > 0) {
+            alpha = std::clamp(std::atoi(text.c_str()), 0, 255) / 255.0f;
+            valid = true;
+        }
+    } else if (len == 8 || len == 6 || len == 3) {
         const auto nib = [](char c) -> int {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
             if (c >= 'A' && c <= 'F') return c - 'A' + 10;
             return 0;
         };
-        for (int i = 0; i < 3; ++i) {
+        const int pairs = len == 3 ? 3 : static_cast<int>(len) / 2;
+        for (int i = 0; i < pairs; ++i) {
             const int byte =
-                st.edit_len == 6
-                    ? nib(st.edit_buf[i * 2]) * 16 +
-                          nib(st.edit_buf[i * 2 + 1])
-                    : nib(st.edit_buf[i]) * 17;
-            rgb[i] = static_cast<float>(byte) / 255.0f;
+                len == 3 ? nib(text[static_cast<size_t>(i)]) * 17
+                         : nib(text[static_cast<size_t>(i) * 2]) * 16 +
+                               nib(text[static_cast<size_t>(i) * 2 + 1]);
+            const float v = static_cast<float>(byte) / 255.0f;
+            if (i < 3)
+                rgb[i] = v;
+            else
+                alpha = v;
         }
         valid = true;
     }
     st.field_edit = -1;
-    st.edit_len = 0;
+    st.edit.set("");
     if (!valid) return;
     rgb_to_hsv(rgb, st.hue, st.sat, st.val);
-    if (out_rgb) {
-        out_rgb[0] = rgb[0];
-        out_rgb[1] = rgb[1];
-        out_rgb[2] = rgb[2];
+    if (st.mode == SwatchMode::Rgba) st.alpha = alpha;
+    if (out_rgba) {
+        out_rgba[0] = rgb[0];
+        out_rgba[1] = rgb[1];
+        out_rgba[2] = rgb[2];
+        if (st.mode == SwatchMode::Rgba) out_rgba[3] = st.alpha;
     }
     if (out_changed) *out_changed = true;
     if (out_released) *out_released = true;
 }
 
 void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
-                     const Context::PopupRequest& req, UiInput& input) {
+                     Context& ctx, const Context::PopupRequest& req,
+                     UiInput& input) {
     auto* st = static_cast<SwatchState*>(req.state);
     if (!st || !st->open) return;
+    const bool owns = ctx.widget_owns_mouse(ctx.acquire_widget_id(st));
+    const bool hue_only = st->mode == SwatchMode::Hue;
+    const bool has_alpha = st->mode == SwatchMode::Rgba;
 
     const Rect& r = req.rect;
     canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg);
     canvas.draw_sdf_rect_outline(r, theme.corner_radius, theme.stroke_width,
                                  theme.hairline);
-    const Rect sv{r.x + 6.0f, r.y + 6.0f, r.w - 12.0f, kPickerSvH};
-    const Rect hue{sv.x, sv.bottom() + 6.0f, sv.w, kPickerHueH};
-    const Rect chip{sv.x, hue.bottom() + 6.0f, kPickerFieldH,
-                    kPickerFieldH};
-    const float fw = (sv.w - chip.w - 4.0f * 3.0f) / 3.0f;
-    Rect fields[4];
-    for (int i = 0; i < 3; ++i)
-        fields[i] = {chip.right() + 4.0f + (fw + 4.0f) * i, chip.y, fw,
+    const float inner_w = r.w - 12.0f;
+    const Rect sv{r.x + 6.0f, r.y + 6.0f, inner_w,
+                  hue_only ? 0.0f : kPickerSvH};
+    const Rect hue{sv.x, hue_only ? r.y + 6.0f : sv.bottom() + 6.0f, sv.w,
+                   kPickerHueH};
+    const Rect alpha_bar{sv.x, hue.bottom() + 6.0f, sv.w,
+                         has_alpha ? kPickerHueH : 0.0f};
+    const float rows_y =
+        (has_alpha ? alpha_bar.bottom() : hue.bottom()) + 6.0f;
+    const Rect chip{sv.x, rows_y, kPickerFieldH, kPickerFieldH};
+
+    const int byte_fields = hue_only ? 0 : (has_alpha ? 4 : 3);
+    Rect fields[5];
+    for (Rect& f : fields) f = {};
+    if (hue_only) {
+        fields[0] = {sv.x, rows_y, sv.w, kPickerFieldH};
+    } else {
+        const float gap = 4.0f;
+        const float fw =
+            (sv.w - chip.w - gap * static_cast<float>(byte_fields)) /
+            static_cast<float>(byte_fields);
+        for (int i = 0; i < byte_fields; ++i)
+            fields[i] = {chip.right() + gap + (fw + gap) *
+                                                  static_cast<float>(i),
+                         chip.y, fw, kPickerFieldH};
+        fields[4] = {sv.x + 14.0f, chip.bottom() + 4.0f, sv.w - 14.0f,
                      kPickerFieldH};
-    fields[3] = {sv.x + 14.0f, chip.bottom() + 4.0f, sv.w - 14.0f,
-                 kPickerFieldH};
+    }
+    const int field_count = hue_only ? 1 : 5;
+    const auto field_slot = [&](int i) { return hue_only ? 0 : i; };
 
     float cur[3];
     hsv_to_rgb(st->hue, st->sat, st->val, cur);
-    if (input.left_pressed()) {
+    if (owns && input.left_pressed()) {
         int hit_field = -1;
-        for (int i = 0; i < 4; ++i)
-            if (fields[i].contains(input.mouse)) hit_field = i;
+        for (int i = 0; i < field_count; ++i) {
+            const int slot = field_slot(i);
+            if (fields[slot].w > 0.0f && fields[slot].contains(input.mouse))
+                hit_field = slot;
+        }
+        if (!hue_only && hit_field == 3 && !has_alpha) hit_field = -1;
         // A press commits the open field first, then routes to the new zone.
         if (st->field_edit >= 0 && hit_field != st->field_edit)
             swatch_commit_field(*st, req.out_rgb, req.out_changed,
@@ -1276,54 +1378,81 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
         if (hit_field >= 0 && hit_field != st->field_edit) {
             hsv_to_rgb(st->hue, st->sat, st->val, cur);
             st->field_edit = hit_field;
-            if (hit_field < 3)
-                st->edit_len = std::snprintf(
-                    st->edit_buf, sizeof(st->edit_buf), "%d",
-                    static_cast<int>(cur[hit_field] * 255.0f + 0.5f));
-            else
-                st->edit_len = std::snprintf(
-                    st->edit_buf, sizeof(st->edit_buf), "%02x%02x%02x",
+            char seed[16];
+            if (hue_only) {
+                std::snprintf(seed, sizeof(seed), "%.3f", st->hue / 360.0f);
+                st->edit.filter = TextFilter::Digits;
+                st->edit.cap = 5;
+            } else if (hit_field < 3) {
+                std::snprintf(seed, sizeof(seed), "%d",
+                              static_cast<int>(cur[hit_field] * 255.0f +
+                                               0.5f));
+                st->edit.filter = TextFilter::Uint;
+                st->edit.cap = 3;
+            } else if (hit_field == 3) {
+                std::snprintf(seed, sizeof(seed), "%d",
+                              static_cast<int>(st->alpha * 255.0f + 0.5f));
+                st->edit.filter = TextFilter::Uint;
+                st->edit.cap = 3;
+            } else {
+                const int n = std::snprintf(
+                    seed, sizeof(seed), "%02x%02x%02x",
                     static_cast<int>(cur[0] * 255.0f + 0.5f),
                     static_cast<int>(cur[1] * 255.0f + 0.5f),
                     static_cast<int>(cur[2] * 255.0f + 0.5f));
-        } else if (sv.contains(input.mouse)) {
+                if (has_alpha && n > 0)
+                    std::snprintf(seed + n, sizeof(seed) - size_t(n), "%02x",
+                                  static_cast<int>(st->alpha * 255.0f +
+                                                   0.5f));
+                st->edit.filter = TextFilter::Hex;
+                st->edit.cap = has_alpha ? 8 : 6;
+            }
+            st->edit.set(seed);
+            ctx.set_focus(ctx.acquire_widget_id(st));
+        } else if (!hue_only && sv.contains(input.mouse)) {
             st->drag_zone = 1;
         } else if (hue.contains(input.mouse)) {
             st->drag_zone = 2;
+        } else if (has_alpha && alpha_bar.contains(input.mouse)) {
+            st->drag_zone = 3;
         }
     }
-    if (st->field_edit >= 0) {
-        for (uint32_t cp : input.typed) {
-            const bool is_digit = cp >= '0' && cp <= '9';
-            const bool is_hex =
-                is_digit || (cp >= 'a' && cp <= 'f') ||
-                (cp >= 'A' && cp <= 'F');
-            const int cap = st->field_edit < 3 ? 3 : 6;
-            if (st->field_edit < 3 ? !is_digit : !is_hex) continue;
-            if (st->edit_len < cap)
-                st->edit_buf[st->edit_len++] = static_cast<char>(cp);
+    if (st->field_edit >= 0 && ctx.has_focus(ctx.acquire_widget_id(st))) {
+        for (const platform::Event& e : input.keys) {
+            const TextResult res = text_field_key(st->edit, e);
+            if (res == TextResult::Commit || res == TextResult::Cancel) {
+                if (res == TextResult::Cancel) st->edit.set("");
+                swatch_commit_field(*st, req.out_rgb, req.out_changed,
+                                    req.out_released);
+                ctx.clear_focus();
+                break;
+            }
         }
-        if (input.backspace_pressed && st->edit_len > 0) --st->edit_len;
-        if (input.enter_pressed)
-            swatch_commit_field(*st, req.out_rgb, req.out_changed,
-                                req.out_released);
     }
     if (st->drag_zone != 0) {
         if (st->drag_zone == 1) {
             st->sat = std::clamp((input.mouse.x - sv.x) / sv.w, 0.0f, 1.0f);
             st->val =
                 1.0f - std::clamp((input.mouse.y - sv.y) / sv.h, 0.0f, 1.0f);
-        } else {
+        } else if (st->drag_zone == 2) {
             st->hue =
                 std::clamp((input.mouse.x - hue.x) / hue.w, 0.0f, 1.0f) *
                 360.0f;
+        } else {
+            st->alpha = std::clamp(
+                (input.mouse.x - alpha_bar.x) / alpha_bar.w, 0.0f, 1.0f);
         }
-        float rgb[3];
-        hsv_to_rgb(st->hue, st->sat, st->val, rgb);
         if (req.out_rgb) {
-            req.out_rgb[0] = rgb[0];
-            req.out_rgb[1] = rgb[1];
-            req.out_rgb[2] = rgb[2];
+            if (hue_only) {
+                req.out_rgb[0] = st->hue / 360.0f;
+            } else {
+                float rgb[3];
+                hsv_to_rgb(st->hue, st->sat, st->val, rgb);
+                req.out_rgb[0] = rgb[0];
+                req.out_rgb[1] = rgb[1];
+                req.out_rgb[2] = rgb[2];
+                if (has_alpha) req.out_rgb[3] = st->alpha;
+            }
         }
         if (req.out_changed) *req.out_changed = true;
         if (input.left_released()) {
@@ -1332,65 +1461,119 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
         }
     }
 
-    float hue_rgb[3];
-    hsv_to_rgb(st->hue, 1.0f, 1.0f, hue_rgb);
-    canvas.draw_rect_corners(
-        sv, Color{1.0f, 1.0f, 1.0f, 1.0f},
-        Color{hue_rgb[0], hue_rgb[1], hue_rgb[2], 1.0f},
-        Color{0.0f, 0.0f, 0.0f, 1.0f}, Color{0.0f, 0.0f, 0.0f, 1.0f});
-    const Vec2 svc{sv.x + sv.w * st->sat, sv.y + sv.h * (1.0f - st->val)};
-    canvas.draw_sdf_rect_outline({svc.x - 4.0f, svc.y - 4.0f, 8.0f, 8.0f},
-                                 4.0f, 1.5f,
-                                 st->val > 0.6f && st->sat < 0.6f
-                                     ? Color{0.0f, 0.0f, 0.0f, 0.9f}
-                                     : Color{1.0f, 1.0f, 1.0f, 0.9f});
+    const auto axis = [](float lo, float span, int i, int n) {
+        return lo + span * static_cast<float>(i) / static_cast<float>(n);
+    };
+    if (!hue_only) {
+        const auto hsv_color = [&](float s, float v) {
+            float rgb[3];
+            hsv_to_rgb(st->hue, s, v, rgb);
+            return Color::srgb(rgb[0], rgb[1], rgb[2]);
+        };
+        for (int yi = 0; yi < kSvCells; ++yi) {
+            const float v0 = 1.0f - axis(0.0f, 1.0f, yi, kSvCells);
+            const float v1 = 1.0f - axis(0.0f, 1.0f, yi + 1, kSvCells);
+            const float y0 = axis(sv.y, sv.h, yi, kSvCells);
+            const float y1 = axis(sv.y, sv.h, yi + 1, kSvCells);
+            for (int xi = 0; xi < kSvCells; ++xi) {
+                const float s0 = axis(0.0f, 1.0f, xi, kSvCells);
+                const float s1 = axis(0.0f, 1.0f, xi + 1, kSvCells);
+                const float x0 = axis(sv.x, sv.w, xi, kSvCells);
+                const float x1 = axis(sv.x, sv.w, xi + 1, kSvCells);
+                canvas.draw_rect_corners(
+                    {x0, y0, x1 - x0, y1 - y0}, hsv_color(s0, v0),
+                    hsv_color(s1, v0), hsv_color(s1, v1), hsv_color(s0, v1));
+            }
+        }
+        const Vec2 svc{sv.x + sv.w * st->sat,
+                       sv.y + sv.h * (1.0f - st->val)};
+        canvas.draw_sdf_rect_outline({svc.x - 4.0f, svc.y - 4.0f, 8.0f, 8.0f},
+                                     4.0f, 1.5f,
+                                     st->val > 0.6f && st->sat < 0.6f
+                                         ? Color{0.0f, 0.0f, 0.0f, 0.9f}
+                                         : Color{1.0f, 1.0f, 1.0f, 0.9f});
+    }
 
-    for (int i = 0; i < 6; ++i) {
-        float c0[3], c1[3];
-        hsv_to_rgb(static_cast<float>(i) * 60.0f, 1.0f, 1.0f, c0);
-        hsv_to_rgb(static_cast<float>(i + 1) * 60.0f, 1.0f, 1.0f, c1);
-        const float x0 = hue.x + hue.w * static_cast<float>(i) / 6.0f;
-        const float x1 = hue.x + hue.w * static_cast<float>(i + 1) / 6.0f;
-        canvas.draw_rect_corners({x0, hue.y, x1 - x0, hue.h},
-                                 Color{c0[0], c0[1], c0[2], 1.0f},
-                                 Color{c1[0], c1[1], c1[2], 1.0f},
-                                 Color{c1[0], c1[1], c1[2], 1.0f},
-                                 Color{c0[0], c0[1], c0[2], 1.0f});
+    const float bar_light = hue_only ? st->hue_light : 0.5f;
+    for (int i = 0; i < kHueCells; ++i) {
+        const Color a = hue_bar_color(
+            static_cast<float>(i) / static_cast<float>(kHueCells),
+            bar_light);
+        const Color b = hue_bar_color(
+            static_cast<float>(i + 1) / static_cast<float>(kHueCells),
+            bar_light);
+        const float x0 = axis(hue.x, hue.w, i, kHueCells);
+        const float x1 = axis(hue.x, hue.w, i + 1, kHueCells);
+        canvas.draw_rect_corners({x0, hue.y, x1 - x0, hue.h}, a, b, b, a);
     }
     const float hx = hue.x + hue.w * st->hue / 360.0f;
     canvas.draw_rect({hx - 1.0f, hue.y - 1.0f, 2.0f, hue.h + 2.0f},
                      Color{1.0f, 1.0f, 1.0f, 0.9f});
 
     hsv_to_rgb(st->hue, st->sat, st->val, cur);
-    canvas.draw_sdf_rect(chip, 3.0f, Color{cur[0], cur[1], cur[2], 1.0f});
-    canvas.draw_sdf_rect_outline(chip, 3.0f, theme.stroke_width,
-                                 theme.hairline);
-    const int bytes[3] = {static_cast<int>(cur[0] * 255.0f + 0.5f),
+    if (has_alpha) {
+        draw_checker(canvas, alpha_bar);
+        const int cells = 24;
+        for (int i = 0; i < cells; ++i) {
+            const float a0 =
+                static_cast<float>(i) / static_cast<float>(cells);
+            const float a1 =
+                static_cast<float>(i + 1) / static_cast<float>(cells);
+            const Color c0 = Color::srgb(cur[0], cur[1], cur[2], a0);
+            const Color c1 = Color::srgb(cur[0], cur[1], cur[2], a1);
+            const float x0 = axis(alpha_bar.x, alpha_bar.w, i, cells);
+            const float x1 = axis(alpha_bar.x, alpha_bar.w, i + 1, cells);
+            canvas.draw_rect_corners({x0, alpha_bar.y, x1 - x0, alpha_bar.h},
+                                     c0, c1, c1, c0);
+        }
+        const float ax = alpha_bar.x + alpha_bar.w * st->alpha;
+        canvas.draw_rect({ax - 1.0f, alpha_bar.y - 1.0f, 2.0f,
+                          alpha_bar.h + 2.0f},
+                         Color{1.0f, 1.0f, 1.0f, 0.9f});
+    }
+
+    if (!hue_only) {
+        const float chip_rgba[4] = {cur[0], cur[1], cur[2], st->alpha};
+        draw_swatch_face(canvas, chip, 3.0f, st->mode, chip_rgba);
+        canvas.draw_sdf_rect_outline(chip, 3.0f, theme.stroke_width,
+                                     theme.hairline);
+        draw_text(canvas, font, "#",
+                  {sv.x + 2.0f,
+                   fields[4].y +
+                       (fields[4].h - font.line_height() *
+                                          theme.font_size_small) * 0.5f},
+                  theme.font_size_small, theme.text_dim);
+    }
+    const int bytes[4] = {static_cast<int>(cur[0] * 255.0f + 0.5f),
                           static_cast<int>(cur[1] * 255.0f + 0.5f),
-                          static_cast<int>(cur[2] * 255.0f + 0.5f)};
-    draw_text(canvas, font, "#",
-              {sv.x + 2.0f,
-               fields[3].y +
-                   (fields[3].h - font.line_height() *
-                                      theme.font_size_small) * 0.5f},
-              theme.font_size_small, theme.text_dim);
-    for (int i = 0; i < 4; ++i) {
+                          static_cast<int>(cur[2] * 255.0f + 0.5f),
+                          static_cast<int>(st->alpha * 255.0f + 0.5f)};
+    for (int i = 0; i < 5; ++i) {
+        if (fields[i].w <= 0.0f) continue;
         const bool editing = st->field_edit == i;
         canvas.draw_sdf_rect(fields[i], 3.0f, theme.control_bg_active);
         canvas.draw_sdf_rect_outline(fields[i], 3.0f, theme.stroke_width,
                                      editing ? theme.accent
                                              : theme.hairline);
-        char buf[12];
+        char buf[16];
+        std::string shown;
         if (editing) {
-            std::snprintf(buf, sizeof(buf), "%.*s_", st->edit_len,
-                          st->edit_buf);
-        } else if (i < 3) {
+            shown = caret_text(st->edit);
+        } else if (hue_only) {
+            std::snprintf(buf, sizeof(buf), "%.3f", st->hue / 360.0f);
+            shown = buf;
+        } else if (i < 4) {
             std::snprintf(buf, sizeof(buf), "%d", bytes[i]);
+            shown = buf;
         } else {
-            std::snprintf(buf, sizeof(buf), "%02x%02x%02x", bytes[0],
-                          bytes[1], bytes[2]);
+            const int n = std::snprintf(buf, sizeof(buf), "%02x%02x%02x",
+                                        bytes[0], bytes[1], bytes[2]);
+            if (has_alpha && n > 0)
+                std::snprintf(buf + n, sizeof(buf) - size_t(n), "%02x",
+                              bytes[3]);
+            shown = buf;
         }
-        draw_text(canvas, font, buf,
+        draw_text(canvas, font, shown.c_str(),
                   {fields[i].x + 5.0f,
                    fields[i].y +
                        (fields[i].h - font.line_height() *
@@ -1621,11 +1804,12 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
     const Context::PopupRequest req = ctx.popup();
     ctx.clear_popup();
     if (req.kind == Context::PopupKind::Color) {
-        run_color_popup(canvas, font, theme, req, input);
+        run_color_popup(canvas, font, theme, ctx, req, input);
         return;
     }
     auto* st = static_cast<DropdownState*>(req.state);
     if (!st || !st->open) return;
+    const bool owns = ctx.widget_owns_mouse(ctx.acquire_widget_id(st));
 
     const Rect& r = req.rect;
     canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg);
@@ -1646,7 +1830,7 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
                    ir.y + (ir.h - font.line_height() * theme.font_size) *
                               0.5f},
                   theme.font_size, fg);
-        if (hover && input.left_pressed()) {
+        if (owns && hover && input.left_pressed()) {
             if (req.out_selected) *req.out_selected = i;
             st->open = false;
         }
@@ -1739,16 +1923,17 @@ LayoutNode* DialF(LayoutArena& arena, float* value, float min_value,
     return n;
 }
 
-LayoutNode* ColorSwatch(LayoutArena& arena, const float rgb[3],
-                        SwatchState* state, float* out_rgb,
-                        bool* out_changed, bool* out_released) {
+LayoutNode* ColorSwatch(LayoutArena& arena, const float rgba[4],
+                        SwatchState* state, float* out_rgba,
+                        bool* out_changed, bool* out_released,
+                        const SwatchOpts& opts) {
     LayoutNode* n = make_node(arena, NodeKind::Leaf);
     auto* u = arena.alloc<SwatchUser>();
-    u->rgb[0] = rgb[0];
-    u->rgb[1] = rgb[1];
-    u->rgb[2] = rgb[2];
+    for (int i = 0; i < 4; ++i) u->rgba[i] = rgba[i];
+    state->mode = opts.mode;
+    state->hue_light = opts.hue_light;
     u->state = state;
-    u->out_rgb = out_rgb;
+    u->out_rgba = out_rgba;
     u->out_changed = out_changed;
     u->out_released = out_released;
     n->user = u;

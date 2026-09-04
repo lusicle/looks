@@ -63,6 +63,7 @@
 #include "platform/win/mf_codec.h"
 #include "ui/canvas2d.h"
 #include "ui/font.h"
+#include "ui/interact.h"
 #include "ui/layout.h"
 #include "ui/text.h"
 #include "ui/ui_renderer.h"
@@ -2129,6 +2130,7 @@ struct EffectUiState {
     ui::ButtonState solo_button, copy_button;
     ui::ButtonState value_edit_button;
     ui::DropdownState param_dd[16];
+    ui::SwatchState param_swatch[18];
     ui::ButtonState text_button;
 };
 
@@ -2157,6 +2159,7 @@ struct LayerUiState {
     // One popup owner per anchor: the card needs its own swatch state.
     ui::SwatchState card_swatch_a, card_swatch_b;
     std::unordered_map<uint64_t, ui::SwatchState> stop_swatch;
+    std::unordered_map<uint64_t, ui::SwatchState> hue_swatch;
     ui::SliderState sliders[56];
     ui::ButtonState value_edit_button;
     ui::ButtonState route_buttons[56], key_buttons[56];
@@ -2240,6 +2243,7 @@ const char* key_chord_name(platform::Key k) {
         return kFns[static_cast<int>(k) - static_cast<int>(K::F1)];
     switch (k) {
         case K::Space: return "space";
+        case K::Escape: return "escape";
         case K::Enter: return "enter";
         case K::Tab: return "tab";
         case K::Backspace: return "backspace";
@@ -2325,18 +2329,18 @@ struct SettingsUi {
     bool open = false;
     int tab = 0;              // 0 = keybinds
     float scroll = 0.0f;
-    std::string filter;
+    ui::TextField filter{.cap = 40};
     // Format: action:<id>, macro:<name>, or script:<path>. Empty = none.
     std::string capture;
     std::string macro_open;
     // Only one text entry may own the caret at a time.
     std::string rename_macro;
-    std::string name_buf;
+    ui::TextField name_buf{.cap = 40};
     bool adding = false;
     // step_edit_index equal to the step count appends on commit.
     std::string step_edit_macro;
     int step_edit_index = -1;
-    std::string step_buf;
+    ui::TextField step_buf{.cap = 160};
     int complete_sel = 0;
     std::string hover;        // interaction pass -> draw pass highlight
 };
@@ -2346,10 +2350,10 @@ void settings_end_entry(SettingsUi& s) {
     s.capture.clear();
     s.adding = false;
     s.rename_macro.clear();
-    s.name_buf.clear();
+    s.name_buf.set("");
     s.step_edit_macro.clear();
     s.step_edit_index = -1;
-    s.step_buf.clear();
+    s.step_buf.set("");
     s.complete_sel = 0;
 }
 
@@ -2519,12 +2523,12 @@ struct AppState {
     bool proxy_probe_has = false;
     // App preference in ui.json, not project state.
     bool import_lossless = false;
+    ui::TextField entry;
     // While focused, Char events type here and letter shortcuts stay inert.
-    std::string preset_filter;
+    ui::TextField preset_filter;
     bool preset_search_focus = false;
     ui::ButtonState preset_search_btn, preset_import_btn;
     // Still media duration in seconds. This field captures the keyboard.
-    std::string duration_edit;
     bool duration_focus = false;
     ui::ButtonState duration_btn;
     std::string media_name;      // empty = test pattern
@@ -2552,8 +2556,9 @@ struct AppState {
     std::vector<flow::Wire> sel_wires;
     uint64_t value_edit_node = 0;
     int value_edit_row = -1;
-    std::string value_edit_buf;
-    bool value_commit = false;
+    uint64_t value_commit_node = 0;
+    int value_commit_row = -1;
+    double value_commit_typed = 0.0;
     bool find_mode = false;
     // Ids remap on paste.
     struct CanvasClipboard {
@@ -2564,11 +2569,8 @@ struct AppState {
         float origin_x = 0.0f, origin_y = 0.0f;
     } clipboard;
     uint64_t frame_rename_id = 0;
-    std::string frame_rename_buf;
     uint64_t group_rename_id = 0;
-    std::string group_rename_buf;
     uint64_t text_edit_id = 0;
-    std::string text_edit_buf;
     ui::ButtonState align_buttons[4];
     flow::CanvasState canvas_state;
     // 0 = the main graph. View state, never serialized.
@@ -2578,7 +2580,6 @@ struct AppState {
     bool saved_view_valid = false;
     // preset_drag_key 0 means no drag is active.
     uint64_t preset_drag_key = 0;
-    Vec2 preset_press{};
     bool preset_drag_live = false;
     uint64_t insert_before_id = 0;
     float add_gx = 0.0f, add_gy = 0.0f;
@@ -2619,7 +2620,6 @@ struct AppState {
     std::unordered_set<uint64_t> preset_bin_closed;
     uint64_t preset_sel = 0;                  // preset key or bin key
     uint64_t preset_rename_key = 0;
-    std::string preset_rename_buf;
     // Bumps on every rescan. Preset thumbnails key on it.
     uint64_t preset_scan_stamp = 1;
     ui::ButtonState preset_new_bin_btn;
@@ -2673,8 +2673,6 @@ struct AppState {
     // blk_drag_mode: 0 idle, 1 move, 2 trim-in, 3 trim-out.
     // sel_placement is view state. 0 means none.
     uint64_t sel_placement = 0;
-    uint64_t last_block_pick = 0;
-    double last_block_pick_time = -1.0e9;
     // The snap threshold is in pixels, so zoom decides the reach.
     bool tl_snap = true;
     double tl_snap_frame = -1.0;
@@ -2747,12 +2745,15 @@ struct AppState {
     int key_edit_mode = 0;   // 0 closed, 1 value, 2 frame
     doc::ParamKey key_edit_target{};
     double key_edit_frame = 0.0;
-    std::string key_edit_buf;
-    // rail_edit_key effect_id 0 means closed.
+    int key_commit_mode = 0;
+    doc::ParamKey key_commit_target{};
+    double key_commit_frame = 0.0;
+    double key_commit_num = 0.0;
+    // effect_id 0 is closed; a commit outlives the field until the next build.
     doc::ParamKey rail_edit_key{};
     float rail_edit_scale = 1.0f;   // the row's display multiplier (deg)
-    std::string rail_edit_buf;
-    bool rail_edit_commit = false;
+    doc::ParamKey rail_commit_key{};
+    double rail_commit_value = 0.0;
     // Paste only onto an instance of the same type.
     bool param_clip_valid = false;
     doc::EffectType param_clip_type = doc::EffectType::RgbSplit;
@@ -2763,7 +2764,7 @@ struct AppState {
     ui::ButtonState add_fx_button,
         fx_cat_buttons[static_cast<size_t>(doc::FxCategory::Count)];
     // Not empty means a flat filtered list. This field captures the keyboard.
-    std::string fx_filter;
+    ui::TextField fx_filter;
     bool fx_search_focus = false;
     ui::ButtonState fx_search_btn;
 
@@ -2819,11 +2820,10 @@ struct AppState {
     // bin_closed holds the closed bins. Absent means open.
     std::unordered_set<uint64_t> bin_closed;
     uint64_t browser_rename_id = 0;
-    std::string browser_rename_buf;
     uint64_t browser_drag_id = 0;
     bool browser_drag_is_bin = false;
     bool browser_drag_live = false;
-    Vec2 browser_drag_from{};
+    bool modal_frame = false;
     std::unordered_map<uint64_t, GroupUiState> group_ui;
     ui::DropdownState tag_dd;
     ui::ButtonState save_button, open_project_button;
@@ -2875,9 +2875,7 @@ struct AppState {
     ui::ScrollState sidebar_scroll, right_scroll, preset_scroll;
     ui::ScrollState browser_scroll;
     uint64_t browser_sel = 0;
-    uint64_t browser_click_id = 0;
-    double browser_click_time = 0.0;
-    std::string browser_filter;
+    ui::TextField browser_filter;
     bool browser_search_focus = false;
     ui::ButtonState browser_search_btn;
     // Sampled from the worker advance counter, not from the UI loop.
@@ -2886,7 +2884,8 @@ struct AppState {
     double play_fps_time = 0.0;
     ui::DropdownState project_fps_dd, project_res_dd;
     ui::ButtonState monitor_ws;
-    int mon_mode = 0;   // 0 idle, 1 move, 2 scale, 3 rotate
+    // 0 idle, 1 move, 2 corner scale, 3 rotate, 4 anchor
+    int mon_mode = 0;
     Vec2 mon_anchor{};
     doc::Placement mon_orig{};
     ui::SliderState block_xf_sliders[7];
@@ -2914,7 +2913,9 @@ struct AppState {
     float mon_canvas_aspect = 16.0f / 9.0f;
     // Gizmo params are canvas space. The drag stages writes at draw time
     // and the command pass coalesces them into one command per frame.
-    int giz_mode = 0;     // 0 idle, 1 point drag, 2 angle drag
+    // 0 idle, 1 point, 2 angle, 3 path anchors, 4 in and 5 out tangent,
+    // 6 region resize, 7 marquee, 8 handle, 9 control or new anchor.
+    int giz_mode = 0;
     uint64_t giz_fx = 0;  // effect instance id (survives reorder)
     int giz_slot = -1;    // index into the descriptor's point/angle list
     Vec2 giz_anchor{};
@@ -2928,7 +2929,6 @@ struct AppState {
     GizmoWrite giz_writes[2] = {};
     int giz_write_n = 0;
     bool giz_released = false;
-    // giz_mode 3 drags an anchor, 4 and 5 drag its in and out tangents.
     // Structural edits do not coalesce. Drags coalesce per layer id.
     int giz_path_sel = -1;         // primary control point (tangent UI)
     // Bitmask: a path holds at most 64 points.
@@ -2936,10 +2936,16 @@ struct AppState {
     // Offset masked anchors from this snapshot so the set moves rigidly.
     std::vector<doc::PathPoint> giz_path_orig;
     uint64_t giz_path_layer = 0;   // resets the selection on layer change
-    bool giz_stop_delete = false;
     bool giz_layer_staged = false;
     bool giz_layer_coalesce = false;
     doc::Layer giz_layer_write;
+    ui::SwatchState giz_swatch;
+    uint64_t giz_swatch_stop = 0;
+    bool giz_swatch_opened = false;
+    ui::Rect giz_swatch_anchor{};
+    float giz_swatch_rgba[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool giz_swatch_changed = false;
+    bool giz_swatch_released = false;
     // A whole-node command. Never coalesce it.
     bool giz_anchor_staged = false;
     uint64_t giz_anchor_node = 0;
@@ -2964,6 +2970,102 @@ struct AppState {
     ui::DropdownState ctx_menu_dd;
     ui::Rect win_rect{};   // this frame's viewport (menu clamping)
 };
+
+enum class TextEntry : uint8_t {
+    None, Duration, KeyEdit, RailEdit, ValueEdit, FrameRename, GroupRename,
+    TextEdit, BrowserRename, PresetRename, BrowserSearch, PresetSearch,
+    FxSearch
+};
+
+void commit_text_entry(AppState& app);
+
+TextEntry active_text_entry(const AppState& app) {
+    if (app.duration_focus) return TextEntry::Duration;
+    if (app.key_edit_mode != 0) return TextEntry::KeyEdit;
+    if (app.rail_edit_key.effect_id != 0) return TextEntry::RailEdit;
+    if (app.value_edit_node) return TextEntry::ValueEdit;
+    if (app.frame_rename_id) return TextEntry::FrameRename;
+    if (app.group_rename_id) return TextEntry::GroupRename;
+    if (app.text_edit_id) return TextEntry::TextEdit;
+    if (app.browser_rename_id) return TextEntry::BrowserRename;
+    if (app.preset_rename_key) return TextEntry::PresetRename;
+    if (app.browser_search_focus) return TextEntry::BrowserSearch;
+    if (app.preset_search_focus) return TextEntry::PresetSearch;
+    if (app.fx_search_focus) return TextEntry::FxSearch;
+    return TextEntry::None;
+}
+
+ui::TextField* text_entry_field(AppState& app) {
+    switch (active_text_entry(app)) {
+        case TextEntry::None: return nullptr;
+        case TextEntry::BrowserSearch: return &app.browser_filter;
+        case TextEntry::PresetSearch: return &app.preset_filter;
+        case TextEntry::FxSearch: return &app.fx_filter;
+        default: return &app.entry;
+    }
+}
+
+struct TextEntryId {
+    TextEntry kind = TextEntry::None;
+    uint64_t id = 0;
+    int index = 0;
+    double at = 0.0;
+    bool operator==(const TextEntryId&) const = default;
+};
+
+TextEntryId text_entry_id(const AppState& app) {
+    TextEntryId out;
+    out.kind = active_text_entry(app);
+    switch (out.kind) {
+        case TextEntry::KeyEdit:
+            out.id = app.key_edit_target.effect_id;
+            out.index = app.key_edit_target.param_index;
+            out.at = app.key_edit_frame;
+            break;
+        case TextEntry::RailEdit:
+            out.id = app.rail_edit_key.effect_id;
+            out.index = app.rail_edit_key.param_index;
+            break;
+        case TextEntry::ValueEdit:
+            out.id = app.value_edit_node;
+            out.index = app.value_edit_row;
+            break;
+        case TextEntry::FrameRename: out.id = app.frame_rename_id; break;
+        case TextEntry::GroupRename: out.id = app.group_rename_id; break;
+        case TextEntry::TextEdit: out.id = app.text_edit_id; break;
+        case TextEntry::BrowserRename: out.id = app.browser_rename_id; break;
+        case TextEntry::PresetRename: out.id = app.preset_rename_key; break;
+        default: break;
+    }
+    return out;
+}
+
+void close_text_entry(AppState& app) {
+    app.duration_focus = false;
+    app.key_edit_mode = 0;
+    app.rail_edit_key = {};
+    app.value_edit_node = 0;
+    app.value_edit_row = -1;
+    app.frame_rename_id = 0;
+    app.group_rename_id = 0;
+    app.text_edit_id = 0;
+    app.browser_rename_id = 0;
+    app.preset_rename_key = 0;
+    app.browser_search_focus = false;
+    app.preset_search_focus = false;
+    app.fx_search_focus = false;
+    app.entry.set("");
+}
+
+ui::TextField& open_text_entry(AppState& app, ui::TextFilter filter,
+                               size_t cap, const std::string& seed) {
+    commit_text_entry(app);
+    close_text_entry(app);
+    app.entry.filter = filter;
+    app.entry.cap = cap;
+    app.entry.set(seed);
+    return app.entry;
+}
 
 bool find_effect_by_id(const doc::Look& look, uint64_t id,
                        size_t* layer_index, size_t* fx_index) {
@@ -4498,8 +4600,7 @@ void open_source(AppState& app, const std::filesystem::path& picked_in) {
         std::filesystem::absolute(picked_in, aec).lexically_normal();
     // Direct write: the media binding is environment, not an edit.
     bind_primary_media(app.document, path_to_u8(picked));
-    app.duration_focus = false;
-    app.duration_edit.clear();
+    if (active_text_entry(app) == TextEntry::Duration) close_text_entry(app);
     // Pause the workers: the bundle table moves under their file access.
     if (app.render_worker) {
         app.render_worker->pause();
@@ -4742,8 +4843,8 @@ void preset_new_bin(AppState& app) {
         rescan_presets(app);
         const std::string rel = path_to_u8(dir.filename());
         app.preset_sel = preset_bin_key(rel);
+        open_text_entry(app, ui::TextFilter::Printable, 0, rel);
         app.preset_rename_key = app.preset_sel;
-        app.preset_rename_buf = rel;
         return;
     }
 }
@@ -4751,9 +4852,8 @@ void preset_new_bin(AppState& app) {
 // Renames the preset file stem and the name inside it, or a bin directory.
 void preset_rename_apply(AppState& app) {
     const uint64_t key = app.preset_rename_key;
-    std::string nm = app.preset_rename_buf;
+    std::string nm = app.entry.buf;
     app.preset_rename_key = 0;
-    app.preset_rename_buf.clear();
     for (char& c : nm)
         if (c == '/' || c == '\\' || c == ':') c = '-';
     if (nm.empty()) return;
@@ -4793,9 +4893,8 @@ void preset_rename_apply(AppState& app) {
 
 void browser_rename_apply(AppState& app) {
     const uint64_t rid = app.browser_rename_id;
-    const std::string nm = app.browser_rename_buf;
+    const std::string nm = app.entry.buf;
     app.browser_rename_id = 0;
-    app.browser_rename_buf.clear();
     if (!rid || nm.empty()) return;
     if (const doc::Bin* b = app.document.find_bin(rid)) {
         app.undo.execute(app.document,
@@ -5797,6 +5896,7 @@ struct FrameUi {
         uint64_t layer_id;    // 0 = an audio-lane block (no canvas card)
         uint64_t placement_id;
         bool* pressed;
+        bool* dbl;
     };
     std::vector<BlockPick> block_picks;
     // Shift presses stay inert, so a multi-select survives a missed block.
@@ -5892,14 +5992,14 @@ struct FrameUi {
     };
     std::vector<TlTab> tl_tabs;
     bool* tl_snap_clicked = nullptr;
-    // Stage the whole rgb triplet as one coalesced layer command.
+    // Stage the whole rgba quad as one coalesced layer command.
     struct ColorStage {
         uint64_t layer_id;
         bool color_b;
         // Non-zero targets a gradient stop instead of color_a / color_b.
         uint64_t stop_id = 0;
-        float* staged;   // [3]
-        float original[3];
+        float* staged;   // [4]
+        float original[4];
         bool* changed;
         bool* released;
     };
@@ -6194,8 +6294,8 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         *u->out_rect = node.clip.empty() ? r : r.intersect(node.clip);
     const ui::WidgetId id =
         frame.ctx.acquire_widget_id(&u->app->browser_ui[u->id].open);
-    const bool owns = frame.ctx.widget_owns_mouse(id);
-    const bool hover = owns && r.contains(frame.input.mouse);
+    const ui::Gesture g = frame.ctx.gesture(id, r);
+    const bool hover = g.hovered && r.contains(frame.input.mouse);
     if (*u->sel == u->id) {
         frame.canvas.draw_rect(
             r, ui::lerp(th.panel_bg, ui::Color{0.0f, 0.0f, 0.0f, 1.0f},
@@ -6243,18 +6343,9 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                             : (hover || *u->sel == u->id ? th.text
                                                          : th.text_dim));
     frame.canvas.pop_clip();
-    if (frame.input.left_pressed() && owns && hover) {
-        *u->clicked = true;
-        // Use a wall clock: the UI frame rate is uncapped.
-        if (u->app->browser_click_id == u->id &&
-            u->app->app_seconds - u->app->browser_click_time < 0.4 &&
-            u->opened)
-            *u->opened = true;
-        u->app->browser_click_id = u->id;
-        u->app->browser_click_time = u->app->app_seconds;
-    }
-    if (frame.input.right_pressed() && owns && hover && u->ctx)
-        *u->ctx = true;
+    if (g.pressed) *u->clicked = true;
+    if (g.double_clicked && u->opened) *u->opened = true;
+    if (g.right_clicked && u->ctx) *u->ctx = true;
 }
 
 // out_rect receives the arena rect for the caller drag and drop lists.
@@ -6345,7 +6436,16 @@ Vec2 measure_gallery(ui::LayoutNode& node, const ui::Constraints& c,
 
 void hit_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<GalleryUser*>(node.user);
-    ui::register_rect_hit(node, frame, u->sel);
+    std::vector<ui::Rect> rects;
+    rects.reserve(u->count);
+    gallery_walk(u->items, u->count, node.rect.w, &rects);
+    for (size_t i = 0; i < u->count && i < rects.size(); ++i) {
+        ui::Rect r = rects[i];
+        r.x += node.rect.x;
+        r.y += node.rect.y;
+        if (!node.clip.empty()) r = r.intersect(node.clip);
+        frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(u->items[i].id));
+    }
 }
 
 void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
@@ -6354,8 +6454,6 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     std::vector<ui::Rect> rects;
     rects.reserve(u->count);
     gallery_walk(u->items, u->count, node.rect.w, &rects);
-    const ui::WidgetId id = frame.ctx.acquire_widget_id(u->sel);
-    const bool owns = frame.ctx.widget_owns_mouse(id);
     const Vec2 m = frame.input.mouse;
     static const uint32_t kChipHex[5] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
                                          0x5B84B1, 0xC96A8F};
@@ -6366,7 +6464,9 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         r.y += node.rect.y;
         if (it.out_rect)
             *it.out_rect = node.clip.empty() ? r : r.intersect(node.clip);
-        const bool hover = owns && r.contains(m);
+        const ui::Gesture g =
+            frame.ctx.gesture(frame.ctx.acquire_widget_id(it.id), r);
+        const bool hover = g.hovered && r.contains(m);
         const bool selected = *u->sel == it.id;
         if (it.kind == 0) {
             frame.canvas.draw_sdf_rect(
@@ -6435,17 +6535,9 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                                    : th.text_dim));
             frame.canvas.pop_clip();
         }
-        if (frame.input.left_pressed() && owns && hover) {
-            if (it.clicked) *it.clicked = true;
-            if (u->app->browser_click_id == it.id &&
-                u->app->app_seconds - u->app->browser_click_time < 0.4 &&
-                it.opened)
-                *it.opened = true;
-            u->app->browser_click_id = it.id;
-            u->app->browser_click_time = u->app->app_seconds;
-        }
-        if (frame.input.right_pressed() && owns && hover && it.ctx)
-            *it.ctx = true;
+        if (g.pressed && it.clicked) *it.clicked = true;
+        if (g.double_clicked && it.opened) *it.opened = true;
+        if (g.right_clicked && it.ctx) *it.ctx = true;
     }
 }
 
@@ -6613,9 +6705,9 @@ const GizmoDesc* gizmo_desc_for(doc::EffectType type) {
 
 // An open path appends on click. Creation is document state.
 // Structural clicks do not coalesce. Drags coalesce per layer id.
-// One monitor handle editor. A caller supplies the handle list and the
-// four edits; the driver owns hit-test, capture, drag and selection.
-// giz_mode 8 is a handle drag, 9 an auxiliary (centre) drag.
+// One monitor handle editor. A caller supplies the handle list, the moves
+// and the insert; the driver owns hit-test, capture, drag and selection.
+// Delete is not here: it runs in the delete action, on the document.
 struct HandleSet {
     uint64_t owner = 0;
     int count = 0;
@@ -6628,9 +6720,9 @@ struct HandleSet {
         std::function<void(Vec2)> move;
     };
     std::vector<Control> controls;
-    std::function<void(int)> remove;
     std::function<bool(Vec2, Vec2*)> on_connector;
     std::function<void(ui::Canvas2D&)> draw_connector;
+    std::function<void(int)> activate;
     bool empty_click_inserts = false;
 };
 
@@ -6652,35 +6744,32 @@ void run_handle_gizmo(AppState& app, ui::LayoutFrame& frame, ui::Rect r,
         return {std::clamp((p.x - r.x) / r.w, 0.0f, 1.0f),
                 std::clamp((p.y - r.y) / r.h, 0.0f, 1.0f)};
     };
-    auto near_px = [&](Vec2 p) {
-        return std::fabs(mouse.x - p.x) <= 7.0f &&
-               std::fabs(mouse.y - p.y) <= 7.0f;
-    };
-
     if ((app.giz_mode == 8 || app.giz_mode == 9) &&
         (!frame.input.left_down() || app.giz_fx != hs.owner)) {
         app.giz_mode = 0;
         app.giz_released = true;
-        frame.ctx.clear_capture();
     }
 
     if (owns && frame.input.left_pressed() && app.giz_mode == 0) {
+        ui::Picker pick;
         for (size_t k = 0; k < hs.controls.size(); ++k)
-            if (near_px(to_px(hs.controls[k].uv))) {
-                app.giz_mode = 9;
-                app.giz_fx = hs.owner;
-                app.giz_slot = static_cast<int>(k);
-                frame.ctx.set_capture(id);
-                break;
-            }
-        for (int i = 0; app.giz_mode == 0 && i < hs.count; ++i)
-            if (near_px(to_px(hs.uv(i)))) {
-                app.giz_mode = 8;
-                app.giz_fx = hs.owner;
-                app.giz_slot = i;
-                app.giz_path_sel = i;
-                frame.ctx.set_capture(id);
-            }
+            pick.add_point(mouse, to_px(hs.controls[k].uv), 7.0f, 0,
+                           static_cast<int>(k));
+        for (int i = 0; i < hs.count; ++i)
+            pick.add_point(mouse, to_px(hs.uv(i)), 7.0f, 1, i);
+        if (pick.hit()) {
+            app.giz_mode = pick.tier() == 1 ? 8 : 9;
+            app.giz_fx = hs.owner;
+            app.giz_slot = pick.best();
+            if (pick.tier() == 1) app.giz_path_sel = pick.best();
+            frame.ctx.begin_drag(id);
+            const uint64_t dkey =
+                (hs.owner << 8) ^ static_cast<uint64_t>(pick.best()) ^
+                (static_cast<uint64_t>(pick.tier()) << 60);
+            if (frame.ctx.press_is_double(dkey) && pick.tier() == 1 &&
+                hs.activate)
+                hs.activate(pick.best());
+        }
         if (app.giz_mode == 0 && hs.insert) {
             Vec2 at{};
             if (hs.empty_click_inserts) {
@@ -6690,12 +6779,6 @@ void run_handle_gizmo(AppState& app, ui::LayoutFrame& frame, ui::Rect r,
             }
         }
     }
-    if (hs.remove && app.giz_stop_delete && app.giz_path_sel >= 0 &&
-        app.giz_path_sel < hs.count) {
-        app.giz_stop_delete = false;
-        hs.remove(app.giz_path_sel);
-    }
-
     if (app.giz_mode == 8 && app.giz_fx == hs.owner && app.giz_slot >= 0 &&
         app.giz_slot < hs.count)
         hs.move(app.giz_slot, to_uv(mouse));
@@ -6724,7 +6807,11 @@ void run_handle_gizmo(AppState& app, ui::LayoutFrame& frame, ui::Rect r,
 void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
                           ui::Rect r) {
     doc::Layer* lay = doc::find_layer(app.look(), app.sel.id);
-    if (!lay || lay->source != doc::LayerSourceKind::Gradient) return;
+    if (!lay || lay->source != doc::LayerSourceKind::Gradient) {
+        app.giz_swatch.open = false;
+        app.giz_swatch_stop = 0;
+        return;
+    }
     const doc::Layer snap = *lay;
     auto stage = [&](doc::Layer up, bool coalesce) {
         app.giz_layer_write = std::move(up);
@@ -6745,7 +6832,7 @@ void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
     };
     hs.tint = [&snap](int i) -> ui::Color {
         const float* c = snap.stops[static_cast<size_t>(i)].color;
-        return {c[0], c[1], c[2], 1.0f};
+        return ui::Color::srgb(c[0], c[1], c[2], c[3]);
     };
     hs.move = [&, mesh](int i, Vec2 u) {
         doc::Layer up = snap;
@@ -6757,6 +6844,18 @@ void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
             s.t = doc::gradient_lever_t(snap, u.x, u.y);
         }
         stage(std::move(up), true);
+    };
+    hs.activate = [&app, &snap, &hs, r](int i) {
+        const doc::GradientStop& s = snap.stops[static_cast<size_t>(i)];
+        app.giz_swatch_stop = s.id;
+        app.giz_swatch.mode = ui::SwatchMode::Rgba;
+        app.giz_swatch.open = true;
+        app.giz_swatch_opened = true;
+        for (int c = 0; c < 4; ++c) app.giz_swatch_rgba[c] = s.color[c];
+        ui::swatch_seed_from(app.giz_swatch, app.giz_swatch_rgba);
+        const Vec2 u = hs.uv(i);
+        app.giz_swatch_anchor = {r.x + u.x * r.w - 7.0f,
+                                 r.y + u.y * r.h - 7.0f, 14.0f, 14.0f};
     };
     hs.insert = [&](Vec2 u) {
         doc::Layer up = snap;
@@ -6771,7 +6870,7 @@ void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
             const float d = dx * dx + dy * dy;
             if (d < best) {
                 best = d;
-                for (int c = 0; c < 3; ++c) ns.color[c] = s.color[c];
+                for (int c = 0; c < 4; ++c) ns.color[c] = s.color[c];
             }
         }
         up.stops.push_back(ns);
@@ -6791,18 +6890,11 @@ void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
                 const float dx = s.x - u.x, dy = s.y - u.y;
                 if (dx * dx + dy * dy < best) {
                     best = dx * dx + dy * dy;
-                    for (int c = 0; c < 3; ++c) ns.color[c] = s.color[c];
+                    for (int c = 0; c < 4; ++c) ns.color[c] = s.color[c];
                 }
             }
             up.stops.push_back(ns);
             app.giz_path_sel = static_cast<int>(up.stops.size()) - 1;
-            stage(std::move(up), false);
-        };
-        hs.remove = [&](int i) {
-            if (snap.stops.size() <= 1) return;
-            doc::Layer up = snap;
-            up.stops.erase(up.stops.begin() + static_cast<ptrdiff_t>(i));
-            app.giz_path_sel = -1;
             stage(std::move(up), false);
         };
         hs.empty_click_inserts = true;
@@ -6866,6 +6958,43 @@ void draw_gradient_editor(AppState& app, ui::LayoutFrame& frame,
         };
     }
     run_handle_gizmo(app, frame, r, hs);
+
+    if (!app.giz_swatch.open || !app.giz_swatch_stop) return;
+    const doc::GradientStop* open_stop = nullptr;
+    for (const doc::GradientStop& s : snap.stops)
+        if (s.id == app.giz_swatch_stop) open_stop = &s;
+    const ui::Rect pop =
+        ui::swatch_popup_rect(app.giz_swatch_anchor, app.giz_swatch, frame);
+    const bool away = frame.input.left_pressed() &&
+                      !app.giz_swatch_opened &&
+                      !pop.contains(frame.input.mouse);
+    app.giz_swatch_opened = false;
+    if (!open_stop || away) {
+        ui::swatch_commit_field(app.giz_swatch, app.giz_swatch_rgba,
+                                &app.giz_swatch_changed,
+                                &app.giz_swatch_released);
+        app.giz_swatch.open = false;
+    }
+    if (app.giz_swatch.open) {
+        ui::Context::PopupRequest req;
+        req.kind = ui::Context::PopupKind::Color;
+        req.anchor = app.giz_swatch_anchor;
+        req.rect = pop;
+        req.state = &app.giz_swatch;
+        req.out_rgb = app.giz_swatch_rgba;
+        req.out_changed = &app.giz_swatch_changed;
+        req.out_released = &app.giz_swatch_released;
+        frame.ctx.set_popup(req);
+    }
+    if (app.giz_swatch_changed && open_stop) {
+        doc::Layer up = snap;
+        for (doc::GradientStop& s : up.stops)
+            if (s.id == app.giz_swatch_stop)
+                for (int c = 0; c < 4; ++c) s.color[c] = app.giz_swatch_rgba[c];
+        stage(std::move(up), !app.giz_swatch_released);
+        app.giz_swatch_changed = false;
+    }
+    if (!app.giz_swatch.open) app.giz_swatch_stop = 0;
 }
 
 void draw_path_editor(AppState& app, ui::LayoutNode& node,
@@ -6879,7 +7008,6 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
         if (app.giz_mode != 0) {
             app.giz_mode = 0;
             app.giz_released = true;
-            frame.ctx.clear_capture();
         }
         return;
     }
@@ -6919,7 +7047,6 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
                 }
             }
         app.giz_mode = 0;
-        frame.ctx.clear_capture();
     }
     if (app.giz_mode != 0 &&
         (app.giz_mode < 3 || !frame.input.left_down() ||
@@ -6928,7 +7055,6 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
           app.giz_slot >= static_cast<int>(lay->path.size())))) {
         app.giz_mode = 0;
         app.giz_released = true;
-        frame.ctx.clear_capture();
     }
 
     // Mode 3 moves the selected set, 4 and 5 one tangent, 9 both tangents.
@@ -7073,7 +7199,7 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
         app.giz_anchor = mouse;
         app.giz_orig[0] = ox;
         app.giz_orig[1] = oy;
-        frame.ctx.set_capture(id);
+        frame.ctx.begin_drag(id);
     };
     // path_closed defaults true, so an empty path is also creation.
     if (!lay->path_closed || lay->path.empty()) {
@@ -7100,20 +7226,24 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
         }
         return;
     }
-    if (have_tout && near_px(tout)) {
-        const doc::PathPoint& sp =
-            lay->path[static_cast<size_t>(app.giz_path_sel)];
-        start_drag(5, app.giz_path_sel, sp.out_dx, sp.out_dy);
-        return;
-    }
-    if (have_tin && near_px(tin)) {
-        const doc::PathPoint& sp =
-            lay->path[static_cast<size_t>(app.giz_path_sel)];
-        start_drag(4, app.giz_path_sel, sp.in_dx, sp.in_dy);
-        return;
-    }
+    ui::Picker ppick;
+    if (have_tout) ppick.add_point(mouse, tout, 6.0f, 2, 0);
+    if (have_tin) ppick.add_point(mouse, tin, 6.0f, 2, 1);
     for (size_t i = 0; i < lay->path.size(); ++i)
-        if (near_px(to_px(lay->path[i].ax, lay->path[i].ay))) {
+        ppick.add_point(mouse, to_px(lay->path[i].ax, lay->path[i].ay),
+                        6.0f, 1, static_cast<int>(i));
+    if (ppick.hit() && ppick.tier() == 2) {
+        const doc::PathPoint& sp =
+            lay->path[static_cast<size_t>(app.giz_path_sel)];
+        if (ppick.best() == 0)
+            start_drag(5, app.giz_path_sel, sp.out_dx, sp.out_dy);
+        else
+            start_drag(4, app.giz_path_sel, sp.in_dx, sp.in_dy);
+        return;
+    }
+    if (ppick.hit() && ppick.tier() == 1) {
+        {
+            const size_t i = static_cast<size_t>(ppick.best());
             const uint64_t bit = i < 64 ? 1ull << i : 0;
             if (frame.input.mods & platform::kModShift) {
                 // Toggle membership; no drag on a shift click.
@@ -7140,6 +7270,7 @@ void draw_path_editor(AppState& app, ui::LayoutNode& node,
                        lay->path[i].ay);
             return;
         }
+    }
     // Split with de Casteljau so the curve does not move.
     if (lay->path.size() >= 2 && lay->path.size() < 64 &&
         poly.size() >= 4) {
@@ -7254,8 +7385,8 @@ void draw_camera_overlay(AppState& app, ui::LayoutNode& node,
     if (!seg) return;
     const ui::Color ac = frame.theme.accent;
     const Vec2 mouse = frame.input.mouse;
-    float best_d2 = 12.0f * 12.0f;
-    uint32_t best_track = 0;
+    ui::Picker pick;
+    std::vector<uint32_t> tracks;
     Vec2 anchor_px{};
     bool have_anchor_px = false;
     frame.canvas.push_clip(node.rect);
@@ -7276,12 +7407,8 @@ void draw_camera_overlay(AppState& app, ui::LayoutNode& node,
                 {p.x - 2.0f, p.y - 2.0f, 4.0f, 4.0f}, 2.0f,
                 frame.theme.text_dim);
         }
-        const float dx = mouse.x - p.x, dy = mouse.y - p.y;
-        const float d2 = dx * dx + dy * dy;
-        if (d2 < best_d2) {
-            best_d2 = d2;
-            best_track = sp.track;
-        }
+        pick.add_point(mouse, p, 12.0f, 0, static_cast<int>(tracks.size()));
+        tracks.push_back(sp.track);
     }
     frame.canvas.pop_clip();
     if (have_anchor_px)
@@ -7289,12 +7416,13 @@ void draw_camera_overlay(AppState& app, ui::LayoutNode& node,
                                        anchor_px.y - 6.0f, 12.0f, 12.0f});
     const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
     if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id) &&
-        !fit_clicked && best_track) {
+        !fit_clicked && pick.hit()) {
+        const uint32_t track = tracks[static_cast<size_t>(pick.best())];
         app.giz_anchor_staged = true;
         app.giz_anchor_node = vn->id;
         // Clicking the current anchor clears it.
         app.giz_anchor_track =
-            vn->source.anchor == best_track ? 0u : best_track;
+            vn->source.anchor == track ? 0u : track;
     }
 }
 
@@ -7329,7 +7457,6 @@ void draw_look_gizmos(AppState& app, ui::LayoutNode& node,
         if (app.giz_mode != 0) {
             app.giz_mode = 0;
             app.giz_released = true;
-            frame.ctx.clear_capture();
         }
         return;
     }
@@ -7341,7 +7468,6 @@ void draw_look_gizmos(AppState& app, ui::LayoutNode& node,
         (!frame.input.left_down() || app.giz_fx != fx->id)) {
         app.giz_mode = 0;
         app.giz_released = true;
-        frame.ctx.clear_capture();
     }
 
     // Handles draw from the live values so they track the mouse.
@@ -7480,46 +7606,36 @@ void draw_look_gizmos(AppState& app, ui::LayoutNode& node,
     frame.canvas.pop_clip();
 
     const bool owns = frame.ctx.widget_owns_mouse(id);
-    auto near_hd = [&](Vec2 p) {
-        return std::fabs(mouse.x - p.x) <= 6.0f &&
-               std::fabs(mouse.y - p.y) <= 6.0f;
-    };
     if (frame.input.left_pressed() && owns && app.giz_mode == 0 &&
         !fit_clicked) {
-        if (have_region && near_hd(region_br)) {
+        ui::Picker pick;
+        if (have_region) pick.add_point(mouse, region_br, 6.0f, 2, 0);
+        for (int i = 0; i < npt; ++i)
+            pick.add_point(mouse, ppos[i], 6.0f, 1, i);
+        for (int i = 0; i < nang; ++i)
+            pick.add_point(mouse, atip[i], 6.0f, 0, i);
+        if (!pick.hit()) return;
+        const int s = pick.best();
+        app.giz_fx = fx->id;
+        app.giz_anchor = mouse;
+        if (pick.tier() == 2) {
             app.giz_mode = 6;
-            app.giz_fx = fx->id;
             app.giz_slot = 0;
-            app.giz_anchor = mouse;
             app.giz_orig[0] =
                 fx->params[static_cast<size_t>(gd->rw_param)];
             app.giz_orig[1] =
                 fx->params[static_cast<size_t>(gd->rh_param)];
-            frame.ctx.set_capture(id);
-            return;
-        }
-        for (int i = 0; i < npt; ++i) {
-            if (!near_hd(ppos[i])) continue;
-            const GizmoPoint& gp = gd->pt[pslot[i]];
+        } else if (pick.tier() == 1) {
+            const GizmoPoint& gp = gd->pt[pslot[s]];
             app.giz_mode = 1;
-            app.giz_fx = fx->id;
-            app.giz_slot = pslot[i];
-            app.giz_anchor = mouse;
+            app.giz_slot = pslot[s];
             app.giz_orig[0] = fx->params[static_cast<size_t>(gp.px)];
             app.giz_orig[1] = fx->params[static_cast<size_t>(gp.py)];
-            frame.ctx.set_capture(id);
-            break;
+        } else {
+            app.giz_mode = 2;
+            app.giz_slot = aslot[s];
         }
-        if (app.giz_mode == 0)
-            for (int i = 0; i < nang; ++i) {
-                if (!near_hd(atip[i])) continue;
-                app.giz_mode = 2;
-                app.giz_fx = fx->id;
-                app.giz_slot = aslot[i];
-                app.giz_anchor = mouse;
-                frame.ctx.set_capture(id);
-                break;
-            }
+        frame.ctx.begin_drag(id);
     }
 }
 
@@ -7536,9 +7652,13 @@ void hit_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     AppState& a = *u->app;
     // Hits reset inside run_frame, so register the popup hit here.
     if (a.ctx_menu.kind && a.ctx_menu_dd.open)
-        frame.ctx.add_hit(app_ctx_menu_rect(a, frame.font),
-                          frame.ctx.acquire_widget_id(&a.ctx_menu_dd),
-                          ui::HitLayer::Popup);
+        frame.ctx.push_overlay(app_ctx_menu_rect(a, frame.font),
+                               frame.ctx.acquire_widget_id(&a.ctx_menu_dd),
+                               false);
+    if (a.giz_swatch.open)
+        frame.ctx.push_overlay(
+            ui::swatch_popup_rect(a.giz_swatch_anchor, a.giz_swatch, frame),
+            frame.ctx.acquire_widget_id(&a.giz_swatch), false);
     ui::register_rect_hit(node, frame, &a.monitor_ws);
 }
 
@@ -7573,11 +7693,13 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         app.xf_history.front().first <= app.view_doc_revision)
         app.xf_history.clear();
     const Vec2 mpos = frame.input.mouse;
+    const ui::WidgetId mon_id = frame.ctx.acquire_widget_id(&app.monitor_ws);
+    const bool mon_owns = frame.ctx.widget_owns_mouse(mon_id);
+    const float mon_wheel = frame.ctx.take_wheel(mon_id);
     // The zoom snaps back to exact fit near 1.
-    if (node.rect.contains(mpos) && frame.input.wheel_y != 0.0f) {
+    if (mon_wheel != 0.0f) {
         const float z0 = app.mon_zoom;
-        float z1 = std::clamp(z0 * std::pow(1.12f, frame.input.wheel_y),
-                              0.1f, 8.0f);
+        float z1 = std::clamp(z0 * std::pow(1.12f, mon_wheel), 0.1f, 8.0f);
         if (std::fabs(z1 - 1.0f) < 0.06f) z1 = 1.0f;
         const ui::Rect ri = node.rect.inset(1.0f);
         const Vec2 lc{ri.x + ri.w * 0.5f, ri.y + ri.h * 0.5f};
@@ -7591,8 +7713,7 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             app.mon_pan = {};
     }
     // Keep the pan bounded so the picture cannot go off the panel.
-    if ((frame.input.buttons_pressed & ui::kMouseMiddle) &&
-        node.rect.contains(mpos)) {
+    if ((frame.input.buttons_pressed & ui::kMouseMiddle) && mon_owns) {
         app.mon_panning = true;
         app.mon_pan_anchor = mpos;
         app.mon_pan_orig = app.mon_pan;
@@ -7724,27 +7845,24 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const ui::WidgetId id = frame.ctx.acquire_widget_id(&app.monitor_ws);
     const bool owns = frame.ctx.widget_owns_mouse(id);
     const Vec2 mouse = frame.input.mouse;
-    auto near_pt = [&](Vec2 p2) {
-        return std::fabs(mouse.x - p2.x) <= 6.0f &&
-               std::fabs(mouse.y - p2.y) <= 6.0f;
-    };
     if (frame.input.left_pressed() && owns && app.mon_mode == 0 &&
         !fit_clicked) {
         float sx = 0.0f, sy = 0.0f;
         inv(mouse, &sx, &sy);
-        int mode = 0;
-        if (near_pt(anc)) mode = 4;
-        else if (near_pt(rot)) mode = 3;
-        else if (near_pt(c00) || near_pt(c10) || near_pt(c11) ||
-                 near_pt(c01))
-            mode = 2;
-        else if (sx >= b0 && sx <= b2 && sy >= b1 && sy <= b3)
-            mode = 1;
+        ui::Picker pick;
+        pick.add_point(mouse, anc, 6.0f, 4, 4);
+        pick.add_point(mouse, rot, 6.0f, 3, 3);
+        pick.add_point(mouse, c00, 6.0f, 2, 2);
+        pick.add_point(mouse, c10, 6.0f, 2, 2);
+        pick.add_point(mouse, c11, 6.0f, 2, 2);
+        pick.add_point(mouse, c01, 6.0f, 2, 2);
+        pick.add_inside(sx >= b0 && sx <= b2 && sy >= b1 && sy <= b3, 1, 1);
+        const int mode = pick.hit() ? pick.best() : 0;
         if (mode) {
             app.mon_mode = mode;
             app.mon_anchor = mouse;
             app.mon_orig = st;
-            frame.ctx.set_capture(id);
+            frame.ctx.begin_drag(id);
         } else {
             monitor_click_pick(app, r, mouse);
         }
@@ -7752,7 +7870,6 @@ void draw_monitor(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (app.mon_mode != 0 && !frame.input.left_down()) {
         app.mon_mode = 0;
         if (u->released) *u->released = true;
-        frame.ctx.clear_capture();
     }
     if (app.mon_mode != 0 && u->changed) {
         const doc::Placement& o = app.mon_orig;
@@ -7951,9 +8068,9 @@ ui::LayoutNode* MenuButton(ui::LayoutArena& arena, const char* label,
         const auto* mu = static_cast<const MenuUser*>(node.user);
         ui::register_rect_hit(node, frame, &mu->state->button);
         if (mu->state->open)
-            frame.ctx.add_hit(menu_popup_rect(*mu, node.rect, frame),
-                              frame.ctx.acquire_widget_id(mu->state),
-                              ui::HitLayer::Popup);
+            frame.ctx.push_overlay(menu_popup_rect(*mu, node.rect, frame),
+                                   frame.ctx.acquire_widget_id(mu->state),
+                                   false);
     };
     n->draw_fn = [](ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const auto* mu = static_cast<const MenuUser*>(node.user);
@@ -8031,11 +8148,8 @@ ui::LayoutNode* SplitterBar(ui::LayoutArena& arena, AppState& app,
     n->draw_fn = [](ui::LayoutNode& node, ui::LayoutFrame& f) {
         auto* su = static_cast<SeamUser*>(node.user);
         const ui::WidgetId id = f.ctx.acquire_widget_id(su->drag);
-        const bool owns = f.ctx.widget_owns_mouse(id);
-        if (f.input.left_pressed() && owns) {
-            su->drag->dragging = true;
-            f.ctx.set_capture(id);
-        }
+        const ui::Gesture g = f.ctx.gesture(id, node.rect);
+        if (g.pressed) su->drag->dragging = true;
         if (su->drag->dragging) {
             if (f.input.left_down()) {
                 const float d = su->axis == 0 ? f.input.mouse_delta.x
@@ -8044,11 +8158,10 @@ ui::LayoutNode* SplitterBar(ui::LayoutArena& arena, AppState& app,
                                        su->min_frac, su->max_frac);
             } else {
                 su->drag->dragging = false;
-                f.ctx.clear_capture();
                 save_ui_prefs(*su->app);
             }
         }
-        const bool hot = owns || su->drag->dragging;
+        const bool hot = g.hovered || su->drag->dragging;
         const ui::Rect& r = node.rect;
         if (su->axis == 0)
             f.canvas.draw_rect({r.x + 2.0f, r.y, 2.0f, r.h},
@@ -8167,13 +8280,9 @@ uint32_t timeline_frame_at(const AppState& app, float x) {
 }
 
 // The x mapping uses the ruler column, not the label column.
-void timeline_zoom_wheel(AppState& app, ui::UiInput& input,
-                         uint32_t frame_count) {
-    if (input.wheel_y == 0.0f || frame_count == 0) return;
-    const ui::Rect& r = app.tl_rect;
-    if (r.w <= 0.0f || input.mouse.x < r.x || input.mouse.x >= r.right() ||
-        input.mouse.y < r.y || input.mouse.y >= r.bottom())
-        return;
+void timeline_zoom_wheel(AppState& app, const ui::UiInput& input,
+                         float wheel_y, uint32_t frame_count) {
+    if (wheel_y == 0.0f || frame_count == 0) return;
     double v0 = app.tl_v0, v1 = app.tl_v1;
     if (v1 - v0 < 1.0 || v1 > frame_count) {
         v0 = 0.0;
@@ -8181,7 +8290,7 @@ void timeline_zoom_wheel(AppState& app, ui::UiInput& input,
     }
     const double span = v1 - v0;
     if (input.mods & platform::kModShift) {
-        const double step = span * 0.1 * -input.wheel_y;
+        const double step = span * 0.1 * -wheel_y;
         v0 = std::clamp(v0 + step, 0.0,
                         static_cast<double>(frame_count) - span);
         v1 = v0 + span;
@@ -8190,7 +8299,7 @@ void timeline_zoom_wheel(AppState& app, ui::UiInput& input,
         const double t =
             std::clamp((input.mouse.x - sx) / sw, 0.0f, 1.0f);
         const double at = v0 + t * span;
-        double ns = std::clamp(span * std::pow(1.25, -input.wheel_y), 4.0,
+        double ns = std::clamp(span * std::pow(1.25, -wheel_y), 4.0,
                                static_cast<double>(frame_count));
         v0 = std::clamp(at - (at - v0) * ns / span, 0.0,
                         static_cast<double>(frame_count) - ns);
@@ -8198,7 +8307,6 @@ void timeline_zoom_wheel(AppState& app, ui::UiInput& input,
     }
     app.tl_v0 = v0;
     app.tl_v1 = v1;
-    input.wheel_y = 0.0f;
 }
 
 void hit_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
@@ -8216,6 +8324,10 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     tl_extend_rect(*u->app, r);
     u->app->tl_strip_x = r.x;
     u->app->tl_strip_w = r.w;
+    timeline_zoom_wheel(
+        *u->app, frame.input,
+        frame.ctx.take_wheel(frame.ctx.acquire_widget_id(&u->app->ruler)),
+        u->frame_count);
     const double v0 = u->v0;
     const double vspan = std::max(1.0, u->v1 - u->v0);
     auto frame_x = [&](double f) { return tl_x_of(r, v0, vspan, f); };
@@ -8314,23 +8426,24 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         return tl_frame_of(r, v0, vspan, frame.input.mouse.x, 0.0,
                            static_cast<double>(u->frame_count));
     };
-    if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id)) {
+    const ui::Gesture g = frame.ctx.gesture(id, r);
+    if (g.pressed) {
         const float mx = frame.input.mouse.x;
         const float my = frame.input.mouse.y;
-        if (std::abs(mx - in_x) <= 5.0f) state.drag_mode = 2;
-        else if (std::abs(mx - out_x) <= 5.0f) state.drag_mode = 3;
-        else if (my <= r.y + band_h + 2.0f) {
-            state.drag_mode = 4;
+        ui::Picker pick;
+        pick.add_1d(mx, in_x, 5.0f, 2, 2);
+        pick.add_1d(mx, out_x, 5.0f, 2, 3);
+        pick.add_inside(my <= r.y + band_h + 2.0f, 1, 4);
+        pick.add_inside(true, 0, 1);
+        state.drag_mode = static_cast<uint8_t>(pick.best());
+        if (state.drag_mode == 4) {
             state.loop_anchor = mouse_frame();
-        } else {
-            state.drag_mode = 1;
+        } else if (state.drag_mode == 1) {
             state.scrub_anchor = mouse_frame();
             state.scrub_moved = false;
         }
-        frame.ctx.set_capture(id);
     }
-    if (frame.input.right_pressed() && frame.ctx.widget_owns_mouse(id) &&
-        !u->app->scope_is_look() && u->out->ruler_ctx) {
+    if (g.right_clicked && !u->app->scope_is_look() && u->out->ruler_ctx) {
         *u->out->ruler_ctx = true;
         *u->out->ruler_ctx_frame = static_cast<float>(mouse_frame());
     }
@@ -8361,14 +8474,13 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 break;
             }
         }
-        if (frame.input.left_released()) {
+        if (g.drag_released) {
             // A click (no real drag) on the loop band clears the region.
             if (state.drag_mode == 4 &&
                 std::abs(mouse_frame() - state.loop_anchor) < 1.5)
                 u->out->loop_clear = true;
             if (state.drag_mode >= 2) u->out->region_released = true;
             state.drag_mode = 0;
-            frame.ctx.clear_capture();
         }
     }
 }
@@ -8433,6 +8545,7 @@ struct TlBlock {
     bool* changed = nullptr;
     bool* released = nullptr;
     bool* pressed = nullptr;
+    bool* dbl = nullptr;
     bool* ctx = nullptr;
     float* ctx_at = nullptr;            // cursor's sequence-local frame
 };
@@ -8472,6 +8585,10 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.canvas.draw_sdf_rect({r.x, r.y, 3.0f, r.h}, 1.5f,
                                    theme.accent);
     tl_extend_rect(app, r);
+    timeline_zoom_wheel(app, frame.input,
+                        frame.ctx.take_wheel(frame.ctx.acquire_widget_id(
+                            &app.tl_lane_ids[u->lane_index])),
+                        app.player.frame_count());
     const double v0 = u->v0;
     const double vspan = std::max(1.0, u->v1 - u->v0);
     auto frame_x = [&](double f) { return tl_x_of(r, v0, vspan, f); };
@@ -8611,10 +8728,9 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         app.blk_drag_track = 0;
         app.blk_hover_track = 0;
         app.tl_snap_frame = -1.0;
-        frame.ctx.clear_capture();
     }
-    if (frame.input.left_pressed() && frame.ctx.widget_owns_mouse(id) &&
-        !u->locked) {
+    const ui::Gesture g = frame.ctx.gesture(id, r);
+    if (g.pressed && !u->locked) {
         const float mx = frame.input.mouse.x;
         bool on_block = false;
         for (size_t i = 0; i < u->count; ++i) {
@@ -8624,6 +8740,7 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (mx < x0 - 4.0f || mx > x1 + 4.0f) continue;
             on_block = true;
             *b.pressed = true;
+            if (b.dbl && g.double_clicked) *b.dbl = true;
             app.blk_drag_layer = b.layer_id;
             app.blk_drag_placement = b.placement_id;
             app.blk_drag_anchor = mouse_frame();
@@ -8633,10 +8750,12 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             app.blk_hover_track = 0;
             app.blk_ghost_t0 = b.t0;
             app.blk_ghost_t1 = b.t1;
-            if (std::abs(mx - x0) <= 4.0f) app.blk_drag_mode = 2;
-            else if (std::abs(mx - x1) <= 4.0f) app.blk_drag_mode = 3;
-            else app.blk_drag_mode = 1;
-            frame.ctx.set_capture(id);
+            ui::Picker edge;
+            edge.add_1d(mx, x0, 4.0f, 1, 2);
+            edge.add_1d(mx, x1, 4.0f, 1, 3);
+            edge.add_inside(true, 0, 1);
+            app.blk_drag_mode = static_cast<uint8_t>(edge.best());
+            frame.ctx.begin_drag(id);
             break;
         }
         // Shift presses stay inert, so a missed block keeps the selection.
@@ -8644,7 +8763,7 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             !(frame.input.mods & platform::kModShift))
             *u->out->tl_deselect = true;
     }
-    if (frame.input.right_pressed() && frame.ctx.widget_owns_mouse(id)) {
+    if (g.right_clicked) {
         const float mx = frame.input.mouse.x;
         bool on_block = false;
         for (size_t i = 0; i < u->count; ++i) {
@@ -8818,7 +8937,6 @@ void draw_block_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 app.blk_drag_track = 0;
                 app.blk_hover_track = 0;
                 app.tl_snap_frame = -1.0;
-                frame.ctx.clear_capture();
             }
             break;
         }
@@ -8850,6 +8968,10 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const float span = std::max(1.0e-6f, u->max_value - u->min_value);
     const uint32_t frames = std::max(1u, u->frame_count);
     tl_extend_rect(*u->app, r);
+    timeline_zoom_wheel(
+        *u->app, frame.input,
+        frame.ctx.take_wheel(frame.ctx.acquire_widget_id(u->state)),
+        u->frame_count);
     const double v0 = u->v0;
     const double vspan = std::max(1.0, u->v1 - u->v0);
 
@@ -8959,9 +9081,9 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                              u->app->key_edit_frame == sk.frame;
         char ro[64];
         if (editing)
-            std::snprintf(ro, sizeof(ro), "%s %s_",
+            std::snprintf(ro, sizeof(ro), "%s %s",
                           u->app->key_edit_mode == 2 ? "f" : "v",
-                          u->app->key_edit_buf.c_str());
+                          ui::caret_text(u->app->entry).c_str());
         else
             std::snprintf(ro, sizeof(ro), "f %.0f  %.4g", sk.frame,
                           sk.value);
@@ -8977,7 +9099,7 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
     // Interaction queues into FrameUi and applies post-frame.
     const ui::WidgetId id = frame.ctx.acquire_widget_id(&state);
-    const bool owns = frame.ctx.widget_owns_mouse(id);
+    const ui::Gesture g = frame.ctx.gesture(id, node.rect);
     const Vec2 mouse = frame.input.mouse;
     const bool dragging = state.dragging_key || state.dragging_in ||
                           state.dragging_out || state.group_drag ||
@@ -8991,23 +9113,16 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                mouse.y >= rc.y && mouse.y < rc.bottom();
     };
     auto nearest_key = [&]() {
-        int hit = -1;
-        float best = 8.0f;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const float dx = to_x(keys[i].frame) - mouse.x;
-            const float dy = to_y(keys[i].value) - mouse.y;
-            const float d = std::sqrt(dx * dx + dy * dy);
-            if (d < best) {
-                best = d;
-                hit = static_cast<int>(i);
-            }
-        }
-        return hit;
+        ui::Picker pick;
+        for (size_t i = 0; i < keys.size(); ++i)
+            pick.add_point(mouse,
+                           {to_x(keys[i].frame), to_y(keys[i].value)}, 8.0f,
+                           0, static_cast<int>(i));
+        return pick.best();
     };
 
     // Right-click deletes the hit key and its whole selected set.
-    if ((frame.input.buttons_pressed & ui::kMouseRight) && owns &&
-        !dragging) {
+    if (g.right_clicked && !dragging) {
         const int hit = nearest_key();
         if (hit >= 0) {
             std::vector<doc::Keyframe> edited;
@@ -9025,7 +9140,7 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    if (frame.input.left_pressed() && owns && !dragging) {
+    if (g.pressed && !dragging) {
         bool consumed = false;
         if (has_sel) {
             for (int ci = 0; ci < 3 && !consumed; ++ci) {
@@ -9065,16 +9180,17 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             const doc::Keyframe& sk =
                 keys[static_cast<size_t>(state.selected)];
             AppState& a = *u->app;
-            a.key_edit_mode =
+            const int mode =
                 (frame.input.mods & platform::kModShift) ? 2 : 1;
-            a.key_edit_target = u->target;
-            a.key_edit_frame = sk.frame;
             char seed[32];
-            if (a.key_edit_mode == 2)
+            if (mode == 2)
                 std::snprintf(seed, sizeof(seed), "%.0f", sk.frame);
             else
                 std::snprintf(seed, sizeof(seed), "%g", sk.value);
-            a.key_edit_buf = seed;
+            open_text_entry(a, ui::TextFilter::Signed, 15, seed);
+            a.key_edit_mode = mode;
+            a.key_edit_target = u->target;
+            a.key_edit_frame = sk.frame;
             consumed = true;
         }
         if (!consumed) {
@@ -9104,12 +9220,12 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 state.drag_anchor_value = from_y(mouse.y);
                 state.drag_orig = keys;
                 state.drag_sel = state.sel_frames;
-                frame.ctx.set_capture(id);
+                frame.ctx.begin_drag(id);
             } else if (grabbed >= 0) {
                 state.sel_frames.clear();
                 state.selected = grabbed;
                 state.dragging_key = true;
-                frame.ctx.set_capture(id);
+                frame.ctx.begin_drag(id);
             } else {
                 bool on_handle = false;
                 if (state.selected >= 0 &&
@@ -9120,19 +9236,15 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                          to_y(k.value + k.out_dy)};
                     const Vec2 in_p{to_x(k.frame + k.in_dx),
                                         to_y(k.value + k.in_dy)};
-                    auto near_point = [&](Vec2 p) {
-                        const float dx = p.x - mouse.x;
-                        const float dy = p.y - mouse.y;
-                        return dx * dx + dy * dy < 36.0f;
-                    };
-                    if (near_point(out_p)) {
-                        state.dragging_out = true;
+                    ui::Picker tan;
+                    tan.add_point(mouse, out_p, 6.0f, 0, 0);
+                    tan.add_point(mouse, in_p, 6.0f, 0, 1);
+                    if (tan.hit()) {
+                        if (tan.best() == 0) state.dragging_out = true;
+                        else state.dragging_in = true;
                         on_handle = true;
-                    } else if (near_point(in_p)) {
-                        state.dragging_in = true;
-                        on_handle = true;
+                        frame.ctx.begin_drag(id);
                     }
-                    if (on_handle) frame.ctx.set_capture(id);
                 }
                 if (!on_handle) {
                     const double mf = from_x(mouse.x);
@@ -9154,12 +9266,12 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         state.sel_frames.clear();
                         state.pending_add_frame = k.frame;
                         state.dragging_key = true;
-                        frame.ctx.set_capture(id);
+                        frame.ctx.begin_drag(id);
                         emit(std::move(edited));
                     } else {
                         state.box_select = true;
                         state.box_anchor = mouse;
-                        frame.ctx.set_capture(id);
+                        frame.ctx.begin_drag(id);
                     }
                 }
             }
@@ -9185,7 +9297,6 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
             state.box_select = false;
-            frame.ctx.clear_capture();
         }
     }
 
@@ -9268,7 +9379,6 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         state.group_drag = false;
         state.drag_orig.clear();
         state.drag_sel.clear();
-        frame.ctx.clear_capture();
         u->out->lane_release = true;
     }
 }
@@ -9455,14 +9565,15 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                             SliderState* slider_state,
                             const char* options = nullptr,
                             const char* tip = nullptr,
-                            float display_scale = 1.0f) {
+                            float display_scale = 1.0f,
+                            float hue_bar = -1.0f) {
         value = shown_param_value(app, {fx.id, param_index}, value, min_v,
                                   max_v);
         ParamStage stage{};
         stage.layer_index = app.selected_layer;
         stage.fx_index = fx_index;
         stage.param_index = param_index;
-        stage.staged = arena.alloc<float>();
+        stage.staged = arena.alloc<float>(hue_bar >= 0.0f ? 4 : 1);
         *stage.staged = value;
         stage.original = value;
         stage.changed = arena.alloc<bool>();
@@ -9479,24 +9590,14 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         FrameUi::KeyToggle key_toggle{key, value, arena.alloc<bool>()};
 
         // The type-in commit lands through this row staged path.
-        bool editing = app.rail_edit_key == key;
-        if (editing && app.rail_edit_commit) {
-            char* endp = nullptr;
-            const double typed =
-                std::strtod(app.rail_edit_buf.c_str(), &endp);
-            if (endp != app.rail_edit_buf.c_str()) {
-                const float scale = app.rail_edit_scale != 0.0f
-                                        ? app.rail_edit_scale
-                                        : 1.0f;
-                // A typed value never snaps. Only drags snap.
-                *stage.staged = std::clamp(
-                    static_cast<float>(typed / scale), min_v, max_v);
-                *stage.changed = true;
-                *stage.released = true;
-            }
-            app.rail_edit_key = {};
-            app.rail_edit_commit = false;
-            editing = false;
+        const bool editing = app.rail_edit_key == key;
+        if (app.rail_commit_key == key) {
+            // A typed value never snaps. Only drags snap.
+            *stage.staged = std::clamp(
+                static_cast<float>(app.rail_commit_value), min_v, max_v);
+            *stage.changed = true;
+            *stage.released = true;
+            app.rail_commit_key = {};
         }
         FrameUi::RailEdit redit{};
         redit.key = key;
@@ -9549,7 +9650,7 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                                &state.param_dd[o < 16 ? o : 15],
                                pick.selected, SizeSpec::fill());
         } else if (editing) {
-            std::string shown = app.rail_edit_buf + "_";
+            std::string shown = ui::caret_text(app.entry);
             ButtonOpts bo;
             bo.align_left = true;
             bo.width = SizeSpec::fill();
@@ -9557,6 +9658,13 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
             control = Button(arena,
                              arena.dup(shown.c_str(), shown.size()),
                              &state.value_edit_button, nullptr, bo);
+        } else if (hue_bar >= 0.0f) {
+            ui::SwatchOpts sopts;
+            sopts.mode = ui::SwatchMode::Hue;
+            sopts.hue_light = hue_bar;
+            control = ColorSwatch(arena, stage.staged,
+                                  &state.param_swatch[o], stage.staged,
+                                  stage.changed, stage.released, sopts);
         } else if (format && std::strstr(format, "deg")) {
             control = DialF(arena, stage.staged, min_v, max_v, slider_state,
                             opts);
@@ -9600,13 +9708,13 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
                      desc.display_deg ? "%.0f deg" : desc.format,
                      &state.params[p], options,
                      arena.dup(tipbuf, std::strlen(tipbuf)),
-                     desc.display_deg ? 57.29578f : 1.0f);
+                     desc.display_deg ? 57.29578f : 1.0f, desc.hue_bar);
     }
     if (fx.type == doc::EffectType::Text) {
         FrameUi::TextEditOpen open{fx.id, arena.alloc<bool>()};
         const bool editing = app.text_edit_id == fx.id;
-        std::string shown = editing ? app.text_edit_buf : fx.text;
-        if (editing) shown += '_';
+        std::string shown =
+            editing ? ui::caret_text(app.entry) : fx.text;
         ButtonOpts bo;
         bo.align_left = true;
         bo.width = SizeSpec::fill();
@@ -9953,6 +10061,7 @@ static std::vector<doc::ParamKey> layer_mod_row_map(const doc::Layer& sl) {
         none();   // shape dropdown
         none();   // blend dropdown
         const bool mesh = sl.gradient == doc::GradientKind::Mesh;
+        if (mesh) lay(22);
         if (!mesh) {
             lay(23);
             lay(24);
@@ -10223,20 +10332,21 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             layer_row(LFs::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                       "%.2f");
             // Colors edit through the swatch only, never channel sliders.
-            auto swatch_row = [&](const char* label, const float* rgb,
+            auto swatch_row = [&](const char* label, const float* rgba,
                                   bool is_b, ui::SwatchState* sw) {
                 if (srow >= 56) return;
                 FrameUi::ColorStage cstage{};
                 cstage.layer_id = layer.id;
                 cstage.color_b = is_b;
-                cstage.staged = arena.alloc<float>(3);
-                for (int c = 0; c < 3; ++c) {
-                    cstage.staged[c] = rgb[c];
-                    cstage.original[c] = rgb[c];
+                cstage.staged = arena.alloc<float>(4);
+                for (int c = 0; c < 4; ++c) {
+                    cstage.staged[c] = rgba[c];
+                    cstage.original[c] = rgba[c];
                 }
                 cstage.changed = arena.alloc<bool>();
                 cstage.released = arena.alloc<bool>();
                 out.color_stages.push_back(cstage);
+                if (sw) sw->mode = ui::SwatchMode::Rgba;
                 rows[srow].label = label;
                 rows[srow].kind = 3;
                 rows[srow].swatch = sw;
@@ -10253,14 +10363,15 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 FrameUi::ColorStage cstage{};
                 cstage.layer_id = layer.id;
                 cstage.stop_id = gs.id;
-                cstage.staged = arena.alloc<float>(3);
-                for (int c = 0; c < 3; ++c) {
+                cstage.staged = arena.alloc<float>(4);
+                for (int c = 0; c < 4; ++c) {
                     cstage.staged[c] = gs.color[c];
                     cstage.original[c] = gs.color[c];
                 }
                 cstage.changed = arena.alloc<bool>();
                 cstage.released = arena.alloc<bool>();
                 out.color_stages.push_back(cstage);
+                if (sw) sw->mode = ui::SwatchMode::Rgba;
                 rows[srow].label = label;
                 rows[srow].kind = 3;
                 rows[srow].swatch = sw;
@@ -10312,6 +10423,9 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 layer_row(LFs::GradSpace, "blend", 0.0f, 2.0f,
                           static_cast<float>(layer.gradient_space), "%.0f",
                           "rgb|hsl|oklab");
+                if (mesh)
+                    layer_row(LFs::GradLen, "spread", 0.05f, 4.0f,
+                              layer.gradient_len, "%.2f");
                 if (!mesh) {
                     layer_row(LFs::GradX, "centre x", 0.0f, 1.0f,
                               layer.gradient_x, "%.3f");
@@ -10666,14 +10780,15 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                  const char* label, float min_v, float max_v,
                                  float value, const char* fmt,
                                  const char* options = nullptr,
-                                 float display_scale = 1.0f) {
+                                 float display_scale = 1.0f,
+                                 float hue_bar = -1.0f) {
                 value = shown_param_value(app, {fx.id, param_index}, value,
                                           min_v, max_v);
                 ParamStage stage{};
                 stage.layer_index = li;
                 stage.fx_index = i;
                 stage.param_index = param_index;
-                stage.staged = arena.alloc<float>();
+                stage.staged = arena.alloc<float>(hue_bar >= 0.0f ? 4 : 1);
                 *stage.staged = value;
                 stage.original = value;
                 stage.changed = arena.alloc<bool>();
@@ -10719,6 +10834,16 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 if (options) {
                     row.kind = 1;
                     row.options = options;
+                } else if (hue_bar >= 0.0f) {
+                    LayerUiState& hui = app.layer_ui[layer.id];
+                    ui::SwatchState& hsw =
+                        hui.hue_swatch[fx.id * 64u +
+                                       static_cast<uint64_t>(
+                                           param_index + 2)];
+                    hsw.mode = ui::SwatchMode::Hue;
+                    hsw.hue_light = hue_bar;
+                    row.kind = 3;
+                    row.swatch = &hsw;
                 }
             };
             stage_row(0, doc::kWetParam, "wet/dry", 0.0f, 1.0f, fx.wet,
@@ -10737,7 +10862,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                           desc.min_value, desc.max_value, fx.params[p],
                           desc.display_deg ? "%.0f deg" : desc.format,
                           options,
-                          desc.display_deg ? 57.29578f : 1.0f);
+                          desc.display_deg ? 57.29578f : 1.0f,
+                          desc.hue_bar);
             }
             if (is_text_fx) {
                 flow::ParamRow& trow = rows[n_rows - 1];
@@ -11401,16 +11527,14 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             : (app.text_edit_id
                    ? flow::node_id(flow::NodeKind::Effect, app.text_edit_id)
                    : 0);
-    // Only one rename id is set at a time: they share one text buffer.
-    const std::string& rename_src =
-        app.group_rename_id
-            ? app.group_rename_buf
-            : (app.text_edit_id ? app.text_edit_buf : app.frame_rename_buf);
-    graph->rename_text = arena.dup(rename_src.c_str(), rename_src.size());
+    graph->rename_text = arena.dup(app.entry.buf.c_str(),
+                                   app.entry.buf.size());
     graph->value_edit_node = app.value_edit_node;
     graph->value_edit_row = app.value_edit_row;
-    graph->value_edit_text = arena.dup(app.value_edit_buf.c_str(),
-                                       app.value_edit_buf.size());
+    graph->value_edit_text = arena.dup(app.entry.buf.c_str(),
+                                       app.entry.buf.size());
+    graph->text_caret = app.entry.caret;
+    graph->add_filter_caret = app.fx_filter.caret;
     if (!app.multi_sel.empty()) {
         uint64_t* multi_arr =
             arena.alloc<uint64_t>(app.multi_sel.size());
@@ -11426,7 +11550,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     std::tolower(static_cast<unsigned char>(c)));
             return s;
         };
-        const std::string needle = lower(app.fx_filter);
+        const std::string needle = lower(app.fx_filter.buf);
         auto matches = [&](const char* label, const char* cat) {
             if (needle.empty()) return true;
             if (lower(label).find(needle) != std::string::npos)
@@ -11491,7 +11615,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         graph->add_headers = header_arr;
         graph->add_count = items.size();
         graph->add_filter =
-            arena.dup(app.fx_filter.c_str(), app.fx_filter.size());
+            arena.dup(app.fx_filter.buf.c_str(), app.fx_filter.buf.size());
         // What the menu shows with no filter: the search must not outgrow it.
         if (app.find_mode) {
             graph->add_rows = nodes.size();
@@ -11681,9 +11805,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         out.browser_view_pick[0] = arena.alloc<bool>();
         out.browser_view_pick[1] = arena.alloc<bool>();
         {
-            std::string label = app.browser_filter;
-            if (app.browser_search_focus) label += "_";
-            else if (label.empty()) label = "search...";
+            std::string label =
+                app.browser_search_focus
+                    ? ui::caret_text(app.browser_filter)
+                    : app.browser_filter.buf;
+            if (label.empty()) label = "search...";
             ButtonOpts so;
             so.width = SizeSpec::fill();
             so.flat = true;
@@ -11720,7 +11846,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         int stripe = 0;
         auto rename_row = [&](uint64_t id, int depth) {
             std::string shown(static_cast<size_t>(depth) * 2 + 2, ' ');
-            shown += app.browser_rename_buf + "_";
+            shown += ui::caret_text(app.entry);
             ButtonOpts bo;
             bo.flat = true;
             bo.align_left = true;
@@ -11744,7 +11870,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             cell.kind = kind;
             std::string shown = name.empty() ? std::string(fallback) : name;
             if (id == app.browser_rename_id)
-                shown = app.browser_rename_buf + "_";
+                shown = ui::caret_text(app.entry);
             cell.name = arena.dup(shown.c_str(), shown.size());
             cell.open_bin = open_bin;
             cell.scoped = id == app.scope_look;
@@ -11819,17 +11945,17 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             }
         };
         auto matches = [&](const std::string& nm) {
-            if (app.browser_filter.empty()) return true;
+            if (app.browser_filter.buf.empty()) return true;
             auto low = [](std::string s) {
                 for (char& c : s)
                     if (c >= 'A' && c <= 'Z')
                         c = static_cast<char>(c + 32);
                 return s;
             };
-            return low(nm).find(low(app.browser_filter)) !=
+            return low(nm).find(low(app.browser_filter.buf)) !=
                    std::string::npos;
         };
-        if (!app.browser_filter.empty()) {
+        if (!app.browser_filter.buf.empty()) {
             for (const doc::Sequence& sq : app.document.sequences)
                 if (matches(sq.name))
                     tree_row(sq.id, 1, sq.name, "sequence", 0, false);
@@ -11936,7 +12062,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             out.duration_clicked = arena.alloc<bool>();
             std::string label;
             if (app.duration_focus) {
-                label = app.duration_edit + "_";
+                label = ui::caret_text(app.entry);
             } else {
                 char buf[32];
                 const double secs =
@@ -12278,24 +12404,14 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             out.param_ctxs.push_back(pctx);
             opts.out_ctx = pctx.clicked;
             // Typed values do not snap and clamp to the hard range.
-            bool editing = app.rail_edit_key == lkey;
-            if (editing && app.rail_edit_commit) {
-                char* endp = nullptr;
-                const double typed =
-                    std::strtod(app.rail_edit_buf.c_str(), &endp);
-                if (endp != app.rail_edit_buf.c_str()) {
-                    const float scale = app.rail_edit_scale != 0.0f
-                                            ? app.rail_edit_scale
-                                            : 1.0f;
-                    *stage.staged = std::clamp(
-                        static_cast<float>(typed / scale), min_v,
-                        hard_max > max_v ? hard_max : max_v);
-                    *stage.changed = true;
-                    *stage.released = true;
-                }
-                app.rail_edit_key = {};
-                app.rail_edit_commit = false;
-                editing = false;
+            const bool editing = app.rail_edit_key == lkey;
+            if (app.rail_commit_key == lkey) {
+                *stage.staged = std::clamp(
+                    static_cast<float>(app.rail_commit_value), min_v,
+                    hard_max > max_v ? hard_max : max_v);
+                *stage.changed = true;
+                *stage.released = true;
+                app.rail_commit_key = {};
             }
             FrameUi::RailEdit redit{};
             redit.key = lkey;
@@ -12311,7 +12427,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             opts.out_value_clicked = redit.clicked;
             LayoutNode* control;
             if (editing) {
-                std::string shown = app.rail_edit_buf + "_";
+                std::string shown = ui::caret_text(app.entry);
                 ButtonOpts bo;
                 bo.align_left = true;
                 bo.width = SizeSpec::fill();
@@ -12337,23 +12453,25 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         using LF = FrameUi::LayerField;
         layer_slider(LF::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                      "%.2f");
-        auto color_swatch_row = [&](const char* label, const float rgb[3],
+        auto color_swatch_row = [&](const char* label, const float rgba[4],
                                     bool is_b, ui::SwatchState& swatch) {
             FrameUi::ColorStage cstage{};
             cstage.layer_id = layer.id;
             cstage.color_b = is_b;
-            cstage.staged = arena.alloc<float>(3);
-            for (int c = 0; c < 3; ++c) {
-                cstage.staged[c] = rgb[c];
-                cstage.original[c] = rgb[c];
+            cstage.staged = arena.alloc<float>(4);
+            for (int c = 0; c < 4; ++c) {
+                cstage.staged[c] = rgba[c];
+                cstage.original[c] = rgba[c];
             }
             cstage.changed = arena.alloc<bool>();
             cstage.released = arena.alloc<bool>();
             out.color_stages.push_back(cstage);
+            ui::SwatchOpts sopts;
+            sopts.mode = ui::SwatchMode::Rgba;
             layer_rows_ui.push_back(value_row(
                 arena, label,
-                ColorSwatch(arena, rgb, &swatch, cstage.staged,
-                            cstage.changed, cstage.released)));
+                ColorSwatch(arena, rgba, &swatch, cstage.staged,
+                            cstage.changed, cstage.released, sopts)));
         };
         // Pattern shape 4 is SMPTE bars: it has fixed colors, no rows.
         const bool pattern_two_color =
@@ -12687,9 +12805,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                  Button(arena, "+ frame", &app.add_frame_button,
                         out.add_frame_clicked, half)}));
             out.fx_search_clicked = arena.alloc<bool>();
-            std::string label = app.fx_filter;
-            if (app.fx_search_focus) label += "_";
-            else if (label.empty()) label = "search...";
+            std::string label = app.fx_search_focus
+                                    ? ui::caret_text(app.fx_filter)
+                                    : app.fx_filter.buf;
+            if (label.empty()) label = "search...";
             ButtonOpts search_opts;
             search_opts.width = SizeSpec::fill();
             search_opts.flat = true;
@@ -12701,14 +12820,14 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                        &app.fx_search_btn, out.fx_search_clicked,
                        search_opts)));
         }
-        if (!app.fx_filter.empty()) {
+        if (!app.fx_filter.buf.empty()) {
             auto lower = [](std::string s) {
                 for (char& c : s)
                     c = static_cast<char>(
                         std::tolower(static_cast<unsigned char>(c)));
                 return s;
             };
-            const std::string needle = lower(app.fx_filter);
+            const std::string needle = lower(app.fx_filter.buf);
             std::vector<LayoutNode*> browser;
             ButtonOpts half;
             half.width = SizeSpec::fill();
@@ -12820,9 +12939,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             out.preset_search_clicked = arena.alloc<bool>();
             out.preset_view_pick[0] = arena.alloc<bool>();
             out.preset_view_pick[1] = arena.alloc<bool>();
-            std::string label = app.preset_filter;
-            if (app.preset_search_focus) label += "_";
-            else if (label.empty()) label = "search...";
+            std::string label = app.preset_search_focus
+                                    ? ui::caret_text(app.preset_filter)
+                                    : app.preset_filter.buf;
+            if (label.empty()) label = "search...";
             ButtonOpts search_opts;
             search_opts.width = SizeSpec::fill();
             search_opts.flat = true;
@@ -12868,7 +12988,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         int stripe = 0;
         auto rename_row = [&](int depth) {
             std::string shown(static_cast<size_t>(depth) * 2 + 2, ' ');
-            shown += app.preset_rename_buf + "_";
+            shown += ui::caret_text(app.entry);
             ButtonOpts bo;
             bo.flat = true;
             bo.align_left = true;
@@ -12887,7 +13007,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 cell.kind = kind;
                 std::string shown = name;
                 if (key == app.preset_rename_key)
-                    shown = app.preset_rename_buf + "_";
+                    shown = ui::caret_text(app.entry);
                 cell.name = arena.dup(shown.c_str(), shown.size());
                 cell.open_bin = open_bin;
                 cell.clicked = arena.alloc<bool>();
@@ -12945,14 +13065,14 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             }
         };
         auto matches_filter = [&](const doc::Preset& p) {
-            if (app.preset_filter.empty()) return true;
+            if (app.preset_filter.buf.empty()) return true;
             auto lower = [](std::string s) {
                 for (char& c : s)
                     c = static_cast<char>(std::tolower(
                         static_cast<unsigned char>(c)));
                 return s;
             };
-            return lower(p.name).find(lower(app.preset_filter)) !=
+            return lower(p.name).find(lower(app.preset_filter.buf)) !=
                    std::string::npos;
         };
         auto tag_ok = [&](const doc::Preset& p) {
@@ -12962,7 +13082,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                  app.preset_tag_index)]) != p.tags.end();
         };
         const bool filtering =
-            !app.preset_filter.empty() || app.preset_tag_index >= 0;
+            !app.preset_filter.buf.empty() || app.preset_tag_index >= 0;
         if (filtering) {
             for (size_t pi = 0; pi < app.presets.size(); ++pi)
                 if (tag_ok(app.presets[pi]) &&
@@ -13494,18 +13614,16 @@ ui::LayoutNode* build_transport(ui::LayoutArena& arena, AppState& app,
 }
 
 // Do not change doc.lanes during a walk: set_lane_command can erase them.
-void commit_key_edit(AppState& app) {
-    const int mode = app.key_edit_mode;
-    app.key_edit_mode = 0;
-    if (mode == 0 || app.key_edit_buf.empty()) return;
-    char* end = nullptr;
-    const double num = std::strtod(app.key_edit_buf.c_str(), &end);
-    if (end == app.key_edit_buf.c_str()) return;
+void apply_key_commit(AppState& app) {
+    const int mode = app.key_commit_mode;
+    app.key_commit_mode = 0;
+    if (mode == 0) return;
+    const double num = app.key_commit_num;
     for (const doc::KeyframeLane& lane : app.look().lanes) {
-        if (!(lane.target == app.key_edit_target)) continue;
+        if (!(lane.target == app.key_commit_target)) continue;
         std::vector<doc::Keyframe> keys = lane.keys;
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (keys[i].frame != app.key_edit_frame) continue;
+            if (keys[i].frame != app.key_commit_frame) continue;
             if (mode == 1) {
                 keys[i].value = static_cast<float>(num);
             } else {
@@ -13517,7 +13635,7 @@ void commit_key_edit(AppState& app) {
             }
             app.undo.execute(
                 app.document,
-                doc::set_lane_command(app.scope_look,app.key_edit_target, std::move(keys)));
+                doc::set_lane_command(app.scope_look,app.key_commit_target, std::move(keys)));
             return;
         }
         return;
@@ -13526,94 +13644,100 @@ void commit_key_edit(AppState& app) {
 
 // Only one inline text field is active: this commits it and clears it.
 void commit_text_entry(AppState& app) {
-    if (app.frame_rename_id) {
-        app.undo.execute(app.document,
-                         doc::set_frame_title_command(
-                             app.scope_look, app.frame_rename_id,
-                             app.frame_rename_buf));
-        app.frame_rename_id = 0;
-        app.frame_rename_buf.clear();
-    }
-    if (app.group_rename_id) {
-        size_t gli = 0;
-        if (find_group_by_id(app.look(), app.group_rename_id, &gli))
-            for (const doc::Group& gr : app.look().layers[gli].groups)
-                if (gr.id == app.group_rename_id) {
-                    doc::Group edited = gr;
-                    edited.name = app.group_rename_buf;
-                    app.undo.execute(app.document,
-                                     doc::set_group_props_command(
-                                         app.scope_look, gli, edited));
-                    break;
-                }
-        app.group_rename_id = 0;
-        app.group_rename_buf.clear();
-    }
-    if (app.text_edit_id) {
-        size_t li = 0, fi = 0;
-        if (find_effect_by_id(app.look(), app.text_edit_id, &li, &fi))
+    switch (active_text_entry(app)) {
+        case TextEntry::None:
+            return;
+        case TextEntry::Duration:
+            if (!app.entry.buf.empty())
+                apply_still_duration(app,
+                                     std::atof(app.entry.buf.c_str()));
+            break;
+        case TextEntry::KeyEdit: {
+            char* end = nullptr;
+            const double num = std::strtod(app.entry.buf.c_str(), &end);
+            if (end != app.entry.buf.c_str()) {
+                app.key_commit_mode = app.key_edit_mode;
+                app.key_commit_target = app.key_edit_target;
+                app.key_commit_frame = app.key_edit_frame;
+                app.key_commit_num = num;
+            }
+            break;
+        }
+        case TextEntry::RailEdit: {
+            char* endp = nullptr;
+            const double typed = std::strtod(app.entry.buf.c_str(), &endp);
+            if (endp != app.entry.buf.c_str()) {
+                const float scale = app.rail_edit_scale != 0.0f
+                                        ? app.rail_edit_scale
+                                        : 1.0f;
+                app.rail_commit_key = app.rail_edit_key;
+                app.rail_commit_value = typed / scale;
+            }
+            break;
+        }
+        case TextEntry::ValueEdit:
+            if (!app.entry.buf.empty()) {
+                app.value_commit_node = app.value_edit_node;
+                app.value_commit_row = app.value_edit_row;
+                app.value_commit_typed = std::atof(app.entry.buf.c_str());
+            }
+            break;
+        case TextEntry::FrameRename:
             app.undo.execute(app.document,
-                             doc::set_effect_text_command(
-                                 app.scope_look, li, fi,
-                                 app.text_edit_buf));
-        app.text_edit_id = 0;
-        app.text_edit_buf.clear();
+                             doc::set_frame_title_command(
+                                 app.scope_look, app.frame_rename_id,
+                                 app.entry.buf));
+            break;
+        case TextEntry::GroupRename: {
+            size_t gli = 0;
+            if (find_group_by_id(app.look(), app.group_rename_id, &gli))
+                for (const doc::Group& gr : app.look().layers[gli].groups)
+                    if (gr.id == app.group_rename_id) {
+                        doc::Group edited = gr;
+                        edited.name = app.entry.buf;
+                        app.undo.execute(app.document,
+                                         doc::set_group_props_command(
+                                             app.scope_look, gli, edited));
+                        break;
+                    }
+            break;
+        }
+        case TextEntry::TextEdit: {
+            size_t li = 0, fi = 0;
+            if (find_effect_by_id(app.look(), app.text_edit_id, &li, &fi))
+                app.undo.execute(app.document,
+                                 doc::set_effect_text_command(
+                                     app.scope_look, li, fi,
+                                     app.entry.buf));
+            break;
+        }
+        case TextEntry::BrowserRename:
+            browser_rename_apply(app);
+            break;
+        case TextEntry::PresetRename:
+            preset_rename_apply(app);
+            break;
+        case TextEntry::BrowserSearch:
+        case TextEntry::PresetSearch:
+        case TextEntry::FxSearch:
+            break;
     }
-    if (app.key_edit_mode != 0) commit_key_edit(app);
-    if (app.duration_focus) {
-        if (!app.duration_edit.empty())
-            apply_still_duration(app,
-                                 std::atof(app.duration_edit.c_str()));
-        app.duration_focus = false;
-        app.duration_edit.clear();
-    }
-    if (app.value_edit_node) app.value_commit = true;
-    if (app.rail_edit_key.effect_id != 0) app.rail_edit_commit = true;
-    if (app.browser_rename_id) browser_rename_apply(app);
-    if (app.preset_rename_key) preset_rename_apply(app);
-    app.browser_search_focus = false;
-    app.preset_search_focus = false;
-    app.fx_search_focus = false;
+    close_text_entry(app);
 }
 
-// A press commits only the fields that were active before this frame.
-struct TextEntrySnapshot {
-    uint64_t frame_rename, group_rename, text_edit;
-    uint64_t browser_rename, preset_rename, value_edit;
-    doc::ParamKey rail_edit;
-    int key_edit_mode;
-    bool duration;
-    bool browser_search, preset_search, fx_search;
-};
-TextEntrySnapshot snapshot_text_entry(const AppState& app) {
-    return {app.frame_rename_id,       app.group_rename_id,
-            app.text_edit_id,          app.browser_rename_id,
-            app.preset_rename_key,     app.value_edit_node,
-            app.rail_edit_key,         app.key_edit_mode,
-            app.duration_focus,        app.browser_search_focus,
-            app.preset_search_focus,   app.fx_search_focus};
-}
-bool text_entry_unchanged(const AppState& app,
-                          const TextEntrySnapshot& s) {
-    return app.frame_rename_id == s.frame_rename &&
-           app.group_rename_id == s.group_rename &&
-           app.text_edit_id == s.text_edit &&
-           app.browser_rename_id == s.browser_rename &&
-           app.preset_rename_key == s.preset_rename &&
-           app.value_edit_node == s.value_edit &&
-           app.rail_edit_key == s.rail_edit &&
-           app.key_edit_mode == s.key_edit_mode &&
-           app.duration_focus == s.duration &&
-           app.browser_search_focus == s.browser_search &&
-           app.preset_search_focus == s.preset_search &&
-           app.fx_search_focus == s.fx_search;
-}
-bool any_text_entry(const TextEntrySnapshot& s) {
-    return s.frame_rename || s.group_rename || s.text_edit ||
-           s.browser_rename || s.preset_rename || s.value_edit ||
-           s.rail_edit.effect_id != 0 || s.key_edit_mode != 0 ||
-           s.duration || s.browser_search || s.preset_search ||
-           s.fx_search;
+void cancel_text_entry(AppState& app) {
+    switch (active_text_entry(app)) {
+        case TextEntry::BrowserSearch:
+            app.browser_filter.set("");
+            break;
+        case TextEntry::FxSearch:
+            app.canvas_state.add_open = false;
+            app.find_mode = false;
+            break;
+        default:
+            break;
+    }
+    close_text_entry(app);
 }
 
 // Returns false when no lane drives the param: the caller writes the base.
@@ -13852,6 +13976,7 @@ struct KeyIntents {
     float key_trim_in = -1.0f, key_trim_out = -1.0f;
     // tl_hovered comes from the last frame's timeline rect.
     bool tl_hovered = false;
+    bool do_cancel = false;
 };
 
 namespace act {
@@ -13935,10 +14060,13 @@ void import_media(AppState&, KeyIntents& k) { k.import_media = true; }
 void import_preset(AppState&, KeyIntents& k) { k.import_preset = true; }
 void export_out(AppState&, KeyIntents& k) { k.do_export = true; }
 
+void cancel(AppState&, KeyIntents& k) { k.do_cancel = true; }
+
 void find_node(AppState& a, KeyIntents&) {
     if (!a.scope_is_look()) return;
+    close_text_entry(a);
     a.find_mode = true;
-    a.fx_filter.clear();
+    a.fx_filter.set("");
     a.fx_search_focus = true;
     a.canvas_state.add_open = true;
     a.canvas_state.add_anchor = a.canvas_state.last_mouse;
@@ -14062,7 +14190,17 @@ void delete_selected(AppState& a, KeyIntents& k) {
         // Delete removes the selected control points, never the layer.
         doc::Layer* pl = doc::find_layer(a.look(), a.sel.id);
         if (pl && pl->source == doc::LayerSourceKind::Gradient) {
-            a.giz_stop_delete = true;
+            if (pl->gradient == doc::GradientKind::Mesh &&
+                pl->stops.size() > 1 &&
+                a.giz_path_sel < static_cast<int>(pl->stops.size())) {
+                doc::Layer up = *pl;
+                up.stops.erase(up.stops.begin() +
+                               static_cast<ptrdiff_t>(a.giz_path_sel));
+                a.undo.execute(a.document,
+                               doc::set_layer_props_command(
+                                   a.scope_look, std::move(up)));
+                a.giz_path_sel = -1;
+            }
             return;
         }
         if (pl && pl->source == doc::LayerSourceKind::Shape &&
@@ -14133,6 +14271,7 @@ const std::vector<ActionDef>& action_registry() {
         {"ab_wipe", "a/b wipe", "a", false, act::ab_wipe},
         {"alpha_checker", "alpha checker", "", false, act::alpha_checker},
         {"bypass", "bypass fx", "b", false, act::bypass},
+        {"cancel", "cancel / step back out", "escape", false, act::cancel},
         {"copy", "copy", "ctrl+c", false, act::copy},
         {"cut", "cut", "ctrl+x", false, act::cut},
         {"cycle_theme", "cycle theme", "t", false, act::cycle_theme},
@@ -14355,11 +14494,12 @@ std::vector<StepCompletion> step_completions(const AppState& app,
 
 void settings_apply_completion(AppState& app, size_t index) {
     SettingsUi& s = app.settings;
-    const auto comps = step_completions(app, s.step_buf);
+    const auto comps = step_completions(app, s.step_buf.buf);
     if (index >= comps.size()) return;
-    const std::string word = step_trailing_word(s.step_buf);
-    s.step_buf.resize(s.step_buf.size() - word.size());
-    s.step_buf += comps[index].insert;
+    const std::string word = step_trailing_word(s.step_buf.buf);
+    s.step_buf.set(
+        s.step_buf.buf.substr(0, s.step_buf.buf.size() - word.size()) +
+        comps[index].insert);
     s.complete_sel = 0;
 }
 
@@ -14386,8 +14526,8 @@ std::string chords_of(const AppState& app, KeyBinding::Kind kind,
 }
 
 bool settings_filter_hits(const AppState& app, std::string_view name) {
-    return app.settings.filter.empty() ||
-           name.find(app.settings.filter) != std::string_view::npos;
+    return app.settings.filter.buf.empty() ||
+           name.find(app.settings.filter.buf) != std::string_view::npos;
 }
 
 SettingsLayout settings_layout(const AppState& app, const ui::Font&,
@@ -14432,7 +14572,7 @@ SettingsLayout settings_layout(const AppState& app, const ui::Font&,
             const bool editing =
                 s.step_edit_macro == name && s.step_edit_index == i;
             row(SettingsRow::Kind::StepRow,
-                editing ? s.step_buf + "_" : step, step, i,
+                editing ? ui::caret_text(s.step_buf) : step, step, i,
                 !editing && !macro_step_error(step).empty(), kSetRowH);
             if (editing) {
                 sl.edit_anchor = sl.rows.back().rect;
@@ -14442,7 +14582,7 @@ SettingsLayout settings_layout(const AppState& app, const ui::Font&,
         }
         if (s.step_edit_macro == name &&
             s.step_edit_index == static_cast<int>(steps.size())) {
-            row(SettingsRow::Kind::StepRow, s.step_buf + "_", "", i,
+            row(SettingsRow::Kind::StepRow, ui::caret_text(s.step_buf), "", i,
                 false, kSetRowH);
             sl.edit_anchor = sl.rows.back().rect;
             sl.edit_active = true;
@@ -14451,7 +14591,7 @@ SettingsLayout settings_layout(const AppState& app, const ui::Font&,
             kSetRowH);
     }
     row(SettingsRow::Kind::NewMacro,
-        s.adding ? "name: " + s.name_buf + "_" : "+ new macro", "", -1,
+        s.adding ? "name: " + ui::caret_text(s.name_buf) : "+ new macro", "", -1,
         false, kSetRowH);
 
     row(SettingsRow::Kind::Heading, "script", "", -1, false, kSetHeadH);
@@ -14498,7 +14638,7 @@ SettingsOverlay settings_overlay(const AppState& app,
     if (sl.edit_anchor.bottom() <= sl.view.y ||
         sl.edit_anchor.y >= sl.view.bottom())
         return ov;
-    const auto comps = step_completions(app, s.step_buf);
+    const auto comps = step_completions(app, s.step_buf.buf);
     if (!comps.empty()) {
         ov.shown = std::min<int>(kCompleteShown,
                                  static_cast<int>(comps.size()));
@@ -14510,7 +14650,7 @@ SettingsOverlay settings_overlay(const AppState& app,
                 " more - keep typing)");
     } else {
         std::string word;
-        for (const char c : s.step_buf) {
+        for (const char c : s.step_buf.buf) {
             if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                 c == '_' || (!word.empty() && c >= '0' && c <= '9'))
                 word.push_back(c);
@@ -14584,10 +14724,10 @@ void settings_close(AppState& app) {
 
 void settings_commit_name(AppState& app) {
     SettingsUi& s = app.settings;
-    const std::string name = s.name_buf;
+    const std::string name = s.name_buf.buf;
     if (s.adding) {
         s.adding = false;
-        s.name_buf.clear();
+        s.name_buf.set("");
         if (name.empty()) return;
         if (app.macros.count(name)) {
             app.status = "macro name taken";
@@ -14601,7 +14741,7 @@ void settings_commit_name(AppState& app) {
     if (s.rename_macro.empty()) return;
     const std::string old = s.rename_macro;
     s.rename_macro.clear();
-    s.name_buf.clear();
+    s.name_buf.set("");
     if (name.empty() || name == old) return;
     if (app.macros.count(name)) {
         app.status = "macro name taken";
@@ -14622,28 +14762,30 @@ void settings_commit_step(AppState& app) {
     SettingsUi& s = app.settings;
     const auto it = app.macros.find(s.step_edit_macro);
     if (it != app.macros.end()) {
-        const std::string err = macro_step_error(s.step_buf);
+        const std::string err = macro_step_error(s.step_buf.buf);
         if (!err.empty()) {
             app.status = err;
             return;
         }
         const size_t i = static_cast<size_t>(s.step_edit_index);
         if (i < it->second.size())
-            it->second[i] = s.step_buf;
+            it->second[i] = s.step_buf.buf;
         else
-            it->second.push_back(s.step_buf);
+            it->second.push_back(s.step_buf.buf);
         save_ui_prefs(app);
     }
     s.step_edit_macro.clear();
     s.step_edit_index = -1;
-    s.step_buf.clear();
+    s.step_buf.set("");
     s.complete_sel = 0;
 }
 
-// Escape and the backtick key never bind as a chord.
+// Escape cancels a capture here, so it never binds through this panel.
 void settings_key_event(AppState& app, const platform::Event& e) {
     SettingsUi& s = app.settings;
+    const bool key_down = e.type == platform::Event::Type::KeyDown;
     if (!s.capture.empty()) {
+        if (!key_down) return;
         if (e.key == platform::Key::Escape) {
             s.capture.clear();
             return;
@@ -14674,9 +14816,10 @@ void settings_key_event(AppState& app, const platform::Event& e) {
         save_ui_prefs(app);
         return;
     }
+    const bool step = s.step_edit_index >= 0;
     // Autocomplete owns arrows and tab while the dropdown has rows.
-    if (s.step_edit_index >= 0) {
-        const auto comps = step_completions(app, s.step_buf);
+    if (key_down && step) {
+        const auto comps = step_completions(app, s.step_buf.buf);
         if (!comps.empty()) {
             const int count = std::min<int>(
                 kCompleteShown, static_cast<int>(comps.size()));
@@ -14696,47 +14839,29 @@ void settings_key_event(AppState& app, const platform::Event& e) {
             }
         }
     }
-    std::string* dst = s.step_edit_index >= 0 ? &s.step_buf
-                       : (s.adding || !s.rename_macro.empty())
-                           ? &s.name_buf
-                           : &s.filter;
-    if (e.key == platform::Key::Backspace) {
-        if (!dst->empty()) dst->pop_back();
-        if (s.step_edit_index >= 0) s.complete_sel = 0;
-        return;
+    ui::TextField& dst = step ? s.step_buf
+                         : (s.adding || !s.rename_macro.empty())
+                             ? s.name_buf
+                             : s.filter;
+    switch (ui::text_field_key(dst, e)) {
+        case ui::TextResult::Edit:
+            if (step) s.complete_sel = 0;
+            break;
+        case ui::TextResult::Commit:
+            if (step) settings_commit_step(app);
+            else settings_commit_name(app);
+            break;
+        case ui::TextResult::Cancel:
+            if (step || s.adding || !s.rename_macro.empty())
+                settings_end_entry(s);
+            else if (!s.filter.buf.empty())
+                s.filter.set("");
+            else
+                settings_close(app);
+            break;
+        case ui::TextResult::None:
+            break;
     }
-    if (e.key == platform::Key::Enter) {
-        if (s.step_edit_index >= 0) settings_commit_step(app);
-        else settings_commit_name(app);
-        return;
-    }
-    if (e.key == platform::Key::Escape) {
-        if (s.step_edit_index >= 0 || s.adding ||
-            !s.rename_macro.empty()) {
-            settings_end_entry(s);
-        } else if (!s.filter.empty()) {
-            s.filter.clear();
-        } else {
-            settings_close(app);
-        }
-    }
-}
-
-void settings_char_event(AppState& app, uint32_t cp) {
-    SettingsUi& s = app.settings;
-    if (!s.capture.empty()) return;
-    if (cp < 32 || cp >= 127) return;
-    if (s.step_edit_index >= 0) {
-        if (s.step_buf.size() < 160) {
-            s.step_buf.push_back(static_cast<char>(cp));
-            s.complete_sel = 0;
-        }
-        return;
-    }
-    std::string* dst = (s.adding || !s.rename_macro.empty())
-                           ? &s.name_buf
-                           : &s.filter;
-    if (dst->size() < 40) dst->push_back(static_cast<char>(cp));
 }
 
 // This pass reads live input; the caller then deadens the frame below.
@@ -14812,7 +14937,7 @@ void settings_interact(AppState& app, const ui::UiInput& input,
                 } else if (over(ren, "macro-ren:" + r.key)) {
                     if (clicked) {
                         s.rename_macro = r.key;
-                        s.name_buf = r.key;
+                        s.name_buf.set(r.key);
                     }
                 } else if (over(del, "macro-del:" + r.key)) {
                     if (clicked) {
@@ -14862,7 +14987,7 @@ void settings_interact(AppState& app, const ui::UiInput& input,
                     if (clicked && i < n) {
                         s.step_edit_macro = s.macro_open;
                         s.step_edit_index = r.index;
-                        s.step_buf = steps->second[i];
+                        s.step_buf.set(steps->second[i]);
                     }
                 }
                 break;
@@ -14965,9 +15090,10 @@ void draw_settings(ui::Canvas2D& canvas, const ui::Font& font,
                              s.step_edit_index < 0 && !s.adding &&
                              s.rename_macro.empty();
     ui::draw_text(canvas, font,
-                  "filter: " + s.filter + (filter_live ? "_" : ""),
+                  "filter: " + (filter_live ? ui::caret_text(s.filter)
+                                            : s.filter.buf),
                   {sl.filter.x + 6.0f, sl.filter.y + text_dy}, fs,
-                  s.filter.empty() ? th.text_dim : th.text);
+                  s.filter.buf.empty() ? th.text_dim : th.text);
 
     canvas.push_clip(sl.view);
     auto btn = [&](const ui::Rect& r, const std::string& label,
@@ -15027,7 +15153,7 @@ void draw_settings(ui::Canvas2D& canvas, const ui::Font& font,
                     canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
                 ui::probe_add("macro:" + r.key, r.rect);
                 ui::draw_text(canvas, font,
-                              renaming ? s.name_buf + "_" : r.label,
+                              renaming ? ui::caret_text(s.name_buf) : r.label,
                               {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
                               open_row || renaming ? th.accent : th.text);
                 chord_btn(r, 4, "macro:" + r.key, "set:macro:" + r.key);
@@ -15200,6 +15326,7 @@ bool tl_block_core(AppState& app, ui::LayoutArena& arena,
     b->changed = arena.alloc<bool>();
     b->released = arena.alloc<bool>();
     b->pressed = arena.alloc<bool>();
+    b->dbl = arena.alloc<bool>();
     b->ctx = arena.alloc<bool>();
     b->ctx_at = arena.alloc<float>();
     return is_seq_target;
@@ -15392,7 +15519,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                 out.block_stages.push_back(
                     {track.id, place.id, b.staged, b.changed, b.released});
                 out.block_picks.push_back(
-                    {li, track.id, place.id, b.pressed});
+                    {li, track.id, place.id, b.pressed, b.dbl});
                 out.block_ctxs.push_back(
                     {track.id, place.id, false, b.ctx, b.ctx_at});
                 lane.blocks.push_back(b);
@@ -15493,7 +15620,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                     {0, place.id, b.staged, b.changed, b.released});
                 // An audio block picks no video layer.
                 out.block_picks.push_back(
-                    {SIZE_MAX, 0, place.id, b.pressed});
+                    {SIZE_MAX, 0, place.id, b.pressed, b.dbl});
                 out.block_ctxs.push_back(
                     {track.id, place.id, true, b.ctx, b.ctx_at});
                 ablocks.push_back(b);
@@ -15795,6 +15922,8 @@ struct ScriptHost {
     std::string script_name;
     bool exit_when_done = false;
     bool exit_requested = false;
+    bool guard_armed = false;
+    double guard_deadline = 0.0;   // app_seconds
     int exit_code = 0;
     int failures = 0;
     int open_groups = 0;   // undo groups the script opened and must close
@@ -15831,7 +15960,7 @@ struct ScriptHost {
     uint64_t view_rev = 0;
 
     bool console_open = false;
-    std::string console_input;
+    ui::TextField console_input;
     std::vector<std::string> console_hist;
     int hist_pos = -1;
     std::vector<std::string> log_lines;
@@ -15903,20 +16032,23 @@ struct ScriptHost {
     void push_ev(uint64_t at, platform::Event ev) {
         synth.push_back({frame_no + at, std::move(ev)});
     }
-    platform::Event mouse_ev(platform::Event::Type type, float lx,
-                             float ly) const {
+    platform::Event mouse_ev(platform::Event::Type type, float lx, float ly,
+                             uint32_t mods = 0) const {
         platform::Event ev{};
         ev.type = type;
         const float s = window ? window->dpi_scale() : 1.0f;
         ev.mouse_x = lx * s;
         ev.mouse_y = ly * s;
+        ev.mods = mods;
         return ev;
     }
     // move + press + release starting this pump; returns frames used.
-    int queue_click(float lx, float ly, bool right, bool dbl) {
-        push_ev(0, mouse_ev(platform::Event::Type::MouseMove, lx, ly));
+    int queue_click(float lx, float ly, bool right, bool dbl,
+                    uint32_t mods = 0) {
+        push_ev(0,
+                mouse_ev(platform::Event::Type::MouseMove, lx, ly, mods));
         platform::Event down =
-            mouse_ev(platform::Event::Type::MouseDown, lx, ly);
+            mouse_ev(platform::Event::Type::MouseDown, lx, ly, mods);
         down.button = right ? platform::MouseButton::Right
                             : platform::MouseButton::Left;
         platform::Event up = down;
@@ -15943,112 +16075,94 @@ struct ScriptHost {
         }
     }
 
-    // This strips the events it consumes, before synthetic input goes in.
-    void console_events(std::vector<platform::Event>& evs) {
-        for (size_t i = 0; i < evs.size();) {
-            platform::Event& e = evs[i];
-            const bool key_down = e.type == platform::Event::Type::KeyDown;
-            if (!console_open) {
-                if (key_down && e.key == platform::Key::Grave) {
-                    console_open = true;
-                    evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
-                    // The paired WM_CHAR backtick follows in this batch.
-                    for (size_t j = i; j < evs.size(); ++j)
-                        if (evs[j].type == platform::Event::Type::Char &&
-                            (evs[j].codepoint == '`' ||
-                             evs[j].codepoint == '~')) {
-                            evs.erase(evs.begin() +
-                                      static_cast<ptrdiff_t>(j));
-                            break;
-                        }
-                    continue;
-                }
-                ++i;
-                continue;
-            }
-            // Open: the console owns the keyboard, mouse passes through.
-            if (e.type == platform::Event::Type::Char) {
-                if (e.codepoint == '`' || e.codepoint == '~') {
-                } else if (e.codepoint >= 32 && e.codepoint < 127) {
-                    console_input +=
-                        static_cast<char>(e.codepoint);
-                    hist_pos = -1;
-                }
-                evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
-                continue;
-            }
-            if (key_down) {
-                bool eat = true;
-                switch (e.key) {
-                    case platform::Key::Grave:
-                    case platform::Key::Escape:
-                        console_open = false;
-                        break;
-                    case platform::Key::Backspace:
-                        if (!console_input.empty())
-                            console_input.pop_back();
-                        break;
-                    case platform::Key::Enter: {
-                        std::string line = console_input;
-                        console_input.clear();
-                        hist_pos = -1;
-                        if (!line.empty()) {
-                            console_hist.push_back(line);
-                            log("> " + line);
-                            if (!vm) start_source(line, "console");
-                            else log("[busy] a script is running");
-                        }
-                        break;
-                    }
-                    case platform::Key::Up:
-                        if (!console_hist.empty()) {
-                            if (hist_pos < 0)
-                                hist_pos = static_cast<int>(
-                                               console_hist.size()) -
-                                           1;
-                            else if (hist_pos > 0)
-                                --hist_pos;
-                            console_input =
-                                console_hist[static_cast<size_t>(
-                                    hist_pos)];
-                        }
-                        break;
-                    case platform::Key::Down:
-                        if (hist_pos >= 0) {
-                            ++hist_pos;
-                            if (hist_pos >=
-                                static_cast<int>(console_hist.size())) {
-                                hist_pos = -1;
-                                console_input.clear();
-                            } else {
-                                console_input =
-                                    console_hist[static_cast<size_t>(
-                                        hist_pos)];
-                            }
-                        }
-                        break;
-                    default:
-                        eat = e.key != platform::Key::Ctrl &&
-                              e.key != platform::Key::Shift &&
-                              e.key != platform::Key::Alt;
-                        break;
-                }
-                if (eat) {
-                    evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
-                    continue;
-                }
-            }
-            if (e.type == platform::Event::Type::KeyUp) {
-                evs.erase(evs.begin() + static_cast<ptrdiff_t>(i));
-                continue;
-            }
-            ++i;
+    void guard_close(const std::string& reason) {
+        guard_armed = false;
+        log("[guard] " + script_name + ": " + reason);
+        if (exit_code == 0) exit_code = 1;
+        exit_requested = true;
+        finish();
+    }
+
+    // True when the console took the key. Open, it owns the whole keyboard.
+    bool console_key(const platform::Event& e) {
+        if (!console_enabled) return false;
+        const bool key_down = e.type == platform::Event::Type::KeyDown;
+        if (!console_open) {
+            if (!key_down || e.key != platform::Key::Grave) return false;
+            console_open = true;
+            return true;
         }
+        if (e.type == platform::Event::Type::Char) {
+            if (e.codepoint != '`' && e.codepoint != '~' &&
+                ui::text_field_key(console_input, e) ==
+                    ui::TextResult::Edit)
+                hist_pos = -1;
+            return true;
+        }
+        if (!key_down) return false;
+        switch (e.key) {
+            case platform::Key::Grave:
+                console_open = false;
+                return true;
+            case platform::Key::Up:
+                if (!console_hist.empty()) {
+                    if (hist_pos < 0)
+                        hist_pos =
+                            static_cast<int>(console_hist.size()) - 1;
+                    else if (hist_pos > 0)
+                        --hist_pos;
+                    console_input.set(
+                        console_hist[static_cast<size_t>(hist_pos)]);
+                }
+                return true;
+            case platform::Key::Down:
+                if (hist_pos >= 0) {
+                    ++hist_pos;
+                    if (hist_pos >=
+                        static_cast<int>(console_hist.size())) {
+                        hist_pos = -1;
+                        console_input.set("");
+                    } else {
+                        console_input.set(
+                            console_hist[static_cast<size_t>(hist_pos)]);
+                    }
+                }
+                return true;
+            case platform::Key::Ctrl:
+            case platform::Key::Shift:
+            case platform::Key::Alt:
+                return false;
+            default:
+                break;
+        }
+        switch (ui::text_field_key(console_input, e)) {
+            case ui::TextResult::Commit: {
+                const std::string line = console_input.buf;
+                console_input.set("");
+                hist_pos = -1;
+                if (!line.empty()) {
+                    console_hist.push_back(line);
+                    log("> " + line);
+                    if (!vm) start_source(line, "console");
+                    else log("[busy] a script is running");
+                }
+                break;
+            }
+            case ui::TextResult::Cancel:
+                console_open = false;
+                break;
+            default:
+                break;
+        }
+        return true;
     }
 
     void pump() {
         ++frame_no;
-        if (console_enabled) console_events(*events);
+        if (guard_armed && app && app->app_seconds > guard_deadline) {
+            guard_close("time limit reached");
+            return;
+        }
         // Synthetic events append after the real ones, in the same frame.
         for (size_t i = 0; i < synth.size();) {
             if (synth[i].frame <= frame_no) {
@@ -16162,6 +16276,7 @@ struct ScriptHost {
                     vm->error());
                 ++failures;
                 if (exit_code == 0) exit_code = 1;
+                if (guard_armed) exit_requested = true;
                 finish();
                 return;
         }
@@ -16239,7 +16354,7 @@ void draw_console(ScriptHost& sh, ui::Canvas2D& canvas,
                       {r.x + 8.0f, y}, fs, th.text_dim);
         y += line_h;
     }
-    ui::draw_text(canvas, font, "] " + sh.console_input + "_",
+    ui::draw_text(canvas, font, "] " + ui::caret_text(sh.console_input),
                   {r.x + 8.0f, y + 2.0f}, fs, th.text);
 }
 
@@ -16310,17 +16425,6 @@ int param_index_of(const doc::EffectInstance& fx, const script::Value& v) {
 }
 
 // INT_MIN means the name is not a layer param id.
-int layer_param_index_of(const std::string& name) {
-    static constexpr const char* ids[doc::kLayerParamCount] = {
-        "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
-        "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
-        "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
-        "slip",    "waveform",  "phase"};
-    for (int i = 0; i < doc::kLayerParamCount; ++i)
-        if (name == ids[i]) return i;
-    return INT_MIN;
-}
-
 // found_out false means the tail dangles with no link leaving it.
 uint64_t chain_tail(const doc::Look& look, uint64_t layer_id,
                     doc::NodeLink* out_link, bool* found_out) {
@@ -16497,6 +16601,25 @@ void register_ops_app(ScriptHost& sh) {
     env.add("fail", "fail(message) - abort the script", 1, 1,
             [](Vm& vm, std::vector<Value>& a) {
                 return op_err(vm, script::to_display(a[0]));
+            });
+    env.add("close_on_fail",
+            "close_on_fail(seconds) - call it first: it closes the app "
+            "after a runtime error or a stall. exit() makes the normal "
+            "close",
+            0, -1, [&sh](Vm& vm, std::vector<Value>& a) {
+                const double now = sh.app ? sh.app->app_seconds : 0.0;
+                sh.guard_armed = true;
+                sh.guard_deadline = now + 5.0;
+                if (a.size() != 1)
+                    return op_err(vm,
+                                  "close_on_fail(seconds) takes one number");
+                double secs = 0.0;
+                if (!arg_num(vm, a[0], "close_on_fail(seconds)", &secs))
+                    return Value::nil();
+                if (secs <= 0.0)
+                    return op_err(vm, "close_on_fail needs seconds > 0");
+                sh.guard_deadline = now + secs;
+                return Value::nil();
             });
     env.add("exit", "exit(code?) - quit the app when the script ends", 0,
             1, [&sh](Vm&, std::vector<Value>& a) {
@@ -16830,6 +16953,19 @@ void register_ops_app(ScriptHost& sh) {
             });
 }
 
+uint32_t parse_mods(const std::string& m) {
+    uint32_t mods = 0;
+    if (m.find("ctrl") != std::string::npos) mods |= platform::kModCtrl;
+    if (m.find("shift") != std::string::npos) mods |= platform::kModShift;
+    if (m.find("alt") != std::string::npos) mods |= platform::kModAlt;
+    return mods;
+}
+
+uint32_t trailing_mods(const std::vector<script::Value>& a, size_t from) {
+    return a.size() > from && a[from].is_str() ? parse_mods(a[from].as_str())
+                                               : 0u;
+}
+
 bool resolve_target(ScriptHost& sh, script::Vm& vm,
                     std::vector<script::Value>& a, float* x, float* y,
                     size_t* consumed) {
@@ -16889,36 +17025,46 @@ void register_ops_input(ScriptHost& sh) {
                 map_num(m, "h", r.h);
                 return m;
             });
-    env.add("click", "click(x, y) or click(probe_name, index?)", 1, 2,
+    env.add("click",
+            "click(x, y, mods?) or click(probe_name, index?, mods?)", 1, 3,
             [&sh](Vm& vm, std::vector<Value>& a) {
                 float x = 0.0f, y = 0.0f;
                 size_t used = 0;
                 if (!resolve_target(sh, vm, a, &x, &y, &used))
                     return Value::nil();
                 sh.wait = ScriptHost::Wait::Frames;
-                sh.wait_frames = sh.queue_click(x, y, false, false);
+                sh.wait_frames =
+                    sh.queue_click(x, y, false, false,
+                                   trailing_mods(a, used));
                 vm.mark_suspend();
                 return Value::nil();
             });
-    env.add("rclick", "rclick(x, y) or rclick(probe_name, index?)", 1, 2,
+    env.add("rclick",
+            "rclick(x, y, mods?) or rclick(probe_name, index?, mods?)", 1,
+            3,
             [&sh](Vm& vm, std::vector<Value>& a) {
                 float x = 0.0f, y = 0.0f;
                 size_t used = 0;
                 if (!resolve_target(sh, vm, a, &x, &y, &used))
                     return Value::nil();
                 sh.wait = ScriptHost::Wait::Frames;
-                sh.wait_frames = sh.queue_click(x, y, true, false);
+                sh.wait_frames =
+                    sh.queue_click(x, y, true, false,
+                                   trailing_mods(a, used));
                 vm.mark_suspend();
                 return Value::nil();
             });
-    env.add("dblclick", "dblclick(x, y) or dblclick(probe_name, index?)",
-            1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
+    env.add("dblclick",
+            "dblclick(x, y, mods?) or dblclick(probe_name, index?, mods?)",
+            1, 3, [&sh](Vm& vm, std::vector<Value>& a) {
                 float x = 0.0f, y = 0.0f;
                 size_t used = 0;
                 if (!resolve_target(sh, vm, a, &x, &y, &used))
                     return Value::nil();
                 sh.wait = ScriptHost::Wait::Frames;
-                sh.wait_frames = sh.queue_click(x, y, false, true);
+                sh.wait_frames =
+                    sh.queue_click(x, y, false, true,
+                                   trailing_mods(a, used));
                 vm.mark_suspend();
                 return Value::nil();
             });
@@ -16935,11 +17081,12 @@ void register_ops_input(ScriptHost& sh) {
                 vm.mark_suspend();
                 return Value::nil();
             });
-    env.add("drag", "drag(x0, y0, x1, y1, frames?)", 4, 5,
+    env.add("drag", "drag(x0, y0, x1, y1, frames?, mods?)", 4, 6,
             [&sh](Vm& vm, std::vector<Value>& a) {
                 for (int i = 0; i < 4; ++i)
                     if (!a[static_cast<size_t>(i)].is_num())
                         return op_err(vm, "drag(x0, y0, x1, y1, frames?)");
+                const uint32_t mods = trailing_mods(a, 5);
                 const float x0 = static_cast<float>(a[0].num);
                 const float y0 = static_cast<float>(a[1].num);
                 const float x1 = static_cast<float>(a[2].num);
@@ -16950,9 +17097,9 @@ void register_ops_input(ScriptHost& sh) {
                         : 8;
                 sh.push_ev(0, sh.mouse_ev(
                                   platform::Event::Type::MouseMove, x0,
-                                  y0));
+                                  y0, mods));
                 platform::Event down = sh.mouse_ev(
-                    platform::Event::Type::MouseDown, x0, y0);
+                    platform::Event::Type::MouseDown, x0, y0, mods);
                 down.button = platform::MouseButton::Left;
                 sh.push_ev(1, down);
                 for (int i = 1; i <= steps; ++i) {
@@ -16962,10 +17109,10 @@ void register_ops_input(ScriptHost& sh) {
                                sh.mouse_ev(
                                    platform::Event::Type::MouseMove,
                                    x0 + (x1 - x0) * t,
-                                   y0 + (y1 - y0) * t));
+                                   y0 + (y1 - y0) * t, mods));
                 }
                 platform::Event up = sh.mouse_ev(
-                    platform::Event::Type::MouseUp, x1, y1);
+                    platform::Event::Type::MouseUp, x1, y1, mods);
                 up.button = platform::MouseButton::Left;
                 sh.push_ev(2 + static_cast<uint64_t>(steps), up);
                 sh.wait = ScriptHost::Wait::Frames;
@@ -17014,14 +17161,28 @@ void register_ops_input(ScriptHost& sh) {
                     else if (c == ',') k = platform::Key::Comma;
                     else if (c == '.') k = platform::Key::Period;
                     else if (c == '/') k = platform::Key::Slash;
+                    else if (c == '\\') k = platform::Key::Backslash;
+                    else if (c == ';') k = platform::Key::Semicolon;
+                    else if (c == '\'') k = platform::Key::Apostrophe;
+                } else if (name.size() >= 2 && name[0] == 'f' &&
+                           name[1] >= '0' && name[1] <= '9') {
+                    const int n = std::atoi(name.c_str() + 1);
+                    if (n >= 1 && n <= 12)
+                        k = static_cast<platform::Key>(
+                            static_cast<int>(platform::Key::F1) + (n - 1));
                 } else if (name == "space") k = platform::Key::Space;
+                else if (name == "grave") k = platform::Key::Grave;
                 else if (name == "enter") k = platform::Key::Enter;
-                else if (name == "esc") k = platform::Key::Escape;
+                else if (name == "esc" || name == "escape")
+                    k = platform::Key::Escape;
                 else if (name == "tab") k = platform::Key::Tab;
                 else if (name == "backspace") k = platform::Key::Backspace;
                 else if (name == "delete") k = platform::Key::Delete;
                 else if (name == "home") k = platform::Key::Home;
                 else if (name == "end") k = platform::Key::End;
+                else if (name == "insert") k = platform::Key::Insert;
+                else if (name == "pageup") k = platform::Key::PageUp;
+                else if (name == "pagedown") k = platform::Key::PageDown;
                 else if (name == "left") k = platform::Key::Left;
                 else if (name == "right") k = platform::Key::Right;
                 else if (name == "up") k = platform::Key::Up;
@@ -17476,7 +17637,7 @@ void register_ops_graph(ScriptHost& sh) {
                 map_bool(m, "timeline_lock", l->timeline_lock);
                 map_num(m, "target", static_cast<double>(l->target));
                 Value ca = Value::make_list(), cb = Value::make_list();
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 4; ++i) {
                     ca.list->push_back(Value::number(l->color_a[i]));
                     cb.list->push_back(Value::number(l->color_b[i]));
                 }
@@ -17566,22 +17727,22 @@ void register_ops_graph(ScriptHost& sh) {
                         return op_err(vm, "that nesting would loop");
                     up.target = t;
                 }
-                auto color3 = [&](const char* key, float out[3]) {
+                auto color_rgba = [&](const char* key, float out[4]) {
                     const auto it = m.map->find(key);
                     if (it == m.map->end() ||
-                        it->second.kind != Value::Kind::List ||
-                        it->second.list->size() != 3)
+                        it->second.kind != Value::Kind::List)
                         return;
-                    for (int i = 0; i < 3; ++i) {
-                        const Value& c = (*it->second.list)[
-                            static_cast<size_t>(i)];
+                    const size_t n_c = it->second.list->size();
+                    if (n_c != 3 && n_c != 4) return;
+                    for (size_t i = 0; i < n_c; ++i) {
+                        const Value& c = (*it->second.list)[i];
                         if (c.is_num())
                             out[i] = std::clamp(
                                 static_cast<float>(c.num), 0.0f, 1.0f);
                     }
                 };
-                color3("color_a", up.color_a);
-                color3("color_b", up.color_b);
+                color_rgba("color_a", up.color_a);
+                color_rgba("color_b", up.color_b);
                 if (map_get_num(m, "scale", &n))
                     up.gen_scale = static_cast<float>(n);
                 if (map_get_num(m, "angle", &n))
@@ -17625,7 +17786,7 @@ void register_ops_graph(ScriptHost& sh) {
                             cit != sv.map->end() &&
                             cit->second.kind == Value::Kind::List) {
                             const auto& c = *cit->second.list;
-                            for (size_t i = 0; i < 3 && i < c.size(); ++i)
+                            for (size_t i = 0; i < 4 && i < c.size(); ++i)
                                 if (c[i].is_num())
                                     s.color[i] =
                                         static_cast<float>(c[i].num);
@@ -18393,7 +18554,7 @@ bool resolve_param_key(ScriptHost& sh, script::Vm& vm,
             vm.set_error("layer params go by name");
             return false;
         }
-        const int pi = layer_param_index_of(param.as_str());
+        const int pi = mod::layer_param_index_of(param.as_str());
         if (pi == INT_MIN) {
             vm.set_error("no layer param \"" + param.as_str() + "\"");
             return false;
@@ -19993,6 +20154,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             input.mouse.y < app.tl_rect.bottom();
         // The Vec2 is in physical client pixels.
         std::vector<std::pair<std::string, Vec2>> dropped_files;
+        std::vector<platform::Event> ui_keys;
         int confirm_pick = 0;     // 1 enter, 2 or 3 escape
         for (const platform::Event& e : events) {
             if (app.confirm.open()) {
@@ -20016,270 +20178,33 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         running = false;
                     break;
                 case platform::Event::Type::Char:
-                    if (app.settings.open) {
-                        settings_char_event(app, e.codepoint);
-                        break;
-                    }
-                    if (app.duration_focus) {
-                        if ((e.codepoint >= '0' && e.codepoint <= '9') ||
-                            (e.codepoint == '.' &&
-                             app.duration_edit.find('.') ==
-                                 std::string::npos))
-                            app.duration_edit.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.key_edit_mode != 0) {
-                        if (((e.codepoint >= '0' && e.codepoint <= '9') ||
-                             e.codepoint == '.' || e.codepoint == '-') &&
-                            app.key_edit_buf.size() < 15)
-                            app.key_edit_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.rail_edit_key.effect_id != 0) {
-                        if (((e.codepoint >= '0' && e.codepoint <= '9') ||
-                             e.codepoint == '.' || e.codepoint == '-') &&
-                            app.rail_edit_buf.size() < 15)
-                            app.rail_edit_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.value_edit_node) {
-                        if (((e.codepoint >= '0' && e.codepoint <= '9') ||
-                             e.codepoint == '.' || e.codepoint == '-') &&
-                            app.value_edit_buf.size() < 16)
-                            app.value_edit_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.frame_rename_id) {
-                        if (e.codepoint >= 32 && e.codepoint < 127 &&
-                            app.frame_rename_buf.size() < 64)
-                            app.frame_rename_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.group_rename_id) {
-                        if (e.codepoint >= 32 && e.codepoint < 127 &&
-                            app.group_rename_buf.size() < 60)
-                            app.group_rename_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.text_edit_id) {
-                        if (e.codepoint >= 32 && e.codepoint < 127 &&
-                            app.text_edit_buf.size() < 64)
-                            app.text_edit_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.browser_rename_id) {
-                        if (e.codepoint >= 32 && e.codepoint < 127)
-                            app.browser_rename_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.preset_rename_key) {
-                        if (e.codepoint >= 32 && e.codepoint < 127)
-                            app.preset_rename_buf.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.browser_search_focus) {
-                        if (e.codepoint >= 32 && e.codepoint < 127)
-                            app.browser_filter.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.preset_search_focus) {
-                        if (e.codepoint >= 32 && e.codepoint < 127)
-                            app.preset_filter.push_back(
-                                static_cast<char>(e.codepoint));
-                        break;
-                    }
-                    if (app.fx_search_focus && e.codepoint >= 32 &&
-                        e.codepoint < 127)
-                        app.fx_filter.push_back(
-                            static_cast<char>(e.codepoint));
-                    break;
-                case platform::Event::Type::KeyDown:
+                case platform::Event::Type::KeyDown: {
                     if (app.settings.open) {
                         settings_key_event(app, e);
                         break;
                     }
-                    if (app.browser_rename_id) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.browser_rename_buf.empty())
-                            app.browser_rename_buf.pop_back();
-                        else if (e.key == platform::Key::Enter)
-                            commit_text_entry(app);
-                        else if (e.key == platform::Key::Escape)
-                            app.browser_rename_id = 0;
+                    if (script_host.console_key(e)) break;
+                    if (!ctx.focus().is_null()) {
+                        ui_keys.push_back(e);
                         break;
                     }
-                    if (app.preset_rename_key) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.preset_rename_buf.empty())
-                            app.preset_rename_buf.pop_back();
-                        else if (e.key == platform::Key::Enter)
-                            commit_text_entry(app);
-                        else if (e.key == platform::Key::Escape)
-                            app.preset_rename_key = 0;
-                        break;
-                    }
-                    if (app.browser_search_focus) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.browser_filter.empty())
-                            app.browser_filter.pop_back();
-                        else if (e.key == platform::Key::Enter)
-                            app.browser_search_focus = false;
-                        else if (e.key == platform::Key::Escape) {
-                            app.browser_search_focus = false;
-                            app.browser_filter.clear();
-                        }
-                        break;
-                    }
-                    if (app.duration_focus) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.duration_edit.empty()) {
-                            app.duration_edit.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            commit_text_entry(app);
-                        } else if (e.key == platform::Key::Escape) {
-                            app.duration_focus = false;
-                            app.duration_edit.clear();
-                        }
-                        break;
-                    }
-                    if (app.value_edit_node) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.value_edit_buf.empty()) {
-                            app.value_edit_buf.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            app.value_commit = true;
-                        } else if (e.key == platform::Key::Escape) {
-                            app.value_edit_node = 0;
-                            app.value_edit_row = -1;
-                            app.value_edit_buf.clear();
-                        }
-                        break;
-                    }
-                    if (app.frame_rename_id) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.frame_rename_buf.empty()) {
-                            app.frame_rename_buf.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            commit_text_entry(app);
-                        } else if (e.key == platform::Key::Escape) {
-                            app.frame_rename_id = 0;
-                            app.frame_rename_buf.clear();
-                        }
-                        break;
-                    }
-                    if (app.group_rename_id) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.group_rename_buf.empty()) {
-                            app.group_rename_buf.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            commit_text_entry(app);
-                        } else if (e.key == platform::Key::Escape) {
-                            app.group_rename_id = 0;
-                            app.group_rename_buf.clear();
-                        }
-                        break;
-                    }
-                    if (app.text_edit_id) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.text_edit_buf.empty()) {
-                            app.text_edit_buf.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            commit_text_entry(app);
-                        } else if (e.key == platform::Key::Escape) {
-                            app.text_edit_id = 0;
-                            app.text_edit_buf.clear();
-                        }
-                        break;
-                    }
-                    if (app.key_edit_mode != 0) {
-                        if (e.key == platform::Key::Backspace) {
-                            if (!app.key_edit_buf.empty())
-                                app.key_edit_buf.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            commit_text_entry(app);
-                        } else if (e.key == platform::Key::Escape) {
-                            app.key_edit_mode = 0;
-                        }
-                        break;
-                    }
-                    if (app.rail_edit_key.effect_id != 0) {
-                        if (e.key == platform::Key::Backspace) {
-                            if (!app.rail_edit_buf.empty())
-                                app.rail_edit_buf.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            app.rail_edit_commit = true;
-                        } else if (e.key == platform::Key::Escape) {
-                            app.rail_edit_key = {};
-                            app.rail_edit_commit = false;
-                        }
-                        break;
-                    }
-                    if (app.preset_search_focus) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.preset_filter.empty())
-                            app.preset_filter.pop_back();
-                        else if (e.key == platform::Key::Enter ||
-                                 e.key == platform::Key::Escape)
-                            app.preset_search_focus = false;
-                        break;
-                    }
-                    if (app.fx_search_focus) {
-                        if (e.key == platform::Key::Backspace &&
-                            !app.fx_filter.empty()) {
-                            app.fx_filter.pop_back();
-                        } else if (e.key == platform::Key::Enter) {
-                            if (app.canvas_state.add_open)
+                    if (ui::TextField* tf = text_entry_field(app)) {
+                        const TextEntry kind = active_text_entry(app);
+                        const ui::TextResult r = ui::text_field_key(*tf, e);
+                        if (r == ui::TextResult::Commit) {
+                            if (kind == TextEntry::FxSearch &&
+                                app.canvas_state.add_open)
                                 ki.do_add_first = true;
-                            app.fx_search_focus = false;
-                        } else if (e.key == platform::Key::Escape) {
-                            app.fx_search_focus = false;
-                            app.canvas_state.add_open = false;
-                            app.find_mode = false;
+                            commit_text_entry(app);
+                        } else if (r == ui::TextResult::Cancel) {
+                            cancel_text_entry(app);
                         }
                         break;
                     }
-                    if (e.key == platform::Key::Escape) {
-                        if (macro_host.active() ||
-                            !app.action_queue.empty()) {
-                            macro_host.finish();
-                            app.action_queue.clear();
-                            app.status = "macro stopped";
-                        } else if (app.ctx_menu.kind) {
-                            app.ctx_menu = {};
-                            app.ctx_menu_dd.open = false;
-                        } else if (app.canvas_state.dd_open) {
-                            app.canvas_state.dd_open = false;
-                        } else if (app.canvas_state.ctx_open) {
-                            app.canvas_state.ctx_open = false;
-                        } else if (app.open_group &&
-                                   app.sel.kind == SelKind::None) {
-                            exit_group_view(app);
-                        } else if (app.sel.kind != SelKind::None) {
-                            app.sel = {};
-                            app.insert_before_id = 0;
-                        } else if (app.layer_sel || app.sel_placement) {
-                            app.layer_sel = false;
-                            app.sel_placement = 0;
-                        } else if (app.scope_look !=
-                                   app.document.root_sequence) {
-                            enter_scope(app, app.document.root_sequence);
-                        }
-                        // Escape does not quit: close through the window
-                        // path and the dirty guard.
-                    } else {
+                    if (e.type == platform::Event::Type::KeyDown)
                         dispatch_key_binding(app, script_host, ki, e);
-                    }
                     break;
+                }
                 case platform::Event::Type::FileDrop:
                     if (!app.settings.open)
                         dropped_files.emplace_back(
@@ -20291,6 +20216,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
                 default:
                     break;
+            }
+        }
+        if (ki.do_cancel) {
+            // Cancel does not quit: close through the window path and the
+            // dirty guard.
+            if (macro_host.active() || !app.action_queue.empty()) {
+                macro_host.finish();
+                app.action_queue.clear();
+                app.status = "macro stopped";
+            } else if (app.ctx_menu.kind) {
+                app.ctx_menu = {};
+                app.ctx_menu_dd.open = false;
+            } else if (app.canvas_state.dd_open) {
+                app.canvas_state.dd_open = false;
+            } else if (app.canvas_state.ctx_open) {
+                app.canvas_state.ctx_open = false;
+            } else if (app.open_group && app.sel.kind == SelKind::None) {
+                exit_group_view(app);
+            } else if (app.sel.kind != SelKind::None) {
+                app.sel = {};
+                app.insert_before_id = 0;
+            } else if (app.layer_sel || app.sel_placement) {
+                app.layer_sel = false;
+                app.sel_placement = 0;
+            } else if (app.scope_look != app.document.root_sequence) {
+                enter_scope(app, app.document.root_sequence);
             }
         }
         pump_action_queue(app, ki);
@@ -20528,37 +20479,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 static_cast<float>(frame.extent.height) / scale};
 
         input.begin_frame(events, scale);
+        input.keys = std::move(ui_keys);
         // Snapshot before the handlers: an opening press must not commit.
-        const TextEntrySnapshot text_entry_before =
-            snapshot_text_entry(app);
-        auto deaden_input = [&input] {
-            input.buttons_down = 0;
-            input.buttons_pressed = 0;
-            input.buttons_released = 0;
-            input.wheel_x = input.wheel_y = 0.0f;
-            input.typed.clear();
-            input.backspace_pressed = false;
-            input.enter_pressed = false;
-            input.mouse = {-4096.0f, -4096.0f};
-            input.mouse_delta = {};
-            input.consumed = true;
-        };
+        const TextEntryId text_entry_before = text_entry_id(app);
+        app.modal_frame = app.confirm.open() || app.settings.open;
         if (app.confirm.open()) {
             confirm_interact(app, input, font, viewport, confirm_pick,
                              window.get(), &running);
-            deaden_input();
         } else if (app.settings.open) {
             settings_interact(app, input, font, viewport, window.get());
-            deaden_input();
         }
         if (!app.pending_macro.empty()) {
             run_macro(app, macro_host, app.pending_macro);
             app.pending_macro.clear();
         }
-        // Route the wheel on the last frame rect, before the lane scroll.
         app.tl_rect = app.tl_rect_accum;
         app.tl_rect_accum = {};
-        timeline_zoom_wheel(app, input, app.player.frame_count());
         canvas.begin_frame(scale, {viewport.w, viewport.h});
         ui::probe_frame_begin();
         arena.reset();
@@ -20875,12 +20811,38 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         root_opts.padding = ui::Edges::all(8);
         ui::LayoutNode* root = ui::VStack(arena, root_opts,
                                           {menu_bar, body});
+        root->user = &app;
+        root->hit_fn = [](ui::LayoutNode& node, ui::LayoutFrame& frame) {
+            AppState& a = *static_cast<AppState*>(node.user);
+            if (!a.modal_frame) return;
+            const ui::Rect panel =
+                a.confirm.open()
+                    ? confirm_layout(a, frame.font, node.rect).panel
+                    : (a.settings.open
+                           ? settings_layout(a, frame.font, node.rect).panel
+                           : node.rect);
+            frame.ctx.push_overlay(
+                panel, frame.ctx.acquire_widget_id(&a.modal_frame), true);
+        };
 
         ui::LayoutFrame layout_frame{canvas, input, ctx, font,
                                      ui::active_theme(), dt,
                                      header_font ? &*header_font : nullptr};
         app.win_rect = viewport;
         ui::run_frame(root, viewport, layout_frame);
+        apply_key_commit(app);
+
+        auto row_wid = [&](uint64_t id, bool gallery) {
+            return gallery
+                       ? ctx.acquire_widget_id(id)
+                       : ctx.acquire_widget_id(&app.browser_ui[id].open);
+        };
+        auto row_under_mouse = [&](const FrameUi::BrowserNode& bn,
+                                   bool gallery) {
+            return ctx.hit_winner() == row_wid(bn.id, gallery);
+        };
+        const bool browser_gal = app.browser_view == 1;
+        const bool preset_gal = app.preset_view == 1;
 
         if (app.ctx_menu.kind && app.ctx_menu_dd.open &&
             (input.left_pressed() || input.right_pressed()) &&
@@ -21131,12 +21093,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 break;
             }
             if (!app.ctx_menu.kind && input.right_pressed() &&
-                frame_ui.browser_panel &&
+                !ctx.modal_open() && frame_ui.browser_panel &&
                 frame_ui.browser_panel->rect.contains(input.mouse)) {
                 bool on_row = false;
                 for (const FrameUi::BrowserNode& bn :
                      frame_ui.browser_nodes)
-                    if (bn.rect->contains(input.mouse)) on_row = true;
+                    if (row_under_mouse(bn, browser_gal)) on_row = true;
                 if (!on_row) {
                     ctx_open(kCtxBrowserBg);
                     ctx_item("new look", kActNewLook);
@@ -21146,16 +21108,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
             }
             if (app.browser_sel && input.left_pressed() &&
-                !app.ctx_menu.kind && !app.confirm.open()) {
+                !app.ctx_menu.kind && !ctx.modal_open()) {
                 bool on_row = false;
                 for (const FrameUi::BrowserNode& bn :
                      frame_ui.browser_nodes)
-                    if (bn.rect->contains(input.mouse)) on_row = true;
+                    if (row_under_mouse(bn, browser_gal)) on_row = true;
                 if (!on_row) app.browser_sel = 0;
             }
             if (!app.ctx_menu.kind && input.right_pressed() &&
                 frame_ui.preview &&
-                frame_ui.preview->rect.contains(input.mouse)) {
+                ctx.widget_owns_mouse(
+                    ctx.acquire_widget_id(&app.monitor_ws))) {
                 // Map the click through the same content rect the blit uses.
                 const ui::Rect pr = monitor_content_rect(
                     app, frame_ui.preview->rect.inset(1.0f));
@@ -21223,7 +21186,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                      frame_ui.browser_nodes) {
                     if (!bn.is_bin || bn.id == app.browser_drag_id)
                         continue;
-                    if (!bn.rect->contains(input.mouse)) continue;
+                    if (!row_under_mouse(bn, browser_gal)) continue;
                     if (app.browser_drag_is_bin) {
                         if (!doc::bin_reaches(app.document, bn.id,
                                               app.browser_drag_id)) {
@@ -21344,25 +21307,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.browser_drag_id = 0;
             app.browser_drag_live = false;
         } else if (app.browser_drag_id && !app.browser_drag_live) {
-            const float moved =
-                std::fabs(input.mouse.x - app.browser_drag_from.x) +
-                std::fabs(input.mouse.y - app.browser_drag_from.y);
-            if (moved > 6.0f) app.browser_drag_live = true;
+            app.browser_drag_live =
+                ctx.press_moved(row_wid(app.browser_drag_id, browser_gal));
         }
         if (input.left_pressed() && !app.browser_drag_id &&
             !(app.ctx_menu.kind && app.ctx_menu_dd.open)) {
             for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes)
-                if (bn.rect->contains(input.mouse)) {
+                if (row_under_mouse(bn, browser_gal)) {
                     app.browser_drag_id = bn.id;
                     app.browser_drag_is_bin = bn.is_bin;
-                    app.browser_drag_from = input.mouse;
                     break;
                 }
         }
         if (app.browser_drag_live) {
             for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes) {
                 if (!bn.is_bin || bn.id == app.browser_drag_id) continue;
-                if (!bn.rect->contains(input.mouse)) continue;
+                if (!row_under_mouse(bn, browser_gal)) continue;
                 const bool ok =
                     !app.browser_drag_is_bin ||
                     !doc::bin_reaches(app.document, bn.id,
@@ -21857,8 +21817,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             cur = app.presets[static_cast<size_t>(cpi)]
                                       .name;
                         }
+                        open_text_entry(app, ui::TextFilter::Printable, 0,
+                                        cur);
                         app.preset_rename_key = m.a;
-                        app.preset_rename_buf = cur;
                         break;
                     }
                     std::string cur;
@@ -21873,8 +21834,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     else
                         for (const doc::Asset& a2 : app.document.assets)
                             if (a2.id == m.a) cur = a2.name;
+                    open_text_entry(app, ui::TextFilter::Printable, 0, cur);
                     app.browser_rename_id = m.a;
-                    app.browser_rename_buf = cur;
                     break;
                 }
                 case kActMoveToRoot:
@@ -22289,8 +22250,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
                 if (app.sel.kind != SelKind::AddEffect)
                     app.insert_before_id = 0;
-                // A plain click on a selected node keeps the set: it lets
-                // you drag the group.
+            }
+            // A plain click on a selected node keeps the set: it lets
+            // you drag the group.
+            if (fe.clicked) {
                 if (fe.clicked_shift) {
                     auto it = std::find(app.multi_sel.begin(),
                                         app.multi_sel.end(), fe.clicked);
@@ -22365,14 +22328,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         ctx_open_group = target;
                         break;
                     case CtxAction::RenameGroup: {
-                        app.group_rename_id = did;
-                        app.group_rename_buf.clear();
+                        std::string cur;
                         size_t gli = 0;
                         if (find_group_by_id(app.look(), did, &gli))
                             for (const doc::Group& gr :
                                  app.look().layers[gli].groups)
-                                if (gr.id == did)
-                                    app.group_rename_buf = gr.name;
+                                if (gr.id == did) cur = gr.name;
+                        open_text_entry(app, ui::TextFilter::Printable, 60,
+                                        cur);
+                        app.group_rename_id = did;
                         break;
                     }
                     case CtxAction::SavePreset: {
@@ -23190,30 +23154,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             const uint64_t frame_rename_req =
                 fe.frame_rename ? fe.frame_rename : ctx_frame_rename;
             if (frame_rename_req) {
-                app.frame_rename_id = frame_rename_req;
-                app.frame_rename_buf.clear();
+                std::string cur;
                 for (const doc::CanvasFrame& f : app.look().frames)
-                    if (f.id == frame_rename_req)
-                        app.frame_rename_buf = f.title;
+                    if (f.id == frame_rename_req) cur = f.title;
+                open_text_entry(app, ui::TextFilter::Printable, 64, cur);
+                app.frame_rename_id = frame_rename_req;
             }
             if (fe.group_rename) {
                 const uint64_t gid = tag_doc(fe.group_rename);
-                app.group_rename_id = gid;
-                app.group_rename_buf.clear();
+                std::string cur;
                 size_t gli = 0;
                 if (find_group_by_id(app.look(), gid, &gli))
                     for (const doc::Group& gr :
                          app.look().layers[gli].groups)
-                        if (gr.id == gid) app.group_rename_buf = gr.name;
+                        if (gr.id == gid) cur = gr.name;
+                open_text_entry(app, ui::TextFilter::Printable, 60, cur);
+                app.group_rename_id = gid;
             }
             if (fe.text_edit) {
                 const uint64_t tid = tag_doc(fe.text_edit);
-                app.text_edit_id = tid;
-                app.text_edit_buf.clear();
+                std::string cur;
                 size_t tli = 0, tfi = 0;
                 if (find_effect_by_id(app.look(), tid, &tli, &tfi))
-                    app.text_edit_buf =
-                        app.look().layers[tli].stack[tfi].text;
+                    cur = app.look().layers[tli].stack[tfi].text;
+                open_text_entry(app, ui::TextFilter::Printable, 64, cur);
+                app.text_edit_id = tid;
             }
             for (size_t f = 0; f < flow_ui.graph->frame_count; ++f) {
                 const flow::FrameBox& fb = flow_ui.graph->frames[f];
@@ -23226,9 +23191,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
 
             if (fe.value_edit_node) {
-                app.value_edit_node = fe.value_edit_node;
-                app.value_edit_row = fe.value_edit_row;
-                app.value_edit_buf.clear();
+                std::string cur;
                 for (size_t i = 0; i < flow_ui.graph->node_count; ++i) {
                     const flow::Node& nd = flow_ui.graph->nodes[i];
                     if (nd.id != fe.value_edit_node) continue;
@@ -23244,35 +23207,39 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         std::snprintf(vb, sizeof(vb), "%.4g",
                                       static_cast<double>(*vr.staged *
                                                           vds));
-                        app.value_edit_buf = vb;
+                        cur = vb;
                     }
                     break;
                 }
+                open_text_entry(app, ui::TextFilter::Signed, 16, cur);
+                app.value_edit_node = fe.value_edit_node;
+                app.value_edit_row = fe.value_edit_row;
             }
             // A left press commits an older text field. Only Escape
             // abandons one.
-            if (input.left_pressed() && any_text_entry(text_entry_before) &&
-                text_entry_unchanged(app, text_entry_before))
+            if (input.left_pressed() &&
+                text_entry_before.kind != TextEntry::None &&
+                !(text_entry_before.kind == TextEntry::FxSearch &&
+                  app.canvas_state.add_open) &&
+                text_entry_id(app) == text_entry_before)
                 commit_text_entry(app);
-            if (app.value_commit) {
-                app.value_commit = false;
+            if (app.value_commit_node) {
+                const uint64_t vc_node = app.value_commit_node;
+                const int vc_row = app.value_commit_row;
+                app.value_commit_node = 0;
                 for (size_t i = 0; i < flow_ui.graph->node_count; ++i) {
                     const flow::Node& nd = flow_ui.graph->nodes[i];
-                    if (nd.id != app.value_edit_node) continue;
-                    if (app.value_edit_row >= 0 &&
-                        app.value_edit_row < nd.row_count &&
-                        nd.rows[app.value_edit_row].staged &&
-                        !app.value_edit_buf.empty()) {
-                        const flow::ParamRow& row =
-                            nd.rows[app.value_edit_row];
+                    if (nd.id != vc_node) continue;
+                    if (vc_row >= 0 && vc_row < nd.row_count &&
+                        nd.rows[vc_row].staged) {
+                        const flow::ParamRow& row = nd.rows[vc_row];
                         // Typed values use the row hard range: drags snap,
                         // typing does not. Scaled rows type display units.
                         const float vds = row.display_scale != 0.0f
                                               ? row.display_scale
                                               : 1.0f;
                         const float v = std::clamp(
-                            static_cast<float>(
-                                std::atof(app.value_edit_buf.c_str())) /
+                            static_cast<float>(app.value_commit_typed) /
                                 vds,
                             row.min_v,
                             row.hard_max > row.max_v ? row.hard_max
@@ -23286,9 +23253,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         if (tag_kind(nd.id) == flow::NodeKind::Group) {
                             const uint64_t gid = tag_doc(nd.id);
                             size_t gli = 0;
-                            if (app.value_edit_row < 2) {
+                            if (vc_row < 2) {
                                 face_key = {gid | doc::kGroupParamBit,
-                                            app.value_edit_row == 0
+                                            vc_row == 0
                                                 ? doc::kWetParam
                                                 : doc::kOpacityParam};
                                 own_knob = true;
@@ -23308,7 +23275,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                      e.id == k.effect_id;
                                         if (!member) continue;
                                         if (++vrow ==
-                                            app.value_edit_row) {
+                                            vc_row) {
                                             face_key = k;
                                             face = true;
                                             break;
@@ -23349,11 +23316,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         if (tag_kind(nd.id) == flow::NodeKind::Effect ||
                             face) {
                             const int pi = face ? face_key.param_index
-                                : app.value_edit_row == 0
+                                : vc_row == 0
                                 ? doc::kWetParam
-                                : app.value_edit_row == 1
+                                : vc_row == 1
                                     ? doc::kOpacityParam
-                                    : app.value_edit_row - 2;
+                                    : vc_row - 2;
                             const doc::ParamKey pk =
                                 face ? face_key
                                      : doc::ParamKey{tag_doc(nd.id), pi};
@@ -23383,9 +23350,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                     break;
                 }
-                app.value_edit_node = 0;
-                app.value_edit_row = -1;
-                app.value_edit_buf.clear();
             }
 
             for (size_t f = 0;
@@ -23400,10 +23364,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
 
             if (fe.add_menu_opened) {
-                app.fx_filter.clear();
+                close_text_entry(app);
+                app.fx_filter.set("");
                 app.fx_search_focus = true;
-                app.preset_search_focus = false;
-                app.duration_focus = false;
                 app.find_mode = false;
             }
             {
@@ -24760,18 +24723,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         };
         if (input.left_pressed() && !app.preset_drag_key) {
             for (const FrameUi::BrowserNode& pn : frame_ui.preset_nodes_r)
-                if (!pn.is_bin && pn.rect->contains(input.mouse)) {
+                if (!pn.is_bin && row_under_mouse(pn, preset_gal)) {
                     app.preset_drag_key = pn.id;
-                    app.preset_press = input.mouse;
                     app.preset_drag_live = false;
                     break;
                 }
         }
         if (app.preset_drag_key && input.left_down()) {
-            const float dd =
-                std::fabs(input.mouse.x - app.preset_press.x) +
-                std::fabs(input.mouse.y - app.preset_press.y);
-            if (dd > 6.0f) app.preset_drag_live = true;
+            app.preset_drag_live =
+                ctx.press_moved(row_wid(app.preset_drag_key, preset_gal));
             const int dpi = preset_index_of(app, app.preset_drag_key);
             if (app.preset_drag_live && dpi >= 0) {
                 const char* pname =
@@ -24779,7 +24739,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 const ui::Theme& th = ui::active_theme();
                 for (const FrameUi::BrowserNode& pn :
                      frame_ui.preset_nodes_r) {
-                    if (!pn.is_bin || !pn.rect->contains(input.mouse))
+                    if (!pn.is_bin || !row_under_mouse(pn, preset_gal))
                         continue;
                     if (preset_bin_of(app, pn.id))
                         canvas.draw_sdf_rect_outline(*pn.rect, 3.0f, 1.5f,
@@ -24806,7 +24766,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 bool dropped = false;
                 for (const FrameUi::BrowserNode& pn :
                      frame_ui.preset_nodes_r) {
-                    if (!pn.is_bin || !pn.rect->contains(input.mouse))
+                    if (!pn.is_bin || !row_under_mouse(pn, preset_gal))
                         continue;
                     if (const std::string* bin =
                             preset_bin_of(app, pn.id)) {
@@ -24816,13 +24776,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     dropped = true;
                     break;
                 }
-                if (!dropped && frame_ui.canvas_node &&
+                if (!dropped && !ctx.modal_open() && frame_ui.canvas_node &&
                     frame_ui.canvas_node->rect.contains(input.mouse)) {
                     spawn_preset(static_cast<size_t>(pi),
                                  /*at_cursor=*/true);
                     dropped = true;
                 }
-                if (!dropped && frame_ui.preset_panel_node &&
+                if (!dropped && !ctx.modal_open() &&
+                    frame_ui.preset_panel_node &&
                     frame_ui.preset_panel_node->rect.contains(
                         input.mouse) &&
                     !app.preset_info[static_cast<size_t>(pi)].shipped &&
@@ -24851,28 +24812,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             *frame_ui.preset_new_bin_clicked)
             preset_new_bin(app);
         if (input.left_pressed() && !app.ctx_menu.kind &&
-            !app.confirm.open()) {
+            !ctx.modal_open()) {
             bool on_row = false;
             for (const FrameUi::BrowserNode& pn : frame_ui.preset_nodes_r)
-                if (pn.rect->contains(input.mouse)) on_row = true;
+                if (row_under_mouse(pn, preset_gal)) on_row = true;
             if (!on_row && app.preset_sel) app.preset_sel = 0;
         }
         if (frame_ui.tag_selected && *frame_ui.tag_selected >= 0)
             app.preset_tag_index = *frame_ui.tag_selected - 1;   // 0 = all tags
         if (frame_ui.preset_search_clicked && *frame_ui.preset_search_clicked) {
-            app.preset_search_focus = !app.preset_search_focus;
-            app.duration_focus = false;
-            app.fx_search_focus = false;
+            const bool was = app.preset_search_focus;
+            close_text_entry(app);
+            app.preset_search_focus = !was;
         }
         if (frame_ui.fx_search_clicked && *frame_ui.fx_search_clicked) {
-            app.fx_search_focus = !app.fx_search_focus;
-            app.preset_search_focus = false;
-            app.duration_focus = false;
+            const bool was = app.fx_search_focus;
+            close_text_entry(app);
+            app.fx_search_focus = !was;
         }
         if (frame_ui.duration_clicked && *frame_ui.duration_clicked) {
-            app.duration_focus = !app.duration_focus;
-            app.duration_edit.clear();
-            if (app.duration_focus) app.preset_search_focus = false;
+            const bool was = app.duration_focus;
+            open_text_entry(app, ui::TextFilter::Digits, 0, "");
+            app.duration_focus = !was;
         }
         if ((frame_ui.preset_import_clicked &&
              *frame_ui.preset_import_clicked) ||
@@ -25069,18 +25030,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 /*coalesce=*/true);
         }
         if (frame_ui.lane_release) app.undo.break_coalescing();
-        bool rail_opened = false;
         for (const FrameUi::RailEdit& re : frame_ui.rail_edits) {
             if (!re.clicked || !*re.clicked) continue;
+            open_text_entry(app, ui::TextFilter::Signed, 15,
+                            re.seed ? re.seed : "");
             app.rail_edit_key = re.key;
             app.rail_edit_scale = re.scale;
-            app.rail_edit_buf = re.seed ? re.seed : "";
-            app.rail_edit_commit = false;
-            rail_opened = true;
             break;
         }
-        // The shared text-entry gate handles rail click-away.
-        (void)rail_opened;
 
         if (frame_ui.add_layer_open && *frame_ui.add_layer_open)
             app.sel = {SelKind::AddLayer, 0};
@@ -25125,12 +25082,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         for (const FrameUi::TextEditOpen& open : frame_ui.text_edit_opens) {
             if (!*open.clicked) continue;
-            app.text_edit_id = open.effect_id;
-            app.text_edit_buf.clear();
+            std::string cur;
             size_t tli = 0, tfi = 0;
             if (find_effect_by_id(app.look(), open.effect_id, &tli, &tfi))
-                app.text_edit_buf =
-                    app.look().layers[tli].stack[tfi].text;
+                cur = app.look().layers[tli].stack[tfi].text;
+            open_text_entry(app, ui::TextFilter::Printable, 64, cur);
+            app.text_edit_id = open.effect_id;
         }
 
         for (const FrameUi::LayerRow& lrow : frame_ui.layer_rows) {
@@ -25293,11 +25250,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         for (const FrameUi::BlockPick& bp : frame_ui.block_picks) {
             if (!*bp.pressed) continue;
-            const bool dbl =
-                bp.placement_id == app.last_block_pick &&
-                app.app_seconds - app.last_block_pick_time < 0.4;
-            app.last_block_pick = bp.placement_id;
-            app.last_block_pick_time = app.app_seconds;
+            const bool dbl = bp.dbl && *bp.dbl;
             app.sel_placement = bp.placement_id;
             if (bp.layer_index != SIZE_MAX) {
                 app.selected_layer = bp.layer_index;
@@ -25512,7 +25465,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 ? 0.0f
                                 : std::min(1.0f,
                                            edited.stops.back().t + 0.25f);
-                            for (int c = 0; c < 3; ++c)
+                            for (int c = 0; c < 4; ++c)
                                 ns.color[c] = edited.stops.empty()
                                     ? 1.0f
                                     : edited.stops.back().color[c];
@@ -25558,7 +25511,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (*stage.changed &&
                 (stage.staged[0] != stage.original[0] ||
                  stage.staged[1] != stage.original[1] ||
-                 stage.staged[2] != stage.original[2])) {
+                 stage.staged[2] != stage.original[2] ||
+                 stage.staged[3] != stage.original[3])) {
                 doc::Layer* layer = nullptr;
                 for (doc::Layer& l : app.look().layers)
                     if (l.id == stage.layer_id) layer = &l;
@@ -25572,9 +25526,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             if (s.id == stage.stop_id) dst = s.color;
                     }
                     if (!dst) continue;
-                    dst[0] = stage.staged[0];
-                    dst[1] = stage.staged[1];
-                    dst[2] = stage.staged[2];
+                    for (int c = 0; c < 4; ++c) dst[c] = stage.staged[c];
                     app.undo.execute(
                         app.document,
                         doc::set_layer_props_command(app.scope_look,std::move(edited)),
@@ -25803,11 +25755,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.browser_search_clicked &&
             *frame_ui.browser_search_clicked) {
+            close_text_entry(app);
             app.browser_search_focus = true;
-            app.browser_rename_id = 0;
-            app.fx_search_focus = false;
-            app.preset_search_focus = false;
-            app.duration_focus = false;
         }
         if (frame_ui.new_bin_clicked && *frame_ui.new_bin_clicked)
             app.undo.execute(

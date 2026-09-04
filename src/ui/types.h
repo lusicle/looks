@@ -12,6 +12,10 @@
 
 namespace looks::ui {
 
+inline constexpr uint8_t kMouseLeft = 1u << 0;
+inline constexpr uint8_t kMouseRight = 1u << 1;
+inline constexpr uint8_t kMouseMiddle = 1u << 2;
+
 struct Rect {
     float x = 0.0f;
     float y = 0.0f;

@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "doc/effects.h"
+#include "ui/interact.h"
 #include "ui/probe.h"
 #include "ui/text.h"
 #include "ui/theme.h"
@@ -68,13 +70,19 @@ constexpr float kInPitch = 14.0f;
 
 void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<CanvasUser*>(node.user);
+    CanvasState& st = *u->state;
     ui::register_rect_hit(node, frame, u->state);
+    st.menu_up = st.ctx_open || st.port_menu_open || st.dd_open ||
+                 st.add_open;
+    if (st.menu_up)
+        frame.ctx.push_overlay(node.rect,
+                               frame.ctx.acquire_widget_id(&st.menu_up),
+                               false);
     // The open swatch takes the popup layer so clicks miss the cards below.
-    if (u->state->swatch_open)
-        frame.ctx.add_hit(
-            ui::swatch_popup_rect(u->state->swatch_anchor, frame),
-            frame.ctx.acquire_widget_id(u->state->swatch_open),
-            ui::HitLayer::Popup);
+    if (st.swatch_open)
+        frame.ctx.push_overlay(
+            ui::swatch_popup_rect(st.swatch_anchor, *st.swatch_open, frame),
+            frame.ctx.acquire_widget_id(st.swatch_open), false);
 }
 
 // Draw and hit tests must share this geometry or wires miss the cursor.
@@ -91,6 +99,18 @@ Vec2 wire_point(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, float t) {
                 t * t * t * p3.x,
             u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y +
                 t * t * t * p3.y};
+}
+
+std::string caret_string(const char* text, int caret, uint64_t frame_no) {
+    std::string out = text ? text : "";
+    if ((frame_no / 30) % 2 != 0) return out;
+    const int at = std::clamp(caret, 0, static_cast<int>(out.size()));
+    out.insert(out.begin() + at, '_');
+    return out;
+}
+
+std::string caret_string(const Graph& g, uint64_t frame_no) {
+    return caret_string(g.rename_text, g.text_caret, frame_no);
 }
 
 // Returns the squared distance. The hit test samples 24 segments.
@@ -146,8 +166,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const Rect& r = node.rect;
     ui::Canvas2D& canvas = frame.canvas;
     const size_t n = std::min(g.node_count, kMaxNodes);
-
-    st.clock += frame.dt;
 
     if (!st.view_inited) {
         st.view_inited = true;
@@ -261,7 +279,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     };
 
     const ui::WidgetId wid = frame.ctx.acquire_widget_id(&st);
-    const bool owns = frame.ctx.widget_owns_mouse(wid);
+    const ui::Gesture cg = frame.ctx.gesture(wid, r, 3.0f);
+    const bool owns = cg.hovered;
+    const bool menu_owns =
+        frame.ctx.widget_owns_mouse(frame.ctx.acquire_widget_id(&st.menu_up));
     const Vec2 mouse = frame.input.mouse;
     Vec2 gmouse = to_graph(mouse);
     st.last_mouse = mouse;
@@ -336,7 +357,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (st.drag_kind && !frame.input.left_down() &&
         !frame.input.left_released() &&
         !(frame.input.buttons_down & ui::kMouseMiddle)) {
-        if (st.drag_kind == 1 && st.drag_moved) out.move_released = true;
+        if (st.drag_kind == 1 && cg.drag_moved) out.move_released = true;
         st.drag_kind = 0;
         st.drag_row = -1;
     }
@@ -406,26 +427,26 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                           r.bottom() - h - 8.0f));
         return Rect{x, y, kMenuW, h};
     };
-    if (owns && st.add_open && frame.input.wheel_y != 0.0f &&
-        menu_rect().contains(mouse)) {
-        st.add_scroll = std::clamp(
-            st.add_scroll - frame.input.wheel_y * 36.0f, 0.0f,
-            std::max(0.0f, static_cast<float>(g.add_count) * 18.0f -
-                               menu_visible * 18.0f));
-        frame.input.wheel_y = 0.0f;
+    if (st.add_open && menu_rect().contains(mouse)) {
+        const float dy = frame.ctx.take_wheel(
+            frame.ctx.acquire_widget_id(&st.menu_up));
+        if (dy != 0.0f)
+            st.add_scroll = std::clamp(
+                st.add_scroll - dy * 36.0f, 0.0f,
+                std::max(0.0f, static_cast<float>(g.add_count) * 18.0f -
+                                   menu_visible * 18.0f));
     }
 
-    if (owns && frame.input.wheel_y != 0.0f) {
+    const float canvas_wheel = frame.ctx.take_wheel(wid);
+    if (canvas_wheel != 0.0f) {
         const float nz =
-            std::clamp(z * std::pow(1.15f, frame.input.wheel_y), 0.25f,
-                       2.5f);
+            std::clamp(z * std::pow(1.15f, canvas_wheel), 0.25f, 2.5f);
         const float k = nz / z;
         st.pan_x = (mouse.x - r.x) - ((mouse.x - r.x) - st.pan_x) * k;
         st.pan_y = (mouse.y - r.y) - ((mouse.y - r.y) - st.pan_y) * k;
         st.zoom = nz;
         z = nz;
         gmouse = to_graph(mouse);
-        frame.input.wheel_y = 0.0f;
     }
 
     // zone: 0 none, 1 slider, 2 value text, 3 key toggle, 4 expose toggle.
@@ -477,7 +498,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (owns && (frame.input.buttons_pressed & ui::kMouseMiddle) &&
         st.drag_kind == 0) {
         st.drag_kind = 2;
-        frame.ctx.set_capture(wid);
+        frame.ctx.begin_drag(wid);
     }
     if (st.drag_kind == 2 &&
         (frame.input.buttons_down &
@@ -531,7 +552,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             kCtxW, ctx_h};
     };
 
-    if (owns && st.drag_kind == 0 &&
+    if ((owns || menu_owns) && st.drag_kind == 0 &&
         (frame.input.buttons_pressed & ui::kMouseRight)) {
         st.add_open = false;
         st.ctx_open = false;
@@ -559,12 +580,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    bool menu_swallowed_press = false;
     if (st.ctx_open) {
         const Rect mr = ctx_rect();
-        if (frame.input.left_pressed() && owns) {
-            menu_swallowed_press = true;
-            if (mr.contains(mouse)) {
+        if (frame.input.left_pressed()) {
+            if (menu_owns && mr.contains(mouse)) {
                 const int row =
                     static_cast<int>((mouse.y - (mr.y + 4.0f)) / 20.0f);
                 if (row >= 0 && row < static_cast<int>(g.ctx_count)) {
@@ -591,8 +610,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (st.port_menu_open) {
         const size_t feeds = port_feed_count();
         if (feeds < 2) st.port_menu_open = false;
-        if (st.port_menu_open && frame.input.left_pressed() && owns) {
-            menu_swallowed_press = true;
+        if (st.port_menu_open && frame.input.left_pressed() && menu_owns) {
             const Rect mr = port_menu_rect(feeds);
             if (mr.contains(mouse)) {
                 const int row =
@@ -648,8 +666,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                           r.bottom() - h - 4.0f)),
             w, h};
     };
-    if (dd_row_p && frame.input.left_pressed() && owns) {
-        menu_swallowed_press = true;
+    if (dd_row_p && frame.input.left_pressed() && menu_owns) {
         const Rect mr = dd_rect();
         if (mr.contains(mouse)) {
             const int row =
@@ -681,10 +698,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         const bool lost = !sw_row || !st.swatch_open->open ||
                           frame.ctx.popup_owner() != st.swatch_open;
+        const Rect sw_popup =
+            ui::swatch_popup_rect(st.swatch_anchor, *st.swatch_open, frame);
         const bool away =
-            owns && frame.input.left_pressed() &&
-            !ui::swatch_popup_rect(st.swatch_anchor, frame)
-                 .contains(mouse);
+            frame.input.left_pressed() && !sw_popup.contains(mouse);
         if (lost || away) {
             ui::swatch_commit_field(*st.swatch_open,
                                     sw_row ? sw_row->staged : nullptr,
@@ -708,14 +725,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (row >= 0 && row < cat_count)
                 st.add_cat = cat_rows[row];
         }
-        if (frame.input.left_pressed() && owns) {
-            menu_swallowed_press = true;
-            if (have_fly && fr2.contains(mouse)) {
+        if (frame.input.left_pressed()) {
+            if (menu_owns && have_fly && fr2.contains(mouse)) {
                 const int row = static_cast<int>(
                     (mouse.y - (fr2.y + 4.0f)) / 18.0f);
                 const int idx = fly0 + row;
                 if (row >= 0 && idx < fly1) out.add_pick = idx;
-            } else if (mr.contains(mouse)) {
+            } else if (menu_owns && mr.contains(mouse)) {
                 if (!cat_mode) {
                     const int row = static_cast<int>(
                         (mouse.y - (mr.y + 26.0f) + st.add_scroll) /
@@ -726,7 +742,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         out.add_pick = row;
                 }
                 // A click on a category row does nothing: hover opened it.
-            } else {
+            } else if (!mr.contains(mouse) &&
+                       !(have_fly && fr2.contains(mouse))) {
                 st.add_open = false;
             }
         }
@@ -737,102 +754,83 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     ui::measure_text(frame.font, "main", 11.0f).x + 16.0f,
                     20.0f};
     };
-    if (g.crumb && frame.input.left_pressed() && owns &&
-        st.drag_kind == 0 && !menu_swallowed_press &&
-        crumb_main_rect().contains(mouse)) {
+    const bool on_crumb = g.crumb && crumb_main_rect().contains(mouse);
+    if (on_crumb && frame.input.left_pressed() && owns &&
+        st.drag_kind == 0)
         out.crumb_clicked = true;
-        menu_swallowed_press = true;
-    }
 
     if (frame.input.left_pressed() && owns && st.drag_kind == 0 &&
-        !menu_swallowed_press) {
-        st.drag_moved = false;
+        !on_crumb) {
         st.press_screen = mouse;
         // Port grabs come before card hits.
         bool port_handled = false;
         // The nearest anchor wins: exits sit inside each other's grab radius.
         {
-            float best_d2 = 81.0f;
-            const Node* best_nd = nullptr;
-            uint32_t best_port = 0;
+            struct PortRef { const Node* nd; uint32_t port; };
+            std::vector<PortRef> cands;
+            ui::Picker pick;
+            auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
+                pick.add_point(mouse, p, 9.0f, 0,
+                               static_cast<int>(cands.size()));
+                cands.push_back({&nd, pt});
+            };
             for (size_t i = 0; i < n; ++i) {
                 const Node& nd = g.nodes[i];
-                auto consider = [&](Vec2 p, uint32_t pt) {
-                    const float dx = mouse.x - p.x;
-                    const float dy = mouse.y - p.y;
-                    const float d2 = dx * dx + dy * dy;
-                    if (d2 < best_d2) {
-                        best_d2 = d2;
-                        best_nd = &nd;
-                        best_port = pt;
-                    }
-                };
-                if (nd.has_out) consider(port_out(nd), 0);
+                if (nd.has_out) consider(nd, port_out(nd), 0);
                 for (int k = 0; k < exit_count(nd); ++k)
-                    consider(port_exit(nd, k),
+                    consider(nd, port_exit(nd, k),
                              static_cast<uint32_t>(k));
             }
-            if (best_nd) {
+            if (pick.hit()) {
+                const PortRef& pr = cands[static_cast<size_t>(pick.best())];
                 st.drag_kind = 4;
-                st.wire_from = best_nd->id;
-                st.wire_from_port = best_port;
-                frame.ctx.set_capture(wid);
+                st.wire_from = pr.nd->id;
+                st.wire_from_port = pr.port;
+                frame.ctx.begin_drag(wid);
                 port_handled = true;
             }
         }
         if (!port_handled) {
-            float best_d2 = 81.0f;
-            const Node* best_nd = nullptr;
-            uint32_t best_port = 0;
+            struct PortRef { const Node* nd; uint32_t port; };
+            std::vector<PortRef> cands;
+            ui::Picker pick;
+            auto consider = [&](const Node& nd2, Vec2 p, uint32_t pt) {
+                pick.add_point(mouse, p, 9.0f, 0,
+                               static_cast<int>(cands.size()));
+                cands.push_back({&nd2, pt});
+            };
             for (size_t i = 0; i < n; ++i) {
                 const Node& nd2 = g.nodes[i];
-                auto consider = [&](Vec2 p, uint32_t pt) {
-                    const float dx = mouse.x - p.x;
-                    const float dy = mouse.y - p.y;
-                    const float d2 = dx * dx + dy * dy;
-                    if (d2 < best_d2) {
-                        best_d2 = d2;
-                        best_nd = &nd2;
-                        best_port = pt;
-                    }
-                };
-                if (nd2.has_in) consider(port_in(nd2), 0);
-                if (nd2.has_matte_port) consider(port_matte(nd2), 1);
-                if (nd2.has_aux_port) consider(port_aux(nd2), 2);
+                if (nd2.has_in) consider(nd2, port_in(nd2), 0);
+                if (nd2.has_matte_port) consider(nd2, port_matte(nd2), 1);
+                if (nd2.has_aux_port) consider(nd2, port_aux(nd2), 2);
                 for (int k = 1; k <= nd2.slot_rows; ++k)
-                    consider(port_slot(nd2, k),
+                    consider(nd2, port_slot(nd2, k),
                              static_cast<uint32_t>(k + 1));
                 if (nd2.ghost_in && nd2.kind == NodeKind::Group)
-                    consider(port_ghost(nd2),
+                    consider(nd2, port_ghost(nd2),
                              static_cast<uint32_t>(nd2.slot_rows + 2));
             }
-            if (best_nd) {
-            const Node& nd = *best_nd;
+            if (pick.hit()) {
+            const PortRef& best = cands[static_cast<size_t>(pick.best())];
+            const uint32_t best_port = best.port;
+            const Node& nd = *best.nd;
             auto grab_input = [&](uint32_t port) {
                 size_t feeds = 0;
                 for (size_t w = 0; w < g.wire_count; ++w)
                     if (!g.wires[w].data && g.wires[w].to == nd.id &&
                         g.wires[w].to_port == port)
                         ++feeds;
-                const float pdd =
-                    std::fabs(mouse.x - st.last_port_pos.x) +
-                    std::fabs(mouse.y - st.last_port_pos.y);
-                if (feeds >= 2 && st.last_port_time >= 0.0 &&
-                    st.clock - st.last_port_time < 0.4 && pdd < 8.0f &&
-                    st.last_port_node == nd.id &&
-                    st.last_port_port == port) {
+                const bool second = frame.ctx.press_is_double(
+                    nd.id * 31ull + port + 1ull);
+                if (feeds >= 2 && second) {
                     st.port_menu_open = true;
                     st.port_menu_anchor = mouse;
                     st.port_menu_node = nd.id;
                     st.port_menu_port = port;
-                    st.last_port_time = -1.0;
                     port_handled = true;
                     return;
                 }
-                st.last_port_time = st.clock;
-                st.last_port_pos = mouse;
-                st.last_port_node = nd.id;
-                st.last_port_port = port;
                 for (size_t w = 0; w < g.wire_count; ++w)
                     if (!g.wires[w].data &&
                         g.wires[w].to_port == port &&
@@ -842,7 +840,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         st.wire_from_port = g.wires[w].from_port;
                         st.wire_old_to = nd.id;
                         st.wire_old_port = port;
-                        frame.ctx.set_capture(wid);
+                        frame.ctx.begin_drag(wid);
                         port_handled = true;
                         return;
                     }
@@ -851,7 +849,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 st.wire_from_port = 0;
                 st.wire_old_to = nd.id;
                 st.wire_old_port = port;
-                frame.ctx.set_capture(wid);
+                frame.ctx.begin_drag(wid);
                 port_handled = true;
             };
             grab_input(best_port);
@@ -901,11 +899,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         st.swatch_open = pr.swatch;
                         st.swatch_anchor = row_field_rect(nd, rh.row);
                         pr.swatch->open = true;
-                        ui::rgb_to_hsv(pr.staged, pr.swatch->hue,
-                                       pr.swatch->sat, pr.swatch->val);
-                        pr.swatch->drag_zone = 0;
-                        pr.swatch->field_edit = -1;
-                        pr.swatch->edit_len = 0;
+                        ui::swatch_seed_from(*pr.swatch, pr.staged);
                         frame.ctx.set_popup_owner(pr.swatch);
                     } else if (pr.kind == 4 && pr.changed) {
                         *pr.changed = true;
@@ -928,7 +922,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         std::atan2(mouse.y - st.dial_center.y,
                                    mouse.x - st.dial_center.x);
                     st.dial_accum = *pr.staged;
-                    frame.ctx.set_capture(wid);
+                    frame.ctx.begin_drag(wid);
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 1 &&
                            nd.rows[rh.row].staged) {
@@ -938,7 +932,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     *nd.rows[rh.row].staged = slider_value(nd, rh.row);
                     if (nd.rows[rh.row].changed)
                         *nd.rows[rh.row].changed = true;
-                    frame.ctx.set_capture(wid);
+                    frame.ctx.begin_drag(wid);
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 2 &&
                            nd.rows[rh.row].staged) {
@@ -948,33 +942,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
             if (!handled) {
-                const bool second =
-                    st.last_click_time >= 0.0 &&
-                    st.clock - st.last_click_time < 0.4;
-                const float dd =
-                    std::fabs(mouse.x - st.last_click_pos.x) +
-                    std::fabs(mouse.y - st.last_click_pos.y);
-                if (nd.kind == NodeKind::Group && second && dd < 8.0f &&
-                    st.last_click_id == nd.id) {
+                const bool second = frame.ctx.press_is_double(nd.id);
+                if (nd.kind == NodeKind::Group && second) {
                     if (mouse.y < cr.y + kTitleH * z)
                         out.group_rename = nd.id;
                     else
                         out.group_open = nd.id;
-                    st.last_click_time = -1.0;
-                } else if (nd.is_look && second && dd < 8.0f &&
-                           st.last_click_id == nd.id &&
+                } else if (nd.is_look && second &&
                            mouse.y >= cr.y + kTitleH * z) {
                     out.look_open = nd.id;
-                    st.last_click_time = -1.0;
-                } else if (nd.text_edit && second && dd < 8.0f &&
-                           st.last_click_id == nd.id &&
+                } else if (nd.text_edit && second &&
                            mouse.y < cr.y + kTitleH * z) {
                     out.text_edit = nd.id;
-                    st.last_click_time = -1.0;
                 } else {
-                    st.last_click_time = st.clock;
-                    st.last_click_pos = mouse;
-                    st.last_click_id = nd.id;
                     out.clicked = nd.id;
                     // Only the title bar drags a card: a body press must not
                     // move it.
@@ -984,7 +964,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         st.drag_alt = false;
                         st.node_grab_x = gmouse.x - nd.x;
                         st.node_grab_y = gmouse.y - nd.y;
-                        frame.ctx.set_capture(wid);
+                        frame.ctx.begin_drag(wid);
                     }
                 }
             }
@@ -993,7 +973,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.drag_kind = 6;
             st.node_grab_x = gmouse.x;
             st.node_grab_y = gmouse.y;
-            frame.ctx.set_capture(wid);
+            frame.ctx.begin_drag(wid);
         } else if (!port_handled) {
             bool frame_handled = false;
             for (size_t f = 0; f < g.frame_count && !frame_handled; ++f) {
@@ -1006,7 +986,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (corner.contains(mouse)) {
                     st.drag_kind = 7;
                     st.drag_id = node_id(NodeKind::Frame, fb.id);
-                    frame.ctx.set_capture(wid);
+                    frame.ctx.begin_drag(wid);
                     frame_handled = true;
                     break;
                 }
@@ -1021,25 +1001,16 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     *fb.color_clicked = true;
                 } else {
                     const uint64_t fid = node_id(NodeKind::Frame, fb.id);
-                    const float dd =
-                        std::fabs(mouse.x - st.last_click_pos.x) +
-                        std::fabs(mouse.y - st.last_click_pos.y);
-                    if (st.last_click_time >= 0.0 &&
-                        st.clock - st.last_click_time < 0.4 &&
-                        dd < 8.0f && st.last_click_id == fid) {
+                    if (frame.ctx.press_is_double(fid)) {
                         out.frame_rename = fb.id;
-                        st.last_click_time = -1.0;
                     } else {
-                        st.last_click_time = st.clock;
-                        st.last_click_pos = mouse;
-                        st.last_click_id = fid;
                         st.drag_kind = 1;
                         st.drag_id = fid;
                         st.drag_alt =
                             (frame.input.mods & platform::kModAlt) != 0;
                         st.node_grab_x = gmouse.x - fb.x;
                         st.node_grab_y = gmouse.y - fb.y;
-                        frame.ctx.set_capture(wid);
+                        frame.ctx.begin_drag(wid);
                     }
                 }
                 frame_handled = true;
@@ -1047,15 +1018,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (!frame_handled) {
                 st.drag_kind = 2;
                 st.drag_id = kEmptyPress;
-                frame.ctx.set_capture(wid);
+                frame.ctx.begin_drag(wid);
             }
         }
     }
 
     if (st.drag_kind != 0 && frame.input.left_down()) {
-        const float md = std::fabs(mouse.x - st.press_screen.x) +
-                         std::fabs(mouse.y - st.press_screen.y);
-        if (md > 3.0f) st.drag_moved = true;
         if (st.drag_kind == 1) {
             out.moved = st.drag_id;
             out.moved_x = gmouse.x - st.node_grab_x;
@@ -1141,33 +1109,30 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             // The nearest anchor wins: exits sit inside each other's radius.
             const Node* to_nd = find_node(st.wire_old_to);
             if (to_nd) {
-                float best_d2 = 324.0f;
-                const Node* best_nd = nullptr;
-                uint32_t best_port = 0;
+                struct PortRef { const Node* nd; uint32_t port; };
+                std::vector<PortRef> cands;
+                ui::Picker pick;
+                auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
+                    pick.add_point(mouse, p, 18.0f, 0,
+                                   static_cast<int>(cands.size()));
+                    cands.push_back({&nd, pt});
+                };
                 for (size_t i = 0; i < n; ++i) {
                     const Node& nd = g.nodes[i];
                     if (nd.id == st.wire_old_to) continue;
                     if (!out_feeds_input(nd, *to_nd, st.wire_old_port))
                         continue;
-                    auto consider = [&](Vec2 p, uint32_t pt) {
-                        const float dx = mouse.x - p.x;
-                        const float dy = mouse.y - p.y;
-                        const float d2 = dx * dx + dy * dy;
-                        if (d2 < best_d2) {
-                            best_d2 = d2;
-                            best_nd = &nd;
-                            best_port = pt;
-                        }
-                    };
-                    if (nd.has_out) consider(port_out(nd), 0);
+                    if (nd.has_out) consider(nd, port_out(nd), 0);
                     for (int k = 0; k < exit_count(nd); ++k)
-                        consider(port_exit(nd, k),
+                        consider(nd, port_exit(nd, k),
                                  static_cast<uint32_t>(k));
                 }
-                if (best_nd) {
+                if (pick.hit()) {
+                    const PortRef& pr =
+                        cands[static_cast<size_t>(pick.best())];
                     out.connect_requested = true;
-                    out.connect_from = best_nd->id;
-                    out.connect_from_port = best_port;
+                    out.connect_from = pr.nd->id;
+                    out.connect_from_port = pr.port;
                     out.connect_to = st.wire_old_to;
                     out.connect_port = st.wire_old_port;
                 }
@@ -1195,30 +1160,35 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
             // The nearest anchor wins, never list order: rows sit 18 px apart.
-            float best_d2 = 324.0f;
-            for (size_t i = 0; i < n && !from_mod; ++i) {
-                const Node& nd = g.nodes[i];
-                if (nd.id == st.wire_from) continue;
-                auto consider = [&](Vec2 p, uint32_t pt) {
-                    const float dx = mouse.x - p.x;
-                    const float dy = mouse.y - p.y;
-                    const float d2 = dx * dx + dy * dy;
-                    if (d2 < best_d2) {
-                        best_d2 = d2;
-                        to = nd.id;
-                        port = pt;
-                        found = true;
-                    }
+            {
+                struct PortRef { uint64_t id; uint32_t port; };
+                std::vector<PortRef> cands;
+                ui::Picker pick;
+                auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
+                    pick.add_point(mouse, p, 18.0f, 0,
+                                   static_cast<int>(cands.size()));
+                    cands.push_back({nd.id, pt});
                 };
-                if (nd.has_in) consider(port_in(nd), 0);
-                if (nd.has_aux_port) consider(port_aux(nd), 2);
-                if (nd.has_matte_port) consider(port_matte(nd), 1);
-                for (int k = 1; k <= nd.slot_rows; ++k)
-                    consider(port_slot(nd, k),
-                             static_cast<uint32_t>(k + 1));
-                if (nd.ghost_in && nd.kind == NodeKind::Group)
-                    consider(port_ghost(nd),
-                             static_cast<uint32_t>(nd.slot_rows + 2));
+                for (size_t i = 0; i < n && !from_mod; ++i) {
+                    const Node& nd = g.nodes[i];
+                    if (nd.id == st.wire_from) continue;
+                    if (nd.has_in) consider(nd, port_in(nd), 0);
+                    if (nd.has_aux_port) consider(nd, port_aux(nd), 2);
+                    if (nd.has_matte_port) consider(nd, port_matte(nd), 1);
+                    for (int k = 1; k <= nd.slot_rows; ++k)
+                        consider(nd, port_slot(nd, k),
+                                 static_cast<uint32_t>(k + 1));
+                    if (nd.ghost_in && nd.kind == NodeKind::Group)
+                        consider(nd, port_ghost(nd),
+                                 static_cast<uint32_t>(nd.slot_rows + 2));
+                }
+                if (pick.hit()) {
+                    const PortRef& pr =
+                        cands[static_cast<size_t>(pick.best())];
+                    to = pr.id;
+                    port = pr.port;
+                    found = true;
+                }
             }
             if (found) {
                 const bool same = st.drag_kind == 5 &&
@@ -1277,7 +1247,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (nd && st.drag_row >= 0 && st.drag_row < nd->row_count &&
                 nd->rows[st.drag_row].released)
                 *nd->rows[st.drag_row].released = true;
-        } else if (st.drag_kind == 1 && st.drag_moved) {
+        } else if (st.drag_kind == 1 && cg.drag_moved) {
             out.move_released = true;
             if (st.drag_splice_to) {
                 out.node_splice_requested = true;
@@ -1290,16 +1260,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.drag_splice_port = 0;
         } else if (st.drag_kind == 7) {
             out.frame_resize_released = true;
-        } else if (st.drag_kind == 2 && !st.drag_moved &&
+        } else if (st.drag_kind == 2 && !cg.drag_moved &&
                    st.drag_id == kEmptyPress && owns) {
-            const float dd =
-                std::fabs(mouse.x - st.last_click_pos.x) +
-                std::fabs(mouse.y - st.last_click_pos.y);
-            if (st.last_click_time >= 0.0 &&
-                st.clock - st.last_click_time < 0.4 && dd < 8.0f &&
-                st.last_click_id == kEmptyPress) {
+            if (frame.ctx.press_is_double(kEmptyPress)) {
                 open_add_menu();
-                st.last_click_time = -1.0;
             } else {
                 float best = 9.0f * 9.0f;
                 int hit = -1;
@@ -1322,19 +1286,16 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     out.wire_to_port = g.wires[hit].to_port;
                     out.wire_data = g.wires[hit].data;
                     out.wire_to_row = g.wires[hit].to_row;
-                    st.last_click_id = 1;   // 1 marks a wire click, not a node
+                    // 1 marks a wire click, so the next press is not a double.
+                    frame.ctx.press_is_double(1);
                 } else {
                     out.clicked_empty = true;
-                    st.last_click_id = kEmptyPress;
                 }
-                st.last_click_time = st.clock;
-                st.last_click_pos = mouse;
             }
         }
         st.drag_kind = 0;
         st.drag_id = 0;
         st.drag_row = -1;
-        frame.ctx.clear_capture();
     }
 
     if (st.drag_kind != 0 &&
@@ -1343,7 +1304,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.drag_kind = 0;
         st.drag_id = 0;
         st.drag_row = -1;
-        frame.ctx.clear_capture();
     }
 
     canvas.draw_rect(r, theme.window_bg);
@@ -1420,12 +1380,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         const bool renaming = g.rename_frame == fb.id;
         canvas.push_clip({box.x, box.y, box.w - 40.0f * z, 20.0f * z});
-        char rename_buf[96];
+        std::string rename_buf;
         if (renaming)
-            std::snprintf(rename_buf, sizeof(rename_buf), "%s%s",
-                          g.rename_text ? g.rename_text : "",
-                          (frame.ctx.frame() / 30) % 2 == 0 ? "_" : "");
-        ui::draw_text(canvas, frame.font, renaming ? rename_buf : fb.title,
+            rename_buf = caret_string(g, frame.ctx.frame());
+        ui::draw_text(canvas, frame.font,
+                      renaming ? rename_buf.c_str() : fb.title,
                       {box.x + 8.0f * z, box.y + 4.0f * z}, 11.0f * z,
                       renaming ? theme.text : theme.text_dim);
         canvas.pop_clip();
@@ -1508,8 +1467,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             // Scripts address these probe names. Keep them stable.
             {
                 const std::string pname =
-                    nd.id == kOutNodeId
+                    nd.id == kOutNodeId || nd.kind == NodeKind::GroupOut
                         ? std::string("node:output")
+                    : nd.kind == NodeKind::GroupIn
+                        ? std::string("node:input")
                         : "node:" + std::to_string(node_doc_id(nd.id));
                 ui::probe_add(pname, cr);
                 const float pr = 6.0f * z;
@@ -1552,14 +1513,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (nd.rows[tr].kind == 2) has_text_row = true;
             const bool card_renaming =
                 g.rename_node == nd.id && !has_text_row;
-            char title_buf[96];
+            std::string title_buf;
             if (card_renaming)
-                std::snprintf(title_buf, sizeof(title_buf), "%s%s",
-                              g.rename_text ? g.rename_text : "",
-                              (frame.ctx.frame() / 30) % 2 == 0 ? "_"
-                                                                : "");
+                title_buf = caret_string(g, frame.ctx.frame());
             ui::draw_text(canvas, frame.font,
-                          card_renaming ? title_buf : nd.title,
+                          card_renaming ? title_buf.c_str() : nd.title,
                           {tb.x + 8.0f * z, tb.y + (tb.h - ts) * 0.4f}, ts,
                           nd.bypassed ? theme.text_disabled : theme.text);
             canvas.pop_clip();
@@ -1783,10 +1741,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         continue;
                     }
                     if (pr.kind == 3 && pr.staged) {
-                        canvas.draw_sdf_rect(
-                            fr, 2.0f * z,
-                            Color{pr.staged[0], pr.staged[1],
-                                  pr.staged[2], 1.0f});
+                        ui::draw_swatch_face(
+                            canvas, fr, 2.0f * z,
+                            pr.swatch ? pr.swatch->mode
+                                      : ui::SwatchMode::Rgba,
+                            pr.staged,
+                            pr.swatch ? pr.swatch->hue_light : 0.5f);
                         canvas.draw_sdf_rect_outline(
                             fr, 2.0f * z, 1.0f,
                             pr.swatch && st.swatch_open == pr.swatch
@@ -1944,15 +1904,24 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                          theme.control_bg);
                     canvas.draw_sdf_rect_outline(ebox, 2.0f * z, 1.0f,
                                                  theme.accent);
+                    const float tx = right - caret_w - es.x;
                     ui::draw_text(canvas, frame.font, etext,
-                                  {right - caret_w - es.x,
-                                   ry + (kRowH * z - rs) * 0.4f},
-                                  rs, theme.text);
-                    if ((frame.ctx.frame() / 30) % 2 == 0)
-                        canvas.draw_rect({right - caret_w + 1.0f,
-                                          ebox.y + 2.0f * z, caret_w,
-                                          ebox.h - 4.0f * z},
+                                  {tx, ry + (kRowH * z - rs) * 0.4f}, rs,
+                                  theme.text);
+                    if ((frame.ctx.frame() / 30) % 2 == 0) {
+                        const std::string head(
+                            etext,
+                            static_cast<size_t>(std::clamp(
+                                g.text_caret, 0,
+                                static_cast<int>(std::strlen(etext)))));
+                        const float cx =
+                            tx + ui::measure_text(frame.font, head.c_str(),
+                                                  rs)
+                                     .x;
+                        canvas.draw_rect({cx + 1.0f, ebox.y + 2.0f * z,
+                                          caret_w, ebox.h - 4.0f * z},
                                          theme.accent);
+                    }
                 } else if (pr.staged) {
                     char val[32];
                     std::snprintf(val, sizeof(val), pr.format,
@@ -2199,12 +2168,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
         const bool empty_filter =
             !g.add_filter || g.add_filter[0] == '\0';
-        char header[80];
-        std::snprintf(header, sizeof(header), "%s%s",
-                      empty_filter ? "" : g.add_filter,
-                      (frame.ctx.frame() / 30) % 2 == 0 ? "_" : "");
+        const std::string header = caret_string(
+            empty_filter ? "" : g.add_filter, g.add_filter_caret,
+            frame.ctx.frame());
         ui::draw_text(canvas, frame.font,
-                      empty_filter ? "type to search..." : header,
+                      empty_filter ? "type to search..." : header.c_str(),
                       {mr.x + 8.0f, mr.y + 6.0f}, 11.0f,
                       empty_filter ? theme.text_disabled : theme.text);
         canvas.draw_rect({mr.x + 6.0f, mr.y + 24.0f, mr.w - 12.0f, 1.0f},
@@ -2402,7 +2370,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         ui::Context::PopupRequest req;
         req.kind = ui::Context::PopupKind::Color;
         req.anchor = st.swatch_anchor;
-        req.rect = ui::swatch_popup_rect(st.swatch_anchor, frame);
+        req.rect = ui::swatch_popup_rect(st.swatch_anchor, *st.swatch_open,
+                                         frame);
         req.state = st.swatch_open;
         req.out_rgb = sw_row->staged;
         req.out_changed = sw_row->changed;

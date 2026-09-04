@@ -64,9 +64,9 @@ constexpr ParamDesc kQuantizeParams[] = {
     {"pat_scale", "pattern scale", 1.0f, 4.0f, 1.0f, "%.2f x", nullptr,
      false, 2, 0x1FCFE},
     {"pal_hue_a", "custom hue a", 0.0f, 1.0f, 0.08f, "%.2f", nullptr,
-     false, 1, 0x40},
+     false, 1, 0x40, false, 0.5f},
     {"pal_hue_b", "custom hue b", 0.0f, 1.0f, 0.55f, "%.2f", nullptr,
-     false, 1, 0x40},
+     false, 1, 0x40, false, 0.5f},
 };
 
 constexpr ParamDesc kGlowParams[] = {
@@ -294,7 +294,8 @@ constexpr ParamDesc kPatchWeaveParams[] = {
 constexpr ParamDesc kHalationParams[] = {
     {"threshold", "threshold", 0.0f, 1.0f, 0.72f, "%.2f"},
     {"radius", "radius", 0.0f, 64.0f, 16.0f, "%.1f px"},
-    {"hue", "tint hue", 0.0f, 1.0f, 0.03f, "%.2f"},
+    {"hue", "tint hue", 0.0f, 1.0f, 0.03f, "%.2f", nullptr,
+     false, -1, 0, false, 0.5f},
     {"sat", "tint depth", 0.0f, 1.0f, 0.7f, "%.2f"},
     {"strength", "strength", 0.0f, 2.0f, 0.8f, "%.2f"},
     {"absorb", "backing absorb", 0.0f, 1.0f, 0.25f, "%.2f"},
@@ -358,7 +359,8 @@ constexpr ParamDesc kDustScratchesParams[] = {
 
 constexpr ParamDesc kLightLeakParams[] = {
     {"amount", "amount", 0.0f, 2.0f, 0.8f, "%.2f"},
-    {"hue", "hue (0=warm 1=magenta)", 0.0f, 1.0f, 0.2f, "%.2f"},
+    {"hue", "hue (0=warm 1=magenta)", 0.0f, 1.0f, 0.2f, "%.2f",
+     nullptr, false, -1, 0, false, 0.65f},
     {"drift", "drift", 0.0f, 2.0f, 0.25f, "%.2f hz"},
     {"burn", "film burn", 0.0f, 1.0f, 0.0f, "%.2f"},
 };
@@ -578,9 +580,11 @@ constexpr ParamDesc kStreakParams[] = {
 };
 
 constexpr ParamDesc kSplitToneParams[] = {
-    {"sh_hue", "shadow hue", 0.0f, 1.0f, 0.6f, "%.2f"},
+    {"sh_hue", "shadow hue", 0.0f, 1.0f, 0.6f, "%.2f", nullptr,
+     false, -1, 0, false, 0.28f},
     {"sh_amt", "shadow amt", 0.0f, 1.0f, 0.3f, "%.2f"},
-    {"hi_hue", "highlight hue", 0.0f, 1.0f, 0.12f, "%.2f"},
+    {"hi_hue", "highlight hue", 0.0f, 1.0f, 0.12f, "%.2f", nullptr,
+     false, -1, 0, false, 0.72f},
     {"hi_amt", "highlight amt", 0.0f, 1.0f, 0.3f, "%.2f"},
     {"balance", "balance", -1.0f, 1.0f, 0.0f, "%.2f"},
 };
@@ -690,9 +694,12 @@ constexpr ParamDesc kFmSynthParams[] = {
 };
 
 constexpr ParamDesc kColorizerParams[] = {
-    {"sh_hue", "shadow hue", 0.0f, 1.0f, 0.66f, "%.2f"},
-    {"mid_hue", "mid hue", 0.0f, 1.0f, 0.88f, "%.2f"},
-    {"hi_hue", "highlight hue", 0.0f, 1.0f, 0.12f, "%.2f"},
+    {"sh_hue", "shadow hue", 0.0f, 1.0f, 0.66f, "%.2f", nullptr,
+     false, -1, 0, false, 0.28f},
+    {"mid_hue", "mid hue", 0.0f, 1.0f, 0.88f, "%.2f", nullptr,
+     false, -1, 0, false, 0.5f},
+    {"hi_hue", "highlight hue", 0.0f, 1.0f, 0.12f, "%.2f", nullptr,
+     false, -1, 0, false, 0.72f},
     {"sat", "saturation", 0.0f, 1.0f, 0.85f, "%.2f"},
 };
 
@@ -837,10 +844,11 @@ constexpr ParamDesc kPhotocopyParams[] = {
 
 constexpr ParamDesc kRisographParams[] = {
     {"inks", "inks", 1.0f, 3.0f, 2.0f, "%.0f", nullptr, true},
-    {"hue1", "ink 1 hue", 0.0f, 1.0f, 0.55f, "%.2f"},
+    {"hue1", "ink 1 hue", 0.0f, 1.0f, 0.55f, "%.2f", nullptr,
+     false, -1, 0, false, 0.5f},
     // Ink 3 is always yellow.
     {"hue2", "ink 2 hue", 0.0f, 1.0f, 0.93f, "%.2f", nullptr, false,
-     0, 0xC},
+     0, 0xC, false, 0.5f},
     {"misreg", "misregistration", 0.0f, 12.0f, 4.0f, "%.0f px"},
     {"grain", "ink grain", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"paper", "paper warmth", 0.0f, 1.0f, 0.3f, "%.2f"},
@@ -955,9 +963,9 @@ constexpr ParamDesc kPaletteMapParams[] = {
     {"palette", "palette", 0.0f, 4.0f, 4.0f, "%.0f",
      "game boy|cga|nes|teletext|duotone"},
     {"pal_hue_a", "duo hue a", 0.0f, 1.0f, 0.08f, "%.2f", nullptr, false,
-     0, 0x10},
+     0, 0x10, false, 0.5f},
     {"pal_hue_b", "duo hue b", 0.0f, 1.0f, 0.55f, "%.2f", nullptr, false,
-     0, 0x10},
+     0, 0x10, false, 0.5f},
 };
 
 constexpr ParamDesc kDitherParams[] = {
@@ -998,7 +1006,8 @@ constexpr ParamDesc kTextParams[] = {
     {"pos_x", "position x", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"pos_y", "position y", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"angle", "rotate", -180.0f, 180.0f, 0.0f, "%.0f deg"},
-    {"hue", "hue", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"hue", "hue", 0.0f, 1.0f, 0.0f, "%.2f", nullptr,
+     false, -1, 0, false, 0.5f},
     {"sat", "saturation", 0.0f, 1.0f, 0.0f, "%.2f"},
     {"lite", "brightness", 0.0f, 1.0f, 1.0f, "%.2f"},
     {"outline", "outline", 0.0f, 1.0f, 0.25f, "%.2f"},

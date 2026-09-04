@@ -196,6 +196,7 @@ void walk_draw(LayoutNode& node, LayoutFrame& frame, const Rect& active_clip) {
     if (narrows) frame.canvas.pop_clip();
 }
 
+void hit_scrollbar(LayoutNode& node, LayoutFrame& frame);
 void draw_scrollbar(LayoutNode& node, LayoutFrame& frame);
 
 }  // namespace
@@ -321,64 +322,82 @@ void layout(LayoutNode& root, const Rect& rect, const LayoutFrame& frame) {
 
 namespace {
 
-void draw_scrollbar(LayoutNode& node, LayoutFrame& frame) {
-    ScrollState* s = node.scroll;
-    if (!s || s->content <= s->viewport + 0.5f) return;
+struct ScrollBar {
+    Rect track{};
+    Rect thumb{};
+    float range = 0.0f;
+    bool visible = false;
+};
+
+ScrollBar scrollbar_of(const LayoutNode& node) {
+    ScrollBar b;
+    const ScrollState* s = node.scroll;
+    if (!s || s->content <= s->viewport + 0.5f) return b;
     const Rect& r = node.rect;
-    const Rect track{r.right() - kScrollbarWidth - kScrollbarPad,
-                     r.y + kScrollbarPad, kScrollbarWidth,
-                     r.h - kScrollbarPad * 2.0f};
+    b.track = {r.right() - kScrollbarWidth - kScrollbarPad, r.y + kScrollbarPad,
+               kScrollbarWidth, r.h - kScrollbarPad * 2.0f};
     const float thumb_h =
-        std::max(24.0f, track.h * (s->viewport / s->content));
-    const float range = s->content - s->viewport;
-    const float t = range > 0.0f ? s->offset / range : 0.0f;
-    const Rect thumb{track.x, track.y + (track.h - thumb_h) * t, track.w,
-                     thumb_h};
+        std::max(24.0f, b.track.h * (s->viewport / s->content));
+    b.range = s->content - s->viewport;
+    const float t = b.range > 0.0f ? s->offset / b.range : 0.0f;
+    b.thumb = {b.track.x, b.track.y + (b.track.h - thumb_h) * t, b.track.w,
+               thumb_h};
+    b.visible = true;
+    return b;
+}
 
-    // The gutter has no hit entries, so gate on the thumb rect only.
-    const WidgetId id = frame.ctx.acquire_widget_id(s);
-    if (frame.input.left_pressed() && !frame.ctx.has_capture() &&
-        thumb.contains(frame.input.mouse)) {
-        s->dragging_thumb = true;
-        s->drag_grab = frame.input.mouse.y - thumb.y;
-        frame.ctx.set_capture(id);
-    }
-    if (s->dragging_thumb) {
-        if (!frame.input.left_down()) {
-            s->dragging_thumb = false;
-            frame.ctx.clear_capture();
-        } else {
-            const float new_top = frame.input.mouse.y - s->drag_grab - track.y;
-            const float denom = track.h - thumb_h;
-            s->offset = denom > 0.0f ? clampf(new_top / denom, 0.0f, 1.0f) * range
-                                     : 0.0f;
-        }
+void hit_scrollbar(LayoutNode& node, LayoutFrame& frame) {
+    const ScrollBar b = scrollbar_of(node);
+    if (!b.visible) return;
+    Rect r = b.thumb;
+    if (!node.clip.empty()) r = r.intersect(node.clip);
+    frame.ctx.add_hit(r, frame.ctx.acquire_widget_id(node.scroll));
+}
+
+void draw_scrollbar(LayoutNode& node, LayoutFrame& frame) {
+    const ScrollBar b = scrollbar_of(node);
+    if (!b.visible) return;
+    ScrollState* s = node.scroll;
+    const Gesture g =
+        frame.ctx.gesture(frame.ctx.acquire_widget_id(s), b.thumb);
+    if (g.pressed) s->drag_grab = frame.input.mouse.y - b.thumb.y;
+    if (g.drag_active) {
+        const float new_top = frame.input.mouse.y - s->drag_grab - b.track.y;
+        const float denom = b.track.h - b.thumb.h;
+        s->offset =
+            denom > 0.0f ? clampf(new_top / denom, 0.0f, 1.0f) * b.range : 0.0f;
     }
 
-    frame.canvas.draw_sdf_rect(track, kScrollbarWidth * 0.5f,
+    frame.canvas.draw_sdf_rect(b.track, kScrollbarWidth * 0.5f,
                                Color::hex(0x000000, 0.35f));
-    frame.canvas.draw_sdf_rect(thumb, kScrollbarWidth * 0.5f,
-                               Color::hex(0x5A5D63, s->dragging_thumb ? 1.0f : 0.8f));
+    frame.canvas.draw_sdf_rect(
+        b.thumb, kScrollbarWidth * 0.5f,
+        Color::hex(0x5A5D63, g.drag_active ? 1.0f : 0.8f));
 }
 
 }  // namespace
 
 void run_frame(LayoutNode* root, const Rect& rect, LayoutFrame& frame) {
     if (!root) return;
-    frame.ctx.begin_frame();
+    FrameInput fin;
+    fin.mouse = frame.input.mouse;
+    fin.buttons_down = frame.input.buttons_down;
+    fin.buttons_pressed = frame.input.buttons_pressed;
+    fin.buttons_released = frame.input.buttons_released;
+    fin.wheel_y = frame.input.wheel_y;
+    fin.dt = frame.dt;
+    frame.ctx.begin_frame(fin);
     layout(*root, rect, frame);
 
     walk_hit(*root, frame);
-    frame.ctx.finalize_hits(frame.input.mouse);
-    if (frame.ctx.any_hit()) frame.input.consumed = true;
+    frame.ctx.finalize_hits();
 
     if (frame.input.wheel_y != 0.0f) {
         LayoutNode* target = nullptr;
         route_wheel(*root, frame, &target);
         if (target && target->scroll) {
-            target->scroll->offset -= frame.input.wheel_y * kScrollPixelsPerNotch;
-            frame.input.wheel_y = 0.0f;
-            frame.input.consumed = true;
+            const float dy = frame.ctx.take_wheel_in_tree();
+            target->scroll->offset -= dy * kScrollPixelsPerNotch;
         }
     }
 
@@ -480,6 +499,9 @@ LayoutNode* ScrollAreaV(LayoutArena& arena, ScrollState* state,
     n->scroll = state;
     n->width = width;
     n->height = height;
+    n->hit_fn = [](LayoutNode& node, LayoutFrame& frame) {
+        hit_scrollbar(node, frame);
+    };
     n->draw_fn = [](LayoutNode& node, LayoutFrame& frame) {
         draw_scrollbar(node, frame);
     };

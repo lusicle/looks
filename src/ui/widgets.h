@@ -6,6 +6,7 @@
 #include <cmath>
 #include <string_view>
 
+#include "ui/interact.h"
 #include "ui/layout.h"
 #include "ui/theme.h"
 
@@ -166,32 +167,48 @@ LayoutNode* DialF(LayoutArena& arena, float* value, float min_value,
                   float max_value, SliderState* state,
                   const SliderOpts& opts = {});
 
+enum class SwatchMode : uint8_t { Rgb, Rgba, Hue };
+
 struct SwatchState {
     // Keep open first: &state must not alias &state.button.
     bool open = false;
     ButtonState button;
+    SwatchMode mode = SwatchMode::Rgb;
+    float hue_light = 0.5f;
     // HSV keeps the hue that a gray rgb value cannot store.
     float hue = 0.0f;
     float sat = 0.0f;
     float val = 1.0f;
-    int drag_zone = 0;   // 1 = sv square, 2 = hue strip
-    // 0-2 = the R/G/B fields, 3 = hex, -1 = none focused.
+    float alpha = 1.0f;
+    int drag_zone = 0;   // 1 = sv square, 2 = hue strip, 3 = alpha strip
+    // 0-2 = the R/G/B fields, 3 = alpha, 4 = hex, -1 = none focused.
     int field_edit = -1;
-    char edit_buf[10] = {};
-    int edit_len = 0;
+    TextField edit;
 };
 
 void hsv_to_rgb(float h, float s, float v, float out[3]);
 void rgb_to_hsv(const float rgb[3], float& h, float& s, float& v);
-Rect swatch_popup_rect(const Rect& anchor, const LayoutFrame& frame);
+Color hue_bar_color(float hue01, float lightness);
+Rect swatch_popup_rect(const Rect& anchor, const SwatchState& st,
+                       const LayoutFrame& frame);
 // Commits the focused entry field; it does nothing when none has focus.
-void swatch_commit_field(SwatchState& st, float* out_rgb, bool* out_changed,
+void swatch_commit_field(SwatchState& st, float* out_rgba, bool* out_changed,
                          bool* out_released);
+void swatch_seed_from(SwatchState& st, const float rgba[4]);
+void draw_swatch_face(Canvas2D& canvas, const Rect& r, float radius,
+                      SwatchMode mode, const float rgba[4],
+                      float hue_light = 0.5f);
 
-// The picker streams out_rgb while it drags; out_released marks the end.
-LayoutNode* ColorSwatch(LayoutArena& arena, const float rgb[3],
-                        SwatchState* state, float* out_rgb,
-                        bool* out_changed, bool* out_released);
+struct SwatchOpts {
+    SwatchMode mode = SwatchMode::Rgb;
+    float hue_light = 0.5f;
+};
+
+// The picker streams out_rgba while it drags; out_released marks the end.
+LayoutNode* ColorSwatch(LayoutArena& arena, const float rgba[4],
+                        SwatchState* state, float* out_rgba,
+                        bool* out_changed, bool* out_released,
+                        const SwatchOpts& opts = {});
 
 struct PanelOpts {
     Edges padding = Edges::all(12);

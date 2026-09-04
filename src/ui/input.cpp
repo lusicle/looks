@@ -21,11 +21,7 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
     buttons_pressed = 0;
     buttons_released = 0;
     wheel_y = 0.0f;
-    wheel_x = 0.0f;
-    typed.clear();
-    backspace_pressed = false;
-    enter_pressed = false;
-    consumed = false;
+    keys.clear();
 
     const float inv = dpi_scale > 1e-3f ? 1.0f / dpi_scale : 1.0f;
     for (const platform::Event& e : events) {
@@ -52,17 +48,11 @@ void UiInput::begin_frame(const std::vector<platform::Event>& events,
             }
             case platform::Event::Type::MouseWheel:
                 wheel_y += e.wheel_y;
-                wheel_x += e.wheel_x;
                 mods = e.mods;
                 break;
             case platform::Event::Type::Char:
-                typed.push_back(e.codepoint);
                 break;
             case platform::Event::Type::KeyDown:
-                if (e.key == platform::Key::Backspace)
-                    backspace_pressed = true;
-                else if (e.key == platform::Key::Enter)
-                    enter_pressed = true;
                 mods = e.mods;
                 break;
             case platform::Event::Type::KeyUp:

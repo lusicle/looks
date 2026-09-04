@@ -10,8 +10,8 @@ cbuffer Push
     uint kind;
     uint seed;
     uint frame;
-    float ar, ag, ab;  // sRGB
-    float br, bg, bb;  // sRGB
+    float ar, ag, ab, aa;  // sRGB rgb, linear alpha
+    float br, bg, bb, ba;  // sRGB rgb, linear alpha
     float scale;
     float angle;       // radians
     uint shape;
@@ -21,6 +21,8 @@ cbuffer Push
     float grad_cx;
     float grad_cy;
     uint grad_stops;
+    float grad_blend;
+    uint grad_space;
 };
 
 // The SDF uses canvas uv. 0.5 is on the curve, the span is +-0.25 heights.
@@ -83,8 +85,42 @@ float gen_worley(float2 p, uint seed, uint t)
     return saturate(sqrt(md));
 }
 
-// The ramp holds resolved stop colours, already in the linear working
-// space. The engine dummy-binds it for every other generator kind.
+float gen_hue_channel(float p, float q, float t)
+{
+    if (t < 0.0) t += 1.0;
+    if (t > 1.0) t -= 1.0;
+    if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+    if (t < 0.5) return q;
+    if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    return p;
+}
+
+float3 gen_hsl_to_rgb(float h, float s, float l)
+{
+    if (s < 1.0e-6)
+        return float3(l, l, l);
+    const float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+    const float p = 2.0 * l - q;
+    return float3(gen_hue_channel(p, q, h + 1.0 / 3.0),
+                  gen_hue_channel(p, q, h),
+                  gen_hue_channel(p, q, h - 1.0 / 3.0));
+}
+
+float3 gen_oklab_to_linear(float3 lab)
+{
+    const float lr = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    const float mr = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    const float sr = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    const float lc = lr * lr * lr;
+    const float mc = mr * mr * mr;
+    const float sc = sr * sr * sr;
+    return float3(4.0767416621 * lc - 3.3077115913 * mc + 0.2309699292 * sc,
+                  -1.2684380046 * lc + 2.6097574011 * mc - 0.3413193965 * sc,
+                  -0.0041960863 * lc - 0.7034186147 * mc + 1.7076147010 * sc);
+}
+
+// Row 0 holds the resolved ramp in the linear working space. Row 1 holds
+// the raw stops in the BLEND space. The engine dummy-binds it otherwise.
 [[vk::binding(1, 0)]] Sampler2D grad_ramp;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
@@ -97,6 +133,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float3 color_a = fx_srgb_eotf(saturate(float3(ar, ag, ab)));
     const float3 color_b = fx_srgb_eotf(saturate(float3(br, bg, bb)));
+    const float alpha_a = saturate(aa);
+    const float alpha_b = saturate(ba);
 
     float3 rgb;
     float alpha = 1.0;
@@ -109,12 +147,17 @@ void main(uint3 tid : SV_DispatchThreadID)
         float t;
         if (grad_kind == 4u)
         {
-            // Shepard weighting: every stop pulls by inverse square
-            // distance, so the placement itself is the whole shape.
+            // Gaussian weights, rescaled by the running nearest stop. Equal
+            // pulls would average every stop to grey far from all of them.
             const uint n = min(grad_stops, 32u);
-            const float2 tx = float2(1.0 / 256.0, 0.5);
+            const float radius = max(grad_blend, 1.0e-4);
+            const float inv = 1.0 / (radius * radius);
             float3 acc = float3(0.0, 0.0, 0.0);
+            float2 hv = float2(0.0, 0.0);
+            float aacc = 0.0;
             float wsum = 0.0;
+            float near = 1.0e30;
+            float near_hue = 0.0;
             for (uint i = 0u; i < n; ++i)
             {
                 const float4 p = grad_ramp.SampleLevel(
@@ -122,26 +165,72 @@ void main(uint3 tid : SV_DispatchThreadID)
                 const float4 col = grad_ramp.SampleLevel(
                     float2((float(i * 2u + 1u) + 0.5) / 256.0, 0.75), 0);
                 const float2 dd = (uv - p.xy) * float2(aspect, 1.0);
-                const float w = 1.0 / (dot(dd, dd) / (len * len) + 1.0e-4);
+                const float q = dot(dd, dd) * inv;
+                if (q < near)
+                {
+                    const float k = exp(q - near);
+                    acc *= k;
+                    hv *= k;
+                    aacc *= k;
+                    wsum *= k;
+                    near = q;
+                    near_hue = col.r;
+                }
+                const float w = exp(near - q);
                 acc += col.rgb * w;
+                const float ha = col.r * 6.2831853;
+                hv += float2(cos(ha), sin(ha)) * w;
+                aacc += col.a * w;
                 wsum += w;
             }
-            rgb = wsum > 0.0 ? acc / wsum : float3(0.0, 0.0, 0.0);
-            output[tid.xy] = float4(rgb, alpha);
-            return;
+            if (wsum <= 0.0)
+            {
+                rgb = float3(0.0, 0.0, 0.0);
+                alpha = 0.0;
+            }
+            else
+            {
+                alpha = saturate(aacc / wsum);
+                if (grad_space == 1u)
+                {
+                    float h = near_hue;
+                    if (dot(hv, hv) > 1.0e-12)
+                    {
+                        h = atan2(hv.y, hv.x) / 6.2831853;
+                        if (h < 0.0) h += 1.0;
+                    }
+                    rgb = fx_srgb_eotf(saturate(
+                        gen_hsl_to_rgb(h, acc.g / wsum, acc.b / wsum)));
+                }
+                else if (grad_space == 2u)
+                {
+                    rgb = max(gen_oklab_to_linear(acc / wsum),
+                              float3(0.0, 0.0, 0.0));
+                }
+                else
+                {
+                    rgb = acc / wsum;
+                }
+            }
         }
-        if (grad_kind == 1u)
-            t = length(d) * 2.0 / len;
-        else if (grad_kind == 2u)
-            t = (abs(d.x) + abs(d.y)) * 2.0 / len;
-        else if (grad_kind == 3u)
-            t = frac((atan2(d.y, d.x) - angle) / 6.2831853 + 1.0) / len;
         else
         {
-            const float2 dir = float2(cos(angle), sin(angle));
-            t = dot(uv - c, dir) / len + 0.5;
+            if (grad_kind == 1u)
+                t = length(d) * 2.0 / len;
+            else if (grad_kind == 2u)
+                t = (abs(d.x) + abs(d.y)) * 2.0 / len;
+            else if (grad_kind == 3u)
+                t = frac((atan2(d.y, d.x) - angle) / 6.2831853 + 1.0) / len;
+            else
+            {
+                const float2 dir = float2(cos(angle), sin(angle));
+                t = dot(uv - c, dir) / len + 0.5;
+            }
+            const float4 ramp =
+                grad_ramp.SampleLevel(float2(saturate(t), 0.25), 0);
+            rgb = ramp.rgb;
+            alpha = saturate(ramp.a);
         }
-        rgb = grad_ramp.SampleLevel(float2(saturate(t), 0.25), 0).rgb;
     }
     else if (kind == 3)
     {
@@ -174,6 +263,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             n = gen_value_noise(p, seed, t);
         }
         rgb = lerp(color_b, color_a, n);
+        alpha = lerp(alpha_b, alpha_a, n);
     }
     else if (kind == 4)
     {
@@ -233,6 +323,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                 v = float((cp.x + cp.y) & 1);
             }
             rgb = lerp(color_b, color_a, v);
+            alpha = lerp(alpha_b, alpha_a, v);
         }
     }
     else if (kind == 5)
@@ -290,6 +381,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             v = 0.5 + 0.5 * sin(dot(uv - 0.5, dir) * freq + t + ph);
         }
         rgb = lerp(color_b, color_a, saturate(v));
+        alpha = lerp(alpha_b, alpha_a, saturate(v));
     }
     else if (kind == 6)
     {
@@ -316,12 +408,13 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float v = saturate(0.5 - d / feather);
         // The SDF coverage is the alpha. color_b is unused for shapes.
         const float sv = v * v * (3.0 - 2.0 * v);
-        rgb = color_a * sv;
-        alpha = sv;
+        rgb = color_a;
+        alpha = sv * alpha_a;
     }
     else
     {
         rgb = color_a;
+        alpha = alpha_a;
     }
-    output[tid.xy] = float4(rgb, alpha);
+    output[tid.xy] = float4(rgb * alpha, alpha);
 }

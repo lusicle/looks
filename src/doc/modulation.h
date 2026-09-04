@@ -12,7 +12,7 @@ namespace looks::doc {
 // A layer key sets this bit and carries the layer id.
 inline constexpr uint64_t kLayerParamBit = 1ull << 62;
 // Slots 15, 16, 20 and 21 are field ids only, never modulatable.
-inline constexpr int kLayerParamCount = 25;
+inline constexpr int kLayerParamCount = 27;
 // A group key sets this bit and carries the group id; wet/opacity only.
 inline constexpr uint64_t kGroupParamBit = 1ull << 61;
 // A gradient stop key sets this bit and carries the stop id.

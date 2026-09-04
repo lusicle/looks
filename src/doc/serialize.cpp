@@ -62,15 +62,17 @@ std::optional<EffectType> effect_type_from_id(const std::string& id) {
     return std::nullopt;
 }
 
-Value f3_to_json(const float (&v)[3]) {
+template <size_t N>
+Value fn_to_json(const float (&v)[N]) {
     Array a;
     for (float f : v) a.push_back(Value(static_cast<double>(f)));
     return Value(std::move(a));
 }
 
-void f3_from_json(const Value& v, float (&out)[3]) {
+template <size_t N>
+void fn_from_json(const Value& v, float (&out)[N]) {
     const Array& a = v.array();
-    for (size_t i = 0; i < 3 && i < a.size(); ++i)
+    for (size_t i = 0; i < N && i < a.size(); ++i)
         out[i] = static_cast<float>(a[i].as_number(out[i]));
 }
 
@@ -362,8 +364,8 @@ Value layer_to_json(const Layer& l) {
     if (l.slip) v.set("slip", static_cast<int64_t>(l.slip));
     if (l.timeline_lock) v.set("timeline_lock", true);
     if (l.target) v.set("target", static_cast<int64_t>(l.target));
-    v.set("color_a", f3_to_json(l.color_a));
-    v.set("color_b", f3_to_json(l.color_b));
+    v.set("color_a", fn_to_json(l.color_a));
+    v.set("color_b", fn_to_json(l.color_b));
     v.set("gen_scale", static_cast<double>(l.gen_scale));
     v.set("gen_angle", static_cast<double>(l.gen_angle));
     if (l.gen_phase != 0.0f)
@@ -388,6 +390,7 @@ Value layer_to_json(const Layer& l) {
         for (const GradientStop& s : l.stops) {
             Value st = Value::make_object();
             st.set("id", static_cast<int64_t>(s.id));
+            st.set("t", static_cast<double>(s.t));
             st.set("x", static_cast<double>(s.x));
             st.set("y", static_cast<double>(s.y));
             Value col = Value::make_array();
@@ -457,8 +460,8 @@ Layer layer_from_json(const Value& v,
     l.slip = static_cast<uint32_t>(v.get("slip").as_int(0));
     l.timeline_lock = v.get("timeline_lock").as_bool(false);
     l.target = static_cast<uint64_t>(v.get("target").as_int(0));
-    f3_from_json(v.get("color_a"), l.color_a);
-    f3_from_json(v.get("color_b"), l.color_b);
+    fn_from_json(v.get("color_a"), l.color_a);
+    fn_from_json(v.get("color_b"), l.color_b);
     l.gen_scale = num(v, "gen_scale", 6.0f);
     l.gen_angle = num(v, "gen_angle", 0.0f);
     l.gen_phase = num(v, "gen_phase", 0.0f);
@@ -487,11 +490,12 @@ Layer layer_from_json(const Value& v,
             if (!e.is_object()) continue;
             GradientStop s;
             s.id = static_cast<uint64_t>(e.get("id").as_number(0.0));
+            s.t = num(e, "t", 0.0f);
             s.x = num(e, "x", 0.5f);
             s.y = num(e, "y", 0.5f);
             if (const Value& col = e.get("color"); col.is_array()) {
                 const Array& c = col.array();
-                for (size_t i = 0; i < 3 && i < c.size(); ++i)
+                for (size_t i = 0; i < 4 && i < c.size(); ++i)
                     s.color[i] = static_cast<float>(c[i].as_number(0.0));
             }
             if (s.id) l.stops.push_back(s);

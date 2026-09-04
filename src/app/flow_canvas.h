@@ -45,7 +45,7 @@ struct ParamRow {
     bool* changed = nullptr;
     bool* released = nullptr;
     // 0 slider, 1 dropdown, 2 text, 3 swatch, 4 button, 5 status label.
-    // A swatch stages three floats (rgb); the others stage one.
+    // A swatch stages four floats (rgba); the others stage one.
     uint8_t kind = 0;
     const char* options = nullptr;
     const char* text = nullptr;
@@ -154,6 +154,8 @@ struct Graph {
     uint64_t value_edit_node = 0;
     int value_edit_row = -1;
     const char* value_edit_text = "";
+    int text_caret = 0;
+    int add_filter_caret = 0;
     const char* crumb = nullptr;
     const char* hint = nullptr;
 };
@@ -174,12 +176,6 @@ struct CanvasState {
     uint32_t wire_old_port = 0;
     Vec2 press_screen{};
     float node_grab_x = 0.0f, node_grab_y = 0.0f;   // grab offset, graph units
-    bool drag_moved = false;
-    // Seconds on the canvas clock. -1 = no armed first click.
-    double clock = 0.0;
-    double last_click_time = -1.0;
-    Vec2 last_click_pos{};
-    uint64_t last_click_id = 0;
     Vec2 last_mouse{};
     float last_gx = 0.0f, last_gy = 0.0f;
     // One shot. The canvas clears it after the view centers. 0 = idle.
@@ -210,16 +206,12 @@ struct CanvasState {
     bool ctx_open = false;
     Vec2 ctx_anchor{};
     uint64_t ctx_target = 0;
+    bool menu_up = false;
     // The popup rows show link order. The top row draws last.
     bool port_menu_open = false;
     Vec2 port_menu_anchor{};
     uint64_t port_menu_node = 0;
     uint32_t port_menu_port = 0;
-    // Seconds on the canvas clock, like last_click_time.
-    double last_port_time = -1.0;
-    Vec2 last_port_pos{};
-    uint64_t last_port_node = 0;
-    uint32_t last_port_port = 0;
     bool drag_alt = false;
 };
 

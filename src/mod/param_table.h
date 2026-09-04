@@ -34,6 +34,8 @@ const doc::EffectInstance* find_effect(const doc::Document& doc,
                                        size_t* layer_out = nullptr,
                                        size_t* index_out = nullptr);
 
+int layer_param_index_of(const std::string& id);
+
 void param_range(doc::EffectType type, int param_index, float* min_value,
                  float* max_value);
 
