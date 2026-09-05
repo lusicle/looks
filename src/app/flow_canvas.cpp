@@ -830,7 +830,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
     if (frame.input.left_pressed() && owns && st.drag_kind == 0 &&
         !on_crumb) {
-        st.press_screen = mouse;
         // Port grabs come before card hits.
         bool port_handled = false;
         // The nearest anchor wins: exits sit inside each other's grab radius.

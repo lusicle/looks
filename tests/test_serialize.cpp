@@ -673,48 +673,6 @@ TEST(group_creation_slotifies_crossings) {
     CHECK_EQ(again->inputs.front(), slot);
 }
 
-TEST(group_legacy_face_in_migrates_on_load) {
-    // A pre-slot file reroutes through minted slots exactly once.
-    const char* text = R"({
-        "looks_project": 5,
-        "looks": [{"id": 100,
-        "layers": [{"id": 1, "stack": [
-            {"type": "vignette", "id": 2, "group": 9},
-            {"type": "grain", "id": 3, "group": 9}
-        ],
-        "groups": [{"id": 9, "name": "era", "face_in": 2,
-                    "face_out": 3, "exposed": []}]}],
-        "links": [
-            {"from": 1, "to": 2, "port": 0},
-            {"from": 3, "to": 0, "port": 0}
-        ]}]
-    })";
-    json::ParseResult parsed = json::parse(text);
-    CHECK(parsed.value.has_value());
-    Document d = doc::doc_from_json(*parsed.value);
-    const doc::Group* g = doc::find_group(d.looks[0], 9);
-    CHECK(g && g->inputs.size() == size_t{1});
-    const uint64_t slot = g->inputs.front();
-    CHECK(slot > uint64_t{9});
-    bool exterior = false, interior = false;
-    for (const doc::NodeLink& l : d.looks[0].links) {
-        if (l.from == 1 && l.to == slot && l.to_port == 0)
-            exterior = true;
-        if (l.from == slot && l.to == 2 && l.to_port == 0)
-            interior = true;
-        CHECK(!(l.from == 1 && l.to == 2));
-    }
-    CHECK(exterior);
-    CHECK(interior);
-    // A slot-aware file re-loads identically.
-    json::Value out = doc::doc_to_json(d);
-    Document d2 = doc::doc_from_json(out);
-    const doc::Group* g2 = doc::find_group(d2.looks[0], 9);
-    CHECK(g2 && g2->inputs.size() == size_t{1});
-    CHECK_EQ(g2->inputs.front(), slot);
-    CHECK(doc::doc_to_json(d2) == out);
-}
-
 TEST(group_wet_serializes_and_snapshots) {
     Document d = doc_with_look();
     doc::UndoStack undo;

@@ -174,7 +174,6 @@ struct CanvasState {
     uint32_t wire_from_port = 0;
     uint64_t wire_old_to = 0;
     uint32_t wire_old_port = 0;
-    Vec2 press_screen{};
     float node_grab_x = 0.0f, node_grab_y = 0.0f;   // grab offset, graph units
     Vec2 last_mouse{};
     float last_gx = 0.0f, last_gy = 0.0f;
@@ -228,9 +227,6 @@ struct Output {
     uint64_t moved = 0;
     float moved_x = 0.0f, moved_y = 0.0f;
     bool move_released = false;
-    // add_x and add_y use graph units.
-    bool add_requested = false;
-    float add_x = 0.0f, add_y = 0.0f;
     // add_pick indexes Graph::add_items. -1 = none.
     bool add_menu_opened = false;
     int add_pick = -1;

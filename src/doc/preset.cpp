@@ -34,9 +34,7 @@ std::optional<Preset> preset_from_json(const json::Value& v) {
     if (p.name.empty()) p.name = "preset";
     for (const json::Value& t : v.get("tags").array())
         if (t.is_string()) p.tags.push_back(t.as_string());
-    GroupLegacy legacy;
-    p.group = group_from_json(v.get("group"), &legacy);
-    p.face_in = legacy.face_in;
+    p.group = group_from_json(v.get("group"), &p.face_in);
     // A preset file has no slots. They mint at instantiation.
     p.group.inputs.clear();
     for (const json::Value& fv : v.get("effects").array())

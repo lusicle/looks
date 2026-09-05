@@ -22,7 +22,7 @@ public:
     std::string name() const override { return "Group Effects"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Layer& layer = look.layers[layer_index_];
         assert(from_ <= to_ && to_ < layer.stack.size());
         old_group_ids_.clear();
@@ -46,7 +46,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Layer& layer = look.layers[layer_index_];
         for (size_t i = from_; i <= to_; ++i)
             layer.stack[i].group_id = old_group_ids_[i - from_];
@@ -71,7 +71,7 @@ public:
     std::string name() const override { return "Ungroup"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Layer& layer = look.layers[layer_index_];
         members_.clear();
         for (size_t i = 0; i < layer.stack.size(); ++i)
@@ -111,7 +111,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Layer& layer = look.layers[layer_index_];
         for (size_t i : members_) layer.stack[i].group_id = group_id_;
         layer.groups.insert(layer.groups.begin() +
@@ -141,13 +141,13 @@ public:
 
     void apply(Document& doc) override {
         EffectInstance& fx =
-            look_of(doc).layers[layer_index_].stack[effect_index_];
+            entity_of(doc).layers[layer_index_].stack[effect_index_];
         old_group_id_ = fx.group_id;
         fx.group_id = group_id_;
     }
 
     void revert(Document& doc) override {
-        look_of(doc).layers[layer_index_].stack[effect_index_].group_id =
+        entity_of(doc).layers[layer_index_].stack[effect_index_].group_id =
             old_group_id_;
     }
 
@@ -166,7 +166,7 @@ public:
     std::string name() const override { return "Edit Group"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Group* g = group_in(look, layer_index_, updated_.id);
         if (!g) return;
         old_ = *g;
@@ -174,14 +174,14 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         if (Group* g = group_in(look, layer_index_, updated_.id))
             *g = old_;
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetGroupPropsCommand*>(&next);
-        if (!other || !same_look(*other) ||
+        if (!other || !same_entity(*other) ||
             other->layer_index_ != layer_index_ ||
             other->updated_.id != updated_.id)
             return false;
@@ -207,7 +207,7 @@ public:
     }
 
     void apply(Document& doc) override {
-        Group* g = find_group(look_of(doc).layers[layer_index_], group_id_);
+        Group* g = find_group(entity_of(doc).layers[layer_index_], group_id_);
         if (!g) return;
         auto it = std::find(g->exposed.begin(), g->exposed.end(), key_);
         did_ = false;
@@ -222,7 +222,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Group* g = find_group(look_of(doc).layers[layer_index_], group_id_);
+        Group* g = find_group(entity_of(doc).layers[layer_index_], group_id_);
         if (!g || !did_) return;
         if (exposed_) {
             auto it =
@@ -257,7 +257,7 @@ public:
     void apply(Document& doc) override {
         // Materialize first, or stack-order wiring chains the new effects.
         // The members chain internally only. The group card lands unwired.
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
         Layer& layer = look.layers[layer_index_];
@@ -285,7 +285,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Layer& layer = look.layers[layer_index_];
         layer.stack.erase(layer.stack.begin() +
                               static_cast<ptrdiff_t>(insert_at_),
@@ -317,13 +317,13 @@ public:
     std::string name() const override { return "Add Group Input"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         if (Group* g = group_in(look, layer_index_, group_id_))
             g->inputs.push_back(slot_id_);
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         if (Group* g = group_in(look, layer_index_, group_id_))
             if (!g->inputs.empty() && g->inputs.back() == slot_id_)
                 g->inputs.pop_back();
@@ -344,7 +344,7 @@ public:
     std::string name() const override { return "Remove Group Input"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         Group* g = group_in(look, layer_index_, group_id_);
         if (!g) return;
         removed_at_ = g->inputs.size();
@@ -365,7 +365,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         if (Group* g = group_in(look, layer_index_, group_id_))
             if (removed_at_ <= g->inputs.size())
                 g->inputs.insert(g->inputs.begin() +

@@ -21,7 +21,7 @@ public:
     std::string name() const override { return "Set Morph"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         old_from_ = look.morph_from;
         old_to_ = look.morph_to;
         old_pos_ = look.morph_pos;
@@ -31,7 +31,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         look.morph_from = old_from_;
         look.morph_to = old_to_;
         look.morph_pos = old_pos_;
@@ -39,7 +39,7 @@ public:
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetMorphCommand*>(&next);
-        if (!other || !same_look(*other)) return false;
+        if (!other || !same_entity(*other)) return false;
         from_ = other->from_;
         to_ = other->to_;
         pos_ = other->pos_;
@@ -63,7 +63,7 @@ public:
     std::string name() const override { return "Edit Timeline Region"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         old_[0] = seq.trim_in;
         old_[1] = seq.trim_out;
         old_[2] = seq.loop_in;
@@ -75,7 +75,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         seq.trim_in = old_[0];
         seq.trim_out = old_[1];
         seq.loop_in = old_[2];
@@ -85,7 +85,7 @@ public:
     bool merge(const Command& next) override {
         const auto* other =
             dynamic_cast<const SetTimelineRegionCommand*>(&next);
-        if (!other || !same_sequence(*other)) return false;
+        if (!other || !same_entity(*other)) return false;
         trim_in_ = other->trim_in_;
         trim_out_ = other->trim_out_;
         loop_in_ = other->loop_in_;
@@ -108,7 +108,7 @@ public:
     std::string name() const override { return on_ ? on_name_ : off_name_; }
 
     void apply(Document& doc) override {
-        for (KeyframeLane& lane : look_of(doc).lanes) {
+        for (KeyframeLane& lane : entity_of(doc).lanes) {
             if (!(lane.target == target_)) continue;
             old_ = lane.*Flag;
             lane.*Flag = on_;
@@ -116,7 +116,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        for (KeyframeLane& lane : look_of(doc).lanes)
+        for (KeyframeLane& lane : entity_of(doc).lanes)
             if (lane.target == target_) lane.*Flag = old_;
     }
 
@@ -176,7 +176,7 @@ public:
     std::string name() const override { return "Toggle Marker"; }
 
     void apply(Document& doc) override {
-        std::vector<uint32_t>& markers = sequence_of(doc).markers;
+        std::vector<uint32_t>& markers = entity_of(doc).markers;
         auto it = std::find(markers.begin(), markers.end(), frame_);
         if (it != markers.end()) {
             removed_ = true;
@@ -190,7 +190,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        std::vector<uint32_t>& markers = sequence_of(doc).markers;
+        std::vector<uint32_t>& markers = entity_of(doc).markers;
         if (removed_) {
             markers.insert(
                 std::upper_bound(markers.begin(), markers.end(), frame_),
@@ -363,7 +363,7 @@ public:
 
     void apply(Document& doc) override {
         // One wire per param: this replaces the wire of the same target.
-        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        std::vector<ModRoute>& routes = entity_of(doc).mod_routes;
         replaced_.clear();
         for (size_t i = routes.size(); i-- > 0;) {
             if (!(routes[i].target == route_.target)) continue;
@@ -374,7 +374,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        std::vector<ModRoute>& routes = entity_of(doc).mod_routes;
         routes.pop_back();
         for (size_t i = replaced_.size(); i-- > 0;)
             routes.insert(routes.begin() + replaced_[i].first,
@@ -393,7 +393,7 @@ public:
     std::string name() const override { return "Remove Mod Route"; }
 
     void apply(Document& doc) override {
-        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        std::vector<ModRoute>& routes = entity_of(doc).mod_routes;
         for (size_t i = 0; i < routes.size(); ++i) {
             if (routes[i].id == route_id_) {
                 index_ = i;
@@ -406,7 +406,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        std::vector<ModRoute>& routes = look_of(doc).mod_routes;
+        std::vector<ModRoute>& routes = entity_of(doc).mod_routes;
         routes.insert(routes.begin() + index_, removed_);
     }
 
@@ -422,10 +422,10 @@ public:
         : LookCommand(look), node_(node) {}
     std::string name() const override { return "Add Value Node"; }
     void apply(Document& doc) override {
-        look_of(doc).value_nodes.push_back(node_);
+        entity_of(doc).value_nodes.push_back(node_);
     }
     void revert(Document& doc) override {
-        look_of(doc).value_nodes.pop_back();
+        entity_of(doc).value_nodes.pop_back();
     }
 
 private:
@@ -439,7 +439,7 @@ public:
     std::string name() const override { return "Remove Value Node"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         routes_.clear();
         unwired_.clear();
         removed_ = {};
@@ -471,7 +471,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         look.value_nodes.insert(look.value_nodes.begin() + index_, removed_);
         for (const auto& [nid, which] : unwired_)
             if (ValueNode* n = find_value_node(look, nid))
@@ -498,20 +498,20 @@ public:
     std::string name() const override { return "Edit Value Node"; }
 
     void apply(Document& doc) override {
-        ValueNode* n = find_value_node(look_of(doc), node_.id);
+        ValueNode* n = find_value_node(entity_of(doc), node_.id);
         assert(n);
         old_ = *n;
         *n = node_;
     }
 
     void revert(Document& doc) override {
-        if (ValueNode* n = find_value_node(look_of(doc), node_.id))
+        if (ValueNode* n = find_value_node(entity_of(doc), node_.id))
             *n = old_;
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetValueNodeCommand*>(&next);
-        if (!other || !same_look(*other) || other->node_.id != node_.id)
+        if (!other || !same_entity(*other) || other->node_.id != node_.id)
             return false;
         node_ = other->node_;
         return true;
@@ -532,7 +532,7 @@ public:
     }
 
     void apply(Document& doc) override {
-        ValueNode* n = find_value_node(look_of(doc), node_id_);
+        ValueNode* n = find_value_node(entity_of(doc), node_id_);
         assert(n);
         uint64_t& slot = which_ == 0 ? n->in_a : n->in_b;
         old_ = slot;
@@ -540,7 +540,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        if (ValueNode* n = find_value_node(look_of(doc), node_id_))
+        if (ValueNode* n = find_value_node(entity_of(doc), node_id_))
             (which_ == 0 ? n->in_a : n->in_b) = old_;
     }
 
@@ -558,14 +558,14 @@ public:
     std::string name() const override { return "Set Route Curve"; }
 
     void apply(Document& doc) override {
-        ModRoute* r = find_route(look_of(doc), route_id_);
+        ModRoute* r = find_route(entity_of(doc), route_id_);
         assert(r);
         old_curve_ = r->curve;
         r->curve = curve_;
     }
 
     void revert(Document& doc) override {
-        if (ModRoute* r = find_route(look_of(doc), route_id_))
+        if (ModRoute* r = find_route(entity_of(doc), route_id_))
             r->curve = old_curve_;
     }
 
@@ -587,7 +587,7 @@ public:
     std::string name() const override { return "Edit Keyframes"; }
 
     void apply(Document& doc) override {
-        std::vector<KeyframeLane>& lanes = look_of(doc).lanes;
+        std::vector<KeyframeLane>& lanes = entity_of(doc).lanes;
         old_keys_.clear();
         had_lane_ = false;
         for (size_t i = 0; i < lanes.size(); ++i) {
@@ -603,7 +603,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        std::vector<KeyframeLane>& lanes = look_of(doc).lanes;
+        std::vector<KeyframeLane>& lanes = entity_of(doc).lanes;
         for (size_t i = 0; i < lanes.size(); ++i) {
             if (lanes[i].target == target_) {
                 if (had_lane_) lanes[i].keys = old_keys_;
@@ -616,7 +616,7 @@ public:
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetLaneCommand*>(&next);
-        if (!other || !same_look(*other) || !(other->target_ == target_))
+        if (!other || !same_entity(*other) || !(other->target_ == target_))
             return false;
         keys_ = other->keys_;   // old_keys_ stays at the gesture start
         return true;
@@ -642,7 +642,7 @@ public:
     std::string name() const override { return "Edit Keyframes"; }
 
     void apply(Document& doc) override {
-        std::vector<KeyframeLane>& doc_lanes = look_of(doc).lanes;
+        std::vector<KeyframeLane>& doc_lanes = entity_of(doc).lanes;
         old_.clear();
         for (const KeyframeLane& lane : lanes_) {
             Old o;
@@ -663,7 +663,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        std::vector<KeyframeLane>& doc_lanes = look_of(doc).lanes;
+        std::vector<KeyframeLane>& doc_lanes = entity_of(doc).lanes;
         for (size_t n = lanes_.size(); n-- > 0;) {
             const KeyframeLane& lane = lanes_[n];
             const Old& o = old_[n];
@@ -681,7 +681,7 @@ public:
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetLanesCommand*>(&next);
-        if (!other || !same_look(*other) ||
+        if (!other || !same_entity(*other) ||
             other->lanes_.size() != lanes_.size())
             return false;
         for (size_t i = 0; i < lanes_.size(); ++i)
@@ -732,13 +732,13 @@ public:
 
     void apply(Document& doc) override {
         assert(slot_ >= 0 && slot_ < 3);
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         previous_ = look.snapshots[slot_];
         look.snapshots[slot_] = capture_snapshot(look);
     }
 
     void revert(Document& doc) override {
-        look_of(doc).snapshots[slot_] = previous_;
+        entity_of(doc).snapshots[slot_] = previous_;
     }
 
 private:
@@ -754,13 +754,13 @@ public:
 
     void apply(Document& doc) override {
         assert(slot_ >= 0 && slot_ < 3);
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         previous_ = capture_snapshot(look);
         restore(look, look.snapshots[slot_]);
     }
 
     void revert(Document& doc) override {
-        restore(look_of(doc), previous_);
+        restore(entity_of(doc), previous_);
     }
 
 private:

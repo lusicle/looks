@@ -364,7 +364,7 @@ public:
     }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         old_split_ = look.audio_split;
         look.audio_split = split_;
         had_wire_ = false;
@@ -385,7 +385,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         look.audio_split = old_split_;
         if (sealed_) prune_tombstone(look);
         if (had_wire_) look.links.push_back(wire_);
@@ -457,7 +457,7 @@ public:
     std::string name() const override { return "Nest"; }
 
     void apply(Document& doc) override {
-        Look& parent = look_of(doc);
+        Look& parent = entity_of(doc);
         removed_layers_.clear();
         removed_links_.clear();
         // An empty link table means the wiring comes from stack order.
@@ -488,7 +488,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& parent = look_of(doc);
+        Look& parent = entity_of(doc);
         erase_by_id(doc.looks, nested_.id);
         for (size_t i = parent.links.size(); i-- > 0;)
             if (parent.links[i].from == ref_.id && parent.links[i].to == 0) {
@@ -549,7 +549,7 @@ public:
     std::string name() const override { return "Make Unique"; }
 
     void apply(Document& doc) override {
-        Placement* p = find_placement(sequence_of(doc), placement_id_);
+        Placement* p = find_placement(entity_of(doc), placement_id_);
         if (!p || !p->target) return;
         old_target_ = p->target;
         p->target = is_look_ ? look_.id : seq_.id;
@@ -560,7 +560,7 @@ public:
 
     void revert(Document& doc) override {
         if (!applied_) return;
-        if (Placement* p = find_placement(sequence_of(doc), placement_id_))
+        if (Placement* p = find_placement(entity_of(doc), placement_id_))
             p->target = old_target_;
         if (is_look_) erase_by_id(doc.looks, look_.id);
         else erase_by_id(doc.sequences, seq_.id);

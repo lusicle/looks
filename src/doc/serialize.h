@@ -21,11 +21,7 @@ Document doc_from_json(const json::Value& v);
 json::Value effect_to_json(const EffectInstance& fx);
 std::optional<EffectInstance> effect_from_json(const json::Value& v);
 json::Value group_to_json(const Group& g);
-struct GroupLegacy {
-    bool migrate = false;   // no "inputs" key: send it through normalize
-    uint64_t face_in = 0;
-};
-Group group_from_json(const json::Value& v, GroupLegacy* legacy = nullptr);
+Group group_from_json(const json::Value& v, uint64_t* face_in = nullptr);
 
 bool save_document(const std::filesystem::path& path, const Document& doc);
 std::optional<Document> load_document(const std::filesystem::path& path,

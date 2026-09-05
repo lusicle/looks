@@ -15,13 +15,13 @@ public:
     std::string name() const override { return "Add Layer"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         assert(insert_index_ <= look.layers.size());
         look.layers.insert(look.layers.begin() + insert_index_, layer_);
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         look.layers.erase(look.layers.begin() + insert_index_);
     }
 
@@ -37,14 +37,14 @@ public:
     std::string name() const override { return "Remove Layer"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         assert(layer_index_ < look.layers.size());
         removed_ = look.layers[layer_index_];
         look.layers.erase(look.layers.begin() + layer_index_);
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         look.layers.insert(look.layers.begin() + layer_index_, removed_);
     }
 
@@ -60,19 +60,19 @@ public:
     std::string name() const override { return "Edit Layer"; }
 
     void apply(Document& doc) override {
-        Layer* l = find_layer(look_of(doc), updated_.id);
+        Layer* l = find_layer(entity_of(doc), updated_.id);
         assert(l);
         old_ = *l;
         assign(*l, updated_);
     }
 
     void revert(Document& doc) override {
-        if (Layer* l = find_layer(look_of(doc), updated_.id)) assign(*l, old_);
+        if (Layer* l = find_layer(entity_of(doc), updated_.id)) assign(*l, old_);
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetLayerPropsCommand*>(&next);
-        if (!other || !same_look(*other) || other->updated_.id != updated_.id)
+        if (!other || !same_entity(*other) || other->updated_.id != updated_.id)
             return false;
         updated_ = other->updated_;
         return true;
@@ -102,7 +102,7 @@ public:
     std::string name() const override { return "Razor"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         old_outs_.clear();
         for (const PlacementSplit& s : splits_) {
             PlacementSlot slot;
@@ -116,7 +116,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         for (const PlacementSplit& s : splits_) {
             PlacementSlot slot;
             if (find_placement_slot(seq, s.right.id, &slot))

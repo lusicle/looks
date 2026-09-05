@@ -55,7 +55,6 @@ struct Event {
     float mouse_x = 0.0f;
     float mouse_y = 0.0f;
     MouseButton button = MouseButton::Left;
-    float wheel_x = 0.0f;
     float wheel_y = 0.0f;
     Key key = Key::Unknown;
     bool repeat = false;
@@ -67,7 +66,6 @@ struct WindowDesc {
     std::string title = "looks";   // UTF-8
     int width = 1600;              // logical px, scaled by DPI
     int height = 900;
-    bool resizable = true;
 };
 
 class Window {

@@ -37,20 +37,20 @@ public:
     std::string name() const override { return "Edit Parameter"; }
 
     void apply(Document& doc) override {
-        float& p = param_ref(look_of(doc), layer_index_, effect_index_,
+        float& p = param_ref(entity_of(doc), layer_index_, effect_index_,
                              param_index_);
         old_value_ = p;
         p = new_value_;
     }
 
     void revert(Document& doc) override {
-        param_ref(look_of(doc), layer_index_, effect_index_, param_index_) =
+        param_ref(entity_of(doc), layer_index_, effect_index_, param_index_) =
             old_value_;
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetParamCommand*>(&next);
-        if (!other || !same_look(*other) ||
+        if (!other || !same_entity(*other) ||
             other->layer_index_ != layer_index_ ||
             other->effect_index_ != effect_index_ ||
             other->param_index_ != param_index_)
@@ -81,7 +81,7 @@ public:
     std::string name() const override { return "Edit Parameter"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         old_base_.clear();
         for (const ParamWrite& w : base_writes_) {
             float& p = param_ref(look, layer_index_, effect_index_,
@@ -108,7 +108,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         for (size_t i = lane_writes_.size(); i-- > 0;) {
             for (size_t li = 0; li < look.lanes.size(); ++li) {
                 if (look.lanes[li].target == lane_writes_[i].target) {
@@ -127,7 +127,7 @@ public:
 
     bool merge(const Command& next) override {
         const auto* o = dynamic_cast<const SetParamGestureCommand*>(&next);
-        if (!o || !same_look(*o) || o->layer_index_ != layer_index_ ||
+        if (!o || !same_entity(*o) || o->layer_index_ != layer_index_ ||
             o->effect_index_ != effect_index_ ||
             o->base_writes_.size() != base_writes_.size() ||
             o->lane_writes_.size() != lane_writes_.size())
@@ -167,14 +167,14 @@ public:
     std::string name() const override { return name_; }
 
     void apply(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
+        auto& stack = stack_of(entity_of(doc), layer_index_);
         assert(effect_index_ < stack.size());
         old_ = stack[effect_index_].*Field;
         stack[effect_index_].*Field = value_;
     }
 
     void revert(Document& doc) override {
-        stack_of(look_of(doc), layer_index_)[effect_index_].*Field = old_;
+        stack_of(entity_of(doc), layer_index_)[effect_index_].*Field = old_;
     }
 
 private:
@@ -197,13 +197,13 @@ public:
     }
 
     void apply(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
+        auto& stack = stack_of(entity_of(doc), layer_index_);
         assert(insert_index_ <= stack.size());
         stack.insert(stack.begin() + insert_index_, instance_);
     }
 
     void revert(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
+        auto& stack = stack_of(entity_of(doc), layer_index_);
         stack.erase(stack.begin() + insert_index_);
     }
 
@@ -222,14 +222,14 @@ public:
     std::string name() const override { return "Remove Effect"; }
 
     void apply(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
+        auto& stack = stack_of(entity_of(doc), layer_index_);
         assert(effect_index_ < stack.size());
         removed_ = stack[effect_index_];
         stack.erase(stack.begin() + effect_index_);
     }
 
     void revert(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
+        auto& stack = stack_of(entity_of(doc), layer_index_);
         stack.insert(stack.begin() + effect_index_, removed_);
     }
 
@@ -249,10 +249,10 @@ public:
     std::string name() const override { return "Move Effect"; }
 
     void apply(Document& doc) override {
-        shift(look_of(doc), layer_index_, from_, to_);
+        shift(entity_of(doc), layer_index_, from_, to_);
     }
     void revert(Document& doc) override {
-        shift(look_of(doc), layer_index_, to_, from_);
+        shift(entity_of(doc), layer_index_, to_, from_);
     }
 
 private:
@@ -279,7 +279,7 @@ public:
     std::string name() const override { return "Move Node"; }
 
     void apply(Document& doc) override {
-        const Pos p = resolve(look_of(doc));
+        const Pos p = resolve(entity_of(doc));
         if (!p.x) return;
         old_x_ = *p.x;
         old_y_ = *p.y;
@@ -288,7 +288,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        const Pos p = resolve(look_of(doc));
+        const Pos p = resolve(entity_of(doc));
         if (!p.x) return;
         *p.x = old_x_;
         *p.y = old_y_;
@@ -296,7 +296,7 @@ public:
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetNodePosCommand*>(&next);
-        if (!other || !same_look(*other) || other->kind_ != kind_ ||
+        if (!other || !same_entity(*other) || other->kind_ != kind_ ||
             other->id_ != id_)
             return false;
         x_ = other->x_;
@@ -361,13 +361,13 @@ public:
     std::string name() const override { return "Materialize Links"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
     }
 
     void revert(Document& doc) override {
-        if (materialized_) look_of(doc).links.clear();
+        if (materialized_) entity_of(doc).links.clear();
     }
 
 private:
@@ -383,7 +383,7 @@ public:
     std::string name() const override { return "Connect Nodes"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
         pruned_ = prune_tombstone(look);   // a real wire replaces the seal
@@ -428,7 +428,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         if (appended_) {
             erase_last_link(look, link_);
         } else if (had_replaced_ && replaced_at_ < look.links.size()) {
@@ -455,7 +455,7 @@ public:
     std::string name() const override { return "Disconnect Nodes"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
         removed_ = false;
@@ -477,7 +477,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         if (sealed_) prune_tombstone(look);
         if (removed_)
             look.links.insert(
@@ -505,7 +505,7 @@ public:
     std::string name() const override { return "Rewire Nodes"; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         materialized_ = look.links.empty();
         ensure_links(look);
         pruned_ = prune_tombstone(look);
@@ -542,7 +542,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         switch (mode_) {
             case kReplaced:
                 if (at_ < look.links.size()) look.links[at_] = old_;
@@ -588,7 +588,7 @@ public:
 
 private:
     void swap_links(Document& doc) {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         ensure_links(look);
         std::vector<size_t> pos;
         for (size_t i = 0; i < look.links.size(); ++i)
@@ -614,10 +614,10 @@ public:
         : LookCommand(look), frame_(std::move(frame)) {}
     std::string name() const override { return "Add Frame"; }
     void apply(Document& doc) override {
-        look_of(doc).frames.push_back(frame_);
+        entity_of(doc).frames.push_back(frame_);
     }
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         for (auto it = look.frames.begin(); it != look.frames.end(); ++it)
             if (it->id == frame_.id) {
                 look.frames.erase(it);
@@ -635,7 +635,7 @@ public:
         : LookCommand(look), id_(id) {}
     std::string name() const override { return "Remove Frame"; }
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
+        Look& look = entity_of(doc);
         for (auto it = look.frames.begin(); it != look.frames.end(); ++it)
             if (it->id == id_) {
                 removed_ = *it;
@@ -645,7 +645,7 @@ public:
             }
     }
     void revert(Document& doc) override {
-        if (had_) look_of(doc).frames.push_back(removed_);
+        if (had_) entity_of(doc).frames.push_back(removed_);
     }
 
 private:
@@ -660,7 +660,7 @@ public:
         : LookCommand(look), id_(id), w_(w), h_(h) {}
     std::string name() const override { return "Resize Frame"; }
     void apply(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+        if (CanvasFrame* f = find_frame(entity_of(doc), id_)) {
             old_w_ = f->w;
             old_h_ = f->h;
             f->w = w_;
@@ -668,7 +668,7 @@ public:
         }
     }
     void revert(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+        if (CanvasFrame* f = find_frame(entity_of(doc), id_)) {
             f->w = old_w_;
             f->h = old_h_;
         }
@@ -676,7 +676,7 @@ public:
     bool merge(const Command& next) override {
         const auto* other =
             dynamic_cast<const SetFrameBoundsCommand*>(&next);
-        if (!other || !same_look(*other) || other->id_ != id_) return false;
+        if (!other || !same_entity(*other) || other->id_ != id_) return false;
         w_ = other->w_;
         h_ = other->h_;
         return true;
@@ -696,13 +696,13 @@ public:
         : LookCommand(look), id_(id), value_(std::move(value)), name_(name) {}
     std::string name() const override { return name_; }
     void apply(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
+        if (CanvasFrame* f = find_frame(entity_of(doc), id_)) {
             old_ = f->*Field;
             f->*Field = value_;
         }
     }
     void revert(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_)) f->*Field = old_;
+        if (CanvasFrame* f = find_frame(entity_of(doc), id_)) f->*Field = old_;
     }
 
 private:

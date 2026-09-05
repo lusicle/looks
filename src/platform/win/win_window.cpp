@@ -92,9 +92,7 @@ public:
             class_registered = true;
         }
 
-        DWORD style = WS_OVERLAPPEDWINDOW;
-        if (!desc.resizable)
-            style &= ~static_cast<DWORD>(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        const DWORD style = WS_OVERLAPPEDWINDOW;
 
         // The desc gives logical px. Scale by DPI, then get the outer size.
         UINT dpi = GetDpiForSystem();
@@ -262,17 +260,6 @@ private:
                 e.wheel_y = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
                 POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 ScreenToClient(hwnd_, &pt);   // Wheel coords are screen space.
-                e.mouse_x = static_cast<float>(pt.x);
-                e.mouse_y = static_cast<float>(pt.y);
-                e.mods = current_mods();
-                emit(e);
-                return 0;
-            }
-            case WM_MOUSEHWHEEL: {
-                e.type = Event::Type::MouseWheel;
-                e.wheel_x = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
-                POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                ScreenToClient(hwnd_, &pt);
                 e.mouse_x = static_cast<float>(pt.x);
                 e.mouse_y = static_cast<float>(pt.y);
                 e.mods = current_mods();

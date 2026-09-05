@@ -2137,14 +2137,12 @@ struct LayerUiState {
     ui::SwatchState card_swatch_a, card_swatch_b;
     std::unordered_map<uint64_t, ui::SwatchState> stop_swatch;
     std::unordered_map<uint64_t, ui::SwatchState> hue_swatch;
-    ui::SliderState sliders[56];
+    ui::SliderState sliders[22];
     ui::ButtonState value_edit_button;
-    ui::ButtonState route_buttons[56], key_buttons[56];
+    ui::ButtonState route_buttons[22], key_buttons[22];
     bool xf_open = false;
     ui::ButtonState xf_header, flip_h_btn, flip_v_btn, lock_btn;
     ui::ButtonState anchor_centre_btn;
-    ui::SliderState xf_sliders[10];
-    ui::ButtonState xf_route_buttons[10], xf_key_buttons[10];
 };
 
 struct LaneUiState {
@@ -2562,8 +2560,6 @@ struct AppState {
     uint64_t preset_drag_key = 0;
     bool preset_drag_live = false;
     uint64_t insert_before_id = 0;
-    float add_gx = 0.0f, add_gy = 0.0f;
-    bool add_pos_valid = false;
     // One registration per published atlas image, so the map stays tiny.
     std::unordered_map<VkImageView, const ui::UiTexture*> thumb_registry;
     float split_right = 0.30f;      // right column share of the width
@@ -10060,6 +10056,24 @@ static int value_input_of_row(const doc::ValueNode& vn, int row) {
         return row == 1 ? 0 : -1;
     return -1;
 }
+
+static FrameUi::LayerRow stage_layer_row(ui::LayoutArena& arena, size_t li,
+                                         const doc::Layer& layer) {
+    FrameUi::LayerRow lrow{};
+    lrow.index = li;
+    lrow.id = layer.id;
+    lrow.select = arena.alloc<bool>();
+    lrow.visible_changed = arena.alloc<bool>();
+    lrow.visible_staged = arena.alloc<bool>();
+    *lrow.visible_staged = !layer.visible;   // the click writes this
+    lrow.blend_selected = arena.alloc<int>();
+    *lrow.blend_selected = -1;
+    lrow.remove = arena.alloc<bool>();
+    lrow.up = arena.alloc<bool>();
+    lrow.down = arena.alloc<bool>();
+    return lrow;
+}
+
 static int value_row_of_input(const doc::ValueNode& vn, int which) {
     if (vn.source.type == doc::ModSourceType::Math)
         return which == 0 ? 2 : 3;
@@ -10213,18 +10227,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         float auto_x = kAutoX0;
 
         if (!scope) {
-            FrameUi::LayerRow lrow{};
-            lrow.index = li;
-            lrow.id = layer.id;
-            lrow.select = arena.alloc<bool>();
-            lrow.visible_changed = arena.alloc<bool>();
-            lrow.visible_staged = arena.alloc<bool>();
-            *lrow.visible_staged = !layer.visible;
-            lrow.blend_selected = arena.alloc<int>();
-            *lrow.blend_selected = -1;
-            lrow.remove = arena.alloc<bool>();
-            lrow.up = arena.alloc<bool>();
-            lrow.down = arena.alloc<bool>();
+            const FrameUi::LayerRow lrow = stage_layer_row(arena, li, layer);
             out.layer_rows.push_back(lrow);
 
             flow::ParamRow* rows = arena.alloc<flow::ParamRow>(56);
@@ -12190,18 +12193,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         if (app.sel.kind != SelKind::LayerSource || layer.id != app.sel.id)
             continue;
         LayerUiState& ls = app.layer_ui[layer.id];
-        FrameUi::LayerRow lrow{};
-        lrow.index = li;
-        lrow.id = layer.id;
-        lrow.select = arena.alloc<bool>();
-        lrow.visible_changed = arena.alloc<bool>();
-        lrow.visible_staged = arena.alloc<bool>();
-        *lrow.visible_staged = !layer.visible;   // the click writes this
-        lrow.blend_selected = arena.alloc<int>();
-        *lrow.blend_selected = -1;
-        lrow.remove = arena.alloc<bool>();
-        lrow.up = arena.alloc<bool>();
-        lrow.down = arena.alloc<bool>();
+        FrameUi::LayerRow lrow = stage_layer_row(arena, li, layer);
 
         const bool selected = app.layer_sel && li == app.selected_layer;
         const std::string& select_label = layer.name;
@@ -12299,7 +12291,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                 const char* format,
                                 float display_scale = 1.0f,
                                 float hard_max = 0.0f) {
-            if (lslider >= 12) return;
+            if (lslider >= static_cast<int>(std::size(ls.sliders))) return;
             FrameUi::LayerStage stage{};
             stage.layer_id = layer.id;
             stage.field = field;
@@ -12485,64 +12477,22 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             doc::layer_has_transform(layer) ? "transform *" : "transform",
             ls.xf_open, &ls.xf_header, lrow.xf_toggle, /*small=*/true));
         if (ls.xf_open) {
-            int xslider = 0;
-            auto xf_slider = [&](FrameUi::LayerField field, const char* label,
-                                 float min_v, float max_v, float value,
-                                 const char* format) {
-                if (xslider >= 10) return;
-                FrameUi::LayerStage stage{};
-                stage.layer_id = layer.id;
-                stage.field = field;
-                stage.staged = arena.alloc<float>();
-                *stage.staged = value;
-                stage.original = value;
-                stage.changed = arena.alloc<bool>();
-                stage.released = arena.alloc<bool>();
-                SliderOpts opts;
-                opts.format = format;
-                opts.out_changed = stage.changed;
-                opts.out_released = stage.released;
-                const doc::ParamKey lkey{layer.id | doc::kLayerParamBit,
-                                         static_cast<int>(field)};
-                FrameUi::AddRoute add_route{lkey, arena.alloc<bool>()};
-                out.add_routes.push_back(add_route);
-                FrameUi::KeyToggle ktog{lkey, value, arena.alloc<bool>()};
-                out.key_toggles.push_back(ktog);
-                FrameUi::ParamCtx pctx{lkey, value, 0.0f, false,
-                                       arena.alloc<bool>()};
-                pctx.has_def = layer_field_reset(field, &pctx.def_v);
-                out.param_ctxs.push_back(pctx);
-                opts.out_ctx = pctx.clicked;
-                LayoutNode* xcontrol =
-                    format && std::strstr(format, "deg")
-                        ? DialF(arena, stage.staged, min_v, max_v,
-                                &ls.xf_sliders[xslider], opts)
-                        : SliderF(arena, stage.staged, min_v, max_v,
-                                  &ls.xf_sliders[xslider], opts);
-                layer_rows_ui.push_back(param_row(
-                    arena, label, xcontrol,
-                    &ls.xf_route_buttons[xslider], add_route.clicked,
-                    &ls.xf_key_buttons[xslider], ktog.clicked, nullptr,
-                    nullptr, nullptr, lkeyed(lkey), lrouted(lkey)));
-                out.layer_stages.push_back(stage);
-                ++xslider;
-            };
-            xf_slider(LF::CropL, "crop l", 0.0f, 0.45f, layer.crop_l,
-                      "%.2f");
-            xf_slider(LF::CropR, "crop r", 0.0f, 0.45f, layer.crop_r,
-                      "%.2f");
-            xf_slider(LF::CropT, "crop t", 0.0f, 0.45f, layer.crop_t,
-                      "%.2f");
-            xf_slider(LF::CropB, "crop b", 0.0f, 0.45f, layer.crop_b,
-                      "%.2f");
-            xf_slider(LF::XfScale, "scale", 0.25f, 4.0f, layer.xf_scale,
-                      "%.2f x");
-            xf_slider(LF::Rotate, "rotate", -180.0f, 180.0f,
-                      layer.xf_rotate, "%.0f deg");
-            xf_slider(LF::AnchorX, "anchor x", 0.0f, 1.0f,
-                      layer.xf_anchor_x, "%.2f");
-            xf_slider(LF::AnchorY, "anchor y", 0.0f, 1.0f,
-                      layer.xf_anchor_y, "%.2f");
+            layer_slider(LF::CropL, "crop l", 0.0f, 0.45f, layer.crop_l,
+                         "%.2f");
+            layer_slider(LF::CropR, "crop r", 0.0f, 0.45f, layer.crop_r,
+                         "%.2f");
+            layer_slider(LF::CropT, "crop t", 0.0f, 0.45f, layer.crop_t,
+                         "%.2f");
+            layer_slider(LF::CropB, "crop b", 0.0f, 0.45f, layer.crop_b,
+                         "%.2f");
+            layer_slider(LF::XfScale, "scale", 0.25f, 4.0f, layer.xf_scale,
+                         "%.2f x");
+            layer_slider(LF::Rotate, "rotate", -180.0f, 180.0f,
+                         layer.xf_rotate, "%.0f deg");
+            layer_slider(LF::AnchorX, "anchor x", 0.0f, 1.0f,
+                         layer.xf_anchor_x, "%.2f");
+            layer_slider(LF::AnchorY, "anchor y", 0.0f, 1.0f,
+                         layer.xf_anchor_y, "%.2f");
             lrow.anchor_centre = arena.alloc<bool>();
             layer_rows_ui.push_back(value_row(
                 arena, "anchor",
@@ -12566,9 +12516,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 const doc::Asset* la = app.document.find_asset(layer.asset);
                 const uint32_t media = la ? la->frame_count : 0;
                 if (media > 1)
-                    xf_slider(LF::Slip, "slip", 0.0f,
-                              static_cast<float>(media - 1),
-                              static_cast<float>(layer.slip), "%.0f f");
+                    layer_slider(LF::Slip, "slip", 0.0f,
+                                 static_cast<float>(media - 1),
+                                 static_cast<float>(layer.slip), "%.0f f");
                 lrow.clock_lock = arena.alloc<bool>();
                 layer_rows_ui.push_back(value_row(
                     arena, "clock",
@@ -23429,22 +23379,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
             }
 
-            if (fe.add_requested) {
-                if (app.look().layers.empty()) {
-                    app.sel = {SelKind::AddLayer, 0};
-                } else {
-                    const size_t li =
-                        std::min(app.selected_layer,
-                                 app.look().layers.size() - 1);
-                    app.sel = {SelKind::AddEffect,
-                               app.look().layers[li].id};
-                }
-                app.insert_before_id = 0;
-                app.add_gx = fe.add_x;
-                app.add_gy = fe.add_y;
-                app.add_pos_valid = true;
-            }
-
             if (ki.do_duplicate && !structure_done) {
                 float px = 0.0f, py = 0.0f;
                 if (app.sel.kind == SelKind::Effect) {
@@ -24175,11 +24109,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             break;
                         }
                 }
-                if (app.add_pos_valid) {
-                    fx.node_x = app.add_gx;
-                    fx.node_y = app.add_gy;
-                    app.add_pos_valid = false;
-                }
                 const uint64_t new_id = fx.id;
                 app.undo.begin_group("Add Effect");
                 // New effects spawn unwired.
@@ -24872,14 +24801,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             doc::CanvasFrame fr;
             fr.id = app.document.next_effect_id++;
             fr.title = "frame " + std::to_string(fr.id);
-            if (app.add_pos_valid) {
-                fr.x = app.add_gx;
-                fr.y = app.add_gy;
-                app.add_pos_valid = false;
-            } else {
-                fr.x = 80.0f;
-                fr.y = 80.0f;
-            }
+            fr.x = 80.0f;
+            fr.y = 80.0f;
             app.undo.execute(app.document,
                              doc::add_frame_command(app.scope_look,std::move(fr)));
         }

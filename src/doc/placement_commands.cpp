@@ -40,7 +40,7 @@ public:
     std::string name() const override { return "Place Block"; }
 
     void apply(Document& doc) override {
-        for (SeqTrack& t : sequence_of(doc).tracks)
+        for (SeqTrack& t : entity_of(doc).tracks)
             if (t.id == track_id_) {
                 t.placements.push_back(place_);
                 return;
@@ -48,7 +48,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        for (SeqTrack& t : sequence_of(doc).tracks) {
+        for (SeqTrack& t : entity_of(doc).tracks) {
             if (t.id != track_id_) continue;
             for (size_t i = t.placements.size(); i-- > 0;)
                 if (t.placements[i].id == place_.id)
@@ -69,7 +69,7 @@ public:
     std::string name() const override { return "Edit Placement"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         Placement* target = find_placement(seq, updated_.id);
         if (!target) return;
         old_.clear();
@@ -89,14 +89,14 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         for (const auto& [id, place] : old_)
             if (Placement* p = find_placement(seq, id)) *p = place;
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetPlacementCommand*>(&next);
-        if (!other || !same_sequence(*other) ||
+        if (!other || !same_entity(*other) ||
             other->updated_.id != updated_.id)
             return false;
         updated_ = other->updated_;
@@ -115,7 +115,7 @@ public:
     std::string name() const override { return "Unlink"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         Placement* target = find_placement(seq, placement_id_);
         if (!target || !target->link) return;
         link_ = target->link;
@@ -127,7 +127,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         for (const uint64_t id : members_)
             if (Placement* p = find_placement(seq, id)) p->link = link_;
     }
@@ -145,7 +145,7 @@ public:
     std::string name() const override { return "Remove Block"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         removed_.clear();
         Placement* target = find_placement(seq, placement_id_);
         if (!target) return;
@@ -166,7 +166,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         // Insert in reverse capture order to put each one back at its index.
         for (size_t k = removed_.size(); k-- > 0;) {
             const Slot& s = removed_[k];
@@ -202,7 +202,7 @@ public:
     std::string name() const override { return "Add Audio"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         AudioTrack* track = nullptr;
         minted_track_ = false;
         for (AudioTrack& t : seq.audio)
@@ -224,7 +224,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         if (video_placement_)
             if (Placement* v = find_placement(seq, video_placement_))
                 if (v->link == link_id_) v->link = 0;
@@ -264,7 +264,7 @@ public:
     std::string name() const override { return "Edit Audio Track"; }
 
     void apply(Document& doc) override {
-        for (AudioTrack& t : sequence_of(doc).audio) {
+        for (AudioTrack& t : entity_of(doc).audio) {
             if (t.id != track_id_) continue;
             old_name_ = t.name;
             old_gain_ = t.gain;
@@ -278,7 +278,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        for (AudioTrack& t : sequence_of(doc).audio) {
+        for (AudioTrack& t : entity_of(doc).audio) {
             if (t.id != track_id_) continue;
             t.name = old_name_;
             t.gain = old_gain_;
@@ -290,7 +290,7 @@ public:
     bool merge(const Command& next) override {
         const auto* other =
             dynamic_cast<const SetAudioTrackPropsCommand*>(&next);
-        if (!other || !same_sequence(*other) ||
+        if (!other || !same_entity(*other) ||
             other->track_id_ != track_id_)
             return false;
         name_ = other->name_;
@@ -321,7 +321,7 @@ public:
     std::string name() const override { return "Edit Lane"; }
 
     void apply(Document& doc) override {
-        for (SeqTrack& t : sequence_of(doc).tracks) {
+        for (SeqTrack& t : entity_of(doc).tracks) {
             if (t.id != track_id_) continue;
             old_name_ = t.name;
             old_hidden_ = t.hidden;
@@ -333,7 +333,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        for (SeqTrack& t : sequence_of(doc).tracks) {
+        for (SeqTrack& t : entity_of(doc).tracks) {
             if (t.id != track_id_) continue;
             t.name = old_name_;
             t.hidden = old_hidden_;
@@ -360,7 +360,7 @@ public:
     std::string name() const override { return "Move Block"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         PlacementSlot from;
         if (!find_placement_slot(seq, placement_id_, &from)) return;
         std::vector<Placement>* dst =
@@ -377,7 +377,7 @@ public:
 
     void revert(Document& doc) override {
         if (!moved_) return;
-        Sequence& seq = sequence_of(doc);
+        Sequence& seq = entity_of(doc);
         PlacementSlot at;
         if (!find_placement_slot(seq, placement_id_, &at)) return;
         Placement p = (*at.list)[at.index];
@@ -408,14 +408,14 @@ public:
     std::string name() const override { return label_; }
 
     void apply(Document& doc) override {
-        auto& tracks = sequence_of(doc).*Member;
+        auto& tracks = entity_of(doc).*Member;
         tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(
                           std::min(at_index_, tracks.size())),
                       track_);
     }
 
     void revert(Document& doc) override {
-        auto& tracks = sequence_of(doc).*Member;
+        auto& tracks = entity_of(doc).*Member;
         for (size_t i = tracks.size(); i-- > 0;)
             if (tracks[i].id == track_.id)
                 tracks.erase(tracks.begin() + static_cast<ptrdiff_t>(i));
@@ -437,7 +437,7 @@ public:
     std::string name() const override { return label_; }
 
     void apply(Document& doc) override {
-        auto& tracks = sequence_of(doc).*Member;
+        auto& tracks = entity_of(doc).*Member;
         for (size_t i = 0; i < tracks.size(); ++i)
             if (tracks[i].id == track_id_) {
                 index_ = i;
@@ -448,7 +448,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        auto& tracks = sequence_of(doc).*Member;
+        auto& tracks = entity_of(doc).*Member;
         tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(
                           std::min(index_, tracks.size())),
                       removed_);

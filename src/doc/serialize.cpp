@@ -3,7 +3,6 @@
 #include <algorithm>
 
 #include "doc/effects.h"
-#include "doc/group_commands.h"
 #include "util/file.h"
 
 namespace looks::doc {
@@ -441,19 +440,11 @@ Value layer_to_json(const Layer& l) {
     return v;
 }
 
-// normalize_group_inputs must run after the id counters are restored.
-struct GroupMigration {
-    uint64_t group = 0;
-    uint64_t face_in = 0;
-};
-
-Layer layer_from_json(const Value& v,
-                      std::vector<GroupMigration>* migrations) {
+Layer layer_from_json(const Value& v) {
     Layer l;
     l.id = static_cast<uint64_t>(v.get("id").as_int(0));
     l.name = v.get("name").as_string();
-    std::string src_name = v.get("source").as_string();
-    if (src_name == "clip") src_name = "media";   // old files say "clip"
+    const std::string src_name = v.get("source").as_string();
     l.source = static_cast<LayerSourceKind>(
         enum_index(kSourceKindNames, src_name));
     l.asset = static_cast<uint64_t>(v.get("asset").as_int(0));
@@ -528,12 +519,8 @@ Layer layer_from_json(const Value& v,
     l.node_y = num(v, "node_y", 0.0f);
     for (const Value& fv : v.get("stack").array())
         if (auto fx = effect_from_json(fv)) l.stack.push_back(std::move(*fx));
-    for (const Value& gv : v.get("groups").array()) {
-        GroupLegacy legacy;
-        l.groups.push_back(group_from_json(gv, &legacy));
-        if (legacy.migrate && migrations)
-            migrations->push_back({l.groups.back().id, legacy.face_in});
-    }
+    for (const Value& gv : v.get("groups").array())
+        l.groups.push_back(group_from_json(gv));
     return l;
 }
 
@@ -660,8 +647,7 @@ Value look_to_json(const Look& look) {
     return v;
 }
 
-Look look_from_json(const Value& v,
-                    std::vector<GroupMigration>* migrations) {
+Look look_from_json(const Value& v) {
     Look look;
     look.id = static_cast<uint64_t>(v.get("id").as_int(0));
     look.name = v.get("name").as_string();
@@ -674,7 +660,7 @@ Look look_from_json(const Value& v,
 
     for (const Value& lv : v.get("layers").array()) {
         if (look.layers.size() >= kMaxLayers) break;
-        look.layers.push_back(layer_from_json(lv, migrations));
+        look.layers.push_back(layer_from_json(lv));
     }
     for (const Value& nv : v.get("value_nodes").array())
         look.value_nodes.push_back(value_node_from_json(nv));
@@ -907,7 +893,6 @@ json::Value group_to_json(const Group& g) {
     v.set("exposed", std::move(exposed));
     v.set("wet", static_cast<double>(g.wet));
     v.set("opacity", static_cast<double>(g.opacity));
-    // Always write "inputs", empty included: it marks the file slot-aware.
     Value inputs = Value::make_array();
     for (uint64_t s : g.inputs)
         inputs.push(Value(static_cast<int64_t>(s)));
@@ -918,7 +903,7 @@ json::Value group_to_json(const Group& g) {
     return v;
 }
 
-Group group_from_json(const json::Value& v, GroupLegacy* legacy) {
+Group group_from_json(const json::Value& v, uint64_t* face_in) {
     Group g;
     g.id = static_cast<uint64_t>(v.get("id").as_int(0));
     g.name = v.get("name").as_string();
@@ -934,11 +919,7 @@ Group group_from_json(const json::Value& v, GroupLegacy* legacy) {
     g.opacity = num(v, "opacity", 1.0f);
     for (const Value& sv : v.get("inputs").array())
         g.inputs.push_back(static_cast<uint64_t>(sv.as_int(0)));
-    // No "inputs" key means the file needs the face_in migration.
-    if (legacy) {
-        legacy->migrate = !v.get("inputs").is_array();
-        legacy->face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
-    }
+    if (face_in) *face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
     g.face_out = static_cast<uint64_t>(v.get("face_out").as_int(0));
     g.in_x = num(v, "in_x", 0.0f);
     g.in_y = num(v, "in_y", 0.0f);
@@ -1033,10 +1014,9 @@ Document doc_from_json(const json::Value& v) {
     for (const Value& av : v.get("assets").array())
         doc.assets.push_back(asset_from_json(av));
 
-    std::vector<GroupMigration> migrations;
     for (const Value& lv : v.get("looks").array()) {
         if (doc.looks.size() >= kMaxLooks) break;
-        doc.looks.push_back(look_from_json(lv, &migrations));
+        doc.looks.push_back(look_from_json(lv));
     }
     for (const Value& sv : v.get("sequences").array()) {
         if (doc.sequences.size() >= kMaxLooks) break;
@@ -1084,23 +1064,6 @@ Document doc_from_json(const json::Value& v) {
     doc.next_route_id =
         std::max(static_cast<uint64_t>(v.get("next_route_id").as_int(1)),
                  max_route_id + 1);
-
-    // This must run after the counter restore, or new slot ids collide.
-    for (const GroupMigration& m : migrations)
-        for (Look& look : doc.looks) {
-            size_t li = 0;
-            if (Group* g = find_group(look, m.group, &li)) {
-                uint64_t seed = m.face_in;
-                if (!seed)
-                    for (const EffectInstance& e : look.layers[li].stack)
-                        if (e.group_id == g->id) {
-                            seed = e.id;
-                            break;
-                        }
-                normalize_group_inputs(doc, look, li, *g, seed);
-                break;
-            }
-        }
 
     // A document keeps one look with a layer, and one sequence with a lane.
     if (doc.looks.empty()) {
