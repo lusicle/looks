@@ -167,6 +167,97 @@ struct LookBuild {
 
 int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift);
 
+bool media_leaf(const Document& doc, const Layer& layer, const Asset& a,
+                const Cursor& cur, double eff, int64_t off, Cursor* leaf,
+                double* rate, int64_t* shift) {
+    *shift = static_cast<int64_t>(layer.slip) + off;
+    *rate = media_conform_rate(doc, a,
+                               layer.timeline_lock ? cur.root_fps : eff);
+    double lo = 0.0, hi = 0.0;
+    shifted_window(static_cast<double>(a.frame_count), *shift, *rate, &lo,
+                   &hi);
+    if (layer.timeline_lock) {
+        // Locked: read at the root clock, ignore every placement hop.
+        leaf->depth = cur.depth + 1;
+        leaf->a = 1.0;
+        leaf->b = 0.0;
+        leaf->r0 = std::max(cur.r0, lo);
+        leaf->r1 = std::min(cur.r1, hi);
+        return leaf->r1 > leaf->r0;
+    }
+    return child_window(cur, lo, hi, 1.0, lo, leaf);
+}
+
+bool nested_child(const Document& doc, const Layer& layer, const Cursor& cur,
+                  double eff, int64_t off, Cursor* child) {
+    if (!layer.target) return false;
+    if (cur.depth + 1 >= kMaxLookDepth) return false;
+    // Only an explicit duration clamps: a derived one is the content.
+    double dur = 0.0;
+    if (const Look* t = doc.find_look(layer.target)) {
+        dur = static_cast<double>(t->duration);
+    } else if (const Sequence* t = doc.find_sequence(layer.target)) {
+        dur = static_cast<double>(t->duration);
+    } else {
+        return false;   // dangling ref: dormant
+    }
+    const double ratio = entity_fps(doc, layer.target) / eff;
+    double lo = 0.0, hi = 0.0;
+    shifted_window(dur, off, ratio, &lo, &hi);
+    if (!child_window(cur, lo, hi, ratio,
+                      lo * ratio + static_cast<double>(off), child))
+        return false;
+    child->entity = layer.target;
+    child->path = nested_child_path(cur.path, layer.id, layer.target, off);
+    child->root_fps = cur.root_fps;
+    return true;
+}
+
+bool placement_child(const Document& doc, uint64_t track_id,
+                     const Placement& p, const Cursor& cur, double eff,
+                     Cursor* child) {
+    if (!p.target) return false;
+    if (cur.depth + 1 >= kMaxLookDepth) return false;
+    if (!doc.find_look(p.target) && !doc.find_sequence(p.target))
+        return false;   // dangling target: dormant
+    const double ratio = placement_ratio(doc, p, eff);
+    const double speed =
+        p.speed > 0.0f ? static_cast<double>(p.speed) * ratio : 0.0;
+    const uint32_t len = source_length(doc, p);
+    const uint32_t end = placement_end(p, len, ratio);
+    const double lo = static_cast<double>(p.t_in);
+    const double hi = end ? static_cast<double>(end) : kUnbounded;
+    if (!child_window(cur, lo, hi, speed, static_cast<double>(p.source_in),
+                      child))
+        return false;
+    child->entity = p.target;
+    child->path = seq_child_path(cur.path, track_id, p.target);
+    child->root_fps = cur.root_fps;
+    return true;
+}
+
+int sum_or_pass(ProgBuild& pb, std::vector<int>& children) {
+    if (children.empty()) return -1;
+    if (children.size() == 1) return children[0];
+    const int idx = alloc_audio_node(pb);
+    if (idx < 0) return -1;
+    pb.prog.nodes[static_cast<size_t>(idx)].inputs = std::move(children);
+    return idx;
+}
+
+std::vector<int> collect_feeds(LookBuild& lb, uint64_t to, uint32_t port,
+                               int64_t shift) {
+    std::vector<int> children;
+    for (const NodeLink& l : lb.links) {
+        if (l.to != to || l.to_port != port ||
+            !wire_producer_live(lb.look, l.from))
+            continue;
+        const int c = build_doc_node(lb, l.from, shift);
+        if (c >= 0) children.push_back(c);
+    }
+    return children;
+}
+
 int build_layer_audio(LookBuild& lb, const Layer& layer,
                       int64_t src_shift) {
     const Document& doc = lb.pb.doc;
@@ -175,25 +266,12 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
         if (!layer.asset) return -1;
         const Asset* a = doc.find_asset(layer.asset);
         if (!a) return -1;   // dangling id: dormant
-        const int64_t shift =
-            static_cast<int64_t>(layer.slip) + src_shift;
-        const double rate = media_conform_rate(
-            doc, *a, layer.timeline_lock ? cur.root_fps : lb.eff);
-        double lo = 0.0, hi = 0.0;
-        shifted_window(static_cast<double>(a->frame_count), shift, rate,
-                       &lo, &hi);
         Cursor leaf;
-        if (layer.timeline_lock) {
-            // Locked: read at the root clock, ignore every placement hop.
-            leaf.depth = cur.depth + 1;
-            leaf.a = 1.0;
-            leaf.b = 0.0;
-            leaf.r0 = std::max(cur.r0, lo);
-            leaf.r1 = std::min(cur.r1, hi);
-            if (leaf.r1 <= leaf.r0) return -1;
-        } else if (!child_window(cur, lo, hi, 1.0, lo, &leaf)) {
+        double rate = 0.0;
+        int64_t shift = 0;
+        if (!media_leaf(doc, layer, *a, cur, lb.eff, src_shift, &leaf,
+                        &rate, &shift))
             return -1;
-        }
         const int idx = alloc_audio_node(lb.pb);
         if (idx < 0) return -1;
         AudioNode& n = lb.pb.prog.nodes[static_cast<size_t>(idx)];
@@ -214,29 +292,9 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
         return idx;
     }
     if (layer_is_nested(layer)) {
-        if (!layer.target) return -1;
-        if (cur.depth + 1 >= kMaxLookDepth) return -1;
-        // Only an explicit duration clamps: a derived one is the content.
-        double dur = 0.0;
-        if (const Look* t = doc.find_look(layer.target)) {
-            dur = static_cast<double>(t->duration);
-        } else if (const Sequence* t = doc.find_sequence(layer.target)) {
-            dur = static_cast<double>(t->duration);
-        } else {
-            return -1;   // dangling ref: dormant
-        }
-        const double ratio = entity_fps(doc, layer.target) / lb.eff;
-        double lo = 0.0, hi = 0.0;
-        shifted_window(dur, src_shift, ratio, &lo, &hi);
         Cursor child;
-        if (!child_window(cur, lo, hi, ratio,
-                          lo * ratio + static_cast<double>(src_shift),
-                          &child))
+        if (!nested_child(doc, layer, cur, lb.eff, src_shift, &child))
             return -1;
-        child.entity = layer.target;
-        child.path = nested_child_path(cur.path, layer.id, layer.target,
-                                       src_shift);
-        child.root_fps = cur.root_fps;
         const int inner = build_entity_audio(lb.pb, layer.target, child);
         if (inner < 0) return -1;
         const int idx = alloc_audio_node(lb.pb);
@@ -273,17 +331,8 @@ int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift) {
             if (fx->type == EffectType::Offset && live &&
                 offset_targets_audio(*fx))
                 feed_shift = offset_frames(*fx);
-            std::vector<int> children;
-            for (const NodeLink& l : lb.links) {
-                if (l.to != id || l.to_port != 0 ||
-                    !wire_producer_live(lb.look, l.from))
-                    continue;
-                const int c = build_doc_node(lb, l.from, feed_shift);
-                if (c >= 0) children.push_back(c);
-            }
-            if (children.empty()) {
-                result = -1;
-            } else if (is_audio_effect(fx->type) && live) {
+            std::vector<int> children = collect_feeds(lb, id, 0, feed_shift);
+            if (!children.empty() && is_audio_effect(fx->type) && live) {
                 const int idx = alloc_audio_node(lb.pb);
                 if (idx >= 0) {
                     AudioNode& n =
@@ -302,33 +351,12 @@ int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift) {
                     n.inputs = std::move(children);
                 }
                 result = idx;
-            } else if (children.size() == 1) {
-                result = children[0];
             } else {
-                const int idx = alloc_audio_node(lb.pb);
-                if (idx >= 0)
-                    lb.pb.prog.nodes[static_cast<size_t>(idx)].inputs =
-                        std::move(children);
-                result = idx;
+                result = sum_or_pass(lb.pb, children);
             }
         } else if (group_of_input(lb.look, id)) {
-            std::vector<int> children;
-            for (const NodeLink& l : lb.links) {
-                if (l.to != id || l.to_port != 0 ||
-                    !wire_producer_live(lb.look, l.from))
-                    continue;
-                const int c = build_doc_node(lb, l.from, src_shift);
-                if (c >= 0) children.push_back(c);
-            }
-            if (children.size() == 1) {
-                result = children[0];
-            } else if (!children.empty()) {
-                const int idx = alloc_audio_node(lb.pb);
-                if (idx >= 0)
-                    lb.pb.prog.nodes[static_cast<size_t>(idx)].inputs =
-                        std::move(children);
-                result = idx;
-            }
+            std::vector<int> children = collect_feeds(lb, id, 0, src_shift);
+            result = sum_or_pass(lb.pb, children);
         }
     }
     lb.building.erase(id);
@@ -341,21 +369,9 @@ int build_look_audio(ProgBuild& pb, const Look& look, const Cursor& cur) {
     const std::vector<NodeLink>& links = effective_links(look, synth);
     LookBuild lb{pb,  look, links, cur,
                  effective_fps(pb.doc, look), {}, {}};
-    const uint32_t port = look.audio_split ? 1u : 0u;
-    std::vector<int> children;
-    for (const NodeLink& l : links) {
-        if (l.to != 0 || l.to_port != port ||
-            !wire_producer_live(look, l.from))
-            continue;
-        const int c = build_doc_node(lb, l.from, 0);
-        if (c >= 0) children.push_back(c);
-    }
-    if (children.empty()) return -1;
-    if (children.size() == 1) return children[0];
-    const int idx = alloc_audio_node(pb);
-    if (idx < 0) return -1;
-    pb.prog.nodes[static_cast<size_t>(idx)].inputs = std::move(children);
-    return idx;
+    std::vector<int> children =
+        collect_feeds(lb, 0, look.audio_split ? 1u : 0u, 0);
+    return sum_or_pass(pb, children);
 }
 
 int build_seq_audio(ProgBuild& pb, const Sequence& seq,
@@ -366,32 +382,14 @@ int build_seq_audio(ProgBuild& pb, const Sequence& seq,
         const float track_gain = t.mute ? 0.0f : std::max(t.gain, 0.0f);
         if (track_gain <= 0.0f) continue;
         for (const Placement& p : t.placements) {
-            if (!p.target) continue;
-            if (cur.depth + 1 >= kMaxLookDepth) continue;
-            if (!pb.doc.find_look(p.target) &&
-                !pb.doc.find_sequence(p.target))
-                continue;   // dangling block: dormant
             const float pgain =
                 p.audio_mute
                     ? 0.0f
                     : track_gain * std::max(p.audio_gain, 0.0f);
             if (pgain <= 0.0f) continue;
-            const double ratio = placement_ratio(pb.doc, p, eff);
-            const double speed =
-                p.speed > 0.0f ? static_cast<double>(p.speed) * ratio
-                               : 0.0;
-            const uint32_t len = source_length(pb.doc, p);
-            const uint32_t end = placement_end(p, len, ratio);
-            const double lo = static_cast<double>(p.t_in);
-            const double hi =
-                end ? static_cast<double>(end) : kUnbounded;
             Cursor child;
-            if (!child_window(cur, lo, hi, speed,
-                              static_cast<double>(p.source_in), &child))
+            if (!placement_child(pb.doc, t.id, p, cur, eff, &child))
                 continue;
-            child.entity = p.target;
-            child.path = seq_child_path(cur.path, t.id, p.target);
-            child.root_fps = cur.root_fps;
             const int inner = build_entity_audio(pb, p.target, child);
             if (inner < 0) continue;
             const int idx = alloc_audio_node(pb);
@@ -405,12 +403,7 @@ int build_seq_audio(ProgBuild& pb, const Sequence& seq,
             children.push_back(idx);
         }
     }
-    if (children.empty()) return -1;
-    if (children.size() == 1) return children[0];
-    const int idx = alloc_audio_node(pb);
-    if (idx < 0) return -1;
-    pb.prog.nodes[static_cast<size_t>(idx)].inputs = std::move(children);
-    return idx;
+    return sum_or_pass(pb, children);
 }
 
 int build_entity_audio(ProgBuild& pb, uint64_t entity, const Cursor& cur) {
@@ -431,25 +424,11 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         // No frames and no size means audio only: there is no image side.
         if (!a) return;
         if (!a->frame_count && !a->width && !a->height) return;
-        const uint32_t frames = a->frame_count;
-        const int64_t shift = static_cast<int64_t>(layer.slip) + off;
-        // The ratio is against the look rate; a locked node uses the root.
-        const double rate = media_conform_rate(
-            doc, *a, layer.timeline_lock ? cur.root_fps : eff);
-        double lo = 0.0, hi = 0.0;
-        shifted_window(static_cast<double>(frames), shift, rate, &lo, &hi);
         Cursor leaf;
-        if (layer.timeline_lock) {
-            // Locked: read at the root clock, ignore every placement hop.
-            leaf.depth = cur.depth + 1;
-            leaf.a = 1.0;
-            leaf.b = 0.0;
-            leaf.r0 = std::max(cur.r0, lo);
-            leaf.r1 = std::min(cur.r1, hi);
-            if (leaf.r1 <= leaf.r0) return;
-        } else if (!child_window(cur, lo, hi, 1.0, lo, &leaf)) {
+        double rate = 0.0;
+        int64_t shift = 0;
+        if (!media_leaf(doc, layer, *a, cur, eff, off, &leaf, &rate, &shift))
             return;
-        }
         MediaInstance c;
         // The key must match the compiler Source stamp.
         c.key = media_stream_key(cur.path, layer.id, layer.asset,
@@ -466,30 +445,9 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         out.push_back(c);
     };
     auto descend_nested = [&](const Layer& layer, int64_t off) {
-        if (!layer.target) return;
-        if (cur.depth + 1 >= kMaxLookDepth) return;
-        // Only an explicit duration clamps: a derived one is the content.
-        // Lockstep is 1:1 in time: the hop fps ratio scales the child clock.
-        double dur = 0.0;
-        if (const Look* t = doc.find_look(layer.target)) {
-            dur = static_cast<double>(t->duration);
-        } else if (const Sequence* t = doc.find_sequence(layer.target)) {
-            dur = static_cast<double>(t->duration);
-        } else {
-            return;   // dangling ref: dormant
-        }
-        const double ratio = entity_fps(doc, layer.target) / eff;
-        double lo = 0.0, hi = 0.0;
-        shifted_window(dur, off, ratio, &lo, &hi);
         Cursor child;
-        if (!child_window(cur, lo, hi, ratio,
-                          lo * ratio + static_cast<double>(off), &child))
-            return;
-        child.entity = layer.target;
-        child.path = nested_child_path(cur.path, layer.id, layer.target,
-                                       off);
-        child.root_fps = cur.root_fps;
-        walk(doc, child, out);
+        if (nested_child(doc, layer, cur, eff, off, &child))
+            walk(doc, child, out);
     };
 
     // Liveness must mirror compile effect_active exactly.
@@ -546,27 +504,9 @@ void walk_sequence(const Document& doc, const Sequence& seq,
         if (t.hidden) continue;
         for (const Placement& p : t.placements) {
             if (out.size() >= kMaxFlattened) return;
-            if (!p.target) continue;
-            if (cur.depth + 1 >= kMaxLookDepth) continue;
-            if (!doc.find_look(p.target) && !doc.find_sequence(p.target))
-                continue;   // dangling target: dormant
-            const double ratio = placement_ratio(doc, p, eff);
-            const double speed =
-                p.speed > 0.0f ? static_cast<double>(p.speed) * ratio
-                               : 0.0;
-            const uint32_t len = source_length(doc, p);
-            const uint32_t end = placement_end(p, len, ratio);
-            const double lo = static_cast<double>(p.t_in);
-            const double hi =
-                end ? static_cast<double>(end) : kUnbounded;
             Cursor child;
-            if (!child_window(cur, lo, hi, speed,
-                              static_cast<double>(p.source_in), &child))
-                continue;
-            child.entity = p.target;
-            child.path = seq_child_path(cur.path, t.id, p.target);
-            child.root_fps = cur.root_fps;
-            walk(doc, child, out);
+            if (placement_child(doc, t.id, p, cur, eff, &child))
+                walk(doc, child, out);
         }
     }
 }

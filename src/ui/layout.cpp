@@ -128,27 +128,10 @@ void arrange_stack(LayoutNode& node, const Rect& rect, const Rect& clip,
     float leftover = fill_weight > 0.0f ? 0.0f : fill_space;
 
     float cursor = 0.0f;
-    float between = node.gap;
     switch (node.justify) {
         case Justify::Start: break;
         case Justify::Center: cursor = leftover * 0.5f; break;
         case Justify::End: cursor = leftover; break;
-        case Justify::SpaceBetween:
-            if (node.child_count > 1)
-                between += leftover / static_cast<float>(node.child_count - 1);
-            break;
-        case Justify::SpaceAround: {
-            const float unit = leftover / static_cast<float>(node.child_count);
-            cursor = unit * 0.5f;
-            between += unit;
-            break;
-        }
-        case Justify::SpaceEvenly: {
-            const float unit = leftover / static_cast<float>(node.child_count + 1);
-            cursor = unit;
-            between += unit;
-            break;
-        }
     }
 
     for (uint16_t i = 0; i < node.child_count; ++i) {
@@ -164,12 +147,11 @@ void arrange_stack(LayoutNode& node, const Rect& rect, const Rect& clip,
             case AlignMode::Stretch: child_cross = slot_cross; break;
             case AlignMode::Start: break;
             case AlignMode::Center: cross_pos = (slot_cross - child_cross) * 0.5f; break;
-            case AlignMode::End: cross_pos = slot_cross - child_cross; break;
         }
         const Vec2 pos = ax.make(cursor, cross_pos);
         const Vec2 size = ax.make(child_main, child_cross);
         arrange(child, {inner.x + pos.x, inner.y + pos.y, size.x, size.y}, clip);
-        cursor += child_main + between;
+        cursor += child_main + node.gap;
     }
 }
 

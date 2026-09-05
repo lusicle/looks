@@ -264,20 +264,13 @@ bool load_image(const std::filesystem::path& path, ImageRgba* out,
 
 namespace {
 
-void put_be32(std::vector<uint8_t>& out, uint32_t v) {
-    out.push_back(static_cast<uint8_t>(v >> 24));
-    out.push_back(static_cast<uint8_t>(v >> 16));
-    out.push_back(static_cast<uint8_t>(v >> 8));
-    out.push_back(static_cast<uint8_t>(v));
-}
-
 void put_chunk(std::vector<uint8_t>& out, const char type[4],
                const uint8_t* payload, size_t size) {
-    put_be32(out, static_cast<uint32_t>(size));
+    bytes::app_be32(out, static_cast<uint32_t>(size));
     const size_t crc_start = out.size();
     out.insert(out.end(), type, type + 4);
     out.insert(out.end(), payload, payload + size);
-    put_be32(out, crc32(out.data() + crc_start, 4 + size));
+    bytes::app_be32(out, crc32(out.data() + crc_start, 4 + size));
 }
 
 }  // namespace
@@ -331,7 +324,7 @@ std::vector<uint8_t> encode_png_rgba(const uint8_t* rgba, uint32_t width,
                  raw.begin() + static_cast<ptrdiff_t>(pos + n));
         pos += n;
     }
-    put_be32(z, adler32(raw.data(), raw.size()));
+    bytes::app_be32(z, adler32(raw.data(), raw.size()));
     put_chunk(out, "IDAT", z.data(), z.size());
     put_chunk(out, "IEND", nullptr, 0);
     return out;

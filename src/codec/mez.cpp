@@ -245,13 +245,7 @@ void intra_recon(const IntraDct& dct, int quality, DecodedFrame& out) {
     const int ch = (h + 1) / 2;
     const int mb_w = (w + 15) / 16;
     const int mb_h = (h + 15) / 16;
-    out.width = dct.width;
-    out.height = dct.height;
-    out.y_stride = static_cast<size_t>(w);
-    out.uv_stride = static_cast<size_t>(cw);
-    out.y.resize(static_cast<size_t>(w) * h);
-    out.u.resize(static_cast<size_t>(cw) * ch);
-    out.v.resize(static_cast<size_t>(cw) * ch);
+    out.alloc_planes(dct.width, dct.height);
 
     parallel_blocks(mb_w * mb_h, true, [&](int begin, int end) {
         int16_t quantized[kBlockCoeffs];
@@ -338,13 +332,7 @@ bool decode_frame_parallel(const uint8_t* data, size_t size, uint32_t width,
     const int mb_w = (w + 15) / 16;
     const int mb_h = (h + 15) / 16;
 
-    out.width = width;
-    out.height = height;
-    out.y_stride = static_cast<size_t>(w);
-    out.uv_stride = static_cast<size_t>(cw);
-    out.y.resize(static_cast<size_t>(w) * h);
-    out.u.resize(static_cast<size_t>(cw) * ch);
-    out.v.resize(static_cast<size_t>(cw) * ch);
+    out.alloc_planes(width, height);
 
     const int mb_count = mb_w * mb_h;
     std::vector<int16_t> coeffs(static_cast<size_t>(mb_count) * 6 *
@@ -393,13 +381,7 @@ bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
         const int h = static_cast<int>(height);
         const int cw = (w + 1) / 2;
         const int ch = (h + 1) / 2;
-        out.width = width;
-        out.height = height;
-        out.y_stride = static_cast<size_t>(w);
-        out.uv_stride = static_cast<size_t>(cw);
-        out.y.resize(static_cast<size_t>(w) * h);
-        out.u.resize(static_cast<size_t>(cw) * ch);
-        out.v.resize(static_cast<size_t>(cw) * ch);
+        out.alloc_planes(width, height);
         BitReader br(data + 1, size - 1);
         return decode_plane_lossless(br, out.y.data(), out.y_stride, w, h) &&
                decode_plane_lossless(br, out.u.data(), out.uv_stride, cw,
@@ -420,13 +402,7 @@ bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
     const int mb_w = (w + 15) / 16;
     const int mb_h = (h + 15) / 16;
 
-    out.width = width;
-    out.height = height;
-    out.y_stride = static_cast<size_t>(w);
-    out.uv_stride = static_cast<size_t>(cw);
-    out.y.resize(static_cast<size_t>(w) * h);
-    out.u.resize(static_cast<size_t>(cw) * ch);
-    out.v.resize(static_cast<size_t>(cw) * ch);
+    out.alloc_planes(width, height);
 
     BitReader br(data + 1, size - 1);
     int16_t dc_y = 0, dc_u = 0, dc_v = 0;

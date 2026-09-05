@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "util/bytes.h"
+
 namespace looks::json {
 
 const Value* Value::find(std::string_view key) const {
@@ -91,24 +93,6 @@ struct Parser {
         return true;
     }
 
-    static void append_utf8(std::string& s, uint32_t cp) {
-        if (cp < 0x80) {
-            s += static_cast<char>(cp);
-        } else if (cp < 0x800) {
-            s += static_cast<char>(0xC0 | (cp >> 6));
-            s += static_cast<char>(0x80 | (cp & 0x3F));
-        } else if (cp < 0x10000) {
-            s += static_cast<char>(0xE0 | (cp >> 12));
-            s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            s += static_cast<char>(0x80 | (cp & 0x3F));
-        } else {
-            s += static_cast<char>(0xF0 | (cp >> 18));
-            s += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-            s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            s += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-    }
-
     bool parse_string(std::string& out) {
         ++p;
         while (p < end) {
@@ -142,7 +126,7 @@ struct Parser {
                     } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
                         return fail("unpaired surrogate");
                     }
-                    append_utf8(out, cp);
+                    bytes::app_utf8(out, cp);
                     break;
                 }
                 default: return fail("bad escape");

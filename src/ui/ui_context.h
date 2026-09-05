@@ -38,7 +38,6 @@ struct Gesture {
     bool drag_started = false;
     bool drag_moved = false;
     bool drag_released = false;
-    Vec2 press_pos{};
     Vec2 drag_delta{};
 };
 

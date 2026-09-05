@@ -27,13 +27,16 @@ public:
 class LookCommand : public Command {
 public:
     explicit LookCommand(uint64_t look) : look_(look) {}
-    uint64_t look_id() const { return look_; }
 
 protected:
     Look& look_of(Document& doc) const { return doc.look(look_); }
+    Look& entity_of(Document& doc) const { return look_of(doc); }
     // Every merge() override must check this before it coalesces.
     bool same_look(const LookCommand& other) const {
         return other.look_ == look_;
+    }
+    bool same_entity(const LookCommand& other) const {
+        return same_look(other);
     }
 
 private:
@@ -44,14 +47,17 @@ private:
 class SequenceCommand : public Command {
 public:
     explicit SequenceCommand(uint64_t sequence) : sequence_(sequence) {}
-    uint64_t sequence_id() const { return sequence_; }
 
 protected:
     Sequence& sequence_of(Document& doc) const {
         return doc.sequence(sequence_);
     }
+    Sequence& entity_of(Document& doc) const { return sequence_of(doc); }
     bool same_sequence(const SequenceCommand& other) const {
         return other.sequence_ == sequence_;
+    }
+    bool same_entity(const SequenceCommand& other) const {
+        return same_sequence(other);
     }
 
 private:

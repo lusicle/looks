@@ -22,15 +22,12 @@ struct Rect {
     float w = 0.0f;
     float h = 0.0f;
 
-    constexpr float left() const { return x; }
-    constexpr float top() const { return y; }
     constexpr float right() const { return x + w; }
     constexpr float bottom() const { return y + h; }
     constexpr bool empty() const { return w <= 0.0f || h <= 0.0f; }
     constexpr bool contains(Vec2 p) const {
         return p.x >= x && p.x < x + w && p.y >= y && p.y < y + h;
     }
-    constexpr Vec2 center() const { return {x + w * 0.5f, y + h * 0.5f}; }
 
     constexpr Rect intersect(const Rect& o) const {
         float l = std::max(x, o.x);
@@ -56,7 +53,7 @@ struct Color {
     }
 
     static Color srgb(float r, float g, float b, float a = 1.0f) {
-        return {srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a};
+        return {color::srgb_eotf(r), color::srgb_eotf(g), color::srgb_eotf(b), a};
     }
     static Color hex(uint32_t rgb, float a = 1.0f) {
         return srgb(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
@@ -68,15 +65,12 @@ struct Color {
 
     uint32_t to_rgba8() const {
         auto encode = [](float linear) -> uint32_t {
-            float e = linear_to_srgb(std::clamp(linear, 0.0f, 1.0f));
+            float e = color::srgb_oetf(std::clamp(linear, 0.0f, 1.0f));
             return static_cast<uint32_t>(e * 255.0f + 0.5f);
         };
         uint32_t ab = static_cast<uint32_t>(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f);
         return encode(r) | (encode(g) << 8) | (encode(b) << 16) | (ab << 24);
     }
-
-    static float srgb_to_linear(float c) { return color::srgb_eotf(c); }
-    static float linear_to_srgb(float c) { return color::srgb_oetf(c); }
 
     constexpr bool operator==(const Color&) const = default;
 };

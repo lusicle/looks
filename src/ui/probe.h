@@ -18,7 +18,7 @@ struct Probe {
 void probe_frame_begin();
 
 // Duplicate names stay in draw order; probe_find picks one by index.
-void probe_add(const std::string& name, const Rect& rect);
+void probe_add(std::string name, const Rect& rect);
 
 // Reads the last completed frame, not the frame in progress.
 bool probe_find(const std::string& name, int index, Rect* out);

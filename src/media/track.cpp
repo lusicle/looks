@@ -597,7 +597,6 @@ bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
             atb[r] += r1[r] * u + r2[r] * v;
         }
     }
-    int perm[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     for (int col = 0; col < 8; ++col) {
         int piv = col;
         for (int r = col + 1; r < 8; ++r)
@@ -606,7 +605,6 @@ bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
         if (piv != col) {
             for (int c = 0; c < 8; ++c) std::swap(ata[piv][c], ata[col][c]);
             std::swap(atb[piv], atb[col]);
-            std::swap(perm[piv], perm[col]);
         }
         for (int r = col + 1; r < 8; ++r) {
             const double f = ata[r][col] / ata[col][col];
@@ -620,7 +618,6 @@ bool h_refit(const std::vector<float>& ax, const std::vector<float>& ay,
         for (int c = r + 1; c < 8; ++c) s -= ata[r][c] * x[c];
         x[r] = s / ata[r][r];
     }
-    (void)perm;
     for (int k = 0; k < 8; ++k) io_h[k] = static_cast<float>(x[k]);
     io_h[8] = 1.0f;
     return true;

@@ -537,9 +537,53 @@ inline media::MixState build_mix(const doc::Document& doc, uint64_t look_id,
     return mix;
 }
 
+bool make_pool_and_cmds(gfx::Device& device, VkCommandPool* pool,
+                        VkCommandBuffer* cmds, uint32_t count) {
+    VkCommandPoolCreateInfo pool_info{
+        VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool_info.queueFamilyIndex = device.graphics_family();
+    if (vkCreateCommandPool(device.device(), &pool_info, nullptr, pool) !=
+        VK_SUCCESS)
+        return false;
+    VkCommandBufferAllocateInfo cb{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cb.commandPool = *pool;
+    cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb.commandBufferCount = count;
+    return vkAllocateCommandBuffers(device.device(), &cb, cmds) == VK_SUCCESS;
+}
+
+class WorkerGate {
+public:
+    // MezReader ownership is not thread-safe, so hold the worker idle across
+    // player open and close. The counter makes this re-entrant.
+    // Pause must be quiescent: no work in flight when the caller continues.
+    void pause() {
+        std::unique_lock<std::mutex> lock(m_);
+        ++pause_count_;
+        cv_.wait(lock, [&] { return idle_ || quit_; });
+    }
+    void resume() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            --pause_count_;
+        }
+        cv_.notify_all();
+    }
+
+    std::mutex m_;
+    std::condition_variable cv_;
+
+protected:
+    bool quit_ = false;
+    bool idle_ = false;
+    int pause_count_ = 0;
+};
+
 // The worker thread owns the preview Engine.
 // Do not rewrite a published image until the UI frame that read it retires.
-struct RenderWorker {
+struct RenderWorker : WorkerGate {
     struct Job {
         // Immutable snapshot. The UI builds it outside the lock.
         std::shared_ptr<const doc::Document> doc;
@@ -607,20 +651,7 @@ struct RenderWorker {
     ~RenderWorker() { stop(); }
 
     bool start() {
-        VkCommandPoolCreateInfo pool_info{
-            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        pool_info.queueFamilyIndex = device.graphics_family();
-        if (vkCreateCommandPool(device.device(), &pool_info, nullptr,
-                                &pool_) != VK_SUCCESS)
-            return false;
-        VkCommandBufferAllocateInfo cb{
-            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cb.commandPool = pool_;
-        cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cb.commandBufferCount = gfx::kFramesInFlight;
-        if (vkAllocateCommandBuffers(device.device(), &cb, cmd_) !=
-            VK_SUCCESS)
+        if (!make_pool_and_cmds(device, &pool_, cmd_, gfx::kFramesInFlight))
             return false;
         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         for (uint32_t i = 0; i < gfx::kFramesInFlight; ++i)
@@ -657,21 +688,6 @@ struct RenderWorker {
         }
         if (pool_) vkDestroyCommandPool(device.device(), pool_, nullptr);
         pool_ = VK_NULL_HANDLE;
-    }
-
-    // MezReader ownership is not thread-safe, so hold the worker idle across
-    // player open and close. The counter makes this re-entrant.
-    void pause() {
-        std::unique_lock<std::mutex> lock(m_);
-        ++pause_count_;
-        cv_.wait(lock, [&] { return idle_ || quit_; });
-    }
-    void resume() {
-        {
-            std::lock_guard<std::mutex> lock(m_);
-            --pause_count_;
-        }
-        cv_.notify_all();
     }
 
     void invalidate() {
@@ -763,8 +779,6 @@ struct RenderWorker {
     std::unique_ptr<gfx::Engine> engine;
 
     // m_ guards the job snapshot and the publish ring.
-    std::mutex m_;
-    std::condition_variable cv_;
     Job job_;
     uint64_t job_serial_ = 0;
 
@@ -790,10 +804,7 @@ private:
     bool ensure_published(Published& p, uint32_t w, uint32_t h,
                           bool want_source, uint64_t completed);
 
-    bool quit_ = false;
     bool stopped_ = false;   // stop() ran (the destructor re-enters)
-    bool idle_ = false;
-    int pause_count_ = 0;
     // Published under m_ so stop() can abort a roll. Null outside run().
     media::DecodePool* pool_ptr_ = nullptr;
     std::vector<Published> published_;
@@ -1409,7 +1420,7 @@ void RenderWorker::run() {
 
 // This worker owns a private Engine. Do not share the preview engine.
 // Fence-wait every submission inline: slot 0 arenas must not overlap.
-class ThumbWorker {
+class ThumbWorker : public WorkerGate {
 public:
     struct Req {
         uint64_t key = 0;
@@ -1425,21 +1436,7 @@ public:
     ~ThumbWorker() { stop(); }
 
     bool start() {
-        VkCommandPoolCreateInfo pool_info{
-            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        pool_info.queueFamilyIndex = device.graphics_family();
-        if (vkCreateCommandPool(device.device(), &pool_info, nullptr,
-                                &pool_) != VK_SUCCESS)
-            return false;
-        VkCommandBufferAllocateInfo cb{
-            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cb.commandPool = pool_;
-        cb.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cb.commandBufferCount = 1;
-        if (vkAllocateCommandBuffers(device.device(), &cb, &cmd_) !=
-            VK_SUCCESS)
-            return false;
+        if (!make_pool_and_cmds(device, &pool_, &cmd_, 1)) return false;
         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkCreateFence(device.device(), &fence_info, nullptr, &fence_) !=
             VK_SUCCESS)
@@ -1463,20 +1460,6 @@ public:
         fence_ = VK_NULL_HANDLE;
         if (pool_) vkDestroyCommandPool(device.device(), pool_, nullptr);
         pool_ = VK_NULL_HANDLE;
-    }
-
-    // Pause must be quiescent: no work in flight when the caller continues.
-    void pause() {
-        std::unique_lock<std::mutex> lock(m_);
-        ++pause_count_;
-        cv_.wait(lock, [&] { return idle_ || quit_; });
-    }
-    void resume() {
-        {
-            std::lock_guard<std::mutex> lock(m_);
-            --pause_count_;
-        }
-        cv_.notify_all();
     }
 
     // Call from the UI thread once per frame. Do not copy the doc snapshot.
@@ -1525,9 +1508,6 @@ public:
 
     gfx::Device& device;
 
-    std::mutex m_;
-    std::condition_variable cv_;
-
 private:
     void run();
     void render_one(const Req& req, const doc::Document& rdoc);
@@ -1550,9 +1530,6 @@ private:
     std::filesystem::path shader_dir_;
     std::unique_ptr<gfx::Engine> engine_;   // thread-created, private
     std::thread thread_;
-    bool quit_ = false;
-    bool idle_ = false;
-    int pause_count_ = 0;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
@@ -2224,6 +2201,12 @@ struct KeyBinding {
     }
 };
 
+std::string ascii_lower(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
 // Returns null when the key cannot anchor a chord.
 const char* key_chord_name(platform::Key k) {
     using K = platform::Key;
@@ -2296,10 +2279,7 @@ platform::Key key_from_chord_name(std::string_view name) {
 // Returns empty when no keypress can make the chord.
 // Case and modifier order are forgiven.
 std::string normalize_chord(std::string_view chord) {
-    std::string low(chord);
-    for (char& c : low)
-        c = static_cast<char>(
-            std::tolower(static_cast<unsigned char>(c)));
+    std::string low = ascii_lower(std::string(chord));
     uint32_t mods = 0;
     std::string_view s = low;
     for (;;) {
@@ -3092,17 +3072,6 @@ float shown_param_value(const AppState& app, const doc::ParamKey& key,
     return base;
 }
 
-bool find_group_by_id(const doc::Look& look, uint64_t id,
-                      size_t* layer_index) {
-    for (size_t li = 0; li < look.layers.size(); ++li)
-        for (const doc::Group& g : look.layers[li].groups)
-            if (g.id == id) {
-                *layer_index = li;
-                return true;
-            }
-    return false;
-}
-
 int layer_index_by_id(const doc::Look& look, uint64_t id) {
     for (size_t li = 0; li < look.layers.size(); ++li)
         if (look.layers[li].id == id) return static_cast<int>(li);
@@ -3120,7 +3089,7 @@ void validate_selection(AppState& app) {
                 app.sel = {};
             break;
         case SelKind::Group:
-            if (!find_group_by_id(d, app.sel.id, &li)) app.sel = {};
+            if (!doc::find_group(d, app.sel.id, &li)) app.sel = {};
             break;
         case SelKind::LayerSource:
         case SelKind::AddEffect:
@@ -3154,7 +3123,7 @@ void validate_selection(AppState& app) {
             case flow::NodeKind::GroupIn:
             case flow::NodeKind::GroupOut: {
                 size_t li = 0;
-                return find_group_by_id(d, did, &li);
+                return doc::find_group(d, did, &li) != nullptr;
             }
             default:
                 return false;
@@ -4174,6 +4143,29 @@ void refresh_card_waves(AppState& app) {
 }
 
 // Reused per asset: two drops of one file share the wrapper look.
+uint64_t ensure_asset(AppState& app, const std::filesystem::path& picked,
+                      uint64_t asset_id) {
+    if (asset_id) return asset_id;
+    doc::Asset asset = doc::make_asset(
+        app.document, path_to_u8(picked.filename()), path_to_u8(picked));
+    asset_id = asset.id;
+    app.undo.execute(app.document, doc::add_asset_command(std::move(asset)));
+    return asset_id;
+}
+
+uint64_t append_layer_connected(AppState& app, uint64_t look_id,
+                                doc::Layer layer) {
+    const uint64_t layer_id = layer.id;
+    app.undo.execute(app.document,
+                     doc::add_layer_command(
+                         look_id, std::move(layer),
+                         app.document.look(look_id).layers.size()));
+    app.undo.execute(app.document,
+                     doc::connect_command(look_id, {layer_id, 0, 0}));
+    return layer_id;
+}
+
+
 uint64_t find_wrapper_look(const doc::Document& doc, uint64_t asset_id) {
     for (const doc::Look& l : doc.looks)
         if (l.layers.size() == 1 && doc::layer_is_media(l.layers[0]) &&
@@ -4269,28 +4261,14 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
             return true;
         }
         app.undo.begin_group("Add Media");
-        if (!asset_id) {
-            doc::Asset asset = doc::make_asset(
-                app.document, path_to_u8(picked.filename()),
-                path_to_u8(picked));
-            asset_id = asset.id;
-            app.undo.execute(app.document,
-                             doc::add_asset_command(std::move(asset)));
-        }
+        asset_id = ensure_asset(app, picked, asset_id);
         app.undo.execute(app.document,
                          doc::materialize_links_command(app.look().id));
         doc::Layer layer =
             doc::make_layer(app.document, doc::LayerSourceKind::Media);
         layer.name = path_to_u8(picked.stem());
         layer.asset = asset_id;
-        const uint64_t layer_id = layer.id;
-        app.undo.execute(app.document,
-                         doc::add_layer_command(app.look().id,
-                                                std::move(layer),
-                                                app.look().layers.size()));
-        app.undo.execute(
-            app.document,
-            doc::connect_command(app.look().id, {layer_id, 0, 0}));
+        append_layer_connected(app, app.look().id, std::move(layer));
         app.undo.end_group();
         refresh_bundles(app);
         app.selected_layer = app.look().layers.size() - 1;
@@ -4312,14 +4290,7 @@ bool place_media_block(AppState& app, const std::filesystem::path& picked,
     }
     const uint64_t lane_id = lane->id;
     app.undo.begin_group("Add Media");
-    if (!asset_id) {
-        doc::Asset asset = doc::make_asset(
-            app.document, path_to_u8(picked.filename()),
-            path_to_u8(picked));
-        asset_id = asset.id;
-        app.undo.execute(app.document,
-                         doc::add_asset_command(std::move(asset)));
-    }
+    asset_id = ensure_asset(app, picked, asset_id);
     uint64_t wrapper = find_wrapper_look(app.document, asset_id);
     if (!wrapper) {
         doc::Look look = doc::make_look(app.document, path_to_u8(picked.stem()));
@@ -4455,14 +4426,7 @@ bool place_look_block(AppState& app, uint64_t target_id, uint32_t at_frame,
                              : doc::LayerSourceKind::SequenceRef);
         layer.name = tname.empty() ? "ref" : tname;
         layer.target = target_id;
-        const uint64_t layer_id = layer.id;
-        app.undo.execute(app.document,
-                         doc::add_layer_command(app.look().id,
-                                                std::move(layer),
-                                                app.look().layers.size()));
-        app.undo.execute(
-            app.document,
-            doc::connect_command(app.look().id, {layer_id, 0, 0}));
+        append_layer_connected(app, app.look().id, std::move(layer));
         app.undo.end_group();
         app.selected_layer = app.look().layers.size() - 1;
         app.layer_sel = false;
@@ -4556,14 +4520,7 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
             if (l.id == layer_id) layer = &l;
         if (!layer || !doc::layer_is_media(*layer)) return;
         app.undo.begin_group("Bind Media");
-        if (!asset_id) {
-            doc::Asset asset = doc::make_asset(
-                app.document, path_to_u8(picked->filename()),
-                path_to_u8(*picked));
-            asset_id = asset.id;
-            app.undo.execute(app.document,
-                             doc::add_asset_command(std::move(asset)));
-        }
+        asset_id = ensure_asset(app, *picked, asset_id);
         doc::Layer edited = *layer;
         edited.asset = asset_id;
         app.undo.execute(
@@ -10153,7 +10110,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     size_t scope_li = 0;
     const doc::Group* scope_group = nullptr;
     if (app.open_group) {
-        if (find_group_by_id(d, app.open_group, &scope_li))
+        if (doc::find_group(d, app.open_group, &scope_li))
             for (const doc::Group& g : d.layers[scope_li].groups)
                 if (g.id == app.open_group) scope_group = &g;
         // Deleted under us (ungroup/undo): back to the main graph.
@@ -10333,11 +10290,13 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                       "%.2f");
             // Colors edit through the swatch only, never channel sliders.
             auto swatch_row = [&](const char* label, const float* rgba,
-                                  bool is_b, ui::SwatchState* sw) {
+                                  bool is_b, uint64_t stop_id,
+                                  ui::SwatchState* sw) {
                 if (srow >= 56) return;
                 FrameUi::ColorStage cstage{};
                 cstage.layer_id = layer.id;
                 cstage.color_b = is_b;
+                cstage.stop_id = stop_id;
                 cstage.staged = arena.alloc<float>(4);
                 for (int c = 0; c < 4; ++c) {
                     cstage.staged[c] = rgba[c];
@@ -10356,30 +10315,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 ++srow;
             };
             LayerUiState& lui = app.layer_ui[layer.id];
-            auto stop_swatch_row = [&](const char* label,
-                                       const doc::GradientStop& gs,
-                                       ui::SwatchState* sw) {
-                if (srow >= 56) return;
-                FrameUi::ColorStage cstage{};
-                cstage.layer_id = layer.id;
-                cstage.stop_id = gs.id;
-                cstage.staged = arena.alloc<float>(4);
-                for (int c = 0; c < 4; ++c) {
-                    cstage.staged[c] = gs.color[c];
-                    cstage.original[c] = gs.color[c];
-                }
-                cstage.changed = arena.alloc<bool>();
-                cstage.released = arena.alloc<bool>();
-                out.color_stages.push_back(cstage);
-                if (sw) sw->mode = ui::SwatchMode::Rgba;
-                rows[srow].label = label;
-                rows[srow].kind = 3;
-                rows[srow].swatch = sw;
-                rows[srow].staged = cstage.staged;
-                rows[srow].changed = cstage.changed;
-                rows[srow].released = cstage.released;
-                ++srow;
-            };
             auto stop_pos_row = [&](const char* label,
                                     const doc::GradientStop& gs, int chan,
                                     float value, float lo, float hi) {
@@ -10409,11 +10344,11 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             if (layer.source == LSK::Solid ||
                 layer.source == LSK::Noise ||
                 layer.source == LSK::Oscillator || pattern_two_color)
-                swatch_row("color a", layer.color_a, false,
+                swatch_row("color a", layer.color_a, false, 0,
                            &lui.card_swatch_a);
             if (layer.source == LSK::Noise ||
                 layer.source == LSK::Oscillator || pattern_two_color)
-                swatch_row("color b", layer.color_b, true,
+                swatch_row("color b", layer.color_b, true, 0,
                            &lui.card_swatch_b);
             if (layer.source == LSK::Gradient) {
                 const bool mesh = layer.gradient == doc::GradientKind::Mesh;
@@ -10445,8 +10380,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     const doc::GradientStop& gs = layer.stops[si];
                     char lbl[24];
                     std::snprintf(lbl, sizeof(lbl), "stop %zu", si + 1);
-                    stop_swatch_row(arena.dup(lbl, std::strlen(lbl)), gs,
-                                    &lui.stop_swatch[gs.id]);
+                    swatch_row(arena.dup(lbl, std::strlen(lbl)), gs.color,
+                               false, gs.id, &lui.stop_swatch[gs.id]);
                     if (mesh) {
                         stop_pos_row("  x", gs, 1, gs.x, 0.0f, 1.0f);
                         stop_pos_row("  y", gs, 2, gs.y, 0.0f, 1.0f);
@@ -11544,18 +11479,12 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     }
     const AddAction* add_actions = nullptr;
     {
-        auto lower = [](std::string s) {
-            for (char& c : s)
-                c = static_cast<char>(
-                    std::tolower(static_cast<unsigned char>(c)));
-            return s;
-        };
-        const std::string needle = lower(app.fx_filter.buf);
+        const std::string needle = ascii_lower(app.fx_filter.buf);
         auto matches = [&](const char* label, const char* cat) {
             if (needle.empty()) return true;
-            if (lower(label).find(needle) != std::string::npos)
+            if (ascii_lower(label).find(needle) != std::string::npos)
                 return true;
-            return cat && lower(cat).find(needle) != std::string::npos;
+            return cat && ascii_lower(cat).find(needle) != std::string::npos;
         };
         std::vector<const char*> items;
         std::vector<uint8_t> headers;
@@ -11946,13 +11875,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         };
         auto matches = [&](const std::string& nm) {
             if (app.browser_filter.buf.empty()) return true;
-            auto low = [](std::string s) {
-                for (char& c : s)
-                    if (c >= 'A' && c <= 'Z')
-                        c = static_cast<char>(c + 32);
-                return s;
-            };
-            return low(nm).find(low(app.browser_filter.buf)) !=
+            return ascii_lower(nm).find(ascii_lower(app.browser_filter.buf)) !=
                    std::string::npos;
         };
         if (!app.browser_filter.buf.empty()) {
@@ -12766,7 +12689,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
     } else if (app.sel.kind == SelKind::Group) {
         size_t li = 0;
-        if (find_group_by_id(app.look(), app.sel.id, &li)) {
+        if (doc::find_group(app.look(), app.sel.id, &li)) {
             app.selected_layer = li;
             const doc::Layer& sel_layer = app.look().layers[li];
             const doc::Group* group = nullptr;
@@ -12821,13 +12744,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                        search_opts)));
         }
         if (!app.fx_filter.buf.empty()) {
-            auto lower = [](std::string s) {
-                for (char& c : s)
-                    c = static_cast<char>(
-                        std::tolower(static_cast<unsigned char>(c)));
-                return s;
-            };
-            const std::string needle = lower(app.fx_filter.buf);
+            const std::string needle = ascii_lower(app.fx_filter.buf);
             std::vector<LayoutNode*> browser;
             ButtonOpts half;
             half.width = SizeSpec::fill();
@@ -12836,7 +12753,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                  t < static_cast<size_t>(doc::EffectType::Count); ++t) {
                 const doc::EffectInfo& info =
                     doc::effect_info(static_cast<doc::EffectType>(t));
-                if (lower(info.label).find(needle) == std::string::npos)
+                if (ascii_lower(info.label).find(needle) == std::string::npos)
                     continue;
                 out.add_clicked[t] = arena.alloc<bool>();
                 LayoutNode* b =
@@ -13066,13 +12983,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         };
         auto matches_filter = [&](const doc::Preset& p) {
             if (app.preset_filter.buf.empty()) return true;
-            auto lower = [](std::string s) {
-                for (char& c : s)
-                    c = static_cast<char>(std::tolower(
-                        static_cast<unsigned char>(c)));
-                return s;
-            };
-            return lower(p.name).find(lower(app.preset_filter.buf)) !=
+            return ascii_lower(p.name).find(ascii_lower(app.preset_filter.buf)) !=
                    std::string::npos;
         };
         auto tag_ok = [&](const doc::Preset& p) {
@@ -13690,7 +13601,7 @@ void commit_text_entry(AppState& app) {
             break;
         case TextEntry::GroupRename: {
             size_t gli = 0;
-            if (find_group_by_id(app.look(), app.group_rename_id, &gli))
+            if (doc::find_group(app.look(), app.group_rename_id, &gli))
                 for (const doc::Group& gr : app.look().layers[gli].groups)
                     if (gr.id == app.group_rename_id) {
                         doc::Group edited = gr;
@@ -14116,7 +14027,7 @@ void bypass(AppState& a, KeyIntents&) {
                     a.scope_look, li, fi,
                     !a.look().layers[li].stack[fi].bypass));
         } else if (kind == flow::NodeKind::Group &&
-                   find_group_by_id(a.look(), did, &li)) {
+                   doc::find_group(a.look(), did, &li)) {
             for (const doc::Group& gr : a.look().layers[li].groups)
                 if (gr.id == did) {
                     if (!any) a.undo.begin_group("Bypass");
@@ -15705,7 +15616,7 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
                     break;
                 case flow::NodeKind::Group: {
                     size_t gli = 0;
-                    if (find_group_by_id(app.look(), did, &gli))
+                    if (doc::find_group(app.look(), did, &gli))
                         for (const doc::EffectInstance& fx :
                              app.look().layers[gli].stack)
                             if (fx.group_id == did &&
@@ -16377,6 +16288,27 @@ doc::Sequence* arg_seq(ScriptHost& sh, script::Vm& vm,
     return s;
 }
 
+doc::Look* arg_effect(ScriptHost& sh, script::Vm& vm,
+                      const std::vector<script::Value>& a, size_t* li,
+                      size_t* fi) {
+    doc::Look* lk = arg_look(sh, vm, a[0]);
+    if (!lk) return nullptr;
+    if (find_effect_by_id(*lk, a[1].as_id(), li, fi)) return lk;
+    vm.set_error("no such effect");
+    return nullptr;
+}
+
+const doc::ValueNode* arg_value_node(ScriptHost& sh, script::Vm& vm,
+                                     const std::vector<script::Value>& a,
+                                     doc::Look** out_look) {
+    doc::Look* lk = arg_look(sh, vm, a[0]);
+    if (!lk) return nullptr;
+    *out_look = lk;
+    const doc::ValueNode* n = doc::find_value_node(*lk, a[1].as_id());
+    if (!n) vm.set_error("no such value node");
+    return n;
+}
+
 bool arg_num(script::Vm& vm, const script::Value& v, const char* what,
              double* out) {
     if (!v.is_num()) {
@@ -16397,18 +16329,16 @@ doc::EffectType effect_type_by_id(const std::string& id) {
     return doc::EffectType::Count;
 }
 
+const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
+                                   "difference"};
 int blend_by_name(const std::string& n) {
-    const char* names[] = {"normal", "add", "multiply", "screen",
-                           "difference"};
     for (int i = 0; i < 5; ++i)
-        if (n == names[i]) return i;
+        if (n == kBlendNames[i]) return i;
     return -1;
 }
 const char* blend_name(doc::BlendMode m) {
-    const char* names[] = {"normal", "add", "multiply", "screen",
-                           "difference"};
     const auto i = static_cast<size_t>(m);
-    return i < 5 ? names[i] : "normal";
+    return i < 5 ? kBlendNames[i] : "normal";
 }
 
 // Takes a name or a number; INT_MIN means unresolved.
@@ -17143,62 +17073,13 @@ void register_ops_input(ScriptHost& sh) {
     env.add("key", "key(name, mods?) - \"f\", \"space\", \"z\"+\"ctrl\"",
             1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
                 const std::string name = a[0].as_str();
-                platform::Key k = platform::Key::Unknown;
-                if (name.size() == 1) {
-                    const char c = name[0];
-                    if (c >= 'a' && c <= 'z')
-                        k = static_cast<platform::Key>(
-                            static_cast<int>(platform::Key::A) +
-                            (c - 'a'));
-                    else if (c >= '0' && c <= '9')
-                        k = static_cast<platform::Key>(
-                            static_cast<int>(platform::Key::Num0) +
-                            (c - '0'));
-                    else if (c == '[') k = platform::Key::LeftBracket;
-                    else if (c == ']') k = platform::Key::RightBracket;
-                    else if (c == '-') k = platform::Key::Minus;
-                    else if (c == '=') k = platform::Key::Equals;
-                    else if (c == ',') k = platform::Key::Comma;
-                    else if (c == '.') k = platform::Key::Period;
-                    else if (c == '/') k = platform::Key::Slash;
-                    else if (c == '\\') k = platform::Key::Backslash;
-                    else if (c == ';') k = platform::Key::Semicolon;
-                    else if (c == '\'') k = platform::Key::Apostrophe;
-                } else if (name.size() >= 2 && name[0] == 'f' &&
-                           name[1] >= '0' && name[1] <= '9') {
-                    const int n = std::atoi(name.c_str() + 1);
-                    if (n >= 1 && n <= 12)
-                        k = static_cast<platform::Key>(
-                            static_cast<int>(platform::Key::F1) + (n - 1));
-                } else if (name == "space") k = platform::Key::Space;
-                else if (name == "grave") k = platform::Key::Grave;
-                else if (name == "enter") k = platform::Key::Enter;
-                else if (name == "esc" || name == "escape")
-                    k = platform::Key::Escape;
-                else if (name == "tab") k = platform::Key::Tab;
-                else if (name == "backspace") k = platform::Key::Backspace;
-                else if (name == "delete") k = platform::Key::Delete;
-                else if (name == "home") k = platform::Key::Home;
-                else if (name == "end") k = platform::Key::End;
-                else if (name == "insert") k = platform::Key::Insert;
-                else if (name == "pageup") k = platform::Key::PageUp;
-                else if (name == "pagedown") k = platform::Key::PageDown;
-                else if (name == "left") k = platform::Key::Left;
-                else if (name == "right") k = platform::Key::Right;
-                else if (name == "up") k = platform::Key::Up;
-                else if (name == "down") k = platform::Key::Down;
-                if (k == platform::Key::Unknown)
+                const platform::Key k =
+                    name == "esc"     ? platform::Key::Escape
+                    : name == "grave" ? platform::Key::Grave
+                                      : key_from_chord_name(name);
+                if (k == platform::Key::Count)
                     return op_err(vm, "unknown key \"" + name + "\"");
-                uint32_t mods = 0;
-                if (a.size() > 1 && a[1].is_str()) {
-                    const std::string& m = a[1].as_str();
-                    if (m.find("ctrl") != std::string::npos)
-                        mods |= platform::kModCtrl;
-                    if (m.find("shift") != std::string::npos)
-                        mods |= platform::kModShift;
-                    if (m.find("alt") != std::string::npos)
-                        mods |= platform::kModAlt;
-                }
+                const uint32_t mods = trailing_mods(a, 1);
                 platform::Event down{};
                 down.type = platform::Event::Type::KeyDown;
                 down.key = k;
@@ -17559,14 +17440,8 @@ void register_ops_graph(ScriptHost& sh) {
                 doc::Layer layer = doc::make_layer(app.document, k);
                 if (a.size() > 2 && a[2].is_str())
                     layer.name = a[2].as_str();
-                const uint64_t layer_id = layer.id;
-                app.undo.execute(app.document,
-                                 doc::add_layer_command(
-                                     lk->id, std::move(layer),
-                                     lk->layers.size()));
-                app.undo.execute(app.document,
-                                 doc::connect_command(lk->id,
-                                                      {layer_id, 0, 0}));
+                const uint64_t layer_id =
+                    append_layer_connected(app, lk->id, std::move(layer));
                 app.undo.end_group();
                 return Value::number(static_cast<double>(layer_id));
             });
@@ -17595,14 +17470,8 @@ void register_ops_graph(ScriptHost& sh) {
                                       ? doc::LayerSourceKind::LookRef
                                       : doc::LayerSourceKind::SequenceRef);
                 layer.target = target;
-                const uint64_t layer_id = layer.id;
-                app.undo.execute(app.document,
-                                 doc::add_layer_command(
-                                     lk->id, std::move(layer),
-                                     lk->layers.size()));
-                app.undo.execute(app.document,
-                                 doc::connect_command(lk->id,
-                                                      {layer_id, 0, 0}));
+                const uint64_t layer_id =
+                    append_layer_connected(app, lk->id, std::move(layer));
                 app.undo.end_group();
                 return Value::number(static_cast<double>(layer_id));
             });
@@ -17879,11 +17748,9 @@ void register_ops_graph(ScriptHost& sh) {
             "effect_info(look, fx) -> {type,layer,index,bypass,solo,wet,"
             "opacity,blend,group,text}",
             2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 const doc::EffectInstance& fx = lk->layers[li].stack[fi];
                 Value m = Value::make_map();
                 map_num(m, "id", static_cast<double>(fx.id));
@@ -18004,11 +17871,9 @@ void register_ops_graph(ScriptHost& sh) {
     env.add("remove_effect",
             "remove_effect(look, fx) - splices the chain back around it",
             2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 const uint64_t id = a[1].as_id();
                 AppState& app = *sh.app;
                 std::vector<doc::NodeLink> touching;
@@ -18052,11 +17917,9 @@ void register_ops_graph(ScriptHost& sh) {
             });
     env.add("move_effect", "move_effect(look, fx, to_index)", 3, 3,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 double to = 0.0;
                 if (!arg_num(vm, a[2], "to_index", &to))
                     return Value::nil();
@@ -18073,11 +17936,9 @@ void register_ops_graph(ScriptHost& sh) {
             "params(look, fx) -> [{id,label,min,max,value,visible,"
             "options?}]",
             2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 const doc::EffectInstance& fx = lk->layers[li].stack[fi];
                 const doc::EffectInfo& info = doc::effect_info(fx.type);
                 Value out = Value::make_list();
@@ -18100,11 +17961,9 @@ void register_ops_graph(ScriptHost& sh) {
     env.add("get_param",
             "get_param(look, fx, param) - name, \"wet\" or \"opacity\"",
             3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 const doc::EffectInstance& fx = lk->layers[li].stack[fi];
                 const int pi = param_index_of(fx, a[2]);
                 if (pi == INT_MIN ||
@@ -18118,11 +17977,9 @@ void register_ops_graph(ScriptHost& sh) {
             "set_param(look, fx, param, value) - clamped to the param's "
             "range",
             4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 const doc::EffectInstance& fx = lk->layers[li].stack[fi];
                 const int pi = param_index_of(fx, a[2]);
                 if (pi == INT_MIN ||
@@ -18143,11 +18000,9 @@ void register_ops_graph(ScriptHost& sh) {
             });
     env.add("set_bypass", "set_bypass(look, fx, on)", 3, 3,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 sh.app->undo.execute(sh.app->document,
                                      doc::set_bypass_command(
                                          lk->id, li, fi,
@@ -18156,11 +18011,9 @@ void register_ops_graph(ScriptHost& sh) {
             });
     env.add("set_solo", "set_solo(look, fx, on)", 3, 3,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 sh.app->undo.execute(sh.app->document,
                                      doc::set_solo_command(
                                          lk->id, li, fi, a[2].truthy()));
@@ -18170,11 +18023,9 @@ void register_ops_graph(ScriptHost& sh) {
             "set_blend(look, fx, mode) - normal|add|multiply|screen|"
             "difference",
             3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 const int bi = blend_by_name(a[2].as_str());
                 if (bi < 0)
                     return op_err(vm, "unknown blend \"" + a[2].as_str() +
@@ -18188,11 +18039,9 @@ void register_ops_graph(ScriptHost& sh) {
             });
     env.add("set_text", "set_text(look, fx, string) - the Text effect", 3,
             3, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
                 size_t li = 0, fi = 0;
-                if (!find_effect_by_id(*lk, a[1].as_id(), &li, &fi))
-                    return op_err(vm, "no such effect");
+                doc::Look* lk = arg_effect(sh, vm, a, &li, &fi);
+                if (!lk) return Value::nil();
                 sh.app->undo.execute(sh.app->document,
                                      doc::set_effect_text_command(
                                          lk->id, li, fi,
@@ -18697,11 +18546,9 @@ void register_ops_mod(ScriptHost& sh) {
             "generate_track(look, node, start?, end?) - solve the camera "
             "node's wired media (cache makes a repeat a no-op)",
             2, 4, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                const doc::ValueNode* n =
-                    doc::find_value_node(*lk, a[1].as_id());
-                if (!n) return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                const doc::ValueNode* n = arg_value_node(sh, vm, a, &lk);
+                if (!n) return Value::nil();
                 if (n->source.type != doc::ModSourceType::Camera)
                     return op_err(vm, "not a camera node");
                 if (!n->audio_src)
@@ -18735,11 +18582,9 @@ void register_ops_mod(ScriptHost& sh) {
             "track_info(look, node) -> {status, frames, error, start, "
             "end}",
             2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                const doc::ValueNode* n =
-                    doc::find_value_node(*lk, a[1].as_id());
-                if (!n) return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                const doc::ValueNode* n = arg_value_node(sh, vm, a, &lk);
+                if (!n) return Value::nil();
                 Value m = Value::make_map();
                 std::string status = "unwired";
                 if (n->audio_src) {
@@ -18794,11 +18639,9 @@ void register_ops_mod(ScriptHost& sh) {
             "anchor to the solved 3D point nearest uv(x, y) at the "
             "playhead; returns its track id (0 = none in range)",
             4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                const doc::ValueNode* n =
-                    doc::find_value_node(*lk, a[1].as_id());
-                if (!n) return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                const doc::ValueNode* n = arg_value_node(sh, vm, a, &lk);
+                if (!n) return Value::nil();
                 if (n->source.type != doc::ModSourceType::Camera)
                     return op_err(vm, "not a camera node");
                 if (!n->audio_src)
@@ -18860,10 +18703,8 @@ void register_ops_mod(ScriptHost& sh) {
             "node_value(look, node) -> the value node's output at the "
             "playhead",
             2, 2, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                if (!doc::find_value_node(*lk, a[1].as_id()))
-                    return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                if (!arg_value_node(sh, vm, a, &lk)) return Value::nil();
                 AppState& app = *sh.app;
                 const double fps = app.player.fps();
                 const uint32_t frame =
@@ -18919,11 +18760,9 @@ void register_ops_mod(ScriptHost& sh) {
             });
     env.add("get_mod", "get_mod(look, node) -> field map", 2, 2,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                const doc::ValueNode* n =
-                    doc::find_value_node(*lk, a[1].as_id());
-                if (!n) return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                const doc::ValueNode* n = arg_value_node(sh, vm, a, &lk);
+                if (!n) return Value::nil();
                 Value m = Value::make_map();
                 map_num(m, "id", static_cast<double>(n->id));
                 map_str(m, "kind",
@@ -18954,11 +18793,9 @@ void register_ops_mod(ScriptHost& sh) {
             });
     env.add("set_mod", "set_mod(look, node, {fields}) - get_mod's fields",
             3, 3, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                const doc::ValueNode* n =
-                    doc::find_value_node(*lk, a[1].as_id());
-                if (!n) return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                const doc::ValueNode* n = arg_value_node(sh, vm, a, &lk);
+                if (!n) return Value::nil();
                 if (a[2].kind != Value::Kind::Map)
                     return op_err(vm, "set_mod needs a field map");
                 doc::ValueNode up = *n;
@@ -19015,10 +18852,8 @@ void register_ops_mod(ScriptHost& sh) {
     env.add("remove_mod",
             "remove_mod(look, node) - routes it feeds go too", 2, 2,
             [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                if (!doc::find_value_node(*lk, a[1].as_id()))
-                    return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                if (!arg_value_node(sh, vm, a, &lk)) return Value::nil();
                 sh.app->undo.execute(sh.app->document,
                                      doc::remove_value_node_command(
                                          lk->id, a[1].as_id()));
@@ -19028,10 +18863,8 @@ void register_ops_mod(ScriptHost& sh) {
             "wire_mod(look, node, \"a\"|\"b\", from) - helper input; "
             "from 0 unwires",
             4, 4, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                if (!doc::find_value_node(*lk, a[1].as_id()))
-                    return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                if (!arg_value_node(sh, vm, a, &lk)) return Value::nil();
                 const int which = a[2].as_str() == "a"   ? 0
                                   : a[2].as_str() == "b" ? 1
                                                          : -1;
@@ -19073,10 +18906,8 @@ void register_ops_mod(ScriptHost& sh) {
             "route(look, node, target, param, curve?) - wire a value "
             "node onto an effect or layer param; replaces any wire there",
             4, 5, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Look* lk = arg_look(sh, vm, a[0]);
-                if (!lk) return Value::nil();
-                if (!doc::find_value_node(*lk, a[1].as_id()))
-                    return op_err(vm, "no such value node");
+                doc::Look* lk = nullptr;
+                if (!arg_value_node(sh, vm, a, &lk)) return Value::nil();
                 doc::ParamKey key;
                 if (!resolve_param_key(sh, vm, *lk, a[2], a[3], &key))
                     return Value::nil();
@@ -19984,14 +19815,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 stems.push_back(path_to_u8(fit->path().stem()));
         }
         std::sort(stems.begin(), stems.end(),
-                  [](std::string a, std::string b) {
-                      for (char& c : a)
-                          c = static_cast<char>(
-                              std::tolower(static_cast<unsigned char>(c)));
-                      for (char& c : b)
-                          c = static_cast<char>(
-                              std::tolower(static_cast<unsigned char>(c)));
-                      return a < b;
+                  [](const std::string& a, const std::string& b) {
+                      return ascii_lower(a) < ascii_lower(b);
                   });
         for (size_t s = 0; s < stems.size() && s < 8; ++s) {
             if (s) app.font_options += '|';
@@ -20279,16 +20104,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         if (a.path == path_to_u8(job->source))
                             asset_id = a.id;
                     app.undo.begin_group("Import");
-                    if (!asset_id) {
-                        doc::Asset asset = doc::make_asset(
-                            app.document,
-                            path_to_u8(job->source.filename()),
-                            path_to_u8(job->source));
-                        asset_id = asset.id;
-                        app.undo.execute(
-                            app.document,
-                            doc::add_asset_command(std::move(asset)));
-                    }
+                    asset_id = ensure_asset(app, job->source, asset_id);
                     if (job->bind_layer) {
                         doc::Look* bl2 =
                             app.document.find_look(job->bind_look);
@@ -22234,7 +22050,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         app.sel = {SelKind::ModSource, fdoc};
                         break;
                     case flow::NodeKind::Group:
-                        if (find_group_by_id(app.look(), fdoc, &li)) {
+                        if (doc::find_group(app.look(), fdoc, &li)) {
                             app.sel = {SelKind::Group, fdoc};
                             app.selected_layer = li;
                         }
@@ -22330,7 +22146,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     case CtxAction::RenameGroup: {
                         std::string cur;
                         size_t gli = 0;
-                        if (find_group_by_id(app.look(), did, &gli))
+                        if (doc::find_group(app.look(), did, &gli))
                             for (const doc::Group& gr :
                                  app.look().layers[gli].groups)
                                 if (gr.id == did) cur = gr.name;
@@ -22341,7 +22157,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                     case CtxAction::SavePreset: {
                         size_t gli = 0;
-                        if (!find_group_by_id(app.look(), did, &gli))
+                        if (!doc::find_group(app.look(), did, &gli))
                             break;
                         const doc::Group* group = nullptr;
                         for (const doc::Group& gr :
@@ -22650,7 +22466,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     // Unplugging the Out binding does nothing.
                     size_t bgli = 0;
                     const doc::Group* bgroup = nullptr;
-                    if (find_group_by_id(app.look(), app.open_group,
+                    if (doc::find_group(app.look(), app.open_group,
                                          &bgli))
                         bgroup = doc::find_group(
                             app.look().layers[bgli], app.open_group);
@@ -23103,7 +22919,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                        : doc::kOpacityParam};
                             have_key = true;
                         }
-                    } else if (find_group_by_id(app.look(), gid, &gli)) {
+                    } else if (doc::find_group(app.look(), gid, &gli)) {
                         const doc::Layer& gl = app.look().layers[gli];
                         for (const doc::Group& gr : gl.groups) {
                             if (gr.id != gid) continue;
@@ -23164,7 +22980,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 const uint64_t gid = tag_doc(fe.group_rename);
                 std::string cur;
                 size_t gli = 0;
-                if (find_group_by_id(app.look(), gid, &gli))
+                if (doc::find_group(app.look(), gid, &gli))
                     for (const doc::Group& gr :
                          app.look().layers[gli].groups)
                         if (gr.id == gid) cur = gr.name;
@@ -23259,7 +23075,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                 ? doc::kWetParam
                                                 : doc::kOpacityParam};
                                 own_knob = true;
-                            } else if (find_group_by_id(app.look(), gid,
+                            } else if (doc::find_group(app.look(), gid,
                                                         &gli)) {
                                 const doc::Layer& gl =
                                     app.look().layers[gli];
@@ -23429,7 +23245,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                                    fdoc3};
                                         break;
                                     case flow::NodeKind::Group:
-                                        if (find_group_by_id(
+                                        if (doc::find_group(
                                                 app.look(), fdoc3,
                                                 &fli)) {
                                             app.sel = {SelKind::Group,
@@ -23541,7 +23357,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         size_t insert_at = SIZE_MAX;   // SIZE_MAX = at end
                         if (app.open_group) {
                             size_t gli2 = 0;
-                            if (find_group_by_id(app.look(),
+                            if (doc::find_group(app.look(),
                                                  app.open_group, &gli2)) {
                                 li = gli2;
                                 fx.group_id = app.open_group;
@@ -23703,7 +23519,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     tag_doc(fe.group_open ? fe.group_open
                                           : ctx_open_group);
                 size_t gli = 0;
-                if (find_group_by_id(app.look(), gid, &gli)) {
+                if (doc::find_group(app.look(), gid, &gli)) {
                     app.saved_pan_x = app.canvas_state.pan_x;
                     app.saved_pan_y = app.canvas_state.pan_y;
                     app.saved_zoom = app.canvas_state.zoom;
@@ -23823,7 +23639,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         gid = app.look().layers[li].stack[fi].group_id;
                 }
                 size_t gli = 0;
-                if (gid && find_group_by_id(app.look(), gid, &gli)) {
+                if (gid && doc::find_group(app.look(), gid, &gli)) {
                     app.undo.execute(app.document,
                                      doc::ungroup_command(app.scope_look,gli, gid));
                     if (app.sel.kind == SelKind::Group) app.sel = {};
@@ -23986,7 +23802,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
             auto delete_group = [&](uint64_t gid, bool own_undo_group) {
                 size_t gli = 0;
-                if (!find_group_by_id(app.look(), gid, &gli))
+                if (!doc::find_group(app.look(), gid, &gli))
                     return false;
                 if (own_undo_group) app.undo.begin_group("Delete Group");
                 bool removing = true;
@@ -24567,7 +24383,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         for (const FrameUi::GroupActions& ga : frame_ui.group_actions) {
             // Use the group's own layer, not the selected one.
             size_t ga_layer = 0;
-            if (!find_group_by_id(app.look(), ga.group_id, &ga_layer))
+            if (!doc::find_group(app.look(), ga.group_id, &ga_layer))
                 continue;
             const doc::Group* group = nullptr;
             for (const doc::Group& g :

@@ -312,9 +312,24 @@ Vec2 measure_button(LayoutNode& node, const Constraints&,
     return {std::max(64.0f, text_w + 24.0f), frame.theme.control_height};
 }
 
-void hit_button(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const ButtonUser*>(node.user);
+template <class User>
+void hit_state(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const User*>(node.user);
+    register_rect_hit(node, frame, u->state);
+}
+
+template <class User>
+void hit_enabled(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const User*>(node.user);
     if (!u->disabled) register_rect_hit(node, frame, u->state);
+}
+
+void draw_hover(LayoutFrame& frame, const Rect& r, float radius,
+                float hover_t) {
+    if (hover_t <= 0.01f) return;
+    Color bg = frame.theme.control_bg_hover;
+    bg.a *= hover_t;
+    frame.canvas.draw_sdf_rect(r, radius, bg);
 }
 
 void draw_button(LayoutNode& node, LayoutFrame& frame) {
@@ -342,11 +357,8 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
 
     if (u->active && !u->disabled) fg = theme.accent;
     if (u->flat) {
-        if (!u->disabled && u->state->hover_t > 0.01f) {
-            Color hover_bg = theme.control_bg_hover;
-            hover_bg.a *= u->state->hover_t;
-            frame.canvas.draw_sdf_rect(r, theme.corner_radius, hover_bg);
-        }
+        if (!u->disabled)
+            draw_hover(frame, r, theme.corner_radius, u->state->hover_t);
     } else {
         frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
         frame.canvas.draw_sdf_rect_outline(
@@ -429,10 +441,8 @@ void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
         if (lit) {
             frame.canvas.draw_sdf_rect(seg.inset(1.5f), seg_radius,
                                        lit_fill);
-        } else if (st.hover_t > 0.01f) {
-            Color hover = theme.control_bg_hover;
-            hover.a *= st.hover_t;
-            frame.canvas.draw_sdf_rect(seg.inset(1.5f), seg_radius, hover);
+        } else {
+            draw_hover(frame, seg.inset(1.5f), seg_radius, st.hover_t);
         }
         const Color fg = lit ? theme.text : theme.text_dim;
         const Vec2 ts = measure_text(frame.font, u->labels[i],
@@ -500,10 +510,8 @@ void draw_chip(LayoutNode& node, LayoutFrame& frame) {
 
     if (u->on) {
         frame.canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg);
-    } else if (u->state->hover_t > 0.01f) {
-        Color bg = theme.control_bg_hover;
-        bg.a *= u->state->hover_t;
-        frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
+    } else {
+        draw_hover(frame, r, theme.corner_radius, u->state->hover_t);
     }
     const Color fg =
         u->on ? theme.accent
@@ -545,11 +553,6 @@ Vec2 measure_icon(LayoutNode&, const Constraints&, const LayoutFrame& frame) {
     return {frame.theme.control_height + 4.0f, frame.theme.control_height};
 }
 
-void hit_icon(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const IconUser*>(node.user);
-    if (!u->disabled) register_rect_hit(node, frame, u->state);
-}
-
 void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const IconUser*>(node.user);
     const Theme& theme = frame.theme;
@@ -572,11 +575,7 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
         if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
             *u->out_clicked = true;
         maybe_tooltip(*u->state, u->tooltip, frame);
-        if (u->state->hover_t > 0.01f) {
-            Color bg = theme.control_bg_hover;
-            bg.a *= u->state->hover_t;
-            frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
-        }
+        draw_hover(frame, r, theme.corner_radius, u->state->hover_t);
         fg = u->active
             ? theme.accent
             : lerp(theme.text_dim, theme.text, u->state->hover_t);
@@ -704,11 +703,6 @@ Vec2 measure_scrubber(LayoutNode&, const Constraints& c,
     return {c.bounded_w() ? c.max_w : 240.0f, frame.theme.control_height};
 }
 
-void hit_scrubber(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const ScrubberUser*>(node.user);
-    register_rect_hit(node, frame, u->state);
-}
-
 void draw_scrubber(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const ScrubberUser*>(node.user);
     const Theme& theme = frame.theme;
@@ -768,11 +762,6 @@ Vec2 measure_checkbox(LayoutNode& node, const Constraints&,
     return {14.0f + 8.0f + text_w, frame.theme.control_height};
 }
 
-void hit_checkbox(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const CheckboxUser*>(node.user);
-    register_rect_hit(node, frame, u->state);
-}
-
 void draw_checkbox(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const CheckboxUser*>(node.user);
     const Theme& theme = frame.theme;
@@ -818,11 +807,6 @@ struct SliderUser {
 Vec2 measure_slider(LayoutNode&, const Constraints& c, const LayoutFrame& frame) {
     const float w = c.bounded_w() ? c.max_w : 160.0f;
     return {w, frame.theme.control_height};
-}
-
-void hit_slider(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const SliderUser*>(node.user);
-    register_rect_hit(node, frame, u->state);
 }
 
 void draw_slider(LayoutNode& node, LayoutFrame& frame) {
@@ -923,21 +907,6 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     }
 }
 
-struct DialUser {
-    float* value;
-    float min_value;
-    float max_value;
-    SliderState* state;
-    const char* format;
-    bool* out_changed;
-    bool* out_released;
-    bool* out_value_clicked;
-    float display_scale;
-    float display_offset;
-    const char* tooltip;
-    bool* out_ctx;
-};
-
 constexpr float kDialRadius = 8.0f;
 
 // Angle in degrees: 0 at 12 o'clock, clockwise positive.
@@ -951,18 +920,8 @@ float wrap_half_turn(float deg) {
     return deg;
 }
 
-Vec2 measure_dial(LayoutNode&, const Constraints& c, const LayoutFrame& frame) {
-    const float w = c.bounded_w() ? c.max_w : 160.0f;
-    return {w, frame.theme.control_height};
-}
-
-void hit_dial(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const DialUser*>(node.user);
-    register_rect_hit(node, frame, u->state);
-}
-
 void draw_dial(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const DialUser*>(node.user);
+    const auto* u = static_cast<const SliderUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
     SliderState& s = *u->state;
@@ -1600,11 +1559,6 @@ Vec2 measure_section(LayoutNode&, const Constraints& c,
     return {w, frame.theme.control_height};
 }
 
-void hit_section(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const SectionUser*>(node.user);
-    register_rect_hit(node, frame, u->state);
-}
-
 void draw_section(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const SectionUser*>(node.user);
     const Theme& theme = frame.theme;
@@ -1712,7 +1666,7 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
     n->width = opts.width;
     n->measure_fn = measure_button;
     n->draw_fn = draw_button;
-    n->hit_fn = hit_button;
+    n->hit_fn = hit_enabled<ButtonUser>;
     n->debug_name = "button";
     return n;
 }
@@ -1773,7 +1727,7 @@ LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
     n->width = opts.width;
     n->measure_fn = measure_icon;
     n->draw_fn = draw_icon_button;
-    n->hit_fn = hit_icon;
+    n->hit_fn = hit_enabled<IconUser>;
     n->debug_name = "icon_button";
     return n;
 }
@@ -1817,8 +1771,8 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
                                  theme.hairline);
     for (int i = 0; i < req.count; ++i) {
         const Rect ir{r.x + 4.0f,
-                      r.y + 4.0f + static_cast<float>(i) * 20.0f,
-                      r.w - 8.0f, 20.0f};
+                      r.y + 4.0f + static_cast<float>(i) * kPopupRowH,
+                      r.w - 8.0f, kPopupRowH};
         probe_add(std::string("opt:") + req.items[i], ir);
         const bool hover = ir.contains(input.mouse);
         if (hover) canvas.draw_sdf_rect(ir, 2.0f, theme.control_bg_hover);
@@ -1849,7 +1803,7 @@ LayoutNode* Scrubber(LayoutArena& arena, float* frame, float frame_count,
     n->width = SizeSpec::fill();
     n->measure_fn = measure_scrubber;
     n->draw_fn = draw_scrubber;
-    n->hit_fn = hit_scrubber;
+    n->hit_fn = hit_state<ScrubberUser>;
     n->debug_name = "scrubber";
     return n;
 }
@@ -1866,14 +1820,16 @@ LayoutNode* Checkbox(LayoutArena& arena, std::string_view label, bool* value,
     n->user = u;
     n->measure_fn = measure_checkbox;
     n->draw_fn = draw_checkbox;
-    n->hit_fn = hit_checkbox;
+    n->hit_fn = hit_state<CheckboxUser>;
     n->debug_name = "checkbox";
     return n;
 }
 
-LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
-                    float max_value, SliderState* state,
-                    const SliderOpts& opts) {
+static LayoutNode* slider_node(LayoutArena& arena, float* value,
+                               float min_value, float max_value,
+                               SliderState* state, const SliderOpts& opts,
+                               void (*draw)(LayoutNode&, LayoutFrame&),
+                               const char* debug_name) {
     LayoutNode* n = make_node(arena, NodeKind::Leaf);
     auto* u = arena.alloc<SliderUser>();
     u->value = value;
@@ -1891,36 +1847,24 @@ LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
     n->user = u;
     n->width = SizeSpec::fill();
     n->measure_fn = measure_slider;
-    n->draw_fn = draw_slider;
-    n->hit_fn = hit_slider;
-    n->debug_name = "slider";
+    n->draw_fn = draw;
+    n->hit_fn = hit_state<SliderUser>;
+    n->debug_name = debug_name;
     return n;
+}
+
+LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
+                    float max_value, SliderState* state,
+                    const SliderOpts& opts) {
+    return slider_node(arena, value, min_value, max_value, state, opts,
+                       draw_slider, "slider");
 }
 
 LayoutNode* DialF(LayoutArena& arena, float* value, float min_value,
                   float max_value, SliderState* state,
                   const SliderOpts& opts) {
-    LayoutNode* n = make_node(arena, NodeKind::Leaf);
-    auto* u = arena.alloc<DialUser>();
-    u->value = value;
-    u->min_value = min_value;
-    u->max_value = max_value;
-    u->state = state;
-    u->format = opts.format;
-    u->out_changed = opts.out_changed;
-    u->out_released = opts.out_released;
-    u->out_value_clicked = opts.out_value_clicked;
-    u->display_scale = opts.display_scale;
-    u->display_offset = opts.display_offset;
-    u->tooltip = opts.tooltip;
-    u->out_ctx = opts.out_ctx;
-    n->user = u;
-    n->width = SizeSpec::fill();
-    n->measure_fn = measure_dial;
-    n->draw_fn = draw_dial;
-    n->hit_fn = hit_dial;
-    n->debug_name = "dial";
-    return n;
+    return slider_node(arena, value, min_value, max_value, state, opts,
+                       draw_dial, "dial");
 }
 
 LayoutNode* ColorSwatch(LayoutArena& arena, const float rgba[4],
@@ -1961,7 +1905,7 @@ LayoutNode* SectionHeader(LayoutArena& arena, std::string_view text,
     n->width = SizeSpec::fill();
     n->measure_fn = measure_section;
     n->draw_fn = draw_section;
-    n->hit_fn = hit_section;
+    n->hit_fn = hit_state<SectionUser>;
     n->debug_name = "section";
     return n;
 }

@@ -19,11 +19,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-float luma_at(float2 uv)
-{
-    return fx_luma(fx_srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb)));
-}
-
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
@@ -36,7 +31,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float lo = threshold;
     const float hi = threshold + max(range, 0.01);
-    const float l0 = luma_at(uv);
+    const float l0 = fx_enc_luma(input, uv);
     if (l0 < lo || l0 > hi) {
         output[tid.xy] = base;
         return;
@@ -53,7 +48,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     for (int i = 1; i <= max_walk; ++i) {
         const float2 p = uv - axis * float(i);
         if (any(p < 0.0)) break;
-        const float l = luma_at(p);
+        const float l = fx_enc_luma(input, p);
         if (l < lo || l > hi) break;
         back = i;
         const float4 c = input.SampleLevel(p, 0);
@@ -64,7 +59,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     for (int i = 1; i <= max_walk; ++i) {
         const float2 p = uv + axis * float(i);
         if (any(p > 1.0)) break;
-        const float l = luma_at(p);
+        const float l = fx_enc_luma(input, p);
         if (l < lo || l > hi) break;
         fwd = i;
         const float4 c = input.SampleLevel(p, 0);

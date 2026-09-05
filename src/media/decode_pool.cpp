@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "media/bmff.h"
+#include "util/hash.h"
 #include "util/log.h"
 
 namespace looks::media {
@@ -182,8 +183,8 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
             std::vector<uint64_t>& maps = e.second;
             std::sort(maps.begin(), maps.end());
             maps.erase(std::unique(maps.begin(), maps.end()), maps.end());
-            uint64_t fp = 0xCBF29CE484222325ull;
-            for (uint64_t m : maps) fp = (fp ^ m) * 0x100000001B3ull;
+            uint64_t fp = kFnvOffset;
+            for (uint64_t m : maps) fp = (fp ^ m) * kFnvPrime;
             key_fp.emplace_back(e.first, fp);
             auto [g, fresh] = group_min.try_emplace(fp, e.first);
             if (!fresh && e.first < g->second) g->second = e.first;
@@ -556,7 +557,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
         for (size_t i = 0; i < Stream::kEntryMarks; ++i) {
             guard_marks[i] = s.next_entries[i];
             // A mark guards only frames that exist in the ring.
-            if (guard_marks[i] != 0xFFFFFFFFu && s.ringed(guard_marks[i]))
+            if (guard_marks[i] != 0xFFFFFFFFu && s.has_ringed(guard_marks[i]))
                 mark_ringed[i] = true;
         }
     }
@@ -793,7 +794,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
     }
 
     std::shared_ptr<const codec::DecodedFrame> result;
-    std::vector<uint8_t> sample_bytes;
+    std::vector<uint8_t>& sample_bytes = sess->sample_bytes;
     platform::VideoFrameNV12& nv12 = sess->scratch;
     // Label emissions by arrival order from the roll floor. A post-flush
     // stamp can be garbage, so trust it only when it is sane.
@@ -1073,7 +1074,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
             }
             // A stream that moves backward skips its forward frontier.
             if (ps->want < ps->last_want) continue;
-            if (ps->ringed(req.frame)) continue;
+            if (ps->has_ringed(req.frame)) continue;
         }
         // The entry rolls as its own job; an fps conform can land it in
         // the previous keyframe run, which the frontier roll cannot ring.
@@ -1081,7 +1082,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
             bool entry_ringed = false;
             {
                 std::lock_guard<std::mutex> lock(ps->m);
-                entry_ringed = ps->ringed(entry) != nullptr;
+                entry_ringed = ps->has_ringed(entry);
             }
             if (!entry_ringed && !queued_has(req.alias, entry))
                 queued.push_back(
@@ -1109,7 +1110,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         {
             std::lock_guard<std::mutex> lock(ps->m);
             backward = ps->want < ps->last_want;
-            ringed = ps->ringed(back) != nullptr;
+            ringed = ps->has_ringed(back);
         }
         if (!backward || ringed) continue;
         if (!queued_has(req.alias, back))
@@ -1129,7 +1130,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
             bool ringed = false;
             {
                 std::lock_guard<std::mutex> lock(ps->m);
-                ringed = ps->ringed(req.frame) != nullptr;
+                ringed = ps->has_ringed(req.frame);
             }
             if (ringed) continue;
             queued.push_back({req.alias, req.frame, 0, false, root_frame});

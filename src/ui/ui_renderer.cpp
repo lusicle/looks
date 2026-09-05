@@ -1,10 +1,11 @@
 #include "ui/ui_renderer.h"
 
+#include "gfx/compute.h"
+
 #include <vk_mem_alloc.h>
 
 #include <cstring>
 
-#include "util/file.h"
 #include "util/log.h"
 
 namespace looks::ui {
@@ -60,35 +61,10 @@ UiRenderer::~UiRenderer() {
     if (linear_sampler_) vkDestroySampler(dev, linear_sampler_, nullptr);
 }
 
-VkShaderModule UiRenderer::load_shader(const std::filesystem::path& path) {
-    auto bytes = read_file_bytes(path);
-    if (!bytes || bytes->size() % 4 != 0) {
-        log_error("ui: failed to load shader %s", path.string().c_str());
-        return VK_NULL_HANDLE;
-    }
-    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = bytes->size();
-    info.pCode = reinterpret_cast<const uint32_t*>(bytes->data());
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(device_.device(), &info, nullptr, &module) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-    return module;
-}
-
-VkPipeline UiRenderer::build_pipeline(VkShaderModule vs, VkShaderModule fs,
-                                      VkPipelineLayout layout,
-                                      VkFormat color_format,
-                                      uint32_t attribute_count) {
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = fs;
-    stages[1].pName = "main";
-
+static VkPipeline build_ui_pipeline(gfx::Device& device, VkShaderModule vs,
+                                    VkShaderModule fs, VkPipelineLayout layout,
+                                    VkFormat color_format,
+                                    uint32_t attribute_count) {
     VkVertexInputBindingDescription binding{0, sizeof(Vertex),
                                             VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attrs[4] = {
@@ -104,26 +80,6 @@ VkPipeline UiRenderer::build_pipeline(VkShaderModule vs, VkShaderModule fs,
     vertex_input.vertexAttributeDescriptionCount = attribute_count;
     vertex_input.pVertexAttributeDescriptions = attrs;
 
-    VkPipelineInputAssemblyStateCreateInfo input_assembly{
-        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{
-        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{
-        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{
-        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
     // Straight alpha: fragment shaders fold SDF/coverage into alpha.
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.blendEnable = VK_TRUE;
@@ -137,44 +93,14 @@ VkPipeline UiRenderer::build_pipeline(VkShaderModule vs, VkShaderModule fs,
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
-    VkPipelineColorBlendStateCreateInfo blend{
-        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blend_attachment;
-
-    VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
-                                       VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{
-        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamic_states;
-
-    VkPipelineRenderingCreateInfo rendering{
-        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &color_format;
-
-    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    info.pNext = &rendering;
-    info.stageCount = 2;
-    info.pStages = stages;
-    info.pVertexInputState = &vertex_input;
-    info.pInputAssemblyState = &input_assembly;
-    info.pViewportState = &viewport;
-    info.pRasterizationState = &raster;
-    info.pMultisampleState = &multisample;
-    info.pColorBlendState = &blend;
-    info.pDynamicState = &dynamic;
-    info.layout = layout;
-
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(device_.device(), VK_NULL_HANDLE, 1,
-                                           &info, nullptr, &pipeline);
-    if (r != VK_SUCCESS) {
-        log_error("ui: pipeline creation failed: %s", gfx::vk_result_name(r));
-        return VK_NULL_HANDLE;
-    }
-    return pipeline;
+    gfx::GraphicsPipelineDesc desc;
+    desc.vs = vs;
+    desc.fs = fs;
+    desc.layout = layout;
+    desc.color_format = color_format;
+    desc.vertex_input = &vertex_input;
+    desc.blend = &blend_attachment;
+    return gfx::create_graphics_pipeline(device, desc, "ui");
 }
 
 bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader_dir) {
@@ -236,15 +162,15 @@ bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader
     gfx::vk_check(vkCreatePipelineLayout(dev, &layout_info, nullptr, &textured_layout_),
                   "vkCreatePipelineLayout(ui textured)");
 
-    VkShaderModule ui_vs = load_shader(shader_dir / "ui.vert.spv");
-    VkShaderModule ui_fs = load_shader(shader_dir / "ui.frag.spv");
-    VkShaderModule text_vs = load_shader(shader_dir / "text.vert.spv");
-    VkShaderModule text_fs = load_shader(shader_dir / "text.frag.spv");
+    VkShaderModule ui_vs = gfx::load_shader_module(device_, shader_dir / "ui.vert.spv");
+    VkShaderModule ui_fs = gfx::load_shader_module(device_, shader_dir / "ui.frag.spv");
+    VkShaderModule text_vs = gfx::load_shader_module(device_, shader_dir / "text.vert.spv");
+    VkShaderModule text_fs = gfx::load_shader_module(device_, shader_dir / "text.frag.spv");
     bool ok = ui_vs && ui_fs && text_vs && text_fs;
     if (ok) {
-        solid_pipeline_ = build_pipeline(ui_vs, ui_fs, solid_layout_, color_format, 4);
+        solid_pipeline_ = build_ui_pipeline(device_, ui_vs, ui_fs, solid_layout_, color_format, 4);
         // The text shader has no shape input, so it takes 3 attributes.
-        text_pipeline_ = build_pipeline(text_vs, text_fs, textured_layout_, color_format, 3);
+        text_pipeline_ = build_ui_pipeline(device_, text_vs, text_fs, textured_layout_, color_format, 3);
         ok = solid_pipeline_ && text_pipeline_;
     }
     for (VkShaderModule m : {ui_vs, ui_fs, text_vs, text_fs})

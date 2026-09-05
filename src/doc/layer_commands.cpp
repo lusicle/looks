@@ -133,10 +133,6 @@ private:
     std::vector<std::pair<uint64_t, uint32_t>> old_outs_;
 };
 
-}  // namespace
-
-namespace {
-
 // Picks the latest-starting placement, the one the track shows at `at`.
 const Placement* placement_under(const Document& doc,
                                  const std::vector<Placement>& placements,
@@ -196,32 +192,29 @@ std::unique_ptr<Command> razor_group(Document& doc, uint64_t seq_id,
 
 }  // namespace
 
-std::unique_ptr<Command> razor_track_command(Document& doc, uint64_t seq_id,
-                                             uint64_t track_id, uint32_t at) {
-    const Sequence& seq = doc.sequence(seq_id);
-    const SeqTrack* src = nullptr;
-    for (const SeqTrack& t : seq.tracks)
+template <class Track>
+std::unique_ptr<Command> razor_lane(Document& doc, uint64_t seq_id,
+                                    const std::vector<Track>& lanes,
+                                    uint64_t track_id, uint32_t at) {
+    const Track* src = nullptr;
+    for (const Track& t : lanes)
         if (t.id == track_id) src = &t;
     if (!src) return nullptr;
     if (src->placements.size() >= kMaxPlacementsPerTrack) return nullptr;
     const Placement* place = placement_under(
-        doc, src->placements, at, effective_fps(doc, seq));
+        doc, src->placements, at, effective_fps(doc, doc.sequence(seq_id)));
     if (!place) return nullptr;
     return razor_group(doc, seq_id, *place, at);
 }
 
+std::unique_ptr<Command> razor_track_command(Document& doc, uint64_t seq_id,
+                                             uint64_t track_id, uint32_t at) {
+    return razor_lane(doc, seq_id, doc.sequence(seq_id).tracks, track_id, at);
+}
+
 std::unique_ptr<Command> razor_audio_command(Document& doc, uint64_t seq_id,
                                              uint64_t track_id, uint32_t at) {
-    const Sequence& seq = doc.sequence(seq_id);
-    const AudioTrack* track = nullptr;
-    for (const AudioTrack& t : seq.audio)
-        if (t.id == track_id) track = &t;
-    if (!track) return nullptr;
-    if (track->placements.size() >= kMaxPlacementsPerTrack) return nullptr;
-    const Placement* place = placement_under(
-        doc, track->placements, at, effective_fps(doc, seq));
-    if (!place) return nullptr;
-    return razor_group(doc, seq_id, *place, at);
+    return razor_lane(doc, seq_id, doc.sequence(seq_id).audio, track_id, at);
 }
 
 Layer make_layer(Document& doc, LayerSourceKind kind) {

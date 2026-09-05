@@ -1,7 +1,6 @@
 #include "doc/placement_commands.h"
 
 #include <algorithm>
-#include <cmath>
 #include <utility>
 
 #include "doc/layer_commands.h"
@@ -26,12 +25,10 @@ std::vector<Placement>* track_placements(Sequence& seq, uint64_t track_id,
 std::vector<Placement*> group_members(Sequence& seq, uint64_t link) {
     std::vector<Placement*> out;
     if (!link) return out;
-    for (SeqTrack& t : seq.tracks)
+    for_each_lane(seq, [&](auto& t) {
         for (Placement& p : t.placements)
             if (p.link == link) out.push_back(&p);
-    for (AudioTrack& t : seq.audio)
-        for (Placement& p : t.placements)
-            if (p.link == link) out.push_back(&p);
+    });
     return out;
 }
 
@@ -401,30 +398,33 @@ private:
     bool moved_ = false;
 };
 
+template <class Track, std::vector<Track> Sequence::*Member>
 class AddTrackCommand final : public SequenceCommand {
 public:
-    AddTrackCommand(uint64_t sequence, SeqTrack track, size_t at_index)
+    AddTrackCommand(uint64_t sequence, Track track, size_t at_index,
+                    const char* label)
         : SequenceCommand(sequence), track_(std::move(track)),
-          at_index_(at_index) {}
-    std::string name() const override { return "Add Lane"; }
+          at_index_(at_index), label_(label) {}
+    std::string name() const override { return label_; }
 
     void apply(Document& doc) override {
-        auto& tracks = sequence_of(doc).tracks;
+        auto& tracks = sequence_of(doc).*Member;
         tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(
                           std::min(at_index_, tracks.size())),
                       track_);
     }
 
     void revert(Document& doc) override {
-        auto& tracks = sequence_of(doc).tracks;
+        auto& tracks = sequence_of(doc).*Member;
         for (size_t i = tracks.size(); i-- > 0;)
             if (tracks[i].id == track_.id)
                 tracks.erase(tracks.begin() + static_cast<ptrdiff_t>(i));
     }
 
 private:
-    SeqTrack track_;
+    Track track_;
     size_t at_index_;
+    const char* label_;
 };
 
 // Revert clamps the index: the vector can shrink between apply and revert.
@@ -459,27 +459,6 @@ private:
     const char* label_;
     Track removed_;
     size_t index_ = 0;
-};
-
-class AddAudioTrackCommand final : public SequenceCommand {
-public:
-    AddAudioTrackCommand(uint64_t sequence, AudioTrack track)
-        : SequenceCommand(sequence), track_(std::move(track)) {}
-    std::string name() const override { return "Add Audio Track"; }
-
-    void apply(Document& doc) override {
-        sequence_of(doc).audio.push_back(track_);
-    }
-
-    void revert(Document& doc) override {
-        auto& audio = sequence_of(doc).audio;
-        for (size_t i = audio.size(); i-- > 0;)
-            if (audio[i].id == track_.id)
-                audio.erase(audio.begin() + static_cast<ptrdiff_t>(i));
-    }
-
-private:
-    AudioTrack track_;
 };
 
 }  // namespace
@@ -572,8 +551,8 @@ AudioTrack make_audio_track(Document& doc, const Sequence& seq) {
 
 std::unique_ptr<Command> add_track_command(uint64_t sequence, SeqTrack track,
                                            size_t at_index) {
-    return std::make_unique<AddTrackCommand>(sequence, std::move(track),
-                                             at_index);
+    return std::make_unique<AddTrackCommand<SeqTrack, &Sequence::tracks>>(
+        sequence, std::move(track), at_index, "Add Lane");
 }
 
 std::unique_ptr<Command> remove_track_command(const Document& doc,
@@ -592,8 +571,8 @@ std::unique_ptr<Command> remove_track_command(const Document& doc,
 
 std::unique_ptr<Command> add_audio_track_command(uint64_t sequence,
                                                  AudioTrack track) {
-    return std::make_unique<AddAudioTrackCommand>(sequence,
-                                                  std::move(track));
+    return std::make_unique<AddTrackCommand<AudioTrack, &Sequence::audio>>(
+        sequence, std::move(track), SIZE_MAX, "Add Audio Track");
 }
 
 std::unique_ptr<Command> remove_audio_track_command(uint64_t sequence,

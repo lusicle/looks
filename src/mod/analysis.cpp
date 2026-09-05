@@ -13,6 +13,14 @@ namespace looks::mod {
 
 namespace {
 
+float spectral_flux(const std::vector<float>& mags,
+                    const std::vector<float>& prev) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < mags.size(); ++i)
+        sum += std::max(0.0f, mags[i] - prev[i]);
+    return sum;
+}
+
 constexpr uint32_t kFftSize = 1024;
 
 float percentile95(const std::vector<float>& curve) {
@@ -122,12 +130,7 @@ bool build_onset_envelope(const int16_t* samples, uint64_t frame_total,
             buf[i] = mono[static_cast<size_t>(base + i)] * win[i];
         std::vector<float> mags =
             magnitude_spectrum(buf.data(), buf.size(), kTempoFft);
-        if (!prev.empty()) {
-            float sum = 0.0f;
-            for (size_t i = 0; i < mags.size(); ++i)
-                sum += std::max(0.0f, mags[i] - prev[i]);
-            flux[k] = sum;
-        }
+        if (!prev.empty()) flux[k] = spectral_flux(mags, prev);
         prev = std::move(mags);
     }
 
@@ -312,12 +315,7 @@ void analyze_audio(const int16_t* samples, uint64_t frame_total,
         out->mid[f] = band_energy(mags, sample_rate, 250.0f, 2000.0f);
         out->high[f] = band_energy(mags, sample_rate, 2000.0f, 8000.0f);
 
-        if (!prev_mags.empty()) {
-            float sum = 0.0f;
-            for (size_t i = 0; i < mags.size(); ++i)
-                sum += std::max(0.0f, mags[i] - prev_mags[i]);
-            flux[f] = sum;
-        }
+        if (!prev_mags.empty()) flux[f] = spectral_flux(mags, prev_mags);
         prev_mags = std::move(mags);
     }
 

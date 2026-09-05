@@ -20,14 +20,6 @@ struct Vec2 {
     constexpr bool operator==(const Vec2&) const = default;
 
     float length() const { return std::sqrt(x * x + y * y); }
-    Vec2 normalized_or_zero() const {
-        float len = length();
-        return len > 1e-8f ? Vec2{x / len, y / len} : Vec2{};
-    }
-    // Counter-clockwise in screen space, where Y points down.
-    constexpr Vec2 perp_ccw() const { return {y, -x}; }
 };
-
-constexpr float dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
 
 }  // namespace looks

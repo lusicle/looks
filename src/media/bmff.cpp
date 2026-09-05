@@ -305,15 +305,8 @@ void parse_trak(Reader& r, MovieInfo* movie) {
                 Reader& mp = mbox.payload;
                 if (mbox.type == fourcc("mdhd")) {
                     const FullBox fb = full_box(mp);
-                    if (fb.version == 1) {
-                        mp.skip(8 + 8);
-                        track.timescale = mp.u32();
-                        track.duration = mp.u64();
-                    } else {
-                        mp.skip(4 + 4);
-                        track.timescale = mp.u32();
-                        track.duration = mp.u32();
-                    }
+                    mp.skip(fb.version == 1 ? 8 + 8 : 4 + 4);
+                    track.timescale = mp.u32();
                 } else if (mbox.type == fourcc("hdlr")) {
                     full_box(mp);
                     mp.skip(4);   // pre_defined

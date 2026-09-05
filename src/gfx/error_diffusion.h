@@ -50,8 +50,6 @@ struct EdState {
     std::vector<float> work;      // working buffer, planar RGB
     std::vector<uint32_t> hilbert;   // Riemersma visit order
     uint32_t hilbert_w = 0, hilbert_h = 0;
-    uint32_t last_frame = 0xFFFFFFFFu;
-    bool valid = false;
 };
 
 void run_error_diffusion(const uint16_t* halves, uint32_t width,

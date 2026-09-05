@@ -19,11 +19,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-float luma_at(float2 uv)
-{
-    return fx_luma(fx_srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb)));
-}
-
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
@@ -42,8 +37,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 col = l > 1.0e-4 ? enc * (banded / l) : float3(banded, banded, banded);
 
     const float2 e = 1.5 / size;
-    const float gx = luma_at(uv + float2(e.x, 0)) - luma_at(uv - float2(e.x, 0));
-    const float gy = luma_at(uv + float2(0, e.y)) - luma_at(uv - float2(0, e.y));
+    const float gx = fx_enc_luma(input, uv + float2(e.x, 0)) - fx_enc_luma(input, uv - float2(e.x, 0));
+    const float gy = fx_enc_luma(input, uv + float2(0, e.y)) - fx_enc_luma(input, uv - float2(0, e.y));
     const float line = smoothstep(0.12, 0.3, length(float2(gx, gy)));
     col *= 1.0 - line * edge;
 

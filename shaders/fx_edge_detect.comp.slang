@@ -21,11 +21,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-float luma_at(float2 uv)
-{
-    return fx_luma(fx_srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb)));
-}
-
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
@@ -45,19 +40,19 @@ void main(uint3 tid : SV_DispatchThreadID)
             [unroll]
             for (int dx = -1; dx <= 1; ++dx) {
                 const float2 o = float2(float(dx), float(dy));
-                inner += luma_at(uv + o * e);
-                outer += luma_at(uv + o * e * 2.6);
+                inner += fx_enc_luma(input, uv + o * e);
+                outer += fx_enc_luma(input, uv + o * e * 2.6);
             }
         mag = abs(inner - outer) / 9.0 * 6.0;
     } else {
-        const float tl = luma_at(uv + float2(-e.x, -e.y));
-        const float tc = luma_at(uv + float2(0.0, -e.y));
-        const float tr = luma_at(uv + float2(e.x, -e.y));
-        const float ml = luma_at(uv + float2(-e.x, 0.0));
-        const float mr = luma_at(uv + float2(e.x, 0.0));
-        const float bl = luma_at(uv + float2(-e.x, e.y));
-        const float bc = luma_at(uv + float2(0.0, e.y));
-        const float br = luma_at(uv + float2(e.x, e.y));
+        const float tl = fx_enc_luma(input, uv + float2(-e.x, -e.y));
+        const float tc = fx_enc_luma(input, uv + float2(0.0, -e.y));
+        const float tr = fx_enc_luma(input, uv + float2(e.x, -e.y));
+        const float ml = fx_enc_luma(input, uv + float2(-e.x, 0.0));
+        const float mr = fx_enc_luma(input, uv + float2(e.x, 0.0));
+        const float bl = fx_enc_luma(input, uv + float2(-e.x, e.y));
+        const float bc = fx_enc_luma(input, uv + float2(0.0, e.y));
+        const float br = fx_enc_luma(input, uv + float2(e.x, e.y));
         const float gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
         const float gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
         mag = length(float2(gx, gy));

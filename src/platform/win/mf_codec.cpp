@@ -193,6 +193,26 @@ HRESULT pump_output(IMFTransform* mft, DWORD alloc_fallback,
     return S_OK;
 }
 
+// The caller must call receive() first. This stays a hard error.
+bool feed_input(IMFTransform* mft, IMFSample* sample, const char* label) {
+    const HRESULT hr = mft->ProcessInput(0, sample, 0);
+    if (hr == MF_E_NOTACCEPTING) {
+        log_warn("mf: %s not accepting — receive() first", label);
+        return false;
+    }
+    return SUCCEEDED(hr);
+}
+
+void drain_mft(IMFTransform* mft) {
+    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+}
+
+void start_streaming(IMFTransform* mft) {
+    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+}
+
 // key_default applies when the stream does not stamp CleanPoint.
 bool sample_to_packet(IMFSample* sample, EncodedPacket& out,
                       bool key_default) {
@@ -384,8 +404,7 @@ bool H264Decoder::create(const std::vector<uint8_t>& avcc, uint32_t width,
 
     if (!d.negotiate_output(error)) return false;
 
-    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    start_streaming(d.mft.get());
     return true;
 }
 
@@ -416,13 +435,7 @@ bool H264Decoder::feed(const uint8_t* data, size_t size, int64_t pts_100ns,
     HRESULT hr = make_sample(d.annexb.data(), d.annexb.size(), pts_100ns,
                              duration_100ns, sample.put());
     if (FAILED(hr)) return false;
-    hr = d.mft->ProcessInput(0, sample.get(), 0);
-    if (hr == MF_E_NOTACCEPTING) {
-        // The caller must call receive() first. This stays a hard error.
-        log_warn("mf: H264 ProcessInput not accepting — receive() first");
-        return false;
-    }
-    return SUCCEEDED(hr);
+    return feed_input(d.mft.get(), sample.get(), "H264 ProcessInput");
 }
 
 bool H264Decoder::receive(VideoFrameNV12& out) {
@@ -502,8 +515,7 @@ bool H264Decoder::receive(VideoFrameNV12& out) {
 
 void H264Decoder::drain() {
     if (impl_->mft) {
-        impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        drain_mft(impl_->mft.get());
     }
 }
 
@@ -543,8 +555,7 @@ struct PcmMftCore {
 
     bool start(std::string* error) {
         if (!negotiate_output(error)) return false;
-        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        start_streaming(mft.get());
         return true;
     }
 
@@ -553,13 +564,8 @@ struct PcmMftCore {
         Com<IMFSample> sample;
         if (FAILED(make_sample(data, size, pts_100ns, 0, sample.put())))
             return false;
-        const HRESULT hr = mft->ProcessInput(0, sample.get(), 0);
-        if (hr == MF_E_NOTACCEPTING) {
-            log_warn("mf: %s ProcessInput not accepting — receive() first",
-                     label);
-            return false;
-        }
-        return SUCCEEDED(hr);
+        return feed_input(mft.get(), sample.get(),
+                          (std::string(label) + " ProcessInput").c_str());
     }
 
     bool receive(AudioChunk& out) {
@@ -603,8 +609,7 @@ struct PcmMftCore {
 
     void drain() {
         if (!mft) return;
-        mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        drain_mft(mft.get());
     }
 };
 
@@ -924,8 +929,7 @@ bool H264Encoder::create(uint32_t width, uint32_t height, uint32_t fps_num,
 
     apply_encoder_codec_api(e.mft.get(), gop_frames);
 
-    e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    start_streaming(e.mft.get());
     return true;
 }
 
@@ -945,12 +949,7 @@ bool H264Encoder::feed_nv12(const uint8_t* data, int64_t pts_100ns,
         --e.needs_input;
         return e.async_pump(/*wait=*/false);
     }
-    const HRESULT hr = e.mft->ProcessInput(0, sample.get(), 0);
-    if (hr == MF_E_NOTACCEPTING) {
-        log_warn("mf: H264 encoder not accepting — receive() first");
-        return false;
-    }
-    return SUCCEEDED(hr);
+    return feed_input(e.mft.get(), sample.get(), "H264 encoder");
 }
 
 bool H264Encoder::receive(EncodedPacket& out) {
@@ -975,8 +974,7 @@ bool H264Encoder::receive(EncodedPacket& out) {
 void H264Encoder::drain() {
     Impl& e = *impl_;
     if (!e.mft) return;
-    e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-    e.mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    drain_mft(e.mft.get());
     if (e.async_mode) {
         while (!e.drain_complete)
             if (!e.async_pump(/*wait=*/true)) break;
@@ -1038,8 +1036,7 @@ bool AacEncoder::create(uint32_t channels, uint32_t sample_rate,
         return set_error(error, "AAC encoder gave no AudioSpecificConfig",
                          E_UNEXPECTED);
 
-    e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    e.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    start_streaming(e.mft.get());
     return true;
 }
 
@@ -1050,12 +1047,7 @@ bool AacEncoder::feed(const int16_t* samples, size_t count, int64_t pts_100ns) {
     if (FAILED(make_sample(reinterpret_cast<const uint8_t*>(samples), count * 2,
                            pts_100ns, 0, sample.put())))
         return false;
-    const HRESULT hr = e.mft->ProcessInput(0, sample.get(), 0);
-    if (hr == MF_E_NOTACCEPTING) {
-        log_warn("mf: AAC encoder not accepting — receive() first");
-        return false;
-    }
-    return SUCCEEDED(hr);
+    return feed_input(e.mft.get(), sample.get(), "AAC encoder");
 }
 
 bool AacEncoder::receive(EncodedPacket& out) {
@@ -1072,8 +1064,7 @@ bool AacEncoder::receive(EncodedPacket& out) {
 
 void AacEncoder::drain() {
     if (impl_->mft) {
-        impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        drain_mft(impl_->mft.get());
     }
 }
 

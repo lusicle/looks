@@ -82,7 +82,6 @@ public:
     virtual float dpi_scale() const = 0;
     virtual bool minimized() const = 0;
 
-    virtual void set_title(const std::string& utf8) = 0;
     virtual void request_close() = 0;      // destroys the native window
 
     // These are the HWND and the HINSTANCE on Win32.

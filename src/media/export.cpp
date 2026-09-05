@@ -24,10 +24,6 @@ struct AudioPacket {
     int64_t pts;
 };
 
-}  // namespace
-
-namespace {
-
 ExportResult export_movie_impl(uint32_t width, uint32_t height,
                                uint32_t fps_num, uint32_t fps_den,
                                uint32_t frame_count,
@@ -121,7 +117,8 @@ ExportResult export_movie_impl(uint32_t width, uint32_t height,
 
         auto pump_audio = [&]() {
             while (audio_encoder.receive(packet))
-                audio_packets.push_back({packet.data, packet.pts_100ns});
+                audio_packets.push_back(
+                    {std::move(packet.data), packet.pts_100ns});
         };
         // Use the same frame-to-sample rule as the monitor; sample s
         // reads mix position s + skip.

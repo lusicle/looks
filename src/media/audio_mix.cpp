@@ -60,6 +60,28 @@ void build_fir(const MixOp& op, float* w) {
 float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
                 int& budget);
 
+bool pointwise_op(const MixOp& o, float dry, float* fx) {
+    switch (o.kind) {
+        case MixOpKind::Gain:
+            *fx = dry * o.p[0];
+            return true;
+        case MixOpKind::Bitcrush: {
+            const float bits = std::clamp(o.p[0], 1.0f, 16.0f);
+            const float step = 65536.0f / std::exp2(bits);
+            *fx = std::floor(dry / step + 0.5f) * step;
+            return true;
+        }
+        case MixOpKind::Distortion: {
+            const float g = 1.0f + std::clamp(o.p[0], 0.0f, 1.0f) * 24.0f;
+            *fx = std::tanh(dry / 32768.0f * g) / std::tanh(g) * 32768.0f;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+
 float eval_inputs(const MixState& mix, const MixNode& n, double pos,
                   uint32_t k, int& budget) {
     float v = 0.0f;
@@ -97,16 +119,8 @@ float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
     // Taps shift in node-local samples; La converts them to output positions.
     // A frozen clock (La <= 0) has no time axis, so time ops act pointwise.
     const bool ticking = n.La > 1e-12;
+    if (pointwise_op(o, dry, &fx)) return (dry + (fx - dry) * o.wet) * level;
     switch (o.kind) {
-        case MixOpKind::Gain:
-            fx = dry * o.p[0];
-            break;
-        case MixOpKind::Bitcrush: {
-            const float bits = std::clamp(o.p[0], 1.0f, 16.0f);
-            const float step = 65536.0f / std::exp2(bits);
-            fx = std::floor(dry / step + 0.5f) * step;
-            break;
-        }
         case MixOpKind::Downsample: {
             if (!ticking) break;
             const double hold =
@@ -114,12 +128,6 @@ float eval_node(const MixState& mix, int idx, double pos, uint32_t k,
             const double local = n.La * pos + n.Lb;
             const double held = std::floor(local / hold) * hold;
             fx = eval_inputs(mix, n, (held - n.Lb) / n.La, k, budget);
-            break;
-        }
-        case MixOpKind::Distortion: {
-            const float g =
-                1.0f + std::clamp(o.p[0], 0.0f, 1.0f) * 24.0f;
-            fx = std::tanh(dry / 32768.0f * g) / std::tanh(g) * 32768.0f;
             break;
         }
         case MixOpKind::Delay: {
@@ -255,28 +263,14 @@ float eval_chain(const PcmBuffer& pcm, int64_t frames,
     const float dry =
         eval_chain(pcm, frames, ops, firs, op - 1, pos, k, budget);
     float fx = dry;
+    if (pointwise_op(o, dry, &fx)) return dry + (fx - dry) * o.wet;
     switch (o.kind) {
-        case MixOpKind::Gain:
-            fx = dry * o.p[0];
-            break;
-        case MixOpKind::Bitcrush: {
-            const float bits = std::clamp(o.p[0], 1.0f, 16.0f);
-            const float step = 65536.0f / std::exp2(bits);
-            fx = std::floor(dry / step + 0.5f) * step;
-            break;
-        }
         case MixOpKind::Downsample: {
             const double hold =
                 static_cast<double>(std::max(1.0f, o.p[0]));
             const double held = std::floor(pos / hold) * hold;
             fx = eval_chain(pcm, frames, ops, firs, op - 1, held, k,
                             budget);
-            break;
-        }
-        case MixOpKind::Distortion: {
-            const float g =
-                1.0f + std::clamp(o.p[0], 0.0f, 1.0f) * 24.0f;
-            fx = std::tanh(dry / 32768.0f * g) / std::tanh(g) * 32768.0f;
             break;
         }
         case MixOpKind::Delay: {

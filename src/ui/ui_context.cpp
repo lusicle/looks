@@ -182,7 +182,6 @@ Gesture Context::gesture(WidgetId id, const Rect& rect, float drag_px) {
     const bool owns = widget_owns_mouse(id);
     const bool mine = press_id_ == id && !id.is_null();
     g.hovered = owns;
-    g.press_pos = press_pos_;
 
     if ((in_.buttons_pressed & kMouseLeft) && owns && !mine) {
         press_id_ = id;
@@ -190,7 +189,6 @@ Gesture Context::gesture(WidgetId id, const Rect& rect, float drag_px) {
         press_moved_ = false;
         begin_drag(id);
         g.pressed = true;
-        g.press_pos = press_pos_;
         g.double_clicked = take_double(
             (static_cast<uint64_t>(id.slot) << 32) | id.generation);
     }

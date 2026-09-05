@@ -44,13 +44,17 @@ void fft(std::vector<Complex>& data) {
 
 std::vector<float> magnitude_spectrum(const float* samples, size_t count,
                                       size_t n) {
-    std::vector<Complex> data(n);
-    for (size_t i = 0; i < n; ++i) {
-        const float s = i < count ? samples[i] : 0.0f;
-        const float w = 0.5f - 0.5f * static_cast<float>(std::cos(
+    thread_local std::vector<Complex> data;
+    thread_local std::vector<float> window;
+    if (window.size() != n) {
+        window.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            window[i] = 0.5f - 0.5f * static_cast<float>(std::cos(
                                           2.0 * kPi * i / (n - 1)));
-        data[i].re = s * w;
     }
+    data.assign(n, Complex{});
+    for (size_t i = 0; i < n; ++i)
+        data[i].re = (i < count ? samples[i] : 0.0f) * window[i];
     fft(data);
     std::vector<float> mags(n / 2 + 1);
     for (size_t i = 0; i < mags.size(); ++i)

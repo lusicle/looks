@@ -80,6 +80,12 @@ float num(const Value& obj, std::string_view key, float fallback) {
     return static_cast<float>(obj.get(key).as_number(fallback));
 }
 
+void set_xy(Value& v, const char* kx, const char* ky, float x, float y) {
+    if (x == 0.0f && y == 0.0f) return;
+    v.set(kx, static_cast<double>(x));
+    v.set(ky, static_cast<double>(y));
+}
+
 Value param_key_to_json(const ParamKey& k) {
     Value v = Value::make_object();
     // Bits 62 and 61 are past the exact JSON integer range: store bare ids.
@@ -177,10 +183,7 @@ Value value_node_to_json(const ValueNode& n) {
     if (n.in_a) v.set("in_a", static_cast<int64_t>(n.in_a));
     if (n.in_b) v.set("in_b", static_cast<int64_t>(n.in_b));
     if (n.audio_src) v.set("audio_src", static_cast<int64_t>(n.audio_src));
-    if (n.node_x != 0.0f || n.node_y != 0.0f) {
-        v.set("node_x", static_cast<double>(n.node_x));
-        v.set("node_y", static_cast<double>(n.node_y));
-    }
+    set_xy(v, "node_x", "node_y", n.node_x, n.node_y);
     return v;
 }
 
@@ -428,10 +431,7 @@ Value layer_to_json(const Layer& l) {
             xf.set("anchor_y", static_cast<double>(l.xf_anchor_y));
         v.set("transform", std::move(xf));
     }
-    if (l.node_x != 0.0f || l.node_y != 0.0f) {
-        v.set("node_x", static_cast<double>(l.node_x));
-        v.set("node_y", static_cast<double>(l.node_y));
-    }
+    set_xy(v, "node_x", "node_y", l.node_x, l.node_y);
     Value stack = Value::make_array();
     for (const EffectInstance& fx : l.stack) stack.push(effect_to_json(fx));
     v.set("stack", std::move(stack));
@@ -630,10 +630,7 @@ Value look_to_json(const Look& look) {
     v.set("morph_to", look.morph_to);
     v.set("morph_pos", static_cast<double>(look.morph_pos));
 
-    if (look.out_node_x != 0.0f || look.out_node_y != 0.0f) {
-        v.set("out_node_x", static_cast<double>(look.out_node_x));
-        v.set("out_node_y", static_cast<double>(look.out_node_y));
-    }
+    set_xy(v, "out_node_x", "out_node_y", look.out_node_x, look.out_node_y);
     if (!look.links.empty()) {
         Value links = Value::make_array();
         for (const NodeLink& l : look.links) {
@@ -732,17 +729,30 @@ uint64_t max_node_id(const Look& look) {
 
 uint64_t max_sequence_id(const Sequence& seq) {
     uint64_t max_id = seq.id;
-    for (const SeqTrack& t : seq.tracks) {
+    for_each_lane(seq, [&](const auto& t) {
         max_id = std::max(max_id, t.id);
         for (const Placement& p : t.placements)
             max_id = std::max(max_id, std::max(p.id, p.link));
-    }
-    for (const AudioTrack& t : seq.audio) {
-        max_id = std::max(max_id, t.id);
-        for (const Placement& p : t.placements)
-            max_id = std::max(max_id, std::max(p.id, p.link));
-    }
+    });
     return max_id;
+}
+
+template <class Track, class Extra>
+Value tracks_to_json(const std::vector<Track>& tracks, Extra extra) {
+    Value arr = Value::make_array();
+    for (const Track& t : tracks) {
+        Value tv = Value::make_object();
+        tv.set("id", static_cast<int64_t>(t.id));
+        tv.set("name", t.name);
+        extra(tv, t);
+        if (t.lock) tv.set("lock", true);
+        Value places = Value::make_array();
+        for (const Placement& p : t.placements)
+            places.push(placement_to_json(p));
+        tv.set("placements", std::move(places));
+        arr.push(std::move(tv));
+    }
+    return arr;
 }
 
 Value sequence_to_json(const Sequence& seq) {
@@ -758,39 +768,16 @@ Value sequence_to_json(const Sequence& seq) {
         v.set("duration", static_cast<int64_t>(seq.duration));
     if (seq.bin) v.set("bin", static_cast<int64_t>(seq.bin));
 
-    Value tracks = Value::make_array();
-    for (const SeqTrack& t : seq.tracks) {
-        Value tv = Value::make_object();
-        tv.set("id", static_cast<int64_t>(t.id));
-        tv.set("name", t.name);
-        if (t.hidden) tv.set("hidden", true);
-        if (t.lock) tv.set("lock", true);
-        Value places = Value::make_array();
-        for (const Placement& p : t.placements)
-            places.push(placement_to_json(p));
-        tv.set("placements", std::move(places));
-        tracks.push(std::move(tv));
-    }
-    v.set("tracks", std::move(tracks));
-
-    if (!seq.audio.empty()) {
-        Value audio = Value::make_array();
-        for (const AudioTrack& t : seq.audio) {
-            Value tv = Value::make_object();
-            tv.set("id", static_cast<int64_t>(t.id));
-            tv.set("name", t.name);
-            if (t.gain != 1.0f)
-                tv.set("gain", static_cast<double>(t.gain));
-            if (t.mute) tv.set("mute", true);
-            if (t.lock) tv.set("lock", true);
-            Value places = Value::make_array();
-            for (const Placement& p : t.placements)
-                places.push(placement_to_json(p));
-            tv.set("placements", std::move(places));
-            audio.push(std::move(tv));
-        }
-        v.set("audio", std::move(audio));
-    }
+    v.set("tracks", tracks_to_json(seq.tracks, [](Value& tv, const SeqTrack& t) {
+              if (t.hidden) tv.set("hidden", true);
+          }));
+    if (!seq.audio.empty())
+        v.set("audio",
+              tracks_to_json(seq.audio, [](Value& tv, const AudioTrack& t) {
+                  if (t.gain != 1.0f)
+                      tv.set("gain", static_cast<double>(t.gain));
+                  if (t.mute) tv.set("mute", true);
+              }));
 
     if (seq.trim_in) v.set("trim_in", static_cast<int64_t>(seq.trim_in));
     if (seq.trim_out) v.set("trim_out", static_cast<int64_t>(seq.trim_out));
@@ -807,6 +794,24 @@ Value sequence_to_json(const Sequence& seq) {
     return v;
 }
 
+template <class Track, class Extra>
+void tracks_from_json(const Value& arr, std::vector<Track>& out,
+                      Extra extra) {
+    for (const Value& tv : arr.array()) {
+        if (out.size() >= kMaxLayers) break;
+        Track t;
+        t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
+        t.name = tv.get("name").as_string();
+        extra(tv, t);
+        t.lock = tv.get("lock").as_bool(false);
+        for (const Value& pl : tv.get("placements").array()) {
+            if (t.placements.size() >= kMaxPlacementsPerTrack) break;
+            t.placements.push_back(placement_from_json(pl));
+        }
+        out.push_back(std::move(t));
+    }
+}
+
 Sequence sequence_from_json(const Value& v) {
     Sequence seq;
     seq.id = static_cast<uint64_t>(v.get("id").as_int(0));
@@ -817,33 +822,15 @@ Sequence sequence_from_json(const Value& v) {
     seq.format.h = static_cast<uint32_t>(v.get("fmt_h").as_int(0));
     seq.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
 
-    for (const Value& tv : v.get("tracks").array()) {
-        if (seq.tracks.size() >= kMaxLayers) break;
-        SeqTrack t;
-        t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
-        t.name = tv.get("name").as_string();
-        t.hidden = tv.get("hidden").as_bool(false);
-        t.lock = tv.get("lock").as_bool(false);
-        for (const Value& pl : tv.get("placements").array()) {
-            if (t.placements.size() >= kMaxPlacementsPerTrack) break;
-            t.placements.push_back(placement_from_json(pl));
-        }
-        seq.tracks.push_back(std::move(t));
-    }
-    for (const Value& tv : v.get("audio").array()) {
-        if (seq.audio.size() >= kMaxLayers) break;
-        AudioTrack t;
-        t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
-        t.name = tv.get("name").as_string();
-        t.gain = num(tv, "gain", 1.0f);
-        t.mute = tv.get("mute").as_bool(false);
-        t.lock = tv.get("lock").as_bool(false);
-        for (const Value& pl : tv.get("placements").array()) {
-            if (t.placements.size() >= kMaxPlacementsPerTrack) break;
-            t.placements.push_back(placement_from_json(pl));
-        }
-        seq.audio.push_back(std::move(t));
-    }
+    tracks_from_json(v.get("tracks"), seq.tracks,
+                     [](const Value& tv, SeqTrack& t) {
+                         t.hidden = tv.get("hidden").as_bool(false);
+                     });
+    tracks_from_json(v.get("audio"), seq.audio,
+                     [](const Value& tv, AudioTrack& t) {
+                         t.gain = num(tv, "gain", 1.0f);
+                         t.mute = tv.get("mute").as_bool(false);
+                     });
 
     seq.trim_in = static_cast<uint32_t>(v.get("trim_in").as_int(0));
     seq.trim_out = static_cast<uint32_t>(v.get("trim_out").as_int(0));
@@ -872,10 +859,7 @@ json::Value effect_to_json(const EffectInstance& fx) {
     v.set("seed", static_cast<int64_t>(fx.seed));
     v.set("group", static_cast<int64_t>(fx.group_id));
     if (!fx.text.empty()) v.set("text", fx.text);
-    if (fx.node_x != 0.0f || fx.node_y != 0.0f) {
-        v.set("node_x", static_cast<double>(fx.node_x));
-        v.set("node_y", static_cast<double>(fx.node_y));
-    }
+    set_xy(v, "node_x", "node_y", fx.node_x, fx.node_y);
     return v;
 }
 
@@ -912,10 +896,7 @@ json::Value group_to_json(const Group& g) {
     v.set("name", g.name);
     v.set("folded", g.folded);
     v.set("bypass", g.bypass);
-    if (g.node_x != 0.0f || g.node_y != 0.0f) {
-        v.set("node_x", static_cast<double>(g.node_x));
-        v.set("node_y", static_cast<double>(g.node_y));
-    }
+    set_xy(v, "node_x", "node_y", g.node_x, g.node_y);
     Value exposed = Value::make_array();
     for (const ParamKey& k : g.exposed) {
         Value ev = Value::make_object();
@@ -932,14 +913,8 @@ json::Value group_to_json(const Group& g) {
         inputs.push(Value(static_cast<int64_t>(s)));
     v.set("inputs", std::move(inputs));
     if (g.face_out) v.set("face_out", static_cast<int64_t>(g.face_out));
-    if (g.in_x != 0.0f || g.in_y != 0.0f) {
-        v.set("in_x", static_cast<double>(g.in_x));
-        v.set("in_y", static_cast<double>(g.in_y));
-    }
-    if (g.out_x != 0.0f || g.out_y != 0.0f) {
-        v.set("out_x", static_cast<double>(g.out_x));
-        v.set("out_y", static_cast<double>(g.out_y));
-    }
+    set_xy(v, "in_x", "in_y", g.in_x, g.in_y);
+    set_xy(v, "out_x", "out_y", g.out_x, g.out_y);
     return v;
 }
 
@@ -1167,18 +1142,12 @@ Document doc_from_json(const json::Value& v) {
     for (Look& look : doc.looks)
         for (Layer& l : look.layers)
             if (!l.id) l.id = doc.next_effect_id++;
-    for (Sequence& seq : doc.sequences) {
-        for (SeqTrack& t : seq.tracks) {
+    for (Sequence& seq : doc.sequences)
+        for_each_lane(seq, [&](auto& t) {
             if (!t.id) t.id = doc.next_effect_id++;
             for (Placement& p : t.placements)
                 if (!p.id) p.id = doc.next_effect_id++;
-        }
-        for (AudioTrack& t : seq.audio) {
-            if (!t.id) t.id = doc.next_effect_id++;
-            for (Placement& p : t.placements)
-                if (!p.id) p.id = doc.next_effect_id++;
-        }
-    }
+        });
     return doc;
 }
 

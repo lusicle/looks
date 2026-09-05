@@ -37,7 +37,6 @@ public:
 
     // Range 0..2. Gain never touches the clock; silence still advances.
     void set_gain(float gain);
-    float gain() const;
 
     // No-op with an audio device. Callers must tick every cycle;
     // the fallback clock moves only when ticked.

@@ -56,7 +56,6 @@ struct TrackInfo {
     Kind kind = Kind::Other;
     uint32_t track_id = 0;
     uint32_t timescale = 0;
-    uint64_t duration = 0;      // track timescale units
     char fourcc[5] = {};        // sample entry type: "avc1", "mp4a", ...
 
     uint32_t width = 0;

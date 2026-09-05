@@ -4,6 +4,8 @@
 
 #include <cstdio>
 
+#include "util/bytes.h"
+
 namespace looks {
 
 std::optional<std::vector<uint8_t>> read_file_bytes(const std::filesystem::path& path) {
@@ -40,23 +42,6 @@ std::string path_to_u8(const std::filesystem::path& path) {
     const std::wstring& w = path.native();
     std::string out;
     out.reserve(w.size());
-    auto put = [&](uint32_t cp) {
-        if (cp < 0x80) {
-            out.push_back(static_cast<char>(cp));
-        } else if (cp < 0x800) {
-            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else if (cp < 0x10000) {
-            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
-            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        }
-    };
     for (size_t i = 0; i < w.size();) {
         uint32_t cp = static_cast<uint16_t>(w[i++]);
         if (cp >= 0xD800 && cp <= 0xDBFF && i < w.size() &&
@@ -67,7 +52,7 @@ std::string path_to_u8(const std::filesystem::path& path) {
         } else if (cp >= 0xD800 && cp <= 0xDFFF) {
             cp = 0xFFFD;
         }
-        put(cp);
+        bytes::app_utf8(out, cp);
     }
     return out;
 }

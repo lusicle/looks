@@ -1,5 +1,7 @@
 #include "gfx/renderer.h"
 
+#include "gfx/texture.h"
+
 #include <vk_mem_alloc.h>
 
 #include <cstring>
@@ -72,22 +74,12 @@ bool Renderer::ensure_capture_buffer(size_t bytes) {
         capture_buf_ = VK_NULL_HANDLE;
         capture_capacity_ = 0;
     }
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    info.size = bytes;
-    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VmaAllocationCreateInfo alloc_info{};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VmaAllocationInfo mapped{};
-    if (vmaCreateBuffer(device_->allocator(), &info, &alloc_info,
-                        &capture_buf_, &capture_alloc_,
-                        &mapped) != VK_SUCCESS) {
+    if (!create_mapped_buffer(*device_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              &capture_buf_, &capture_alloc_,
+                              &capture_mapped_)) {
         log_error("gfx: capture buffer alloc failed (%zu bytes)", bytes);
-        capture_buf_ = VK_NULL_HANDLE;
         return false;
     }
-    capture_mapped_ = mapped.pMappedData;
     capture_capacity_ = bytes;
     return true;
 }

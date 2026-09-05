@@ -141,10 +141,6 @@ public:
     float dpi_scale() const override { return dpi_scale_; }
     bool minimized() const override { return minimized_; }
 
-    void set_title(const std::string& utf8) override {
-        SetWindowTextW(hwnd_, widen(utf8).c_str());
-    }
-
     void request_close() override {
         if (hwnd_) {
             DestroyWindow(hwnd_);

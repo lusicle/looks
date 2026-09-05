@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
-#include <thread>
 
 #include "codec/core.h"
 #include "doc/effect_instance.h"

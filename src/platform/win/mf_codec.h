@@ -28,7 +28,6 @@ class MfLifetime {
 public:
     MfLifetime();
     ~MfLifetime();
-    bool ok() const { return mf_; }
 
 private:
     bool mf_ = false;

@@ -2,7 +2,6 @@
 
 #include <type_traits>
 
-#include <cassert>
 #include <unordered_map>
 #include <utility>
 
@@ -174,20 +173,14 @@ Sequence clone_sequence_for_unique(Document& doc, const Sequence& src) {
         links.emplace(old, id);
         return id;
     };
-    for (SeqTrack& t : out.tracks) {
+    auto remint_track = [&](auto& t) {
         t.id = doc.next_effect_id++;
         for (Placement& p : t.placements) {
             p.id = doc.next_effect_id++;
             p.link = mapped_link(p.link);
         }
-    }
-    for (AudioTrack& t : out.audio) {
-        t.id = doc.next_effect_id++;
-        for (Placement& p : t.placements) {
-            p.id = doc.next_effect_id++;
-            p.link = mapped_link(p.link);
-        }
-    }
+    };
+    for_each_lane(out, remint_track);
     return out;
 }
 
@@ -322,29 +315,32 @@ private:
     uint64_t old_bin_ = 0;
 };
 
-class SetLookPropsCommand final : public LookCommand {
+template <class Base>
+class SetPropsCommand final : public Base {
 public:
-    SetLookPropsCommand(uint64_t look, std::string name, uint32_t duration)
-        : LookCommand(look), name_(std::move(name)), duration_(duration) {}
-    std::string name() const override { return "Edit Look"; }
+    SetPropsCommand(uint64_t id, std::string name, uint32_t duration,
+                    const char* label)
+        : Base(id), name_(std::move(name)), duration_(duration),
+          label_(label) {}
+    std::string name() const override { return label_; }
 
     void apply(Document& doc) override {
-        Look& look = look_of(doc);
-        old_name_ = look.name;
-        old_duration_ = look.duration;
-        look.name = name_;
-        look.duration = duration_;
+        auto& e = this->entity_of(doc);
+        old_name_ = e.name;
+        old_duration_ = e.duration;
+        e.name = name_;
+        e.duration = duration_;
     }
 
     void revert(Document& doc) override {
-        Look& look = look_of(doc);
-        look.name = old_name_;
-        look.duration = old_duration_;
+        auto& e = this->entity_of(doc);
+        e.name = old_name_;
+        e.duration = old_duration_;
     }
 
     bool merge(const Command& next) override {
-        const auto* other = dynamic_cast<const SetLookPropsCommand*>(&next);
-        if (!other || !same_look(*other)) return false;
+        const auto* other = dynamic_cast<const SetPropsCommand*>(&next);
+        if (!other || !this->same_entity(*other)) return false;
         name_ = other->name_;
         duration_ = other->duration_;
         return true;
@@ -353,6 +349,7 @@ public:
 private:
     std::string name_;
     uint32_t duration_;
+    const char* label_;
     std::string old_name_;
     uint32_t old_duration_ = 0;
 };
@@ -400,44 +397,6 @@ private:
     NodeLink wire_{};
     bool had_wire_ = false;
     bool sealed_ = false;
-};
-
-class SetSequencePropsCommand final : public SequenceCommand {
-public:
-    SetSequencePropsCommand(uint64_t seq, std::string name,
-                            uint32_t duration)
-        : SequenceCommand(seq), name_(std::move(name)),
-          duration_(duration) {}
-    std::string name() const override { return "Edit Sequence"; }
-
-    void apply(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
-        old_name_ = seq.name;
-        old_duration_ = seq.duration;
-        seq.name = name_;
-        seq.duration = duration_;
-    }
-
-    void revert(Document& doc) override {
-        Sequence& seq = sequence_of(doc);
-        seq.name = old_name_;
-        seq.duration = old_duration_;
-    }
-
-    bool merge(const Command& next) override {
-        const auto* other =
-            dynamic_cast<const SetSequencePropsCommand*>(&next);
-        if (!other || !same_sequence(*other)) return false;
-        name_ = other->name_;
-        duration_ = other->duration_;
-        return true;
-    }
-
-private:
-    std::string name_;
-    uint32_t duration_;
-    std::string old_name_;
-    uint32_t old_duration_ = 0;
 };
 
 class SetAssetCommand final : public Command {
@@ -771,8 +730,8 @@ std::unique_ptr<Command> remove_look_command(uint64_t look_id) {
 std::unique_ptr<Command> set_look_props_command(uint64_t look,
                                                 std::string name,
                                                 uint32_t duration) {
-    return std::make_unique<SetLookPropsCommand>(look, std::move(name),
-                                                 duration);
+    return std::make_unique<SetPropsCommand<LookCommand>>(
+        look, std::move(name), duration, "Edit Look");
 }
 
 std::unique_ptr<Command> set_look_audio_split_command(uint64_t look,
@@ -795,8 +754,8 @@ std::unique_ptr<Command> remove_sequence_command(uint64_t seq_id) {
 std::unique_ptr<Command> set_sequence_props_command(uint64_t seq,
                                                     std::string name,
                                                     uint32_t duration) {
-    return std::make_unique<SetSequencePropsCommand>(seq, std::move(name),
-                                                     duration);
+    return std::make_unique<SetPropsCommand<SequenceCommand>>(
+        seq, std::move(name), duration, "Edit Sequence");
 }
 
 std::unique_ptr<Command> add_asset_command(Asset asset) {

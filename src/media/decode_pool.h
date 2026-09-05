@@ -45,7 +45,7 @@ public:
         uint64_t key = 0;
         // Canonical stream key: keys with the same mapping set fold onto one.
         uint64_t alias = 0;
-        size_t source = 0;      // index into sources()
+        size_t source = 0;      // index into the flattened media instances
         uint32_t frame = 0;   // asset frame, clamped into the media
     };
     // Pure: it does no decode and changes no state.
@@ -62,8 +62,6 @@ public:
 
     // Point of no return: every roll bails and later misses return null.
     void abort();
-
-    const std::vector<doc::MediaInstance>& sources() const { return sources_; }
 
     // Frames decoded from disk that prewarm did not already hold.
     uint64_t misses() const { return misses_; }
@@ -115,6 +113,7 @@ private:
             // Capacity must survive across fetches to stop a per-frame
             // allocation.
             platform::VideoFrameNV12 scratch;
+            std::vector<uint8_t> sample_bytes;
 
             ~Session();
         };
@@ -133,6 +132,11 @@ private:
             for (const auto& e : ring)
                 if (e.first == frame) return e.second;
             return nullptr;
+        }
+        bool has_ringed(uint32_t frame) const {
+            for (const auto& e : ring)
+                if (e.first == frame) return true;
+            return false;
         }
         // Recycled frames, guarded by m; they keep capacity for the next
         // decode.

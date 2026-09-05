@@ -280,7 +280,6 @@ void Player::set_looping(bool loop) { impl_->looping.store(loop); }
 void Player::set_gain(float gain) {
     impl_->gain.store(std::clamp(gain, 0.0f, 2.0f));
 }
-float Player::gain() const { return impl_->gain.load(); }
 
 uint32_t Player::frame_count() const { return impl_->frames.load(); }
 double Player::fps() const { return impl_->fps.load(); }

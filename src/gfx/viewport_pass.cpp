@@ -5,8 +5,6 @@
 
 #include "gfx/graph.h"
 #include "gfx/vk_device.h"
-#include "util/file.h"
-#include "util/log.h"
 
 namespace looks::gfx {
 
@@ -17,22 +15,6 @@ struct ViewportPush {
     float offset[2];      // fitted quad center in NDC
     uint32_t alpha_mode;  // 0 flatten over black, 1 checkerboard
 };
-
-VkShaderModule load_shader(Device& device, const std::filesystem::path& path) {
-    auto bytes = read_file_bytes(path);
-    if (!bytes || bytes->size() % 4 != 0) {
-        log_error("gfx: failed to load shader %s", path.string().c_str());
-        return VK_NULL_HANDLE;
-    }
-    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = bytes->size();
-    info.pCode = reinterpret_cast<const uint32_t*>(bytes->data());
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(device.device(), &info, nullptr, &module) !=
-        VK_SUCCESS)
-        return VK_NULL_HANDLE;
-    return module;
-}
 
 }  // namespace
 
@@ -81,87 +63,21 @@ bool ViewportPass::init(VkFormat color_format,
     vk_check(vkCreatePipelineLayout(dev, &layout_info, nullptr, &layout_),
              "vkCreatePipelineLayout(viewport)");
 
-    VkShaderModule vs = load_shader(device_, shader_dir / "viewport.vert.spv");
-    VkShaderModule fs = load_shader(device_, shader_dir / "viewport.frag.spv");
-    bool ok = vs && fs;
-    if (ok) {
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = vs;
-        stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = fs;
-        stages[1].pName = "main";
-
-        VkPipelineVertexInputStateCreateInfo vertex_input{
-            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-
-        VkPipelineInputAssemblyStateCreateInfo input_assembly{
-            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo viewport{
-            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo raster{
-            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        raster.polygonMode = VK_POLYGON_MODE_FILL;
-        raster.cullMode = VK_CULL_MODE_NONE;
-        raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        raster.lineWidth = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo multisample{
-            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineColorBlendAttachmentState blend_attachment{};
-        blend_attachment.colorWriteMask =
-            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo blend{
-            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-        blend.attachmentCount = 1;
-        blend.pAttachments = &blend_attachment;
-
-        VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
-                                           VK_DYNAMIC_STATE_SCISSOR};
-        VkPipelineDynamicStateCreateInfo dynamic{
-            VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = 2;
-        dynamic.pDynamicStates = dynamic_states;
-
-        VkPipelineRenderingCreateInfo rendering{
-            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-        rendering.colorAttachmentCount = 1;
-        rendering.pColorAttachmentFormats = &color_format;
-
-        VkGraphicsPipelineCreateInfo info{
-            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        info.pNext = &rendering;
-        info.stageCount = 2;
-        info.pStages = stages;
-        info.pVertexInputState = &vertex_input;
-        info.pInputAssemblyState = &input_assembly;
-        info.pViewportState = &viewport;
-        info.pRasterizationState = &raster;
-        info.pMultisampleState = &multisample;
-        info.pColorBlendState = &blend;
-        info.pDynamicState = &dynamic;
-        info.layout = layout_;
-        VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info,
-                                               nullptr, &pipeline_);
-        if (r != VK_SUCCESS) {
-            log_error("gfx: viewport pipeline failed: %s", vk_result_name(r));
-            ok = false;
-        }
+    VkShaderModule vs =
+        load_shader_module(device_, shader_dir / "viewport.vert.spv");
+    VkShaderModule fs =
+        load_shader_module(device_, shader_dir / "viewport.frag.spv");
+    if (vs && fs) {
+        GraphicsPipelineDesc desc;
+        desc.vs = vs;
+        desc.fs = fs;
+        desc.layout = layout_;
+        desc.color_format = color_format;
+        pipeline_ = create_graphics_pipeline(device_, desc, "viewport");
     }
     if (vs) vkDestroyShaderModule(dev, vs, nullptr);
     if (fs) vkDestroyShaderModule(dev, fs, nullptr);
-    return ok;
+    return pipeline_ != VK_NULL_HANDLE;
 }
 
 void ViewportPass::draw(VkCommandBuffer cmd, DescriptorArena& arena,

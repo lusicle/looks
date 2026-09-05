@@ -585,28 +585,26 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         return nullptr;
     };
 
+    auto resolve_slot = [&](const doc::ParamKey& target, float* min_v,
+                            float* max_v) -> float* {
+        if (float* s = layer_slot(target, min_v, max_v)) return s;
+        if (float* s = group_slot(target, min_v, max_v)) return s;
+        if (float* s = stop_slot(target, min_v, max_v)) return s;
+        size_t layer = 0, index = 0;
+        if (!find_effect(out, target.effect_id, &layer, &index))
+            return nullptr;
+        doc::EffectInstance& fx = out.layers[layer].stack[index];
+        float* s = param_slot(fx, target.param_index);
+        if (s) param_range(fx.type, target.param_index, min_v, max_v);
+        return s;
+    };
+
     // Lanes set the base; muted lanes drive nothing.
     for (const doc::KeyframeLane& lane : look.lanes) {
         if (lane.keys.empty() || lane.muted) continue;
         float min_v = 0.0f, max_v = 1.0f;
-        if (float* lslot = layer_slot(lane.target, &min_v, &max_v)) {
-            *lslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
-            continue;
-        }
-        if (float* gslot = group_slot(lane.target, &min_v, &max_v)) {
-            *gslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
-            continue;
-        }
-        if (float* sslot = stop_slot(lane.target, &min_v, &max_v)) {
-            *sslot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
-            continue;
-        }
-        size_t layer = 0, index = 0;
-        if (!find_effect(out, lane.target.effect_id, &layer, &index)) continue;
-        doc::EffectInstance& fx = out.layers[layer].stack[index];
-        float* slot = param_slot(fx, lane.target.param_index);
+        float* slot = resolve_slot(lane.target, &min_v, &max_v);
         if (!slot) continue;
-        param_range(fx.type, lane.target.param_index, &min_v, &max_v);
         *slot = std::clamp(eval_lane(lane, frame_index), min_v, max_v);
     }
 
@@ -614,18 +612,8 @@ void resolve_look(const doc::Look& look, doc::Look& out,
     for (const doc::ModRoute& route : look.mod_routes) {
         if (!route.node) continue;
         float min_v = 0.0f, max_v = 1.0f;
-        float* slot = layer_slot(route.target, &min_v, &max_v);
-        if (!slot) slot = group_slot(route.target, &min_v, &max_v);
-        if (!slot) slot = stop_slot(route.target, &min_v, &max_v);
-        if (!slot) {
-            size_t layer = 0, index = 0;
-            if (!find_effect(out, route.target.effect_id, &layer, &index))
-                continue;
-            doc::EffectInstance& fx = out.layers[layer].stack[index];
-            slot = param_slot(fx, route.target.param_index);
-            if (!slot) continue;
-            param_range(fx.type, route.target.param_index, &min_v, &max_v);
-        }
+        float* slot = resolve_slot(route.target, &min_v, &max_v);
+        if (!slot) continue;
         const float value =
             apply_curve(route.curve, eval_value_node(env, route.node));
         *slot = std::clamp(min_v + (max_v - min_v) * value, min_v, max_v);

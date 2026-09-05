@@ -69,22 +69,13 @@ bool Nv12Readback::ensure_targets(uint32_t width, uint32_t height) {
     if (capacity_ < needed) {
         if (readback_)
             vmaDestroyBuffer(device_.allocator(), readback_, readback_alloc_);
-        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = needed;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        VmaAllocationCreateInfo alloc_info{};
-        alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VmaAllocationInfo mapped{};
-        if (vmaCreateBuffer(device_.allocator(), &info, &alloc_info, &readback_,
-                            &readback_alloc_, &mapped) != VK_SUCCESS) {
+        if (!create_mapped_buffer(device_, needed,
+                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback_,
+                                  &readback_alloc_, &mapped_)) {
             log_error("gfx: readback buffer alloc failed (%zu bytes)", needed);
-            readback_ = VK_NULL_HANDLE;
             capacity_ = 0;
             return false;
         }
-        mapped_ = mapped.pMappedData;
         capacity_ = needed;
     }
     return true;
@@ -133,45 +124,16 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
     to_nv12_->dispatch(cmd_, engine.arena(), 0, sampled, 1, storage, 2, push,
                        sizeof(push), w, h, engine.linear_sampler());
 
-    y_image_->transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    uv_image_->transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    copy_nv12_to_buffer(cmd_, *y_image_, *uv_image_, readback_, w, h);
 
-    VkBufferImageCopy copies[2]{};
-    copies[0].bufferOffset = 0;
-    copies[0].bufferRowLength = w;
-    copies[0].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copies[0].imageExtent = {w, h, 1};
-    vkCmdCopyImageToBuffer(cmd_, y_image_->image(),
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1,
-                           &copies[0]);
-    copies[1].bufferOffset = static_cast<VkDeviceSize>(w) * h;
-    copies[1].bufferRowLength = w / 2;  // texels, not bytes
-    copies[1].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copies[1].imageExtent = {w / 2, h / 2, 1};
-    vkCmdCopyImageToBuffer(cmd_, uv_image_->image(),
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1,
-                           &copies[1]);
-
-    VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, nullptr,
-                         0, nullptr);
+    memory_barrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_ACCESS_HOST_READ_BIT);
 
     vk_check(vkEndCommandBuffer(cmd_), "vkEndCommandBuffer(readback)");
 
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd_;
-    {
-        std::lock_guard<std::mutex> lock(device_.queue_mutex());
-        vk_check(vkQueueSubmit(device_.graphics_queue(), 1, &submit, fence_),
-                 "vkQueueSubmit(readback)");
-    }
-    vk_check(vkWaitForFences(dev, 1, &fence_, VK_TRUE, UINT64_MAX),
-             "vkWaitForFences(readback)");
-    vk_check(vkResetFences(dev, 1, &fence_), "vkResetFences(readback)");
+    submit_and_wait(device_, device_.graphics_queue(), cmd_, fence_,
+                    "readback submit");
 
     const size_t bytes = static_cast<size_t>(w) * h * 3 / 2;
     vmaInvalidateAllocation(device_.allocator(), readback_alloc_, 0, bytes);

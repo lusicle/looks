@@ -148,6 +148,8 @@ private:
     bool ensure_codec_io(uint32_t width, uint32_t height);
     VkCommandBuffer codec_begin_segment();
     void codec_flush_segment();
+    void dispatch_to_nv12(VkCommandBuffer rec, uint32_t frame_index,
+                          const GpuImage* in, uint32_t w, uint32_t h);
 
     Device& device_;
     DescriptorArena arena_;

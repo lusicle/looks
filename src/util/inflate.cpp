@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "util/bytes.h"
+
 namespace looks {
 
 namespace {
@@ -229,10 +231,7 @@ bool zlib_inflate(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
     if (((cmf << 8) | flg) % 31 != 0) return false;   // header check
     if (flg & 0x20) return false;                     // FDICT unsupported
     if (!inflate(data + 2, size - 6, out, expected_size)) return false;
-    const uint32_t expect = (static_cast<uint32_t>(data[size - 4]) << 24) |
-                            (data[size - 3] << 16) | (data[size - 2] << 8) |
-                            data[size - 1];
-    return adler32(out.data(), out.size()) == expect;
+    return adler32(out.data(), out.size()) == bytes::be32(data + size - 4);
 }
 
 }  // namespace looks

@@ -21,7 +21,6 @@ public:
 
     // Changing the context invalidates every entry.
     void set_context(uint64_t context);
-    uint64_t context() const { return context_; }
 
     // Lowering the budget evicts immediately; 0 disables (and clears).
     void set_budget(size_t bytes);

@@ -730,54 +730,47 @@ private:
             last_load_ = LastLoad::None;
         }
     }
-    void parse_equality() {
-        parse_compare();
-        while ((check(Tok::Eq) || check(Tok::Ne)) && op_continues()) {
-            const Tok op = cur_tok_.kind;
+    struct BinOp {
+        Tok tok;
+        Op op;
+    };
+    template <size_t N>
+    void parse_binary(void (Compiler::*next)(), const BinOp (&ops)[N]) {
+        (this->*next)();
+        for (;;) {
+            const BinOp* hit = nullptr;
+            for (const BinOp& o : ops)
+                if (check(o.tok)) {
+                    hit = &o;
+                    break;
+                }
+            if (!hit || !op_continues()) return;
             advance();
-            parse_compare();
-            emit(op == Tok::Eq ? Op::Eq : Op::Ne);
+            (this->*next)();
+            emit(hit->op);
             last_load_ = LastLoad::None;
         }
+    }
+    void parse_equality() {
+        static const BinOp k[] = {{Tok::Eq, Op::Eq}, {Tok::Ne, Op::Ne}};
+        parse_binary(&Compiler::parse_compare, k);
     }
     void parse_compare() {
-        parse_term();
-        while ((check(Tok::Lt) || check(Tok::Le) || check(Tok::Gt) ||
-                check(Tok::Ge)) &&
-               op_continues()) {
-            const Tok op = cur_tok_.kind;
-            advance();
-            parse_term();
-            emit(op == Tok::Lt   ? Op::Lt
-                 : op == Tok::Le ? Op::Le
-                 : op == Tok::Gt ? Op::Gt
-                                 : Op::Ge);
-            last_load_ = LastLoad::None;
-        }
+        static const BinOp k[] = {{Tok::Lt, Op::Lt},
+                                  {Tok::Le, Op::Le},
+                                  {Tok::Gt, Op::Gt},
+                                  {Tok::Ge, Op::Ge}};
+        parse_binary(&Compiler::parse_term, k);
     }
     void parse_term() {
-        parse_factor();
-        while ((check(Tok::Plus) || check(Tok::Minus)) && op_continues()) {
-            const Tok op = cur_tok_.kind;
-            advance();
-            parse_factor();
-            emit(op == Tok::Plus ? Op::Add : Op::Sub);
-            last_load_ = LastLoad::None;
-        }
+        static const BinOp k[] = {{Tok::Plus, Op::Add}, {Tok::Minus, Op::Sub}};
+        parse_binary(&Compiler::parse_factor, k);
     }
     void parse_factor() {
-        parse_unary();
-        while ((check(Tok::Star) || check(Tok::Slash) ||
-                check(Tok::Percent)) &&
-               op_continues()) {
-            const Tok op = cur_tok_.kind;
-            advance();
-            parse_unary();
-            emit(op == Tok::Star    ? Op::Mul
-                 : op == Tok::Slash ? Op::Div
-                                    : Op::Mod);
-            last_load_ = LastLoad::None;
-        }
+        static const BinOp k[] = {{Tok::Star, Op::Mul},
+                                  {Tok::Slash, Op::Div},
+                                  {Tok::Percent, Op::Mod}};
+        parse_binary(&Compiler::parse_unary, k);
     }
     void parse_unary() {
         if (match(Tok::Minus)) {
@@ -1435,26 +1428,21 @@ void add_core_natives(Env& env) {
     num1("round", "round(n)", [](double v) { return std::round(v); });
     num1("abs", "abs(n)", [](double v) { return std::fabs(v); });
     num1("sqrt", "sqrt(n)", [](double v) { return std::sqrt(v); });
-    env.add("min", "min(a, b, ...)", 1, -1,
-            [](Vm& vm, std::vector<Value>& a) {
-                double m = 0.0;
-                for (size_t i = 0; i < a.size(); ++i) {
-                    if (!a[i].is_num())
-                        return nat_err(vm, "min() needs numbers");
-                    m = i == 0 ? a[i].num : std::min(m, a[i].num);
-                }
-                return Value::number(m);
-            });
-    env.add("max", "max(a, b, ...)", 1, -1,
-            [](Vm& vm, std::vector<Value>& a) {
-                double m = 0.0;
-                for (size_t i = 0; i < a.size(); ++i) {
-                    if (!a[i].is_num())
-                        return nat_err(vm, "max() needs numbers");
-                    m = i == 0 ? a[i].num : std::max(m, a[i].num);
-                }
-                return Value::number(m);
-            });
+    const auto extremum = [&](const char* name, const char* sig, bool lo) {
+        env.add(name, sig, 1, -1, [name, lo](Vm& vm, std::vector<Value>& a) {
+            double m = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (!a[i].is_num())
+                    return nat_err(vm, std::string(name) + "() needs numbers");
+                m = i == 0     ? a[i].num
+                    : lo       ? std::min(m, a[i].num)
+                               : std::max(m, a[i].num);
+            }
+            return Value::number(m);
+        });
+    };
+    extremum("min", "min(a, b, ...)", true);
+    extremum("max", "max(a, b, ...)", false);
     env.add("near", "near(a, b, eps?) - float-tolerant equality (1e-4)",
             2, 3, [](Vm& vm, std::vector<Value>& a) {
                 if (!a[0].is_num() || !a[1].is_num())

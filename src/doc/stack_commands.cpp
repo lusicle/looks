@@ -155,118 +155,34 @@ private:
     std::vector<std::pair<bool, std::vector<Keyframe>>> old_lanes_;
 };
 
-class SetBypassCommand final : public LookCommand {
+template <class T, T EffectInstance::*Field>
+class SetEffectFieldCommand final : public LookCommand {
 public:
-    SetBypassCommand(uint64_t look, size_t layer_index, size_t effect_index,
-                     bool bypass)
+    SetEffectFieldCommand(uint64_t look, size_t layer_index,
+                          size_t effect_index, T value, const char* name)
         : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), bypass_(bypass) {}
+          effect_index_(effect_index), value_(std::move(value)),
+          name_(name) {}
 
-    std::string name() const override {
-        return bypass_ ? "Bypass Effect" : "Enable Effect";
-    }
+    std::string name() const override { return name_; }
 
     void apply(Document& doc) override {
         auto& stack = stack_of(look_of(doc), layer_index_);
         assert(effect_index_ < stack.size());
-        old_bypass_ = stack[effect_index_].bypass;
-        stack[effect_index_].bypass = bypass_;
+        old_ = stack[effect_index_].*Field;
+        stack[effect_index_].*Field = value_;
     }
 
     void revert(Document& doc) override {
-        stack_of(look_of(doc), layer_index_)[effect_index_].bypass =
-            old_bypass_;
+        stack_of(look_of(doc), layer_index_)[effect_index_].*Field = old_;
     }
 
 private:
     size_t layer_index_;
     size_t effect_index_;
-    bool bypass_;
-    bool old_bypass_ = false;
-};
-
-class SetEffectBlendCommand final : public LookCommand {
-public:
-    SetEffectBlendCommand(uint64_t look, size_t layer_index,
-                          size_t effect_index, BlendMode blend)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), blend_(blend) {}
-
-    std::string name() const override { return "Effect Blend"; }
-
-    void apply(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
-        assert(effect_index_ < stack.size());
-        old_blend_ = stack[effect_index_].blend;
-        stack[effect_index_].blend = blend_;
-    }
-
-    void revert(Document& doc) override {
-        stack_of(look_of(doc), layer_index_)[effect_index_].blend =
-            old_blend_;
-    }
-
-private:
-    size_t layer_index_;
-    size_t effect_index_;
-    BlendMode blend_;
-    BlendMode old_blend_ = BlendMode::Normal;
-};
-
-class SetEffectTextCommand final : public LookCommand {
-public:
-    SetEffectTextCommand(uint64_t look, size_t layer_index, size_t effect_index,
-                         std::string text)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), text_(std::move(text)) {}
-
-    std::string name() const override { return "Edit Text"; }
-
-    void apply(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
-        assert(effect_index_ < stack.size());
-        old_text_ = stack[effect_index_].text;
-        stack[effect_index_].text = text_;
-    }
-
-    void revert(Document& doc) override {
-        stack_of(look_of(doc), layer_index_)[effect_index_].text = old_text_;
-    }
-
-private:
-    size_t layer_index_;
-    size_t effect_index_;
-    std::string text_;
-    std::string old_text_;
-};
-
-class SetSoloCommand final : public LookCommand {
-public:
-    SetSoloCommand(uint64_t look, size_t layer_index, size_t effect_index,
-                   bool solo)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), solo_(solo) {}
-
-    std::string name() const override {
-        return solo_ ? "Solo Effect" : "Unsolo Effect";
-    }
-
-    void apply(Document& doc) override {
-        auto& stack = stack_of(look_of(doc), layer_index_);
-        assert(effect_index_ < stack.size());
-        old_solo_ = stack[effect_index_].solo;
-        stack[effect_index_].solo = solo_;
-    }
-
-    void revert(Document& doc) override {
-        stack_of(look_of(doc), layer_index_)[effect_index_].solo = old_solo_;
-    }
-
-private:
-    size_t layer_index_;
-    size_t effect_index_;
-    bool solo_;
-    bool old_solo_ = false;
+    T value_;
+    const char* name_;
+    T old_{};
 };
 
 class AddEffectCommand final : public LookCommand {
@@ -514,13 +430,7 @@ public:
     void revert(Document& doc) override {
         Look& look = look_of(doc);
         if (appended_) {
-            for (auto it = look.links.rbegin(); it != look.links.rend();
-                 ++it)
-                if (it->from == link_.from && it->to == link_.to &&
-                    it->to_port == link_.to_port) {
-                    look.links.erase(std::next(it).base());
-                    break;
-                }
+            erase_last_link(look, link_);
         } else if (had_replaced_ && replaced_at_ < look.links.size()) {
             look.links[replaced_at_] = replaced_;
         }
@@ -645,13 +555,7 @@ public:
                     old_);
                 break;
             case kAppended:
-                for (auto it = look.links.rbegin();
-                     it != look.links.rend(); ++it)
-                    if (it->from == new_.from && it->to == new_.to &&
-                        it->to_port == new_.to_port) {
-                        look.links.erase(std::next(it).base());
-                        break;
-                    }
+                erase_last_link(look, new_);
                 break;
             case kNoop:
                 break;
@@ -784,48 +688,28 @@ private:
     float old_w_ = 0.0f, old_h_ = 0.0f;
 };
 
-class SetFrameColorCommand final : public LookCommand {
+template <class T, T CanvasFrame::*Field>
+class SetFrameFieldCommand final : public LookCommand {
 public:
-    SetFrameColorCommand(uint64_t look, uint64_t id, uint32_t color)
-        : LookCommand(look), id_(id), color_(color) {}
-    std::string name() const override { return "Tag Frame Colour"; }
+    SetFrameFieldCommand(uint64_t look, uint64_t id, T value,
+                         const char* name)
+        : LookCommand(look), id_(id), value_(std::move(value)), name_(name) {}
+    std::string name() const override { return name_; }
     void apply(Document& doc) override {
         if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
-            old_color_ = f->color;
-            f->color = color_;
+            old_ = f->*Field;
+            f->*Field = value_;
         }
     }
     void revert(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_))
-            f->color = old_color_;
+        if (CanvasFrame* f = find_frame(look_of(doc), id_)) f->*Field = old_;
     }
 
 private:
     uint64_t id_;
-    uint32_t color_;
-    uint32_t old_color_ = 0;
-};
-
-class SetFrameTitleCommand final : public LookCommand {
-public:
-    SetFrameTitleCommand(uint64_t look, uint64_t id, std::string title)
-        : LookCommand(look), id_(id), title_(std::move(title)) {}
-    std::string name() const override { return "Rename Frame"; }
-    void apply(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_)) {
-            old_title_ = f->title;
-            f->title = title_;
-        }
-    }
-    void revert(Document& doc) override {
-        if (CanvasFrame* f = find_frame(look_of(doc), id_))
-            f->title = old_title_;
-    }
-
-private:
-    uint64_t id_;
-    std::string title_;
-    std::string old_title_;
+    T value_;
+    const char* name_;
+    T old_{};
 };
 
 }  // namespace
@@ -843,23 +727,26 @@ std::unique_ptr<Command> set_frame_bounds_command(uint64_t look,
 std::unique_ptr<Command> set_frame_title_command(uint64_t look,
                                                  uint64_t frame_id,
                                                  std::string title) {
-    return std::make_unique<SetFrameTitleCommand>(look, frame_id,
-                                                  std::move(title));
+    return std::make_unique<
+        SetFrameFieldCommand<std::string, &CanvasFrame::title>>(
+        look, frame_id, std::move(title), "Rename Frame");
 }
 
 std::unique_ptr<Command> set_effect_text_command(uint64_t look,
                                                  size_t layer_index,
                                                  size_t effect_index,
                                                  std::string text) {
-    return std::make_unique<SetEffectTextCommand>(look, layer_index,
-                                                  effect_index,
-                                                  std::move(text));
+    return std::make_unique<
+        SetEffectFieldCommand<std::string, &EffectInstance::text>>(
+        look, layer_index, effect_index, std::move(text), "Edit Text");
 }
 
 std::unique_ptr<Command> set_frame_color_command(uint64_t look,
                                                  uint64_t frame_id,
                                                  uint32_t color) {
-    return std::make_unique<SetFrameColorCommand>(look, frame_id, color);
+    return std::make_unique<
+        SetFrameFieldCommand<uint32_t, &CanvasFrame::color>>(
+        look, frame_id, color, "Tag Frame Colour");
 }
 
 std::unique_ptr<Command> remove_frame_command(uint64_t look,
@@ -942,22 +829,25 @@ std::unique_ptr<Command> set_param_gesture_command(
 
 std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
                                             size_t effect_index, bool bypass) {
-    return std::make_unique<SetBypassCommand>(look, layer_index, effect_index,
-                                              bypass);
+    return std::make_unique<SetEffectFieldCommand<bool, &EffectInstance::bypass>>(
+        look, layer_index, effect_index, bypass,
+        bypass ? "Bypass Effect" : "Enable Effect");
 }
 
 std::unique_ptr<Command> set_effect_blend_command(uint64_t look,
                                                   size_t layer_index,
                                                   size_t effect_index,
                                                   BlendMode blend) {
-    return std::make_unique<SetEffectBlendCommand>(look, layer_index,
-                                                   effect_index, blend);
+    return std::make_unique<
+        SetEffectFieldCommand<BlendMode, &EffectInstance::blend>>(
+        look, layer_index, effect_index, blend, "Effect Blend");
 }
 
 std::unique_ptr<Command> set_solo_command(uint64_t look, size_t layer_index,
                                           size_t effect_index, bool solo) {
-    return std::make_unique<SetSoloCommand>(look, layer_index, effect_index,
-                                            solo);
+    return std::make_unique<SetEffectFieldCommand<bool, &EffectInstance::solo>>(
+        look, layer_index, effect_index, solo,
+        solo ? "Solo Effect" : "Unsolo Effect");
 }
 
 std::unique_ptr<Command> add_effect_command(uint64_t look, size_t layer_index,

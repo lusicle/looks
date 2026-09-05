@@ -279,21 +279,11 @@ bool Engine::ensure_cache_io(CacheIo& io, size_t bytes) {
     io.alloc = nullptr;
     io.mapped = nullptr;
     io.capacity = 0;
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    info.size = bytes;
-    info.usage =
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VmaAllocationCreateInfo alloc_info{};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VmaAllocationInfo mapped{};
-    if (vmaCreateBuffer(device_.allocator(), &info, &alloc_info, &io.buf,
-                        &io.alloc, &mapped) != VK_SUCCESS) {
-        io.buf = VK_NULL_HANDLE;
+    if (!create_mapped_buffer(device_, bytes,
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              &io.buf, &io.alloc, &io.mapped))
         return false;
-    }
-    io.mapped = mapped.pMappedData;
     io.capacity = bytes;
     return true;
 }
@@ -335,23 +325,10 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (!bounds_img_) return false;
-    {
-        VkBufferCreateInfo binfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        binfo.size = 4 * sizeof(uint32_t);
-        binfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        VmaAllocationCreateInfo alloc_info{};
-        alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VmaAllocationInfo mapped{};
-        if (vmaCreateBuffer(device_.allocator(), &binfo, &alloc_info,
-                            &bounds_buf_, &bounds_alloc_,
-                            &mapped) != VK_SUCCESS) {
-            bounds_buf_ = VK_NULL_HANDLE;
-            return false;
-        }
-        bounds_mapped_ = mapped.pMappedData;
-    }
+    if (!create_mapped_buffer(device_, 4 * sizeof(uint32_t),
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT, &bounds_buf_,
+                              &bounds_alloc_, &bounds_mapped_))
+        return false;
 
     for (size_t i = 0; i < static_cast<size_t>(doc::EffectType::Count); ++i) {
         if (!kFxShaders[i].spv_name) continue;   // multi-pass, below
@@ -824,13 +801,10 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     const bool advance = !g.has_state || g.last_frame != timeline_frame;
 
     const auto barrier = [&] {
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask =
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
-                             0, nullptr, 0, nullptr);
+        memory_barrier(rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     };
     const auto transition3 = [&](std::unique_ptr<GpuImage>* trio) {
         for (int i = 0; i < 3; ++i)
@@ -845,17 +819,7 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
     barrier();
 
     if (advance) {
-        codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
-        codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
-        {
-            const uint32_t nv_push[2] = {w, h};
-            const GpuImage* sampled[1] = {in};
-            GpuImage* storage[2] = {codec_io_.nv_y.get(),
-                                    codec_io_.nv_uv.get()};
-            to_nv12_->dispatch(rec, arena_, frame_index, sampled, 1, storage,
-                               2, nv_push, sizeof(nv_push), w, h,
-                               linear_sampler_);
-        }
+        dispatch_to_nv12(rec, frame_index, in, w, h);
         codec_io_.nv_y->transition(rec,
                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         codec_io_.nv_uv->transition(rec,
@@ -925,18 +889,12 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
         const auto run_rate = [&](uint32_t mode, uint32_t header) {
             codec_io_.rate_dc->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
             codec_io_.rate_bits->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
-            VkClearColorValue zero{};
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                          1};
-            vkCmdClearColorImage(rec, codec_io_.rate_bits->image(),
-                                 VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
-            VkMemoryBarrier cb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            cb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            cb.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                                 &cb, 0, nullptr, 0, nullptr);
+            clear_color(rec, *codec_io_.rate_bits, VK_IMAGE_LAYOUT_GENERAL, {});
+            memory_barrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT |
+                               VK_ACCESS_SHADER_WRITE_BIT);
             for (int p = 0; p < 3; ++p) {
                 const uint32_t bwp = (planes[p].pw + 7) / 8;
                 const uint32_t bhp = (planes[p].ph + 7) / 8;
@@ -1000,13 +958,10 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
                          g.clean[p].get());
             }
             if (!g.has_state || !mp.drop_iframes) {
-                VkMemoryBarrier to_xfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                to_xfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                to_xfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                vkCmdPipelineBarrier(rec,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
-                                     &to_xfer, 0, nullptr, 0, nullptr);
+                memory_barrier(rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT);
                 for (int p = 0; p < 3; ++p) {
                     VkImageCopy copy{};
                     copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
@@ -1020,13 +975,11 @@ bool Engine::mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
                                    g.moshed[p]->image(),
                                    VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
                 }
-                VkMemoryBarrier from_xfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                from_xfer.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                from_xfer.dstAccessMask =
-                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-                vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                                     1, &from_xfer, 0, nullptr, 0, nullptr);
+                memory_barrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT |
+                                   VK_ACCESS_SHADER_WRITE_BIT);
             }
         } else {
             const auto predict = [&](uint32_t mangle,
@@ -1189,22 +1142,14 @@ bool Engine::ensure_codec_io(uint32_t width, uint32_t height) {
         if (codec_io_.readback)
             vmaDestroyBuffer(device_.allocator(), codec_io_.readback,
                              codec_io_.readback_alloc);
-        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = needed;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        VmaAllocationCreateInfo alloc_info{};
-        alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VmaAllocationInfo mapped{};
-        if (vmaCreateBuffer(device_.allocator(), &info, &alloc_info,
-                            &codec_io_.readback, &codec_io_.readback_alloc,
-                            &mapped) != VK_SUCCESS) {
-            codec_io_.readback = VK_NULL_HANDLE;
+        if (!create_mapped_buffer(device_, needed,
+                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  &codec_io_.readback,
+                                  &codec_io_.readback_alloc,
+                                  &codec_io_.mapped)) {
             codec_io_.capacity = 0;
             return false;
         }
-        codec_io_.mapped = mapped.pMappedData;
         codec_io_.capacity = needed;
     }
     return true;
@@ -1222,20 +1167,19 @@ VkCommandBuffer Engine::codec_begin_segment() {
 
 void Engine::codec_flush_segment() {
     vk_check(vkEndCommandBuffer(codec_io_.cmd), "vkEndCommandBuffer(codecbox)");
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &codec_io_.cmd;
-    {
-        std::lock_guard<std::mutex> lock(device_.queue_mutex());
-        vk_check(vkQueueSubmit(submit_queue_, 1, &submit,
-                               codec_io_.fence),
-                 "vkQueueSubmit(codecbox)");
-    }
-    vk_check(vkWaitForFences(device_.device(), 1, &codec_io_.fence, VK_TRUE,
-                             UINT64_MAX),
-             "vkWaitForFences(codecbox)");
-    vk_check(vkResetFences(device_.device(), 1, &codec_io_.fence),
-             "vkResetFences(codecbox)");
+    submit_and_wait(device_, submit_queue_, codec_io_.cmd, codec_io_.fence,
+                    "codecbox submit");
+}
+
+void Engine::dispatch_to_nv12(VkCommandBuffer rec, uint32_t frame_index,
+                              const GpuImage* in, uint32_t w, uint32_t h) {
+    codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+    const uint32_t nv_push[2] = {w, h};
+    const GpuImage* sampled[1] = {in};
+    GpuImage* storage[2] = {codec_io_.nv_y.get(), codec_io_.nv_uv.get()};
+    to_nv12_->dispatch(rec, arena_, frame_index, sampled, 1, storage, 2,
+                       nv_push, sizeof(nv_push), w, h, linear_sampler_);
 }
 
 // Taps past the fixed grid drop silently.
@@ -1309,6 +1253,22 @@ const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
                                              StagingBuffer& staging,
                                              const doc::Layer& layer) {
     if (layer.stops.empty()) return nullptr;
+    uint64_t hash = hash_combine(0x6A0Dull,
+                                 static_cast<uint64_t>(layer.gradient_space));
+    hash = hash_combine(hash, static_cast<uint64_t>(layer.gradient));
+    hash = hash_combine(hash, as_bits(layer.gradient_len));
+    hash = hash_combine(hash, as_bits(layer.gen_angle));
+    hash = hash_combine(hash, as_bits(layer.gradient_x));
+    hash = hash_combine(hash, as_bits(layer.gradient_y));
+    for (const doc::GradientStop& s : layer.stops) {
+        hash = hash_combine(hash, as_bits(std::clamp(s.t, 0.0f, 1.0f)));
+        hash = hash_combine(hash, as_bits(s.x));
+        hash = hash_combine(hash, as_bits(s.y));
+        for (float c : s.color) hash = hash_combine(hash, as_bits(c));
+    }
+
+    RampSlot& slot = ramp_state_[layer.id];
+    if (slot.tex && slot.hash == hash) return slot.tex.get();
     // Row 0 is the axial ramp, keyed on where each stop projects onto the
     // axis. Row 1 is the raw stop table that Mesh weights per pixel.
     std::vector<std::pair<float, doc::GradientStop>> stops;
@@ -1317,23 +1277,6 @@ const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
         stops.emplace_back(std::clamp(s.t, 0.0f, 1.0f), s);
     std::sort(stops.begin(), stops.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
-
-    uint64_t hash = hash_combine(0x6A0Dull,
-                                 static_cast<uint64_t>(layer.gradient_space));
-    hash = hash_combine(hash, static_cast<uint64_t>(layer.gradient));
-    hash = hash_combine(hash, as_bits(layer.gradient_len));
-    hash = hash_combine(hash, as_bits(layer.gen_angle));
-    hash = hash_combine(hash, as_bits(layer.gradient_x));
-    hash = hash_combine(hash, as_bits(layer.gradient_y));
-    for (const auto& [t, s] : stops) {
-        hash = hash_combine(hash, as_bits(t));
-        hash = hash_combine(hash, as_bits(s.x));
-        hash = hash_combine(hash, as_bits(s.y));
-        for (float c : s.color) hash = hash_combine(hash, as_bits(c));
-    }
-
-    RampSlot& slot = ramp_state_[layer.id];
-    if (slot.tex && slot.hash == hash) return slot.tex.get();
     if (!slot.tex) {
         slot.tex = GpuImage::create(
             device_, VK_FORMAT_R32G32B32A32_SFLOAT, kRampTexels, 2,
@@ -1508,12 +1451,7 @@ Engine::FeedbackSlot* Engine::ensure_feedback_prev(VkCommandBuffer rec,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         slot.last_frame = 0xFFFFFFFFu;
         if (!slot.prev) return nullptr;
-        slot.prev->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkClearColorValue black{};
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(rec, slot.prev->image(),
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
-                             &range);
+        clear_color(rec, *slot.prev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {});
     }
     slot.prev->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return &slot;
@@ -1524,15 +1462,7 @@ void Engine::feedback_writeback(VkCommandBuffer rec, FeedbackSlot& slot,
                                 GpuImage* dst, uint32_t w, uint32_t h,
                                 uint32_t timeline_frame) {
     if (slot.last_frame == timeline_frame) return;
-    dst->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    slot.prev->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.extent = {w, h, 1};
-    vkCmdCopyImage(rec, dst->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   slot.prev->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   1, &copy);
+    copy_full(rec, *dst, *slot.prev, w, h);
     slot.prev->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     dst->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
     slot.last_frame = timeline_frame;
@@ -1561,15 +1491,7 @@ bool Engine::slit_ring_push(VkCommandBuffer rec, SlitSlot& slot,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         if (!target) return false;
     }
-    in_img->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    target->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.extent = {w, h, 1};
-    vkCmdCopyImage(rec, in_img->image(),
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target->image(),
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    copy_full(rec, *in_img, *target, w, h);
     target->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     in_img->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     slot.head = (slot.head + 1) % kSlitRing;
@@ -1604,15 +1526,10 @@ GpuImage* Engine::rd_advance(VkCommandBuffer rec, uint32_t frame_index,
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             if (!slot.state[s]) return nullptr;
-            slot.state[s]->transition(rec,
-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             // A = 1, B = 0 everywhere: the quiescent state.
-            VkClearColorValue init_ab{{1.0f, 0.0f, 0.0f, 1.0f}};
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                          1};
-            vkCmdClearColorImage(rec, slot.state[s]->image(),
-                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &init_ab, 1, &range);
+            clear_color(rec, *slot.state[s],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VkClearColorValue{{1.0f, 0.0f, 0.0f, 1.0f}});
         }
         slot.cur = 0;
     }
@@ -1779,15 +1696,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         ref_key != 0 && ref_key == last_ref_key_ && ref_last && ref_last->y &&
         ensure_prev_ref(ref_last->width, ref_last->height)) {
         prev_frame_valid_ = root_frame == last_timeline_frame_ + 1;
-        ref_last->y->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        prev_y_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkImageCopy copy{};
-        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.extent = {ref_last->width, ref_last->height, 1};
-        vkCmdCopyImage(rec, ref_last->y->image(),
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, prev_y_->image(),
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        copy_full(rec, *ref_last->y, *prev_y_, ref_last->width,
+                  ref_last->height);
         prev_y_->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     } else {
         prev_frame_valid_ = false;
@@ -1882,13 +1792,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             if (!dummy_y_) return nullptr;
         }
-        dummy_y_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        const VkClearColorValue black{};
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                            1};
-        vkCmdClearColorImage(rec, dummy_y_->image(),
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
-                             &range);
+        clear_color(rec, *dummy_y_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {});
         ref_plane = dummy_y_.get();
         prev_frame_valid_ = false;
     }
@@ -1983,11 +1887,6 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         remaining_uses[static_cast<size_t>(graph.before)]++;
     if (graph.measure >= 0)
         remaining_uses[static_cast<size_t>(graph.measure)]++;
-    // One node can end several cards, so the keys collect per node.
-    std::unordered_map<int, std::vector<uint64_t>> tap_keys;
-    for (const auto& tap : graph.thumb_taps)
-        tap_keys[tap.second].push_back(tap.first);
-
     for (int index : graph.order) {
         const GraphNode& node = graph.nodes[static_cast<size_t>(index)];
         // look and timeline_frame below are per instance and shadow the root.
@@ -2017,13 +1916,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 // A key with no frame reads black, never another layer.
                 auto it = layer_planes_.find(skey);
                 if (it == layer_planes_.end() || !it->second.y) {
-                    dst->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                    const VkClearColorValue clear{};
-                    const VkImageSubresourceRange range{
-                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    vkCmdClearColorImage(rec, dst->image(),
-                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                         &clear, 1, &range);
+                    clear_color(rec, *dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                {});
                     break;
                 }
                 // NV12 binds one chroma texture to both slots; Cr is in .g.
@@ -2168,15 +2062,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     // Premultiplied zero, never opaque black: a ground and
                     // a matte reveal must composite as absent, not as a
                     // hole that hides whatever sits below.
-                    dst->transition(rec,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                    const VkClearColorValue zero{};
-                    const VkImageSubresourceRange range{
-                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    vkCmdClearColorImage(
-                        rec, dst->image(),
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1,
-                        &range);
+                    clear_color(rec, *dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                {});
                     break;
                 }
                 const GpuImage* sampled[2] = {sdf_tex, ramp_tex};
@@ -2245,44 +2132,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
                     // The byte-flip and bitrate paths need real bytes, so
                     // they roundtrip through the CPU in three steps.
-                    codec_io_.nv_y->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
-                    codec_io_.nv_uv->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
-                    {
-                        const uint32_t nv_push[2] = {w, h};
-                        const GpuImage* sampled[1] = {in};
-                        GpuImage* storage[2] = {codec_io_.nv_y.get(),
-                                                codec_io_.nv_uv.get()};
-                        to_nv12_->dispatch(rec, arena_, frame_index, sampled,
-                                           1, storage, 2, nv_push,
-                                           sizeof(nv_push), w, h,
-                                           linear_sampler_);
-                    }
-                    codec_io_.nv_y->transition(
-                        rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                    codec_io_.nv_uv->transition(
-                        rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                    dispatch_to_nv12(rec, frame_index, in, w, h);
+                    copy_nv12_to_buffer(rec, *codec_io_.nv_y, *codec_io_.nv_uv,
+                                        codec_io_.readback, w, h);
                     const size_t nv_bytes =
                         static_cast<size_t>(w) * h * 3 / 2;
                     const size_t flow_offset = (nv_bytes + 7) & ~size_t{7};
-                    VkBufferImageCopy copies[2]{};
-                    copies[0].bufferOffset = 0;
-                    copies[0].bufferRowLength = w;
-                    copies[0].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,
-                                                  0, 0, 1};
-                    copies[0].imageExtent = {w, h, 1};
-                    vkCmdCopyImageToBuffer(
-                        rec, codec_io_.nv_y->image(),
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        codec_io_.readback, 1, &copies[0]);
-                    copies[1].bufferOffset = static_cast<size_t>(w) * h;
-                    copies[1].bufferRowLength = w / 2;
-                    copies[1].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,
-                                                  0, 0, 1};
-                    copies[1].imageExtent = {w / 2, h / 2, 1};
-                    vkCmdCopyImageToBuffer(
-                        rec, codec_io_.nv_uv->image(),
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        codec_io_.readback, 1, &copies[1]);
                     if (flow_img) {
                         flow_img->transition(
                             rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2300,12 +2155,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         flow_img->transition(
                             rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                     }
-                    VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                    vkCmdPipelineBarrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-                                         &to_host, 0, nullptr, 0, nullptr);
+                    memory_barrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_HOST_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_HOST_READ_BIT);
                     codec_flush_segment();
 
                     // A paused re-render reuses the cached output.
@@ -2439,14 +2292,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.sig != ed_sig) {
                         in_img->transition(
                             rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        VkMemoryBarrier ed_pre{
-                            VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                        ed_pre.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                        ed_pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                        vkCmdPipelineBarrier(
-                            rec, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &ed_pre, 0,
-                            nullptr, 0, nullptr);
+                        memory_barrier(rec,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_SHADER_WRITE_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT);
                         VkBufferImageCopy ed_copy{};
                         ed_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,
                                                     0, 0, 1};
@@ -2457,14 +2307,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             codec_io_.readback, 1, &ed_copy);
                         in_img->transition(
                             rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                        VkMemoryBarrier ed_host{
-                            VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                        ed_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                        ed_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                        vkCmdPipelineBarrier(
-                            rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &ed_host, 0,
-                            nullptr, 0, nullptr);
+                        memory_barrier(rec, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_HOST_BIT,
+                                       VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_ACCESS_HOST_READ_BIT);
                         codec_flush_segment();
                         rec = codec_begin_segment();
                         vmaInvalidateAllocation(device_.allocator(),
@@ -2508,6 +2354,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                             param_count * sizeof(float));
                 const uint32_t push_bytes = static_cast<uint32_t>(
                     (kFxPreludeWords + param_count) * sizeof(uint32_t));
+                auto dispatch2 = [&](const GpuImage* a, const GpuImage* b,
+                                     uint32_t bytes) {
+                    const GpuImage* sampled[2] = {a, b};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(
+                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
+                        bytes, w, h, linear_sampler_);
+                };
 
                 if (fx.type == doc::EffectType::Glow) {
                     ComputePipeline& pipe = *glow_pass_[node.pass_index];
@@ -2525,11 +2378,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     }
                 } else if (fx.type == doc::EffectType::FlowSmear ||
                            fx.type == doc::EffectType::FlowPaint) {
-                    const GpuImage* sampled[2] = {input_image(0),
-                                                  input_image(1)};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), input_image(1), push_bytes);
                 } else if (fx.type == doc::EffectType::MotionExtract) {
                     // The luma planes are native, so sample through the fit.
                     float fit[4];
@@ -2564,12 +2413,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         as_bits(gm.tile);
                     push[kFxPreludeWords + param_count + 3] =
                         glyph_atlas_color_[which] ? 1u : 0u;
-                    const GpuImage* sampled[2] = {input_image(0),
-                                                  glyph_atlas_[which].get()};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes + 4 * sizeof(uint32_t), w, h,
-                        linear_sampler_);
+                    dispatch2(input_image(0), glyph_atlas_[which].get(),
+                              push_bytes + 4 * sizeof(uint32_t));
                 } else if (fx.type == doc::EffectType::Quantize) {
                     // Mode 9 puts the RD state in this slot; other modes
                     // bind the noise LUT there as a dummy.
@@ -2614,16 +2459,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     GpuImage* in_img =
                         const_cast<GpuImage*>(input_image(0));
-                    const GpuImage* past = in_img;
-                    if (slot.count > 0) {
-                        const uint32_t idx =
-                            (slot.head + kSlitRing - 1) % kSlitRing;
-                        if (slot.ring[idx]) past = slot.ring[idx].get();
-                    }
-                    const GpuImage* sampled[2] = {in_img, past};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    const GpuImage* past = slit_history(slot, in_img, 1);
+                    dispatch2(in_img, past, push_bytes);
                     if (!slit_ring_push(rec, slot, in_img, w, h,
                                         timeline_frame))
                         return nullptr;
@@ -2635,17 +2472,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         static_cast<float>(kSlitRing - 1)));
                     GpuImage* in_img =
                         const_cast<GpuImage*>(input_image(0));
-                    const GpuImage* past = in_img;
-                    if (delay > 0 && slot.count > 0) {
-                        const uint32_t age = std::min(delay, slot.count);
-                        const uint32_t idx =
-                            (slot.head + kSlitRing - age) % kSlitRing;
-                        if (slot.ring[idx]) past = slot.ring[idx].get();
-                    }
-                    const GpuImage* sampled[2] = {in_img, past};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    const GpuImage* past = slit_history(
+                        slot, in_img, std::min(delay, slot.count));
+                    dispatch2(in_img, past, push_bytes);
                     if (!slit_ring_push(rec, slot, in_img, w, h,
                                         timeline_frame))
                         return nullptr;
@@ -2727,27 +2556,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     extra[3] = as_bits(kTextBuckets[bucket]);
                     const GpuImage* sdf_tex =
                         ras ? ras->tex.get() : noise_lut_.get();
-                    const GpuImage* sampled[2] = {input_image(0), sdf_tex};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes + 4 * sizeof(uint32_t), w, h,
-                        linear_sampler_);
+                    dispatch2(input_image(0), sdf_tex,
+                              push_bytes + 4 * sizeof(uint32_t));
                 } else if (fx.type == doc::EffectType::Displace) {
                     // Input 1 is the wired map, or the input's own luma.
                     const GpuImage* map = node.inputs.size() > 1
                                               ? input_image(1)
                                               : input_image(0);
-                    const GpuImage* sampled[2] = {input_image(0), map};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), map, push_bytes);
                 } else if (fx.type == doc::EffectType::DustScratches) {
                     // The damage plate is input 1 and is always present.
-                    const GpuImage* sampled[2] = {input_image(0),
-                                                  dust_tex_.get()};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), dust_tex_.get(), push_bytes);
                 } else if (fx.type == doc::EffectType::SlitScan) {
                     // One dispatch per age band; the bands write disjoint
                     // pixels, so they need no barrier between them.
@@ -2761,11 +2580,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + static_cast<uint32_t>(sizeof(uint32_t));
                     for (uint32_t k = 0; k < depth; ++k) {
                         *extra = k;
-                        const GpuImage* sampled[2] = {
-                            in_img, slit_history(slot, in_img, k)};
-                        fx_[static_cast<size_t>(fx.type)]->dispatch(
-                            rec, arena_, frame_index, sampled, 2, &dst, 1,
-                            push, slit_bytes, w, h, linear_sampler_);
+                        dispatch2(in_img, slit_history(slot, in_img, k),
+                                  slit_bytes);
                     }
                     if (!slit_ring_push(rec, slot, in_img, w, h,
                                         timeline_frame))
@@ -2819,31 +2635,14 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         slot.last_tick = 0xFFFFFFFFu;
                     }
                     if (slot.last_tick != tick) {
-                        in_img->transition(
-                            rec, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        slot.held->transition(
-                            rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                        VkImageCopy hc{};
-                        hc.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
-                                             1};
-                        hc.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
-                                             1};
-                        hc.extent = {w, h, 1};
-                        vkCmdCopyImage(rec, in_img->image(),
-                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                       slot.held->image(),
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                       1, &hc);
+                        copy_full(rec, *in_img, *slot.held, w, h);
                         in_img->transition(
                             rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                         slot.last_tick = tick;
                     }
                     slot.held->transition(
                         rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    const GpuImage* sampled[2] = {in_img, slot.held.get()};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(in_img, slot.held.get(), push_bytes);
                 } else if (fx.type == doc::EffectType::Stutter) {
                     SlitSlot& slot = slit_ring_slot(skey, w, h);
                     GpuImage* in_img =
@@ -2857,15 +2656,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         const uint32_t step = static_cast<uint32_t>(
                             timeline_frame *
                             std::max(fx.params[2], 0.25f));
-                        const uint32_t age = 1u + (step % span);
-                        const uint32_t idx =
-                            (slot.head + kSlitRing - age) % kSlitRing;
-                        if (slot.ring[idx]) chosen = slot.ring[idx].get();
+                        chosen = slit_history(slot, in_img, 1u + (step % span));
                     }
-                    const GpuImage* sampled[2] = {in_img, chosen};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(in_img, chosen, push_bytes);
                     // Record once per timeline frame while unarmed; armed
                     // freezes the ring on purpose.
                     if (!armed && !slit_ring_push(rec, slot, in_img, w, h,
@@ -2880,10 +2673,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                               fx.params[0], fx.params[1],
                                               fx.params[3]);
                     if (!st) return nullptr;
-                    const GpuImage* sampled[2] = {input_image(0), st};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), st, push_bytes);
                 } else if (fx.type == doc::EffectType::VelocityScan) {
                     // The fronts step once per timeline frame; the canvas
                     // is the effect's own previous output.
@@ -2905,15 +2695,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                     VK_IMAGE_USAGE_STORAGE_BIT |
                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT);
                             if (!vs.state[s]) return nullptr;
-                            vs.state[s]->transition(
-                                rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                            VkClearColorValue zero{};
-                            VkImageSubresourceRange range{
-                                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                            vkCmdClearColorImage(
-                                rec, vs.state[s]->image(),
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero,
-                                1, &range);
+                            clear_color(rec, *vs.state[s],
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                        {});
                         }
                         vs.cur = 0;
                     }
@@ -2982,11 +2766,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         push_bytes + static_cast<uint32_t>(sizeof(uint32_t));
                     for (uint32_t k = 0; k < kSlitRing; ++k) {
                         *extra = k;
-                        const GpuImage* sampled[2] = {
-                            in_img, slit_history(slot, in_img, k)};
-                        fx_[static_cast<size_t>(fx.type)]->dispatch(
-                            rec, arena_, frame_index, sampled, 2, &dst, 1,
-                            push, mux_bytes, w, h, linear_sampler_);
+                        dispatch2(in_img, slit_history(slot, in_img, k),
+                                  mux_bytes);
                     }
                     if (!slit_ring_push(rec, slot, in_img, w, h,
                                         timeline_frame))
@@ -3033,11 +2814,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                              linear_sampler_);
                     mod_integral_->transition(
                         rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                    const GpuImage* sampled[2] = {input_image(0),
-                                                  mod_integral_.get()};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1,
-                        push, push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), mod_integral_.get(), push_bytes);
                 } else if (fx.type == doc::EffectType::TrackPin) {
                     // The CPU composes one 3x3 in double for the kernel.
                     // Rotation stays in metric space to stop a shear.
@@ -3126,13 +2903,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     const GpuImage* b_img = node.inputs.size() > 1
                                                 ? input_image(1)
                                                 : input_image(0);
-                    const GpuImage* sampled[2] = {input_image(0), b_img};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1,
-                        push,
-                        push_bytes +
-                            9u * static_cast<uint32_t>(sizeof(uint32_t)),
-                        w, h, linear_sampler_);
+                    dispatch2(input_image(0), b_img,
+                              push_bytes +
+                                  9u * static_cast<uint32_t>(sizeof(uint32_t)));
                 } else if (fx.type == doc::EffectType::BlendNode ||
                            fx.type == doc::EffectType::Aperture ||
                            fx.type == doc::EffectType::Parallax ||
@@ -3141,10 +2914,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     const GpuImage* b = node.inputs.size() > 1
                         ? input_image(1)
                         : input_image(0);
-                    const GpuImage* sampled[2] = {input_image(0), b};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), b, push_bytes);
                 } else if (fx.type == doc::EffectType::AudioScope) {
                     // The waveform strip was uploaded before graph eval.
                     auto it = audio_strip_.find(fx.id);
@@ -3152,18 +2922,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         it != audio_strip_.end() && it->second
                             ? it->second.get()
                             : input_image(0);
-                    const GpuImage* sampled[2] = {input_image(0), strip};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), strip, push_bytes);
                 } else if (doc::is_stateful_feedback(fx.type)) {
                     FeedbackSlot* fb = ensure_feedback_prev(rec, skey, w, h);
                     if (!fb) return nullptr;
-                    const GpuImage* sampled[2] = {input_image(0),
-                                                  fb->prev.get()};
-                    fx_[static_cast<size_t>(fx.type)]->dispatch(
-                        rec, arena_, frame_index, sampled, 2, &dst, 1, push,
-                        push_bytes, w, h, linear_sampler_);
+                    dispatch2(input_image(0), fb->prev.get(), push_bytes);
                     feedback_writeback(rec, *fb, dst, w, h, timeline_frame);
                 } else {
                     const GpuImage* sampled[1] = {input_image(0)};
@@ -3231,9 +2994,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         results[static_cast<size_t>(index)] = dst;
         // A card ends where the compiler says, never where the kind hints:
         // a matte or a group wrap sits past the effect that named the card.
-        if (const auto tit = tap_keys.find(index); tit != tap_keys.end())
-            for (uint64_t key : tit->second)
-                record_thumb_tap(rec, frame_index, dst, key);
+        for (const auto& tap : graph.thumb_taps)
+            if (tap.second == index)
+                record_thumb_tap(rec, frame_index, dst, tap.first);
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
                 pool_->release(results[static_cast<size_t>(input)]);
@@ -3243,14 +3006,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     if (graph.measure >= 0 && results[static_cast<size_t>(graph.measure)]) {
         GpuImage* mimg = results[static_cast<size_t>(graph.measure)];
         mimg->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        bounds_img_->transition(rec, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue cv{};
         for (int i = 0; i < 4; ++i) cv.uint32[i] = 0xFFFFFFFFu;
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-                                            0, 1};
-        vkCmdClearColorImage(rec, bounds_img_->image(),
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1,
-                             &range);
+        clear_color(rec, *bounds_img_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    cv);
         bounds_img_->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
         const uint32_t bpush[2] = {mimg->width(), mimg->height()};
         const GpuImage* msampled[1] = {mimg};
@@ -3300,12 +3059,10 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    cio.buf, 1, &copy);
             out->transition(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            VkMemoryBarrier to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host,
-                                 0, nullptr, 0, nullptr);
+            memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_HOST_READ_BIT);
             cio.pending = true;
             cio.pending_ctx = cache_ctx;
             cio.pending_frame = cache_frame;

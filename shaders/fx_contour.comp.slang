@@ -18,11 +18,6 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-float luma_at(float2 uv)
-{
-    return fx_luma(fx_srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb)));
-}
-
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
@@ -34,10 +29,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float n = clamp(round(levels), 3.0, 32.0);
-    const float l = luma_at(uv);
+    const float l = fx_enc_luma(input, uv);
     const float2 e = 1.0 / size;
-    const float gx = luma_at(uv + float2(e.x, 0)) - luma_at(uv - float2(e.x, 0));
-    const float gy = luma_at(uv + float2(0, e.y)) - luma_at(uv - float2(0, e.y));
+    const float gx = fx_enc_luma(input, uv + float2(e.x, 0)) - fx_enc_luma(input, uv - float2(e.x, 0));
+    const float gy = fx_enc_luma(input, uv + float2(0, e.y)) - fx_enc_luma(input, uv - float2(0, e.y));
     const float grad = max(length(float2(gx, gy)) * 0.5 * n, 1.0e-4);
 
     const float f = frac(l * n);

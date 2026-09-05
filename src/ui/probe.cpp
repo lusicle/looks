@@ -1,5 +1,7 @@
 #include "ui/probe.h"
 
+#include <utility>
+
 namespace looks::ui {
 
 namespace {
@@ -20,8 +22,8 @@ void probe_frame_begin() {
     accum().clear();
 }
 
-void probe_add(const std::string& name, const Rect& rect) {
-    accum().push_back({name, rect});
+void probe_add(std::string name, const Rect& rect) {
+    accum().push_back({std::move(name), rect});
 }
 
 bool probe_find(const std::string& name, int index, Rect* out) {

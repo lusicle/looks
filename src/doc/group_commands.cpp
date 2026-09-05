@@ -8,6 +8,11 @@ namespace looks::doc {
 
 namespace {
 
+Group* group_in(Look& look, size_t layer_index, uint64_t group_id) {
+    if (layer_index >= look.layers.size()) return nullptr;
+    return find_group(look.layers[layer_index], group_id);
+}
+
 class GroupEffectsCommand final : public LookCommand {
 public:
     GroupEffectsCommand(uint64_t look, size_t layer_index, Group group,
@@ -162,8 +167,7 @@ public:
 
     void apply(Document& doc) override {
         Look& look = look_of(doc);
-        if (layer_index_ >= look.layers.size()) return;
-        Group* g = find_group(look.layers[layer_index_], updated_.id);
+        Group* g = group_in(look, layer_index_, updated_.id);
         if (!g) return;
         old_ = *g;
         *g = updated_;
@@ -171,8 +175,7 @@ public:
 
     void revert(Document& doc) override {
         Look& look = look_of(doc);
-        if (layer_index_ >= look.layers.size()) return;
-        if (Group* g = find_group(look.layers[layer_index_], updated_.id))
+        if (Group* g = group_in(look, layer_index_, updated_.id))
             *g = old_;
     }
 
@@ -290,13 +293,7 @@ public:
                                                     insert_at_ +
                                                     effects_.size()));
         layer.groups.pop_back();
-        for (const NodeLink& added : added_links_)
-            for (auto it = look.links.rbegin(); it != look.links.rend(); ++it)
-                if (it->from == added.from && it->to == added.to &&
-                    it->to_port == added.to_port) {
-                    look.links.erase(std::next(it).base());
-                    break;
-                }
+        for (const NodeLink& added : added_links_) erase_last_link(look, added);
         if (materialized_) look.links.clear();
     }
 
@@ -321,15 +318,13 @@ public:
 
     void apply(Document& doc) override {
         Look& look = look_of(doc);
-        if (layer_index_ >= look.layers.size()) return;
-        if (Group* g = find_group(look.layers[layer_index_], group_id_))
+        if (Group* g = group_in(look, layer_index_, group_id_))
             g->inputs.push_back(slot_id_);
     }
 
     void revert(Document& doc) override {
         Look& look = look_of(doc);
-        if (layer_index_ >= look.layers.size()) return;
-        if (Group* g = find_group(look.layers[layer_index_], group_id_))
+        if (Group* g = group_in(look, layer_index_, group_id_))
             if (!g->inputs.empty() && g->inputs.back() == slot_id_)
                 g->inputs.pop_back();
     }
@@ -350,8 +345,7 @@ public:
 
     void apply(Document& doc) override {
         Look& look = look_of(doc);
-        if (layer_index_ >= look.layers.size()) return;
-        Group* g = find_group(look.layers[layer_index_], group_id_);
+        Group* g = group_in(look, layer_index_, group_id_);
         if (!g) return;
         removed_at_ = g->inputs.size();
         for (size_t i = 0; i < g->inputs.size(); ++i)
@@ -372,8 +366,7 @@ public:
 
     void revert(Document& doc) override {
         Look& look = look_of(doc);
-        if (layer_index_ >= look.layers.size()) return;
-        if (Group* g = find_group(look.layers[layer_index_], group_id_))
+        if (Group* g = group_in(look, layer_index_, group_id_))
             if (removed_at_ <= g->inputs.size())
                 g->inputs.insert(g->inputs.begin() +
                                      static_cast<ptrdiff_t>(removed_at_),

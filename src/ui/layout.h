@@ -40,10 +40,8 @@ enum class NodeKind : uint8_t {
     Leaf, VStack, HStack, ZStack, Padding, ScrollArea
 };
 
-enum class AlignMode : uint8_t { Start, Center, End, Stretch };
-enum class Justify : uint8_t {
-    Start, Center, End, SpaceBetween, SpaceAround, SpaceEvenly
-};
+enum class AlignMode : uint8_t { Start, Center, Stretch };
+enum class Justify : uint8_t { Start, Center, End };
 
 struct ScrollState {
     float offset = 0.0f;        // px scrolled along the main axis

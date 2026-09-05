@@ -58,10 +58,6 @@ private:
     explicit UiRenderer(gfx::Device& device) : device_(device) {}
 
     bool init(VkFormat color_format, const std::filesystem::path& shader_dir);
-    VkShaderModule load_shader(const std::filesystem::path& path);
-    VkPipeline build_pipeline(VkShaderModule vs, VkShaderModule fs,
-                              VkPipelineLayout layout, VkFormat color_format,
-                              uint32_t attribute_count);
 
     struct GeometryBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;

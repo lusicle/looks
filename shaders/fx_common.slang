@@ -110,6 +110,11 @@ float fx_ign(uint2 p)
     return frac(52.9829189 * frac(g));
 }
 
+float fx_enc_luma(Sampler2D tex, float2 uv)
+{
+    return fx_luma(fx_srgb_oetf(saturate(tex.SampleLevel(uv, 0).rgb)));
+}
+
 float fx_lut_texel(Sampler2D lut, uint x, uint y)
 {
     const float2 uv = (float2(float(x), float(y)) + 0.5) /

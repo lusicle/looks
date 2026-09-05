@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 #include "gfx/vk_device.h"
 #include "util/log.h"
@@ -15,7 +16,6 @@ std::unique_ptr<GpuImage> GpuImage::create(Device& device, VkFormat format,
                                            VkImageUsageFlags usage) {
     auto img = std::unique_ptr<GpuImage>(new GpuImage());
     img->device_ = &device;
-    img->format_ = format;
     img->width_ = width;
     img->height_ = height;
 
@@ -172,8 +172,38 @@ void TargetPool::release_all() {
         entries_.end());
 }
 
-void TargetPool::clear() {
-    entries_.clear();
+bool create_mapped_buffer(Device& device, VkDeviceSize bytes,
+                          VkBufferUsageFlags usage, VkBuffer* buffer,
+                          VmaAllocation* allocation, void** mapped) {
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = bytes;
+    info.usage = usage;
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo result{};
+    if (vmaCreateBuffer(device.allocator(), &info, &alloc_info, buffer,
+                        allocation, &result) != VK_SUCCESS) {
+        *buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    *mapped = result.pMappedData;
+    return true;
+}
+
+void submit_and_wait(Device& device, VkQueue queue, VkCommandBuffer cmd,
+                     VkFence fence, const char* label) {
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    {
+        std::lock_guard<std::mutex> lock(device.queue_mutex());
+        vk_check(vkQueueSubmit(queue, 1, &submit, fence), label);
+    }
+    vk_check(vkWaitForFences(device.device(), 1, &fence, VK_TRUE, UINT64_MAX),
+             label);
+    vk_check(vkResetFences(device.device(), 1, &fence), label);
 }
 
 }  // namespace looks::gfx

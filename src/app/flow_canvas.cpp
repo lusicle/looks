@@ -515,6 +515,67 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto wire_near = [&](Vec2 p0, Vec2 p3) {
         return wire_dist2(p0, p3, mouse);
     };
+    auto nearest_wire = [&](float radius, auto skip) {
+        float best = radius * radius;
+        int hit = -1;
+        for (size_t w = 0; w < g.wire_count; ++w) {
+            if (skip(g.wires[w])) continue;
+            Vec2 p0, p3;
+            if (!wire_ends(g.wires[w], &p0, &p3)) continue;
+            const float d = wire_near(p0, p3);
+            if (d < best) {
+                best = d;
+                hit = static_cast<int>(w);
+            }
+        }
+        return hit;
+    };
+    struct PortHit {
+        const Node* nd = nullptr;
+        uint32_t port = 0;
+    };
+    auto pick_out_port = [&](float radius, auto accept) {
+        std::vector<PortHit> cands;
+        ui::Picker pick;
+        auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
+            pick.add_point(mouse, p, radius, 0,
+                           static_cast<int>(cands.size()));
+            cands.push_back({&nd, pt});
+        };
+        for (size_t i = 0; i < n; ++i) {
+            const Node& nd = g.nodes[i];
+            if (!accept(nd)) continue;
+            if (nd.has_out) consider(nd, port_out(nd), 0);
+            for (int k = 0; k < exit_count(nd); ++k)
+                consider(nd, port_exit(nd, k), static_cast<uint32_t>(k));
+        }
+        return pick.hit() ? cands[static_cast<size_t>(pick.best())]
+                          : PortHit{};
+    };
+    auto pick_in_port = [&](float radius, bool aux_first, auto accept) {
+        std::vector<PortHit> cands;
+        ui::Picker pick;
+        auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
+            pick.add_point(mouse, p, radius, 0,
+                           static_cast<int>(cands.size()));
+            cands.push_back({&nd, pt});
+        };
+        for (size_t i = 0; i < n; ++i) {
+            const Node& nd = g.nodes[i];
+            if (!accept(nd)) continue;
+            if (nd.has_in) consider(nd, port_in(nd), 0);
+            if (aux_first && nd.has_aux_port) consider(nd, port_aux(nd), 2);
+            if (nd.has_matte_port) consider(nd, port_matte(nd), 1);
+            if (!aux_first && nd.has_aux_port) consider(nd, port_aux(nd), 2);
+            for (int k = 1; k <= nd.slot_rows; ++k)
+                consider(nd, port_slot(nd, k), static_cast<uint32_t>(k + 1));
+            if (nd.ghost_in && nd.kind == NodeKind::Group)
+                consider(nd, port_ghost(nd),
+                         static_cast<uint32_t>(nd.slot_rows + 2));
+        }
+        return pick.hit() ? cands[static_cast<size_t>(pick.best())]
+                          : PortHit{};
+    };
     auto open_add_menu = [&]() {
         if (!g.add_count) return;
         st.add_open = true;
@@ -525,18 +586,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.add_cat = -1;
         st.splice_from = st.splice_to = 0;
         st.splice_port = 0;
-        float best = 10.0f * 10.0f;
-        for (size_t w = 0; w < g.wire_count; ++w) {
-            if (g.wires[w].data || g.wires[w].to_port == 1) continue;
-            Vec2 p0, p3;
-            if (!wire_ends(g.wires[w], &p0, &p3)) continue;
-            const float d = wire_near(p0, p3);
-            if (d < best) {
-                best = d;
-                st.splice_from = g.wires[w].from;
-                st.splice_to = g.wires[w].to;
-                st.splice_port = g.wires[w].to_port;
-            }
+        const int hit = nearest_wire(10.0f, [](const Wire& wr) {
+            return wr.data || wr.to_port == 1;
+        });
+        if (hit >= 0) {
+            st.splice_from = g.wires[hit].from;
+            st.splice_to = g.wires[hit].to;
+            st.splice_port = g.wires[hit].to_port;
         }
         out.add_menu_opened = true;
     };
@@ -713,6 +769,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
+    auto popup_chrome = [&](const Rect& mr) {
+        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
+        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
+    };
+    auto popup_row = [&](const Rect& mr, float ry) {
+        const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
+                         mouse.y >= ry && mouse.y < ry + 20.0f;
+        if (hot)
+            canvas.draw_rect({mr.x + 2.0f, ry, mr.w - 4.0f, 20.0f},
+                             theme.control_bg_hover);
+        return hot;
+    };
+
     if (st.add_open) {
         const Rect mr = menu_rect();
         const bool have_fly =
@@ -765,54 +834,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         // Port grabs come before card hits.
         bool port_handled = false;
         // The nearest anchor wins: exits sit inside each other's grab radius.
-        {
-            struct PortRef { const Node* nd; uint32_t port; };
-            std::vector<PortRef> cands;
-            ui::Picker pick;
-            auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
-                pick.add_point(mouse, p, 9.0f, 0,
-                               static_cast<int>(cands.size()));
-                cands.push_back({&nd, pt});
-            };
-            for (size_t i = 0; i < n; ++i) {
-                const Node& nd = g.nodes[i];
-                if (nd.has_out) consider(nd, port_out(nd), 0);
-                for (int k = 0; k < exit_count(nd); ++k)
-                    consider(nd, port_exit(nd, k),
-                             static_cast<uint32_t>(k));
-            }
-            if (pick.hit()) {
-                const PortRef& pr = cands[static_cast<size_t>(pick.best())];
-                st.drag_kind = 4;
-                st.wire_from = pr.nd->id;
-                st.wire_from_port = pr.port;
-                frame.ctx.begin_drag(wid);
-                port_handled = true;
-            }
+        if (const PortHit pr =
+                pick_out_port(9.0f, [](const Node&) { return true; });
+            pr.nd) {
+            st.drag_kind = 4;
+            st.wire_from = pr.nd->id;
+            st.wire_from_port = pr.port;
+            frame.ctx.begin_drag(wid);
+            port_handled = true;
         }
         if (!port_handled) {
-            struct PortRef { const Node* nd; uint32_t port; };
-            std::vector<PortRef> cands;
-            ui::Picker pick;
-            auto consider = [&](const Node& nd2, Vec2 p, uint32_t pt) {
-                pick.add_point(mouse, p, 9.0f, 0,
-                               static_cast<int>(cands.size()));
-                cands.push_back({&nd2, pt});
-            };
-            for (size_t i = 0; i < n; ++i) {
-                const Node& nd2 = g.nodes[i];
-                if (nd2.has_in) consider(nd2, port_in(nd2), 0);
-                if (nd2.has_matte_port) consider(nd2, port_matte(nd2), 1);
-                if (nd2.has_aux_port) consider(nd2, port_aux(nd2), 2);
-                for (int k = 1; k <= nd2.slot_rows; ++k)
-                    consider(nd2, port_slot(nd2, k),
-                             static_cast<uint32_t>(k + 1));
-                if (nd2.ghost_in && nd2.kind == NodeKind::Group)
-                    consider(nd2, port_ghost(nd2),
-                             static_cast<uint32_t>(nd2.slot_rows + 2));
-            }
-            if (pick.hit()) {
-            const PortRef& best = cands[static_cast<size_t>(pick.best())];
+            const PortHit best =
+                pick_in_port(9.0f, false, [](const Node&) { return true; });
+            if (best.nd) {
             const uint32_t best_port = best.port;
             const Node& nd = *best.nd;
             auto grab_input = [&](uint32_t port) {
@@ -1042,22 +1076,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                   g.wires[w].to_port != 1 &&
                                   g.wires[w].to == dn->id);
                 if (!fed) {
-                    float best = 12.0f * 12.0f;
-                    for (size_t w = 0; w < g.wire_count; ++w) {
-                        const Wire& wr = g.wires[w];
-                        if (wr.data || wr.to_port == 1) continue;
-                        if (wr.from == dn->id || wr.to == dn->id)
-                            continue;
-                        Vec2 p0, p3;
-                        if (!wire_ends(wr, &p0, &p3)) continue;
-                        const float d2 = wire_near(p0, p3);
-                        if (d2 < best) {
-                            best = d2;
-                            st.drag_splice_from = wr.from;
-                            st.drag_splice_to = wr.to;
-                            st.drag_splice_port =
-                                wr.to_port;
-                        }
+                    const int hit = nearest_wire(12.0f, [&](const Wire& wr) {
+                        return wr.data || wr.to_port == 1 ||
+                               wr.from == dn->id || wr.to == dn->id;
+                    });
+                    if (hit >= 0) {
+                        st.drag_splice_from = g.wires[hit].from;
+                        st.drag_splice_to = g.wires[hit].to;
+                        st.drag_splice_port = g.wires[hit].to_port;
                     }
                 }
             }
@@ -1109,27 +1135,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             // The nearest anchor wins: exits sit inside each other's radius.
             const Node* to_nd = find_node(st.wire_old_to);
             if (to_nd) {
-                struct PortRef { const Node* nd; uint32_t port; };
-                std::vector<PortRef> cands;
-                ui::Picker pick;
-                auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
-                    pick.add_point(mouse, p, 18.0f, 0,
-                                   static_cast<int>(cands.size()));
-                    cands.push_back({&nd, pt});
-                };
-                for (size_t i = 0; i < n; ++i) {
-                    const Node& nd = g.nodes[i];
-                    if (nd.id == st.wire_old_to) continue;
-                    if (!out_feeds_input(nd, *to_nd, st.wire_old_port))
-                        continue;
-                    if (nd.has_out) consider(nd, port_out(nd), 0);
-                    for (int k = 0; k < exit_count(nd); ++k)
-                        consider(nd, port_exit(nd, k),
-                                 static_cast<uint32_t>(k));
-                }
-                if (pick.hit()) {
-                    const PortRef& pr =
-                        cands[static_cast<size_t>(pick.best())];
+                const PortHit pr = pick_out_port(18.0f, [&](const Node& nd) {
+                    return nd.id != st.wire_old_to &&
+                           out_feeds_input(nd, *to_nd, st.wire_old_port);
+                });
+                if (pr.nd) {
                     out.connect_requested = true;
                     out.connect_from = pr.nd->id;
                     out.connect_from_port = pr.port;
@@ -1160,32 +1170,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
             // The nearest anchor wins, never list order: rows sit 18 px apart.
-            {
-                struct PortRef { uint64_t id; uint32_t port; };
-                std::vector<PortRef> cands;
-                ui::Picker pick;
-                auto consider = [&](const Node& nd, Vec2 p, uint32_t pt) {
-                    pick.add_point(mouse, p, 18.0f, 0,
-                                   static_cast<int>(cands.size()));
-                    cands.push_back({nd.id, pt});
-                };
-                for (size_t i = 0; i < n && !from_mod; ++i) {
-                    const Node& nd = g.nodes[i];
-                    if (nd.id == st.wire_from) continue;
-                    if (nd.has_in) consider(nd, port_in(nd), 0);
-                    if (nd.has_aux_port) consider(nd, port_aux(nd), 2);
-                    if (nd.has_matte_port) consider(nd, port_matte(nd), 1);
-                    for (int k = 1; k <= nd.slot_rows; ++k)
-                        consider(nd, port_slot(nd, k),
-                                 static_cast<uint32_t>(k + 1));
-                    if (nd.ghost_in && nd.kind == NodeKind::Group)
-                        consider(nd, port_ghost(nd),
-                                 static_cast<uint32_t>(nd.slot_rows + 2));
-                }
-                if (pick.hit()) {
-                    const PortRef& pr =
-                        cands[static_cast<size_t>(pick.best())];
-                    to = pr.id;
+            if (!from_mod) {
+                const PortHit pr =
+                    pick_in_port(18.0f, true, [&](const Node& nd) {
+                        return nd.id != st.wire_from;
+                    });
+                if (pr.nd) {
+                    to = pr.nd->id;
                     port = pr.port;
                     found = true;
                 }
@@ -1265,17 +1256,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             if (frame.ctx.press_is_double(kEmptyPress)) {
                 open_add_menu();
             } else {
-                float best = 9.0f * 9.0f;
-                int hit = -1;
-                for (size_t w = 0; w < g.wire_count; ++w) {
-                    Vec2 p0, p3;
-                    if (!wire_ends(g.wires[w], &p0, &p3)) continue;
-                    const float d = wire_near(p0, p3);
-                    if (d < best) {
-                        best = d;
-                        hit = static_cast<int>(w);
-                    }
-                }
+                const int hit =
+                    nearest_wire(9.0f, [](const Wire&) { return false; });
                 if (hit >= 0) {
                     out.wire_clicked = true;
                     out.wire_clicked_shift =
@@ -2164,8 +2146,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                           theme.accent, false);
         }
         const Rect mr = menu_rect();
-        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
-        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
+        popup_chrome(mr);
         const bool empty_filter =
             !g.add_filter || g.add_filter[0] == '\0';
         const std::string header = caret_string(
@@ -2269,15 +2250,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
     if (st.ctx_open && g.ctx_count) {
         const Rect mr = ctx_rect();
-        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
-        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
+        popup_chrome(mr);
         for (size_t i = 0; i < g.ctx_count; ++i) {
             const float ry = mr.y + 4.0f + static_cast<float>(i) * 20.0f;
-            const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
-                             mouse.y >= ry && mouse.y < ry + 20.0f;
-            if (hot)
-                canvas.draw_rect({mr.x + 2.0f, ry, mr.w - 4.0f, 20.0f},
-                                 theme.control_bg_hover);
+            const bool hot = popup_row(mr, ry);
             ui::draw_text(canvas, frame.font, g.ctx_items[i],
                           {mr.x + 10.0f, ry + 4.0f}, 11.0f,
                           hot ? theme.text : theme.text_dim);
@@ -2287,8 +2263,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (st.port_menu_open) {
         const size_t feeds = port_feed_count();
         const Rect mr = port_menu_rect(feeds);
-        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
-        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
+        popup_chrome(mr);
         size_t seen = 0;
         for (size_t w = 0; w < g.wire_count; ++w) {
             const Wire& wr = g.wires[w];
@@ -2312,11 +2287,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             ui::probe_add("stack:" + std::string(title),
                           {mr.x, ry, mr.w, 20.0f});
-            const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
-                             mouse.y >= ry && mouse.y < ry + 20.0f;
-            if (hot)
-                canvas.draw_rect({mr.x + 2.0f, ry, mr.w - 4.0f, 20.0f},
-                                 theme.control_bg_hover);
+            const bool hot = popup_row(mr, ry);
             ui::draw_text(canvas, frame.font, title,
                           {mr.x + 10.0f, ry + 4.0f}, 11.0f,
                           hot ? theme.text : theme.text_dim);
@@ -2339,18 +2310,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     if (dd_row_p) {
         const int n = doc::param_option_count(dd_row_p->options);
         const Rect mr = dd_rect();
-        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
-        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
+        popup_chrome(mr);
         const int cur = std::clamp(
             static_cast<int>(*dd_row_p->staged - dd_row_p->min_v + 0.5f),
             0, n > 0 ? n - 1 : 0);
         for (int i = 0; i < n; ++i) {
             const float ry = mr.y + 4.0f + static_cast<float>(i) * 20.0f;
-            const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
-                             mouse.y >= ry && mouse.y < ry + 20.0f;
-            if (hot)
-                canvas.draw_rect({mr.x + 2.0f, ry, mr.w - 4.0f, 20.0f},
-                                 theme.control_bg_hover);
+            const bool hot = popup_row(mr, ry);
             char opt_buf[48];
             int olen = 0;
             const char* o =

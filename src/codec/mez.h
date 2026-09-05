@@ -34,6 +34,16 @@ struct DecodedFrame {
     // The codec paths never see nv12 frames.
     bool nv12 = false;
 
+    void alloc_planes(uint32_t w, uint32_t h) {
+        width = w;
+        height = h;
+        y_stride = w;
+        uv_stride = (w + 1) / 2;
+        y.resize(static_cast<size_t>(w) * h);
+        u.resize(uv_stride * ((h + 1) / 2));
+        v.resize(uv_stride * ((h + 1) / 2));
+    }
+
     FrameView view() const {
         if (nv12)
             return {{y.data(), y_stride},

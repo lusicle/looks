@@ -477,6 +477,12 @@ inline void canvas_size(const Document& doc, uint32_t* w, uint32_t* h) {
     *h = std::max(cvh & ~1u, 2u);
 }
 
+template <class Seq, class F>
+void for_each_lane(Seq& seq, F f) {
+    for (auto& t : seq.tracks) f(t);
+    for (auto& t : seq.audio) f(t);
+}
+
 inline uint32_t look_duration(const Document& doc, const Look& look,
                               int depth);
 inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
@@ -600,16 +606,12 @@ inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
     if (depth >= kMaxLookDepth) return 0;
     const double eff = effective_fps(doc, seq);
     uint32_t end = 0;
-    for (const SeqTrack& t : seq.tracks)
+    for_each_lane(seq, [&](const auto& t) {
         for (const Placement& p : t.placements)
             end = std::max(
                 end, placement_end(p, source_length(doc, p, depth + 1),
                                    placement_ratio(doc, p, eff)));
-    for (const AudioTrack& t : seq.audio)
-        for (const Placement& p : t.placements)
-            end = std::max(
-                end, placement_end(p, source_length(doc, p, depth + 1),
-                                   placement_ratio(doc, p, eff)));
+    });
     return end;
 }
 
@@ -921,6 +923,14 @@ inline bool prune_tombstone(Look& look) {
             return true;
         }
     return false;
+}
+
+inline void erase_last_link(Look& look, const NodeLink& l) {
+    for (auto it = look.links.rbegin(); it != look.links.rend(); ++it)
+        if (it->from == l.from && it->to == l.to && it->to_port == l.to_port) {
+            look.links.erase(std::next(it).base());
+            return;
+        }
 }
 
 }  // namespace looks::doc

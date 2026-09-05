@@ -60,4 +60,20 @@ private:
     ComputePipelineDesc desc_{};
 };
 
+VkShaderModule load_shader_module(Device& device,
+                                  const std::filesystem::path& path);
+
+struct GraphicsPipelineDesc {
+    VkShaderModule vs = VK_NULL_HANDLE;
+    VkShaderModule fs = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkFormat color_format = VK_FORMAT_UNDEFINED;
+    const VkPipelineVertexInputStateCreateInfo* vertex_input = nullptr;
+    const VkPipelineColorBlendAttachmentState* blend = nullptr;
+};
+
+VkPipeline create_graphics_pipeline(Device& device,
+                                    const GraphicsPipelineDesc& desc,
+                                    const char* label);
+
 }  // namespace looks::gfx

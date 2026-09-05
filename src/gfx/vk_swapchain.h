@@ -25,7 +25,6 @@ public:
     uint32_t image_count() const { return static_cast<uint32_t>(images_.size()); }
     VkImage image(uint32_t i) const { return images_[i]; }
     VkImageView view(uint32_t i) const { return views_[i]; }
-    VkSwapchainKHR handle() const { return swapchain_; }
 
     // VK_ERROR_OUT_OF_DATE_KHR is not fatal; the caller recreates and retries.
     VkResult acquire(VkSemaphore signal, uint32_t* image_index);

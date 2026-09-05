@@ -155,4 +155,7 @@ add_slang_shaders(looks_shaders
         matte_apply.comp.slang
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_common.slang
-        ${CMAKE_CURRENT_SOURCE_DIR}/fx_glow_blur_body.slang)
+        ${CMAKE_CURRENT_SOURCE_DIR}/fx_glow_blur_body.slang
+        ${CMAKE_CURRENT_SOURCE_DIR}/fx_pattern.slang
+        ${CMAKE_CURRENT_SOURCE_DIR}/fx_seg7.slang
+        ${CMAKE_CURRENT_SOURCE_DIR}/mosh_common.slang)

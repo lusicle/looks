@@ -98,57 +98,33 @@ private:
     uint32_t old_[4] = {};
 };
 
-class SetLaneLoopCommand final : public LookCommand {
+template <bool KeyframeLane::*Flag>
+class SetLaneFlagCommand final : public LookCommand {
 public:
-    SetLaneLoopCommand(uint64_t look, ParamKey target, bool loop)
-        : LookCommand(look), target_(target), loop_(loop) {}
-    std::string name() const override {
-        return loop_ ? "Loop Keyframes" : "Unloop Keyframes";
-    }
+    SetLaneFlagCommand(uint64_t look, ParamKey target, bool on,
+                       const char* on_name, const char* off_name)
+        : LookCommand(look), target_(target), on_(on), on_name_(on_name),
+          off_name_(off_name) {}
+    std::string name() const override { return on_ ? on_name_ : off_name_; }
 
     void apply(Document& doc) override {
         for (KeyframeLane& lane : look_of(doc).lanes) {
             if (!(lane.target == target_)) continue;
-            old_ = lane.loop;
-            lane.loop = loop_;
+            old_ = lane.*Flag;
+            lane.*Flag = on_;
         }
     }
 
     void revert(Document& doc) override {
         for (KeyframeLane& lane : look_of(doc).lanes)
-            if (lane.target == target_) lane.loop = old_;
+            if (lane.target == target_) lane.*Flag = old_;
     }
 
 private:
     ParamKey target_;
-    bool loop_;
-    bool old_ = false;
-};
-
-class SetLaneMuteCommand final : public LookCommand {
-public:
-    SetLaneMuteCommand(uint64_t look, ParamKey target, bool muted)
-        : LookCommand(look), target_(target), muted_(muted) {}
-    std::string name() const override {
-        return muted_ ? "Mute Keyframes" : "Unmute Keyframes";
-    }
-
-    void apply(Document& doc) override {
-        for (KeyframeLane& lane : look_of(doc).lanes) {
-            if (!(lane.target == target_)) continue;
-            old_ = lane.muted;
-            lane.muted = muted_;
-        }
-    }
-
-    void revert(Document& doc) override {
-        for (KeyframeLane& lane : look_of(doc).lanes)
-            if (lane.target == target_) lane.muted = old_;
-    }
-
-private:
-    ParamKey target_;
-    bool muted_;
+    bool on_;
+    const char* on_name_;
+    const char* off_name_;
     bool old_ = false;
 };
 
@@ -888,11 +864,13 @@ std::unique_ptr<Command> set_timeline_region_command(uint64_t look,
 }
 std::unique_ptr<Command> set_lane_loop_command(uint64_t look, ParamKey target,
                                                bool loop) {
-    return std::make_unique<SetLaneLoopCommand>(look, target, loop);
+    return std::make_unique<SetLaneFlagCommand<&KeyframeLane::loop>>(
+        look, target, loop, "Loop Keyframes", "Unloop Keyframes");
 }
 std::unique_ptr<Command> set_lane_mute_command(uint64_t look, ParamKey target,
                                                bool muted) {
-    return std::make_unique<SetLaneMuteCommand>(look, target, muted);
+    return std::make_unique<SetLaneFlagCommand<&KeyframeLane::muted>>(
+        look, target, muted, "Mute Keyframes", "Unmute Keyframes");
 }
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
                                                   bool sidechain_mux,

@@ -26,34 +26,43 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     return VK_FALSE;
 }
 
-bool has_layer(const char* name) {
+template <class P, class Enumerate>
+bool has_named(const char* name, Enumerate enumerate,
+               const char (P::*field)[VK_MAX_EXTENSION_NAME_SIZE]) {
     uint32_t count = 0;
-    vkEnumerateInstanceLayerProperties(&count, nullptr);
-    std::vector<VkLayerProperties> layers(count);
-    vkEnumerateInstanceLayerProperties(&count, layers.data());
-    for (const auto& l : layers)
-        if (std::strcmp(l.layerName, name) == 0) return true;
+    enumerate(&count, nullptr);
+    std::vector<P> props(count);
+    enumerate(&count, props.data());
+    for (const P& p : props)
+        if (std::strcmp(p.*field, name) == 0) return true;
     return false;
+}
+
+bool has_layer(const char* name) {
+    return has_named<VkLayerProperties>(
+        name,
+        [](uint32_t* n, VkLayerProperties* p) {
+            vkEnumerateInstanceLayerProperties(n, p);
+        },
+        &VkLayerProperties::layerName);
 }
 
 bool has_instance_extension(const char* name) {
-    uint32_t count = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
-    std::vector<VkExtensionProperties> exts(count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
-    for (const auto& e : exts)
-        if (std::strcmp(e.extensionName, name) == 0) return true;
-    return false;
+    return has_named<VkExtensionProperties>(
+        name,
+        [](uint32_t* n, VkExtensionProperties* p) {
+            vkEnumerateInstanceExtensionProperties(nullptr, n, p);
+        },
+        &VkExtensionProperties::extensionName);
 }
 
 bool has_device_extension(VkPhysicalDevice pd, const char* name) {
-    uint32_t count = 0;
-    vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, nullptr);
-    std::vector<VkExtensionProperties> exts(count);
-    vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, exts.data());
-    for (const auto& e : exts)
-        if (std::strcmp(e.extensionName, name) == 0) return true;
-    return false;
+    return has_named<VkExtensionProperties>(
+        name,
+        [pd](uint32_t* n, VkExtensionProperties* p) {
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, n, p);
+        },
+        &VkExtensionProperties::extensionName);
 }
 
 struct QueuePick {

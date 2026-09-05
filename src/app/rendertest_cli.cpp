@@ -50,33 +50,37 @@ gfx::Engine::LayerSourceFrame media_frame(const doc::Document& doc,
 }
 
 struct SyntheticSource {
+    uint32_t w, h;
     std::vector<uint8_t> y, u, v;
 
-    SyntheticSource() {
-        y.resize(kWidth * kHeight);
-        u.resize((kWidth / 2) * (kHeight / 2));
-        v.resize((kWidth / 2) * (kHeight / 2));
+    explicit SyntheticSource(uint32_t width, uint32_t height)
+        : w(width), h(height) {
+        y.resize(static_cast<size_t>(w) * h);
+        u.resize(static_cast<size_t>(w / 2) * (h / 2));
+        v.resize(static_cast<size_t>(w / 2) * (h / 2));
     }
 
     gfx::SourcePlanes planes(uint32_t frame) {
-        for (uint32_t r = 0; r < kHeight; ++r)
-            for (uint32_t c = 0; c < kWidth; ++c)
-                y[r * kWidth + c] = devsynth::luma(c, r, frame, kWidth);
-        for (uint32_t r = 0; r < kHeight / 2; ++r) {
-            for (uint32_t c = 0; c < kWidth / 2; ++c) {
-                u[r * (kWidth / 2) + c] = devsynth::cb(c, frame);
-                v[r * (kWidth / 2) + c] = devsynth::cr(r, frame);
+        for (uint32_t r = 0; r < h; ++r)
+            for (uint32_t c = 0; c < w; ++c)
+                y[static_cast<size_t>(r) * w + c] =
+                    devsynth::luma(c, r, frame, w);
+        for (uint32_t r = 0; r < h / 2; ++r)
+            for (uint32_t c = 0; c < w / 2; ++c) {
+                u[static_cast<size_t>(r) * (w / 2) + c] =
+                    devsynth::cb(c, frame);
+                v[static_cast<size_t>(r) * (w / 2) + c] =
+                    devsynth::cr(r, frame);
             }
-        }
         gfx::SourcePlanes p;
         p.y = y.data();
-        p.y_stride = kWidth;
+        p.y_stride = w;
         p.u = u.data();
-        p.u_stride = kWidth / 2;
+        p.u_stride = w / 2;
         p.v = v.data();
-        p.v_stride = kWidth / 2;
-        p.width = kWidth;
-        p.height = kHeight;
+        p.v_stride = w / 2;
+        p.width = w;
+        p.height = h;
         return p;
     }
 };
@@ -213,7 +217,7 @@ bool cache_coherence_check(gfx::Device& device,
         return false;
     }
     const uint64_t ctx = 0xC0FFEEull | 1u;
-    SyntheticSource source;
+    SyntheticSource source(kWidth, kHeight);
     std::vector<uint8_t> nv12;
     std::vector<uint64_t> miss_hashes, hit_hashes;
     for (uint32_t f = 0; f < frames; ++f) {
@@ -316,7 +320,7 @@ bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
         std::fprintf(stderr, "engine/readback init failed\n");
         return false;
     }
-    SyntheticSource source;
+    SyntheticSource source(kWidth, kHeight);
     std::vector<uint8_t> nv12;
     hashes.clear();
     for (uint32_t f = 0; f < frames; ++f) {
@@ -331,42 +335,6 @@ bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
     return true;
 }
 
-struct BenchSource {
-    uint32_t w, h;
-    std::vector<uint8_t> y, u, v;
-
-    explicit BenchSource(uint32_t width, uint32_t height)
-        : w(width), h(height) {
-        y.resize(static_cast<size_t>(w) * h);
-        u.resize(static_cast<size_t>(w / 2) * (h / 2));
-        v.resize(static_cast<size_t>(w / 2) * (h / 2));
-    }
-
-    gfx::SourcePlanes planes(uint32_t frame) {
-        for (uint32_t r = 0; r < h; ++r)
-            for (uint32_t c = 0; c < w; ++c)
-                y[static_cast<size_t>(r) * w + c] =
-                    devsynth::luma(c, r, frame, w);
-        for (uint32_t r = 0; r < h / 2; ++r)
-            for (uint32_t c = 0; c < w / 2; ++c) {
-                u[static_cast<size_t>(r) * (w / 2) + c] =
-                    devsynth::cb(c, frame);
-                v[static_cast<size_t>(r) * (w / 2) + c] =
-                    devsynth::cr(r, frame);
-            }
-        gfx::SourcePlanes p;
-        p.y = y.data();
-        p.y_stride = w;
-        p.u = u.data();
-        p.u_stride = w / 2;
-        p.v = v.data();
-        p.v_stride = w / 2;
-        p.width = w;
-        p.height = h;
-        return p;
-    }
-};
-
 int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
     const std::filesystem::path temp_dir =
         std::filesystem::path(LOOKS_REPO_ROOT) / "temp";
@@ -378,7 +346,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
 
     constexpr uint32_t kFrames = 16;
     constexpr uint32_t kWarm = 4;
-    BenchSource source(1920, 1080);
+    SyntheticSource source(1920, 1080);
 
     struct Row {
         double ms;
@@ -544,7 +512,7 @@ int wmain(int argc, wchar_t** argv) {
         auto engine = gfx::Engine::create(*device, shader_dir);
         auto readback = gfx::Nv12Readback::create(*device, shader_dir);
         if (!engine || !readback) return 1;
-        SyntheticSource source;
+        SyntheticSource source(kWidth, kHeight);
         auto producer = [&](uint32_t f, std::vector<uint8_t>& nv12) {
             const auto lf = media_frame(doc, source.planes(f));
             return readback->render(*engine, doc, doc.looks[0].id, f, 30.0,
