@@ -559,7 +559,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
              "colorizer", "palette_map", "posterize", "threshold", "solarize", "quantize",
              "bit_plane", "grain", "halftone", "cross_hatch", "photocopy", "risograph",
              "watercolor", "wet_plate", "cel_shade", "dither", "contour", "edge_detect",
-             "emulsion", "direct_flash", "oversharpen", "mosquito", "composite_artifacts", "film_stock", "lidar"})
+             "emulsion", "direct_flash", "oversharpen", "mosquito", "composite_artifacts", "film_stock", "lidar", "normalise"})
             preserves = preserves || std::strcmp(info.id, id) == 0;
         if (!preserves) continue;
         fx = doc::make_effect(doc, type);
@@ -633,6 +633,100 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     };
+    fx = doc::make_effect(doc, doc::EffectType::Normalise);
+    for (float quality : {0.0f, 1.0f}) {
+        fx.params[0] = quality;
+        for (auto source : {doc::LayerSourceKind::Solid, doc::LayerSourceKind::Shape}) {
+            layer.source = source;
+            layer.gen_scale = 0.13f;
+            layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.25f;
+            for (float alpha : {0.0f, 0.0625f, 0.5f, 1.0f}) {
+                layer.color_a[3] = alpha;
+                fx.wet = 0.0f;
+                if (!render(0)) return false;
+                const auto dry = pixels;
+                fx.wet = 1.0f;
+                for (float target : {0.0f, 0.18f, 0.5f, 1.0f}) {
+                    fx.params[1] = target;
+                    if (!render(0)) return false;
+                    ++cases;
+                    for (size_t i = 0; i < pixels.size(); i += 4) {
+                        const float expected = target * dry[i + 3];
+                        if (std::abs(pixels[i] - expected) > 0.0006f ||
+                            std::abs(pixels[i + 1] - expected) > 0.0006f ||
+                            std::abs(pixels[i + 2] - expected) > 0.0006f ||
+                            pixels[i + 3] != dry[i + 3]) {
+                            std::fprintf(stderr, "Normalise midpoint %.2f quality %.0f alpha %.4f: %.6f expected %.6f\n",
+                                target, quality, alpha, pixels[i], expected);
+                            ++failures;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    layer.source = doc::LayerSourceKind::Noise;
+    layer.gen_scale = 9.0f;
+    layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.95f;
+    layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.1f;
+    layer.color_a[3] = layer.color_b[3] = 0.5f;
+    fx.params[0] = 1.0f;
+    for (float target : {0.03f, 0.5f, 0.97f}) {
+        fx.params[1] = target;
+        fx.params[2] = 0.0f;
+        if (!render(0)) return false;
+        ++cases;
+        double light = 0.0, weight = 0.0;
+        float lo = 1.0f, hi = 0.0f;
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            light += pixels[i];
+            weight += pixels[i + 3];
+            lo = std::min(lo, pixels[i] / pixels[i + 3]);
+            hi = std::max(hi, pixels[i] / pixels[i + 3]);
+        }
+        if (std::abs(light / weight - target) > 0.0006 || lo < 0.0f || hi > 1.0f || hi <= lo) {
+            std::fprintf(stderr, "Normalise detail: mean %.6f target %.2f range %.6f %.6f\n",
+                light / weight, target, lo, hi);
+            ++failures;
+        }
+        if (target != 0.5f) {
+            fx.params[2] = 1.0f;
+            if (!render(0)) return false;
+            ++cases;
+            bool clipped = false;
+            for (size_t i = 0; i < pixels.size(); i += 4)
+                clipped = clipped || pixels[i] == 0.0f || pixels[i] == pixels[i + 3];
+            if (!clipped) {
+                std::fprintf(stderr, "Normalise clip range does not clip\n");
+                ++failures;
+            }
+        }
+    }
+    layer.source = doc::LayerSourceKind::TestPattern;
+    layer.osc_shape = 1u;
+    layer.gen_scale = 5.0f;
+    fx.params = {0.0f, 0.5f, 0.0f};
+    if (!render(0)) return false;
+    ++cases;
+    double pattern_light = 0.0, pattern_weight = 0.0;
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        pattern_light += pixels[i];
+        pattern_weight += pixels[i + 3];
+    }
+    if (std::abs(pattern_light / pattern_weight - 0.5) > 0.01) {
+        std::fprintf(stderr, "Normalise fast periodic input: mean %.6f\n", pattern_light / pattern_weight);
+        ++failures;
+    }
+    const auto stable_normalise = pixels;
+    if (!render(1) || pixels != stable_normalise) {
+        std::fprintf(stderr, "Normalise samples change between frames\n");
+        ++failures;
+    }
+    ++cases;
+    layer.source = doc::LayerSourceKind::Solid;
+    layer.osc_shape = 0u;
+    layer.color_a[3] = 1.0f;
     fx = doc::make_effect(doc, doc::EffectType::Watercolor);
     fx.params.assign(fx.params.size(), 0.0f);
     for (float level : {0.02f, 0.2f, 0.5f, 0.9f}) {

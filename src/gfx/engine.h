@@ -185,6 +185,7 @@ private:
     std::unique_ptr<ComputePipeline> crt_prepare_, crt_blur_;
     std::unique_ptr<ComputePipeline> optical_reduce_;
     std::unique_ptr<ComputePipeline> camera_meter_;
+    std::unique_ptr<ComputePipeline> normalise_reduce_;
     std::unique_ptr<ComputePipeline> scope_bins_pass_;
     std::unique_ptr<GpuImage> scope_bins_[kFramesInFlight];
     struct CrtSlot {

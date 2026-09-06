@@ -1040,6 +1040,12 @@ constexpr ParamDesc kWhiteBalanceParams[] = {
     {"tint", "tint", -1.0f, 1.0f, 0.0f, "%+.2f"},
 };
 
+constexpr ParamDesc kNormaliseParams[] = {
+    {"quality", "quality", 0.0f, 1.0f, 0.0f, "%.0f", "fast|accurate"},
+    {"midpoint", "midpoint", 0.0f, 1.0f, 0.5f, "%.3f"},
+    {"range", "range", 0.0f, 1.0f, 0.0f, "%.0f", "preserve detail|clip"},
+};
+
 constexpr ParamDesc kSharpenParams[] = {
     {"amount", "amount", 0.0f, 2.0f, 0.5f, "%.2f"},
     {"radius", "radius", 0.5f, 6.0f, 1.5f, "%.1f px"},
@@ -1282,6 +1288,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"halation", "Halation", kHalationParams, 6, FxCategory::Optics},
     {"rolling_shutter", "Rolling Shutter", kRollingShutterParams, 5,
      FxCategory::Warp},
+    {"normalise", "Normalise", kNormaliseParams, 3, FxCategory::Color},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));

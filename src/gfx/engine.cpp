@@ -277,6 +277,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_patch_weave.comp.spv", 1},
     {"fx_halation.comp.spv", 2},
     {"fx_rolling_shutter.comp.spv", 2},
+    {"fx_normalise.comp.spv", 2},
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -454,6 +455,8 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     if (!optical_reduce_) return false;
     camera_meter_ = mk("fx_camera_meter.comp.spv", 2, 1, 14 * sizeof(uint32_t));
     if (!camera_meter_) return false;
+    normalise_reduce_ = mk("fx_normalise_reduce.comp.spv", 1, 1, 5 * sizeof(uint32_t));
+    if (!normalise_reduce_) return false;
     scope_bins_pass_ = mk("fx_scope_bins.comp.spv", 1, 1, 4 * sizeof(uint32_t));
     if (!scope_bins_pass_) return false;
 
@@ -2230,7 +2233,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 }
                 const auto& fx = *fx_ptr;
 
-                if (fx_optical_filter(fx.type) &&
+                if ((fx_optical_filter(fx.type) || fx.type == doc::EffectType::Normalise) &&
                     (fx.wet <= 0.0f || fx.opacity <= 0.0f ||
                      ((fx.type == doc::EffectType::Glow || fx.type == doc::EffectType::CornerSoft) &&
                        fx.params[0] <= 0.0f))) {
@@ -2519,6 +2522,31 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     }
                     mix_composite_release(rec, frame_index, input_image(0), current, dst,
                         fx.wet, fx.opacity, w, h);
+                } else if (fx.type == doc::EffectType::Normalise) {
+                    GpuImage* source = input_image(0);
+                    uint32_t sw = w, sh = h;
+                    uint32_t grid_w = fx.params[0] < 0.5f ? std::min(w, 128u) : w;
+                    uint32_t grid_h = fx.params[0] < 0.5f ? std::min(h, 128u) : h;
+                    uint32_t first = 1;
+                    do {
+                        const uint32_t nw = (grid_w + 7u) / 8u;
+                        const uint32_t nh = (grid_h + 7u) / 8u;
+                        GpuImage* reduced = pool_->acquire(nw, nh, VK_FORMAT_R32G32B32A32_SFLOAT);
+                        if (!reduced) return nullptr;
+                        reduced->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                        const uint32_t rp[5] = {sw, sh, grid_w, grid_h, first};
+                        const GpuImage* sampled[1] = {source};
+                        normalise_reduce_->dispatch(rec, arena_, frame_index, sampled, 1,
+                            &reduced, 1, rp, sizeof(rp), grid_w, grid_h, linear_sampler_);
+                        reduced->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        if (!first) pool_->release(source);
+                        source = reduced;
+                        sw = grid_w = nw;
+                        sh = grid_h = nh;
+                        first = 0;
+                    } while (grid_w > 1 || grid_h > 1);
+                    dispatch2(input_image(0), source, push_bytes);
+                    pool_->release(source);
                 } else if (fx.type == doc::EffectType::CamAuto) {
                     FeedbackSlot* meter = ensure_feedback_prev(rec, skey, 1, 1);
                     if (!meter) return nullptr;

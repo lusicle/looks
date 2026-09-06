@@ -73,7 +73,8 @@ class TargetPool {
 public:
     explicit TargetPool(Device& device) : device_(device) {}
 
-    GpuImage* acquire(uint32_t width, uint32_t height);
+    GpuImage* acquire(uint32_t width, uint32_t height,
+                      VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT);
     void release(GpuImage* image);
     void release_all();
 
@@ -84,6 +85,7 @@ private:
         std::unique_ptr<GpuImage> image;
         bool in_use = false;
         uint64_t last_used = 0;
+        VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
     };
     Device& device_;
     std::vector<Entry> entries_;

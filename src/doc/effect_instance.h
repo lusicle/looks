@@ -145,6 +145,7 @@ enum class EffectType : uint32_t {
     PatchWeave,
     Halation,
     RollingShutter,
+    Normalise,
     Count,
 };
 

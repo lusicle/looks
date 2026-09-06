@@ -135,10 +135,10 @@ bool StagingBuffer::upload_image(VkCommandBuffer cmd, const void* data,
     return true;
 }
 
-GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
+GpuImage* TargetPool::acquire(uint32_t width, uint32_t height, VkFormat format) {
     for (Entry& e : entries_) {
         if (!e.in_use && e.image->width() == width &&
-            e.image->height() == height) {
+            e.image->height() == height && e.format == format) {
             e.in_use = true;
             e.last_used = gen_;
             return e.image.get();
@@ -146,12 +146,12 @@ GpuImage* TargetPool::acquire(uint32_t width, uint32_t height) {
     }
     // The render cache uploads into pooled targets; keep TRANSFER_DST.
     auto image = GpuImage::create(
-        device_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height,
+        device_, format, width, height,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
             VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (!image) return nullptr;
-    entries_.push_back({std::move(image), true, gen_});
+    entries_.push_back({std::move(image), true, gen_, format});
     return entries_.back().image.get();
 }
 

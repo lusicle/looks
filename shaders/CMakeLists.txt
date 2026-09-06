@@ -151,6 +151,8 @@ add_slang_shaders(looks_shaders
         fx_patch_weave.comp.slang
         fx_halation.comp.slang
         fx_rolling_shutter.comp.slang
+        fx_normalise.comp.slang
+        fx_normalise_reduce.comp.slang
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang
