@@ -13,6 +13,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float ortho;
     float tone;
     float plate;
@@ -33,13 +36,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     // The weights must sum to 1 at both ends of the lerp.
     const float3 w = lerp(kFxLumaW,
                           float3(0.05, 0.25, 0.70), saturate(ortho));
-    float l = dot(enc, w);
-
-    l = pow(l, 0.9);
+    const float exposure = dot(max(fx_straight(base), 0.0), w);
+    const float density = pow(exposure, 0.8);
+    float l = fx_srgb_oetf(float3(density / (density + 0.55), 0.0, 0.0)).r;
     l = l * 0.92 + 0.04 + saturate(fog) * 0.2 * (1.0 - l);
 
     const float2 border = min(uv, 1.0 - uv);
@@ -60,7 +62,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                              float3(1.0, 0.87, 0.70), saturate(tone));
     const float3 outc = fx_srgb_eotf(saturate(saturate(l) * tint));
 
-    const float4 result = float4(outc, base.a);
+    const float4 result = float4(outc * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

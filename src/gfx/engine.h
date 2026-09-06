@@ -180,16 +180,22 @@ private:
     uint64_t measured_placement_ = 0;
     std::unique_ptr<ComputePipeline> fx_[static_cast<size_t>(doc::EffectType::Count)];
     std::unique_ptr<ComputePipeline> matte_extract_, matte_apply_;
-    std::unique_ptr<ComputePipeline> glow_pass_[4];   // bright, H, V, comp
+    std::unique_ptr<ComputePipeline> glow_columns_;
     std::unique_ptr<ComputePipeline> flow_;
     std::unique_ptr<ComputePipeline> crt_prepare_, crt_blur_;
+    std::unique_ptr<ComputePipeline> optical_reduce_;
+    std::unique_ptr<ComputePipeline> camera_meter_;
+    std::unique_ptr<ComputePipeline> scope_bins_pass_;
+    std::unique_ptr<GpuImage> scope_bins_[kFramesInFlight];
     struct CrtSlot {
         std::unique_ptr<GpuImage> previous, current;
         uint32_t last_frame = 0xFFFFFFFFu;
         bool previous_valid = false;
     };
     std::unordered_map<uint64_t, CrtSlot> crt_state_;
-    std::vector<std::unique_ptr<GpuImage>> crt_retired_[kFramesInFlight];
+    std::vector<std::unique_ptr<GpuImage>> retired_images_[kFramesInFlight];
+    uint32_t render_slot_ = 0;
+    uint32_t effect_frame_ = 0;
 
     // A codec effect splits the graph into fenced CPU roundtrip segments.
     struct CodecIo {
@@ -226,7 +232,7 @@ private:
     std::unique_ptr<GpuImage> dummy_flow_;   // bound when no flow is wired
     struct MoshGpuSlot {
         std::unique_ptr<GpuImage> clean[3], moshed[3];       // Y, U, V
-        std::unique_ptr<GpuImage> pred_clean[3], pred_moshed[3], pred_tmp[3];
+        std::unique_ptr<GpuImage> pred_clean[3], pred_moshed[3];
         uint32_t w = 0, h = 0;
         uint32_t last_frame = 0xFFFFFFFFu;
         uint64_t sig = 0;   // paused-edit re-arm, same contract as MoshSlot
@@ -236,7 +242,7 @@ private:
     // Legal only when the params need no real bitstream.
     // state_key is the instance-scoped slot id, the same as GraphNode::key.
     bool mosh_gpu_box(VkCommandBuffer rec, const doc::EffectInstance& fx,
-                      uint64_t state_key,
+                      uint64_t state_key, uint64_t revision,
                       const codec::MoshParams& mp, const GpuImage* in,
                       GpuImage* flow_img, uint32_t w, uint32_t h,
                       uint32_t frame_index, uint32_t timeline_frame,
@@ -245,13 +251,16 @@ private:
 
     // Updated only when the timeline advances, so paused re-renders match.
     struct FeedbackSlot {
-        std::unique_ptr<GpuImage> prev;
+        std::unique_ptr<GpuImage> prev, current;
         uint32_t last_frame = 0xFFFFFFFFu;
+        uint32_t mode = 0xFFFFFFFFu;
+        bool valid = false;
     };
     std::unordered_map<uint64_t, FeedbackSlot> feedback_state_;
     // Recreated on size change and left SHADER_READ_ONLY for the pass.
     FeedbackSlot* ensure_feedback_prev(VkCommandBuffer rec, uint64_t skey,
-                                       uint32_t w, uint32_t h);
+                                       uint32_t w, uint32_t h,
+                                       VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT);
     void feedback_writeback(VkCommandBuffer rec, FeedbackSlot& slot,
                             GpuImage* dst, uint32_t w, uint32_t h,
                             uint32_t timeline_frame);
@@ -262,15 +271,14 @@ private:
     bool set_glyph_atlas_impl(const uint8_t* pixels, uint32_t width,
                               uint32_t height, float tile_px, uint32_t cols,
                               uint32_t rows, int slot, bool color);
-    // Slots: 0 halftone, 1 ascii, 2 custom, 3 braille, 4 teletext.
     // A color-flagged slot holds RGBA tiles: alpha is coverage.
-    std::unique_ptr<GpuImage> glyph_atlas_[5];
-    bool glyph_atlas_color_[5] = {};
+    std::unique_ptr<GpuImage> glyph_atlas_[3];
+    bool glyph_atlas_color_[3] = {};
     struct GlyphMeta {
         uint32_t cols = 16, rows = 6;
         float tile = 8.0f;
     };
-    GlyphMeta glyph_meta_[5];
+    GlyphMeta glyph_meta_[3];
 
     // Falls back to procedural grunge; this is always non-null.
     std::unique_ptr<GpuImage> dust_tex_;
@@ -317,6 +325,8 @@ private:
         std::unique_ptr<GpuImage> ring[kSlitRing];
         uint32_t head = 0;      // next write position
         uint32_t count = 0;     // valid entries
+        uint32_t read_head = 0, read_count = 0;
+        uint32_t read_frame = 0xFFFFFFFFu;
         uint32_t last_frame = 0xFFFFFFFFu;
     };
     std::unordered_map<uint64_t, SlitSlot> slit_state_;
@@ -359,16 +369,10 @@ private:
     GpuImage* rd_advance(VkCommandBuffer rec, uint32_t frame_index,
                          uint64_t skey, const GpuImage* in, uint32_t w,
                          uint32_t h, uint32_t timeline_frame, uint32_t steps,
-                         float feed, float kill, float inject);
+                         float feed, float kill, float inject, float fps = 60.0f);
 
     // Front field layout: one row per line, one column per along-axis texel.
     static constexpr uint32_t kVsSlots = 24;
-    struct VsSlot {
-        std::unique_ptr<GpuImage> state[2];
-        int cur = 0;
-        uint32_t last_frame = 0xFFFFFFFFu;
-    };
-    std::unordered_map<uint64_t, VsSlot> vs_state_;
     std::unique_ptr<ComputePipeline> vs_front_;
 
     // RGBA32F scratch: R, G, B channel phases plus the luma phase.

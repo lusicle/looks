@@ -87,6 +87,27 @@ TEST(stack_set_param_and_wet_opacity) {
              effect_info(EffectType::RgbSplit).params[0].default_value);
 }
 
+TEST(effect_controls_follow_dependencies) {
+    for (uint32_t type = 0; type < static_cast<uint32_t>(EffectType::Count); ++type) {
+        const auto& info = effect_info(static_cast<EffectType>(type));
+        CHECK(info.param_count <= 30);
+        CHECK(info.control_order != nullptr);
+        if (!info.control_order || info.param_count > 30) continue;
+        bool seen[32] = {};
+        for (uint32_t row = 0; row < info.param_count; ++row) {
+            const int p = info.control_order[row];
+            CHECK(p >= 0 && p < static_cast<int>(info.param_count));
+            if (p < 0 || p >= static_cast<int>(info.param_count)) continue;
+            CHECK(!seen[p]);
+            const int dependency = info.params[p].vis_param;
+            if (dependency >= 0) CHECK(seen[dependency]);
+            seen[p] = true;
+        }
+        CHECK_EQ(info.control_order[info.param_count], kWetParam);
+        CHECK_EQ(info.control_order[info.param_count + 1], kOpacityParam);
+    }
+}
+
 TEST(stack_param_drag_coalesces) {
     Document doc = make_doc_with_two();
     UndoStack undo;

@@ -1,6 +1,7 @@
 // These constants must stay equal to the shader prelude constants.
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 
@@ -67,6 +68,15 @@ inline float srgb_oetf(float lin) {
     if (lin < 0.0f) lin = 0.0f;
     return lin <= 0.0031308f ? lin * 12.92f
                              : 1.055f * std::pow(lin, 1.0f / 2.4f) - 0.055f;
+}
+
+inline const std::array<float, 256>& srgb8_linear_table() {
+    static const auto table = [] {
+        std::array<float, 256> values{};
+        for (int i = 0; i < 256; ++i) values[i] = srgb_eotf(i / 255.0f);
+        return values;
+    }();
+    return table;
 }
 
 inline float hsl_channel(float p, float q, float t) {

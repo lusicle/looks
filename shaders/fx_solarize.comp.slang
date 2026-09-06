@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float threshold;
     float folds;
     float knee;
@@ -24,8 +27,8 @@ float fold1(float x, float t, float k)
 {
     const float over = x - t;
     if (k > 1.0e-3) {
-        const float folded = t - (sqrt(over * over + k * k) - k);
-        return max(folded, 0.0) / max(t, 1.0e-3) * t;
+        const float u = saturate(over / k);
+        return max(x - 2.0 * max(over, 0.0) * u * (2.0 - u), 0.0);
     }
     return x <= t ? x : max(2.0 * t - x, 0.0);
 }
@@ -39,7 +42,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    float3 enc = fx_srgb_oetf(saturate(base.rgb));
+    float3 enc = fx_srgb_oetf(saturate(fx_straight(base)));
     const int n = clamp(int(folds + 0.5), 1, 4);
     const float t = clamp(threshold, 0.05, 0.95);
     const float k = knee * 0.12;
@@ -50,7 +53,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         if (i + 1 < n) enc = saturate(enc / max(t, 1.0e-3));
     }
 
-    const float4 result = float4(fx_srgb_eotf(saturate(enc)), base.a);
+    const float4 result = float4(fx_srgb_eotf(saturate(enc)) * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

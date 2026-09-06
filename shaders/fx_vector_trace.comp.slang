@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float density;
     float len_px;
     float rate;      // hz
@@ -53,18 +56,19 @@ void main(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= width || tid.y >= height)
         return;
-    const float2 size = float2(width, height);
-    const float2 uv = (float2(tid.xy) + 0.5) / size;
+    const float2 size = float2(canvas_w, canvas_h);
+    const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    float3 col = canvas.SampleLevel(uv, 0).rgb * saturate(persist);
+    float3 col = canvas.SampleLevel(uv, 0).rgb * fx_decay(persist, fps);
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
-    const uint epoch = uint(t * 0.25);
+    const uint epoch = 0;
     const float len = max(len_px, 4.0);
     const float cell = len * 1.25;
-    const float bw = max(beam_w, 0.5);
-    const float2 p = float2(tid.xy);
+    const float footprint = canvas_w / float(width);
+    const float bw = max(beam_w, footprint * 0.5);
+    const float2 p = uv * size;
 
     const int2 my_cell = int2(p / cell);
     [unroll]

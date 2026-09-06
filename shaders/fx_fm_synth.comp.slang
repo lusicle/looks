@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float freq;    // cycles across the frame
     float fm;
     float pm;
@@ -19,7 +22,8 @@ cbuffer Push
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D phase;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 static const float kTau = 6.28318530718;
 
@@ -34,24 +38,28 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * speed * kTau;
-    const float l = fx_luma(base.rgb);
+    const float l = fx_luma(fx_encoded(base));
     const uint m = uint(mode + 0.5);
 
-    const float scan = m == 1u ? uv.x : uv.y;
-    const float inst_freq = freq * (1.0 + fm * (l - 0.5) * 2.0);
+    const float2 axis = m == 1u ? float2(1.0 / size.x, 0.0) : float2(0.0, 1.0 / size.y);
+    const float ph = phase.SampleLevel(uv, 0).a + l * pm * 2.0;
+    const float2 next = clamp(uv + axis, 0.0, 1.0);
+    const float2 prev = clamp(uv - axis, 0.0, 1.0);
+    const float dp = abs(phase.SampleLevel(next, 0).a - phase.SampleLevel(prev, 0).a +
+                         (fx_enc_luma(input, next) - fx_enc_luma(input, prev)) * pm * 2.0) * 0.5;
     const float carrier =
-        sin(scan * inst_freq * kTau + l * pm * kTau * 2.0 + t);
+        sin(ph * kTau + t) * (1.0 - smoothstep(0.25, 0.5, dp));
 
     float3 outc;
     float out_a = base.a;
     if (m == 2u) {
         const float k = saturate(depth / 64.0);
-        outc = base.rgb * lerp(1.0, 0.5 + 0.5 * carrier, k * 2.0);
+        outc = base.rgb * lerp(1.0, 0.5 + 0.5 * carrier, k);
     } else {
         float2 suv = uv;
-        if (m == 1u) suv.y = uv.y + carrier * depth / size.y;
-        else suv.x = uv.x + carrier * depth / size.x;
-        const float4 s = input.SampleLevel(clamp(suv, 0.0, 1.0), 0);
+        if (m == 1u) suv.y = uv.y + carrier * depth / canvas_h;
+        else suv.x = uv.x + carrier * depth / canvas_w;
+        const float4 s = fx_sample_border(input, suv);
         outc = s.rgb;
         out_a = s.a;
     }

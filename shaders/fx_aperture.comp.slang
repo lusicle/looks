@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float radius;
     float blades;
     float rotation;
@@ -21,7 +24,8 @@ cbuffer Push
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D aux;
-[[vk::binding(2, 0)]] RWTexture2D<float4> output;
+[[vk::binding(2, 0)]] Sampler2D filtered;
+[[vk::binding(3, 0)]] RWTexture2D<float4> output;
 
 static const int kTaps = 48;
 
@@ -45,14 +49,14 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float depth;
     if (depth_src < 0.5)
-        depth = fx_luma(base.rgb);
+        depth = fx_luma(fx_straight(base));
     else if (depth_src < 1.5)
         depth = saturate(length(uv - 0.5) * 2.0);
     else
-        depth = fx_luma(aux.SampleLevel(uv, 0).rgb);
+        depth = fx_luma(fx_straight(aux.SampleLevel(uv, 0)));
 
     const float coc = abs(depth - focus) * 2.0;
-    const float r = radius * coc;
+    const float r = radius * coc * float(width) / canvas_w;
     if (r < 0.5)
     {
         output[tid.xy] = base;
@@ -76,8 +80,12 @@ void main(uint3 tid : SV_DispatchThreadID)
         d -= radial * along * edge * 0.75;
 
         const float2 suv = clamp(uv + d * r / size, 0.0, 1.0);
-        const float4 s = input.SampleLevel(suv, 0);
-        const float wgt = 1.0 + fx_luma(s.rgb) * (highlight - 1.0);
+        const float sample_depth = depth_src < 0.5 ? fx_luma(fx_straight(input.SampleLevel(suv, 0))) :
+            depth_src < 1.5 ? saturate(length(suv - 0.5) * 2.0) : fx_luma(fx_straight(aux.SampleLevel(suv, 0)));
+        const float4 s = lerp(input.SampleLevel(suv, 0), filtered.SampleLevel(suv, 0),
+                             smoothstep(2.0, 8.0, r));
+        const float depth_weight = 1.0 - smoothstep(0.01, 0.1, max(sample_depth - depth, 0.0));
+        const float wgt = max(0.0, 1.0 + fx_luma(s.rgb) * (highlight - 1.0)) * depth_weight;
         acc += s * wgt;
         wsum += wgt;
     }

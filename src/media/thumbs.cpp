@@ -19,7 +19,7 @@ bool write_thumbs(const std::filesystem::path& path,
     FILE* f = _wfopen(path.c_str(), L"wb");
     if (!f) return false;
     uint8_t header[10];
-    std::memcpy(header, "THM1", 4);
+    std::memcpy(header, strip.linear_filtered ? "THM2" : "THM1", 4);
     bytes::put_le16(header + 4, static_cast<uint16_t>(strip.w));
     bytes::put_le16(header + 6, static_cast<uint16_t>(strip.h));
     bytes::put_le16(header + 8, static_cast<uint16_t>(strip.count));
@@ -34,7 +34,8 @@ bool write_thumbs(const std::filesystem::path& path,
 bool read_thumbs(const std::filesystem::path& path, ThumbStripData* out) {
     const auto data = read_file_bytes(path);
     if (!data || data->size() <= 10 ||
-        std::memcmp(data->data(), "THM1", 4) != 0)
+        (std::memcmp(data->data(), "THM1", 4) != 0 &&
+         std::memcmp(data->data(), "THM2", 4) != 0))
         return false;
     const uint8_t* p = data->data();
     const uint32_t w = bytes::le16(p + 4);
@@ -45,6 +46,7 @@ bool read_thumbs(const std::filesystem::path& path, ThumbStripData* out) {
     out->w = w;
     out->h = h;
     out->count = count;
+    out->linear_filtered = std::memcmp(p, "THM2", 4) == 0;
     out->rgb.assign(p + 10, p + need);
     return true;
 }
@@ -56,10 +58,12 @@ bool read_thumbs_header(const std::filesystem::path& path,
     uint8_t header[10];
     const bool got = std::fread(header, 1, 10, f) == 10;
     std::fclose(f);
-    if (!got || std::memcmp(header, "THM1", 4) != 0) return false;
+    if (!got || (std::memcmp(header, "THM1", 4) != 0 &&
+                 std::memcmp(header, "THM2", 4) != 0)) return false;
     out->w = bytes::le16(header + 4);
     out->h = bytes::le16(header + 6);
     out->count = bytes::le16(header + 8);
+    out->linear_filtered = std::memcmp(header, "THM2", 4) == 0;
     out->rgb.clear();
     return out->w && out->h && out->count;
 }

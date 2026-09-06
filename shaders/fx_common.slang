@@ -4,6 +4,28 @@
 #ifndef FX_COMMON_SLANG
 #define FX_COMMON_SLANG
 
+float fx_decay(float retention, float fps)
+{
+    return pow(saturate(retention), 60.0 / max(fps, 1.0));
+}
+
+float fx_sinc(float x)
+{
+    return abs(x) < 0.0001 ? 1.0 : sin(x) / x;
+}
+
+float fx_segment_distance(float2 p, float2 a, float2 b)
+{
+    float2 ab = b - a;
+    return length(p - a - ab * saturate(dot(p - a, ab) / max(dot(ab, ab), 1e-8)));
+}
+
+float4 fx_sample_border(Sampler2D tex, float2 uv)
+{
+    return tex.SampleLevel(saturate(uv), 0) *
+        float(all(uv >= 0.0) && all(uv <= 1.0));
+}
+
 uint fx_hash(uint x)
 {
     x ^= x >> 16;
@@ -79,6 +101,41 @@ float3 fx_srgb_eotf(float3 encoded)
     return lerp(hi, lo, step(encoded, 0.04045));
 }
 
+float3 fx_straight(float4 c)
+{
+    return c.a > 1e-6 ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
+}
+
+float3 fx_encoded(float4 c)
+{
+    return fx_srgb_oetf(saturate(fx_straight(c)));
+}
+
+float4 fx_from_encoded(float3 c, float alpha)
+{
+    return float4(fx_srgb_eotf(saturate(c)) * alpha, alpha);
+}
+
+float4 fx_blend(float4 a, float4 b, uint mode)
+{
+    const float alpha = a.a + b.a * (1.0 - a.a);
+    if (mode == 0u) return float4(b.rgb + a.rgb * (1.0 - b.a), alpha);
+    const float3 ca = fx_straight(a);
+    const float3 cb = fx_straight(b);
+    float3 mixed = cb;
+    if (mode == 1u) mixed = ca + cb;
+    else if (mode == 2u) mixed = ca * cb;
+    else if (mode == 3u) mixed = fx_screen(ca, cb);
+    else if (mode == 4u) mixed = abs(ca - cb);
+    else if (mode == 5u) mixed = max(ca - cb, 0.0);
+    else if (mode == 6u) mixed = min(ca, cb);
+    else if (mode == 7u) mixed = max(ca, cb);
+    else if (mode == 8u) mixed = lerp(2.0 * ca * cb,
+        1.0 - 2.0 * (1.0 - ca) * (1.0 - cb), step(0.5, ca));
+    return float4(a.rgb * (1.0 - b.a) + b.rgb * (1.0 - a.a) +
+                  mixed * (a.a * b.a), alpha);
+}
+
 // The packed LUT is 512x192 R8. Rows 0 to 63 hold the STBN 64x64x8 atlas,
 // slice s at x = s*64. Rows 64 to 191 hold the 128x128 blue noise.
 
@@ -112,7 +169,7 @@ float fx_ign(uint2 p)
 
 float fx_enc_luma(Sampler2D tex, float2 uv)
 {
-    return fx_luma(fx_srgb_oetf(saturate(tex.SampleLevel(uv, 0).rgb)));
+    return fx_luma(fx_encoded(tex.SampleLevel(uv, 0)));
 }
 
 float fx_lut_texel(Sampler2D lut, uint x, uint y)

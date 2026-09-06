@@ -18,6 +18,8 @@ cbuffer Push
     uint mode;
     uint frame_w;
     uint frame_h;
+    float canvas_w;
+    float canvas_h;
 };
 
 [[vk::binding(0, 0)]] Sampler2D front_old;
@@ -35,7 +37,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float4 st = front_old.SampleLevel(st_uv, 0);
 
     const uint along_max = mode == 0u ? frame_h : frame_w;
-    const float extent = mode == 0u ? float(frame_w) : float(frame_h);
+    const float extent = mode == 0u ? canvas_w : canvas_h;
     if (tid.x >= along_max) {
         front_new[tid.xy] = st;
         return;
@@ -49,22 +51,27 @@ void main(uint3 tid : SV_DispatchThreadID)
             st = float4(0.0, 1.0, float(tick) + 1.0, 0.0);
         }
     } else {
+        if (st.r >= extent) {
+            st.g = 0.0;
+            front_new[tid.xy] = st;
+            return;
+        }
         const float2 uv = mode == 0u
-            ? float2((st.r + 0.5) / float(frame_w),
+            ? float2(st.r / canvas_w,
                      (float(tid.x) + 0.5) / float(frame_h))
             : float2((float(tid.x) + 0.5) / float(frame_w),
-                     (st.r + 0.5) / float(frame_h));
-        const float l = fx_luma(fx_srgb_oetf(
-            saturate(video.SampleLevel(saturate(uv), 0).rgb)));
+                     st.r / canvas_h);
+        const float l = fx_enc_luma(video, saturate(uv));
         const float brake =
             lerp(1.0, pow(saturate(1.0 - l), 3.0), saturate(stick));
         const float shear =
             1.0 + (fx_value_noise1(seed ^ (tid.y + 1u) * 131u,
-                                   float(tid.x) * 0.03 + t * 1.7) - 0.5) *
+                                   float(tid.x) / float(along_max) *
+                                   (mode == 0u ? canvas_h : canvas_w) * 0.03 + t * 1.7) - 0.5) *
                       wiggle * 1.6;
-        st.r += max(speed / max(fps, 1.0) * brake * shear, 0.04);
+        st.a = st.r;
+        st.r += speed / max(fps, 1.0) * brake * shear;
         // A stuck front retires after one full spawn cycle.
-        if (st.r >= extent) st.g = 0.0;
         if (float(tick) >= st.b - 1.0 + float(slots)) st.g = 0.0;
     }
     front_new[tid.xy] = st;

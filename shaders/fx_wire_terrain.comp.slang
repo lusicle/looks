@@ -25,13 +25,12 @@ cbuffer Push
 // Keep the band average. It dilutes 8-bit luma quantization steps.
 float wt_luma(Sampler2D tex, float2 suv, float band_v)
 {
-    const float l0 = fx_luma(tex.SampleLevel(suv, 0).rgb);
-    const float lu = fx_luma(tex.SampleLevel(
-        float2(suv.x, clamp(suv.y - band_v, 0.0, 1.0)), 0).rgb);
-    const float ld = fx_luma(tex.SampleLevel(
-        float2(suv.x, clamp(suv.y + band_v, 0.0, 1.0)), 0).rgb);
-    const float l = l0 * 0.5 + (lu + ld) * 0.25;
-    return fx_luma(fx_srgb_oetf(saturate(float3(l, l, l))));
+    const float4 center = tex.SampleLevel(suv, 0);
+    const float4 upper = tex.SampleLevel(
+        float2(suv.x, clamp(suv.y - band_v, 0.0, 1.0)), 0);
+    const float4 lower = tex.SampleLevel(
+        float2(suv.x, clamp(suv.y + band_v, 0.0, 1.0)), 0);
+    return fx_luma(fx_encoded(center * 0.5 + (upper + lower) * 0.25));
 }
 
 [shader("compute")]

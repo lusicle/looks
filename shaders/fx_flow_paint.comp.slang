@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float radius;   // px
     float aniso;
     float boost;
@@ -57,9 +60,17 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float2 mv = flow.SampleLevel(uv, 0).rg;
+    const float2 mv = flow.SampleLevel(uv, 0).rg * float2(canvas_w / width, canvas_h / height);
     const float speed = length(mv);
-    const float2 dir = speed > 0.05 ? mv / speed : float2(1.0, 0.0);
+    const float2 pixel = 1.0 / float2(canvas_w, canvas_h);
+    const float2 gradient = float2(
+        fx_luma(input.SampleLevel(clamp(uv + float2(pixel.x, 0), 0.0, 1.0), 0).rgb) -
+        fx_luma(input.SampleLevel(clamp(uv - float2(pixel.x, 0), 0.0, 1.0), 0).rgb),
+        fx_luma(input.SampleLevel(clamp(uv + float2(0, pixel.y), 0.0, 1.0), 0).rgb) -
+        fx_luma(input.SampleLevel(clamp(uv - float2(0, pixel.y), 0.0, 1.0), 0).rgb));
+    const float2 contour = length(gradient) > 1e-5 ?
+        normalize(float2(-gradient.y, gradient.x)) : float2(1.0, 0.0);
+    const float2 dir = speed > 0.5 ? mv / speed : contour;
 
     const float stretch =
         1.0 + aniso * (1.0 + saturate(speed * 0.15) * boost) * 1.6;
@@ -70,14 +81,13 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 m0, m1, m2;
     float a0, a1, a2;
     float v0, v1, v2;
-    sector(uv, size, major, minor, 1.0, m0, a0, v0);
-    sector(uv, size, major, minor, -1.0, m1, a1, v1);
-    sector(uv, size, minor, major * 0.4, 1.0, m2, a2, v2);
-    float3 outc = m0;
-    float out_a = a0;
-    float best = v0;
-    if (v1 < best) { outc = m1; out_a = a1; best = v1; }
-    if (v2 < best) { outc = m2; out_a = a2; }
+    sector(uv, float2(canvas_w, canvas_h), major, minor, 1.0, m0, a0, v0);
+    sector(uv, float2(canvas_w, canvas_h), major, minor, -1.0, m1, a1, v1);
+    sector(uv, float2(canvas_w, canvas_h), minor, major * 0.4, 1.0, m2, a2, v2);
+    float3 weights = 1.0 / pow(1.0 + float3(v0, v1, v2) * 200.0, 2.0);
+    weights /= weights.x + weights.y + weights.z;
+    float3 outc = m0 * weights.x + m1 * weights.y + m2 * weights.z;
+    float out_a = dot(float3(a0, a1, a2), weights);
 
     const float4 result = float4(outc, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));

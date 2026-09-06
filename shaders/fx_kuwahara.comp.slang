@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float radius;   // px, capped at 6 by the unrolled loops
 };
 
@@ -27,46 +30,33 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const int r = clamp(int(radius + 0.5), 1, 6);
-    float3 best_mean = 0.0;
-    float best_a = base.a;
-    float best_var = 1.0e9;
-
-    [unroll]
-    for (int q = 0; q < 4; ++q) {
-        const int sx = (q & 1) == 0 ? -1 : 0;
-        const int sy = (q & 2) == 0 ? -1 : 0;
-        float3 sum = 0.0;
-        float sum_a = 0.0;
-        float sum_l = 0.0, sum_l2 = 0.0;
-        float n = 0.0;
-        for (int j = 0; j <= 6; ++j) {
-            if (j > r) break;
-            for (int i = 0; i <= 6; ++i) {
-                if (i > r) break;
-                const float ox = sx == 0 ? float(i) : -float(i);
-                const float oy = sy == 0 ? float(j) : -float(j);
-                const float4 raw =
-                    input.SampleLevel(uv + float2(ox, oy) / size, 0);
-                const float3 s = fx_srgb_oetf(saturate(raw.rgb));
-                const float l = fx_luma(s);
-                sum += s;
-                sum_a += raw.a;
-                sum_l += l;
-                sum_l2 += l * l;
-                n += 1.0;
+    float4 sums[4] = {0.0, 0.0, 0.0, 0.0};
+    float2 moments[4] = {0.0, 0.0, 0.0, 0.0};
+    float counts[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int y = -r; y <= r; ++y) {
+        for (int x = -r; x <= r; ++x) {
+            float4 s = input.SampleLevel(clamp(uv + float2(x, y) / float2(canvas_w, canvas_h), 0.0, 1.0), 0);
+            float l = fx_luma(fx_srgb_oetf(saturate(fx_straight(s))));
+            for (int q = 0; q < 4; ++q) {
+                if (((q & 1) == 0 ? x <= 0 : x >= 0) &&
+                    ((q & 2) == 0 ? y <= 0 : y >= 0)) {
+                    sums[q] += s;
+                    moments[q] += float2(l, l * l);
+                    counts[q] += 1.0;
+                }
             }
         }
-        const float mean_l = sum_l / n;
-        const float variance = sum_l2 / n - mean_l * mean_l;
-        if (variance < best_var) {
-            best_var = variance;
-            best_mean = sum / n;
-            best_a = sum_a / n;
-        }
     }
-
-    const float4 result =
-        float4(fx_srgb_eotf(saturate(best_mean)), best_a);
+    float4 result = 0.0;
+    float total = 0.0;
+    for (int q = 0; q < 4; ++q) {
+        float2 m = moments[q] / counts[q];
+        float variance = max(m.y - m.x * m.x, 0.0);
+        float weight = 1.0 / pow(1.0 + variance * 200.0, 2.0);
+        result += sums[q] / counts[q] * weight;
+        total += weight;
+    }
+    result /= total;
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

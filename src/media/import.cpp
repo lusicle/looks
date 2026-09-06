@@ -115,9 +115,10 @@ void downsample_half(const I420Frame& src, I420Frame& dst) {
 
 // Each destination pixel box-averages its source region to stop aliasing.
 struct ThumbStrip {
-    ThumbStripData data{0, kThumbStripH, 0, {}};
+    ThumbStripData data{0, kThumbStripH, 0, {}, true};
 
     void add(const I420Frame& f) {
+        const auto& linear = color::srgb8_linear_table();
         uint32_t& w = data.w;
         const uint32_t h = data.h;
         if (w == 0)
@@ -134,27 +135,25 @@ struct ThumbStrip {
                 const uint32_t sx0 = x * f.width / w;
                 const uint32_t sx1 =
                     std::max(sx0 + 1, (x + 1) * f.width / w);
-                uint32_t sum_y = 0, sum_u = 0, sum_v = 0, n = 0;
+                float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+                uint32_t n = 0;
                 for (uint32_t sy = sy0; sy < sy1; ++sy)
                     for (uint32_t sx = sx0; sx < sx1; ++sx) {
-                        sum_y +=
-                            f.y[static_cast<size_t>(sy) * f.width + sx];
-                        sum_u += f.u[static_cast<size_t>(sy / 2) * scw +
-                                     sx / 2];
-                        sum_v += f.v[static_cast<size_t>(sy / 2) * scw +
-                                     sx / 2];
+                        int r, g, b;
+                        color::ycbcr709_to_rgb8(
+                            f.y[static_cast<size_t>(sy) * f.width + sx],
+                            f.u[static_cast<size_t>(sy / 2) * scw + sx / 2],
+                            f.v[static_cast<size_t>(sy / 2) * scw + sx / 2], &r, &g, &b);
+                        sum_r += linear[std::clamp(r, 0, 255)];
+                        sum_g += linear[std::clamp(g, 0, 255)];
+                        sum_b += linear[std::clamp(b, 0, 255)];
                         ++n;
                     }
-                int r, g, b;
-                color::ycbcr709_to_rgb8(
-                    static_cast<int>((sum_y + n / 2) / n),
-                    static_cast<int>((sum_u + n / 2) / n),
-                    static_cast<int>((sum_v + n / 2) / n), &r, &g, &b);
                 uint8_t* px = data.rgb.data() + base +
                               (static_cast<size_t>(y) * w + x) * 3;
-                px[0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
-                px[1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
-                px[2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
+                px[0] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(sum_r / n) * 255.0f + 0.5f, 0.0f, 255.0f));
+                px[1] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(sum_g / n) * 255.0f + 0.5f, 0.0f, 255.0f));
+                px[2] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(sum_b / n) * 255.0f + 0.5f, 0.0f, 255.0f));
             }
         }
         ++data.count;

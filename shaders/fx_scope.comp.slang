@@ -1,121 +1,62 @@
-// Binding 1 is this instance's output from the previous frame.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
-cbuffer Push
-{
-    uint width;
-    uint height;
-    float wet;
-    float opacity;
-    uint seed;
-    uint frame;
-    float fps;
-    float mode;
-    float gain;
-    float glow;
-    float persist;
-    float graticule;
-    float color;
+cbuffer Push {
+    uint width; uint height; float wet; float opacity; uint seed; uint frame; float fps;
+    float canvas_w; float canvas_h; uint history_valid;
+    float mode; float gain; float glow; float persist; float graticule; float color;
 };
-
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D canvas;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
+[[vk::binding(3, 0)]] RWTexture2D<float4> state_out;
+[[vk::binding(4, 0)]] [[vk::image_format("r32ui")]] RWTexture2D<uint> bins;
 
-static const float3 kPhosphor = float3(0.25, 1.0, 0.45);
+float3 trace_at(int2 p)
+{
+    if (any(p < 0) || any(p > 255)) return 0.0;
+    float count = float(bins[p]);
+    if (count <= 0.0) return 0.0;
+    float3 sum = float3(bins[p + int2(256, 0)], bins[p + int2(512, 0)], bins[p + int2(768, 0)]);
+    float3 tint = lerp(float3(0.25, 1.0, 0.45), sum / (count * 31.0), mode > 0.5 && mode < 1.5 ? 1.0 : saturate(color));
+    float samples = float(width) * float(height) / 65536.0;
+    float density = 1.0 - exp(-count / max(samples * 2.0, 1.0));
+    return tint * density;
+}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x >= width || tid.y >= height)
-        return;
-    const float2 size = float2(width, height);
-    const float2 uv = (float2(tid.xy) + 0.5) / size;
-    const float4 base = input.SampleLevel(uv, 0);
-
-    float3 col = canvas.SampleLevel(uv, 0).rgb * saturate(persist);
-
-    const float t = fps > 0.0 ? float(frame) / fps : 0.0;
-    const uint tick = uint(t * 24.0);
-    const uint m = uint(mode + 0.5);
-    const float g = saturate(glow);
-
-    if (m <= 1u) {
-        // The level space is encoded, not linear.
-        const uint third = min(uint(uv.x * 3.0), 2u);
-        const float u = m == 1u ? frac(uv.x * 3.0) : uv.x;
-        const float level = 1.0 - uv.y;
-        float acc = 0.0;
-        float3 sig = float3(0.0, 0.0, 0.0);
-        for (uint k = 0; k < 48; ++k) {
-            const float j =
-                fx_hash01(fx_hash3(seed ^ tick * 0x9E3Bu, k, 0x55u));
-            const float v = (float(k) + j) / 48.0;
-            const float3 enc = fx_srgb_oetf(saturate(
-                input.SampleLevel(float2(u, v), 0).rgb));
-            const float val =
-                m == 1u ? enc[third] : fx_luma(enc);
-            const float d =
-                (val * saturate(gain * 0.5 + 0.5) - level) * size.y;
-            const float a = exp(-d * d * 0.25);
-            acc += a;
-            sig += input.SampleLevel(float2(u, v), 0).rgb * a;
-        }
-        float3 trace_col;
-        if (m == 1u) {
-            const float3 tint = third == 0u ? float3(1.0, 0.25, 0.2)
-                              : third == 1u ? float3(0.25, 1.0, 0.3)
-                                            : float3(0.3, 0.4, 1.0);
-            trace_col = tint;
-        } else {
-            trace_col = lerp(kPhosphor,
-                             sig / max(acc, 1e-4) * 1.6, saturate(color));
-        }
-        col = max(col, trace_col * acc * 0.35 * g);
-
-        const float lf = frac(level * 4.0);
-        const float ld = min(lf, 1.0 - lf) * size.y * 0.25;
-        col += kPhosphor * saturate(graticule) * 0.10 *
-               exp(-ld * ld * 2.0);
+    if (tid.x >= width || tid.y >= height) return;
+    float2 size = float2(width, height);
+    float2 uv = (float2(tid.xy) + 0.5) / size;
+    float4 base = input.SampleLevel(uv, 0);
+    float2 signal_uv = uv;
+    if (mode > 1.5) signal_uv.x = (uv.x - 0.5) * float(width) / float(height) + 0.5;
+    float2 pos = signal_uv * 255.0;
+    int2 p = int2(floor(pos));
+    float2 f = frac(pos);
+    float3 trace = lerp(lerp(trace_at(p), trace_at(p + int2(1, 0)), f.x),
+                        lerp(trace_at(p + int2(0, 1)), trace_at(p + int2(1, 1)), f.x), f.y);
+    float3 halo = trace_at(p + int2(2, 0)) + trace_at(p - int2(2, 0)) +
+                  trace_at(p + int2(0, 2)) + trace_at(p - int2(0, 2));
+    trace += halo * saturate(glow) * 0.12;
+    float3 col = max(trace, canvas.SampleLevel(uv, 0).rgb * fx_decay(persist, fps));
+    state_out[tid.xy] = float4(col, saturate(fx_luma(col)));
+    float grid = 0.0;
+    if (mode < 1.5) {
+        float level = frac((1.0 - uv.y) * 4.0);
+        float d = min(level, 1.0 - level) * size.y * 0.25;
+        grid = exp(-d * d * 2.0);
     } else {
-        // Samples land at (Cb, -Cr) on a centered square.
-        const float2 ndc =
-            (float2(tid.xy) - size * 0.5) / (0.5 * size.y);
-        for (uint k = 0; k < 64; ++k) {
-            const uint hk = fx_hash3(seed ^ tick * 0x2F6Bu, k, 0x33u);
-            const float su =
-                (float(k % 8u) + fx_hash01(hk)) / 8.0;
-            const float sv =
-                (float(k / 8u) + fx_hash01(fx_hash(hk))) / 8.0;
-            const float3 rgb =
-                input.SampleLevel(float2(su, sv), 0).rgb;
-            const float3 enc = fx_srgb_oetf(saturate(rgb));
-            const float l = fx_luma(enc);
-            // The chroma scales match the NV12 encoder units.
-            const float2 cbcr = fx_rgb_to_cbcr709(enc, l);
-            const float2 pos = float2(cbcr.x, -cbcr.y) * 1.8 * gain;
-            const float d_px = length(pos - ndc) * 0.5 * size.y;
-            const float a = exp(-d_px * d_px * 0.28);
-            const float3 dot_col =
-                lerp(kPhosphor, rgb * 1.6, saturate(color));
-            col = max(col, dot_col * a * g * 1.2);
-        }
-        const float r = length(ndc);
-        const float ring =
-            exp(-pow((r - 0.9) * size.y * 0.5, 2.0) * 0.5);
-        const float cross_d =
-            min(abs(ndc.x), abs(ndc.y)) * 0.5 * size.y;
-        const float cross =
-            exp(-cross_d * cross_d * 2.0) * step(r, 0.9);
-        col += kPhosphor * saturate(graticule) * 0.12 * (ring + cross);
+        float2 ndc = (signal_uv - 0.5) * 2.0;
+        float radius = length(ndc);
+        float ring = exp(-pow((radius - 0.9) * size.y * 0.5, 2.0) * 0.5);
+        float d = min(abs(ndc.x), abs(ndc.y)) * size.y * 0.5;
+        grid = ring + exp(-d * d * 2.0) * step(radius, 0.9);
     }
-
-    const float4 result =
-        float4(min(col, float3(1.5, 1.5, 1.5)),
-               max(base.a, saturate(fx_luma(col))));
-    const float4 wetted = lerp(base, result, saturate(wet));
-    output[tid.xy] = lerp(base, wetted, saturate(opacity));
+    col += float3(0.25, 1.0, 0.45) * saturate(graticule) * grid * 0.1;
+    float4 result = float4(col, max(base.a, saturate(fx_luma(col))));
+    output[tid.xy] = lerp(base, result, saturate(wet) * saturate(opacity));
 }

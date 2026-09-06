@@ -42,7 +42,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float diff =
         inside ? saturate(abs(cur - prev) * max(gain, 0.0)) : 0.0;
 
-    const float3 diff_rgb = float3(diff, diff, diff);
+    const float3 diff_rgb = float3(diff, diff, diff) * base.a;
     const float3 scaled = base.rgb * diff;
     const float4 result =
         float4(lerp(scaled, diff_rgb, saturate(pure_diff)), base.a);

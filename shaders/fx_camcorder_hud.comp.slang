@@ -1,5 +1,3 @@
-// Draw the HUD in encoded space. It is signal, not scene.
-
 #include "fx_common.slang"
 #include "fx_seg7.slang"
 
@@ -13,118 +11,65 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
-    float size;       // px per overlay unit
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
+    float size;
     float blink_hz;
     float elements;
+    float battery;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] RWTexture2D<float4> output;
 
-float box(float2 p, float2 lo, float2 hi)
-{
-    return (p.x >= lo.x && p.x < hi.x && p.y >= lo.y && p.y < hi.y) ? 1.0
-                                                                    : 0.0;
-}
-
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x >= width || tid.y >= height)
-        return;
-    const float2 size_px = float2(width, height);
-    const float2 uv = (float2(tid.xy) + 0.5) / size_px;
-    const float4 base = input.SampleLevel(uv, 0);
+    if (tid.x >= width || tid.y >= height) return;
+    float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
+    float4 base = input.SampleLevel(uv, 0);
+    float2 canvas = float2(canvas_w, canvas_h);
+    float2 px = uv * canvas;
+    float unit = max(size, 1.0);
+    float2 f = canvas / float2(width, height) / unit;
 
-    const float unit = max(size, 1.0);
-    const float t = fps > 0.0 ? float(frame) / fps : 0.0;
-    const int el = int(elements + 0.5);
-    const float2 px = float2(tid.xy) + 0.5;
-
-    float white = 0.0, red = 0.0;
-
-    {
-        const float2 origin = float2(6.0, 5.0) * unit;
-        const float2 lp = (px - origin) / unit;
-        const bool blink = blink_hz < 0.05 ||
-                           frac(t * blink_hz) < 0.6;
-        if (blink) {
-            const float2 d = lp - float2(2.0, 3.5);
-            if (dot(d, d) < 4.0) red = 1.0;
-        }
-        const float2 rp = lp - float2(6.0, 0.0);
-        white = max(white, box(rp, float2(0, 0), float2(1, 7)));
-        white = max(white, box(rp, float2(0.5, 0), float2(3.5, 1)));
-        white = max(white, box(rp, float2(0.5, 3), float2(3.5, 4)));
-        white = max(white, box(rp, float2(3, 0.5), float2(4, 3.5)));
-        white = max(white, box(rp, float2(2.5, 4), float2(3.5, 7)));
-        const float2 ep = lp - float2(11.5, 0.0);
-        white = max(white, box(ep, float2(0, 0), float2(1, 7)));
-        white = max(white, box(ep, float2(0.5, 0), float2(3.5, 1)));
-        white = max(white, box(ep, float2(0.5, 3), float2(3.0, 4)));
-        white = max(white, box(ep, float2(0.5, 6), float2(3.5, 7)));
-        const float2 cp = lp - float2(17.0, 0.0);
-        white = max(white, box(cp, float2(0, 0), float2(1, 7)));
-        white = max(white, box(cp, float2(0.5, 0), float2(3.5, 1)));
-        white = max(white, box(cp, float2(0.5, 6), float2(3.5, 7)));
+    float2 p = (px - float2(6.0, 5.0) * unit) / unit;
+    float t = float(frame) / max(fps, 1.0);
+    float red = blink_hz < 0.05 || frac(t * blink_hz) < 0.6
+        ? overlay_disc(p - float2(2.0, 3.5), 2.0, f) : 0.0;
+    float white = 0.0;
+    float2 r = p - float2(6.0, 0.0);
+    white = max(white, seg_coverage(0x73u, r, f));
+    white = max(white, overlay_box(r, float2(2.5, 4), float2(3.5, 7), f));
+    white = max(white, seg_coverage(0x79u, p - float2(11.5, 0.0), f));
+    white = max(white, seg_coverage(0x39u, p - float2(17.0, 0.0), f));
+    if (elements >= 0.5) {
+        uint seconds = uint(t);
+        uint hh = (seconds / 3600u) % 24u;
+        uint mm = (seconds / 60u) % 60u;
+        uint ss = seconds % 60u;
+        int codes[16] = {int(hh / 10u), int(hh % 10u), -2, int(mm / 10u), int(mm % 10u),
+                         -2, int(ss / 10u), int(ss % 10u), -1, -1, -1, -1, -1, -1, -1, -1};
+        float2 origin = float2(canvas.x - 45.0 * unit, 5.0 * unit);
+        white = max(white, overlay_line((px - origin) / unit, codes, 8u, f));
     }
-
-    // Slot code -2 is the colon in the mm:ss counter.
-    if (el >= 1) {
-        const uint total_s = uint(t);
-        const uint mm = (total_s / 60u) % 100u;
-        const uint ss = total_s % 60u;
-        const int codes[5] = {int(mm / 10u), int(mm % 10u), -2,
-                              int(ss / 10u), int(ss % 10u)};
-        const float line_w = (5.0 * 5.0 - 1.0) * unit;
-        const float2 origin =
-            float2(size_px.x - 6.0 * unit - line_w, 5.0 * unit);
-        const float2 lp = (px - origin) / unit;
-        if (lp.y >= 0.0 && lp.y < 7.0) {
-            const int slot = int(floor(lp.x / 5.0));
-            if (slot >= 0 && slot < 5) {
-                const float2 cp = float2(lp.x - float(slot) * 5.0, lp.y);
-                const int code = codes[slot];
-                if (code >= 0)
-                    white = max(white, seg_coverage(kDigit[code], cp));
-                else if (cp.x >= 1.5 && cp.x < 2.5 &&
-                         ((cp.y >= 1.5 && cp.y < 2.5) ||
-                          (cp.y >= 4.5 && cp.y < 5.5)))
-                    white = 1.0;
-            }
-        }
-    }
-
-    if (el >= 2) {
-        const float2 origin = float2(6.0, size_px.y - 10.0 * unit);
-        const float2 lp = (px - origin) / unit;
-        const float shell =
-            max(box(lp, float2(0, 0), float2(12, 5)) -
-                    box(lp, float2(0.7, 0.7), float2(11.3, 4.3)),
-                box(lp, float2(12, 1.5), float2(13, 3.5)));
+    if (elements >= 1.5) {
+        float2 b = (px - float2(6.0 * unit, canvas.y - 10.0 * unit)) / unit;
+        float shell = max(overlay_box(b, float2(0, 0), float2(12, 5), f) -
+                          overlay_box(b, float2(0.7, 0.7), float2(11.3, 4.3), f),
+                          overlay_box(b, float2(12, 1.5), float2(13, 3.5), f));
         white = max(white, shell);
-        white = max(white, box(lp, float2(1.4, 1.4), float2(4.6, 3.6)));
-        white = max(white, box(lp, float2(5.4, 1.4), float2(8.6, 3.6)));
-
-        // The 0.05 margin puts brackets on the 90 percent safe frame.
-        const float2 m = size_px * 0.05;
-        const float bl = 10.0 * unit;
-        const float bw = 1.0 * unit;
-        const float2 q = float2(min(px.x, size_px.x - px.x),
-                                min(px.y, size_px.y - px.y));
-        if ((abs(q.x - m.x) < bw * 0.5 && q.y >= m.y && q.y < m.y + bl) ||
-            (abs(q.y - m.y) < bw * 0.5 && q.x >= m.x && q.x < m.x + bl))
-            white = max(white, 0.8);
+        white = max(white, overlay_box(b, float2(1.4, 1.4),
+                                      float2(1.4 + 9.2 * saturate(battery), 3.6), f));
+        float2 q = min(px, canvas - px) / unit;
+        float2 margin = canvas * 0.05 / unit;
+        float brackets = max(overlay_box(q, margin - float2(0.5, 0), margin + float2(0.5, 10), f),
+                             overlay_box(q, margin - float2(0, 0.5), margin + float2(10, 0.5), f));
+        white = max(white, brackets * 0.8);
     }
-
-    float3 enc = fx_srgb_oetf(saturate(base.rgb));
-    enc = lerp(enc, float3(0.92, 0.92, 0.92), white * 0.9);
-    enc = lerp(enc, float3(0.95, 0.15, 0.1), red * 0.95);
-
-    const float4 result =
-        float4(fx_srgb_eotf(saturate(enc)),
-               max(base.a, max(white * 0.9, red * 0.95)));
-    const float4 wetted = lerp(base, result, saturate(wet));
-    output[tid.xy] = lerp(base, wetted, saturate(opacity));
+    float4 result = overlay_ink(base, float3(0.92, 0.92, 0.92), white * 0.9);
+    result = overlay_ink(result, float3(0.95, 0.15, 0.1), red * 0.95);
+    output[tid.xy] = lerp(base, result, saturate(wet) * saturate(opacity));
 }

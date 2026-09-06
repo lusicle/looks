@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float bump;
     float jump_px;
     float flash;
@@ -30,9 +33,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float b = saturate(bump);
-    const float dy = b * jump_px / size.y;
-    const float2 suv = float2(uv.x, frac(uv.y + dy));
-    const float4 rolled = input.SampleLevel(suv, 0);
+    const float dy = b * cos((1.0 - b) * 12.56637) * jump_px / canvas_h;
+    const float2 suv = float2(uv.x, uv.y + dy);
+    const float4 rolled = fx_sample_border(input, suv);
     float3 col = rolled.rgb;
 
     if (dy > 0.0005) {
@@ -42,16 +45,17 @@ void main(uint3 tid : SV_DispatchThreadID)
         col *= 1.0 - bar * 0.85 * b;
     }
 
-    col = lerp(col, float3(1.4, 1.35, 1.2), flash * b * 0.7);
+    col = lerp(col, float3(1.4, 1.35, 1.2) * rolled.a, flash * b * 0.7);
 
     if (dirt * b > 0.01) {
-        const uint2 cell = uint2(tid.xy / 12u);
-        const uint h = fx_hash4(seed, frame, cell.x, cell.y);
+        const float2 pixel = uv * float2(canvas_w, canvas_h);
+        const uint2 cell = uint2(pixel / 12.0);
+        const uint h = fx_hash4(seed, 0u, cell.x, cell.y);
         if (fx_hash01(h) < dirt * b * 0.5) {
             const float2 cpos =
                 (float2(cell) + float2(fx_hash01(fx_hash(h ^ 0x1u)),
                                        fx_hash01(fx_hash(h ^ 0x2u)))) * 12.0;
-            const float2 d2 = float2(tid.xy) - cpos;
+            const float2 d2 = pixel - cpos;
             const float rr = 1.5 + 3.0 * fx_hash01(fx_hash(h ^ 0x3u));
             if (dot(d2, d2) < rr * rr)
                 col *= 0.15;

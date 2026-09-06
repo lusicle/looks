@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float type;
     float cell_w;
     float cell_h;
@@ -70,7 +73,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const bool celled = ty == 0 || ty == 1 || ty == 3;
     const float rf = saturate(refract);
     const float wb = saturate(wobble);
-    const float2 p = float2(tid.xy) + 0.5;
+    const float2 p = uv * float2(canvas_w, canvas_h);
 
     float2 g = float2(0.0, 0.0);   // surface gradient (unitless slope)
     float seam = 0.0;
@@ -134,40 +137,46 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 gdir = slen > 1.0e-4 ? g / slen : float2(1.0, 0.0);
     const float3 nrm = normalize(float3(-g, 1.0));
 
-    // refract is an ior proxy, not a real index of refraction.
-    const float dev = atan(slen) * (0.12 + 0.88 * rf);
+    const float ior = 1.0 + rf * 0.7;
+    const float incidence = atan(slen);
+    const float dev = incidence - asin(sin(incidence) / ior);
     const float travel = tan(min(dev, 1.25)) * cw * 0.45;
     const float2 disp = -gdir * travel;
-    const float2 duv = disp / size;
+    const float2 duv = disp / float2(canvas_w, canvas_h);
 
     const float sf = saturate(soften);
     const float blur_px =
         celled ? sf * cw * (0.06 + 0.12 * saturate(slen * 0.4))
                : sf * cw * 0.4;
-    const float2 buv = gdir * blur_px / size;
 
     const float dsp = saturate(dispersion) * 0.3;
-    const float2 uv_g = clamp(uv + duv, 0.0, 1.0);
-    const float2 uv_r = clamp(uv + duv * (1.0 - dsp), 0.0, 1.0);
-    const float2 uv_b = clamp(uv + duv * (1.0 + dsp), 0.0, 1.0);
+    const float2 uv_g = uv + duv;
+    const float2 uv_r = uv + duv * (1.0 - dsp);
+    const float2 uv_b = uv + duv * (1.0 + dsp);
     float3 col;
-    const float4 sr = input.SampleLevel(uv_r, 0);
-    const float4 sg = input.SampleLevel(uv_g, 0);
-    const float4 sb = input.SampleLevel(uv_b, 0);
+    const float4 sr = fx_sample_border(input, uv_r);
+    const float4 sg = fx_sample_border(input, uv_g);
+    const float4 sb = fx_sample_border(input, uv_b);
     col.r = sr.r;
     col.g = sg.g;
     col.b = sb.b;
     // Alpha moves with the refracted content. Union the split rays.
     float col_a = max(sg.a, max(sr.a, sb.a));
-    const float4 s0 = input.SampleLevel(clamp(uv_g - buv, 0.0, 1.0), 0);
-    const float4 s1 = input.SampleLevel(clamp(uv_g + buv, 0.0, 1.0), 0);
-    col = lerp(col, (col + s0.rgb + s1.rgb) * (1.0 / 3.0),
-               saturate(blur_px * 0.6));
-    col_a = lerp(col_a, (col_a + s0.a + s1.a) * (1.0 / 3.0),
-                 saturate(blur_px * 0.6));
+    if (blur_px > 0.01) {
+        float4 rough = 0.0;
+        for (int i = 0; i < 16; ++i) {
+            float theta = float(i) * 2.3999632;
+            float2 offset = float2(cos(theta), sin(theta)) *
+                sqrt((float(i) + 0.5) / 16.0) * blur_px / float2(canvas_w, canvas_h);
+            rough += fx_sample_border(input, uv_g + offset);
+        }
+        col = lerp(col, rough.rgb / 16.0, saturate(blur_px * 0.6));
+        col_a = lerp(col_a, rough.a / 16.0, saturate(blur_px * 0.6));
+    }
 
     const float ed = saturate(edge);
-    const float fres = pow(1.0 - saturate(nrm.z), 5.0);
+    const float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+    const float fres = f0 + (1.0 - f0) * pow(1.0 - saturate(nrm.z), 5.0);
     const float3 key = normalize(float3(-0.45, -0.6, 0.66));
     const float relief = dot(nrm, key) - 0.66;
     col *= 1.0 - fres * ed * 0.85;
@@ -178,7 +187,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float3 half_v = normalize(key + float3(0.0, 0.0, 1.0));
     const float lobe = pow(saturate(dot(nrm, half_v)), 60.0);
     const float grazing = 0.25 + 0.75 * fres;
-    const float env = 0.1 + 1.9 * fx_luma(col);
+    const float env = 0.1 * col_a + 1.9 * fx_luma(col);
     const float amp = 0.35 + 0.65 * saturate(nv.x * 0.5 + 0.5);
     col += lobe * grazing * env * amp * saturate(glint) * 1.6;
 

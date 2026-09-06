@@ -38,12 +38,12 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     if (crunch > 0.001) {
         const float2 e = z / size;   // one source pixel at this zoom
-        float3 ring = 0.0;
-        ring += input.SampleLevel(clamp(suv + float2(e.x, 0.0), 0.0, 1.0), 0).rgb;
-        ring += input.SampleLevel(clamp(suv - float2(e.x, 0.0), 0.0, 1.0), 0).rgb;
-        ring += input.SampleLevel(clamp(suv + float2(0.0, e.y), 0.0, 1.0), 0).rgb;
-        ring += input.SampleLevel(clamp(suv - float2(0.0, e.y), 0.0, 1.0), 0).rgb;
-        col = max(col + (col - ring * 0.25) * crunch * 1.2, 0.0);
+        float4 ring = 0.0;
+        ring += input.SampleLevel(clamp(suv + float2(e.x, 0.0), 0.0, 1.0), 0);
+        ring += input.SampleLevel(clamp(suv - float2(e.x, 0.0), 0.0, 1.0), 0);
+        ring += input.SampleLevel(clamp(suv + float2(0.0, e.y), 0.0, 1.0), 0);
+        ring += input.SampleLevel(clamp(suv - float2(0.0, e.y), 0.0, 1.0), 0);
+        col = max(col + (col - fx_straight(ring) * zoomed.a) * crunch * 1.2, 0.0);
     }
 
     const float4 result = float4(col, zoomed.a);

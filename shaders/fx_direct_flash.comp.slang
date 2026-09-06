@@ -37,18 +37,19 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float3 flash_tint =
         lerp(float3(1.0, 1.0, 1.0), float3(0.85, 0.92, 1.15), saturate(cool));
-    float3 col = base.rgb * (1.0 + lit * strength * 2.0) *
+    const float3 straight = fx_straight(base);
+    float3 col = straight * (1.0 + lit * strength * 2.0) *
                  lerp(float3(1.0, 1.0, 1.0), flash_tint, lit);
     col += lit * strength * 0.02;
     col *= lerp(0.55, 1.0, lit);
 
     if (red_eye > 0.001) {
-        const float l = fx_luma(base.rgb);
+        const float l = fx_luma(straight);
         const float dark = saturate(1.0 - l * 6.0);
         col.r += dark * dark * lit * red_eye * 0.9;
     }
 
-    const float4 result = float4(col, base.a);
+    const float4 result = float4(col * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

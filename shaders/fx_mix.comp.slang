@@ -1,3 +1,5 @@
+#include "fx_common.slang"
+
 [[vk::push_constant]]
 cbuffer Push
 {
@@ -19,9 +21,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 a = dry.SampleLevel(uv, 0);
-    const float4 b = fx.SampleLevel(uv, 0);
+    const float4 sampled = fx.SampleLevel(uv, 0);
+    const float4 b = float4(fx_straight(sampled) * a.a, a.a);
     const float4 wetted = lerp(a, b, saturate(wet));
     const float4 mixed = lerp(a, wetted, saturate(opacity));
     // Dry alpha survives. The NV12 roundtrip brings back no alpha.
-    output[tid.xy] = float4(mixed.rgb, a.a);
+    output[tid.xy] = mixed;
 }

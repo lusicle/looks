@@ -55,15 +55,15 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float n = max(levels, 2.0);
     float3 result;
     if (mode >= 0.5) {
-        const float y = fx_luma(saturate(base.rgb));
+        const float y = fx_luma(saturate(fx_straight(base)));
         const float q =
             fx_dither_levels(float3(y, y, y), n, t01).x / (n - 1.0);
         result = float3(q, q, q);
     } else {
-        result = fx_dither_levels(base.rgb, n, t01) / (n - 1.0);
+        result = fx_dither_levels(fx_straight(base), n, t01) / (n - 1.0);
     }
 
-    const float4 dithered = float4(fx_srgb_eotf(result), base.a);
+    const float4 dithered = fx_from_encoded(result, base.a);
     const float4 wetted = lerp(base, dithered, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float band_px;
     float shift_px;
     float noise;
@@ -30,27 +33,29 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
+    const float2 material_px = uv * float2(canvas_w, canvas_h);
+    const uint tick = uint(t * 59.94);
     const float edge_wob =
-        (fx_hash01(fx_hash3(seed ^ 0x6E2u, frame, 5u)) - 0.5) * 3.0;
-    const float band_top = size.y - max(band_px, 1.0) + edge_wob;
+        (fx_value_noise1(seed ^ 0x6E2u, t * wobble) - 0.5) * 3.0;
+    const float band_top = canvas_h - max(band_px, 0.0) + edge_wob * step(0.001, band_px);
 
     float4 result = base;
-    if (float(tid.y) >= band_top) {
+    if (material_px.y >= band_top && band_px > 0.0) {
         const float depth =
-            (float(tid.y) - band_top) / max(band_px, 1.0);
+            (material_px.y - band_top) / max(band_px, 1.0);
         const float sway =
-            (fx_value_noise1(seed, t * max(wobble, 0.01)) - 0.5) * 2.0;
+            (fx_value_noise1(seed, t * max(wobble, 0.0)) - 0.5) * 2.0;
         const float dx = sway * (0.55 + 0.45 * depth) * shift_px;
         const float2 suv =
-            float2(frac(uv.x + dx / size.x), uv.y);
+            float2(frac(uv.x + dx / canvas_w), uv.y);
         const float4 tugged = input.SampleLevel(suv, 0);
-        float3 c = tugged.rgb;
+        float3 c = fx_encoded(tugged);
         float c_a = tugged.a;
 
         const float streak = fx_vnoise2(
             seed ^ 0x31Bu,
-            float2(float(tid.x) / 7.0,
-                   float(tid.y) * 2.7 + float(frame) * 91.0)) - 0.5;
+            float2(material_px.x / 7.0,
+                   material_px.y * 2.7 + float(tick) * 91.0)) - 0.5;
         const float mixamt =
             saturate(noise * (0.2 + depth * depth) * 1.4);
         c = saturate(c + streak * mixamt * 1.1);
@@ -58,7 +63,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float l = fx_luma(c);
         c = lerp(c, float3(l, l, l), depth * 0.7);
 
-        const float from_edge = float(tid.y) - band_top;
+        const float from_edge = material_px.y - band_top;
         if (from_edge < 2.0) {
             const float sp =
                 fx_hash01(fx_hash4(seed, frame, tid.x / 3u, 9u));
@@ -68,7 +73,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                 c_a = max(c_a, noise * 0.9);
             }
         }
-        result = float4(c, c_a);
+        result = fx_from_encoded(c, c_a);
     }
 
     const float4 wetted = lerp(base, result, saturate(wet));

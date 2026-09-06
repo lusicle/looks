@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float af;
     float ae;
     float awb;
@@ -17,7 +20,8 @@ cbuffer Push
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D meter;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -32,8 +36,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float r = max(rate, 0.05);
 
-    const float hunt = fx_value_noise1(seed, t * r * 1.3);
-    const float defocus = af * 9.0 * hunt * hunt;
+    const float4 measured = meter.SampleLevel(float2(0.5, 0.5), 0);
+    const float defocus = af * measured.a;
 
     float3 col = base.rgb;
     float col_a = base.a;
@@ -47,7 +51,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float a = float(i) * 2.39996;
             const float rr = sqrt(fi) * defocus;
             const float2 p =
-                clamp(uv + float2(cos(a), sin(a)) * rr / size, 0.0, 1.0);
+                clamp(uv + float2(cos(a), sin(a)) * rr / float2(canvas_w, canvas_h), 0.0, 1.0);
             const float4 s = input.SampleLevel(p, 0);
             acc += s.rgb;
             acc_a += s.a;
@@ -57,21 +61,17 @@ void main(uint3 tid : SV_DispatchThreadID)
         col_a = acc_a / wsum;
     }
 
-    const float target =
-        (fx_value_noise1(seed ^ 0x0AEAu, t * r * 0.8) - 0.5) * 2.0;
-    const float gain = 1.0 + target * ae * 0.55;
+    const float gain = exp2(measured.r * ae);
     col *= gain;
     const float floor_amt = ae * max(gain - 1.0, 0.0) * 0.35;
     if (floor_amt > 0.001) {
         const float n =
             fx_hash01(fx_hash4(seed, frame, tid.x, tid.y)) - 0.5;
-        const float shadow = 1.0 - saturate(fx_luma(col) * 3.0);
-        col += n * floor_amt * shadow;
+        const float shadow = 1.0 - saturate(fx_luma(fx_straight(float4(col, col_a))) * 3.0);
+        col += n * floor_amt * shadow * col_a;
     }
 
-    const float temp =
-        (fx_value_noise1(seed ^ 0xA3Bu, t * r * 0.5) - 0.5) * 2.0 * awb;
-    col *= float3(1.0 + temp * 0.28, 1.0 + temp * 0.04, 1.0 - temp * 0.30);
+    col *= exp2(float3(measured.g, 0.0, measured.b) * awb);
 
     const float4 result = float4(max(col, 0.0), col_a);
     const float4 wetted = lerp(base, result, saturate(wet));

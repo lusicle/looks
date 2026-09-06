@@ -53,17 +53,5 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
     b *= saturate(opacity);
 
-    const float3 bu = b.rgb / max(b.a, 1.0e-6);
-    float3 blended;
-    switch (mode)
-    {
-    case 1: blended = a.rgb + bu; break;
-    case 2: blended = a.rgb * bu; break;
-    case 3: blended = fx_screen(a.rgb, bu); break;
-    case 4: blended = abs(a.rgb - bu); break;
-    default: blended = bu; break;
-    }
-    const float3 rgb = lerp(a.rgb, blended, b.a);
-    const float alpha = a.a + b.a * (1.0 - a.a);
-    output[tid.xy] = float4(rgb, alpha);
+    output[tid.xy] = fx_blend(a, b, mode);
 }

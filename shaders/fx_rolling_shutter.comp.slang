@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float readout;
     float axis;
     float gain;
@@ -37,9 +40,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (wobble > 0.0)
         t += sin(line_t * 6.2831853) * wobble * readout * 0.35;
 
-    const float2 probe = axis < 0.5 ? float2(uv.x, saturate(anchor))
-                                    : float2(saturate(anchor), uv.y);
-    const float2 mv = flow.SampleLevel(probe, 0).rg * gain;
+    const float2 mv = flow.SampleLevel(uv, 0).rg * gain;
 
     const float2 suv = clamp(uv + mv * t / size, 0.0, 1.0);
     const float4 result = input.SampleLevel(suv, 0);

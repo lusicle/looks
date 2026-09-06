@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float mode;
     float luma_res;      // lines
     float chroma_res;    // lines
@@ -30,7 +33,7 @@ static const float kLines = 243.0;   // active lines per field
 
 float enc_luma(float2 p)
 {
-    return fx_luma(fx_srgb_oetf(saturate(input.SampleLevel(p, 0).rgb)));
+    return fx_luma(fx_encoded(input.SampleLevel(p, 0)));
 }
 
 [shader("compute")]
@@ -49,18 +52,20 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float do_s = sp == 0 ? 1.0 : (sp == 1 ? 1.5 : 2.5);
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
+    const uint field = uint(t * 59.94);
+    const float2 material_px = uv * float2(canvas_w, canvas_h);
     const float line_h = 1.0 / kLines;               // uv
     const uint vline = min(uint(uv.y * kLines), uint(kLines) - 1u);
 
     const float jr =
-        fx_hash01(fx_hash4(seed, vline, frame, 0x7B5u)) - 0.5;
+        fx_hash01(fx_hash4(seed, vline, field, 0x7B5u)) - 0.5;
     const float wander =
         fx_value_noise1(seed ^ 0x3D1u, t * 2.2) - 0.5;
     float dx_px = jr * 2.0 * tbe + wander * tbe * 0.8;
     const float flag_w =
         (fx_value_noise1(seed ^ 0x9C4u, t * 1.3) - 0.5) * 2.0;
     dx_px += skew * 26.0 * exp(-float(vline) / 14.0) * flag_w;
-    const float sx = uv.x - dx_px / size.x;
+    const float sx = uv.x - dx_px / canvas_w;
     const float sy = uv.y;
 
     // The ringing overshoot is biased bright on purpose.
@@ -90,27 +95,27 @@ void main(uint3 tid : SV_DispatchThreadID)
     float2 cbcr = float2(0.0, 0.0);
     float cw = 0.0;
     [unroll]
-    for (int k = 0; k < 7; ++k) {
-        const float o = (float(k) - 3.0) * cpitch * 0.5;
+    for (int k = 0; k < 15; ++k) {
+        const float o = (float(k) - 7.0) * cpitch * (1.5 / 7.0);
         const float2 p = float2(sx + o / size.x, sy - line_h * 0.5);
         const float3 enc =
-            fx_srgb_oetf(saturate(input.SampleLevel(p, 0).rgb));
+            fx_encoded(input.SampleLevel(p, 0));
         const float yv = fx_luma(enc);
-        const float wgt = 1.0 - abs(float(k) - 3.0) / 4.0;
+        const float wgt = 1.0 - abs(float(k) - 7.0) / 8.0;
         cbcr += fx_rgb_to_cbcr709(enc, yv) * wgt;
         cw += wgt;
     }
     cbcr /= cw;
     const float cn = saturate(chroma_noise * nz_s);
     const float ang =
-        (fx_hash01(fx_hash4(seed ^ 0x51Du, vline, frame, 1u)) - 0.5) *
+        (fx_hash01(fx_hash4(seed ^ 0x51Du, vline, field, 1u)) - 0.5) *
             cn * 0.7 +
         (fx_value_noise1(seed ^ 0x2E7u, t * 3.7) - 0.5) * cn * 0.25;
     const float ca = cos(ang), sa = sin(ang);
     cbcr = float2(cbcr.x * ca - cbcr.y * sa, cbcr.x * sa + cbcr.y * ca);
     const float cmag = sqrt(dot(cbcr, cbcr));
-    const float2 cxy = float2(float(tid.x) / 9.0,
-                              float(vline) * 1.71 + float(frame) * 77.0);
+    const float2 cxy = float2(material_px.x / 9.0,
+                              float(vline) * 1.71 + float(field) * 77.0);
     const float2 csnow =
         float2(fx_vnoise2(seed ^ 0x77Au, cxy) - 0.5,
                fx_vnoise2(seed ^ 0x1B3u, cxy + 53.0) - 0.5);
@@ -118,16 +123,16 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     // The luma noise is smeared horizontally, never white grain.
     const float nz = saturate(noise * nz_s);
-    const float2 nxy = float2(float(tid.x) / 6.0,
-                              float(vline) * 2.13 + float(frame) * 131.0);
+    const float2 nxy = float2(material_px.x / 6.0,
+                              float(vline) * 2.13 + float(field) * 131.0);
     const float streak = fx_vnoise2(seed ^ 0x4F9u, nxy) - 0.5;
     const float fine =
-        fx_hash01(fx_hash4(seed, tid.x, tid.y, frame)) - 0.5;
+        (fx_hash01(fx_hash4(seed, uint(material_px.x), uint(material_px.y), field)) - 0.5) * min(1.0, float(width) / canvas_w);
     y_out += (streak * 0.75 + fine * 0.25) * nz * 0.5 *
              (0.35 + 0.65 * (1.0 - y_out));
 
     float drop = 0.0;
-    const uint dh = fx_hash4(seed ^ 0xD07u, vline, frame, 2u);
+    const uint dh = fx_hash4(seed ^ 0xD07u, vline, field, 2u);
     if (fx_hash01(dh) < saturate(dropouts * do_s) * 0.06) {
         const float x0 = fx_hash01(fx_hash(dh ^ 0x11u)) * 0.9;
         const float seg = 0.03 + 0.25 * fx_hash01(fx_hash(dh ^ 0x22u));
@@ -150,7 +155,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float src_a = input.SampleLevel(float2(sx, sy), 0).a;
     const float out_a = max(src_a, drop);
-    const float4 result = float4(fx_srgb_eotf(enc_out), out_a);
+    const float4 result = fx_from_encoded(enc_out, out_a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

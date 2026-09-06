@@ -40,7 +40,7 @@ constexpr ParamDesc kJitterParams[] = {
 constexpr ParamDesc kQuantizeParams[] = {
     {"levels", "levels", 2.0f, 16.0f, 4.0f, "%.0f", nullptr, true, 1, 0x3},
     {"palette", "palette", 0.0f, 6.0f, 0.0f, "%.0f",
-     "rgb|gray|game boy|cga|nes|teletext|duotone"},
+     "rgb|gray|game boy palette|cga palette|nes subset|teletext palette|duotone"},
     {"dither", "dither", 0.0f, 16.0f, 3.0f, "%.0f",
      "none|bayer 2|bayer 4|bayer 8|white noise|blue noise|stbn|moire|"
      "level cycle|rd stipple|spiral|rings|diamond|clustered dot|lines|"
@@ -196,6 +196,8 @@ constexpr ParamDesc kInterlaceParams[] = {
     {"darken", "line darken", 0.0f, 1.0f, 0.15f, "%.2f"},
     {"mode", "mode", 0.0f, 2.0f, 0.0f, "%.0f",
      "field weave|comb|lines only"},
+    {"standard", "raster", 0.0f, 1.0f, 0.0f, "%.0f", "480 lines|576 lines"},
+    {"field_order", "first field", 0.0f, 1.0f, 0.0f, "%.0f", "top|bottom", false, 2, 0x1},
 };
 
 constexpr ParamDesc kSliceShuffleParams[] = {
@@ -247,14 +249,14 @@ constexpr ParamDesc kDripParams[] = {
     {"rate", "fall rate", 0.0f, 24.0f, 4.0f, "%.1f px"},
     {"threshold", "threshold", 0.0f, 1.0f, 0.6f, "%.2f"},
     {"pick", "picks", 0.0f, 1.0f, 0.0f, "%.0f", "bright|dark"},
-    {"viscosity", "viscosity", 0.0f, 1.0f, 0.88f, "%.2f"},
+    {"viscosity", "retention", 0.0f, 1.0f, 0.88f, "%.2f"},
     {"angle", "fall angle", -3.14159265f, 3.14159265f, 1.5707963f, "%.0f",
      nullptr, false, -1, 0, true},
     {"spread", "spread", 0.0f, 1.0f, 0.25f, "%.2f"},
 };
 
 constexpr ParamDesc kBurnInParams[] = {
-    {"mode", "latches", 0.0f, 2.0f, 0.0f, "%.0f", "brightest|darkest|first"},
+    {"mode", "mode", 0.0f, 3.0f, 3.0f, "%.0f", "brightest|darkest|first|wear"},
     {"threshold", "threshold", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"bleed", "bleed back", 0.0f, 1.0f, 0.0f, "%.3f"},
     {"tint", "scar tint", 0.0f, 1.0f, 0.0f, "%.2f"},
@@ -323,10 +325,14 @@ constexpr ParamDesc kSyncFailParams[] = {
 };
 
 constexpr ParamDesc kTimestampParams[] = {
-    {"mode", "mode", 0.0f, 2.0f, 2.0f, "%.0f", "date|timecode|both"},
+    {"mode", "mode", 0.0f, 2.0f, 2.0f, "%.0f", "date|time|both"},
     {"size", "size", 1.0f, 6.0f, 3.0f, "%.0f"},
     {"corner", "corner", 0.0f, 3.0f, 3.0f, "%.0f",
      "top left|top right|bottom left|bottom right"},
+    {"year", "year", 1970.0f, 2099.0f, 2003.0f, "%.0f", nullptr, true, 0, 0x5},
+    {"month", "month", 1.0f, 12.0f, 12.0f, "%.0f", nullptr, true, 0, 0x5},
+    {"day", "day", 1.0f, 31.0f, 24.0f, "%.0f", nullptr, true, 0, 0x5},
+    {"start_time", "start time", 0.0f, 86399.0f, 0.0f, "%.0f s", nullptr, true},
 };
 
 constexpr ParamDesc kOversharpenParams[] = {
@@ -363,6 +369,7 @@ constexpr ParamDesc kLightLeakParams[] = {
      nullptr, false, -1, 0, false, 0.65f},
     {"drift", "drift", 0.0f, 2.0f, 0.25f, "%.2f hz"},
     {"burn", "film burn", 0.0f, 1.0f, 0.0f, "%.2f"},
+    {"entry", "entry edge", 0.0f, 3.0f, 2.0f, "%.0f", "left|top|right|bottom"},
 };
 
 constexpr ParamDesc kAnamorphicParams[] = {
@@ -417,6 +424,7 @@ constexpr ParamDesc kCamcorderHudParams[] = {
     {"blink_hz", "rec blink", 0.0f, 4.0f, 1.0f, "%.1f hz"},
     {"elements", "elements", 0.0f, 2.0f, 2.0f, "%.0f",
      "rec|rec + counter|full hud"},
+    {"battery", "battery", 0.0f, 1.0f, 0.67f, "%.2f", nullptr, false, 2, 0x4},
 };
 
 constexpr ParamDesc kGateMaskParams[] = {
@@ -428,7 +436,7 @@ constexpr ParamDesc kGateMaskParams[] = {
 
 constexpr ParamDesc kCueMarkParams[] = {
     {"period", "period", 2.0f, 60.0f, 12.0f, "%.0f s"},
-    {"dwell", "dwell", 1.0f, 12.0f, 4.0f, "%.0f frames", nullptr, true},
+    {"dwell", "dwell", 1.0f, 12.0f, 4.0f, "%.0f film frames", nullptr, true},
     {"mark_size", "size", 0.02f, 0.12f, 0.05f, "%.2f"},
 };
 
@@ -823,6 +831,7 @@ constexpr ParamDesc kAudioScopeParams[] = {
     {"pos_y", "position", 0.0f, 1.0f, 0.5f, "%.2f"},
     {"glow", "glow", 0.0f, 1.0f, 0.6f, "%.2f"},
     {"color", "source color", 0.0f, 1.0f, 0.2f, "%.2f"},
+    {"trigger", "trigger", 0.0f, 1.0f, 0.0f, "%.0f", "free|rising"},
 };
 
 constexpr ParamDesc kEngraverParams[] = {
@@ -1127,7 +1136,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"lens_distort", "Lens Distort", kLensDistortParams, 3,
      FxCategory::Optics},
     {"fringe", "Fringing", kFringeParams, 3, FxCategory::Optics},
-    {"interlace", "Interlace", kInterlaceParams, 3, FxCategory::Signal},
+    {"interlace", "Interlace", kInterlaceParams, 5, FxCategory::Signal},
     {"slice_shuffle", "Slice Shuffle", kSliceShuffleParams, 4,
      FxCategory::Signal},
     {"pixel_stretch", "Pixel Stretch", kPixelStretchParams, 2,
@@ -1136,13 +1145,13 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::Signal},
     {"analog_snow", "Analog Snow", kSnowParams, 4, FxCategory::Signal},
     {"sync_fail", "Sync Failure", kSyncFailParams, 3, FxCategory::Signal},
-    {"timestamp", "Timestamp", kTimestampParams, 3, FxCategory::Overlay},
+    {"timestamp", "Timestamp", kTimestampParams, 7, FxCategory::Overlay},
     {"oversharpen", "Oversharpen", kOversharpenParams, 2,
      FxCategory::Texture},
     {"blur", "Blur", kBlurParams, 5, FxCategory::Texture},
     {"dust_scratches", "Dust & Scratches", kDustScratchesParams, 6,
      FxCategory::Texture},
-    {"light_leak", "Light Leak", kLightLeakParams, 4, FxCategory::Optics},
+    {"light_leak", "Light Leak", kLightLeakParams, 5, FxCategory::Optics},
     {"anamorphic", "Anamorphic", kAnamorphicParams, 4, FxCategory::Optics},
     {"direct_flash", "Direct Flash", kDirectFlashParams, 4,
      FxCategory::Optics},
@@ -1151,7 +1160,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"cel_shade", "Cel Shade", kCelShadeParams, 2, FxCategory::PaintPrint},
     {"rutt_etra", "Rutt-Etra", kRuttEtraParams, 7, FxCategory::Mosaic},
     {"slit_scan", "Slit-Scan", kSlitScanParams, 3, FxCategory::Time},
-    {"camcorder_hud", "Camcorder HUD", kCamcorderHudParams, 3,
+    {"camcorder_hud", "Camcorder HUD", kCamcorderHudParams, 4,
      FxCategory::Overlay},
     {"gate_mask", "Gate Mask", kGateMaskParams, 3, FxCategory::Overlay},
     {"cue_mark", "Cue Marks", kCueMarkParams, 3, FxCategory::Overlay},
@@ -1233,7 +1242,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"scope", "Scope Monitor", kScopeParams, 6, FxCategory::Signal},
     {"security_mux", "Security Mux", kSecurityMuxParams, 5,
      FxCategory::Time},
-    {"audio_scope", "Audio Scope", kAudioScopeParams, 7,
+    {"audio_scope", "Audio Scope", kAudioScopeParams, 8,
      FxCategory::Signal},
     {"engraver", "Engraver", kEngraverParams, 10, FxCategory::PaintPrint},
     {"blend_node", "Blend", kBlendNodeParams, 1, FxCategory::Overlay},
@@ -1292,7 +1301,34 @@ const char* fx_category_label(FxCategory category) {
 }
 
 const EffectInfo& effect_info(EffectType type) {
-    return kEffectInfos[static_cast<uint32_t>(type)];
+    struct Controls {
+        EffectInfo info[static_cast<size_t>(EffectType::Count)];
+        int order[static_cast<size_t>(EffectType::Count)][32] = {};
+        Controls() {
+            for (size_t effect = 0; effect < static_cast<size_t>(EffectType::Count); ++effect) {
+                info[effect] = kEffectInfos[effect];
+                if (info[effect].control_order) continue;
+                bool emitted[32] = {};
+                uint32_t row = 0;
+                for (int phase = 0; phase < 2; ++phase) {
+                    for (uint32_t pass = 0; pass < info[effect].param_count; ++pass) {
+                        for (uint32_t p = 0; p < info[effect].param_count; ++p) {
+                            const auto& param = info[effect].params[p];
+                            if (emitted[p] || (phase == 0 && !param.options)) continue;
+                            if (param.vis_param >= 0 && !emitted[static_cast<uint32_t>(param.vis_param)]) continue;
+                            order[effect][row++] = static_cast<int>(p);
+                            emitted[p] = true;
+                        }
+                    }
+                }
+                order[effect][row++] = kWetParam;
+                order[effect][row] = kOpacityParam;
+                info[effect].control_order = order[effect];
+            }
+        }
+    };
+    static const Controls controls;
+    return controls.info[static_cast<uint32_t>(type)];
 }
 
 EffectInstance make_effect(Document& doc, EffectType type) {
@@ -1309,6 +1345,8 @@ EffectInstance make_effect(Document& doc, EffectType type) {
 
 bool effect_uses_history(EffectType type) {
     switch (type) {
+        case EffectType::FilmSlip:
+        case EffectType::CamAuto:
         case EffectType::Echo:
         case EffectType::Feedback:
         case EffectType::SlitScan:

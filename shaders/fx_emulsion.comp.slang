@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float warp;
     float mottle;
     float mold;
@@ -31,14 +34,14 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float2 q = uv * scale * 3.0;
-    const float drift = t * 0.07;
+    const float drift = 0.0;
 
     const float wx = fx_vnoise2(seed ^ 0x11u, q + drift) - 0.5;
     const float wy = fx_vnoise2(seed ^ 0x22u, q + 17.3 - drift) - 0.5;
     const float2 suv =
-        clamp(uv + float2(wx, wy) * warp * 46.0 / size, 0.0, 1.0);
+        clamp(uv + float2(wx, wy) * warp * 46.0 / float2(canvas_w, canvas_h), 0.0, 1.0);
     const float4 weaved = input.SampleLevel(suv, 0);
-    float3 col = weaved.rgb;
+    float3 col = fx_straight(weaved);
 
     if (mottle > 0.001) {
         const float mr = fx_vnoise2(seed ^ 0x33u, q * 1.7 + drift) - 0.5;
@@ -59,7 +62,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         col = lerp(col, col * 1.35 + 0.08, halo * 0.7);
     }
 
-    const float4 result = float4(max(col, 0.0), weaved.a);
+    const float4 result = float4(max(col, 0.0) * weaved.a, weaved.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

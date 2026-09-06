@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float omega;
     float distortion;
     float lowpass;      // the integrator pass uses this, not the shader
@@ -101,7 +104,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                             saturate(color)));
     }
 
-    const float4 result = float4(min(col, float3(1.4, 1.4, 1.4)),
+    const float4 result = float4(min(col, float3(1.4, 1.4, 1.4)) * base.a,
                                  base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

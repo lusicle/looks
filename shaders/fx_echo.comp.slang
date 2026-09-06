@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float decay;
     float mode;
 };
@@ -28,9 +31,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
-    const float4 prev = prev_out.SampleLevel(uv, 0);
-    const float3 trail = prev.rgb * saturate(decay);
-    const float trail_a = prev.a * saturate(decay);
+    const float4 prev = history_valid != 0u ? prev_out.SampleLevel(uv, 0) : base;
+    const float retention = pow(saturate(decay), 60.0 / max(fps, 1.0));
+    const float3 trail = prev.rgb * retention;
+    const float trail_a = prev.a * retention;
 
     // The trail is content. Alpha decays the same as color.
     float3 echoed;
@@ -39,8 +43,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         echoed = max(base.rgb, trail);
         echoed_a = max(base.a, trail_a);
     } else {
-        echoed = lerp(base.rgb, trail, saturate(decay));
-        echoed_a = lerp(base.a, trail_a, saturate(decay));
+        echoed = lerp(base.rgb, prev.rgb, retention);
+        echoed_a = lerp(base.a, prev.a, retention);
     }
 
     const float4 result = float4(echoed, echoed_a);

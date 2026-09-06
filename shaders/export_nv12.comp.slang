@@ -7,6 +7,7 @@ cbuffer Push
 {
     uint width;
     uint height;
+    uint straight_input;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -16,7 +17,8 @@ cbuffer Push
 float3 fetch_encoded(float2 texel, float2 size)
 {
     const float2 uv = texel / size;
-    return fx_srgb_oetf(saturate(input.SampleLevel(uv, 0).rgb));
+    const float4 c = input.SampleLevel(uv, 0);
+    return straight_input != 0u ? fx_encoded(c) : fx_srgb_oetf(saturate(c.rgb));
 }
 
 [shader("compute")]

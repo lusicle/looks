@@ -63,10 +63,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 rgb;
     if (m == 0u) rgb = float3(line, line, line);
     else if (m == 1u) rgb = float3(1.0 - line, 1.0 - line, 1.0 - line);
-    else rgb = base.rgb * (1.0 - line * 0.85);
-    if (m != 2u) rgb = fx_srgb_eotf(rgb);
+    else rgb = fx_straight(base) * (1.0 - line * 0.85);
 
-    const float4 result = float4(rgb, base.a);
+    const float4 result = float4(rgb * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

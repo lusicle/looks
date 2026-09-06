@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float amount;
     float weave_px;   // thread pitch
     float hotspot;
@@ -32,12 +35,16 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     // The screen is static in screen space. It does not move.
     const float pitch = max(weave_px, 2.0);
-    const float2 ph = float2(tid.xy) * (6.28318 / pitch);
-    const float wv = 0.5 * (sin(ph.x) + sin(ph.y * 1.07 + 1.3));
+    const float2 material_px = uv * float2(canvas_w, canvas_h);
+    const float2 footprint = float2(canvas_w, canvas_h) / size;
+    const float2 ph = material_px * (6.28318 / pitch);
+    const float wv = 0.5 * (sin(ph.x) * fx_sinc(3.14159 * footprint.x / pitch) +
+        sin(ph.y * 1.07 + 1.3) * fx_sinc(3.14159 * footprint.y * 1.07 / pitch));
     // Keep the per-cell irregularity or it looks like a grid.
-    const uint2 cell = uint2(float2(tid.xy) / pitch);
+    const uint2 cell = uint2(material_px / pitch);
     const float irregular =
-        fx_hash01(fx_hash3(seed, cell.x, cell.y)) - 0.5;
+        (fx_hash01(fx_hash3(seed, cell.x, cell.y)) - 0.5) *
+            min(1.0, pitch / max(footprint.x, footprint.y));
     const float weave_mod =
         1.0 - saturate(amount) * 0.18 * (0.5 - 0.5 * wv + 0.4 * irregular);
 

@@ -68,16 +68,16 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (cov_out <= 0.0)
         return;
 
-    const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float3 fill = lerp(float3(1.0, 1.0, 1.0),
                              fx_hue_to_rgb(hue), saturate(sat)) *
                         saturate(lite);
-    float3 c = lerp(enc, float3(0.02, 0.02, 0.02), cov_out);
-    c = lerp(c, fill, cov);
+    const float3 fill_linear = fx_srgb_eotf(saturate(fill));
+    const float3 border_linear = fx_srgb_eotf(float3(0.02, 0.02, 0.02));
+    const float3 c = base.rgb * (1.0 - cov_out) +
+        border_linear * (cov_out - cov) + fill_linear * cov;
 
     // Drawn glyphs union their coverage into alpha.
-    const float4 result = float4(fx_srgb_eotf(saturate(c)),
-                                 max(base.a, cov_out));
+    const float4 result = float4(c, base.a + cov_out * (1.0 - base.a));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

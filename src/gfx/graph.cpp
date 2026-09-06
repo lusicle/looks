@@ -14,9 +14,8 @@ namespace looks::gfx {
 
 namespace {
 
-// The graph holds one shared motion-vector field per frame.
 struct FlowSlot {
-    int node = -1;
+    std::unordered_map<int, int> nodes;
 };
 
 // Ownership maps stay local to emit_look; two hops must never share entries.
@@ -64,12 +63,6 @@ struct Compiler {
             return n;
         };
 
-        if (fx.type == doc::EffectType::Glow) {
-            const int bright = add(make(0, {upstream}), instance, key);
-            const int blur_h = add(make(1, {bright}), instance, key);
-            const int blur_v = add(make(2, {blur_h}), instance, key);
-            return add(make(3, {upstream, blur_v}), instance, key);
-        }
         if (fx.type == doc::EffectType::FlowSmear ||
             fx.type == doc::EffectType::Datamosh ||
             fx.type == doc::EffectType::FlowParticles ||
@@ -80,12 +73,19 @@ struct Compiler {
             (fx.type == doc::EffectType::Dither && fx.params.size() > 7 &&
              fx.params[7] >= 0.5f)) {
             // Quantize/Dither need flow only in motion-locked mode.
-            if (flow.node < 0) {
+            auto found = flow.nodes.find(upstream);
+            int flow_node;
+            if (found == flow.nodes.end()) {
                 GraphNode f;
                 f.kind = GraphNode::Kind::Flow;
-                flow.node = add(std::move(f), 0);
-            }
-            return add(make(0, {upstream, flow.node}), instance, key);
+                f.inputs = {upstream};
+                const auto& source = graph.nodes[static_cast<size_t>(upstream)];
+                const uint64_t flow_key = hash_combine(source.key ? source.key : key,
+                    0xF10A0000u + static_cast<uint32_t>(source.kind));
+                flow_node = add(std::move(f), instance, flow_key);
+                flow.nodes.emplace(upstream, flow_node);
+            } else flow_node = found->second;
+            return add(make(0, {upstream, flow_node}), instance, key);
         }
         if (doc::effect_aux_port(fx.type) && extra_input >= 0)
             return add(make(0, {upstream, extra_input}), instance, key);

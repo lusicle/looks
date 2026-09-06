@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float streak;
     float threshold;
     float squeeze;
@@ -19,7 +22,8 @@ cbuffer Push
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D filtered;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -33,7 +37,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const float sx = (uv.x - 0.5) * squeeze + 0.5;
     const float2 suv = float2(clamp(sx, 0.0, 1.0), uv.y);
-    const float4 squeezed = input.SampleLevel(suv, 0);
+    const float4 squeezed = fx_sample_border(input, float2(sx, uv.y));
     float3 col = squeezed.rgb;
     float col_a = squeezed.a;
 
@@ -45,10 +49,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float f = (float(i) / float(kTaps - 1)) - 0.5;
         const float dx = f * 0.6;
         const float3 s =
-            input.SampleLevel(float2(clamp(sx + dx, 0.0, 1.0), uv.y), 0).rgb;
-        const float l = fx_luma(s);
-        const float over = max(l - gate, 0.0);
-        flare += s * over * (1.0 - abs(f) * 2.0) * (1.0 - abs(f) * 2.0);
+            fx_sample_border(filtered, float2(sx + dx, uv.y)).rgb;
+        flare += s * (1.0 - abs(f) * 2.0) * (1.0 - abs(f) * 2.0);
     }
     flare /= float(kTaps);
     const float3 blue_tint = float3(0.35, 0.55, 1.0);
@@ -56,19 +58,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     col_a = max(col_a, saturate(fx_luma(flare) * streak * 6.0));
 
     if (bokeh > 0.001) {
-        float3 oval = 0.0;
+        float4 oval = 0.0;
         [unroll]
-        for (int i = 0; i < 12; ++i) {
-            const float a = float(i) * 0.5236;
-            const float2 o = float2(cos(a) * 0.5, sin(a)) * bokeh * 14.0;
-            const float3 s =
-                input.SampleLevel(clamp(suv + o / size, 0.0, 1.0), 0).rgb;
-            const float l = fx_luma(s);
-            oval += s * max(l - gate, 0.0);
+        for (int i = 0; i < 32; ++i) {
+            const float a = float(i) * 2.3999632;
+            const float2 o = float2(cos(a) * 0.5, sin(a)) * bokeh * 14.0 * sqrt((float(i) + 0.5) / 32.0);
+            const float4 s =
+                fx_sample_border(input, suv + o / float2(canvas_w, canvas_h));
+            oval += s;
         }
-        col += oval / 12.0 * bokeh * 2.0;
-        col_a = max(col_a,
-                    saturate(fx_luma(oval) / 12.0 * bokeh * 2.0));
+        col += (oval.rgb / 32.0 - squeezed.rgb) * saturate(bokeh);
+        col_a = max(lerp(squeezed.a, oval.a / 32.0, saturate(bokeh)),
+                    saturate(fx_luma(flare) * streak * 6.0));
     }
 
     const float4 result = float4(col, col_a);

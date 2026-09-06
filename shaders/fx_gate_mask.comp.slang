@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float gauge;
     float round_;
     float soft;
@@ -31,25 +34,28 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const int g = int(gauge + 0.5);
-    const float frame_aspect = size.x / size.y;
+    const float frame_aspect = canvas_w / canvas_h;
     const float2 p = (uv - 0.5) * float2(frame_aspect, 1.0);
-    const float edge = max(soft * 0.03, 0.002);
+    const float edge = max(soft * 0.03, 1.0 / float(height));
 
     float4 result;
     if (g == 4) {
-        // The window sits high to leave a wide bottom border.
-        const float hs = 0.365;
-        const float2 c = float2(0.0, -0.055);
-        const float r = round_ * hs * 0.25 + 0.004;
-        const float2 q = abs(p - c) - float2(hs, hs) + r;
+        const float scale = min(0.9, frame_aspect * 107.0 / 88.0 * 0.9);
+        const float2 outer = float2(88.0, 107.0) * (scale / 214.0);
+        const float2 window = float2(79.0, 77.0) * (scale / 214.0);
+        const float2 c = float2(0.0, -10.5 * scale / 107.0);
+        const float r = round_ * window.y * 0.25;
+        const float2 q = abs(p - c) - window + r;
         const float d =
             length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-        const float gate = 1.0 - smoothstep(0.0, edge, d);
+        const float gate = 1.0 - smoothstep(-edge * 0.5, edge * 0.5, d);
+        const float2 card_q = abs(p) - outer;
+        const float card_d = length(max(card_q, 0.0)) + min(max(card_q.x, card_q.y), 0.0);
+        const float card = 1.0 - smoothstep(-edge * 0.5, edge * 0.5, card_d);
         const float3 border = fx_srgb_eotf(float3(0.94, 0.92, 0.87));
         const float inset = exp(-pow(abs(d) * 80.0, 2.0)) * 0.35;
         float3 col = lerp(border * (1.0 - inset), base.rgb, gate);
-        // The card border is opaque content around the window.
-        result = float4(col, lerp(1.0, base.a, gate));
+        result = float4(col, lerp(1.0, base.a, gate)) * card;
     } else {
         const float aspect =
             g == 0 ? 1.333 : (g == 1 ? 1.37 : (g == 2 ? 1.85 : 2.39));
@@ -64,7 +70,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 q = abs(p) - he + r;
         const float d =
             length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-        const float gate = 1.0 - smoothstep(0.0, edge, d);
+        const float gate = 1.0 - smoothstep(-edge * 0.5, edge * 0.5, d);
         result = float4(base.rgb * gate, base.a);
     }
     const float4 wetted = lerp(base, result, saturate(wet));

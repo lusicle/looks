@@ -39,14 +39,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float3 enc = fx_srgb_oetf(saturate(base.rgb));
+    const float3 enc = fx_encoded(base);
     const float4 src = float4(enc, fx_luma(enc));
     const float3 mixed = float3(pick_channel(src, r_from),
                                 pick_channel(src, g_from),
                                 pick_channel(src, b_from));
     const float3 c = lerp(enc, mixed, saturate(amount));
 
-    const float4 result = float4(fx_srgb_eotf(saturate(c)), base.a);
+    const float4 result = fx_from_encoded(c, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -84,10 +84,8 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
                    params.bitrate_budget)
             quality = std::max(1, quality - 15);
         intra_recon(intra_scratch_, quality, clean_state_);
-        // Fixed quality is idempotent; alternate the quantizer so error grows.
-        for (int g = 0; g < std::min(params.generations, 12); ++g) {
-            const int gq = std::clamp(
-                params.quality - ((g & 1) ? 9 : 0), 1, 100);
+        for (int g = 1; g < std::min(params.generations, 12); ++g) {
+            const int gq = std::clamp(params.quality, 1, 100);
             encode_decode_intra(clean_state_.view(), gq, clean_state_);
         }
         if (!has_state_ || !params.drop_iframes) state_ = clean_state_;
@@ -100,10 +98,6 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
     predict(clean_state_, frame_index, params, mvs, /*mangle=*/false,
             clean_pred_);
     predict(state_, frame_index, params, mvs, /*mangle=*/true, pred_);
-    for (int r = 0; r < std::min(params.p_repeat, 8); ++r) {
-        predict(pred_, frame_index, params, mvs, /*mangle=*/true, pred_tmp_);
-        std::swap(pred_, pred_tmp_);
-    }
 
     uint16_t qy[kBlockCoeffs], qc[kBlockCoeffs];
     int quality = std::clamp(params.quality, 1, 100);
@@ -217,58 +211,65 @@ void MoshCodec::process(const FrameView& in, uint32_t frame_index,
         done = parsed;
     }
 
-    parallel_blocks(mb_count, true, [&](int begin, int end) {
-        int16_t quantized[kBlockCoeffs];
-        int16_t block[kBlockCoeffs];
-        for (int mb = begin; mb < end; ++mb) {
-            const int mx = mb % mb_w;
-            const int my = mb / mb_w;
-            const size_t base = static_cast<size_t>(mb) * 6;
-            const bool corrupt =
-                params.residual_corrupt > 0.0f &&
-                hash_float01(frame_seed,
-                             static_cast<uint64_t>(my) * 4096 + mx) <
-                    params.residual_corrupt;
-            for (int b = 0; b < 6; ++b) {
-                if (p_zero_[base + b]) continue;
-                const bool luma = b < 4;
-                const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
-                const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
-                const int pw = luma ? static_cast<int>(w)
-                                    : static_cast<int>(cw);
-                const int ph = luma ? static_cast<int>(h)
-                                    : static_cast<int>(ch);
-                const uint16_t* qtab = luma ? qy : qc;
-                quantize(p_coeffs_.data() + (base + b) * kBlockCoeffs, qtab,
-                         quantized);
-                dequantize(quantized, qtab, block);
-                idct8x8(block);
-                uint8_t* cplane = luma
-                    ? clean_pred_.y.data()
-                    : (b == 4 ? clean_pred_.u.data() : clean_pred_.v.data());
-                const size_t cstride =
-                    luma ? clean_pred_.y_stride : clean_pred_.uv_stride;
-                add_residual(block,
-                             cplane + static_cast<size_t>(py) * cstride + px,
-                             cstride, pw - px, ph - py);
-                if (corrupt || static_cast<int>(base) + b >= done) continue;
-                if (params.byte_flips > 0) {
-                    dequantize(p_parsed_.data() + (base + b) * kBlockCoeffs,
-                               qtab, block);
-                    idct8x8(block);
-                }
-                uint8_t* mplane = luma
-                    ? pred_.y.data()
-                    : (b == 4 ? pred_.u.data() : pred_.v.data());
-                const size_t mstride =
-                    luma ? pred_.y_stride : pred_.uv_stride;
-                add_residual(block,
-                             mplane + static_cast<size_t>(py) * mstride + px,
-                             mstride, pw - px, ph - py);
-            }
+    for (int repeat = 0; repeat <= std::clamp(params.p_repeat, 0, 8); ++repeat) {
+        if (repeat > 0) {
+            predict(pred_, frame_index, params, mvs, true, pred_tmp_);
+            std::swap(pred_, pred_tmp_);
         }
-    });
+        parallel_blocks(mb_count, true, [&](int begin, int end) {
+            int16_t quantized[kBlockCoeffs];
+            int16_t block[kBlockCoeffs];
+            for (int mb = begin; mb < end; ++mb) {
+                const int mx = mb % mb_w;
+                const int my = mb / mb_w;
+                const size_t base = static_cast<size_t>(mb) * 6;
+                const bool corrupt =
+                    params.residual_corrupt > 0.0f &&
+                    hash_float01(frame_seed,
+                                 static_cast<uint64_t>(my) * 4096 + mx) <
+                        params.residual_corrupt;
+                for (int b = 0; b < 6; ++b) {
+                    if (p_zero_[base + b]) continue;
+                    const bool luma = b < 4;
+                    const int px = luma ? mx * 16 + (b & 1) * 8 : mx * 8;
+                    const int py = luma ? my * 16 + (b >> 1) * 8 : my * 8;
+                    const int pw = luma ? static_cast<int>(w)
+                                        : static_cast<int>(cw);
+                    const int ph = luma ? static_cast<int>(h)
+                                        : static_cast<int>(ch);
+                    const uint16_t* qtab = luma ? qy : qc;
+                    quantize(p_coeffs_.data() + (base + b) * kBlockCoeffs, qtab,
+                             quantized);
+                    dequantize(quantized, qtab, block);
+                    idct8x8(block);
+                    uint8_t* cplane = luma
+                        ? clean_pred_.y.data()
+                        : (b == 4 ? clean_pred_.u.data() : clean_pred_.v.data());
+                    const size_t cstride =
+                        luma ? clean_pred_.y_stride : clean_pred_.uv_stride;
+                    if (repeat == 0)
+                        add_residual(block,
+                                     cplane + static_cast<size_t>(py) * cstride + px,
+                                     cstride, pw - px, ph - py);
+                    if (corrupt || static_cast<int>(base) + b >= done) continue;
+                    if (params.byte_flips > 0) {
+                        dequantize(p_parsed_.data() + (base + b) * kBlockCoeffs,
+                                   qtab, block);
+                        idct8x8(block);
+                    }
+                    uint8_t* mplane = luma
+                        ? pred_.y.data()
+                        : (b == 4 ? pred_.u.data() : pred_.v.data());
+                    const size_t mstride =
+                        luma ? pred_.y_stride : pred_.uv_stride;
+                    add_residual(block,
+                                 mplane + static_cast<size_t>(py) * mstride + px,
+                                 mstride, pw - px, ph - py);
+                }
+            }
+        });
 
+    }
     std::swap(clean_state_, clean_pred_);
     std::swap(state_, pred_);
     out = state_;

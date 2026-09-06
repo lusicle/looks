@@ -1,5 +1,3 @@
-// .thumbs layout, little-endian: 'THM1' u16 w, u16 h, u16 count,
-// then count packed RGB cells of w*h*3 bytes.
 #pragma once
 
 #include <cstdint>
@@ -16,6 +14,7 @@ struct ThumbStripData {
     uint32_t h = 0;
     uint32_t count = 0;
     std::vector<uint8_t> rgb;   // count thumbs, each w * h * 3
+    bool linear_filtered = false;
 };
 
 bool write_thumbs(const std::filesystem::path& path,

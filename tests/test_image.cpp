@@ -1,5 +1,8 @@
 #include "util/image.h"
 #include "util/inflate.h"
+#include "util/file.h"
+#include "media/import.h"
+#include "media/thumbs.h"
 
 #include "test_framework.h"
 
@@ -145,4 +148,36 @@ TEST(png_encode_decode_roundtrip) {
     CHECK_EQ(back.width, w);
     CHECK_EQ(back.height, h);
     CHECK(back.pixels == src);
+}
+
+TEST(thumbnails_preserve_linear_mean) {
+    const auto dir = std::filesystem::path(LOOKS_REPO_ROOT) / "temp";
+    const auto path = dir / "thumbnail_linear_check.png";
+    std::vector<uint8_t> rgba(320 * 180 * 4, 255);
+    for (uint32_t y = 0; y < 180; ++y)
+        for (uint32_t x = 0; x < 320; ++x)
+            for (int c = 0; c < 3; ++c)
+                rgba[(y * 320 + x) * 4 + c] = (x + y) % 2 ? 255 : 0;
+    const auto png = encode_png_rgba(rgba.data(), 320, 180);
+    CHECK(write_file_bytes(path, png.data(), png.size()));
+    media::ImportOptions options;
+    options.quality = 0;
+    options.proxy = false;
+    const auto result = media::import_media(path, dir, options);
+    CHECK(result.ok);
+    media::ThumbStripData strip;
+    CHECK(media::read_thumbs(result.thumbs_path, &strip));
+    CHECK(strip.linear_filtered);
+    CHECK_EQ(strip.count, 1u);
+    CHECK_EQ(strip.w, 160u);
+    CHECK_EQ(strip.h, 90u);
+    for (uint8_t value : strip.rgb) CHECK(value >= 187 && value <= 189);
+    media::ThumbStripData head;
+    CHECK(media::read_thumbs_header(result.thumbs_path, &head));
+    CHECK(head.linear_filtered);
+    CHECK(media::rebuild_still_thumbs(result.mez_path, result.thumbs_path));
+    media::ThumbStripData rebuilt;
+    CHECK(media::read_thumbs(result.thumbs_path, &rebuilt));
+    CHECK(rebuilt.linear_filtered);
+    CHECK(rebuilt.rgb == strip.rgb);
 }

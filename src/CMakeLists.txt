@@ -232,5 +232,5 @@ add_executable(looks_rendertest app/rendertest_cli.cpp)
 target_compile_definitions(looks_rendertest PRIVATE
     LOOKS_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 target_link_libraries(looks_rendertest PRIVATE
-    looks_gfx looks_doc looks_media looks_util)
+    looks_gfx looks_ui looks_doc looks_media looks_util)
 add_dependencies(looks_rendertest looks)

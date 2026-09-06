@@ -339,7 +339,7 @@ std::vector<uint16_t> make_halves(uint32_t w, uint32_t h, uint32_t seed) {
                                        0xFFFF) /
                     65535.0f;
                 halves[(static_cast<size_t>(y) * w + x) * 4 + c] =
-                    float_to_half(f);
+                    float_to_half(c == 3 ? 1.0f : f);
             }
     return halves;
 }
@@ -366,6 +366,29 @@ TEST(error_diffusion_matches_reference) {
                     CHECK(opt.out == ref.out);
                 }
             }
+        }
+    }
+}
+
+TEST(error_diffusion_preserves_straight_color) {
+    constexpr uint32_t w = 32, h = 24;
+    for (int kernel = 0; kernel < 8; ++kernel) {
+        doc::EffectInstance fx;
+        fx.params = {5.0f, static_cast<float>(kernel), 1.0f, 0.0f, 0.0f};
+        gfx::EdState opaque;
+        std::vector<uint16_t> pixels(size_t(w) * h * 4);
+        for (float alpha : {1.0f, 0.5f, 0.0625f, 0.0f}) {
+            for (size_t i = 0; i < size_t(w) * h; ++i) {
+                pixels[i * 4] = float_to_half(0.5f * alpha);
+                pixels[i * 4 + 1] = float_to_half(0.25f * alpha);
+                pixels[i * 4 + 2] = float_to_half(0.125f * alpha);
+                pixels[i * 4 + 3] = float_to_half(alpha);
+            }
+            gfx::EdState result;
+            gfx::run_error_diffusion(pixels.data(), w, h, fx, result);
+            if (alpha == 1.0f) opaque = result;
+            else if (alpha > 0.0f) CHECK(result.out == opaque.out);
+            else for (uint32_t value : result.out) CHECK(value == 0);
         }
     }
 }

@@ -30,7 +30,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float l = fx_luma(fx_srgb_oetf(saturate(base.rgb)));
+    const float l = fx_luma(fx_encoded(base));
 
     // The stop luminances must rise. Keep the dark stop near black.
     const float3 c0 = fx_hue_to_rgb(sh_hue) * 0.12;
@@ -41,7 +41,7 @@ void main(uint3 tid : SV_DispatchThreadID)
                           : lerp(c1, c2, (l - 0.5) * 2.0);
     ramp = lerp(float3(l, l, l), ramp, saturate(sat));
 
-    const float4 result = float4(fx_srgb_eotf(saturate(ramp)), base.a);
+    const float4 result = fx_from_encoded(ramp, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

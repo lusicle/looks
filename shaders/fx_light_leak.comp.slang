@@ -12,10 +12,14 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float amount;
     float hue;
     float drift;    // hz
     float burn;
+    float entry;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -31,20 +35,23 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * max(drift, 1.0e-3);
+    const float t = (fps > 0.0 ? float(frame) / fps : 0.0) * max(drift, 0.0);
+    float2 leak_uv = uv;
+    if (entry < 0.5) leak_uv.x = 1.0 - uv.x;
+    else if (entry < 1.5) leak_uv = float2(1.0 - uv.y, uv.x);
+    else if (entry > 2.5) leak_uv = uv.yx;
 
-    // The blobs sit off the right edge. Only their falloff enters frame.
     float leak = 0.0;
     for (uint i = 0u; i < 2u; ++i) {
         const float cy = fx_value_noise1(seed + i * 17u, t + float(i) * 3.7);
         const float cx = 1.05 + 0.1 * fx_value_noise1(seed + i * 31u, t * 0.7);
-        const float2 d = (uv - float2(cx, cy)) * float2(1.0, size.y / size.x);
+        const float2 d = (leak_uv - float2(cx, cy)) * float2(1.0, size.y / size.x);
         const float r = length(d);
         const float breathe =
             0.6 + 0.4 * fx_value_noise1(seed + i * 53u, t * 1.3);
         leak += breathe * exp(-r * r * 9.0);
     }
-    const float edge = exp(-(1.0 - uv.x) * 5.0) * 0.5;
+    const float edge = exp(-(1.0 - leak_uv.x) * 5.0) * 0.5;
     leak = (leak + edge) * amount;
 
     const float3 warm = float3(1.0, 0.32, 0.08);
@@ -54,11 +61,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     float3 result_rgb = base.rgb + tint * leak;
 
     if (burn > 0.001) {
-        const float tb = fps > 0.0 ? float(frame) / fps : 0.0;
+        const float tb = t;
         const float flicker =
             0.55 + 0.45 * fx_value_noise1(seed ^ 0xB00Bu, tb * 13.0);
         const float2 corner = float2(1.0, 1.0);
-        const float2 dc = (uv - corner) * float2(size.x / size.y, 1.0);
+        const float2 dc = (leak_uv - corner) * float2(size.x / size.y, 1.0);
         const float ang = atan2(dc.y, dc.x);
         const float rag =
             0.35 * fx_value_noise1(seed ^ 0xF1AEu, ang * 2.2 + tb * 2.0);

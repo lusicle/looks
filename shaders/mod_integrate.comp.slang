@@ -43,12 +43,12 @@ void main(uint3 tid : SV_DispatchThreadID)
         const uint pos = rev ? steps - 1u - s : s;
         const uint2 px = vert ? uint2(pos, tid.x) : uint2(tid.x, pos);
         const float2 uv = (float2(px) + 0.5) / size;
-        const float3 rgb = fx_srgb_oetf(saturate(
-            input.SampleLevel(uv, 0).rgb * 0.5 +
-            input.SampleLevel(clamp(uv - d_lane, 0.0, 1.0), 0).rgb *
+        const float3 rgb = fx_encoded(
+            input.SampleLevel(uv, 0) * 0.5 +
+            input.SampleLevel(clamp(uv - d_lane, 0.0, 1.0), 0) *
                 0.25 +
-            input.SampleLevel(clamp(uv + d_lane, 0.0, 1.0), 0).rgb *
-                0.25));
+            input.SampleLevel(clamp(uv + d_lane, 0.0, 1.0), 0) *
+                0.25);
         const float4 sig = float4(rgb, fx_luma(rgb));
 
         if (sig_s.x < 0.0) sig_s = sig;
@@ -67,8 +67,9 @@ void main(uint3 tid : SV_DispatchThreadID)
         // The base caps at half the density cap to keep 2x headroom.
         // The total caps at 0.25 cycles/px, a 4 px minimum trace pitch.
         const float base_f = min(omega / float(steps), 0.125);
-        const float4 f = min(base_f * (1.0 + dext * w4),
-                             float4(0.25, 0.25, 0.25, 0.25));
+        const float4 f = (mode & 4u) != 0u ?
+            min(omega / float(steps) * max(1.0 + distortion * (sig_s - 0.5) * 2.0, 0.0), 0.45) :
+            min(base_f * (1.0 + dext * w4), float4(0.25, 0.25, 0.25, 0.25));
         phi += f;
         integral[px] = phi;
     }

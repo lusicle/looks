@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float points;
     float length_px;
     float threshold;
@@ -17,7 +20,8 @@ cbuffer Push
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D filtered;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -39,9 +43,8 @@ void main(uint3 tid : SV_DispatchThreadID)
         for (int s = 1; s <= 16; ++s) {
             const float f = float(s) / 16.0;
             const float d = f * f * length_px;
-            const float2 p = clamp(uv + dir * d / size, 0.0, 1.0);
-            const float3 c = input.SampleLevel(p, 0).rgb;
-            const float3 over = max(c - threshold, 0.0);
+            const float2 p = uv + dir * d / float2(canvas_w, canvas_h);
+            const float3 over = fx_sample_border(filtered, p).rgb;
             const float3 disperse =
                 lerp(float3(1.0, 0.95, 0.85), float3(0.85, 0.9, 1.0), f);
             spike += over * disperse * (1.0 - f) * (1.0 - f);

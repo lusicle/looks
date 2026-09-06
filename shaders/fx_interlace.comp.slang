@@ -12,9 +12,14 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float shift;    // comb offset, px
     float darken;
     float mode;
+    float standard;
+    float field_order;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -32,23 +37,27 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const int m = int(mode + 0.5);
-    const bool odd = (tid.y & 1u) != 0u;
+    const float raster = standard < 0.5 ? 480.0 : 576.0;
+    const float footprint = raster / float(height);
+    const float line0 = uv.y * raster - footprint * 0.5;
+    const float line1 = line0 + footprint;
+    const float integral0 = floor(line0 * 0.5) + max(frac(line0 * 0.5) * 2.0 - 1.0, 0.0);
+    const float integral1 = floor(line1 * 0.5) + max(frac(line1 * 0.5) * 2.0 - 1.0, 0.0);
+    const float odd = saturate((integral1 - integral0) / footprint);
+    const uint field = uint(float(frame) / max(fps, 1.0) * (standard < 0.5 ? 59.94 : 50.0));
+    const float older = ((field + uint(field_order)) & 1u) != 0u ? 1.0 - odd : odd;
 
     float4 result;
     if (m == 0) {
-        result = odd ? prev.SampleLevel(uv, 0) : base;
+        result = lerp(base, prev.SampleLevel(uv, 0), older);
     } else if (m == 1) {
-        const float field = odd ? 1.0 : -1.0;
         const float parity = (frame & 1u) != 0u ? 1.0 : -1.0;
-        const float2 suv = float2(
-            clamp(uv.x + field * parity * shift / size.x, 0.0, 1.0),
-            uv.y);
-        result = input.SampleLevel(suv, 0);
+        const float2 delta = float2(parity * shift / canvas_w, 0.0);
+        result = lerp(input.SampleLevel(uv - delta, 0), input.SampleLevel(uv + delta, 0), odd);
     } else {
         result = base;
     }
-    if (odd)
-        result.rgb *= 1.0 - saturate(darken);
+    result.rgb *= 1.0 - saturate(darken) * odd;
 
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));

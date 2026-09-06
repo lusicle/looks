@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float mode;
     float res;           // virtual luma samples across the width
     float chroma_res;    // virtual chroma samples across the width
@@ -50,12 +53,11 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const bool svideo = mode >= 0.5;
     const float smp = max(res, 32.0);
-    // n0 and vline use virtual samples. Virtual pixels stay square.
     const float n0 = uv.x * smp;
-    const uint vline = uint(uv.y * smp * size.y / size.x);
-    // Carrier: 4 samples per cycle, 180 deg per line, 90 deg per frame.
+    const uint vline = uint(uv.y * 480.0);
+    const uint field = uint(float(frame) / max(fps, 1.0) * 59.94);
     const float line_ph = 3.14159265 * float(vline & 1u) +
-                          1.57079633 * float(frame & 3u);
+                          1.57079633 * float(field & 3u);
 
     float y_sep = 0.0;
     float comp_c = 0.0;
@@ -64,7 +66,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float n = n0 + (float(k) - 1.5);
         const float2 p = float2(n / smp, uv.y);
         const float3 yiq =
-            rgb_to_yiq(fx_srgb_oetf(saturate(input.SampleLevel(p, 0).rgb)));
+            rgb_to_yiq(fx_encoded(input.SampleLevel(p, 0)));
         const float th = 1.57079633 * n + line_ph;
         const float c = svideo
                             ? yiq.x
@@ -73,14 +75,18 @@ void main(uint3 tid : SV_DispatchThreadID)
         // One raw tap keeps full carrier amplitude for the crawl residue.
         if (k == 1) comp_c = c;
     }
+    const float3 left = input.SampleLevel(uv - float2(2.0 / smp, 0.0), 0).rgb;
+    const float3 right = input.SampleLevel(uv + float2(2.0 / smp, 0.0), 0).rgb;
+    const float crawl_edge = saturate(length(left - right) * 4.0) *
+        abs(fx_sinc(0.78539816 * smp / float(width)));
     const float y_out = svideo
                             ? y_sep
-                            : lerp(y_sep, comp_c, saturate(dot_crawl) * 0.6);
+                            : lerp(y_sep, comp_c, saturate(dot_crawl) * 0.6 * crawl_edge);
 
     const float cres = clamp(chroma_res, 8.0, smp);
     const float span = smp / cres * 2.0;    // window in virtual samples
     const float stride = span / 8.0;
-    const float dxs = chroma_delay / size.x * smp;   // delay in samples
+    const float dxs = chroma_delay / canvas_w * smp;
     float2 iq = float2(0.0, 0.0);
     float wsum = 0.0;
     [unroll]
@@ -89,22 +95,28 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float n = n0 - dxs + o;
         const float2 p = float2(n / smp, uv.y);
         const float3 yiq =
-            rgb_to_yiq(fx_srgb_oetf(saturate(input.SampleLevel(p, 0).rgb)));
+            rgb_to_yiq(fx_encoded(input.SampleLevel(p, 0)));
         const float wgt = 1.0 - abs(float(k) - 4.0) / 5.0;
         if (svideo) {
             iq += yiq.yz * wgt;
         } else {
-            const float th = 1.57079633 * n + line_ph;
-            const float c = yiq.x + yiq.y * cos(th) + yiq.z * sin(th);
-            const float feed = c - (1.0 - saturate(rainbow)) * yiq.x;
-            iq += 2.0 * feed * float2(cos(th), sin(th)) * wgt;
+            float2 decoded = 0.0;
+            for (int phase = 0; phase < 4; ++phase) {
+                const float sample_n = n + float(phase) - 1.5;
+                const float3 signal = rgb_to_yiq(fx_encoded(input.SampleLevel(float2(sample_n / smp, uv.y), 0)));
+                const float th = 1.57079633 * sample_n + line_ph;
+                const float2 carrier = float2(cos(th), sin(th));
+                const float feed = signal.x * saturate(rainbow) + dot(signal.yz, carrier);
+                decoded += feed * carrier * 0.5;
+            }
+            iq += decoded * wgt;
         }
         wsum += wgt;
     }
     iq /= wsum;
 
     const float3 enc = saturate(yiq_to_rgb(float3(y_out, iq.x, iq.y)));
-    const float4 result = float4(fx_srgb_eotf(enc), base.a);
+    const float4 result = fx_from_encoded(enc, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

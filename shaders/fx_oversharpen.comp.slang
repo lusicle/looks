@@ -30,24 +30,22 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float3 enc = fx_srgb_oetf(saturate(base.rgb));
+    const float3 enc = fx_encoded(base);
     const float2 r = radius / size;
     float3 blur = enc;
-    blur += fx_srgb_oetf(saturate(input.SampleLevel(uv + float2(r.x, 0), 0).rgb));
-    blur += fx_srgb_oetf(saturate(input.SampleLevel(uv - float2(r.x, 0), 0).rgb));
-    blur += fx_srgb_oetf(saturate(input.SampleLevel(uv + float2(0, r.y), 0).rgb));
-    blur += fx_srgb_oetf(saturate(input.SampleLevel(uv - float2(0, r.y), 0).rgb));
-    blur += fx_srgb_oetf(saturate(input.SampleLevel(uv + r * 0.7071, 0).rgb));
-    blur += fx_srgb_oetf(saturate(input.SampleLevel(uv - r * 0.7071, 0).rgb));
-    blur += fx_srgb_oetf(saturate(
-        input.SampleLevel(uv + float2(r.x, -r.y) * 0.7071, 0).rgb));
-    blur += fx_srgb_oetf(saturate(
-        input.SampleLevel(uv - float2(r.x, -r.y) * 0.7071, 0).rgb));
+    blur += fx_encoded(input.SampleLevel(uv + float2(r.x, 0), 0));
+    blur += fx_encoded(input.SampleLevel(uv - float2(r.x, 0), 0));
+    blur += fx_encoded(input.SampleLevel(uv + float2(0, r.y), 0));
+    blur += fx_encoded(input.SampleLevel(uv - float2(0, r.y), 0));
+    blur += fx_encoded(input.SampleLevel(uv + r * 0.7071, 0));
+    blur += fx_encoded(input.SampleLevel(uv - r * 0.7071, 0));
+    blur += fx_encoded(input.SampleLevel(uv + float2(r.x, -r.y) * 0.7071, 0));
+    blur += fx_encoded(input.SampleLevel(uv - float2(r.x, -r.y) * 0.7071, 0));
     blur /= 9.0;
 
     const float3 sharp = saturate(enc + (enc - blur) * amount);
 
-    const float4 result = float4(fx_srgb_eotf(sharp), base.a);
+    const float4 result = fx_from_encoded(sharp, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

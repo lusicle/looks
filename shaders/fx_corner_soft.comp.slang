@@ -10,13 +10,17 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float amount;
     float start;    // radius where softness begins
     float astig;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D filtered;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -29,7 +33,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float2 c = (uv - 0.5) * float2(size.x / size.y, 1.0);
-    const float r = length(c) * 1.155;   // about 1 at the 16:9 corner
+    const float r = length(c) / length(float2(size.x / size.y, 1.0) * 0.5);
     const float t = saturate((r - start) / max(1.0 - start, 1.0e-3));
     const float radius = t * t * amount * 14.0;
 
@@ -50,16 +54,16 @@ void main(uint3 tid : SV_DispatchThreadID)
             const float rr = sqrt(fi);
             const float2 off = (tan_dir * cos(a) * tan_r +
                                 rad_dir * sin(a) * rad_r) * rr;
-            const float2 p = clamp(uv + off / size, 0.0, 1.0);
+            const float2 p = clamp(uv + off / float2(canvas_w, canvas_h), 0.0, 1.0);
             const float wgt = 1.0 - fi * 0.6;
-            const float4 s = input.SampleLevel(p, 0);
+            const float4 s = lerp(input.SampleLevel(p, 0), filtered.SampleLevel(p, 0),
+                                 smoothstep(2.0, 8.0, radius * float(width) / canvas_w));
             acc += s.rgb * wgt;
             acc_a += s.a * wgt;
             wsum += wgt;
         }
         outc = acc / wsum;
         out_a = acc_a / wsum;
-        outc *= 1.0 - t * amount * 0.25;
     }
 
     const float4 result = float4(outc, out_a);

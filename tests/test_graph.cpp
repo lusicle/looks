@@ -51,6 +51,38 @@ TEST(graph_topo_linear_chain) {
     CHECK_EQ(order[2], 0);
 }
 
+TEST(graph_motion_uses_and_shares_the_upstream_image) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = looks::doc::LayerSourceKind::Solid;
+    layer.stack.push_back(make_effect(doc, EffectType::RollingShutter));
+    layer.stack.push_back(make_effect(doc, EffectType::Datamosh));
+    auto graph = compile_graph(doc, look.id, 0);
+    CHECK(graph.valid);
+    int flows = 0;
+    for (const auto& n : graph.nodes) {
+        if (n.kind == GraphNode::Kind::Flow) ++flows;
+        if (n.kind == GraphNode::Kind::Effect) {
+            CHECK_EQ(n.inputs.size(), size_t{2});
+            const auto& flow = graph.nodes[static_cast<size_t>(n.inputs[1])];
+            CHECK(flow.kind == GraphNode::Kind::Flow);
+            CHECK_EQ(flow.inputs.size(), size_t{1});
+            CHECK_EQ(flow.inputs[0], n.inputs[0]);
+        }
+    }
+    CHECK_EQ(flows, 2);
+    look.links = {{layer.id, layer.stack[0].id, 0},
+                  {layer.id, layer.stack[1].id, 0},
+                  {layer.stack[0].id, 0, 0}, {layer.stack[1].id, 0, 0}};
+    graph = compile_graph(doc, look.id, 1);
+    CHECK(graph.valid);
+    flows = 0;
+    for (const auto& n : graph.nodes)
+        if (n.kind == GraphNode::Kind::Flow) ++flows;
+    CHECK_EQ(flows, 1);
+}
+
 TEST(graph_topo_diamond) {
     std::vector<GraphNode> nodes;
     nodes.push_back(node({}));
@@ -62,6 +94,48 @@ TEST(graph_topo_diamond) {
     CHECK_EQ(order.size(), size_t{4});
     CHECK_EQ(order[0], 0);
     CHECK_EQ(order[3], 3);
+}
+
+TEST(graph_anaglyph_keeps_the_right_image_separate_from_the_matte) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
+    look.layers[0].stack.push_back(make_effect(doc, EffectType::Anaglyph));
+    const auto left = look.layers[0].id;
+    const auto fx = look.layers[0].stack[0].id;
+    looks::doc::Layer right;
+    right.id = doc.next_effect_id++;
+    right.source = looks::doc::LayerSourceKind::Gradient;
+    look.layers.push_back(right);
+    look.links = {{left, fx, 0}, {right.id, fx, 2}, {fx, 0, 0}};
+    const auto graph = compile_graph(doc, look.id, 0);
+    CHECK(graph.valid);
+    int effects = 0;
+    for (const auto& n : graph.nodes) {
+        CHECK(n.kind != GraphNode::Kind::MatteExtract);
+        if (n.kind != GraphNode::Kind::Effect) continue;
+        ++effects;
+        CHECK_EQ(n.inputs.size(), size_t{2});
+        CHECK(n.inputs[0] != n.inputs[1]);
+        CHECK_EQ(graph.nodes[static_cast<size_t>(n.inputs[1])].layer_index, 1);
+    }
+    CHECK_EQ(effects, 1);
+}
+
+TEST(graph_jitter_camera_motion_is_independent_of_content) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
+    look.layers[0].stack.push_back(make_effect(doc, EffectType::Jitter));
+    for (int mode = 0; mode < 4; ++mode) {
+        look.layers[0].stack[0].params[2] = static_cast<float>(mode);
+        const auto graph = compile_graph(doc, look.id, 0);
+        CHECK(graph.valid);
+        int flows = 0;
+        for (const auto& n : graph.nodes)
+            if (n.kind == GraphNode::Kind::Flow) ++flows;
+        CHECK_EQ(flows, 0);
+    }
 }
 
 TEST(graph_topo_detects_cycle) {
@@ -1013,11 +1087,10 @@ TEST(graph_razor_identity_is_structural) {
     CHECK_EQ(stacked.size(), uncut[0].size() * 2);
 }
 
-TEST(graph_source_matte_on_multipass_effect) {
+TEST(graph_glow_uses_one_effect_node_with_a_source_matte) {
     using looks::doc::Layer;
     using looks::doc::LayerSourceKind;
 
-    // A multipass effect gates like the single-pass case, in a later look.
     Document doc = doc_with_look();
     doc.looks[0].layers[0].asset = bind_asset(doc);
     looks::doc::Look lab;
@@ -1047,6 +1120,7 @@ TEST(graph_source_matte_on_multipass_effect) {
     CHECK(g.valid);
     int extract = -1, apply = -1;
     int generators = 0;
+    int effects = 0;
     for (size_t i = 0; i < g.nodes.size(); ++i) {
         const GraphNode& n = g.nodes[i];
         for (int in : n.inputs) {
@@ -1058,9 +1132,11 @@ TEST(graph_source_matte_on_multipass_effect) {
         if (n.kind == GraphNode::Kind::MatteApply)
             apply = static_cast<int>(i);
         if (n.kind == GraphNode::Kind::Generator) ++generators;
+        if (n.kind == GraphNode::Kind::Effect) ++effects;
     }
     CHECK(extract >= 0);
     CHECK(apply >= 0);
+    CHECK_EQ(effects, 1);
     CHECK_EQ(generators, 2);   // gradient + shape, nothing fabricated
     const GraphNode& ex = g.nodes[static_cast<size_t>(extract)];
     CHECK_EQ(ex.inputs.size(), size_t{1});

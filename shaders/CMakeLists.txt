@@ -23,8 +23,6 @@ add_slang_shaders(looks_shaders
         fx_jitter.comp.slang
         fx_quantize.comp.slang
         fx_glow_bright.comp.slang
-        fx_glow_blur_h.comp.slang
-        fx_glow_blur_v.comp.slang
         fx_glow_composite.comp.slang
         flow.comp.slang
         fx_flow_smear.comp.slang
@@ -87,6 +85,7 @@ add_slang_shaders(looks_shaders
         fx_head_switch.comp.slang
         fx_vhs_osd.comp.slang
         fx_cam_auto.comp.slang
+        fx_camera_meter.comp.slang
         fx_mosquito.comp.slang
         fx_bit_plane.comp.slang
         fx_block_shuffle.comp.slang
@@ -119,6 +118,7 @@ add_slang_shaders(looks_shaders
         fx_slow_scan.comp.slang
         fx_vector_trace.comp.slang
         fx_scope.comp.slang
+        fx_scope_bins.comp.slang
         fx_security_mux.comp.slang
         fx_audio_scope.comp.slang
         fx_engraver.comp.slang
@@ -146,6 +146,7 @@ add_slang_shaders(looks_shaders
         fx_drip.comp.slang
         fx_burn_in.comp.slang
         fx_aperture.comp.slang
+        fx_optical_reduce.comp.slang
         fx_parallax.comp.slang
         fx_patch_weave.comp.slang
         fx_halation.comp.slang
@@ -157,8 +158,8 @@ add_slang_shaders(looks_shaders
         matte_apply.comp.slang
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_common.slang
+        ${CMAKE_CURRENT_SOURCE_DIR}/fx_optics.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_crt_common.slang
-        ${CMAKE_CURRENT_SOURCE_DIR}/fx_glow_blur_body.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_pattern.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_seg7.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/mosh_common.slang)

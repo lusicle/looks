@@ -262,7 +262,7 @@ bool video_pass_incomplete(const std::filesystem::path& source) {
     if (!bundle_is_fresh(thumbs, source)) return true;
     media::ThumbStripData head;
     return !media::read_thumbs_header(thumbs, &head) ||
-           head.h < media::kThumbStripH;
+           head.h < media::kThumbStripH || !head.linear_filtered;
 }
 
 // Returns 0 when the group has no members or no such slot.
@@ -3861,8 +3861,7 @@ const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
         s.tried = true;
         return &s;
     }
-    // Rebuild a mez strip written at an older cell height, one time.
-    if (strip.h < media::kThumbStripH && !paths.mez.empty() &&
+    if ((strip.h < media::kThumbStripH || !strip.linear_filtered) && !paths.mez.empty() &&
         media::rebuild_still_thumbs(paths.mez, tpath)) {
         media::ThumbStripData fresh;
         if (media::read_thumbs(tpath, &fresh) && fresh.count)
@@ -3899,6 +3898,7 @@ const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
     app.strip_stage_count = lcount;
     app.strip_stage_rgba.assign(
         static_cast<size_t>(lw) * lcount * lh * 4, 255);
+    const auto& linear = color::srgb8_linear_table();
     for (uint32_t t = 0; t < lcount; ++t) {
         const uint8_t* src =
             strip.rgb.data() + static_cast<size_t>(
@@ -3912,24 +3912,25 @@ const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
                 const uint32_t sx0 = x * strip.w / lw;
                 const uint32_t sx1 =
                     std::max(sx0 + 1, (x + 1) * strip.w / lw);
-                uint32_t rs = 0, gs = 0, bs = 0, n = 0;
+                float rs = 0.0f, gs = 0.0f, bs = 0.0f;
+                uint32_t n = 0;
                 for (uint32_t sy = sy0; sy < sy1; ++sy)
                     for (uint32_t sx = sx0; sx < sx1; ++sx) {
                         const uint8_t* sp =
                             src +
                             (static_cast<size_t>(sy) * strip.w + sx) * 3;
-                        rs += sp[0];
-                        gs += sp[1];
-                        bs += sp[2];
+                        rs += linear[sp[0]];
+                        gs += linear[sp[1]];
+                        bs += linear[sp[2]];
                         ++n;
                     }
                 uint8_t* d = app.strip_stage_rgba.data() +
                              (static_cast<size_t>(y) * lw * lcount +
                               t * lw + x) *
                                  4;
-                d[0] = static_cast<uint8_t>((rs + n / 2) / n);
-                d[1] = static_cast<uint8_t>((gs + n / 2) / n);
-                d[2] = static_cast<uint8_t>((bs + n / 2) / n);
+                d[0] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(rs / n) * 255.0f + 0.5f, 0.0f, 255.0f));
+                d[1] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(gs / n) * 255.0f + 0.5f, 0.0f, 255.0f));
+                d[2] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(bs / n) * 255.0f + 0.5f, 0.0f, 255.0f));
             }
         }
     }
@@ -15634,9 +15635,9 @@ void register_ops_app(ScriptHost& sh) {
             "wait_idle(timeout_s?) - until the monitor shows the current "
             "document",
             0, 1, [&sh](Vm& vm, std::vector<Value>& a) {
-                sh.worker->poke();
-                sh.wait = ScriptHost::Wait::Idle;
                 sh.wait_seq0 = sh.worker->snapshot_seq();
+                sh.wait = ScriptHost::Wait::Idle;
+                sh.worker->poke();
                 const double t =
                     !a.empty() && a[0].is_num() ? a[0].num : 10.0;
                 sh.wait_deadline = sh.app->app_seconds + t;
@@ -25293,19 +25294,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                 parsed.value->get("cols").as_int(16));
                         }
                     }
-                    tile = std::max(1.0f, tile);
-                    cols = std::max(
-                        1u, std::min(cols, img.width /
-                                               static_cast<uint32_t>(tile)));
-                    const uint32_t rows = std::max(
-                        1u, img.height / static_cast<uint32_t>(tile));
+                    if (!std::isfinite(tile) || tile < 1.0f || tile > img.height ||
+                        std::floor(tile) != tile || !cols || double(cols) * tile != img.width ||
+                        img.height % static_cast<uint32_t>(tile) != 0) {
+                        app.status = "invalid glyph atlas grid";
+                        continue;
+                    }
+                    const uint32_t rows = img.height / static_cast<uint32_t>(tile);
                     bool is_color = false;
                     for (size_t i = 0; i < static_cast<size_t>(img.width) *
                                                img.height && !is_color;
                          ++i) {
                         const uint8_t* px = img.pixels.data() + i * 4;
                         const int r = px[0], g = px[1], b = px[2];
-                        if (std::abs(r - g) > 8 || std::abs(g - b) > 8)
+                        if (r != g || g != b || px[3] != 255)
                             is_color = true;
                     }
                     // The render worker owns the engine: give the atlas to it.

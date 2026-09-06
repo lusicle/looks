@@ -357,8 +357,7 @@ const UiTexture* UiRenderer::register_image(const uint8_t* rgba,
     tex->height = height;
     tex->rgba_image = true;
 
-    // UNORM, not SRGB: the viewport blit owns the OETF.
-    if (!upload_texture(*tex, VK_FORMAT_R8G8B8A8_UNORM, rgba, bytes,
+    if (!upload_texture(*tex, VK_FORMAT_R8G8B8A8_SRGB, rgba, bytes,
                         {.image_fail = "ui: image texture creation failed (%ux%u)",
                          .pool = "vkCreateCommandPool(image upload)",
                          .cmd = "vkAllocateCommandBuffers(image upload)",

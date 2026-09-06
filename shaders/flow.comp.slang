@@ -1,5 +1,5 @@
 // Output motion vectors are in canvas pixels on a (w/16, h/16) grid.
-// Luma planes use native source pixels. The fit rect maps canvas to uv.
+#include "fx_common.slang"
 
 [[vk::push_constant]]
 cbuffer Push
@@ -29,9 +29,9 @@ float block_sad(float2 cur_base, float2 prev_base, float2 rect,
         {
             const float2 o = float2(x * 2 + 1, y * 2 + 1);
             const float a =
-                cur_luma.SampleLevel((cur_base + o - rect) * inv_fit, 0).r;
+                fx_luma(cur_luma.SampleLevel((cur_base + o - rect) * inv_fit, 0).rgb);
             const float b =
-                prev_luma.SampleLevel((prev_base + o - rect) * inv_fit, 0).r;
+                fx_luma(prev_luma.SampleLevel((prev_base + o - rect) * inv_fit, 0).rgb);
             sad += abs(a - b);
         }
     }

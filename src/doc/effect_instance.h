@@ -169,6 +169,7 @@ inline const char* effect_aux_port(EffectType type) {
         case EffectType::TimeDisplace: return "map";
         case EffectType::TrackPin: return "b";
         case EffectType::Aperture: return "depth";
+        case EffectType::Anaglyph: return "right";
         case EffectType::Parallax: return "depth";
         default: return nullptr;
     }

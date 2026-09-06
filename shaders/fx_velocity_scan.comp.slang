@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float mode;
     float speed;     // the stepper uses this, not the shader
     float stick;     // the stepper uses this, not the shader
@@ -30,6 +33,12 @@ cbuffer Push
 
 static const uint kSlots = 24;
 
+float ramp_area(float x, float span)
+{
+    float t = clamp(x, 0.0, span);
+    return t * (x - 0.5 * t);
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
@@ -42,11 +51,14 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const bool rows = mode >= 0.5;
     const uint along = rows ? tid.x : tid.y;
-    const float sweep_p = rows ? float(tid.y) + 0.5 : float(tid.x) + 0.5;
+    const float sweep_p = rows ? uv.y * canvas_h : uv.x * canvas_w;
+    const float pixel = rows ? canvas_h / float(height) : canvas_w / float(width);
 
     const float4 held = canvas.SampleLevel(uv, 0);
-    float3 col = held.rgb * saturate(persist);
-    float col_a = held.a * saturate(persist);
+    const float dt = 60.0 / max(fps, 1.0);
+    const float retention = pow(saturate(persist), dt);
+    float3 col = held.rgb * retention;
+    float col_a = held.a * retention;
 
     const float3 src_col =
         lerp(float3(1.0, 1.0, 1.0), base.rgb * 1.4, saturate(color));
@@ -56,11 +68,23 @@ void main(uint3 tid : SV_DispatchThreadID)
                    (float(s) + 0.5) / float(kSlots));
         const float4 st = front.SampleLevel(st_uv, 0);
         if (st.g < 0.5) continue;
-        const float d = abs(sweep_p - st.r);
-        if (d < beam_w) {
-            const float glow = 1.0 - d / beam_w;
-            col += src_col * glow * glow * 0.35;
-            col_a = max(col_a, glow * glow * 0.35);
+        const float travel = st.r - st.a;
+        const float x = sweep_p - st.a;
+        if (x < -beam_w - pixel * 0.5 || x > travel + beam_w + pixel * 0.5) continue;
+        float coverage;
+        if (travel > 1.0e-4) {
+            coverage = (ramp_area(x + beam_w + pixel * 0.5, travel) -
+                        ramp_area(x - beam_w + pixel * 0.5, travel) -
+                        ramp_area(x + beam_w - pixel * 0.5, travel) +
+                        ramp_area(x - beam_w - pixel * 0.5, travel)) / (travel * pixel);
+        } else {
+            coverage = max(min(x + pixel * 0.5, beam_w) -
+                           max(x - pixel * 0.5, -beam_w), 0.0) / pixel;
+        }
+        if (coverage > 0.0) {
+            const float energy = saturate(coverage) * 0.35 * dt;
+            col += src_col * energy;
+            col_a = max(col_a, energy);
         }
     }
     // Use a ceiling instead of blowout so bunched fronts stay readable.

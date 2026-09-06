@@ -31,18 +31,18 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     // Bilinear taps scale the footprint with radius. Do not add taps.
     const float2 r = px * max(radius, 0.01);
-    float3 blur = base.rgb * 0.25;
-    blur += input.SampleLevel(uv + float2(r.x, 0.0), 0).rgb * 0.125;
-    blur += input.SampleLevel(uv - float2(r.x, 0.0), 0).rgb * 0.125;
-    blur += input.SampleLevel(uv + float2(0.0, r.y), 0).rgb * 0.125;
-    blur += input.SampleLevel(uv - float2(0.0, r.y), 0).rgb * 0.125;
-    blur += input.SampleLevel(uv + r, 0).rgb * 0.0625;
-    blur += input.SampleLevel(uv - r, 0).rgb * 0.0625;
-    blur += input.SampleLevel(uv + float2(r.x, -r.y), 0).rgb * 0.0625;
-    blur += input.SampleLevel(uv + float2(-r.x, r.y), 0).rgb * 0.0625;
+    float4 blur = base * 0.25;
+    blur += input.SampleLevel(uv + float2(r.x, 0.0), 0) * 0.125;
+    blur += input.SampleLevel(uv - float2(r.x, 0.0), 0) * 0.125;
+    blur += input.SampleLevel(uv + float2(0.0, r.y), 0) * 0.125;
+    blur += input.SampleLevel(uv - float2(0.0, r.y), 0) * 0.125;
+    blur += input.SampleLevel(uv + r, 0) * 0.0625;
+    blur += input.SampleLevel(uv - r, 0) * 0.0625;
+    blur += input.SampleLevel(uv + float2(r.x, -r.y), 0) * 0.0625;
+    blur += input.SampleLevel(uv + float2(-r.x, r.y), 0) * 0.0625;
 
     const float3 sharpened =
-        max(base.rgb + (base.rgb - blur) * amount, 0.0);
+        max(base.rgb + (base.rgb - fx_straight(blur) * base.a) * amount, 0.0);
 
     const float4 wetted =
         lerp(base, float4(sharpened, base.a), saturate(wet));

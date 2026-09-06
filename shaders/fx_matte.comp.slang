@@ -32,7 +32,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
 
-    const float3 enc = fx_srgb_oetf(saturate(base.rgb));
+    const float3 enc = fx_encoded(base);
     const float l = fx_luma(enc);
     const uint m = uint(mode + 0.5);
     float v;
@@ -64,7 +64,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 result =
         int(out_mode + 0.5) == 1
             ? base * v
-            : float4(fx_srgb_eotf(float3(v, v, v)), base.a);
+            : float4(float3(v, v, v) * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

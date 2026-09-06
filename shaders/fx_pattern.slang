@@ -44,7 +44,7 @@ float fx_ordered_pattern(int id, float2 pf, uint2 pix, uint seed,
     if (id == 2)
         return fx_bayer8(p) + 0.5 / 64.0;
     if (id == 3)
-        return fx_hash01(fx_hash4(seed, boil_tick, pix.x, pix.y));
+        return fx_hash01(fx_hash4(seed, boil_tick, p.x, p.y));
     if (id == 4)
         return fx_blue_noise(noise_lut, p);
     if (id == 5)

@@ -41,11 +41,11 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     const uint m = uint(mode + 0.5);
     float3 rgb;
-    if (m == 0u) rgb = fx_srgb_eotf(float3(line, line, line));
-    else if (m == 1u) rgb = fx_srgb_eotf(float3(1.0, 1.0, 1.0) * (1.0 - line));
-    else rgb = base.rgb * (1.0 - line * 0.8) + line * 0.02;
+    if (m == 0u) rgb = float3(line, line, line);
+    else if (m == 1u) rgb = float3(1.0, 1.0, 1.0) * (1.0 - line);
+    else rgb = fx_straight(base) * (1.0 - line * 0.8) + line * 0.02;
 
-    const float4 result = float4(rgb, base.a);
+    const float4 result = float4(rgb * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

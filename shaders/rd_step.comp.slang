@@ -10,6 +10,7 @@ cbuffer Push
     float feed;
     float kill;
     float inject;
+    float dt;
 };
 
 [[vk::binding(0, 0)]] Sampler2D state;     // A = r, B = g
@@ -43,14 +44,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     lap += 0.05 * ab_at(uv - float2(e.x, -e.y));
 
     const float abb = c.x * c.y * c.y;
-    float a = c.x + (1.0 * lap.x - abb + feed * (1.0 - c.x));
-    float b = c.y + (0.5 * lap.y + abb - (feed + kill) * c.y);
+    float a = c.x + dt * (1.0 * lap.x - abb + feed * (1.0 - c.x));
+    float b = c.y + dt * (0.5 * lap.y + abb - (feed + kill) * c.y);
 
     // Inject in the midtones only. The extremes flood the sim flat.
     const float3 rgb = frame_in.SampleLevel(uv, 0).rgb;
     const float l = fx_luma(rgb);
     const float mid = smoothstep(0.05, 0.25, l) * (1.0 - smoothstep(0.5, 0.9, l));
-    b += inject * 0.02 * mid * (1.0 - b);
+    b += inject * dt * 0.02 * mid * (1.0 - b);
 
     next_state[tid.xy] = float4(saturate(a), saturate(b), 0.0, 1.0);
 }

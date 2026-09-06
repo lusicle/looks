@@ -1,5 +1,3 @@
-// Work in display-referred space. The drawing is ink on paper.
-
 #include "fx_common.slang"
 
 [[vk::push_constant]]
@@ -12,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float spacing;   // px
     float layers;    // hatch directions, 1 to 4
     float ink;
@@ -31,9 +32,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     const float2 uv = (float2(tid.xy) + 0.5) / float2(width, height);
     const float4 base = input.SampleLevel(uv, 0);
-    const float2 px = float2(tid.xy);
+    const float2 px = uv * float2(canvas_w, canvas_h);
+    const float footprint = canvas_w / float(width);
 
-    const float l = fx_luma(fx_srgb_oetf(saturate(base.rgb)));
+    const float l = fx_luma(fx_encoded(base));
     const int n = clamp(int(layers + 0.5), 1, 4);
     const float pitch = max(spacing, 2.0);
 
@@ -48,19 +50,23 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float tremor =
             (fx_value_noise1(seed ^ uint(i) * 91u, along * 0.05) - 0.5) *
             wobble * pitch * 0.8;
-        const float d =
-            abs(frac((across + tremor) / pitch) - 0.5) * pitch;
         const float press = saturate((thresh - l) / max(thresh, 1.0e-3));
-        const float half_w = 0.35 + press * 0.75;
-        const float stroke = 1.0 - smoothstep(half_w - 0.4, half_w + 0.4, d);
-        paper = min(paper, 1.0 - stroke * ink);
+        const float half_w = press * 1.1;
+        const float duty = saturate(2.0 * half_w / pitch);
+        const float span = footprint * (abs(ca) + abs(sa)) / pitch;
+        const float coord = (across + tremor) / pitch - 0.5 + duty * 0.5;
+        const float lo = coord - span * 0.5;
+        const float hi = coord + span * 0.5;
+        const float coverage = ((floor(hi) - floor(lo)) * duty + min(frac(hi), duty) - min(frac(lo), duty)) / span;
+        const float stroke = lerp(duty, saturate(coverage),
+                                 smoothstep(1.5, 3.0, pitch / footprint));
+        paper *= 1.0 - saturate(stroke * ink);
     }
 
-    const float3 enc = fx_srgb_oetf(saturate(base.rgb));
     const float3 drawn =
-        lerp(float3(paper, paper, paper), enc * paper, 0.15);
+        lerp(float3(paper, paper, paper), saturate(fx_straight(base)) * paper, 0.15);
 
-    const float4 result = float4(fx_srgb_eotf(saturate(drawn)), base.a);
+    const float4 result = float4(drawn * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

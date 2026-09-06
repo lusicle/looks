@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float preset;
     float push;
     float punch;
@@ -91,8 +94,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const uint p = min(uint(preset + 0.5), kPresets - 1);
+    if (p == 0u && push == 0.0 && punch == 0.0 && fade == 0.0 && highlight == 0.0) {
+        output[tid.xy] = base;
+        return;
+    }
 
-    float3 lin = base.rgb * exp2(push);
+    float3 lin = fx_straight(base) * exp2(push);
     lin = max(mul(kMatrix[p], lin), 0.0);
     // A positive highlight deepens the shoulder. A negative one clips white.
     const float knee = 0.8 - saturate(highlight) * 0.45;
@@ -104,7 +111,9 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 enc = fx_srgb_oetf(saturate(lin));
     const float contrast = kTone[p].x + saturate(punch) * 0.6;
-    enc = saturate((enc - 0.42) * (1.0 + contrast) + 0.42);
+    const float3 odds = max(enc, 1e-5) / max(1.0 - enc, 1e-5);
+    const float3 developed = pow(odds, max(0.2, 1.0 + contrast));
+    enc = developed / (1.0 + developed);
     const float l = fx_luma(enc);
     enc = saturate(lerp(float3(l, l, l), enc, kTone[p].y));
     // Presets 13 and 16 add a base fog to the fade knob.
@@ -115,7 +124,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         float3(1.0 + kTone[p].z * 0.4, 1.0, 1.0 - kTone[p].z * 0.2);
     enc = enc * (1.0 - lift) + lift * fade_tint * 0.6;
 
-    const float4 result = float4(fx_srgb_eotf(saturate(enc)), base.a);
+    const float4 result = float4(fx_srgb_eotf(saturate(enc)) * base.a, base.a);
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

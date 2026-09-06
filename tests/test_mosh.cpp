@@ -181,7 +181,7 @@ TEST(mosh_mv_field_advects) {
     CHECK(matches > total * 3 / 4);
 }
 
-TEST(mosh_generation_loss_degrades) {
+TEST(mosh_generation_loss_matches_repeated_fixed_quality_encoding) {
     TestFrame frame(0);
     MoshParams params;
     params.quality = 35;
@@ -196,7 +196,34 @@ TEST(mosh_generation_loss_degrades) {
     DecodedFrame b;
     many.process(frame.view(), 0, gen, {}, b);
 
-    CHECK(mean_abs_diff(b.y, frame.y) > mean_abs_diff(a.y, frame.y));
+    DecodedFrame repeated = a;
+    for (int pass = 1; pass < 8; ++pass) {
+        MoshCodec encoder;
+        DecodedFrame next;
+        encoder.process(repeated.view(), 0, params, {}, next);
+        repeated = std::move(next);
+    }
+    CHECK(b.y == repeated.y);
+    CHECK(b.u == repeated.u);
+    CHECK(b.v == repeated.v);
+}
+
+TEST(mosh_repeat_reapplies_residual) {
+    TestFrame first(0), second(0);
+    std::fill(first.y.begin(), first.y.end(), uint8_t{64});
+    std::fill(second.y.begin(), second.y.end(), uint8_t{80});
+    MoshParams params;
+    params.quality = 100;
+    params.gop_length = 100;
+    params.p_repeat = 2;
+    MoshCodec codec;
+    DecodedFrame out;
+    codec.process(first.view(), 0, params, {}, out);
+    codec.process(second.view(), 1, params, {}, out);
+    CHECK(std::abs(static_cast<int>(out.y[0]) - 112) <= 2);
+    params.p_repeat = 0;
+    codec.process(second.view(), 2, params, {}, out);
+    CHECK(std::abs(static_cast<int>(out.y[0]) - 112) <= 2);
 }
 
 TEST(mosh_bitrate_starvation_caps_quality) {

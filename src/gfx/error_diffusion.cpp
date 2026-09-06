@@ -65,10 +65,13 @@ void run_error_diffusion(const uint16_t* halves, uint32_t width,
         static_cast<int>(height), true, [&](int begin, int end) {
             for (int row = begin; row < end; ++row) {
                 const size_t base = static_cast<size_t>(row) * width;
-                for (size_t x = 0; x < width; ++x)
+                for (size_t x = 0; x < width; ++x) {
+                    const float alpha = half_to_float(halves[(base + x) * 4 + 3]);
+                    const float inv_alpha = alpha > 1e-6f ? 1.0f / alpha : 0.0f;
                     for (size_t c = 0; c < 3; ++c)
                         v[c * n + base + x] =
-                            lin_lut[halves[(base + x) * 4 + c]];
+                            std::clamp(lin_lut[halves[(base + x) * 4 + c]] * inv_alpha, 0.0f, 1.0f);
+                }
             }
         });
     if (carry_amt > 0.0f && slot.carry.size() == n * 3)
@@ -224,9 +227,10 @@ void run_error_diffusion(const uint16_t* halves, uint32_t width,
                 const int xb = x - dir;
                 const bool has_back = xb >= 0 && xb < iw;
                 // Weights index the original input level, not the shift.
-                const float orig =
-                    lin_lut[halves[(static_cast<size_t>(y) * width +
-                                    static_cast<size_t>(x)) * 4 + c]];
+                const size_t pixel = (static_cast<size_t>(y) * width + static_cast<size_t>(x)) * 4;
+                const float alpha = half_to_float(halves[pixel + 3]);
+                const float orig = alpha > 1e-6f ?
+                    std::clamp(lin_lut[halves[pixel + c]] / alpha, 0.0f, 1.0f) : 0.0f;
                 const float* wv = ostro_w[row_lut[std::min(
                     4095, static_cast<int>(orig * 4096.0f))]];
                 // The unclamped pick gives the same count; only error clamps.

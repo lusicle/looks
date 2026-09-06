@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float roll;    // picture heights per second
     float tear;
     float band;
@@ -29,6 +32,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
+    const uint field = uint(t * 59.94);
+    const uint line = uint(uv.y * 480.0);
 
     float sy = uv.y + t * roll;
     sy -= floor(sy);
@@ -48,7 +53,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (d < band) {
         const float fall = 1.0 - d / band;
         const float line_jit =
-            fx_hash01(fx_hash4(seed, frame, tid.y, 7u)) - 0.5;
+            fx_hash01(fx_hash4(seed, field, line, 7u)) - 0.5;
         sx += (0.25 + 0.15 * line_jit) * tear * fall;
     }
     sx -= floor(sx);

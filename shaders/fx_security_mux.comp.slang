@@ -1,4 +1,3 @@
-// The engine dispatches this once for each age band of the ring.
 
 #include "fx_common.slang"
 
@@ -12,12 +11,15 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float cols;
     float rows_n;
     float spread;
     float mono;
     float osd;
-    uint pass_age;   // the engine appends this age band word
+    uint pass_tile;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
@@ -30,23 +32,17 @@ static const uint kRing = 16;   // must match the engine kSlitRing
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x >= width || tid.y >= height)
-        return;
     const float2 size = float2(width, height);
-    const float2 uv = (float2(tid.xy) + 0.5) / size;
-
     const uint nc = uint(clamp(cols, 1.0, 4.0) + 0.5);
     const uint nr = uint(clamp(rows_n, 1.0, 4.0) + 0.5);
-    const uint tx = min(uint(uv.x * float(nc)), nc - 1u);
-    const uint ty = min(uint(uv.y * float(nr)), nr - 1u);
-    const uint tile = ty * nc + tx;
-
-    const uint age = min(
-        uint(fx_hash01(fx_hash3(seed, tile, 0x77u)) * saturate(spread) *
-             float(kRing - 1u) + 0.5),
-        kRing - 1u);
-    if (age != pass_age)
-        return;
+    const uint tx = pass_tile % nc;
+    const uint ty = pass_tile / nc;
+    const uint tile = pass_tile;
+    const uint2 start = uint2(tx * width / nc, ty * height / nr);
+    const uint2 end = uint2((tx + 1u) * width / nc, (ty + 1u) * height / nr);
+    const uint2 pixel = start + tid.xy;
+    if (any(pixel >= end)) return;
+    const float2 uv = (float2(pixel) + 0.5) / size;
 
     const float4 base = input.SampleLevel(uv, 0);
 
@@ -62,18 +58,18 @@ void main(uint3 tid : SV_DispatchThreadID)
     col = lerp(col, l * float3(0.78, 0.90, 0.84), saturate(mono)) * gn;
     const float fz =
         fx_hash01(fx_hash4(seed ^ 0xC5u, tid.x, tid.y, frame)) - 0.5;
-    col += fz * saturate(mono) * 0.05;
+    col = max(col + fz * saturate(mono) * 0.05 * col_a, 0.0);
 
     const float o = saturate(osd);
     if (o > 0.01) {
-        const float2 tpx = luv * size / float2(float(nc), float(nr));
-        const float2 tsz = size / float2(float(nc), float(nr));
+        const float2 tpx = luv * float2(canvas_w, canvas_h) / float2(float(nc), float(nr));
+        const float2 tsz = float2(canvas_w, canvas_h) / float2(float(nc), float(nr));
         const float bd =
             min(min(tpx.x, tsz.x - tpx.x), min(tpx.y, tsz.y - tpx.y));
         if (bd < 2.0) { col = lerp(col, float3(0.02, 0.02, 0.02), o);
-                        col_a = max(col_a, o); }
+                        col_a += o * (1.0 - col_a); }
         else if (bd < 3.0) { col = lerp(col, float3(0.35, 0.35, 0.35), o);
-                             col_a = max(col_a, o); }
+                             col_a += o * (1.0 - col_a); }
 
         const float t = fps > 0.0 ? float(frame) / fps : 0.0;
         const bool blink =
@@ -81,7 +77,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         const float2 dotc = float2(10.0, 10.0);
         if (blink && length(tpx - dotc) < 3.5) {
             col = lerp(col, float3(1.0, 0.12, 0.08), o);
-            col_a = max(col_a, o);
+            col_a += o * (1.0 - col_a);
         }
 
         const float2 dpx = tpx - float2(8.0, tsz.y - 9.0);
@@ -90,12 +86,12 @@ void main(uint3 tid : SV_DispatchThreadID)
             const uint slot_i = uint(max(slot_f, 0.0));
             if (slot_i <= tile && frac(slot_f) < 0.5) {
                 col = lerp(col, float3(0.95, 0.95, 0.9), o);
-                col_a = max(col_a, o);
+                col_a += o * (1.0 - col_a);
             }
         }
     }
 
     const float4 result = float4(col, col_a);
     const float4 wetted = lerp(base, result, saturate(wet));
-    output[tid.xy] = lerp(base, wetted, saturate(opacity));
+    output[pixel] = lerp(base, wetted, saturate(opacity));
 }

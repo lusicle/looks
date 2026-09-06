@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float feed;     // rd_step uses feed, kill, steps and inject
     float kill;
     float steps;
@@ -40,7 +43,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float col_a = base.a;
     if (ink < 0.5) {
         col = base.rgb * (1.0 - body * 0.92);
-        col += rim * base.rgb * 0.8 + rim * 0.05;
+        col += rim * (base.rgb * 0.8 + base.a * 0.05);
     } else {
         col = base.rgb + body * (base.rgb * 2.5 + 0.08) + rim * 0.15;
         // The pattern's own light carries coverage past the content.

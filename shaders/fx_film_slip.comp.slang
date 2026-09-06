@@ -10,13 +10,17 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float slip;    // 0..1 of a frame height
     float speed;   // hz
     float blend;
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D previous;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -31,16 +35,21 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float t = fps > 0.0 ? float(frame) / fps : 0.0;
     const float offset = frac(slip + t * speed);
 
-    const float2 suv = float2(uv.x, frac(uv.y + offset));
-    const float4 rolled = input.SampleLevel(suv, 0);
+    float4 rolled = 0.0;
+    const float travel = speed * 0.5 / max(fps, 1.0);
+    for (int i = 0; i < 8; ++i) {
+        const float y = uv.y + offset - travel * (float(i) + 0.5) / 8.0;
+        const float2 suv = float2(uv.x, frac(y));
+        rolled += (y >= 1.0 ? previous.SampleLevel(suv, 0) : input.SampleLevel(suv, 0)) * 0.125;
+    }
     float3 col = rolled.rgb;
     float col_a = rolled.a;
 
     if (blend > 0.001) {
         const float2 guv = float2(uv.x, frac(uv.y + offset + 0.5));
-        const float4 ghost = input.SampleLevel(guv, 0);
-        col = lerp(col, col + ghost.rgb * 0.6, blend * 0.6);
-        col_a = max(col_a, ghost.a * blend * 0.6);
+        const float4 ghost = previous.SampleLevel(guv, 0);
+        col = lerp(col, ghost.rgb, blend * 0.5);
+        col_a = lerp(col_a, ghost.a, blend * 0.5);
     }
 
     if (offset > 0.002 && offset < 0.998) {

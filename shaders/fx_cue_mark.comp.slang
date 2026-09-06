@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float period;      // seconds
     float dwell;       // frames
     float mark_size;   // radius, normalized to height
@@ -29,29 +32,34 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float4 base = input.SampleLevel(uv, 0);
 
     const float fp = max(fps, 1.0);
-    const uint period_frames = max(uint(period * fp), 2u);
-    const uint in_period = frame % period_frames;
-    const uint dwell_f = max(uint(dwell), 1u);
-    const bool on = in_period < dwell_f ||
-                    (in_period >= uint(fp) && in_period < uint(fp) + dwell_f);
+    const float reel = max(period, 2.0);
+    const float time = float(frame) / fp;
+    const float first = max(reel - 8.0, 0.0);
+    const float second = reel - 1.0;
+    const float duration = max(dwell, 1.0) / 24.0;
+    float exposure = 0.0;
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        float start = floor(time / reel) * reel + float(cycle) * reel;
+        exposure += max(min(time + 1.0 / fp, start + first + duration) - max(time, start + first), 0.0) * fp;
+        exposure += max(min(time + 1.0 / fp, start + second + duration) - max(time, start + second), 0.0) * fp;
+    }
 
     float mark = 0.0;
-    if (on) {
+    if (exposure > 0.0) {
         const float2 center = float2(0.93, 0.09);
         const float2 d = (uv - center) * float2(size.x / size.y, 1.0);
         const float rr = length(d) / max(mark_size, 1.0e-3);
-        const uint event = frame / period_frames;
+        const uint event = uint(time / reel);
         const float ang = atan2(d.y, d.x);
         const float wobble =
             0.85 + 0.25 * fx_value_noise1(seed ^ event, ang * 2.2 + 10.0);
-        mark = rr < wobble ? 1.0 : 0.0;
+        const float edge = 1.0 / (float(height) * max(mark_size, 1.0e-3));
+        mark = (1.0 - smoothstep(wobble - edge, wobble + edge, rr)) * saturate(exposure);
     }
 
-    float3 enc = fx_srgb_oetf(saturate(base.rgb));
-    enc = lerp(enc, float3(0.10, 0.08, 0.07), mark * 0.9);
-
-    const float4 result =
-        float4(fx_srgb_eotf(enc), max(base.a, mark * 0.9));
+    const float alpha = mark * 0.9;
+    const float4 result = float4(base.rgb * (1.0 - alpha) +
+        fx_srgb_eotf(float3(0.10, 0.08, 0.07)) * alpha, base.a + alpha * (1.0 - base.a));
     const float4 wetted = lerp(base, result, saturate(wet));
     output[tid.xy] = lerp(base, wetted, saturate(opacity));
 }

@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float amount;
     float radius;
     float rate;     // hz
@@ -30,36 +33,27 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 uv = (float2(tid.xy) + 0.5) / size;
     const float4 base = input.SampleLevel(uv, 0);
 
-    // Take the max gradient on a ring so the shimmer hugs both sides.
-    const float2 px = 1.0 / size;
-    float edge = 0.0;
-    [unroll]
-    for (int k = 0; k < 4; ++k) {
-        const float a = float(k) * 1.5708;
-        const float2 off = float2(cos(a), sin(a)) * radius * px;
-        const float2 p = clamp(uv + off, 0.0, 1.0);
-        const float l0 = fx_luma(input.SampleLevel(
-            clamp(p - float2(px.x, 0.0), 0.0, 1.0), 0).rgb);
-        const float l1 = fx_luma(input.SampleLevel(
-            clamp(p + float2(px.x, 0.0), 0.0, 1.0), 0).rgb);
-        const float l2 = fx_luma(input.SampleLevel(
-            clamp(p - float2(0.0, px.y), 0.0, 1.0), 0).rgb);
-        const float l3 = fx_luma(input.SampleLevel(
-            clamp(p + float2(0.0, px.y), 0.0, 1.0), 0).rgb);
-        edge = max(edge, abs(l1 - l0) + abs(l3 - l2));
+    const float2 pixel = uv * float2(canvas_w, canvas_h);
+    const float2 step_uv = max(radius, 1.0) / float2(canvas_w, canvas_h) * 0.5;
+    const float3 encoded = fx_encoded(base);
+    float3 filtered = 0.0;
+    float weight = 0.0;
+    for (int k = -4; k <= 4; ++k) {
+        const float x = float(k) * 0.65;
+        const float w = fx_sinc(x * 3.14159265) * fx_sinc(x * 1.04719755);
+        const float3 horizontal = fx_encoded(input.SampleLevel(
+            saturate(uv + float2(float(k) * step_uv.x, 0.0)), 0));
+        const float3 vertical = fx_encoded(input.SampleLevel(
+            saturate(uv + float2(0.0, float(k) * step_uv.y)), 0));
+        filtered += (horizontal + vertical) * (w * 0.5);
+        weight += w;
     }
-    const float gate = saturate(edge * 5.0);
-
-    const float t = fps > 0.0 ? float(frame) / fps : 0.0;
+    const float t = float(frame) / max(fps, 1.0);
     const uint tick = uint(t * max(rate, 0.01));
-    // The cells are 2 px.
-    const float n = fx_hash01(fx_hash4(seed ^ tick * 0x9E37u, tick,
-                                       tid.x / 2u, tid.y / 2u)) - 0.5;
-
-    float3 enc = fx_srgb_oetf(saturate(base.rgb));
-    enc = saturate(enc + n * gate * amount * 0.5);
-
-    const float4 result = float4(fx_srgb_eotf(enc), base.a);
-    const float4 wetted = lerp(base, result, saturate(wet));
-    output[tid.xy] = lerp(base, wetted, saturate(opacity));
+    const uint2 block = uint2(pixel / 8.0);
+    const float strength = 0.75 + 0.25 * fx_hash01(fx_hash4(seed, tick, block.x, block.y));
+    const float resolved = min(1.0, max(radius, 1.0) * float(width) / canvas_w);
+    const float3 enc = saturate(encoded + (filtered / weight - encoded) * amount * strength * resolved);
+    const float4 result = fx_from_encoded(enc, base.a);
+    output[tid.xy] = lerp(base, result, saturate(wet) * saturate(opacity));
 }

@@ -10,6 +10,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float threshold;
     float ghosts;
     float spread;
@@ -18,12 +21,12 @@ cbuffer Push
 };
 
 [[vk::binding(0, 0)]] Sampler2D input;
-[[vk::binding(1, 0)]] RWTexture2D<float4> output;
+[[vk::binding(1, 0)]] Sampler2D filtered;
+[[vk::binding(2, 0)]] RWTexture2D<float4> output;
 
 float3 bright_at(float2 p, float t)
 {
-    const float3 c = input.SampleLevel(clamp(p, 0.0, 1.0), 0).rgb;
-    return max(c - t, 0.0);
+    return fx_sample_border(filtered, p).rgb;
 }
 
 [shader("compute")]
@@ -51,7 +54,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         [unroll]
         for (int k = 0; k < 4; ++k) {
             const float a = float(k) * 1.5708 + float(i);
-            g += bright_at(gp + float2(cos(a), sin(a)) * 4.0 / size,
+            g += bright_at(gp + float2(cos(a), sin(a)) * 4.0 / float2(canvas_w, canvas_h),
                            threshold);
         }
         flare += g * 0.25 * fade * disperse;

@@ -12,6 +12,9 @@ cbuffer Push
     uint seed;
     uint frame;
     float fps;
+    float canvas_w;
+    float canvas_h;
+    uint history_valid;
     float period;    // seconds per full frame
     float mode;
     float beam;
@@ -22,6 +25,7 @@ cbuffer Push
 [[vk::binding(0, 0)]] Sampler2D input;
 [[vk::binding(1, 0)]] Sampler2D canvas;
 [[vk::binding(2, 0)]] RWTexture2D<float4> output;
+[[vk::binding(3, 0)]] RWTexture2D<float4> state_out;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -63,16 +67,14 @@ void main(uint3 tid : SV_DispatchThreadID)
         col_a = s.a;
         const float fz =
             fx_hash01(fx_hash4(seed ^ 0xF1u, tid.x, tid.y, cycle)) - 0.5;
-        col = max(col + fz * saturate(noise) * 0.25, 0.0);
+        col = max(col + fz * saturate(noise) * 0.25 * col_a, 0.0);
     } else {
         const float4 held = canvas.SampleLevel(uv, 0);
         col = held.rgb;
         col_a = held.a;
-        if (pos > s_now)
-            col *= 1.0 - saturate(dim) * 0.6;
     }
-
-    // Glow only ahead of the write line so it does not burn in.
+    state_out[tid.xy] = float4(col, col_a);
+    if (pos > s_now) col *= 1.0 - saturate(dim) * 0.6;
     const float ahead = (pos - s_now) * extent;
     if (ahead > 0.0) {
         const float glow =

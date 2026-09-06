@@ -32,7 +32,7 @@ bool Nv12Readback::init(const std::filesystem::path& shader_dir) {
     desc.spv_name = "export_nv12.comp.spv";
     desc.sampled_inputs = 1;
     desc.storage_outputs = 2;
-    desc.push_bytes = 2 * sizeof(uint32_t);
+    desc.push_bytes = 3 * sizeof(uint32_t);
     to_nv12_ = ComputePipeline::create(device_, shader_dir, desc);
     if (!to_nv12_) return false;
 
@@ -118,7 +118,7 @@ bool Nv12Readback::render(Engine& engine, const doc::Document& doc,
 
     y_image_->transition(cmd_, VK_IMAGE_LAYOUT_GENERAL);
     uv_image_->transition(cmd_, VK_IMAGE_LAYOUT_GENERAL);
-    const uint32_t push[2] = {w, h};
+    const uint32_t push[3] = {w, h, 0};
     const GpuImage* sampled[1] = {final_image};
     GpuImage* storage[2] = {y_image_.get(), uv_image_.get()};
     to_nv12_->dispatch(cmd_, engine.arena(), 0, sampled, 1, storage, 2, push,
