@@ -503,7 +503,7 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     generator_ = mk("gen.comp.spv", 2, 1, 24 * sizeof(uint32_t));
     layer_blend_ = mk("layer_blend.comp.spv", 2, 1, 11 * sizeof(uint32_t));
     layer_transform_ =
-        mk("layer_transform.comp.spv", 1, 1, 11 * sizeof(uint32_t));
+        mk("layer_transform.comp.spv", 1, 1, 12 * sizeof(uint32_t));
     if (!generator_ || !layer_blend_ || !layer_transform_) return false;
 
     codec_io_.staging = std::make_unique<StagingBuffer>(device_);
@@ -2050,7 +2050,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 // Look layers only; sequence Motion runs in the lane blend.
                 const doc::Layer& layer =
                     look.layers[static_cast<size_t>(node.layer_index)];
-                uint32_t push[11] = {};
+                uint32_t push[12] = {};
                 push[0] = w;
                 push[1] = h;
                 push[2] = as_bits(layer.crop_l);
@@ -2063,6 +2063,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 push[8] = as_bits(layer.xf_rotate * doc::kDeg2Rad);
                 push[9] = as_bits(layer.xf_anchor_x);
                 push[10] = as_bits(layer.xf_anchor_y);
+                push[11] = as_bits(layer.opacity);
                 const GpuImage* sampled[1] = {input_image(0)};
                 layer_transform_->dispatch(rec, arena_, frame_index, sampled,
                                            1, &dst, 1, push, sizeof(push), w,
@@ -2185,8 +2186,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 if (node.layer_index >= 0) {
                     const doc::Layer& layer =
                         look.layers[static_cast<size_t>(node.layer_index)];
-                    mode = layer.blend;
-                    opacity = layer.opacity;
+                    if (node.effect_index >= 0) {
+                        const auto& fx = layer.stack[static_cast<size_t>(node.effect_index)];
+                        mode = fx.blend;
+                        opacity = fx.opacity;
+                    } else mode = layer.blend;
                 } else {
                     moved = node.p_scale != 1.0f || node.p_rotate != 0.0f ||
                             node.p_shift_x != 0.0f ||
@@ -2213,9 +2217,16 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             case GraphNode::Kind::Effect: {
                 effect_frame_ = timeline_frame;
                 const double effect_fps = doc::entity_fps(doc, linst.look);
-                const doc::EffectInstance& fx =
-                    look.layers[static_cast<size_t>(node.layer_index)]
+                const doc::EffectInstance* fx_ptr =
+                    &look.layers[static_cast<size_t>(node.layer_index)]
                         .stack[static_cast<size_t>(node.effect_index)];
+                doc::EffectInstance blended_fx;
+                if (fx_ptr->blend != doc::BlendMode::Normal) {
+                    blended_fx = *fx_ptr;
+                    blended_fx.opacity = 1.0f;
+                    fx_ptr = &blended_fx;
+                }
+                const auto& fx = *fx_ptr;
 
                 if (fx_optical_filter(fx.type) &&
                     (fx.wet <= 0.0f || fx.opacity <= 0.0f ||
@@ -3344,6 +3355,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         for (int input : node.inputs)
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
                 pool_->release(results[static_cast<size_t>(input)]);
+        if (remaining_uses[static_cast<size_t>(index)] == 0) pool_->release(dst);
     }
 
     // read_measure_bounds harvests this after the caller's fence.

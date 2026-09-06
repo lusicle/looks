@@ -150,6 +150,144 @@ TEST(graph_topo_detects_cycle) {
     CHECK(!topo_sort(nodes, order));
 }
 
+TEST(graph_live_branch_survives_an_empty_peer) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = looks::doc::LayerSourceKind::Solid;
+    layer.stack.push_back(make_effect(doc, EffectType::Invert));
+    layer.stack.push_back(make_effect(doc, EffectType::Blur));
+    const uint64_t empty = layer.stack[0].id, live = layer.stack[1].id;
+    look.links = {{layer.id, live, 0}, {empty, live, 0}, {live, 0, 0}};
+    for (int order = 0; order < 2; ++order) {
+        const auto g = compile_graph(doc, look.id, 0);
+        CHECK(g.valid);
+        CHECK(g.nodes[g.output].kind == GraphNode::Kind::Effect);
+        if (g.nodes[g.output].kind == GraphNode::Kind::Effect)
+            CHECK_EQ(look.layers[0].stack[g.nodes[g.output].effect_index].id, live);
+        std::reverse(layer.stack.begin(), layer.stack.end());
+    }
+}
+
+TEST(graph_long_bypass_chain_keeps_its_source) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = looks::doc::LayerSourceKind::Solid;
+    for (int i = 0; i < 100; ++i) {
+        layer.stack.push_back(make_effect(doc, EffectType::Invert));
+        layer.stack.back().bypass = true;
+    }
+    const auto g = compile_graph(doc, look.id, 0);
+    CHECK(g.valid);
+    CHECK_EQ(g.nodes[g.output].layer_index, 0);
+}
+
+TEST(graph_rejects_main_and_mask_cycles) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = looks::doc::LayerSourceKind::Solid;
+    layer.stack.push_back(make_effect(doc, EffectType::Invert));
+    layer.stack.push_back(make_effect(doc, EffectType::Blur));
+    const uint64_t a = layer.stack[0].id, b = layer.stack[1].id;
+    look.links = {{a, b, 0}, {b, a, 0}, {a, 0, 0}};
+    CHECK(!compile_graph(doc, look.id, 0).valid);
+    look.links = {{layer.id, a, 0}, {a, layer.id, 1}, {a, 0, 0}};
+    CHECK(!compile_graph(doc, look.id, 0).valid);
+}
+
+TEST(graph_group_mix_survives_a_bypassed_face) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = looks::doc::LayerSourceKind::Solid;
+    layer.stack.push_back(make_effect(doc, EffectType::Invert));
+    layer.stack.push_back(make_effect(doc, EffectType::Blur));
+    looks::doc::Group group;
+    group.id = doc.next_effect_id++;
+    group.inputs = {doc.next_effect_id++};
+    group.face_out = layer.stack[1].id;
+    group.wet = 0.25f;
+    layer.groups.push_back(group);
+    for (auto& fx : layer.stack) fx.group_id = group.id;
+    layer.stack[1].bypass = true;
+    look.links = {{layer.id, group.inputs[0], 0},
+        {group.inputs[0], layer.stack[0].id, 0},
+        {layer.stack[0].id, group.face_out, 0}, {group.face_out, 0, 0}};
+    const auto g = compile_graph(doc, look.id, 0);
+    CHECK(g.valid);
+    CHECK(g.nodes[g.output].kind == GraphNode::Kind::GroupMix);
+}
+
+TEST(graph_offset_keeps_source_mask_and_multiple_inputs) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    look.layers[0].asset = bind_asset(doc);
+    look.layers[0].stack.push_back(make_effect(doc, EffectType::Offset));
+    auto& offset = look.layers[0].stack[0];
+    offset.params[0] = 10.0f;
+    offset.params[1] = 2.0f;
+    const uint64_t source = look.layers[0].id, fx = offset.id;
+    looks::doc::Layer mask;
+    mask.id = doc.next_effect_id++;
+    mask.source = looks::doc::LayerSourceKind::Solid;
+    look.layers.push_back(mask);
+    look.links = {{source, fx, 0}, {mask.id, source, 1}, {fx, 0, 0}};
+    auto graph = compile_graph(doc, look.id, 20);
+    CHECK(graph.valid);
+    CHECK(graph.nodes[graph.output].kind == GraphNode::Kind::MatteApply);
+    look.links = {{source, fx, 0}, {mask.id, fx, 0}, {fx, 0, 0}};
+    graph = compile_graph(doc, look.id, 20);
+    CHECK(graph.valid);
+    CHECK(graph.nodes[graph.output].kind == GraphNode::Kind::LayerBlend);
+    int sources = 0;
+    for (const auto& n : graph.nodes)
+        if (n.kind == GraphNode::Kind::Source) ++sources;
+    CHECK_EQ(sources, 1);
+}
+
+TEST(graph_motion_separates_different_merged_inputs) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
+    const uint64_t a = look.layers[0].id;
+    looks::doc::Layer second;
+    second.id = doc.next_effect_id++;
+    second.source = looks::doc::LayerSourceKind::Gradient;
+    second.stack.push_back(make_effect(doc, EffectType::RollingShutter));
+    second.stack.push_back(make_effect(doc, EffectType::Datamosh));
+    const uint64_t x = second.stack[0].id, y = second.stack[1].id;
+    look.layers.push_back(second);
+    look.links = {{a, x, 0}, {second.id, x, 0},
+        {second.id, y, 0}, {a, y, 0}, {x, 0, 0}, {y, 0, 0}};
+    const auto graph = compile_graph(doc, look.id, 0);
+    CHECK(graph.valid);
+    std::vector<uint64_t> keys;
+    for (const auto& n : graph.nodes)
+        if (n.kind == GraphNode::Kind::Flow) keys.push_back(n.key);
+    CHECK_EQ(keys.size(), size_t{2});
+    if (keys.size() == 2) CHECK(keys[0] != keys[1]);
+}
+
+TEST(graph_ports_keep_all_node_id_bits) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = looks::doc::LayerSourceKind::Solid;
+    layer.stack.push_back(make_effect(doc, EffectType::Invert));
+    layer.stack.push_back(make_effect(doc, EffectType::Blur));
+    const uint64_t a = layer.stack[0].id;
+    layer.stack[1].id = a + (uint64_t{1} << 56);
+    const uint64_t b = layer.stack[1].id;
+    look.links = {{layer.id, a, 0}, {a, b, 0}, {b, 0, 0}};
+    const auto graph = compile_graph(doc, look.id, 0);
+    CHECK(graph.valid);
+    CHECK_EQ(graph.nodes[graph.output].effect_index, 1);
+    const int input = graph.nodes[graph.output].inputs[0];
+    CHECK_EQ(graph.nodes[input].effect_index, 0);
+}
+
 TEST(graph_compile_empty_stack) {
     // Unbound media is dormant; layer_index -1 is the black display generator.
     Document doc = doc_with_look();

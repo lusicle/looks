@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <functional>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -31,9 +31,18 @@ struct Compiler {
     double root_fps = 30.0;
     FlowSlot flow;
     int zero_node = -1;
+    bool valid = true;
 
     int add(GraphNode node, int instance, uint64_t key = 0) {
         node.instance = instance;
+        if (node.kind == GraphNode::Kind::LayerBlend ||
+            node.kind == GraphNode::Kind::LayerTransform ||
+            node.kind == GraphNode::Kind::MatteExtract ||
+            node.kind == GraphNode::Kind::MatteApply ||
+            node.kind == GraphNode::Kind::GroupMix) {
+            key = hash_combine(key, static_cast<uint64_t>(node.kind));
+            for (int input : node.inputs) key = hash_combine(key, graph.nodes[input].key);
+        }
         node.key = key;
         graph.nodes.push_back(std::move(node));
         return static_cast<int>(graph.nodes.size()) - 1;
@@ -236,7 +245,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     // A wire to a time-culled producer is a closed gate, never unwired.
     std::unordered_map<uint64_t, int> heads;   // layer id to node index
     std::unordered_set<uint64_t> head_ungated;   // matte wired, not yet gated
-    std::unordered_map<uint64_t, char> time_culled;
     const LookInstance self = graph.instances[static_cast<size_t>(inst)];
     for (size_t li = 0; li < look.layers.size(); ++li) {
         const doc::Layer& layer = look.layers[li];
@@ -263,7 +271,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                         doc, *a, layer.timeline_lock ? root_fps : eff),
                     &lo, &hi);
                 if (t < lo || t >= hi) {
-                    time_culled[layer.id] = 1;
                     continue;
                 }
             }
@@ -288,7 +295,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 doc::shifted_window(static_cast<double>(dur), 0, ratio,
                                     &lo, &hi);
                 if (self.local_time < lo || self.local_time >= hi) {
-                    time_culled[layer.id] = 1;
                     continue;
                 }
             }
@@ -316,7 +322,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             gen.layer_index = static_cast<int>(li);
             cur = add(std::move(gen), inst, subject_key(layer.id));
         }
-        if (doc::layer_has_transform(layer)) {
+        if (doc::layer_has_transform(layer) || layer.opacity != 1.0f) {
             GraphNode xf;
             xf.kind = GraphNode::Kind::LayerTransform;
             xf.layer_index = static_cast<int>(li);
@@ -332,7 +338,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
 
     // Pass A2: an Offset wired directly on a source becomes a shifted read
     // and re-keys its stream; wired anywhere else it passes through.
-    std::unordered_map<uint64_t, char> offset_terminal;
+    std::unordered_map<uint64_t, uint64_t> offset_terminal;
     if (!strip_effects) {
         for (size_t li = 0; li < look.layers.size(); ++li) {
             if (!look.layers[li].visible) continue;
@@ -345,9 +351,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 const int64_t off = doc::offset_frames(fx);
                 if (!off) continue;
                 // Adjacency looks through group input slots.
-                const uint64_t src =
-                    doc::hop_group_inputs(look, links,
-                                          link_into(fx.id, 0));
+                const uint64_t src = doc::offset_source(look, links, fx.id);
                 const doc::Layer* sl = nullptr;
                 size_t sli = 0;
                 for (size_t k = 0; k < look.layers.size(); ++k)
@@ -358,7 +362,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 if (!sl || !sl->visible ||
                     !(doc::layer_is_media(*sl) || doc::layer_is_nested(*sl)))
                     continue;
-                offset_terminal[fx.id] = 1;
+                offset_terminal[fx.id] = sl->id;
                 int shifted = -1;
                 if (doc::layer_is_media(*sl)) {
                     if (!sl->asset) continue;   // dormant, like the base
@@ -379,7 +383,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                             sl->timeline_lock ? root_fps : eff),
                         &lo, &hi);
                     if (t < lo || t >= hi) {
-                        time_culled[fx.id] = 1;
                         continue;
                     }
                     GraphNode srcn;
@@ -404,7 +407,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     doc::shifted_window(static_cast<double>(dur), off,
                                         ratio, &lo, &hi);
                     if (self.local_time < lo || self.local_time >= hi) {
-                        time_culled[fx.id] = 1;
                         continue;
                     }
                     if (self.depth + 1 >= doc::kMaxLookDepth) continue;
@@ -424,7 +426,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                         emit_entity(sl->target, ci, /*is_root=*/false);
                     if (shifted < 0) continue;
                 }
-                if (doc::layer_has_transform(*sl)) {
+                if (doc::layer_has_transform(*sl) || sl->opacity != 1.0f) {
                     GraphNode xf;
                     xf.kind = GraphNode::Kind::LayerTransform;
                     xf.layer_index = static_cast<int>(sli);
@@ -437,13 +439,14 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     }
 
     // Stacking order is the link order: the first link composites at bottom.
-    std::unordered_map<uint64_t, std::vector<uint64_t>> port_links;
+    using Port = std::pair<uint64_t, uint32_t>;
+    std::map<Port, std::vector<uint64_t>> port_links;
     for (const doc::NodeLink& l : links)
-        port_links[(l.to << 8) | l.to_port].push_back(l.from);
+        port_links[{l.to, l.to_port}].push_back(l.from);
     static const std::vector<uint64_t> kNoLinks;
     auto links_into_port =
         [&](uint64_t to, uint32_t port) -> const std::vector<uint64_t>& {
-        const auto it = port_links.find((to << 8) | port);
+        const auto it = port_links.find({to, port});
         return it == port_links.end() ? kNoLinks : it->second;
     };
     auto owner_layer_index = [&](uint64_t id) -> size_t {
@@ -487,75 +490,62 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 if (face) face_wraps[face] = {li, gi, &g, mixes};
             }
     }
-    // True if the feed hangs from a producer that is only off right now.
-    std::function<bool(uint64_t, int)> id_culled =
-        [&](uint64_t id, int depth) -> bool {
-        if (time_culled.count(id)) return true;
-        if (depth > 64) return false;
-        if (offset_terminal.count(id)) return false;
-        if ((owner.count(id) && !fx_out.count(id)) || slot_ids.count(id)) {
-            for (uint64_t from : links_into_port(id, 0))
-                if (id_culled(from, depth + 1)) return true;
-        }
-        return false;
+    std::vector<uint64_t> subjects;
+    std::unordered_map<uint64_t, int> subject_indices;
+    auto add_subject = [&](uint64_t id) {
+        if (subject_indices.emplace(id, static_cast<int>(subjects.size())).second)
+            subjects.push_back(id);
     };
-    auto port_culled = [&](uint64_t to, uint32_t port) {
+    for (const auto& layer : look.layers) {
+        add_subject(layer.id);
+        for (const auto& fx : layer.stack) add_subject(fx.id);
+        for (const auto& group : layer.groups)
+            for (uint64_t slot : group.inputs) add_subject(slot);
+    }
+    std::vector<GraphNode> dependencies(subjects.size());
+    auto depend_on_port = [&](size_t index, uint64_t to, uint32_t port) {
         for (uint64_t from : links_into_port(to, port))
-            if (id_culled(from, 0)) return true;
-        return false;
+            if (auto it = subject_indices.find(from); it != subject_indices.end())
+                dependencies[index].inputs.push_back(it->second);
     };
-    // True if a feed still waits on an active effect that has not emitted.
-    std::function<bool(uint64_t, int)> id_pending =
-        [&](uint64_t id, int depth) -> bool {
-        if (depth > 64) return false;
-        if (fx_out.count(id) || offset_terminal.count(id)) return false;
-        // An ungated head is not the image its consumers must read.
-        if (head_ungated.count(id)) return true;
-        if (auto it = owner.find(id); it != owner.end()) {
-            if (effect_active(id)) return true;
-            for (uint64_t from : links_into_port(id, 0))
-                if (id_pending(from, depth + 1)) return true;
-        } else if (slot_ids.count(id)) {
-            for (uint64_t from : links_into_port(id, 0))
-                if (id_pending(from, depth + 1)) return true;
+    for (size_t i = 0; i < subjects.size(); ++i) {
+        const uint64_t id = subjects[i];
+        if (head_ungated.count(id)) depend_on_port(i, id, 1);
+        if (auto it = offset_terminal.find(id); it != offset_terminal.end())
+            depend_on_port(i, it->second, 1);
+        if ((owner.count(id) && !offset_terminal.count(id)) || slot_ids.count(id))
+            depend_on_port(i, id, 0);
+        if (effect_active(id)) {
+            depend_on_port(i, id, 1);
+            if (doc::effect_aux_port(owner.at(id).effect->type)) depend_on_port(i, id, 2);
         }
-        return false;
-    };
-    auto port_pending = [&](uint64_t to, uint32_t port) {
-        for (uint64_t from : links_into_port(to, port))
-            if (id_pending(from, 0)) return true;
-        return false;
-    };
+        if (auto it = face_wraps.find(id); it != face_wraps.end()) {
+            const auto& group = *it->second.group;
+            if (!group.inputs.empty()) depend_on_port(i, group.inputs.front(), 0);
+            depend_on_port(i, group.id, 1);
+        }
+    }
+    std::vector<int> subject_order;
+    if (!topo_sort(dependencies, subject_order)) { valid = false; return -1; }
     // Returns the node that makes an id's output; -1 = dormant or culled.
-    std::unordered_map<uint64_t, int> merge_memo;
-    std::function<int(uint64_t, int)> resolve_node;
-    std::function<int(uint64_t, uint32_t, int)> merge_port;
-    resolve_node = [&](uint64_t id, int depth) -> int {
+    std::map<Port, int> merge_memo;
+    auto resolve_node = [&](uint64_t id) -> int {
         if (auto it = fx_out.find(id); it != fx_out.end())
             return it->second;
         // A shim with no head ends the chain; do not use the unshifted layer.
         if (offset_terminal.count(id)) return -1;
         if (auto it = heads.find(id); it != heads.end()) return it->second;
-        if (owner.count(id) || slot_ids.count(id)) {
-            // Inactive effects and slots pass their port-0 merge through.
-            if (owner.count(id) && effect_active(id))
-                return -1;   // starved: never emitted
-            if (depth > 64) return -1;
-            return merge_port(id, 0, depth + 1);
-        }
         return -1;
     };
-    merge_port = [&](uint64_t to, uint32_t port, int depth) -> int {
-        // The key must stay injective; ports are tiny, so the shift is exact.
-        const uint64_t memo_key = (to << 8) | port;
+    auto merge_port = [&](uint64_t to, uint32_t port) -> int {
+        const Port memo_key{to, port};
         if (auto it = merge_memo.find(memo_key); it != merge_memo.end())
             return it->second;
-        if (depth > 64) return -1;
         // The layer matte already gated the head, so the stack carried it
         // down. Alpha-over reveals what is below wherever the gate closed.
         int below = -1;
         for (uint64_t from : links_into_port(to, port)) {
-            const int cur = resolve_node(from, depth + 1);
+            const int cur = resolve_node(from);
             if (cur < 0) continue;
             if (below < 0) {
                 below = cur;
@@ -602,11 +592,19 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                         static_cast<int>(stack_index), in_node, inst, key,
                         extra);
         int out = fx_node;
+        if (fx.blend != doc::BlendMode::Normal) {
+            GraphNode blend;
+            blend.kind = GraphNode::Kind::LayerBlend;
+            blend.layer_index = static_cast<int>(li);
+            blend.effect_index = static_cast<int>(stack_index);
+            blend.inputs = {in_node, out};
+            out = add(std::move(blend), inst, key);
+        }
         // The matte does not gate if the displace map consumed it.
         if (gate >= 0 && gate != extra) {
             GraphNode apply;
             apply.kind = GraphNode::Kind::MatteApply;
-            apply.inputs = {in_node, fx_node, gate};
+            apply.inputs = {in_node, out, gate};
             out = add(std::move(apply), inst);
         }
         fx_out[fx.id] = out;
@@ -614,19 +612,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         return out;
     };
 
-    // Pass B: an effect with no live in-feed is dormant and never emitted.
-    // Phase 0 waits for wired aux and matte producers; phase 1 stops waiting.
-    std::vector<std::pair<size_t, size_t>> pending;
-    for (size_t li = 0; li < look.layers.size(); ++li)
-        for (size_t i = 0; i < look.layers[li].stack.size(); ++i) {
-            const doc::EffectInstance& fx = look.layers[li].stack[i];
-            if (effect_active(fx.id)) pending.emplace_back(li, i);
-        }
     // The group dry side is the first slot's feed, or nothing when it is off.
     auto group_dry = [&](const doc::Group& g) {
         if (g.inputs.empty()) return zero();
         const uint64_t slot0 = g.inputs.front();
-        int dry = merge_port(slot0, 0, 0);
+        int dry = merge_port(slot0, 0);
         if (dry < 0) dry = zero();
         return dry;
     };
@@ -635,7 +625,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         const auto wit = face_wraps.find(face_id);
         if (wit == face_wraps.end()) return;
         const FaceWrap& fw = wit->second;
-        const int raw = fx_out[face_id];
+        const int face = resolve_node(face_id);
+        const int raw = face >= 0 ? face : zero();
         const int dry = group_dry(*fw.group);
         int out = raw;
         if (fw.mixes) {
@@ -644,12 +635,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             mix.layer_index = static_cast<int>(fw.layer_index);
             mix.effect_index = static_cast<int>(fw.group_index);
             mix.inputs = {dry, raw};
-            out = add(std::move(mix), inst);
+            out = add(std::move(mix), inst, subject_key(fw.group->id));
         }
-        int matte_node = merge_port(fw.group->id, 1, 0);
+        int matte_node = merge_port(fw.group->id, 1);
         if (matte_node < 0 &&
-            !links_into_port(fw.group->id, 1).empty() &&
-            port_culled(fw.group->id, 1))
+            !links_into_port(fw.group->id, 1).empty())
             matte_node = zero();
         if (matte_node >= 0) {
             GraphNode ex;
@@ -666,92 +656,51 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     };
     // A layer matte gates the HEAD, so the whole stack sees the crop. The
     // composite then alpha-overs, which reveals below where the gate closed.
-    auto gate_head = [&](uint64_t layer_id) {
-        int m = merge_port(layer_id, 1, 0);
-        if (m < 0 && port_culled(layer_id, 1)) m = zero();
-        head_ungated.erase(layer_id);
-        if (m < 0) return;
+    auto gate_source = [&](uint64_t layer_id, int head) {
+        int m = merge_port(layer_id, 1);
+        if (m < 0 && !links_into_port(layer_id, 1).empty()) m = zero();
+        if (m < 0) return head;
         GraphNode ex;
         ex.kind = GraphNode::Kind::MatteExtract;
         ex.inputs.push_back(m);
         const int gate = add(std::move(ex), inst);
         GraphNode apply;
         apply.kind = GraphNode::Kind::MatteApply;
-        apply.inputs = {zero(), heads[layer_id], gate};
-        const int out = add(std::move(apply), inst);
-        heads[layer_id] = out;
-        set_tap(layer_id | kThumbSourceBit, out);
+        apply.inputs = {zero(), head, gate};
+        return add(std::move(apply), inst);
     };
-    for (int phase = 0; phase < 2; ++phase) {
-        bool progress = true;
-        while (progress && (!pending.empty() || !head_ungated.empty())) {
-            progress = false;
-            // Gate first: an effect must never read an ungated head.
-            for (const doc::Layer& hl : look.layers) {
-                if (!head_ungated.count(hl.id)) continue;
-                if (phase == 0 && port_pending(hl.id, 1)) continue;
-                gate_head(hl.id);
-                progress = true;
-            }
-            for (auto it = pending.begin(); it != pending.end();) {
-                const doc::EffectInstance& fx =
-                    look.layers[it->first].stack[it->second];
-                if (port_pending(fx.id, 0)) {
-                    ++it;
-                    continue;
+    for (int index : subject_order) {
+        const uint64_t id = subjects[static_cast<size_t>(index)];
+        if (head_ungated.count(id)) {
+            heads[id] = gate_source(id, heads.at(id));
+            set_tap(id | kThumbSourceBit, heads.at(id));
+        }
+        if (auto it = offset_terminal.find(id); it != offset_terminal.end() && fx_out.count(id)) {
+            fx_out[id] = gate_source(it->second, fx_out.at(id));
+            set_tap(id, fx_out.at(id));
+        }
+        if (slot_ids.count(id)) fx_out[id] = merge_port(id, 0);
+        if (auto it = owner.find(id); it != owner.end() && !offset_terminal.count(id)) {
+            const int in_node = merge_port(id, 0);
+            fx_out[id] = in_node;
+            if (effect_active(id) && in_node >= 0) {
+                int aux_node = -1;
+                if (doc::effect_aux_port(it->second.effect->type)) {
+                    aux_node = merge_port(id, 2);
+                    if (aux_node < 0 && !links_into_port(id, 2).empty()) aux_node = zero();
                 }
-                if (phase == 0 && (port_pending(fx.id, 2) ||
-                                   port_pending(fx.id, 1))) {
-                    ++it;
-                    continue;
-                }
-                if (phase == 0) {
-                    const auto wit = face_wraps.find(fx.id);
-                    if (wit != face_wraps.end()) {
-                        const doc::Group& wg = *wit->second.group;
-                        const bool dry_wait =
-                            !wg.inputs.empty() &&
-                            port_pending(wg.inputs.front(), 0);
-                        if (dry_wait || port_pending(wg.id, 1)) {
-                            ++it;
-                            continue;
-                        }
-                    }
-                }
-                const int in_node = merge_port(fx.id, 0, 0);
-                if (in_node < 0) {
-                    // No live in-feed: dormant, drop without emitting.
-                    it = pending.erase(it);
-                    progress = true;
-                    continue;
-                }
-                // An aux producer that is off feeds zeros; unwired stays -1.
-                int aux_node = merge_port(fx.id, 2, 0);
-                if (aux_node < 0 &&
-                    !links_into_port(fx.id, 2).empty() &&
-                    port_culled(fx.id, 2))
-                    aux_node = zero();
-                // A matte producer that is off feeds zeros, so the gate closes.
-                int matte_node = merge_port(fx.id, 1, 0);
-                if (matte_node < 0 &&
-                    !links_into_port(fx.id, 1).empty() &&
-                    port_culled(fx.id, 1))
-                    matte_node = zero();
-                emit_one(it->first, it->second, in_node, aux_node,
-                         matte_node);
-                wrap_group_face(fx.id);
-                it = pending.erase(it);
-                progress = true;
+                int matte_node = merge_port(id, 1);
+                if (matte_node < 0 && !links_into_port(id, 1).empty()) matte_node = zero();
+                const size_t li = it->second.layer;
+                const size_t si = static_cast<size_t>(it->second.effect - look.layers[li].stack.data());
+                emit_one(li, si, in_node, aux_node, matte_node);
             }
         }
+        wrap_group_face(id);
     }
 
-    auto resolve = [&](uint64_t id) -> int {
-        return resolve_node(id, 0);
-    };
-
     // Pass C: the composite is the fan-in of Output node id 0, port 0.
-    int below = merge_port(0, 0, 0);
+    int below = merge_port(0, 0);
 
 
     // The preview tap resolves in the root instance only; -1 = unresolvable.
@@ -765,7 +714,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             if (const uint64_t face =
                     doc::group_face_member(look, preview_node))
                 id = face;
-            idx = resolve(id);
+            idx = resolve_node(id);
         }
         if (idx >= 0) graph.preview = idx;
     }
@@ -780,7 +729,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             for (const doc::NodeLink& l : links) {
                 if (owner_layer_index(l.from) != want) continue;
                 if (l.to != 0 && owner_layer_index(l.to) == want) continue;
-                if (int r = resolve(l.from); r >= 0) idx = r;
+                if (int r = resolve_node(l.from); r >= 0) idx = r;
             }
         if (idx >= 0) graph.preview = idx;
     }
@@ -846,7 +795,7 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
         graph.before = before >= 0 ? before : c.zero();
     }
 
-    graph.valid = topo_sort(graph.nodes, graph.order);
+    graph.valid = c.valid && topo_sort(graph.nodes, graph.order);
     return graph;
 }
 

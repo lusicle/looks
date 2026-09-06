@@ -467,6 +467,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     doc.canvas_h = h;
     auto look = doc::make_look(doc, "Alpha checks");
     look.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
+    look.layers[0].opacity = 1.0f;
     look.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Invert));
     doc.looks.push_back(std::move(look));
     auto& layer = doc.looks[0].layers[0];
@@ -843,6 +844,102 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         std::fprintf(stderr, "Alpha wired matte: %.5f expected %.5f\n", pixels[3], cutout_alpha);
         ++failures;
     }
+    doc::Document composite_doc;
+    composite_doc.cache_mb = 0;
+    auto composite_look = doc::make_look(composite_doc, "Composite checks");
+    for (int c = 0; c < 3; ++c) {
+        auto source = doc::make_layer(composite_doc, doc::LayerSourceKind::Solid);
+        source.color_a[0] = source.color_a[1] = source.color_a[2] = 0.0f;
+        source.color_a[c] = 1.0f;
+        source.opacity = c == 0 ? 0.5f : c == 1 ? 0.25f : 0.75f;
+        composite_look.layers.push_back(std::move(source));
+    }
+    composite_doc.looks.push_back(std::move(composite_look));
+    auto& cl = composite_doc.looks[0];
+    auto render_composite = [&](uint64_t root = 0, uint64_t preview = 0) {
+        ++composite_doc.revision;
+        engine->set_preview_divisor(1);
+        if (!begin_probe()) return false;
+        return read_pixels(engine->render(probe.cmd, 0, composite_doc,
+            root ? root : cl.id, 0, 60.0, w, h, 0, 0, nullptr,
+            nullptr, 0, preview));
+    };
+    std::array<int, 3> permutation{0, 1, 2};
+    do {
+        cl.links.clear();
+        float expected[4]{};
+        for (int c : permutation) {
+            const auto& source = cl.layers[c];
+            cl.links.push_back({source.id, 0, 0});
+            for (int k = 0; k < 4; ++k) expected[k] *= 1.0f - source.opacity;
+            expected[c] += source.opacity;
+            expected[3] += source.opacity;
+        }
+        if (!render_composite()) return false;
+        expect_color("ordered three-source composite", expected, 0.001f);
+    } while (std::next_permutation(permutation.begin(), permutation.end()));
+    const uint64_t red = cl.layers[0].id, green = cl.layers[1].id;
+    cl.layers[0].stack.push_back(doc::make_effect(composite_doc, doc::EffectType::Invert));
+    const uint64_t invert = cl.layers[0].stack[0].id;
+    cl.layers[0].stack[0].opacity = 0.5f;
+    cl.links = {{red, invert, 0}, {invert, 0, 0}};
+    if (!render_composite()) return false;
+    const float half_effect[4] = {0.25f, 0.25f, 0.25f, 0.5f};
+    expect_color("source and effect opacity", half_effect, 0.001f);
+    if (!render_composite(0, red)) return false;
+    const float red_source[4] = {0.5f, 0.0f, 0.0f, 0.5f};
+    expect_color("source preview opacity", red_source, 0.001f);
+    cl.layers[0].stack[0].opacity = 1.0f;
+    cl.layers[0].stack.push_back(doc::make_effect(composite_doc, doc::EffectType::Blur));
+    const uint64_t face = cl.layers[0].stack[1].id;
+    cl.layers[0].stack[1].bypass = true;
+    cl.links = {{red, invert, 0}, {red, face, 0}, {face, invert, 0}, {invert, 0, 0}};
+    if (!render_composite()) return false;
+    const float diamond[4] = {0.0f, 0.75f, 0.75f, 0.75f};
+    expect_color("shared source diamond", diamond, 0.001f);
+    std::reverse(cl.layers[0].stack.begin(), cl.layers[0].stack.end());
+    if (!render_composite()) return false;
+    expect_color("diamond storage order", diamond, 0.001f);
+    std::reverse(cl.layers[0].stack.begin(), cl.layers[0].stack.end());
+    cl.layers[1].color_a[0] = cl.layers[1].color_a[1] = cl.layers[1].color_a[2] = 1.0f;
+    cl.links = {{green, red, 1}, {red, invert, 0}, {invert, 0, 0}};
+    if (!render_composite()) return false;
+    const float masked[4] = {0.0f, 0.125f, 0.125f, 0.125f};
+    expect_color("source opacity and mask", masked, 0.001f);
+    doc::Group composite_group;
+    composite_group.id = composite_doc.next_effect_id++;
+    composite_group.inputs = {composite_doc.next_effect_id++};
+    composite_group.face_out = face;
+    composite_group.wet = 0.25f;
+    cl.layers[0].groups.push_back(composite_group);
+    for (auto& effect : cl.layers[0].stack) effect.group_id = composite_group.id;
+    cl.links = {{red, composite_group.inputs[0], 0},
+        {composite_group.inputs[0], invert, 0}, {invert, face, 0}, {face, 0, 0}};
+    if (!render_composite()) return false;
+    const float grouped[4] = {0.375f, 0.125f, 0.125f, 0.5f};
+    expect_color("group mix with bypassed face", grouped, 0.001f);
+    cl.links.push_back({green, composite_group.id, 1});
+    if (!render_composite()) return false;
+    const float grouped_mask[4] = {0.46875f, 0.03125f, 0.03125f, 0.5f};
+    expect_color("group mix before mask", grouped_mask, 0.001f);
+    cl.layers[0].groups.clear();
+    for (auto& effect : cl.layers[0].stack) effect.group_id = 0;
+    cl.links = {{red, invert, 0}, {invert, 0, 0}};
+    cl.layers[0].stack[0].blend = doc::BlendMode::Add;
+    cl.layers[0].stack[0].opacity = 0.25f;
+    if (!render_composite()) return false;
+    const float effect_blend[4] = {0.5f, 0.125f, 0.125f, 0.5625f};
+    expect_color("effect blend and opacity", effect_blend, 0.001f);
+    cl.layers[0].stack[0].blend = doc::BlendMode::Normal;
+    cl.links = {{red, 0, 0}};
+    doc::Placement placement;
+    placement.id = composite_doc.next_effect_id++;
+    placement.target = cl.id;
+    placement.opacity = 0.5f;
+    composite_doc.root().tracks[0].placements.push_back(placement);
+    if (!render_composite(composite_doc.root_sequence)) return false;
+    const float placed[4] = {0.25f, 0.0f, 0.0f, 0.25f};
+    expect_color("source and placement opacity", placed, 0.001f);
     auto ui_renderer = ui::UiRenderer::create(device, VK_FORMAT_R16G16B16A16_SFLOAT, shader_dir);
     auto ui_target = gfx::GpuImage::create(device, VK_FORMAT_R16G16B16A16_SFLOAT, w, h,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -888,6 +985,7 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
     doc.cache_mb = 0;
     auto look = doc::make_look(doc, "Simulation checks");
     look.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
+    look.layers[0].opacity = 1.0f;
     look.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
     doc.looks.push_back(std::move(look));
     auto& layer = doc.looks[0].layers[0];

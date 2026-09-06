@@ -14,6 +14,7 @@ cbuffer Push
     float rotate_rad;
     float anchor_x;    // scale and rotate pivot, uv
     float anchor_y;
+    float opacity;
 };
 
 [[vk::binding(0, 0)]] Sampler2D source;
@@ -52,5 +53,5 @@ void main(uint3 tid : SV_DispatchThreadID)
     const float2 suv = xform_source_uv(uv, aspect);
     const float cov = xform_coverage(suv);
     const float4 src = source.SampleLevel(clamp(suv, 0.0, 1.0), 0);
-    output[tid.xy] = src * cov;
+    output[tid.xy] = src * (cov * saturate(opacity));
 }

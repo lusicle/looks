@@ -820,6 +820,23 @@ inline uint64_t hop_group_inputs(const Look& look,
     return id;
 }
 
+inline uint64_t offset_source(const Look& look, const std::vector<NodeLink>& links,
+                              uint64_t offset) {
+    uint64_t id = offset;
+    for (size_t depth = 0; depth <= links.size(); ++depth) {
+        uint64_t next = 0;
+        for (const auto& link : links) {
+            if (link.to != id || link.to_port != 0 || !wire_producer_live(look, link.from)) continue;
+            if (next) return 0;
+            next = link.from;
+        }
+        if (!next) return 0;
+        if (!group_of_input(look, next)) return find_layer(look, next) ? next : 0;
+        id = next;
+    }
+    return 0;
+}
+
 inline ValueNode* find_value_node(Look& look, uint64_t node_id) {
     for (ValueNode& n : look.value_nodes)
         if (n.id == node_id) return &n;

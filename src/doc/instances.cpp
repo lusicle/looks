@@ -468,8 +468,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                 const int64_t off = offset_frames(fx);
                 if (!off) continue;
                 // Adjacency looks through group input slots, like the compiler.
-                const uint64_t src = hop_group_inputs(
-                    look, links, link_into(look, links, fx.id, 0));
+                const uint64_t src = offset_source(look, links, fx.id);
                 for (const Layer& l : look.layers)
                     if (l.id == src) vshifts.emplace_back(src, off);
             }
