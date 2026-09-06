@@ -37,6 +37,13 @@ struct ButtonState {
     float hover_seconds = 0.0f;   // sustained-hover clock for tooltips
 };
 
+float transition_step(float current, bool on, float dt);
+
+enum class Icon : uint8_t {
+    Play, Pause, Up, Down, Close, Wave, Key, Knob, Eye, EyeOff, Dice, Link,
+    Solo, SoloOn, Copy, Lock, Magnet, ChevronRight,
+};
+
 struct SliderState {
     bool dragging = false;
     float hover_seconds = 0.0f;   // sustained-hover clock for tooltips
@@ -91,6 +98,9 @@ struct ButtonOpts {
     const char* tooltip = nullptr;   // shown after a hover delay
     // Right-click sets this flag.
     bool* out_ctx = nullptr;
+    const char* probe = nullptr;
+    bool* out_hovered = nullptr;
+    int trailing_icon = -1;
 };
 
 LayoutNode* Button(LayoutArena& arena, std::string_view label,
@@ -109,11 +119,6 @@ LayoutNode* Segmented(LayoutArena& arena, const char* const* labels,
                       const char* const* tooltips, int count, int active,
                       ButtonState* states, bool* const* out_clicked,
                       SizeSpec width = {});
-
-enum class Icon : uint8_t {
-    Play, Pause, Up, Down, Close, Wave, Key, Knob, Eye, EyeOff, Dice, Link,
-    Solo, SoloOn, Copy, Lock, Magnet,
-};
 
 LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
                        bool* out_clicked, const ButtonOpts& opts = {});
@@ -142,6 +147,68 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
 LayoutNode* Checkbox(LayoutArena& arena, std::string_view label, bool* value,
                      ButtonState* state, bool* out_changed = nullptr);
 
+struct TextInputState {
+    ButtonState button;
+    bool had_focus = false;
+};
+
+struct TextNav {
+    bool up = false;
+    bool down = false;
+    bool tab = false;
+};
+
+TextResult text_input_keys(TextField& field, UiInput& input,
+                           TextNav* nav = nullptr);
+
+struct TextInputOpts {
+    const char* placeholder = nullptr;
+    const char* prefix = nullptr;
+    const char* text = nullptr;
+    const char* probe = nullptr;
+    const char* tooltip = nullptr;
+    bool flat = false;
+    bool small = false;
+    bool grab_focus = false;
+    SizeSpec width = SizeSpec::fill();
+    bool* out_clicked = nullptr;
+    bool* out_changed = nullptr;
+    bool* out_commit = nullptr;
+    bool* out_cancel = nullptr;
+    bool* out_blur = nullptr;
+    TextNav* nav = nullptr;
+};
+
+LayoutNode* TextInput(LayoutArena& arena, TextField* field,
+                      TextInputState* state, const TextInputOpts& opts = {});
+bool text_input_focused(const Context& ctx, const TextInputState* state);
+void text_input_focus(Context& ctx, const TextInputState* state);
+
+struct TextCaret {
+    int caret = -1;
+    int sel_lo = 0;
+    int sel_hi = 0;
+};
+bool caret_blink_on(const Context& ctx);
+TextCaret field_caret(const TextField& f, int offset, bool blink_on);
+
+struct TextHostOuts {
+    bool* clicked = nullptr;
+    bool* changed = nullptr;
+    bool* commit = nullptr;
+    bool* cancel = nullptr;
+    bool* blur = nullptr;
+    TextNav* nav = nullptr;
+};
+struct TextHostResult {
+    bool focused = false;
+    bool ended = false;
+};
+TextHostResult text_host_frame(LayoutFrame& frame, WidgetId id,
+                               TextInputState& st, TextField& field,
+                               const Rect& r, bool grab_focus,
+                               const TextHostOuts& outs);
+
 struct SliderOpts {
     const char* format = "%.2f";   // value readout; nullptr hides it
     bool* out_changed = nullptr;   // value moved this frame
@@ -155,6 +222,11 @@ struct SliderOpts {
     const char* tooltip = nullptr;   // sustained-hover tip (range/default)
     // Right-click sets this flag.
     bool* out_ctx = nullptr;
+    TextField* edit = nullptr;
+    TextInputState* edit_state = nullptr;
+    bool* out_commit = nullptr;
+    bool* out_cancel = nullptr;
+    bool* out_blur = nullptr;
 };
 
 LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
@@ -222,5 +294,43 @@ LayoutNode* Panel(LayoutArena& arena, LayoutNode* child,
                   const PanelOpts& opts = {});
 
 LayoutNode* Separator(LayoutArena& arena);
+
+struct ButtonFace {
+    float hover_t = 0.0f;
+    float press_t = 0.0f;
+    bool active = false;
+    bool disabled = false;
+    bool flat = false;
+    bool align_left = false;
+    float font_size = 13.0f;
+    float radius = 3.0f;
+    float scale = 1.0f;
+    int trailing_icon = -1;
+};
+void draw_button_face(Canvas2D& canvas, const Font& font, const Theme& theme,
+                      const Rect& r, std::string_view label,
+                      const ButtonFace& face, const Rect& clip = {});
+float value_box_width(const Font& font, std::string_view value,
+                      float font_size, float scale);
+Rect slider_value_rect(const Rect& r, float box_w);
+Rect slider_track_rect(const Rect& r, float box_w, float scale);
+void draw_slider_track(Canvas2D& canvas, const Theme& theme, const Rect& track,
+                       float t, float live_t, bool active, float scale);
+void draw_dial_face(Canvas2D& canvas, const Theme& theme, Vec2 center,
+                    float knob_radius, float deg, bool active, float live_deg,
+                    bool has_live, float scale);
+void draw_dropdown_face(Canvas2D& canvas, const Font& font, const Theme& theme,
+                        const Rect& r, std::string_view text, bool open,
+                        float hover_t, float font_size, float radius,
+                        float scale, const Rect& clip = {});
+void draw_text_input_face(Canvas2D& canvas, const Font& font,
+                          const Theme& theme, const Rect& r,
+                          std::string_view text, const TextCaret& caret,
+                          bool focused, bool flat, bool dim, float hover_t,
+                          float font_size, float radius, float scale,
+                          const Rect& clip = {});
+void draw_popup_chrome(Canvas2D& canvas, const Theme& theme, const Rect& r);
+void draw_popup_row(Canvas2D& canvas, const Theme& theme, const Rect& r,
+                    bool hover);
 
 }  // namespace looks::ui

@@ -4,6 +4,11 @@
 
 namespace looks::ui {
 
+inline Color lerp(Color a, Color b, float t) {
+    return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+            a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t};
+}
+
 class Theme {
 public:
     Color window_bg = Color::hex(0x101114);
@@ -24,7 +29,19 @@ public:
     float font_size_small = 11.0f;
     float font_size_heading = 16.0f;
     float control_height = 22.0f;
+    float row_height_compact = 18.0f;
+    float font_size_compact = 10.0f;
+
+    Color selection_bg() const {
+        return lerp(panel_bg, Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.5f);
+    }
+    Color well_bg() const {
+        return lerp(panel_bg, Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+    }
 };
+
+const Color* chip_palette();
+const Color* category_palette();
 
 const Theme& default_theme();
 
@@ -34,10 +51,5 @@ const char* theme_name(int index);
 const Theme& theme_preset(int index);
 const Theme& active_theme();
 void set_active_theme(int index);   // the index wraps into range
-
-inline Color lerp(Color a, Color b, float t) {
-    return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
-            a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t};
-}
 
 }  // namespace looks::ui

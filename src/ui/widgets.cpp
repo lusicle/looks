@@ -102,6 +102,30 @@ void set_active_theme(int index) {
     g_theme_index = ((index % theme_count()) + theme_count()) % theme_count();
 }
 
+const Color* chip_palette() {
+    static const Color palette[5] = {
+        Color::hex(0xC9A23F), Color::hex(0x3FA7A0), Color::hex(0x8A6FD1),
+        Color::hex(0x5B84B1), Color::hex(0xC96A8F),
+    };
+    return palette;
+}
+
+const Color* category_palette() {
+    static const Color palette[8] = {
+        Color::hex(0x7E57C2), Color::hex(0x26A69A), Color::hex(0xEC7063),
+        Color::hex(0x5DADE2), Color::hex(0xF5B041), Color::hex(0xA1887F),
+        Color::hex(0x66BB6A), Color::hex(0xB0BEC5),
+    };
+    return palette;
+}
+
+float transition_step(float current, bool on, float dt) {
+    constexpr float kTransitionSeconds = 0.12f;
+    const float target = on ? 1.0f : 0.0f;
+    const float rate = std::min(1.0f, dt / kTransitionSeconds);
+    return current + (target - current) * rate;
+}
+
 void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                      Vec2 center, Color color, float font_size) {
     const float cx = center.x;
@@ -225,18 +249,16 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
             canvas.draw_sdf_rect_outline({cx - 2.0f, cy - 2.0f, 8.0f, 8.0f},
                                          1.5f, 1.0f, color);
             break;
+        case Icon::ChevronRight:
+            canvas.draw_line({cx - 1.5f, cy - 3.5f}, {cx + 2.0f, cy}, 1.2f,
+                             color);
+            canvas.draw_line({cx + 2.0f, cy}, {cx - 1.5f, cy + 3.5f}, 1.2f,
+                             color);
+            break;
     }
 }
 
 namespace {
-
-constexpr float kTransitionSeconds = 0.12f;
-
-float transition_step(float current, bool on, float dt) {
-    const float target = on ? 1.0f : 0.0f;
-    const float rate = std::min(1.0f, dt / kTransitionSeconds);
-    return current + (target - current) * rate;
-}
 
 // Returns true when a press releases inside the rect.
 bool tick_press_release(ButtonState& state, WidgetId id, const Rect& rect,
@@ -301,6 +323,9 @@ struct ButtonUser {
     bool active;
     const char* tooltip;
     bool* out_ctx;
+    const char* probe;
+    bool* out_hovered;
+    int trailing_icon;
 };
 
 Vec2 measure_button(LayoutNode& node, const Constraints&,
@@ -332,53 +357,375 @@ void draw_hover(LayoutFrame& frame, const Rect& r, float radius,
     frame.canvas.draw_sdf_rect(r, radius, bg);
 }
 
+}  // namespace
+
+void draw_button_face(Canvas2D& canvas, const Font& font, const Theme& theme,
+                      const Rect& r, std::string_view label,
+                      const ButtonFace& f, const Rect& clip) {
+    Color bg = lerp(theme.control_bg, theme.control_bg_hover, f.hover_t);
+    bg = lerp(bg, theme.control_bg_active, f.press_t);
+    Color fg = f.flat ? lerp(theme.text_dim, theme.text, f.hover_t)
+                      : theme.text;
+    if (f.disabled) fg = theme.text_disabled;
+    if (f.active && !f.disabled) fg = theme.accent;
+    if (f.flat) {
+        if (!f.disabled && f.hover_t > 0.01f)
+            canvas.draw_sdf_rect(r, f.radius,
+                                 theme.control_bg_hover.with_alpha(
+                                     theme.control_bg_hover.a * f.hover_t));
+    } else {
+        canvas.draw_sdf_rect(r, f.radius, bg);
+        canvas.draw_sdf_rect_outline(
+            r, f.radius, theme.stroke_width,
+            f.active && !f.disabled ? theme.accent : theme.hairline);
+    }
+    const float icon_w = f.trailing_icon >= 0 ? 14.0f * f.scale : 0.0f;
+    const Rect text_r{r.x, r.y, std::max(0.0f, r.w - icon_w), r.h};
+    // Clip the label so a wide label truncates instead of bleeding out.
+    const Rect text_clip = clip.empty() ? text_r : text_r.intersect(clip);
+    canvas.push_clip(text_clip);
+    const Vec2 text_size = measure_text(font, label, f.font_size);
+    const float pad = 4.0f * f.scale;
+    const float tx = f.align_left
+        ? r.x + pad
+        : r.x + std::max(pad, (text_r.w - text_size.x) * 0.5f);
+    draw_text(canvas, font, label,
+              {tx, r.y + (r.h - font.line_height() * f.font_size) * 0.5f},
+              f.font_size, fg);
+    canvas.pop_clip();
+    if (f.trailing_icon >= 0)
+        draw_icon_glyph(canvas, font, static_cast<Icon>(f.trailing_icon),
+                        {r.right() - 8.0f * f.scale, r.y + r.h * 0.5f},
+                        f.disabled ? theme.text_disabled : theme.text_dim,
+                        f.font_size);
+}
+
+float value_box_width(const Font& font, std::string_view value,
+                      float font_size, float scale) {
+    return std::max(38.0f * scale,
+                    measure_text(font, value, font_size).x + 10.0f * scale);
+}
+
+Rect slider_value_rect(const Rect& r, float box_w) {
+    return {r.right() - box_w, r.y, box_w, r.h};
+}
+
+Rect slider_track_rect(const Rect& r, float box_w, float scale) {
+    const float gap = box_w > 0.0f ? 8.0f * scale : 0.0f;
+    return {r.x, r.y, std::max(0.0f, r.w - box_w - gap), r.h};
+}
+
+void draw_slider_track(Canvas2D& canvas, const Theme& theme, const Rect& track,
+                       float t, float live_t, bool active, float scale) {
+    const float sy = track.y + track.h * 0.5f;
+    canvas.draw_rect({track.x, sy - 1.0f, track.w, 2.0f},
+                     theme.control_bg_hover);
+    canvas.draw_rect({track.x, sy - 1.0f, track.w * std::clamp(t, 0.0f, 1.0f),
+                      2.0f},
+                     theme.accent_dim);
+    if (live_t >= 0.0f) {
+        const float lx = track.x + track.w * std::clamp(live_t, 0.0f, 1.0f);
+        canvas.draw_rect({lx - 1.0f, sy - 5.0f * scale,
+                          std::max(2.0f, 1.5f * scale), 10.0f * scale},
+                         theme.accent);
+    }
+    const float hx = track.x + track.w * std::clamp(t, 0.0f, 1.0f);
+    canvas.draw_sdf_rect({hx - 2.5f * scale, sy - 4.0f * scale, 5.0f * scale,
+                          8.0f * scale},
+                         1.5f * scale, active ? theme.accent : theme.text);
+}
+
+bool caret_blink_on(const Context& ctx) { return (ctx.frame() / 30) % 2 == 0; }
+
+TextCaret field_caret(const TextField& f, int offset, bool blink_on) {
+    TextCaret c;
+    c.caret = blink_on ? offset + f.caret : -1;
+    c.sel_lo = offset + f.sel_lo();
+    c.sel_hi = offset + f.sel_hi();
+    return c;
+}
+
+void draw_dial_face(Canvas2D& canvas, const Theme& theme, Vec2 center,
+                    float knob_radius, float deg, bool active, float live_deg,
+                    bool has_live, float scale) {
+    const Rect knob{center.x - knob_radius, center.y - knob_radius,
+                    knob_radius * 2.0f, knob_radius * 2.0f};
+    canvas.draw_sdf_rect(knob, knob_radius, theme.control_bg_active);
+    canvas.draw_sdf_rect_outline(knob, knob_radius, theme.stroke_width,
+                                 theme.hairline);
+    canvas.draw_line({center.x, knob.y - 3.0f * scale},
+                     {center.x, knob.y - 1.0f * scale}, 1.0f, theme.text_dim);
+    const auto needle = [&](float d, float len, Color c, float w) {
+        const float rad = std::fmod(d, 360.0f) * 0.0174533f;
+        canvas.draw_line(
+            {center.x, center.y},
+            {center.x + std::sin(rad) * (knob_radius - 2.0f * scale) * len,
+             center.y - std::cos(rad) * (knob_radius - 2.0f * scale) * len},
+            w, c);
+    };
+    if (has_live) needle(live_deg, 1.0f, theme.accent, 1.5f * scale);
+    needle(deg, 1.0f, active ? theme.accent : theme.text, 1.5f * scale);
+}
+
+void draw_dropdown_face(Canvas2D& canvas, const Font& font, const Theme& theme,
+                        const Rect& r, std::string_view text, bool open,
+                        float hover_t, float font_size, float radius,
+                        float scale, const Rect& clip) {
+    canvas.draw_sdf_rect(
+        r, radius, lerp(theme.control_bg, theme.control_bg_hover, hover_t));
+    canvas.draw_sdf_rect_outline(r, radius, theme.stroke_width,
+                                 open ? theme.accent : theme.hairline);
+    // The gutter holds the chevron; text stops before it, never under it.
+    Rect text_r = r;
+    text_r.w = std::max(0.0f, text_r.w - 19.0f * scale);
+    const Rect text_clip = clip.empty() ? text_r : text_r.intersect(clip);
+    canvas.push_clip(text_clip);
+    draw_text(canvas, font, text,
+              {r.x + 8.0f * scale,
+               r.y + (r.h - font.line_height() * font_size) * 0.5f},
+              font_size, theme.text);
+    canvas.pop_clip();
+    const float cxr = r.right() - 11.0f * scale;
+    const float cyr = r.y + r.h * 0.5f - (open ? -1.5f : 1.0f) * scale;
+    const float cs = 3.5f * scale;
+    const float dir = open ? -cs : cs;
+    canvas.draw_line({cxr - cs, cyr}, {cxr, cyr + dir}, 1.0f, theme.text_dim);
+    canvas.draw_line({cxr, cyr + dir}, {cxr + cs, cyr}, 1.0f, theme.text_dim);
+}
+
+void draw_text_input_face(Canvas2D& canvas, const Font& font,
+                          const Theme& theme, const Rect& r,
+                          std::string_view text, const TextCaret& caret,
+                          bool focused, bool flat, bool dim, float hover_t,
+                          float font_size, float radius, float scale,
+                          const Rect& clip) {
+    if (flat) {
+        const float t = std::max(hover_t, focused ? 1.0f : 0.0f);
+        if (t > 0.01f)
+            canvas.draw_sdf_rect(r, radius,
+                                 theme.control_bg_hover.with_alpha(
+                                     theme.control_bg_hover.a * t));
+    } else {
+        canvas.draw_sdf_rect(
+            r, radius, lerp(theme.control_bg, theme.control_bg_hover, hover_t));
+        canvas.draw_sdf_rect_outline(r, radius, theme.stroke_width,
+                                     focused ? theme.accent : theme.hairline);
+    }
+    const Rect text_clip = clip.empty() ? r : r.intersect(clip);
+    canvas.push_clip(text_clip);
+    const float tx = r.x + 4.0f * scale;
+    const float ty = r.y + (r.h - font.line_height() * font_size) * 0.5f;
+    auto x_at = [&](int index) {
+        const int n = std::clamp(index, 0, static_cast<int>(text.size()));
+        return tx +
+               measure_text(font, text.substr(0, static_cast<size_t>(n)),
+                            font_size)
+                   .x;
+    };
+    const float bar_y = r.y + 3.0f * scale;
+    const float bar_h = std::max(1.0f, r.h - 6.0f * scale);
+    if (focused && caret.sel_lo < caret.sel_hi) {
+        const float x0 = x_at(caret.sel_lo);
+        const float x1 = x_at(caret.sel_hi);
+        canvas.draw_rect({x0, bar_y, x1 - x0, bar_h},
+                         theme.accent_dim.with_alpha(0.5f));
+    }
+    draw_text(canvas, font, text, {tx, ty}, font_size,
+              dim ? theme.text_dim : theme.text);
+    if (focused && caret.caret >= 0)
+        canvas.draw_rect({x_at(caret.caret), bar_y, std::max(1.0f, scale),
+                          bar_h},
+                         theme.accent);
+    canvas.pop_clip();
+}
+
+void draw_popup_chrome(Canvas2D& canvas, const Theme& theme, const Rect& r) {
+    canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg);
+    canvas.draw_sdf_rect_outline(r, theme.corner_radius, theme.stroke_width,
+                                 theme.hairline);
+}
+
+void draw_popup_row(Canvas2D& canvas, const Theme& theme, const Rect& r,
+                    bool hover) {
+    if (hover) canvas.draw_sdf_rect(r, 2.0f, theme.control_bg_hover);
+}
+
+TextResult text_input_keys(TextField& field, UiInput& input, TextNav* nav) {
+    TextResult last = TextResult::None;
+    for (const platform::Event& e : input.keys) {
+        if (nav && e.type == platform::Event::Type::KeyDown) {
+            if (e.key == platform::Key::Up) {
+                nav->up = true;
+                continue;
+            }
+            if (e.key == platform::Key::Down) {
+                nav->down = true;
+                continue;
+            }
+            if (e.key == platform::Key::Tab) {
+                nav->tab = true;
+                continue;
+            }
+        }
+        if (nav && e.type == platform::Event::Type::Char &&
+            e.codepoint == '\t')
+            continue;
+        const TextResult r = text_field_key(field, e);
+        if (r != TextResult::None) last = r;
+        if (r == TextResult::Commit || r == TextResult::Cancel) break;
+    }
+    return last;
+}
+
+bool text_input_focused(const Context& ctx, const TextInputState* state) {
+    return ctx.has_focus(const_cast<Context&>(ctx).acquire_widget_id(state));
+}
+
+void text_input_focus(Context& ctx, const TextInputState* state) {
+    ctx.set_focus(ctx.acquire_widget_id(state));
+}
+
+TextHostResult text_host_frame(LayoutFrame& frame, WidgetId id,
+                               TextInputState& st, TextField& field,
+                               const Rect& r, bool grab_focus,
+                               const TextHostOuts& outs) {
+    TextHostResult res;
+    bool focused = frame.ctx.has_focus(id);
+    if (grab_focus && !focused && !st.had_focus &&
+        frame.ctx.focus().is_null()) {
+        frame.ctx.set_focus(id);
+        focused = true;
+    }
+    if (tick_press_release(st.button, id, r, frame)) {
+        if (!focused) {
+            frame.ctx.set_focus(id);
+            focused = true;
+        }
+        if (outs.clicked) *outs.clicked = true;
+    }
+    if (focused) {
+        const TextResult k = text_input_keys(field, frame.input, outs.nav);
+        if (k == TextResult::Edit && outs.changed) *outs.changed = true;
+        if (k == TextResult::Commit || k == TextResult::Cancel) {
+            if (k == TextResult::Commit && outs.commit) *outs.commit = true;
+            if (k == TextResult::Cancel && outs.cancel) *outs.cancel = true;
+            frame.ctx.clear_focus();
+            focused = false;
+            res.ended = true;
+        }
+    }
+    if (st.had_focus && !focused && !res.ended && outs.blur) *outs.blur = true;
+    st.had_focus = focused;
+    res.focused = focused;
+    return res;
+}
+
+namespace {
+
 void draw_button(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const ButtonUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
-    if (!u->disabled) probe_add(std::string(u->label, u->length), r);
+    if (!u->disabled)
+        probe_add(u->probe ? std::string(u->probe)
+                           : std::string(u->label, u->length),
+                  r);
 
-    Color bg = theme.control_bg;
-    Color fg = u->flat ? theme.text_dim : theme.text;
-    if (u->disabled) {
-        fg = theme.text_disabled;
-    } else {
+    ButtonFace face;
+    if (!u->disabled) {
         const WidgetId id = frame.ctx.acquire_widget_id(u->state);
         if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
             *u->out_clicked = true;
-        if (u->out_ctx && frame.input.right_pressed() &&
-            frame.ctx.widget_owns_mouse(id) && r.contains(frame.input.mouse))
+        const bool over = frame.ctx.widget_owns_mouse(id) &&
+                          r.contains(frame.input.mouse);
+        if (u->out_hovered && over) *u->out_hovered = true;
+        if (u->out_ctx && frame.input.right_pressed() && over)
             *u->out_ctx = true;
         maybe_tooltip(*u->state, u->tooltip, frame);
-        bg = lerp(bg, theme.control_bg_hover, u->state->hover_t);
-        bg = lerp(bg, theme.control_bg_active, u->state->press_t);
-        if (u->flat) fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
+        face.hover_t = u->state->hover_t;
+        face.press_t = u->state->press_t;
     }
+    face.active = u->active;
+    face.disabled = u->disabled;
+    face.flat = u->flat;
+    face.align_left = u->align_left;
+    face.font_size = theme.font_size;
+    face.radius = theme.corner_radius;
+    face.trailing_icon = u->trailing_icon;
+    draw_button_face(frame.canvas, frame.font, theme, r,
+                     {u->label, u->length}, face, node.clip);
+}
 
-    if (u->active && !u->disabled) fg = theme.accent;
-    if (u->flat) {
-        if (!u->disabled)
-            draw_hover(frame, r, theme.corner_radius, u->state->hover_t);
+struct TextInputUser {
+    TextField* field;
+    TextInputState* state;
+    const char* placeholder;
+    const char* prefix;
+    const char* text;
+    const char* probe;
+    const char* tooltip;
+    bool flat;
+    bool small;
+    bool grab_focus;
+    bool* out_clicked;
+    bool* out_changed;
+    bool* out_commit;
+    bool* out_cancel;
+    bool* out_blur;
+    TextNav* nav;
+};
+
+Vec2 measure_text_input(LayoutNode& node, const Constraints&,
+                        const LayoutFrame& frame) {
+    const auto* u = static_cast<const TextInputUser*>(node.user);
+    const float fs =
+        u->small ? frame.theme.font_size_small : frame.theme.font_size;
+    const float text_w = measure_text(frame.font, u->field->buf, fs).x;
+    return {std::max(64.0f, text_w + 24.0f), frame.theme.control_height};
+}
+
+void draw_text_input(LayoutNode& node, LayoutFrame& frame) {
+    auto* u = static_cast<TextInputUser*>(node.user);
+    const Theme& theme = frame.theme;
+    const Rect& r = node.rect;
+    TextInputState& st = *u->state;
+    const WidgetId id = frame.ctx.acquire_widget_id(&st);
+    probe_add(u->probe         ? std::string(u->probe)
+              : u->placeholder ? std::string(u->placeholder)
+              : u->prefix      ? std::string(u->prefix)
+                               : std::string("field"),
+              r);
+
+    TextHostOuts outs;
+    outs.clicked = u->out_clicked;
+    outs.changed = u->out_changed;
+    outs.commit = u->out_commit;
+    outs.cancel = u->out_cancel;
+    outs.blur = u->out_blur;
+    outs.nav = u->nav;
+    const TextHostResult h =
+        text_host_frame(frame, id, st, *u->field, r, u->grab_focus, outs);
+    maybe_tooltip(st.button, u->tooltip, frame);
+
+    const float fs = u->small ? theme.font_size_small : theme.font_size;
+    std::string shown = u->prefix ? u->prefix : "";
+    const int prefix_len = static_cast<int>(shown.size());
+    bool dim = false;
+    TextCaret caret;
+    if (h.focused) {
+        shown += u->field->buf;
+        caret = field_caret(*u->field, prefix_len, caret_blink_on(frame.ctx));
+    } else if (u->text) {
+        shown += u->text;
+    } else if (!u->field->buf.empty()) {
+        shown += u->field->buf;
     } else {
-        frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
-        frame.canvas.draw_sdf_rect_outline(
-            r, theme.corner_radius, theme.stroke_width,
-            u->active && !u->disabled ? theme.accent : theme.hairline);
+        if (u->placeholder) shown += u->placeholder;
+        dim = true;
     }
-
-    // Clip the label so a wide label truncates instead of bleeding out.
-    const Rect text_clip = node.clip.empty() ? r : r.intersect(node.clip);
-    frame.canvas.push_clip(text_clip);
-    const Vec2 text_size =
-        measure_text(frame.font, {u->label, u->length}, theme.font_size);
-    const float tx = u->align_left
-        ? r.x + 4.0f
-        : r.x + std::max(4.0f, (r.w - text_size.x) * 0.5f);
-    draw_text(frame.canvas, frame.font, {u->label, u->length},
-              {tx,
-               r.y + (r.h - frame.font.line_height() * theme.font_size) * 0.5f},
-              theme.font_size, fg);
-    frame.canvas.pop_clip();
+    draw_text_input_face(frame.canvas, frame.font, theme, r, shown, caret,
+                         h.focused, u->flat, dim, st.button.hover_t, fs,
+                         theme.corner_radius, 1.0f, node.clip);
 }
 
 struct SegmentedUser {
@@ -547,6 +894,7 @@ struct IconUser {
     bool disabled;
     bool active;
     const char* tooltip;
+    const char* probe;
 };
 
 Vec2 measure_icon(LayoutNode&, const Constraints&, const LayoutFrame& frame) {
@@ -561,9 +909,11 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
         static const char* names[] = {
             "play", "pause", "up", "down", "close", "wave", "key", "knob",
             "eye", "eyeoff", "dice", "link", "solo", "soloon", "copy",
-            "lock", "magnet"};
+            "lock", "magnet", "chevronright"};
         const size_t ii = static_cast<size_t>(u->icon);
-        if (ii < sizeof(names) / sizeof(names[0]))
+        if (u->probe)
+            probe_add(u->probe, r);
+        else if (ii < sizeof(names) / sizeof(names[0]))
             probe_add(std::string("icon:") + names[ii], r);
     }
 
@@ -649,34 +999,12 @@ void draw_dropdown(LayoutNode& node, LayoutFrame& frame) {
         st.open = false;
     maybe_tooltip(st.button, u->tooltip, frame);
 
-    Color bg = lerp(theme.control_bg, theme.control_bg_hover,
-                    st.button.hover_t);
-    frame.canvas.draw_sdf_rect(r, theme.corner_radius, bg);
-    frame.canvas.draw_sdf_rect_outline(r, theme.corner_radius,
-                                       theme.stroke_width, theme.hairline);
-
     const char* current =
         u->selected >= 0 && u->selected < u->count ? u->items[u->selected]
                                                    : "-";
-    // The gutter holds the chevron; text stops before it, never under it.
-    Rect text_r = r;
-    text_r.w = std::max(0.0f, text_r.w - 19.0f);
-    const Rect text_clip =
-        node.clip.empty() ? text_r : text_r.intersect(node.clip);
-    frame.canvas.push_clip(text_clip);
-    draw_text(frame.canvas, frame.font, current,
-              {r.x + 8.0f,
-               r.y + (r.h - frame.font.line_height() * theme.font_size) *
-                         0.5f},
-              theme.font_size, theme.text);
-    frame.canvas.pop_clip();
-    const float cxr = r.right() - 11.0f;
-    const float cyr = r.y + r.h * 0.5f - (st.open ? -1.5f : 1.0f);
-    const float dir = st.open ? -3.5f : 3.5f;
-    frame.canvas.draw_line({cxr - 3.5f, cyr}, {cxr, cyr + dir}, 1.0f,
-                           theme.text_dim);
-    frame.canvas.draw_line({cxr, cyr + dir}, {cxr + 3.5f, cyr}, 1.0f,
-                           theme.text_dim);
+    draw_dropdown_face(frame.canvas, frame.font, theme, r, current, st.open,
+                       st.button.hover_t, theme.font_size,
+                       theme.corner_radius, 1.0f, node.clip);
 
     if (st.open) {
         Context::PopupRequest req;
@@ -802,7 +1130,57 @@ struct SliderUser {
     float display_offset;
     const char* tooltip;
     bool* out_ctx;
+    TextField* edit;
+    TextInputState* edit_state;
+    bool* out_commit;
+    bool* out_cancel;
+    bool* out_blur;
 };
+
+float slider_box_width(const SliderUser& u, const LayoutFrame& frame,
+                       const char* value) {
+    const bool editing = u.edit && u.edit_state;
+    if (!u.format && !editing) return 0.0f;
+    return value_box_width(frame.font,
+                           editing ? std::string_view(u.edit->buf)
+                                   : std::string_view(value),
+                           frame.theme.font_size_small, 1.0f);
+}
+
+void hit_slider(LayoutNode& node, LayoutFrame& frame) {
+    const auto* u = static_cast<const SliderUser*>(node.user);
+    register_rect_hit(node, frame, u->state);
+    if (u->edit && u->edit_state) {
+        Rect box = slider_value_rect(node.rect,
+                                     slider_box_width(*u, frame, ""));
+        if (!node.clip.empty()) box = box.intersect(node.clip);
+        frame.ctx.add_hit(box, frame.ctx.acquire_widget_id(u->edit_state));
+    }
+}
+
+void draw_slider_box(const SliderUser& u, const Rect& box, const char* value,
+                     LayoutFrame& frame) {
+    const Theme& theme = frame.theme;
+    if (u.edit && u.edit_state) {
+        TextHostOuts outs;
+        outs.commit = u.out_commit;
+        outs.cancel = u.out_cancel;
+        outs.blur = u.out_blur;
+        const TextHostResult h = text_host_frame(
+            frame, frame.ctx.acquire_widget_id(u.edit_state), *u.edit_state,
+            *u.edit, box, true, outs);
+        draw_text_input_face(
+            frame.canvas, frame.font, theme, box, u.edit->buf,
+            h.focused ? field_caret(*u.edit, 0, caret_blink_on(frame.ctx))
+                      : TextCaret{},
+            h.focused, false, false, 0.0f, theme.font_size_small,
+            theme.corner_radius, 1.0f);
+    } else if (u.format) {
+        draw_text_input_face(frame.canvas, frame.font, theme, box, value,
+                             TextCaret{}, false, false, false, 0.0f,
+                             theme.font_size_small, theme.corner_radius, 1.0f);
+    }
+}
 
 Vec2 measure_slider(LayoutNode&, const Constraints& c, const LayoutFrame& frame) {
     const float w = c.bounded_w() ? c.max_w : 160.0f;
@@ -815,23 +1193,22 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     const Rect& r = node.rect;
     SliderState& s = *u->state;
 
-    // The value text zone opens the editor; the track always drags.
+    // The value box opens the editor; the track always drags.
     char buf[32] = {};
-    float text_w = 0.0f;
-    if (u->format) {
+    if (u->format)
         std::snprintf(buf, sizeof(buf), u->format,
                       *u->value * u->display_scale + u->display_offset);
-        text_w = measure_text(frame.font, buf, theme.font_size_small).x;
-    }
-    const float value_zone_x = r.right() - text_w - 10.0f;
+    const float box_w = slider_box_width(*u, frame, buf);
+    const Rect box = slider_value_rect(r, box_w);
+    const Rect track = slider_track_rect(r, box_w, 1.0f);
+    const bool editing = u->edit && u->edit_state;
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
     const Gesture g = frame.ctx.gesture(id, r);
     if (u->out_ctx && g.right_clicked && !s.dragging) *u->out_ctx = true;
     if (g.pressed) {
-        if (u->out_value_clicked && u->format &&
-            frame.input.mouse.x >= value_zone_x) {
-            *u->out_value_clicked = true;
+        if (box_w > 0.0f && box.contains(frame.input.mouse)) {
+            if (u->out_value_clicked && !editing) *u->out_value_clicked = true;
         } else {
             s.dragging = true;
             s.fine = false;
@@ -850,14 +1227,15 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
         float next;
         if (s.fine) {
             next = s.fine_anchor_value +
-                   (r.w > 1.0f
-                        ? (frame.input.mouse.x - s.fine_anchor_x) / r.w
+                   (track.w > 1.0f
+                        ? (frame.input.mouse.x - s.fine_anchor_x) / track.w
                         : 0.0f) *
                        span * 0.1f;
             next = std::clamp(next, u->min_value, u->max_value);
         } else {
-            const float t = r.w > 1.0f
-                ? std::clamp((frame.input.mouse.x - r.x) / r.w, 0.0f, 1.0f)
+            const float t = track.w > 1.0f
+                ? std::clamp((frame.input.mouse.x - track.x) / track.w, 0.0f,
+                             1.0f)
                 : 0.0f;
             next = u->min_value + t * span;
         }
@@ -888,23 +1266,8 @@ void draw_slider(LayoutNode& node, LayoutFrame& frame) {
     const float span = u->max_value - u->min_value;
     const float t = span != 0.0f
         ? std::clamp((*u->value - u->min_value) / span, 0.0f, 1.0f) : 0.0f;
-
-    frame.canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg_active);
-    if (t > 0.0f) {
-        frame.canvas.push_clip({r.x, r.y, r.w * t, r.h});
-        frame.canvas.draw_sdf_rect(r, theme.corner_radius,
-                                   s.dragging ? theme.accent : theme.accent_dim);
-        frame.canvas.pop_clip();
-    }
-    frame.canvas.draw_sdf_rect_outline(r, theme.corner_radius,
-                                       theme.stroke_width, theme.hairline);
-
-    if (u->format) {
-        draw_text(frame.canvas, frame.font, buf,
-                  {r.right() - text_w - 6.0f,
-                   r.y + (r.h - frame.font.line_height() * theme.font_size_small) * 0.5f},
-                  theme.font_size_small, theme.text);
-    }
+    draw_slider_track(frame.canvas, theme, track, t, -1.0f, s.dragging, 1.0f);
+    draw_slider_box(*u, box, buf, frame);
 }
 
 constexpr float kDialRadius = 8.0f;
@@ -927,22 +1290,20 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
     SliderState& s = *u->state;
 
     char buf[32] = {};
-    float text_w = 0.0f;
-    if (u->format) {
+    if (u->format)
         std::snprintf(buf, sizeof(buf), u->format,
                       *u->value * u->display_scale + u->display_offset);
-        text_w = measure_text(frame.font, buf, theme.font_size_small).x;
-    }
-    const float value_zone_x = r.right() - text_w - 10.0f;
+    const float box_w = slider_box_width(*u, frame, buf);
+    const Rect box = slider_value_rect(r, box_w);
+    const bool editing = u->edit && u->edit_state;
     const Vec2 center{r.x + kDialRadius + 3.0f, r.y + r.h * 0.5f};
 
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
     const Gesture g = frame.ctx.gesture(id, r);
     if (u->out_ctx && g.right_clicked && !s.dragging) *u->out_ctx = true;
     if (g.pressed) {
-        if (u->out_value_clicked && u->format &&
-            frame.input.mouse.x >= value_zone_x) {
-            *u->out_value_clicked = true;
+        if (box_w > 0.0f && box.contains(frame.input.mouse)) {
+            if (u->out_value_clicked && !editing) *u->out_value_clicked = true;
         } else {
             s.dragging = true;
             s.dial_angle = dial_mouse_angle(frame.input.mouse, center);
@@ -984,29 +1345,10 @@ void draw_dial(LayoutNode& node, LayoutFrame& frame) {
                               {frame.input.mouse.x + 12.0f,
                                frame.input.mouse.y + 18.0f});
 
-    const Rect knob{center.x - kDialRadius, center.y - kDialRadius,
-                    kDialRadius * 2.0f, kDialRadius * 2.0f};
-    frame.canvas.draw_sdf_rect(knob, kDialRadius, theme.control_bg_active);
-    frame.canvas.draw_sdf_rect_outline(knob, kDialRadius, theme.stroke_width,
-                                       theme.hairline);
-    frame.canvas.draw_line({center.x, knob.y - 3.0f}, {center.x, knob.y - 1.0f},
-                           1.0f, theme.text_dim);
-    const float shown = std::fmod(*u->value * u->display_scale, 360.0f);
-    const float rad = shown * 0.0174533f;
-    const Color pointer = s.dragging ? theme.accent : theme.text;
-    frame.canvas.draw_line(
-        {center.x, center.y},
-        {center.x + std::sin(rad) * (kDialRadius - 2.0f),
-         center.y - std::cos(rad) * (kDialRadius - 2.0f)},
-        1.5f, pointer);
-
-    if (u->format) {
-        draw_text(frame.canvas, frame.font, buf,
-                  {r.right() - text_w - 6.0f,
-                   r.y + (r.h - frame.font.line_height() *
-                                    theme.font_size_small) * 0.5f},
-                  theme.font_size_small, theme.text);
-    }
+    draw_dial_face(frame.canvas, theme, center, kDialRadius,
+                   *u->value * u->display_scale, s.dragging, 0.0f, false,
+                   1.0f);
+    draw_slider_box(*u, box, buf, frame);
 }
 
 }  // namespace
@@ -1662,12 +2004,44 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
     u->active = opts.active;
     u->tooltip = opts.tooltip;
     u->out_ctx = opts.out_ctx;
+    u->probe = opts.probe;
+    u->out_hovered = opts.out_hovered;
+    u->trailing_icon = opts.trailing_icon;
     n->user = u;
     n->width = opts.width;
     n->measure_fn = measure_button;
     n->draw_fn = draw_button;
     n->hit_fn = hit_enabled<ButtonUser>;
     n->debug_name = "button";
+    return n;
+}
+
+LayoutNode* TextInput(LayoutArena& arena, TextField* field,
+                      TextInputState* state, const TextInputOpts& opts) {
+    LayoutNode* n = make_node(arena, NodeKind::Leaf);
+    auto* u = arena.alloc<TextInputUser>();
+    u->field = field;
+    u->state = state;
+    u->placeholder = opts.placeholder;
+    u->prefix = opts.prefix;
+    u->text = opts.text;
+    u->probe = opts.probe;
+    u->tooltip = opts.tooltip;
+    u->flat = opts.flat;
+    u->small = opts.small;
+    u->grab_focus = opts.grab_focus;
+    u->out_clicked = opts.out_clicked;
+    u->out_changed = opts.out_changed;
+    u->out_commit = opts.out_commit;
+    u->out_cancel = opts.out_cancel;
+    u->out_blur = opts.out_blur;
+    u->nav = opts.nav;
+    n->user = u;
+    n->width = opts.width;
+    n->measure_fn = measure_text_input;
+    n->draw_fn = draw_text_input;
+    n->hit_fn = hit_state<TextInputUser>;
+    n->debug_name = "text_input";
     return n;
 }
 
@@ -1723,6 +2097,7 @@ LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
     u->disabled = opts.disabled;
     u->active = opts.active;
     u->tooltip = opts.tooltip;
+    u->probe = opts.probe;
     n->user = u;
     n->width = opts.width;
     n->measure_fn = measure_icon;
@@ -1766,16 +2141,14 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
     const bool owns = ctx.widget_owns_mouse(ctx.acquire_widget_id(st));
 
     const Rect& r = req.rect;
-    canvas.draw_sdf_rect(r, theme.corner_radius, theme.control_bg);
-    canvas.draw_sdf_rect_outline(r, theme.corner_radius, theme.stroke_width,
-                                 theme.hairline);
+    draw_popup_chrome(canvas, theme, r);
     for (int i = 0; i < req.count; ++i) {
         const Rect ir{r.x + 4.0f,
                       r.y + 4.0f + static_cast<float>(i) * kPopupRowH,
                       r.w - 8.0f, kPopupRowH};
         probe_add(std::string("opt:") + req.items[i], ir);
         const bool hover = ir.contains(input.mouse);
-        if (hover) canvas.draw_sdf_rect(ir, 2.0f, theme.control_bg_hover);
+        draw_popup_row(canvas, theme, ir, hover);
         const Color fg = i == req.selected
             ? theme.accent
             : (hover ? theme.text : theme.text_dim);
@@ -1844,11 +2217,16 @@ static LayoutNode* slider_node(LayoutArena& arena, float* value,
     u->display_offset = opts.display_offset;
     u->tooltip = opts.tooltip;
     u->out_ctx = opts.out_ctx;
+    u->edit = opts.edit;
+    u->edit_state = opts.edit_state;
+    u->out_commit = opts.out_commit;
+    u->out_cancel = opts.out_cancel;
+    u->out_blur = opts.out_blur;
     n->user = u;
     n->width = SizeSpec::fill();
     n->measure_fn = measure_slider;
     n->draw_fn = draw;
-    n->hit_fn = hit_state<SliderUser>;
+    n->hit_fn = hit_slider;
     n->debug_name = debug_name;
     return n;
 }

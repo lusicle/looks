@@ -3,10 +3,12 @@
 #include <cstdint>
 
 #include "ui/layout.h"
+#include "ui/widgets.h"
 
 namespace looks::ui {
 struct UiTexture;
 struct SwatchState;
+struct TextField;
 }
 
 namespace looks::flow {
@@ -47,7 +49,8 @@ struct ParamRow {
     // 0 slider, 1 dropdown, 2 text, 3 swatch, 4 button, 5 status label.
     // A swatch stages four floats (rgba); the others stage one.
     uint8_t kind = 0;
-    const char* options = nullptr;
+    const char* const* option_items = nullptr;
+    int option_count = 0;
     const char* text = nullptr;
     ui::SwatchState* swatch = nullptr;
     float live = 0.0f;
@@ -139,7 +142,6 @@ struct Graph {
     // add_headers has add_count entries. A header row is not pickable.
     const char* const* add_items = nullptr;
     size_t add_count = 0;
-    const char* add_filter = "";
     const uint8_t* add_headers = nullptr;
     // Rows the unfiltered menu shows. A filtered list never exceeds it.
     size_t add_rows = 0;
@@ -150,12 +152,9 @@ struct Graph {
     size_t sel_wire_count = 0;
     uint64_t rename_frame = 0;
     uint64_t rename_node = 0;
-    const char* rename_text = "";
     uint64_t value_edit_node = 0;
     int value_edit_row = -1;
-    const char* value_edit_text = "";
-    int text_caret = 0;
-    int add_filter_caret = 0;
+    ui::TextField* edit_field = nullptr;
     const char* crumb = nullptr;
     const char* hint = nullptr;
 };
@@ -183,9 +182,10 @@ struct CanvasState {
     bool add_open = false;
     Vec2 add_anchor{};
     float add_gx = 0.0f, add_gy = 0.0f;
-    float add_scroll = 0.0f;
     // Flat index into add_items of the open category. -1 = none.
     int add_cat = -1;
+    bool edit_had_focus = false;
+    ui::Rect edit_rect{};
     uint64_t splice_from = 0, splice_to = 0;
     uint32_t splice_port = 0;
     // dd_field is the field rect in screen space at open time.
@@ -193,6 +193,12 @@ struct CanvasState {
     uint64_t dd_node = 0;
     int dd_row = -1;
     ui::Rect dd_field{};
+    ui::Rect dd_rect{};
+    ui::DropdownState dd_state;
+    int dd_selected = -1;
+    ui::Rect ctx_rect{};
+    ui::DropdownState ctx_dd;
+    int ctx_selected = -1;
     ui::SwatchState* swatch_open = nullptr;
     ui::Rect swatch_anchor{};
     // dial_accum stays unsnapped so drags below one degree accumulate.
@@ -227,9 +233,10 @@ struct Output {
     uint64_t moved = 0;
     float moved_x = 0.0f, moved_y = 0.0f;
     bool move_released = false;
-    // add_pick indexes Graph::add_items. -1 = none.
     bool add_menu_opened = false;
-    int add_pick = -1;
+    bool text_commit = false;
+    bool text_cancel = false;
+    bool text_blur = false;
     // A rewire emits disconnect and connect in the same frame.
     bool connect_requested = false;
     uint64_t connect_from = 0, connect_to = 0;

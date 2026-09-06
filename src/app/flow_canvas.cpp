@@ -7,7 +7,6 @@
 #include <string>
 #include <vector>
 
-#include "doc/effects.h"
 #include "ui/interact.h"
 #include "ui/probe.h"
 #include "ui/text.h"
@@ -26,21 +25,11 @@ constexpr float kNodeW = 200.0f;
 constexpr float kTitleH = 24.0f;
 constexpr float kPrevH = 106.0f;   // 16:9 in the 188 px inner width
 constexpr float kScopeH = 32.0f;
-constexpr float kRowH = 18.0f;
+float row_h() { return ui::active_theme().row_height_compact; }
 constexpr float kPadB = 8.0f;
 constexpr float kGridMinor = 24.0f;
 constexpr float kGridMajor = 120.0f;
 constexpr size_t kMaxNodes = 512;
-
-// One hue per FxCategory, in enum order.
-const Color* tint_palette() {
-    static const Color palette[8] = {
-        Color::hex(0x7E57C2), Color::hex(0x26A69A), Color::hex(0xEC7063),
-        Color::hex(0x5DADE2), Color::hex(0xF5B041), Color::hex(0xA1887F),
-        Color::hex(0x66BB6A), Color::hex(0xB0BEC5),
-    };
-    return palette;
-}
 
 struct CanvasUser {
     const Graph* graph;
@@ -72,11 +61,18 @@ void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<CanvasUser*>(node.user);
     CanvasState& st = *u->state;
     ui::register_rect_hit(node, frame, u->state);
-    st.menu_up = st.ctx_open || st.port_menu_open || st.dd_open ||
-                 st.add_open;
+    st.menu_up = st.ctx_open || st.port_menu_open || st.dd_open;
     if (st.menu_up)
         frame.ctx.push_overlay(node.rect,
                                frame.ctx.acquire_widget_id(&st.menu_up),
+                               false);
+    if (st.dd_state.open)
+        frame.ctx.push_overlay(st.dd_rect,
+                               frame.ctx.acquire_widget_id(&st.dd_state),
+                               false);
+    if (st.ctx_dd.open)
+        frame.ctx.push_overlay(st.ctx_rect,
+                               frame.ctx.acquire_widget_id(&st.ctx_dd),
                                false);
     // The open swatch takes the popup layer so clicks miss the cards below.
     if (st.swatch_open)
@@ -99,18 +95,6 @@ Vec2 wire_point(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, float t) {
                 t * t * t * p3.x,
             u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y +
                 t * t * t * p3.y};
-}
-
-std::string caret_string(const char* text, int caret, uint64_t frame_no) {
-    std::string out = text ? text : "";
-    if ((frame_no / 30) % 2 != 0) return out;
-    const int at = std::clamp(caret, 0, static_cast<int>(out.size()));
-    out.insert(out.begin() + at, '_');
-    return out;
-}
-
-std::string caret_string(const Graph& g, uint64_t frame_no) {
-    return caret_string(g.rename_text, g.text_caret, frame_no);
 }
 
 // Returns the squared distance. The hit test samples 24 segments.
@@ -211,7 +195,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     };
     auto rows_top_g = [&](const Node& nd) {
         return strip_top(nd) +
-               static_cast<float>(port_row_count(nd)) * kRowH;
+               static_cast<float>(port_row_count(nd)) * row_h();
     };
     // Stack index 0 is the In dot, k is slot k, the last one is the ghost.
     auto in_stack_count = [](const Node& nd) {
@@ -255,22 +239,22 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     };
     auto port_matte = [&](const Node& nd) {
         return to_screen(
-            {nd.x, nd.y + strip_top(nd) + 0.5f * kRowH});
+            {nd.x, nd.y + strip_top(nd) + 0.5f * row_h()});
     };
     auto port_aux = [&](const Node& nd) {
         return to_screen(
             {nd.x, nd.y + strip_top(nd) +
-                       (nd.has_matte_port ? 1.5f : 0.5f) * kRowH});
+                       (nd.has_matte_port ? 1.5f : 0.5f) * row_h()});
     };
     auto port_exit = [&](const Node& nd, int k) {
         return to_screen(
             {nd.x + kNodeW, nd.y + strip_top(nd) +
-                                (static_cast<float>(k) + 0.5f) * kRowH});
+                                (static_cast<float>(k) + 0.5f) * row_h()});
     };
     auto row_anchor = [&](const Node& nd, int row) {
         return to_screen({nd.x, nd.y + rows_top_g(nd) +
                                     (static_cast<float>(row) + 0.5f) *
-                                        kRowH});
+                                        row_h()});
     };
     auto find_node = [&](uint64_t id) -> const Node* {
         for (size_t i = 0; i < n; ++i)
@@ -307,7 +291,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (!cr.contains(mouse)) return -1;
         const float rows_top = cr.y + rows_top_g(nd) * z;
         if (mouse.y < rows_top) return -1;
-        const int row = static_cast<int>((mouse.y - rows_top) / (kRowH * z));
+        const int row = static_cast<int>((mouse.y - rows_top) / (row_h() * z));
         if (row < 0 || row >= nd.row_count) return -1;
         return nd.rows[row].route_clicked || nd.rows[row].value_input
                    ? row
@@ -373,69 +357,38 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
     }
 
-    // Keep this before the zoom handler so the menu wheel wins.
-    int cat_rows[32];
-    int cat_count = 0;
-    if (g.add_headers && (!g.add_filter || g.add_filter[0] == '\0'))
-        for (size_t i = 0; i < g.add_count && cat_count < 32; ++i)
-            if (g.add_headers[i])
-                cat_rows[cat_count++] = static_cast<int>(i);
-    const bool cat_mode = cat_count > 0;
-    if (!cat_mode) st.add_cat = -1;
-    if (cat_mode && st.add_cat >= 0 &&
-        (st.add_cat >= static_cast<int>(g.add_count) ||
-         !g.add_headers[st.add_cat]))
-        st.add_cat = -1;
-    int fly0 = 0, fly1 = 0;
-    if (cat_mode && st.add_cat >= 0) {
-        fly0 = st.add_cat + 1;
-        fly1 = fly0;
-        while (fly1 < static_cast<int>(g.add_count) &&
-               !g.add_headers[fly1])
-            ++fly1;
+    const bool hosting = g.edit_field && (g.rename_frame != 0 ||
+                                          g.rename_node != 0 ||
+                                          g.value_edit_node != 0);
+    if (hosting && frame.ctx.focus().is_null() && !st.edit_had_focus)
+        frame.ctx.set_focus(wid);
+    bool efocus = hosting && frame.ctx.has_focus(wid);
+    bool eended = false;
+    if (efocus) {
+        const ui::TextResult res =
+            ui::text_input_keys(*g.edit_field, frame.input);
+        if (res == ui::TextResult::Commit || res == ui::TextResult::Cancel) {
+            if (res == ui::TextResult::Commit) out.text_commit = true;
+            else out.text_cancel = true;
+            eended = true;
+        } else if (frame.input.left_pressed() && owns &&
+                   !st.edit_rect.contains(mouse)) {
+            out.text_blur = true;
+            eended = true;
+        }
+        if (eended) {
+            frame.ctx.clear_focus();
+            efocus = false;
+        }
     }
-    const float kMenuW = 190.0f;
-    // A search never makes the menu taller than the list it replaced.
-    const int menu_rows =
-        std::min(g.add_rows ? static_cast<int>(g.add_rows) : 14, 14);
-    const int menu_visible = std::min(
-        static_cast<int>(std::min<size_t>(
-            cat_mode ? static_cast<size_t>(cat_count) : g.add_count, 14)),
-        menu_rows);
-    const float menu_h = 26.0f + menu_visible * 18.0f + 6.0f;
-    // The clamp uses the tallest the menu can get, so the top never moves.
-    const float menu_h_max = 26.0f + menu_rows * 18.0f + 6.0f;
-    auto menu_rect = [&]() {
-        return Rect{
-            std::max(r.x + 4.0f,
-                     std::min(st.add_anchor.x, r.right() - kMenuW - 8.0f)),
-            std::max(r.y + 4.0f,
-                     std::min(st.add_anchor.y,
-                              r.bottom() - menu_h_max - 8.0f)),
-            kMenuW, menu_h};
-    };
-    auto fly_rect = [&]() {
-        const Rect mr = menu_rect();
-        int vis_row = 0;
-        for (int c = 0; c < cat_count; ++c)
-            if (cat_rows[c] == st.add_cat) vis_row = c;
-        const float h = static_cast<float>(fly1 - fly0) * 18.0f + 8.0f;
-        float x = mr.right() + 2.0f;
-        if (x + kMenuW > r.right() - 4.0f) x = mr.x - kMenuW - 2.0f;
-        const float y =
-            std::max(r.y + 4.0f, std::min(mr.y + 26.0f + vis_row * 18.0f,
-                                          r.bottom() - h - 8.0f));
-        return Rect{x, y, kMenuW, h};
-    };
-    if (st.add_open && menu_rect().contains(mouse)) {
-        const float dy = frame.ctx.take_wheel(
-            frame.ctx.acquire_widget_id(&st.menu_up));
-        if (dy != 0.0f)
-            st.add_scroll = std::clamp(
-                st.add_scroll - dy * 36.0f, 0.0f,
-                std::max(0.0f, static_cast<float>(g.add_count) * 18.0f -
-                                   menu_visible * 18.0f));
-    }
+    if (hosting && st.edit_had_focus && !efocus && !eended)
+        out.text_blur = true;
+    st.edit_had_focus = efocus;
+    const std::string edit_shown = hosting ? g.edit_field->buf : std::string();
+    const ui::TextCaret edit_caret =
+        efocus ? ui::field_caret(*g.edit_field, 0,
+                                 ui::caret_blink_on(frame.ctx))
+               : ui::TextCaret{};
 
     const float canvas_wheel = frame.ctx.take_wheel(wid);
     if (canvas_wheel != 0.0f) {
@@ -449,45 +402,65 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         gmouse = to_graph(mouse);
     }
 
+    const float ts = 12.0f * z;
+    const float rs = theme.font_size_compact * z;
     // zone: 0 none, 1 slider, 2 value text, 3 key toggle, 4 expose toggle.
     struct RowHit {
         int row = -1;
         int zone = 0;
+    };
+    // Field rect in screen space.
+    auto row_field_rect = [&](const Node& nd, int row) {
+        const Rect cr = node_rect_s(nd);
+        const float ry = cr.y + rows_top_g(nd) * z +
+                         static_cast<float>(row) * row_h() * z;
+        const float fx0 = cr.x + 64.0f * z;
+        return Rect{fx0, ry + 1.5f * z, (cr.right() - 8.0f * z) - fx0,
+                    row_h() * z - 3.0f * z};
     };
     auto hit_row = [&](const Node& nd) -> RowHit {
         RowHit h;
         const Rect cr = node_rect_s(nd);
         const float rows_top = cr.y + rows_top_g(nd) * z;
         if (mouse.y < rows_top) return h;
-        const int row = static_cast<int>((mouse.y - rows_top) / (kRowH * z));
+        const int row = static_cast<int>((mouse.y - rows_top) / (row_h() * z));
         if (row < 0 || row >= nd.row_count) return h;
         h.row = row;
         const float lx = (mouse.x - cr.x) / z;   // graph units into the card
-        if (nd.rows[row].key_clicked && lx >= 3.0f && lx < 15.0f)
+        if (nd.rows[row].key_clicked && lx >= 3.0f && lx < 15.0f) {
             h.zone = 3;
-        else if (nd.rows[row].expose_clicked && lx >= 15.0f && lx < 27.0f)
+        } else if (nd.rows[row].expose_clicked && lx >= 15.0f && lx < 27.0f) {
             h.zone = 4;
-        else if (lx >= 64.0f && lx < kNodeW - 46.0f)
+        } else if (lx >= 64.0f && lx <= kNodeW - 8.0f) {
             h.zone = 1;
-        else if (lx >= kNodeW - 46.0f && lx <= kNodeW - 8.0f)
-            h.zone = 2;
+            const ParamRow& pr = nd.rows[row];
+            if (pr.kind == 0 && pr.staged && pr.format) {
+                const float ds =
+                    pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
+                char val[32];
+                std::snprintf(val, sizeof(val), pr.format, *pr.staged * ds);
+                const float bw = ui::value_box_width(frame.font, val, rs, z);
+                if (mouse.x >=
+                    ui::slider_value_rect(row_field_rect(nd, row), bw).x)
+                    h.zone = 2;
+            }
+        }
         return h;
     };
-    // Field rect in screen space.
-    auto row_field_rect = [&](const Node& nd, int row) {
-        const Rect cr = node_rect_s(nd);
-        const float ry = cr.y + rows_top_g(nd) * z +
-                         static_cast<float>(row) * kRowH * z;
-        const float fx0 = cr.x + 64.0f * z;
-        return Rect{fx0, ry + 1.5f * z, (cr.right() - 8.0f * z) - fx0,
-                    kRowH * z - 3.0f * z};
-    };
     auto slider_value = [&](const Node& nd, int row) {
-        const Rect cr = node_rect_s(nd);
-        const float t = std::clamp(
-            ((mouse.x - cr.x) / z - 64.0f) / (kNodeW - 46.0f - 64.0f), 0.0f,
-            1.0f);
         const ParamRow& pr = nd.rows[row];
+        const Rect fr = row_field_rect(nd, row);
+        char val[32] = {};
+        if (pr.staged && pr.format) {
+            const float ds =
+                pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
+            std::snprintf(val, sizeof(val), pr.format, *pr.staged * ds);
+        }
+        const float bw =
+            pr.format ? ui::value_box_width(frame.font, val, rs, z) : 0.0f;
+        const Rect track = ui::slider_track_rect(fr, bw, z);
+        const float t = std::clamp(
+            (mouse.x - track.x) / std::max(track.w, 1.0f), 0.0f, 1.0f);
         // Snap to the readout format: the stored value equals the shown one.
         return std::clamp(
             ui::snap_to_format(pr.min_v + t * (pr.max_v - pr.min_v),
@@ -582,7 +555,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         st.add_anchor = mouse;
         st.add_gx = gmouse.x;
         st.add_gy = gmouse.y;
-        st.add_scroll = 0.0f;
         st.add_cat = -1;
         st.splice_from = st.splice_to = 0;
         st.splice_port = 0;
@@ -595,17 +567,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.splice_port = g.wires[hit].to_port;
         }
         out.add_menu_opened = true;
-    };
-
-    const float kCtxW = 170.0f;
-    const float ctx_h = static_cast<float>(g.ctx_count) * 20.0f + 8.0f;
-    auto ctx_rect = [&]() {
-        return Rect{
-            std::max(r.x + 4.0f,
-                     std::min(st.ctx_anchor.x, r.right() - kCtxW - 8.0f)),
-            std::max(r.y + 4.0f,
-                     std::min(st.ctx_anchor.y, r.bottom() - ctx_h - 8.0f)),
-            kCtxW, ctx_h};
     };
 
     if ((owns || menu_owns) && st.drag_kind == 0 &&
@@ -628,6 +589,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             st.ctx_open = true;
             st.ctx_anchor = mouse;
             st.ctx_target = target;
+            st.ctx_dd.open = true;
+            st.ctx_selected = -1;
+            frame.ctx.set_popup_owner(&st.ctx_dd);
             if (target == kOutNodeId ||
                 node_kind_of(target) != NodeKind::Frame)
                 out.clicked = target;
@@ -637,18 +601,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 
     if (st.ctx_open) {
-        const Rect mr = ctx_rect();
-        if (frame.input.left_pressed()) {
-            if (menu_owns && mr.contains(mouse)) {
-                const int row =
-                    static_cast<int>((mouse.y - (mr.y + 4.0f)) / 20.0f);
-                if (row >= 0 && row < static_cast<int>(g.ctx_count)) {
-                    out.ctx_pick = row;
-                    out.ctx_node = st.ctx_target;
-                }
-            }
-            st.ctx_open = false;
-        }
+        if (frame.ctx.popup_owner() != &st.ctx_dd) st.ctx_dd.open = false;
+        if (frame.input.left_pressed() && !st.ctx_rect.contains(mouse))
+            st.ctx_dd.open = false;
+        if (!st.ctx_dd.open) st.ctx_open = false;
     }
 
     auto port_feed_count = [&]() -> size_t {
@@ -711,32 +667,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             dd_node_p = nullptr;
         }
     }
-    auto dd_rect = [&]() {
-        const int n =
-            dd_row_p ? doc::param_option_count(dd_row_p->options) : 0;
-        const float w = std::max(st.dd_field.w, 110.0f);
-        const float h = static_cast<float>(n) * 20.0f + 8.0f;
-        return Rect{
-            std::clamp(st.dd_field.x, r.x + 4.0f, r.right() - w - 4.0f),
-            std::max(r.y + 4.0f, std::min(st.dd_field.bottom() + 2.0f,
-                                          r.bottom() - h - 4.0f)),
-            w, h};
-    };
-    if (dd_row_p && frame.input.left_pressed() && menu_owns) {
-        const Rect mr = dd_rect();
-        if (mr.contains(mouse)) {
-            const int row =
-                static_cast<int>((mouse.y - (mr.y + 4.0f)) / 20.0f);
-            const int n = doc::param_option_count(dd_row_p->options);
-            if (row >= 0 && row < n) {
-                *dd_row_p->staged =
-                    dd_row_p->min_v + static_cast<float>(row);
-                if (dd_row_p->changed) *dd_row_p->changed = true;
-                if (dd_row_p->released) *dd_row_p->released = true;
-            }
+    if (dd_row_p) {
+        if (frame.ctx.popup_owner() != &st.dd_state) st.dd_state.open = false;
+        if (frame.input.left_pressed() && !st.dd_rect.contains(mouse))
+            st.dd_state.open = false;
+        if (!st.dd_state.open) {
+            st.dd_open = false;
+            dd_row_p = nullptr;
         }
-        st.dd_open = false;
-        dd_row_p = nullptr;
     }
 
     const ParamRow* sw_row = nullptr;
@@ -769,54 +707,13 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    auto popup_chrome = [&](const Rect& mr) {
-        canvas.draw_sdf_rect(mr, 5.0f, theme.control_bg);
-        canvas.draw_sdf_rect_outline(mr, 5.0f, 1.0f, theme.accent_dim);
-    };
     auto popup_row = [&](const Rect& mr, float ry) {
         const bool hot = mouse.x >= mr.x && mouse.x < mr.right() &&
                          mouse.y >= ry && mouse.y < ry + 20.0f;
-        if (hot)
-            canvas.draw_rect({mr.x + 2.0f, ry, mr.w - 4.0f, 20.0f},
-                             theme.control_bg_hover);
+        ui::draw_popup_row(canvas, theme, {mr.x + 4.0f, ry, mr.w - 8.0f, 20.0f},
+                           hot);
         return hot;
     };
-
-    if (st.add_open) {
-        const Rect mr = menu_rect();
-        const bool have_fly =
-            cat_mode && st.add_cat >= 0 && fly1 > fly0;
-        const Rect fr2 = have_fly ? fly_rect() : Rect{};
-        if (cat_mode && mr.contains(mouse) &&
-            mouse.y >= mr.y + 26.0f) {
-            const int row =
-                static_cast<int>((mouse.y - (mr.y + 26.0f)) / 18.0f);
-            if (row >= 0 && row < cat_count)
-                st.add_cat = cat_rows[row];
-        }
-        if (frame.input.left_pressed()) {
-            if (menu_owns && have_fly && fr2.contains(mouse)) {
-                const int row = static_cast<int>(
-                    (mouse.y - (fr2.y + 4.0f)) / 18.0f);
-                const int idx = fly0 + row;
-                if (row >= 0 && idx < fly1) out.add_pick = idx;
-            } else if (menu_owns && mr.contains(mouse)) {
-                if (!cat_mode) {
-                    const int row = static_cast<int>(
-                        (mouse.y - (mr.y + 26.0f) + st.add_scroll) /
-                        18.0f);
-                    if (mouse.y >= mr.y + 26.0f && row >= 0 &&
-                        row < static_cast<int>(g.add_count) &&
-                        !(g.add_headers && g.add_headers[row]))
-                        out.add_pick = row;
-                }
-                // A click on a category row does nothing: hover opened it.
-            } else if (!mr.contains(mouse) &&
-                       !(have_fly && fr2.contains(mouse))) {
-                st.add_open = false;
-            }
-        }
-    }
 
     auto crumb_main_rect = [&]() {
         return Rect{r.x + 10.0f, r.y + 8.0f,
@@ -926,6 +823,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         st.dd_node = nd.id;
                         st.dd_row = rh.row;
                         st.dd_field = row_field_rect(nd, rh.row);
+                        st.dd_state.open = true;
+                        st.dd_selected = -1;
+                        frame.ctx.set_popup_owner(&st.dd_state);
                     } else if (pr.kind == 2) {
                         out.text_edit = nd.id;
                     } else if (pr.kind == 3 && pr.swatch && pr.staged) {
@@ -1337,8 +1237,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const Vec2 tl = to_screen({fx, fy});
         const Rect box{tl.x, tl.y, fw * z, fh * z};
         const bool tinted = fb.color >= 1 && fb.color <= 8;
-        const Color fcol =
-            tinted ? tint_palette()[(fb.color - 1) & 7] : theme.hairline;
+        const Color fcol = tinted ? ui::category_palette()[(fb.color - 1) & 7]
+                                  : theme.hairline;
         canvas.draw_sdf_rect(box, 6.0f * z,
                              tinted ? fcol.with_alpha(0.10f)
                                     : theme.control_bg.with_alpha(0.35f));
@@ -1360,15 +1260,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     theme.text_disabled);
         }
         const bool renaming = g.rename_frame == fb.id;
-        canvas.push_clip({box.x, box.y, box.w - 40.0f * z, 20.0f * z});
-        std::string rename_buf;
-        if (renaming)
-            rename_buf = caret_string(g, frame.ctx.frame());
-        ui::draw_text(canvas, frame.font,
-                      renaming ? rename_buf.c_str() : fb.title,
-                      {box.x + 8.0f * z, box.y + 4.0f * z}, 11.0f * z,
-                      renaming ? theme.text : theme.text_dim);
-        canvas.pop_clip();
+        const Rect title_r{box.x, box.y, box.w - 40.0f * z, 20.0f * z};
+        if (renaming) {
+            st.edit_rect = title_r;
+            ui::draw_text_input_face(canvas, frame.font, theme, title_r,
+                                     edit_shown, edit_caret, efocus, true,
+                                     false, 0.0f, 11.0f * z, 4.0f * z, z);
+        } else {
+            canvas.push_clip(title_r);
+            ui::draw_text(canvas, frame.font, fb.title,
+                          {box.x + 8.0f * z, box.y + 4.0f * z}, 11.0f * z,
+                          theme.text_dim);
+            canvas.pop_clip();
+        }
         for (int t = 0; t < 2; ++t) {
             const float o = (5.0f + t * 4.0f) * z;
             canvas.draw_line({box.right() - o, box.bottom() - 2.0f * z},
@@ -1428,8 +1332,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
     // Array order is z order. The dragged card draws last.
     ui::probe_add("canvas", r);
-    const float ts = 12.0f * z;
-    const float rs = 10.0f * z;
     for (int pass = 0; pass < 2; ++pass) {
         for (size_t i = 0; i < n; ++i) {
             const Node& nd = g.nodes[i];
@@ -1478,30 +1380,37 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                  theme.control_bg.with_alpha(
                                      nd.bypassed ? 0.4f : 1.0f));
             if (nd.tint != 255)
-                canvas.draw_rect({tb.x + 1.0f, tb.y + 3.0f * z, 3.0f * z,
-                                  tb.h - 6.0f * z},
-                                 tint_palette()[nd.tint & 7].with_alpha(
-                                     nd.bypassed ? 0.35f : 0.9f));
+                canvas.draw_rect(
+                    {tb.x + 1.0f, tb.y + 3.0f * z, 3.0f * z,
+                     tb.h - 6.0f * z},
+                    ui::category_palette()[nd.tint & 7].with_alpha(
+                        nd.bypassed ? 0.35f : 0.9f));
             canvas.draw_sdf_rect_outline(
                 cr, 5.0f * z, selected || in_multi ? 2.0f : 1.0f,
                 selected ? theme.accent
                          : (in_multi ? theme.accent_dim
                                      : (hovered ? theme.text_disabled
                                                 : theme.hairline)));
-            canvas.push_clip({tb.x, tb.y, tb.w - 40.0f * z, tb.h});
             bool has_text_row = false;
             for (int tr = 0; tr < nd.row_count; ++tr)
                 if (nd.rows[tr].kind == 2) has_text_row = true;
             const bool card_renaming =
                 g.rename_node == nd.id && !has_text_row;
-            std::string title_buf;
-            if (card_renaming)
-                title_buf = caret_string(g, frame.ctx.frame());
-            ui::draw_text(canvas, frame.font,
-                          card_renaming ? title_buf.c_str() : nd.title,
-                          {tb.x + 8.0f * z, tb.y + (tb.h - ts) * 0.4f}, ts,
-                          nd.bypassed ? theme.text_disabled : theme.text);
-            canvas.pop_clip();
+            const Rect title_r{tb.x, tb.y, tb.w - 40.0f * z, tb.h};
+            if (card_renaming) {
+                st.edit_rect = title_r;
+                ui::draw_text_input_face(canvas, frame.font, theme, title_r,
+                                         edit_shown, edit_caret, efocus, true,
+                                         false, 0.0f, ts, 4.0f * z, z);
+            } else {
+                canvas.push_clip(title_r);
+                ui::draw_text(canvas, frame.font, nd.title,
+                              {tb.x + 8.0f * z, tb.y + (tb.h - ts) * 0.4f},
+                              ts,
+                              nd.bypassed ? theme.text_disabled
+                                          : theme.text);
+                canvas.pop_clip();
+            }
             float tcx = tb.right() - 12.0f * z;
             if (nd.remove_clicked) {
                 const float s = 3.2f * z;
@@ -1541,12 +1450,10 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 
             float cy = cr.y + kTitleH * z;
             if (node_has_preview(nd)) {
-                const Rect pv{cr.x + 6.0f * z, cy + 3.0f * z,
-                              cr.w - 12.0f * z, kPrevH * z - 6.0f * z};
+                const Rect pv{cr.x + 1.0f, cy, cr.w - 2.0f, kPrevH * z};
                 if (nd.wave_card) {
                     // Draw the input trace first: the output stays in front.
-                    canvas.draw_sdf_rect(pv, 3.0f * z,
-                                         theme.control_bg_active);
+                    canvas.draw_rect(pv, theme.control_bg_active);
                     const float mid = pv.y + pv.h * 0.5f;
                     const float half = pv.h * 0.5f - 2.0f * z;
                     canvas.draw_rect({pv.x, mid - 0.5f, pv.w, 1.0f},
@@ -1577,18 +1484,14 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         trace(nd.wave_out,
                               theme.accent.with_alpha(0.85f));
                     }
-                    canvas.draw_sdf_rect_outline(pv, 3.0f * z, 1.0f,
-                                                 theme.hairline);
+                    canvas.draw_rect_outline(pv, 1.0f, theme.hairline);
                 } else if (nd.preview) {
                     canvas.draw_image_quad(pv, nd.preview, nd.pu0, nd.pv0,
                                            nd.pu1, nd.pv1,
-                                           Color::rgba(1, 1, 1, 1),
-                                           3.0f * z);
+                                           Color::rgba(1, 1, 1, 1), 0.0f);
                 } else {
-                    canvas.draw_sdf_rect(pv, 3.0f * z,
-                                         theme.control_bg_active);
-                    canvas.draw_sdf_rect_outline(pv, 3.0f * z, 1.0f,
-                                                 theme.hairline);
+                    canvas.draw_rect(pv, theme.control_bg_active);
+                    canvas.draw_rect_outline(pv, 1.0f, theme.hairline);
                 }
                 cy += (kPrevH + 6.0f) * z;
             } else if (nd.scope && nd.scope_count > 1) {
@@ -1633,12 +1536,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             } else {
                 cy += 2.0f * z;
             }
-            cy += static_cast<float>(port_row_count(nd)) * kRowH * z;
+            cy += static_cast<float>(port_row_count(nd)) * row_h() * z;
 
             const RowHit rh = hovered ? hit_row(nd) : RowHit{};
             for (int row = 0; row < nd.row_count; ++row) {
                 const ParamRow& pr = nd.rows[row];
-                const float ry = cy + row * kRowH * z;
+                const float ry = cy + row * row_h() * z;
                 const bool row_hot = rh.row == row;
                 Color lab = theme.text_dim;
                 if (pr.keyed) lab = theme.accent;
@@ -1647,7 +1550,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (pr.key_clicked) {
                     const float kr2 = 3.0f * z;
                     const Vec2 kc{cr.x + 9.0f * z,
-                                  ry + kRowH * z * 0.5f};
+                                  ry + row_h() * z * 0.5f};
                     if (pr.keyed)
                         canvas.draw_sdf_rect({kc.x - kr2, kc.y - kr2,
                                               kr2 * 2, kr2 * 2},
@@ -1664,7 +1567,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 if (pr.expose_clicked) {
                     const float er = 2.8f * z;
                     const Vec2 ec{cr.x + 21.0f * z,
-                                  ry + kRowH * z * 0.5f};
+                                  ry + row_h() * z * 0.5f};
                     if (pr.exposed)
                         canvas.draw_rect({ec.x - er, ec.y - er, er * 2,
                                           er * 2},
@@ -1677,9 +1580,9 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                 : theme.text_disabled);
                     label_x = cr.x + 29.0f * z;
                 }
-                canvas.push_clip({cr.x, ry, 62.0f * z, kRowH * z});
+                canvas.push_clip({cr.x, ry, 62.0f * z, row_h() * z});
                 ui::draw_text(canvas, frame.font, pr.label,
-                              {label_x, ry + (kRowH * z - rs) * 0.4f},
+                              {label_x, ry + (row_h() * z - rs) * 0.4f},
                               rs, lab);
                 canvas.pop_clip();
                 if (pr.kind != 0) {
@@ -1687,37 +1590,29 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     const float fx0 = cr.x + 64.0f * z;
                     const Rect fr{fx0, ry + 1.5f * z,
                                   (cr.right() - 8.0f * z) - fx0,
-                                  kRowH * z - 3.0f * z};
+                                  row_h() * z - 3.0f * z};
                     const bool field_hot =
                         row_hot && (rh.zone == 1 || rh.zone == 2);
                     if (pr.kind == 5) {
                         canvas.push_clip({fx0, ry,
                                           (cr.right() - 8.0f * z) - fx0,
-                                          kRowH * z});
+                                          row_h() * z});
                         ui::draw_text(canvas, frame.font,
                                       pr.text ? pr.text : "",
-                                      {fx0, ry + (kRowH * z - rs) * 0.4f},
+                                      {fx0, ry + (row_h() * z - rs) * 0.4f},
                                       rs, theme.text_dim);
                         canvas.pop_clip();
                         continue;
                     }
                     if (pr.kind == 4) {
-                        canvas.draw_sdf_rect(fr, 2.0f * z,
-                                             field_hot
-                                                 ? theme.control_bg_hover
-                                                 : theme.control_bg);
-                        canvas.draw_sdf_rect_outline(
-                            fr, 2.0f * z, 1.0f,
-                            field_hot ? theme.accent : theme.hairline);
                         const char* blabel = pr.text ? pr.text : pr.label;
-                        const Vec2 bsz =
-                            ui::measure_text(frame.font, blabel, rs);
-                        ui::draw_text(canvas, frame.font, blabel,
-                                      {fr.x + (fr.w - bsz.x) * 0.5f,
-                                       ry + (kRowH * z - rs) * 0.4f},
-                                      rs,
-                                      field_hot ? theme.text
-                                                : theme.text_dim);
+                        ui::ButtonFace bf;
+                        bf.hover_t = field_hot ? 1.0f : 0.0f;
+                        bf.font_size = rs;
+                        bf.radius = 2.0f * z;
+                        bf.scale = z;
+                        ui::draw_button_face(canvas, frame.font, theme, fr,
+                                             blabel, bf);
                         ui::probe_add(blabel, fr);
                         continue;
                     }
@@ -1736,182 +1631,84 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                              : theme.hairline));
                         continue;
                     }
-                    const bool dd_here = st.dd_open &&
-                                         st.dd_node == nd.id &&
-                                         st.dd_row == row;
-                    canvas.draw_sdf_rect(fr, 2.0f * z,
-                                         field_hot
-                                             ? theme.control_bg_hover
-                                             : theme.control_bg);
-                    canvas.draw_sdf_rect_outline(
-                        fr, 2.0f * z, 1.0f,
-                        dd_here ? theme.accent : theme.hairline);
+                    if (pr.kind == 1) {
+                        const bool dd_here = st.dd_open &&
+                                             st.dd_node == nd.id &&
+                                             st.dd_row == row;
+                        const int idx =
+                            pr.staged && pr.option_count > 0
+                                ? std::clamp(static_cast<int>(*pr.staged -
+                                                              pr.min_v +
+                                                              0.5f),
+                                             0, pr.option_count - 1)
+                                : 0;
+                        const char* shown =
+                            pr.option_count > 0 ? pr.option_items[idx] : "";
+                        ui::draw_dropdown_face(canvas, frame.font, theme, fr,
+                                               shown, dd_here,
+                                               field_hot ? 1.0f : 0.0f, rs,
+                                               2.0f * z, z);
+                        continue;
+                    }
                     const bool editing_text =
                         pr.kind == 2 && g.rename_node == nd.id;
-                    const float tx = fr.x + 4.0f * z;
-                    canvas.push_clip(
-                        {fr.x, fr.y, fr.w - 10.0f * z, fr.h});
-                    if (editing_text) {
-                        const char* etext =
-                            g.rename_text ? g.rename_text : "";
-                        const Vec2 es =
-                            ui::measure_text(frame.font, etext, rs);
-                        ui::draw_text(canvas, frame.font, etext,
-                                      {tx, ry + (kRowH * z - rs) * 0.4f},
-                                      rs, theme.text);
-                        if ((frame.ctx.frame() / 30) % 2 == 0)
-                            canvas.draw_rect(
-                                {tx + es.x + 1.0f, fr.y + 2.0f * z,
-                                 std::max(1.0f, z), fr.h - 4.0f * z},
-                                theme.accent);
-                    } else {
-                        char opt_buf[48];
-                        const char* shown = "";
-                        if (pr.kind == 1 && pr.staged) {
-                            const int n =
-                                doc::param_option_count(pr.options);
-                            const int idx = std::clamp(
-                                static_cast<int>(*pr.staged - pr.min_v +
-                                                 0.5f),
-                                0, n > 0 ? n - 1 : 0);
-                            int olen = 0;
-                            const char* o = doc::param_option_at(
-                                pr.options, idx, &olen);
-                            olen = std::min(
-                                olen, static_cast<int>(sizeof(opt_buf)) -
-                                          1);
-                            std::memcpy(opt_buf, o,
-                                        static_cast<size_t>(olen));
-                            opt_buf[olen] = '\0';
-                            shown = opt_buf;
-                        } else if (pr.kind == 2) {
-                            shown = pr.text ? pr.text : "";
-                        }
-                        ui::draw_text(canvas, frame.font, shown,
-                                      {tx, ry + (kRowH * z - rs) * 0.4f},
-                                      rs,
-                                      field_hot ? theme.text
-                                                : theme.text_dim);
-                    }
-                    canvas.pop_clip();
-                    if (pr.kind == 1) {
-                        const float cx2 = fr.right() - 8.0f * z;
-                        const float cy2 = ry + kRowH * z * 0.5f - 1.0f * z;
-                        const float cs = 2.6f * z;
-                        const Color cc = field_hot ? theme.text_dim
-                                                   : theme.text_disabled;
-                        canvas.draw_line({cx2 - cs, cy2},
-                                         {cx2, cy2 + cs}, 1.2f, cc);
-                        canvas.draw_line({cx2, cy2 + cs},
-                                         {cx2 + cs, cy2}, 1.2f, cc);
-                    }
+                    if (editing_text) st.edit_rect = fr;
+                    ui::draw_text_input_face(
+                        canvas, frame.font, theme, fr,
+                        editing_text ? edit_shown
+                                     : std::string(pr.text ? pr.text : ""),
+                        editing_text ? edit_caret : ui::TextCaret{},
+                        editing_text && efocus, false, false,
+                        field_hot ? 1.0f : 0.0f, rs, 2.0f * z, z);
                     continue;
                 }
-                const float sx0 = cr.x + 64.0f * z;
-                const float sx1 = cr.x + (kNodeW - 46.0f) * z;
-                const float sy = ry + kRowH * z * 0.5f;
+                const Rect fr = row_field_rect(nd, row);
                 const bool dial_row =
                     pr.format && std::strstr(pr.format, "deg");
                 const float row_ds =
                     pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
-                if (dial_row) {
-                    // 0 degrees points up and clockwise is positive.
-                    const float kcx = sx0 + 7.0f * z;
-                    const float kr = 5.5f * z;
-                    canvas.draw_sdf_rect_outline(
-                        {kcx - kr, sy - kr, kr * 2.0f, kr * 2.0f}, kr,
-                        1.2f,
-                        row_hot ? theme.text_dim : theme.text_disabled);
-                    const auto needle = [&](float deg_v, float len,
-                                            Color c) {
-                        const float ang =
-                            (deg_v - 90.0f) * 0.0174533f;
-                        canvas.draw_line(
-                            {kcx, sy},
-                            {kcx + std::cos(ang) * kr * len,
-                             sy + std::sin(ang) * kr * len},
-                            1.5f, c);
-                    };
-                    if (pr.has_live)
-                        needle(pr.live * row_ds, 1.0f, theme.accent);
-                    if (pr.staged)
-                        needle(*pr.staged * row_ds, 0.9f,
-                               row_hot ? theme.text : theme.text_dim);
-                } else {
-                canvas.draw_rect({sx0, sy - 1.0f, sx1 - sx0, 2.0f},
-                                 theme.control_bg_hover);
-                if (pr.staged) {
-                    const float t = std::clamp(
-                        (*pr.staged - pr.min_v) /
-                            std::max(pr.max_v - pr.min_v, 1e-6f),
-                        0.0f, 1.0f);
-                    canvas.draw_rect({sx0, sy - 1.0f, (sx1 - sx0) * t,
-                                      2.0f},
-                                     theme.accent_dim);
-                    const float hx = sx0 + (sx1 - sx0) * t;
-                    canvas.draw_sdf_rect({hx - 2.5f * z, sy - 4.0f * z,
-                                          5.0f * z, 8.0f * z},
-                                         1.5f * z,
-                                         row_hot ? theme.text
-                                                 : theme.text_dim);
-                }
-                if (pr.has_live) {
-                    const float lt = std::clamp(
-                        (pr.live - pr.min_v) /
-                            std::max(pr.max_v - pr.min_v, 1e-6f),
-                        0.0f, 1.0f);
-                    const float lx = sx0 + (sx1 - sx0) * lt;
-                    canvas.draw_rect({lx - 1.0f, sy - 5.0f * z,
-                                      std::max(2.0f, 1.5f * z),
-                                      10.0f * z},
-                                     theme.accent);
-                }
-                }
                 const bool row_editing = g.value_edit_node == nd.id &&
                                          g.value_edit_row == row;
-                if (row_editing) {
-                    const char* etext =
-                        g.value_edit_text ? g.value_edit_text : "";
-                    const Vec2 es =
-                        ui::measure_text(frame.font, etext, rs);
-                    const float pad = 5.0f * z;
-                    const float caret_w = std::max(1.0f, z);
-                    const float ew = std::max(
-                        es.x + caret_w + 2.0f * pad, 44.0f * z);
-                    const float right = cr.right() - 8.0f * z;
-                    const Rect ebox{right + pad - ew, ry + 1.5f * z, ew,
-                                    kRowH * z - 3.0f * z};
-                    canvas.draw_sdf_rect(ebox, 2.0f * z,
-                                         theme.control_bg);
-                    canvas.draw_sdf_rect_outline(ebox, 2.0f * z, 1.0f,
-                                                 theme.accent);
-                    const float tx = right - caret_w - es.x;
-                    ui::draw_text(canvas, frame.font, etext,
-                                  {tx, ry + (kRowH * z - rs) * 0.4f}, rs,
-                                  theme.text);
-                    if ((frame.ctx.frame() / 30) % 2 == 0) {
-                        const std::string head(
-                            etext,
-                            static_cast<size_t>(std::clamp(
-                                g.text_caret, 0,
-                                static_cast<int>(std::strlen(etext)))));
-                        const float cx =
-                            tx + ui::measure_text(frame.font, head.c_str(),
-                                                  rs)
-                                     .x;
-                        canvas.draw_rect({cx + 1.0f, ebox.y + 2.0f * z,
-                                          caret_w, ebox.h - 4.0f * z},
-                                         theme.accent);
-                    }
-                } else if (pr.staged) {
-                    char val[32];
+                char val[32] = {};
+                if (pr.staged && pr.format)
                     std::snprintf(val, sizeof(val), pr.format,
                                   *pr.staged * row_ds);
-                    const Vec2 vs = ui::measure_text(frame.font, val, rs);
-                    ui::draw_text(canvas, frame.font, val,
-                                  {cr.right() - 8.0f * z - vs.x,
-                                   ry + (kRowH * z - rs) * 0.4f},
-                                  rs, theme.text_dim);
+                const std::string_view box_text =
+                    row_editing ? std::string_view(edit_shown)
+                                : std::string_view(val);
+                const float box_w =
+                    pr.format || row_editing
+                        ? ui::value_box_width(frame.font, box_text, rs, z)
+                        : 0.0f;
+                const Rect box = ui::slider_value_rect(fr, box_w);
+                const Rect track = ui::slider_track_rect(fr, box_w, z);
+                if (dial_row) {
+                    ui::draw_dial_face(
+                        canvas, theme, {fr.x + 7.0f * z, fr.y + fr.h * 0.5f},
+                        5.5f * z, pr.staged ? *pr.staged * row_ds : 0.0f,
+                        row_hot, pr.live * row_ds, pr.has_live, z);
+                } else {
+                    const float span = std::max(pr.max_v - pr.min_v, 1e-6f);
+                    const float t = pr.staged
+                        ? std::clamp((*pr.staged - pr.min_v) / span, 0.0f,
+                                     1.0f)
+                        : 0.0f;
+                    const float lt = pr.has_live
+                        ? std::clamp((pr.live - pr.min_v) / span, 0.0f, 1.0f)
+                        : -1.0f;
+                    const bool dragging_row = st.drag_kind == 3 &&
+                                              st.drag_id == nd.id &&
+                                              st.drag_row == row;
+                    ui::draw_slider_track(canvas, theme, track, t, lt,
+                                          dragging_row, z);
+                }
+                if (box_w > 0.0f) {
+                    if (row_editing) st.edit_rect = box;
+                    ui::draw_text_input_face(
+                        canvas, frame.font, theme, box, box_text,
+                        row_editing ? edit_caret : ui::TextCaret{},
+                        row_editing && efocus, false, false, 0.0f, rs,
+                        2.0f * z, z);
                 }
             }
 
@@ -2087,8 +1884,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     if (hot_row >= 0) {
                         const Rect cr = node_rect_s(nd);
                         const Vec2 p = row_anchor(nd, hot_row);
-                        canvas.draw_rect({cr.x, p.y - kRowH * z * 0.5f,
-                                          cr.w, kRowH * z},
+                        canvas.draw_rect({cr.x, p.y - row_h() * z * 0.5f,
+                                          cr.w, row_h() * z},
                                          theme.accent.with_alpha(0.10f));
                     }
                 }
@@ -2136,133 +1933,33 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    if (st.add_open) {
-        if (st.splice_to) {
-            Wire sw{st.splice_from, st.splice_to, st.splice_port};
-            Vec2 p0, p3;
-            if (wire_ends(sw, &p0, &p3))
-                draw_wire(canvas, p0, p3, std::max(2.2f, 2.4f * z),
-                          theme.accent, false);
-        }
-        const Rect mr = menu_rect();
-        popup_chrome(mr);
-        const bool empty_filter =
-            !g.add_filter || g.add_filter[0] == '\0';
-        const std::string header = caret_string(
-            empty_filter ? "" : g.add_filter, g.add_filter_caret,
-            frame.ctx.frame());
-        ui::draw_text(canvas, frame.font,
-                      empty_filter ? "type to search..." : header.c_str(),
-                      {mr.x + 8.0f, mr.y + 6.0f}, 11.0f,
-                      empty_filter ? theme.text_disabled : theme.text);
-        canvas.draw_rect({mr.x + 6.0f, mr.y + 24.0f, mr.w - 12.0f, 1.0f},
-                         theme.hairline);
-        canvas.push_clip({mr.x, mr.y + 26.0f, mr.w,
-                          mr.h - 32.0f});
-        if (cat_mode) {
-            for (int c = 0; c < cat_count; ++c) {
-                const float ry = mr.y + 26.0f + c * 18.0f;
-                const bool open = cat_rows[c] == st.add_cat;
-                const bool hot = mouse.x >= mr.x &&
-                                 mouse.x < mr.right() &&
-                                 mouse.y >= ry && mouse.y < ry + 18.0f;
-                if (open || hot)
-                    canvas.draw_rect(
-                        {mr.x + 2.0f, ry, mr.w - 4.0f, 18.0f},
-                        theme.control_bg_hover);
-                ui::draw_text(canvas, frame.font,
-                              g.add_items[cat_rows[c]],
-                              {mr.x + 10.0f, ry + 3.0f}, 11.0f,
-                              open || hot ? theme.text : theme.text_dim);
-                const float ax = mr.right() - 12.0f;
-                const float ay = ry + 9.0f;
-                canvas.draw_line({ax, ay - 3.5f}, {ax + 3.5f, ay}, 1.2f,
-                                 theme.text_disabled);
-                canvas.draw_line({ax + 3.5f, ay}, {ax, ay + 3.5f}, 1.2f,
-                                 theme.text_disabled);
-            }
-        } else {
-            const int first =
-                static_cast<int>(st.add_scroll / 18.0f);
-            for (int i = first;
-                 i < static_cast<int>(g.add_count) && i < first + 15;
-                 ++i) {
-                const float ry =
-                    mr.y + 26.0f + i * 18.0f - st.add_scroll;
-                const bool header = g.add_headers && g.add_headers[i];
-                const bool hot = !header && mouse.x >= mr.x &&
-                                 mouse.x < mr.right() &&
-                                 mouse.y >= ry && mouse.y < ry + 18.0f;
-                if (hot)
-                    canvas.draw_rect(
-                        {mr.x + 2.0f, ry, mr.w - 4.0f, 18.0f},
-                        theme.control_bg_hover);
-                ui::draw_text(canvas, frame.font, g.add_items[i],
-                              {mr.x + (header ? 6.0f : 10.0f),
-                               ry + (header ? 4.5f : 3.0f)},
-                              header ? 9.0f : 11.0f,
-                              header ? theme.text_disabled
-                                     : (hot ? theme.text
-                                            : theme.text_dim));
-            }
-        }
-        canvas.pop_clip();
-        const float content_h = static_cast<float>(g.add_count) * 18.0f;
-        const float view_h = menu_visible * 18.0f;
-        if (!cat_mode && content_h > view_h) {
-            const Rect track{mr.right() - 5.0f, mr.y + 26.0f, 3.0f,
-                             view_h};
-            canvas.draw_rect(track, theme.control_bg_hover);
-            const float th =
-                std::max(18.0f, view_h * view_h / content_h);
-            const float ty =
-                track.y + st.add_scroll / (content_h - view_h) *
-                              (track.h - th);
-            canvas.draw_sdf_rect({track.x, ty, 3.0f, th}, 1.5f,
-                                 theme.text_disabled);
-        }
-        if (g.add_count == 0)
-            ui::draw_text(canvas, frame.font, "no match",
-                          {mr.x + 10.0f, mr.y + 30.0f}, 11.0f,
-                          theme.text_disabled);
-        if (cat_mode && st.add_cat >= 0 && fly1 > fly0) {
-            const Rect fr2 = fly_rect();
-            canvas.draw_sdf_rect(fr2, 5.0f, theme.control_bg);
-            canvas.draw_sdf_rect_outline(fr2, 5.0f, 1.0f,
-                                         theme.accent_dim);
-            for (int i = fly0; i < fly1; ++i) {
-                const float ry =
-                    fr2.y + 4.0f + static_cast<float>(i - fly0) * 18.0f;
-                const bool hot = mouse.x >= fr2.x &&
-                                 mouse.x < fr2.right() &&
-                                 mouse.y >= ry && mouse.y < ry + 18.0f;
-                if (hot)
-                    canvas.draw_rect(
-                        {fr2.x + 2.0f, ry, fr2.w - 4.0f, 18.0f},
-                        theme.control_bg_hover);
-                ui::draw_text(canvas, frame.font, g.add_items[i],
-                              {fr2.x + 10.0f, ry + 3.0f}, 11.0f,
-                              hot ? theme.text : theme.text_dim);
-            }
-        }
+    if (st.add_open && st.splice_to) {
+        Wire sw{st.splice_from, st.splice_to, st.splice_port};
+        Vec2 p0, p3;
+        if (wire_ends(sw, &p0, &p3))
+            draw_wire(canvas, p0, p3, std::max(2.2f, 2.4f * z),
+                      theme.accent, false);
     }
 
-    if (st.ctx_open && g.ctx_count) {
-        const Rect mr = ctx_rect();
-        popup_chrome(mr);
-        for (size_t i = 0; i < g.ctx_count; ++i) {
-            const float ry = mr.y + 4.0f + static_cast<float>(i) * 20.0f;
-            const bool hot = popup_row(mr, ry);
-            ui::draw_text(canvas, frame.font, g.ctx_items[i],
-                          {mr.x + 10.0f, ry + 4.0f}, 11.0f,
-                          hot ? theme.text : theme.text_dim);
-        }
+    if (st.ctx_open && g.ctx_count && st.ctx_dd.open) {
+        st.ctx_rect = ui::list_popup_rect(
+            {st.ctx_anchor.x, st.ctx_anchor.y, 0.0f, 0.0f}, 170.0f,
+            g.ctx_items, static_cast<int>(g.ctx_count), frame);
+        ui::Context::PopupRequest req;
+        req.anchor = {st.ctx_anchor.x, st.ctx_anchor.y, 0.0f, 0.0f};
+        req.rect = st.ctx_rect;
+        req.items = g.ctx_items;
+        req.count = static_cast<int>(g.ctx_count);
+        req.selected = -1;
+        req.state = &st.ctx_dd;
+        req.out_selected = &st.ctx_selected;
+        frame.ctx.set_popup(req);
     }
 
     if (st.port_menu_open) {
         const size_t feeds = port_feed_count();
         const Rect mr = port_menu_rect(feeds);
-        popup_chrome(mr);
+        ui::draw_popup_chrome(canvas, theme, mr);
         size_t seen = 0;
         for (size_t w = 0; w < g.wire_count; ++w) {
             const Wire& wr = g.wires[w];
@@ -2306,29 +2003,22 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
-    if (dd_row_p) {
-        const int n = doc::param_option_count(dd_row_p->options);
-        const Rect mr = dd_rect();
-        popup_chrome(mr);
-        const int cur = std::clamp(
+    if (dd_row_p && st.dd_state.open) {
+        const int n = dd_row_p->option_count;
+        st.dd_rect = ui::list_popup_rect(st.dd_field,
+                                         std::max(st.dd_field.w, 110.0f),
+                                         dd_row_p->option_items, n, frame);
+        ui::Context::PopupRequest req;
+        req.anchor = st.dd_field;
+        req.rect = st.dd_rect;
+        req.items = dd_row_p->option_items;
+        req.count = n;
+        req.selected = std::clamp(
             static_cast<int>(*dd_row_p->staged - dd_row_p->min_v + 0.5f),
             0, n > 0 ? n - 1 : 0);
-        for (int i = 0; i < n; ++i) {
-            const float ry = mr.y + 4.0f + static_cast<float>(i) * 20.0f;
-            const bool hot = popup_row(mr, ry);
-            char opt_buf[48];
-            int olen = 0;
-            const char* o =
-                doc::param_option_at(dd_row_p->options, i, &olen);
-            olen = std::min(olen,
-                            static_cast<int>(sizeof(opt_buf)) - 1);
-            std::memcpy(opt_buf, o, static_cast<size_t>(olen));
-            opt_buf[olen] = '\0';
-            ui::draw_text(canvas, frame.font, opt_buf,
-                          {mr.x + 10.0f, ry + 4.0f}, 11.0f,
-                          i == cur ? theme.accent
-                                   : (hot ? theme.text : theme.text_dim));
-        }
+        req.state = &st.dd_state;
+        req.out_selected = &st.dd_selected;
+        frame.ctx.set_popup(req);
     }
 
     if (st.swatch_open && sw_row) {
@@ -2353,7 +2043,7 @@ float node_width() { return kNodeW; }
 
 float node_height(int row_count, bool has_preview, int port_rows) {
     return kTitleH + (has_preview ? kPrevH + 6.0f : 2.0f) +
-           static_cast<float>(port_rows + row_count) * kRowH + kPadB;
+           static_cast<float>(port_rows + row_count) * row_h() + kPadB;
 }
 
 float node_height_of(const Node& nd) {
@@ -2408,7 +2098,7 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
                 ? to_screen({a->x + kNodeW,
                              a->y + strip_top(*a) +
                                  (static_cast<float>(wr.from_port) +
-                                  0.5f) * kRowH})
+                                  0.5f) * row_h()})
                 : to_screen({a->x + kNodeW, a->y + port_y(*a)});
         const bool slot_end = wr.to_port >= 2 &&
                               static_cast<int>(wr.to_port) - 1 <=
@@ -2422,7 +2112,7 @@ bool pick_wire(const Graph& g, const CanvasState& st, const ui::Rect& canvas,
                 : wr.to_port == 2
                 ? to_screen({b->x, b->y + strip_top(*b) +
                                        (b->has_matte_port ? 1.5f : 0.5f) *
-                                           kRowH})
+                                           row_h()})
                 : stacked && wr.to_port == 0 && b->has_in
                 ? to_screen({b->x, b->y + stack_y(*b, 0)})
                 : to_screen({b->x, b->y + port_y(*b)});

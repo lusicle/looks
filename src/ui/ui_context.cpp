@@ -21,6 +21,7 @@ Context::Context() : slots_(256) {}
 void Context::begin_frame(const FrameInput& in) {
     ++frame_;
     hits_.clear();
+    layer_stack_.clear();
     hit_order_ = 0;
     winner_ = {};
     winner_layer_ = HitLayer::Tree;
@@ -96,8 +97,16 @@ bool Context::id_is_live(WidgetId id) const {
 
 void Context::add_hit(const Rect& rect, WidgetId id, HitLayer layer) {
     if (rect.empty() || id.is_null()) return;
+    if (!layer_stack_.empty() && layer_stack_.back() > layer)
+        layer = layer_stack_.back();
     if (layer == HitLayer::Modal) modal_ = true;
     hits_.push_back({rect, id, layer, hit_order_++});
+}
+
+void Context::push_hit_layer(HitLayer layer) { layer_stack_.push_back(layer); }
+
+void Context::pop_hit_layer() {
+    if (!layer_stack_.empty()) layer_stack_.pop_back();
 }
 
 void Context::push_overlay(const Rect& rect, WidgetId id, bool exclusive) {
@@ -135,6 +144,12 @@ float Context::take_wheel(WidgetId id) {
 
 float Context::take_wheel_in_tree() {
     if (wheel_ == 0.0f || pointer_over_overlay()) return 0.0f;
+    const float w = wheel_;
+    wheel_ = 0.0f;
+    return w;
+}
+
+float Context::take_wheel_any() {
     const float w = wheel_;
     wheel_ = 0.0f;
     return w;

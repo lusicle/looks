@@ -54,6 +54,8 @@ public:
     // Hit rects are logical px and the caller clips them first.
     void add_hit(const Rect& rect, WidgetId id, HitLayer layer = HitLayer::Tree);
     void push_overlay(const Rect& rect, WidgetId id, bool exclusive);
+    void push_hit_layer(HitLayer layer);
+    void pop_hit_layer();
     void finalize_hits();
     WidgetId hit_winner() const { return winner_; }
     bool any_hit() const { return !winner_.is_null(); }
@@ -64,6 +66,7 @@ public:
 
     float take_wheel(WidgetId id);
     float take_wheel_in_tree();
+    float take_wheel_any();
 
     void set_focus(WidgetId id) { focus_ = id; }
     void clear_focus() { focus_ = {}; }
@@ -149,6 +152,7 @@ private:
     std::vector<Slot> slots_;      // open-addressed, power-of-two
     size_t live_slots_ = 0;
     std::vector<HitEntry> hits_;
+    std::vector<HitLayer> layer_stack_;
     WidgetId winner_{};
     HitLayer winner_layer_ = HitLayer::Tree;
     WidgetId capture_{};

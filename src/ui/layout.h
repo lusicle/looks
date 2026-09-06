@@ -37,7 +37,21 @@ struct SizeSpec {
 };
 
 enum class NodeKind : uint8_t {
-    Leaf, VStack, HStack, ZStack, Padding, ScrollArea
+    Leaf, VStack, HStack, ZStack, Padding, ScrollArea, Overlay
+};
+
+struct OverlayOpts {
+    enum class Place : uint8_t { Anchored, Centered };
+    Place place = Place::Anchored;
+    Vec2 anchor{};
+    float center_bias = 0.5f;
+    float min_top = 0.0f;
+    Rect bounds{};
+    Vec2 clamp_size{};
+    bool exclusive = false;
+    bool backdrop = false;
+    const void* id = nullptr;
+    bool* out_pressed_outside = nullptr;
 };
 
 enum class AlignMode : uint8_t { Start, Center, Stretch };
@@ -78,6 +92,7 @@ struct LayoutNode {
     LayoutNode** children = nullptr;
     uint16_t child_count = 0;
     ScrollState* scroll = nullptr;  // ScrollArea only
+    const OverlayOpts* overlay = nullptr;
 
     MeasureFn measure_fn = nullptr; // Leaf content measure (optional)
     DrawFn draw_fn = nullptr;
@@ -121,6 +136,8 @@ LayoutNode* Spacer(LayoutArena& arena, float weight = 1.0f);
 LayoutNode* ScrollAreaV(LayoutArena& arena, ScrollState* state,
                         LayoutNode* child, SizeSpec width = SizeSpec::fill(),
                         SizeSpec height = SizeSpec::fill());
+LayoutNode* Overlay(LayoutArena& arena, const OverlayOpts& opts,
+                    LayoutNode* child);
 
 Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame);
 void arrange(LayoutNode& node, const Rect& rect, const Rect& parent_clip);

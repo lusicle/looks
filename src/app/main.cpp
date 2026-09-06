@@ -2105,10 +2105,10 @@ struct EffectUiState {
     ui::ButtonState route_buttons[18], key_buttons[18], expose_buttons[18];
     ui::ButtonState group_button, rnd_button;
     ui::ButtonState solo_button, copy_button;
-    ui::ButtonState value_edit_button;
+    ui::TextInputState value_edit_state;
     ui::DropdownState param_dd[16];
     ui::SwatchState param_swatch[18];
-    ui::ButtonState text_button;
+    ui::TextInputState text_state;
 };
 
 struct GroupUiState {
@@ -2138,7 +2138,7 @@ struct LayerUiState {
     std::unordered_map<uint64_t, ui::SwatchState> stop_swatch;
     std::unordered_map<uint64_t, ui::SwatchState> hue_swatch;
     ui::SliderState sliders[22];
-    ui::ButtonState value_edit_button;
+    ui::TextInputState value_edit_state;
     ui::ButtonState route_buttons[22], key_buttons[22];
     bool xf_open = false;
     ui::ButtonState xf_header, flip_h_btn, flip_v_btn, lock_btn;
@@ -2166,6 +2166,7 @@ struct LaneUiState {
     ui::ButtonState loop_button;
     ui::ButtonState mute_button;
     ui::ButtonState kill_button;
+    bool entry_focus = false;
 };
 
 struct RulerState {
@@ -2305,9 +2306,13 @@ void save_ui_prefs(const AppState& app);
 // View state only. Never put settings state in the project.
 struct SettingsUi {
     bool open = false;
+    bool was_open = false;
     int tab = 0;              // 0 = keybinds
-    float scroll = 0.0f;
+    ui::ScrollState scroll_state;
     ui::TextField filter{.cap = 40};
+    ui::TextInputState filter_state, name_state, step_state;
+    ui::ButtonState tab_button;
+    std::vector<ui::ButtonState> row_buttons;
     // Format: action:<id>, macro:<name>, or script:<path>. Empty = none.
     std::string capture;
     std::string macro_open;
@@ -2320,7 +2325,6 @@ struct SettingsUi {
     int step_edit_index = -1;
     ui::TextField step_buf{.cap = 160};
     int complete_sel = 0;
-    std::string hover;        // interaction pass -> draw pass highlight
 };
 
 // Cancel every text entry before another opens. Capture counts as one.
@@ -2360,8 +2364,22 @@ struct ConfirmDialog {
     std::string name;              // DeleteMacro target
     uint64_t id = 0;               // DeleteBrowserItem target
     ui::ButtonState buttons[3];    // primary / secondary / cancel
-    int hovered = -1;              // interaction pass -> draw pass
     bool open() const { return kind != Kind::None; }
+};
+
+enum class TextEntry : uint8_t {
+    None, Duration, KeyEdit, RailEdit, ValueEdit, FrameRename, GroupRename,
+    TextEdit, BrowserRename, PresetRename
+};
+
+struct TextTarget {
+    TextEntry kind = TextEntry::None;
+    uint64_t id = 0;
+    int index = -1;
+    int mode = 0;
+    doc::ParamKey key{};
+    double at = 0.0;
+    float scale = 1.0f;
 };
 
 struct AppState {
@@ -2502,13 +2520,11 @@ struct AppState {
     // App preference in ui.json, not project state.
     bool import_lossless = false;
     ui::TextField entry;
-    // While focused, Char events type here and letter shortcuts stay inert.
+    TextTarget text_target;
     ui::TextField preset_filter;
-    bool preset_search_focus = false;
-    ui::ButtonState preset_search_btn, preset_import_btn;
-    // Still media duration in seconds. This field captures the keyboard.
-    bool duration_focus = false;
-    ui::ButtonState duration_btn;
+    ui::TextInputState preset_search_state;
+    ui::ButtonState preset_import_btn;
+    ui::TextInputState duration_state;
     std::string media_name;      // empty = test pattern
     std::string status;
     ConfirmDialog confirm;
@@ -2532,8 +2548,6 @@ struct AppState {
     // sel stays the primary rail selection.
     std::vector<uint64_t> multi_sel;
     std::vector<flow::Wire> sel_wires;
-    uint64_t value_edit_node = 0;
-    int value_edit_row = -1;
     uint64_t value_commit_node = 0;
     int value_commit_row = -1;
     double value_commit_typed = 0.0;
@@ -2546,9 +2560,6 @@ struct AppState {
         std::vector<doc::NodeLink> links;
         float origin_x = 0.0f, origin_y = 0.0f;
     } clipboard;
-    uint64_t frame_rename_id = 0;
-    uint64_t group_rename_id = 0;
-    uint64_t text_edit_id = 0;
     ui::ButtonState align_buttons[4];
     flow::CanvasState canvas_state;
     // 0 = the main graph. View state, never serialized.
@@ -2595,7 +2606,6 @@ struct AppState {
     std::vector<std::string> preset_bins;     // user bin rel-paths, sorted
     std::unordered_set<uint64_t> preset_bin_closed;
     uint64_t preset_sel = 0;                  // preset key or bin key
-    uint64_t preset_rename_key = 0;
     // Bumps on every rescan. Preset thumbnails key on it.
     uint64_t preset_scan_stamp = 1;
     ui::ButtonState preset_new_bin_btn;
@@ -2717,17 +2727,10 @@ struct AppState {
     // Keys are normalized to the first key. Paste lands at the playhead.
     std::vector<doc::Keyframe> key_clipboard;
     doc::ParamKey key_clip_target{};
-    // Identity by frame, so the document round trip cannot lose the key.
-    int key_edit_mode = 0;   // 0 closed, 1 value, 2 frame
-    doc::ParamKey key_edit_target{};
-    double key_edit_frame = 0.0;
     int key_commit_mode = 0;
     doc::ParamKey key_commit_target{};
     double key_commit_frame = 0.0;
     double key_commit_num = 0.0;
-    // effect_id 0 is closed; a commit outlives the field until the next build.
-    doc::ParamKey rail_edit_key{};
-    float rail_edit_scale = 1.0f;   // the row's display multiplier (deg)
     doc::ParamKey rail_commit_key{};
     double rail_commit_value = 0.0;
     // Paste only onto an instance of the same type.
@@ -2739,10 +2742,11 @@ struct AppState {
     bool fx_cat_open[static_cast<size_t>(doc::FxCategory::Count)] = {};
     ui::ButtonState add_fx_button,
         fx_cat_buttons[static_cast<size_t>(doc::FxCategory::Count)];
-    // Not empty means a flat filtered list. This field captures the keyboard.
     ui::TextField fx_filter;
-    bool fx_search_focus = false;
-    ui::ButtonState fx_search_btn;
+    ui::TextInputState fx_search_state, add_search_state;
+    std::vector<ui::ButtonState> add_menu_buttons;
+    ui::ScrollState add_menu_scroll;
+    ui::Rect canvas_rect{};
 
     // View state only. Never undo or export this.
     bool ab_wipe = false;
@@ -2790,16 +2794,15 @@ struct AppState {
     ui::ButtonState snap_button;
     struct BrowserRowUi {
         ui::ButtonState open, place;
+        ui::TextInputState edit;
     };
     std::unordered_map<uint64_t, BrowserRowUi> browser_ui;
     ui::ButtonState new_seq_button, browser_new_look_button, new_bin_button;
     // bin_closed holds the closed bins. Absent means open.
     std::unordered_set<uint64_t> bin_closed;
-    uint64_t browser_rename_id = 0;
     uint64_t browser_drag_id = 0;
     bool browser_drag_is_bin = false;
     bool browser_drag_live = false;
-    bool modal_frame = false;
     std::unordered_map<uint64_t, GroupUiState> group_ui;
     ui::DropdownState tag_dd;
     ui::ButtonState save_button, open_project_button;
@@ -2852,8 +2855,7 @@ struct AppState {
     ui::ScrollState browser_scroll;
     uint64_t browser_sel = 0;
     ui::TextField browser_filter;
-    bool browser_search_focus = false;
-    ui::ButtonState browser_search_btn;
+    ui::TextInputState browser_search_state;
     // Sampled from the worker advance counter, not from the UI loop.
     double play_fps = 0.0;
     uint64_t play_fps_count = 0;
@@ -2947,96 +2949,23 @@ struct AppState {
     ui::Rect win_rect{};   // this frame's viewport (menu clamping)
 };
 
-enum class TextEntry : uint8_t {
-    None, Duration, KeyEdit, RailEdit, ValueEdit, FrameRename, GroupRename,
-    TextEdit, BrowserRename, PresetRename, BrowserSearch, PresetSearch,
-    FxSearch
-};
-
 void commit_text_entry(AppState& app);
 
 TextEntry active_text_entry(const AppState& app) {
-    if (app.duration_focus) return TextEntry::Duration;
-    if (app.key_edit_mode != 0) return TextEntry::KeyEdit;
-    if (app.rail_edit_key.effect_id != 0) return TextEntry::RailEdit;
-    if (app.value_edit_node) return TextEntry::ValueEdit;
-    if (app.frame_rename_id) return TextEntry::FrameRename;
-    if (app.group_rename_id) return TextEntry::GroupRename;
-    if (app.text_edit_id) return TextEntry::TextEdit;
-    if (app.browser_rename_id) return TextEntry::BrowserRename;
-    if (app.preset_rename_key) return TextEntry::PresetRename;
-    if (app.browser_search_focus) return TextEntry::BrowserSearch;
-    if (app.preset_search_focus) return TextEntry::PresetSearch;
-    if (app.fx_search_focus) return TextEntry::FxSearch;
-    return TextEntry::None;
-}
-
-ui::TextField* text_entry_field(AppState& app) {
-    switch (active_text_entry(app)) {
-        case TextEntry::None: return nullptr;
-        case TextEntry::BrowserSearch: return &app.browser_filter;
-        case TextEntry::PresetSearch: return &app.preset_filter;
-        case TextEntry::FxSearch: return &app.fx_filter;
-        default: return &app.entry;
-    }
-}
-
-struct TextEntryId {
-    TextEntry kind = TextEntry::None;
-    uint64_t id = 0;
-    int index = 0;
-    double at = 0.0;
-    bool operator==(const TextEntryId&) const = default;
-};
-
-TextEntryId text_entry_id(const AppState& app) {
-    TextEntryId out;
-    out.kind = active_text_entry(app);
-    switch (out.kind) {
-        case TextEntry::KeyEdit:
-            out.id = app.key_edit_target.effect_id;
-            out.index = app.key_edit_target.param_index;
-            out.at = app.key_edit_frame;
-            break;
-        case TextEntry::RailEdit:
-            out.id = app.rail_edit_key.effect_id;
-            out.index = app.rail_edit_key.param_index;
-            break;
-        case TextEntry::ValueEdit:
-            out.id = app.value_edit_node;
-            out.index = app.value_edit_row;
-            break;
-        case TextEntry::FrameRename: out.id = app.frame_rename_id; break;
-        case TextEntry::GroupRename: out.id = app.group_rename_id; break;
-        case TextEntry::TextEdit: out.id = app.text_edit_id; break;
-        case TextEntry::BrowserRename: out.id = app.browser_rename_id; break;
-        case TextEntry::PresetRename: out.id = app.preset_rename_key; break;
-        default: break;
-    }
-    return out;
+    return app.text_target.kind;
 }
 
 void close_text_entry(AppState& app) {
-    app.duration_focus = false;
-    app.key_edit_mode = 0;
-    app.rail_edit_key = {};
-    app.value_edit_node = 0;
-    app.value_edit_row = -1;
-    app.frame_rename_id = 0;
-    app.group_rename_id = 0;
-    app.text_edit_id = 0;
-    app.browser_rename_id = 0;
-    app.preset_rename_key = 0;
-    app.browser_search_focus = false;
-    app.preset_search_focus = false;
-    app.fx_search_focus = false;
+    app.text_target = {};
     app.entry.set("");
 }
 
-ui::TextField& open_text_entry(AppState& app, ui::TextFilter filter,
-                               size_t cap, const std::string& seed) {
+ui::TextField& open_text_entry(AppState& app, const TextTarget& target,
+                               ui::TextFilter filter, size_t cap,
+                               const std::string& seed) {
     commit_text_entry(app);
     close_text_entry(app);
+    app.text_target = target;
     app.entry.filter = filter;
     app.entry.cap = cap;
     app.entry.set(seed);
@@ -4796,17 +4725,18 @@ void preset_new_bin(AppState& app) {
         rescan_presets(app);
         const std::string rel = path_to_u8(dir.filename());
         app.preset_sel = preset_bin_key(rel);
-        open_text_entry(app, ui::TextFilter::Printable, 0, rel);
-        app.preset_rename_key = app.preset_sel;
+        TextTarget t;
+        t.kind = TextEntry::PresetRename;
+        t.id = app.preset_sel;
+        open_text_entry(app, t, ui::TextFilter::Printable, 0, rel);
         return;
     }
 }
 
 // Renames the preset file stem and the name inside it, or a bin directory.
 void preset_rename_apply(AppState& app) {
-    const uint64_t key = app.preset_rename_key;
+    const uint64_t key = app.text_target.id;
     std::string nm = app.entry.buf;
-    app.preset_rename_key = 0;
     for (char& c : nm)
         if (c == '/' || c == '\\' || c == ':') c = '-';
     if (nm.empty()) return;
@@ -4845,9 +4775,8 @@ void preset_rename_apply(AppState& app) {
 }
 
 void browser_rename_apply(AppState& app) {
-    const uint64_t rid = app.browser_rename_id;
+    const uint64_t rid = app.text_target.id;
     const std::string nm = app.entry.buf;
-    app.browser_rename_id = 0;
     if (!rid || nm.empty()) return;
     if (const doc::Bin* b = app.document.find_bin(rid)) {
         app.undo.execute(app.document,
@@ -5371,135 +5300,6 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
 }
 
 // The interaction pass and the draw pass share this layout.
-struct ConfirmLayout {
-    ui::Rect panel;
-    ui::Rect button[3];
-    int count = 0;                     // 3 = save/discard/cancel, 2 = yes/no
-    const std::string* labels[3]{};
-    std::vector<std::string> lines;    // body, wrapped to the panel
-    float title_h = 0.0f, line_h = 0.0f, pad = 20.0f;
-};
-
-ConfirmLayout confirm_layout(const AppState& app, const ui::Font& font,
-                             const ui::Rect& viewport) {
-    static const std::string kCancel = "cancel";
-    const ui::Theme& th = ui::active_theme();
-    const ConfirmDialog& d = app.confirm;
-    ConfirmLayout cl;
-    cl.count = d.kind == ConfirmDialog::Kind::SaveDiscard ? 3 : 2;
-    cl.labels[0] = &d.primary;
-    cl.labels[1] = &d.secondary;
-    cl.labels[2] = &kCancel;
-    const float panel_w = std::min(400.0f, viewport.w - 48.0f);
-    const float inner_w = panel_w - cl.pad * 2.0f;
-    std::string line;
-    size_t pos = 0;
-    while (pos <= d.text.size()) {
-        size_t next = d.text.find(' ', pos);
-        if (next == std::string::npos) next = d.text.size();
-        const std::string word = d.text.substr(pos, next - pos);
-        const std::string cand = line.empty() ? word : line + " " + word;
-        if (!line.empty() &&
-            ui::measure_text(font, cand, th.font_size).x > inner_w) {
-            cl.lines.push_back(line);
-            line = word;
-        } else {
-            line = cand;
-        }
-        pos = next + 1;
-    }
-    if (!line.empty()) cl.lines.push_back(line);
-    cl.line_h = font.line_height() * th.font_size;
-    cl.title_h = font.line_height() * th.font_size_heading;
-    const float btn_h = 24.0f;
-    const float panel_h = cl.pad + cl.title_h + 10.0f +
-                          static_cast<float>(cl.lines.size()) * cl.line_h +
-                          16.0f + btn_h + cl.pad;
-    cl.panel = {std::round((viewport.w - panel_w) * 0.5f),
-                std::round(std::max(24.0f, viewport.h * 0.38f -
-                                               panel_h * 0.5f)),
-                panel_w, panel_h};
-    // Buttons right-aligned, primary rightmost.
-    float bx = cl.panel.right() - cl.pad;
-    const float by = cl.panel.bottom() - cl.pad - btn_h;
-    for (int i = 0; i < cl.count; ++i) {
-        const float bw = std::max(
-            64.0f,
-            ui::measure_text(font, *cl.labels[i], th.font_size).x + 24.0f);
-        bx -= bw;
-        cl.button[i] = {bx, by, bw, btn_h};
-        bx -= 8.0f;
-    }
-    return cl;
-}
-
-// Runs against the live input. The caller deadens the input afterwards.
-// pick_key maps enter to 1 and escape to 2 or 3.
-void confirm_interact(AppState& app, const ui::UiInput& input,
-                      const ui::Font& font, const ui::Rect& viewport,
-                      int pick_key, platform::Window* window,
-                      bool* running) {
-    const ConfirmLayout cl = confirm_layout(app, font, viewport);
-    ConfirmDialog& d = app.confirm;
-    d.hovered = -1;
-    int pick = pick_key;
-    for (int i = 0; i < cl.count; ++i) {
-        const bool inside = cl.button[i].contains(input.mouse);
-        if (inside) d.hovered = i;
-        ui::ButtonState& bs = d.buttons[i];
-        if (inside && input.left_pressed()) bs.pressed = true;
-        if (input.left_released()) {
-            if (bs.pressed && inside && pick == 0) pick = i + 1;
-            bs.pressed = false;
-        }
-    }
-    if (pick) resolve_confirm(app, pick, window, running);
-}
-
-void draw_confirm_dialog(ui::Canvas2D& canvas, const ui::Font& font,
-                         const ui::Font* header_font,
-                         const ui::Rect& viewport, AppState& app, float dt) {
-    const ui::Theme& th = ui::active_theme();
-    const ConfirmLayout cl = confirm_layout(app, font, viewport);
-    ConfirmDialog& d = app.confirm;
-    canvas.draw_sdf_rect(viewport, 0.0f, ui::Color{0.0f, 0.0f, 0.0f, 0.45f});
-    const float radius = th.corner_radius * 2.0f;
-    canvas.draw_sdf_rect(cl.panel, radius, th.panel_bg);
-    canvas.draw_sdf_rect_outline(cl.panel, radius, th.stroke_width,
-                                 th.hairline);
-    float y = cl.panel.y + cl.pad;
-    ui::draw_text(canvas, header_font ? *header_font : font, d.title,
-                  {cl.panel.x + cl.pad, y}, th.font_size_heading, th.text);
-    y += cl.title_h + 10.0f;
-    for (const std::string& ln : cl.lines) {
-        ui::draw_text(canvas, font, ln, {cl.panel.x + cl.pad, y},
-                      th.font_size, th.text_dim);
-        y += cl.line_h;
-    }
-    for (int i = 0; i < cl.count; ++i) {
-        ui::ButtonState& bs = d.buttons[i];
-        const float target = d.hovered == i ? 1.0f : 0.0f;
-        bs.hover_t += (target - bs.hover_t) *
-                      std::min(1.0f, dt * 14.0f);
-        ui::Color bg =
-            ui::lerp(th.control_bg, th.control_bg_hover, bs.hover_t);
-        if (bs.pressed) bg = th.control_bg_active;
-        const ui::Rect& r = cl.button[i];
-        ui::probe_add(*cl.labels[i], r);
-        canvas.draw_sdf_rect(r, th.corner_radius, bg);
-        canvas.draw_sdf_rect_outline(
-            r, th.corner_radius, th.stroke_width,
-            i == 0 ? th.accent_dim : th.hairline);
-        const std::string& lab = *cl.labels[i];
-        const Vec2 ts = ui::measure_text(font, lab, th.font_size);
-        ui::draw_text(
-            canvas, font, lab,
-            {r.x + (r.w - ts.x) * 0.5f,
-             r.y + (r.h - font.line_height() * th.font_size) * 0.5f},
-            th.font_size, i == 0 ? th.text : th.text_dim);
-    }
-}
-
 // Copy only what changed, then bump the serial to wake the worker.
 void push_render_job(RenderWorker& w, AppState& app) {
     bool changed = false;
@@ -5881,7 +5681,6 @@ struct FrameUi {
     bool* new_sequence_clicked = nullptr;
     bool* browser_new_look_clicked = nullptr;   // placed nowhere
     bool* new_bin_clicked = nullptr;
-    bool* browser_search_clicked = nullptr;
     struct BinRow {
         uint64_t id;
         bool* toggled;   // click folds/unfolds + selects (view state)
@@ -5909,6 +5708,7 @@ struct FrameUi {
         const char* name = "";
         bool open_bin = false;
         bool scoped = false;
+        bool renaming = false;
         const ui::UiTexture* tex = nullptr;   // null = chip placeholder
         float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
         bool* clicked = nullptr;
@@ -6039,7 +5839,6 @@ struct FrameUi {
     bool* proxy_toggle_staged = nullptr;
     bool* lossless_changed = nullptr;
     bool* lossless_staged = nullptr;
-    bool* preset_search_clicked = nullptr;
     bool* preset_import_clicked = nullptr;
     bool* duration_clicked = nullptr;
     bool* ab_clicked = nullptr;
@@ -6054,8 +5853,30 @@ struct FrameUi {
     std::vector<QueueRow> queue_rows;
 
     bool* add_layer_open = nullptr;
-    bool* fx_search_clicked = nullptr;
     bool* add_frame_clicked = nullptr;
+    bool text_commit = false;
+    bool text_cancel = false;
+    bool text_blur = false;
+    bool fx_commit = false;
+    bool fx_cancel = false;
+    bool browser_filter_cancel = false;
+    std::vector<std::pair<int, bool*>> add_menu_clicks;
+    std::vector<std::pair<int, bool*>> add_cat_hovers;
+    bool add_menu_outside = false;
+    bool add_fly_outside = false;
+    bool add_fly_open = false;
+    bool* confirm_clicks[3] = {};
+    std::vector<std::pair<std::string, bool*>> settings_hits;
+    bool settings_outside = false;
+    ui::TextNav step_nav;
+    bool name_commit = false;
+    bool name_cancel = false;
+    bool name_blur = false;
+    bool step_commit = false;
+    bool step_cancel = false;
+    bool step_blur = false;
+    bool step_changed = false;
+    bool settings_filter_cancel = false;
     bool* open_add_clicked = nullptr;
     // The picked index lands as the param value.
     struct ParamPick {
@@ -6249,17 +6070,17 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.acquire_widget_id(&u->app->browser_ui[u->id].open);
     const ui::Gesture g = frame.ctx.gesture(id, r);
     const bool hover = g.hovered && r.contains(frame.input.mouse);
+    ui::ButtonState& hb = u->app->browser_ui[u->id].open;
+    hb.hover_t = ui::transition_step(hb.hover_t, hover, frame.dt);
     if (*u->sel == u->id) {
-        frame.canvas.draw_rect(
-            r, ui::lerp(th.panel_bg, ui::Color{0.0f, 0.0f, 0.0f, 1.0f},
-                        0.5f));
+        frame.canvas.draw_rect(r, th.selection_bg());
         frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
     } else {
         if (u->stripe)
             frame.canvas.draw_rect(r, th.control_bg.with_alpha(0.45f));
-        if (hover)
-            frame.canvas.draw_rect(r,
-                                   th.control_bg_hover.with_alpha(0.6f));
+        if (hb.hover_t > 0.01f)
+            frame.canvas.draw_rect(
+                r, th.control_bg_hover.with_alpha(0.6f * hb.hover_t));
     }
     float tx = r.x + 8.0f + static_cast<float>(u->depth) * 14.0f;
     if (u->kind == 0) {
@@ -6279,12 +6100,10 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         tx += 12.0f;
     }
-    static const uint32_t kChipHex[5] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
-                                         0x5B84B1, 0xC96A8F};
     frame.canvas.draw_sdf_rect(
         {tx, r.y + (r.h - 8.0f) * 0.5f, 8.0f, 8.0f}, 2.0f,
-        ui::Color::hex(kChipHex[u->kind],
-                       u->kind == 0 && !u->open_bin ? 0.7f : 1.0f));
+        ui::chip_palette()[u->kind].with_alpha(
+            u->kind == 0 && !u->open_bin ? 0.7f : 1.0f));
     tx += 14.0f;
     frame.canvas.push_clip(r);
     ui::draw_text(frame.canvas, frame.font, u->name,
@@ -6293,8 +6112,10 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                    0.5f},
                   th.font_size,
                   u->scoped ? th.accent
-                            : (hover || *u->sel == u->id ? th.text
-                                                         : th.text_dim));
+                            : (*u->sel == u->id
+                                   ? th.text
+                                   : ui::lerp(th.text_dim, th.text,
+                                              hb.hover_t)));
     frame.canvas.pop_clip();
     if (g.pressed) *u->clicked = true;
     if (g.double_clicked && u->opened) *u->opened = true;
@@ -6342,10 +6163,45 @@ inline constexpr float kGalLabelH = 17.0f;
 
 struct GalleryUser {
     AppState* app;
+    FrameUi* out;
     const FrameUi::GalleryCell* items;
     size_t count;
     uint64_t* sel;
 };
+
+struct GalleryHost {
+    std::string text;
+    bool focused = false;
+    ui::TextCaret caret;
+};
+
+GalleryHost gallery_hosted_text(GalleryUser& u, const FrameUi::GalleryCell& it,
+                                ui::LayoutFrame& frame) {
+    AppState& a = *u.app;
+    ui::TextInputState& es = a.browser_ui[it.id].edit;
+    const ui::WidgetId cid = frame.ctx.acquire_widget_id(it.id);
+    if (frame.ctx.focus().is_null() && !es.had_focus) frame.ctx.set_focus(cid);
+    bool focused = frame.ctx.has_focus(cid);
+    bool ended = false;
+    if (focused) {
+        const ui::TextResult res = ui::text_input_keys(a.entry, frame.input);
+        if (res == ui::TextResult::Commit || res == ui::TextResult::Cancel) {
+            if (res == ui::TextResult::Commit) u.out->text_commit = true;
+            else u.out->text_cancel = true;
+            frame.ctx.clear_focus();
+            focused = false;
+            ended = true;
+        }
+    }
+    if (es.had_focus && !focused && !ended) u.out->text_blur = true;
+    es.had_focus = focused;
+    GalleryHost h;
+    h.text = a.entry.buf;
+    h.focused = focused;
+    if (focused)
+        h.caret = ui::field_caret(a.entry, 0, ui::caret_blink_on(frame.ctx));
+    return h;
+}
 
 // The layout must be a pure function of the width.
 float gallery_walk(const FrameUi::GalleryCell* items, size_t count,
@@ -6408,8 +6264,7 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     rects.reserve(u->count);
     gallery_walk(u->items, u->count, node.rect.w, &rects);
     const Vec2 m = frame.input.mouse;
-    static const uint32_t kChipHex[5] = {0xC9A23F, 0x3FA7A0, 0x8A6FD1,
-                                         0x5B84B1, 0xC96A8F};
+    const ui::Color* chips = ui::chip_palette();
     for (size_t i = 0; i < u->count && i < rects.size(); ++i) {
         const FrameUi::GalleryCell& it = u->items[i];
         ui::Rect r = rects[i];
@@ -6420,14 +6275,18 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const ui::Gesture g =
             frame.ctx.gesture(frame.ctx.acquire_widget_id(it.id), r);
         const bool hover = g.hovered && r.contains(m);
+        ui::ButtonState& hb = u->app->browser_ui[it.id].open;
+        hb.hover_t = ui::transition_step(hb.hover_t, hover, frame.dt);
+        const float hover_t = hb.hover_t;
         const bool selected = *u->sel == it.id;
+        const GalleryHost hosted =
+            it.renaming ? gallery_hosted_text(*u, it, frame) : GalleryHost{};
+        const char* name = it.renaming ? hosted.text.c_str() : it.name;
         if (it.kind == 0) {
             frame.canvas.draw_sdf_rect(
                 r, 3.0f,
-                selected
-                    ? ui::lerp(th.panel_bg,
-                               ui::Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.5f)
-                    : th.control_bg.with_alpha(hover ? 0.7f : 0.45f));
+                selected ? th.selection_bg()
+                         : th.control_bg.with_alpha(0.45f + 0.25f * hover_t));
             if (selected)
                 frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
             const float cx = r.x + 11.0f;
@@ -6446,15 +6305,23 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             }
             frame.canvas.draw_sdf_rect(
                 {r.x + 20.0f, r.y + (r.h - 8.0f) * 0.5f, 8.0f, 8.0f},
-                2.0f, ui::Color::hex(kChipHex[0], it.open_bin ? 1.0f : 0.7f));
+                2.0f, chips[0].with_alpha(it.open_bin ? 1.0f : 0.7f));
             frame.canvas.push_clip(r);
-            ui::draw_text(
-                frame.canvas, frame.font, it.name,
-                {r.x + 34.0f,
-                 r.y + (r.h - frame.font.line_height() * th.font_size) *
-                           0.5f},
-                th.font_size,
-                hover || selected ? th.text : th.text_dim);
+            if (it.renaming)
+                ui::draw_text_input_face(
+                    frame.canvas, frame.font, th,
+                    {r.x + 30.0f, r.y, r.w - 30.0f, r.h}, hosted.text,
+                    hosted.caret, hosted.focused, true, false, 0.0f,
+                    th.font_size, 3.0f, 1.0f);
+            else
+                ui::draw_text(
+                    frame.canvas, frame.font, name,
+                    {r.x + 34.0f,
+                     r.y + (r.h - frame.font.line_height() * th.font_size) *
+                               0.5f},
+                    th.font_size,
+                    selected ? th.text
+                             : ui::lerp(th.text_dim, th.text, hover_t));
             frame.canvas.pop_clip();
         } else {
             const float thh = r.h - kGalLabelH;
@@ -6470,22 +6337,30 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 frame.canvas.draw_sdf_rect(
                     {tr.x + tr.w * 0.5f - 5.0f, tr.y + tr.h * 0.5f - 5.0f,
                      10.0f, 10.0f},
-                    2.0f, ui::Color::hex(kChipHex[it.kind], 0.8f));
+                    2.0f, chips[it.kind].with_alpha(0.8f));
             }
             if (selected)
                 frame.canvas.draw_sdf_rect_outline(tr, 3.0f, 1.5f,
                                                    th.accent);
-            else if (hover)
-                frame.canvas.draw_sdf_rect_outline(tr, 3.0f, 1.0f,
-                                                   th.control_bg_hover);
+            else if (hover_t > 0.01f)
+                frame.canvas.draw_sdf_rect_outline(
+                    tr, 3.0f, 1.0f, th.control_bg_hover.with_alpha(hover_t));
             frame.canvas.push_clip(r);
-            ui::draw_text(frame.canvas, frame.font, it.name,
-                          {r.x + 2.0f, r.y + thh + 2.0f},
-                          th.font_size_small,
-                          it.scoped
-                              ? th.accent
-                              : (selected || hover ? th.text
-                                                   : th.text_dim));
+            if (it.renaming)
+                ui::draw_text_input_face(
+                    frame.canvas, frame.font, th,
+                    {r.x, r.y + thh, r.w, r.h - thh}, hosted.text,
+                    hosted.caret, hosted.focused, true, false, 0.0f,
+                    th.font_size_small, 3.0f, 1.0f);
+            else
+                ui::draw_text(frame.canvas, frame.font, name,
+                              {r.x + 2.0f, r.y + thh + 2.0f},
+                              th.font_size_small,
+                              it.scoped
+                                  ? th.accent
+                                  : (selected ? th.text
+                                              : ui::lerp(th.text_dim, th.text,
+                                                         hover_t)));
             frame.canvas.pop_clip();
         }
         if (g.pressed && it.clicked) *it.clicked = true;
@@ -6495,10 +6370,12 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 }
 
 ui::LayoutNode* LibraryGallery(ui::LayoutArena& arena, AppState& app,
+                               FrameUi& out,
                                const FrameUi::GalleryCell* items,
                                size_t count, uint64_t* sel) {
     auto* u = arena.alloc<GalleryUser>();
     u->app = &app;
+    u->out = &out;
     u->items = items;
     u->count = count;
     u->sel = sel;
@@ -8044,9 +7921,14 @@ ui::LayoutNode* MenuButton(ui::LayoutArena& arena, const char* label,
         if (st.open && !hover && !over_popup &&
             frame.input.left_pressed())
             st.open = false;
-        if (hover || st.open)
-            frame.canvas.draw_sdf_rect(r, 3.0f,
-                                       frame.theme.control_bg_hover);
+        st.button.hover_t =
+            ui::transition_step(st.button.hover_t, hover, frame.dt);
+        const float lit = std::max(st.button.hover_t, st.open ? 1.0f : 0.0f);
+        if (lit > 0.01f)
+            frame.canvas.draw_sdf_rect(
+                r, frame.theme.corner_radius,
+                frame.theme.control_bg_hover.with_alpha(
+                    frame.theme.control_bg_hover.a * lit));
         ui::probe_add(mu->label, r);
         ui::draw_text(frame.canvas, frame.font, mu->label,
                       {r.x + 10.0f,
@@ -9026,32 +8908,63 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
     }
 
+    const ui::WidgetId id = frame.ctx.acquire_widget_id(&state);
     ui::Rect readout_rect{};
     if (state.selected >= 0 && state.selected < static_cast<int>(keys.size())) {
         const doc::Keyframe& sk = keys[static_cast<size_t>(state.selected)];
-        const bool editing = u->app->key_edit_mode != 0 &&
-                             u->app->key_edit_target == u->target &&
-                             u->app->key_edit_frame == sk.frame;
+        AppState& a = *u->app;
+        const TextTarget& tt = a.text_target;
+        const bool editing = tt.kind == TextEntry::KeyEdit &&
+                             tt.key == u->target && tt.at == sk.frame;
+        bool focused = false;
+        if (editing) {
+            if (frame.ctx.focus().is_null() && !state.entry_focus)
+                frame.ctx.set_focus(id);
+            focused = frame.ctx.has_focus(id);
+            bool ended = false;
+            if (focused) {
+                const ui::TextResult res =
+                    ui::text_input_keys(a.entry, frame.input);
+                if (res == ui::TextResult::Commit ||
+                    res == ui::TextResult::Cancel) {
+                    if (res == ui::TextResult::Commit)
+                        u->out->text_commit = true;
+                    else
+                        u->out->text_cancel = true;
+                    frame.ctx.clear_focus();
+                    focused = false;
+                    ended = true;
+                }
+            }
+            if (state.entry_focus && !focused && !ended)
+                u->out->text_blur = true;
+        }
+        state.entry_focus = focused;
         char ro[64];
         if (editing)
-            std::snprintf(ro, sizeof(ro), "%s %s",
-                          u->app->key_edit_mode == 2 ? "f" : "v",
-                          ui::caret_text(u->app->entry).c_str());
+            std::snprintf(ro, sizeof(ro), "%s %s", tt.mode == 2 ? "f" : "v",
+                          a.entry.buf.c_str());
         else
             std::snprintf(ro, sizeof(ro), "f %.0f  %.4g", sk.frame,
                           sk.value);
         readout_rect = {r.x + 34.0f, r.y + 2.0f,
                         10.0f + 5.4f * static_cast<float>(std::strlen(ro)),
                         12.0f};
-        frame.canvas.draw_sdf_rect(readout_rect, 2.0f, theme.control_bg);
-        ui::draw_text(frame.canvas, frame.font, ro,
-                      {readout_rect.x + 4.0f, readout_rect.y + 1.5f}, 9.0f,
-                      editing ? theme.text : theme.text_dim);
+        if (editing)
+            ui::draw_text_input_face(
+                frame.canvas, frame.font, theme, readout_rect, ro,
+                focused ? ui::field_caret(a.entry, 2,
+                                          ui::caret_blink_on(frame.ctx))
+                        : ui::TextCaret{},
+                focused, false, false, 0.0f, 9.0f, 2.0f, 0.6f);
+        else
+            ui::draw_text_input_face(frame.canvas, frame.font, theme,
+                                     readout_rect, ro, ui::TextCaret{}, false,
+                                     false, true, 0.0f, 9.0f, 2.0f, 0.6f);
     }
     frame.canvas.pop_clip();
 
     // Interaction queues into FrameUi and applies post-frame.
-    const ui::WidgetId id = frame.ctx.acquire_widget_id(&state);
     const ui::Gesture g = frame.ctx.gesture(id, node.rect);
     const Vec2 mouse = frame.input.mouse;
     const bool dragging = state.dragging_key || state.dragging_in ||
@@ -9140,10 +9053,13 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 std::snprintf(seed, sizeof(seed), "%.0f", sk.frame);
             else
                 std::snprintf(seed, sizeof(seed), "%g", sk.value);
-            open_text_entry(a, ui::TextFilter::Signed, 15, seed);
-            a.key_edit_mode = mode;
-            a.key_edit_target = u->target;
-            a.key_edit_frame = sk.frame;
+            TextTarget t;
+            t.kind = TextEntry::KeyEdit;
+            t.mode = mode;
+            t.key = u->target;
+            t.at = sk.frame;
+            open_text_entry(a, t, ui::TextFilter::Signed, 15, seed);
+            frame.ctx.set_focus(id);
             consumed = true;
         }
         if (!consumed) {
@@ -9543,7 +9459,8 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         FrameUi::KeyToggle key_toggle{key, value, arena.alloc<bool>()};
 
         // The type-in commit lands through this row staged path.
-        const bool editing = app.rail_edit_key == key;
+        const bool editing = app.text_target.kind == TextEntry::RailEdit &&
+                             app.text_target.key == key;
         if (app.rail_commit_key == key) {
             // A typed value never snaps. Only drags snap.
             *stage.staged = std::clamp(
@@ -9564,6 +9481,11 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         }
         out.rail_edits.push_back(redit);
         opts.out_value_clicked = redit.clicked;
+        opts.edit = editing ? &app.entry : nullptr;
+        opts.edit_state = &state.value_edit_state;
+        opts.out_commit = &out.text_commit;
+        opts.out_cancel = &out.text_cancel;
+        opts.out_blur = &out.text_blur;
         const uint32_t o = ordinal < 18 ? ordinal : 17;
         ++ordinal;
         ui::ButtonState* expose_state = nullptr;
@@ -9602,15 +9524,6 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
             control = Dropdown(arena, items, n, cur,
                                &state.param_dd[o < 16 ? o : 15],
                                pick.selected, SizeSpec::fill());
-        } else if (editing) {
-            std::string shown = ui::caret_text(app.entry);
-            ButtonOpts bo;
-            bo.align_left = true;
-            bo.width = SizeSpec::fill();
-            bo.tooltip = "enter commits, esc cancels";
-            control = Button(arena,
-                             arena.dup(shown.c_str(), shown.size()),
-                             &state.value_edit_button, nullptr, bo);
         } else if (hue_bar >= 0.0f) {
             ui::SwatchOpts sopts;
             sopts.mode = ui::SwatchMode::Hue;
@@ -9665,17 +9578,20 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
     }
     if (fx.type == doc::EffectType::Text) {
         FrameUi::TextEditOpen open{fx.id, arena.alloc<bool>()};
-        const bool editing = app.text_edit_id == fx.id;
-        std::string shown =
-            editing ? ui::caret_text(app.entry) : fx.text;
-        ButtonOpts bo;
-        bo.align_left = true;
-        bo.width = SizeSpec::fill();
-        bo.tooltip = "edit the text (enter commits, esc cancels)";
+        const bool editing = app.text_target.kind == TextEntry::TextEdit &&
+                             app.text_target.id == fx.id;
+        TextInputOpts to;
+        to.text = editing ? nullptr : fx.text.c_str();
+        to.tooltip = "edit the text (enter commits, esc cancels)";
+        to.out_clicked = open.clicked;
+        if (editing) {
+            to.out_commit = &out.text_commit;
+            to.out_cancel = &out.text_cancel;
+            to.out_blur = &out.text_blur;
+        }
         rows.push_back(value_row(
             arena, "text",
-            Button(arena, arena.dup(shown.c_str(), shown.size()),
-                   &state.text_button, open.clicked, bo)));
+            TextInput(arena, &app.entry, &state.text_state, to)));
         out.text_edit_opens.push_back(open);
     }
 
@@ -10104,6 +10020,20 @@ struct FlowBuild {
     const CtxAction* ctx_actions = nullptr;   // parallels graph->ctx_items
 };
 
+const char* const* option_items(ui::LayoutArena& arena, const char* options,
+                                int* count) {
+    const int n = doc::param_option_count(options);
+    const char** items = arena.alloc<const char*>(static_cast<size_t>(
+        std::max(1, n)));
+    for (int i = 0; i < n; ++i) {
+        int len = 0;
+        const char* o = doc::param_option_at(options, i, &len);
+        items[i] = arena.dup(o, static_cast<size_t>(len));
+    }
+    *count = n;
+    return items;
+}
+
 FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                      const ui::UiTexture* thumb_tex,
                      const std::unordered_map<uint64_t, uint32_t>*
@@ -10256,7 +10186,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 rows[srow].display_scale = display_scale;
                 if (options) {
                     rows[srow].kind = 1;
-                    rows[srow].options = options;
+                    rows[srow].option_items =
+                        option_items(arena, options, &rows[srow].option_count);
                 } else {
                     const doc::ParamKey lkey{
                         layer.id | doc::kLayerParamBit,
@@ -10459,7 +10390,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 out.media_row_binds.push_back(crb);
                 rows[srow].label = "media";
                 rows[srow].kind = 1;
-                rows[srow].options = arena.dup(opts.c_str(), opts.size());
+                rows[srow].option_items =
+                    option_items(arena, opts.c_str(), &rows[srow].option_count);
                 rows[srow].min_v = 0.0f;
                 rows[srow].max_v = static_cast<float>(crb.n_assets + 1);
                 rows[srow].format = "%.0f";
@@ -10609,7 +10541,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     rows[slot].display_scale = fscale;
                     if (fopts) {
                         rows[slot].kind = 1;
-                        rows[slot].options = fopts;
+                        rows[slot].option_items = option_items(
+                            arena, fopts, &rows[slot].option_count);
                     }
                     rows[slot].staged = stage.staged;
                     rows[slot].changed = stage.changed;
@@ -10771,7 +10704,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 }
                 if (options) {
                     row.kind = 1;
-                    row.options = options;
+                    row.option_items =
+                        option_items(arena, options, &row.option_count);
                 } else if (hue_bar >= 0.0f) {
                     LayerUiState& hui = app.layer_ui[layer.id];
                     ui::SwatchState& hsw =
@@ -11016,7 +10950,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 std::max(1, doc::param_option_count(options) - 1));
             rows[slot].format = "%.0f";
             rows[slot].kind = 1;
-            rows[slot].options = options;
+            rows[slot].option_items =
+                option_items(arena, options, &rows[slot].option_count);
             rows[slot].staged = nr.pick_staged[which];
             rows[slot].changed = nr.pick_changed[which];
             rows[slot].released = arena.alloc<bool>();
@@ -11345,7 +11280,8 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         *arow = flow::ParamRow{};
         arow->label = "audio";
         arow->kind = 1;
-        arow->options = "combined|split";
+        arow->option_items =
+            option_items(arena, "combined|split", &arow->option_count);
         arow->min_v = 0.0f;
         arow->max_v = 1.0f;
         out.out_audio_staged = arena.alloc<float>();
@@ -11458,21 +11394,17 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         graph->sel_wires = sw_arr;
         graph->sel_wire_count = app.sel_wires.size();
     }
-    graph->rename_frame = app.frame_rename_id;
+    const TextTarget& tt = app.text_target;
+    graph->rename_frame = tt.kind == TextEntry::FrameRename ? tt.id : 0;
     graph->rename_node =
-        app.group_rename_id
-            ? flow::node_id(flow::NodeKind::Group, app.group_rename_id)
-            : (app.text_edit_id
-                   ? flow::node_id(flow::NodeKind::Effect, app.text_edit_id)
+        tt.kind == TextEntry::GroupRename
+            ? flow::node_id(flow::NodeKind::Group, tt.id)
+            : (tt.kind == TextEntry::TextEdit
+                   ? flow::node_id(flow::NodeKind::Effect, tt.id)
                    : 0);
-    graph->rename_text = arena.dup(app.entry.buf.c_str(),
-                                   app.entry.buf.size());
-    graph->value_edit_node = app.value_edit_node;
-    graph->value_edit_row = app.value_edit_row;
-    graph->value_edit_text = arena.dup(app.entry.buf.c_str(),
-                                       app.entry.buf.size());
-    graph->text_caret = app.entry.caret;
-    graph->add_filter_caret = app.fx_filter.caret;
+    graph->value_edit_node = tt.kind == TextEntry::ValueEdit ? tt.id : 0;
+    graph->value_edit_row = tt.kind == TextEntry::ValueEdit ? tt.index : -1;
+    graph->edit_field = &app.entry;
     if (!app.multi_sel.empty()) {
         uint64_t* multi_arr =
             arena.alloc<uint64_t>(app.multi_sel.size());
@@ -11546,8 +11478,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         graph->add_items = item_arr;
         graph->add_headers = header_arr;
         graph->add_count = items.size();
-        graph->add_filter =
-            arena.dup(app.fx_filter.buf.c_str(), app.fx_filter.buf.size());
         // What the menu shows with no filter: the search must not outgrow it.
         if (app.find_mode) {
             graph->add_rows = nodes.size();
@@ -11644,7 +11574,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     auto* events = arena.alloc<flow::Output>();
     // Arena memory is zeroed and skips member initializers.
     // Set each -1 sentinel by hand or a zero field reads as a live event.
-    events->add_pick = -1;
     events->route_drop_row = -1;
     events->ctx_pick = -1;
     return {graph, events, add_actions, ctx_actions};
@@ -11733,29 +11662,21 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     LayoutNode* browser_create = nullptr;
     const bool browser_gal = app.browser_view == 1;
     {
-        out.browser_search_clicked = arena.alloc<bool>();
         out.browser_view_pick[0] = arena.alloc<bool>();
         out.browser_view_pick[1] = arena.alloc<bool>();
         {
-            std::string label =
-                app.browser_search_focus
-                    ? ui::caret_text(app.browser_filter)
-                    : app.browser_filter.buf;
-            if (label.empty()) label = "search...";
-            ButtonOpts so;
-            so.width = SizeSpec::fill();
+            TextInputOpts so;
+            so.placeholder = "search...";
             so.flat = true;
-            so.align_left = true;
             so.tooltip = "type to filter the project";
+            so.out_cancel = &out.browser_filter_cancel;
             PanelOpts well;
             well.padding = Edges::all(1);
-            well.bg = lerp(active_theme().panel_bg,
-                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+            well.bg = active_theme().well_bg();
             LayoutNode* well_node =
                 Panel(arena,
-                      Button(arena, arena.dup(label.c_str(), label.size()),
-                             &app.browser_search_btn,
-                             out.browser_search_clicked, so),
+                      TextInput(arena, &app.browser_filter,
+                                &app.browser_search_state, so),
                       well);
             // Fill, or the well hugs the text and resizes on every keypress.
             well_node->width = SizeSpec::fill();
@@ -11777,15 +11698,17 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
         int stripe = 0;
         auto rename_row = [&](uint64_t id, int depth) {
-            std::string shown(static_cast<size_t>(depth) * 2 + 2, ' ');
-            shown += ui::caret_text(app.entry);
-            ButtonOpts bo;
-            bo.flat = true;
-            bo.align_left = true;
-            bo.width = SizeSpec::fill();
-            browser_rows.push_back(
-                Button(arena, arena.dup(shown.c_str(), shown.size()),
-                       &app.browser_ui[id].open, arena.alloc<bool>(), bo));
+            const std::string indent(static_cast<size_t>(depth) * 2 + 2,
+                                     ' ');
+            TextInputOpts to;
+            to.prefix = arena.dup(indent.c_str(), indent.size());
+            to.flat = true;
+            to.grab_focus = true;
+            to.out_commit = &out.text_commit;
+            to.out_cancel = &out.text_cancel;
+            to.out_blur = &out.text_blur;
+            browser_rows.push_back(TextInput(arena, &app.entry,
+                                             &app.browser_ui[id].edit, to));
             ++stripe;
         };
         auto asset_thumb = [&](uint64_t id, FrameUi::GalleryCell* cell) {
@@ -11801,8 +11724,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             cell.id = id;
             cell.kind = kind;
             std::string shown = name.empty() ? std::string(fallback) : name;
-            if (id == app.browser_rename_id)
-                shown = ui::caret_text(app.entry);
+            cell.renaming = app.text_target.kind == TextEntry::BrowserRename &&
+                            app.text_target.id == id;
             cell.name = arena.dup(shown.c_str(), shown.size());
             cell.open_bin = open_bin;
             cell.scoped = id == app.scope_look;
@@ -11846,7 +11769,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 gal_cell(id, kind, name, fallback, open_bin);
                 return;
             }
-            if (id == app.browser_rename_id) {
+            if (app.text_target.kind == TextEntry::BrowserRename &&
+                app.text_target.id == id) {
                 rename_row(id, depth);
                 return;
             }
@@ -11918,7 +11842,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         out.browser_cells = std::move(browser_cells);
         if (browser_gal && !out.browser_cells.empty())
             browser_rows.push_back(LibraryGallery(
-                arena, app, out.browser_cells.data(),
+                arena, app, out, out.browser_cells.data(),
                 out.browser_cells.size(), &app.browser_sel));
         out.new_sequence_clicked = arena.alloc<bool>();
         out.browser_new_look_clicked = arena.alloc<bool>();
@@ -11986,25 +11910,24 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             opened && is_still_source(opened->path);
         if (is_still) {
             out.duration_clicked = arena.alloc<bool>();
-            std::string label;
-            if (app.duration_focus) {
-                label = ui::caret_text(app.entry);
-            } else {
-                char buf[32];
-                const double secs =
-                    app.player.frame_count() / app.player.fps();
-                std::snprintf(buf, sizeof(buf), "%.1f s", secs);
-                label = buf;
-            }
-            ButtonOpts dur_opts;
-            dur_opts.width = SizeSpec::fill();
+            const bool editing = app.text_target.kind == TextEntry::Duration;
+            char buf[32];
+            const double secs = app.player.frame_count() / app.player.fps();
+            std::snprintf(buf, sizeof(buf), "%.1f s", secs);
+            TextInputOpts dur_opts;
+            dur_opts.text = editing ? nullptr : arena.dup(buf, std::strlen(buf));
             dur_opts.flat = true;
-            dur_opts.align_left = true;
+            dur_opts.grab_focus = editing;
             dur_opts.tooltip = "still length in seconds: click, type, enter";
+            dur_opts.out_clicked = out.duration_clicked;
+            if (editing) {
+                dur_opts.out_commit = &out.text_commit;
+                dur_opts.out_cancel = &out.text_cancel;
+                dur_opts.out_blur = &out.text_blur;
+            }
             rows.push_back(value_row(
                 arena, "duration",
-                Button(arena, arena.dup(label.c_str(), label.size()),
-                       &app.duration_btn, out.duration_clicked, dur_opts)));
+                TextInput(arena, &app.entry, &app.duration_state, dur_opts)));
         }
         if (!is_still) {
         out.speed_staged = arena.alloc<float>();
@@ -12319,7 +12242,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             out.param_ctxs.push_back(pctx);
             opts.out_ctx = pctx.clicked;
             // Typed values do not snap and clamp to the hard range.
-            const bool editing = app.rail_edit_key == lkey;
+            const bool editing =
+                app.text_target.kind == TextEntry::RailEdit &&
+                app.text_target.key == lkey;
             if (app.rail_commit_key == lkey) {
                 *stage.staged = std::clamp(
                     static_cast<float>(app.rail_commit_value), min_v,
@@ -12340,17 +12265,13 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             }
             out.rail_edits.push_back(redit);
             opts.out_value_clicked = redit.clicked;
+            opts.edit = editing ? &app.entry : nullptr;
+            opts.edit_state = &ls.value_edit_state;
+            opts.out_commit = &out.text_commit;
+            opts.out_cancel = &out.text_cancel;
+            opts.out_blur = &out.text_blur;
             LayoutNode* control;
-            if (editing) {
-                std::string shown = ui::caret_text(app.entry);
-                ButtonOpts bo;
-                bo.align_left = true;
-                bo.width = SizeSpec::fill();
-                bo.tooltip = "enter commits, esc cancels";
-                control = Button(arena,
-                                 arena.dup(shown.c_str(), shown.size()),
-                                 &ls.value_edit_button, nullptr, bo);
-            } else if (format && std::strstr(format, "deg")) {
+            if (format && std::strstr(format, "deg")) {
                 control = DialF(arena, stage.staged, min_v, max_v,
                                 &ls.sliders[lslider], opts);
             } else {
@@ -12677,21 +12598,16 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         out.add_layer_open, half),
                  Button(arena, "+ frame", &app.add_frame_button,
                         out.add_frame_clicked, half)}));
-            out.fx_search_clicked = arena.alloc<bool>();
-            std::string label = app.fx_search_focus
-                                    ? ui::caret_text(app.fx_filter)
-                                    : app.fx_filter.buf;
-            if (label.empty()) label = "search...";
-            ButtonOpts search_opts;
-            search_opts.width = SizeSpec::fill();
+            TextInputOpts search_opts;
+            search_opts.placeholder = "search...";
             search_opts.flat = true;
-            search_opts.align_left = true;
             search_opts.tooltip = "type to filter effects by name";
+            search_opts.out_commit = &out.fx_commit;
+            search_opts.out_cancel = &out.fx_cancel;
             rows.push_back(value_row(
                 arena, "find",
-                Button(arena, arena.dup(label.c_str(), label.size()),
-                       &app.fx_search_btn, out.fx_search_clicked,
-                       search_opts)));
+                TextInput(arena, &app.fx_filter, &app.fx_search_state,
+                          search_opts)));
         }
         if (!app.fx_filter.buf.empty()) {
             const std::string needle = ascii_lower(app.fx_filter.buf);
@@ -12803,27 +12719,19 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             tag_items[t + 1] = arena.dup(tags[static_cast<size_t>(t)].c_str(),
                                          tags[static_cast<size_t>(t)].size());
         {
-            out.preset_search_clicked = arena.alloc<bool>();
             out.preset_view_pick[0] = arena.alloc<bool>();
             out.preset_view_pick[1] = arena.alloc<bool>();
-            std::string label = app.preset_search_focus
-                                    ? ui::caret_text(app.preset_filter)
-                                    : app.preset_filter.buf;
-            if (label.empty()) label = "search...";
-            ButtonOpts search_opts;
-            search_opts.width = SizeSpec::fill();
+            TextInputOpts search_opts;
+            search_opts.placeholder = "search...";
             search_opts.flat = true;
-            search_opts.align_left = true;
             search_opts.tooltip = "type to filter presets by name";
             PanelOpts well;
             well.padding = Edges::all(1);
-            well.bg = lerp(active_theme().panel_bg,
-                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+            well.bg = active_theme().well_bg();
             LayoutNode* well_node =
                 Panel(arena,
-                      Button(arena, arena.dup(label.c_str(), label.size()),
-                             &app.preset_search_btn,
-                             out.preset_search_clicked, search_opts),
+                      TextInput(arena, &app.preset_filter,
+                                &app.preset_search_state, search_opts),
                       well);
             static const char* kViewLabels[2] = {"list", "grid"};
             static const char* kViewTips[2] = {"tree list view",
@@ -12854,16 +12762,18 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         std::vector<FrameUi::GalleryCell> preset_cells;
         int stripe = 0;
         auto rename_row = [&](int depth) {
-            std::string shown(static_cast<size_t>(depth) * 2 + 2, ' ');
-            shown += ui::caret_text(app.entry);
-            ButtonOpts bo;
-            bo.flat = true;
-            bo.align_left = true;
-            bo.width = SizeSpec::fill();
-            rows.push_back(Button(
-                arena, arena.dup(shown.c_str(), shown.size()),
-                &app.browser_ui[app.preset_rename_key].open,
-                arena.alloc<bool>(), bo));
+            const std::string indent(static_cast<size_t>(depth) * 2 + 2,
+                                     ' ');
+            TextInputOpts to;
+            to.prefix = arena.dup(indent.c_str(), indent.size());
+            to.flat = true;
+            to.grab_focus = true;
+            to.out_commit = &out.text_commit;
+            to.out_cancel = &out.text_cancel;
+            to.out_blur = &out.text_blur;
+            rows.push_back(TextInput(
+                arena, &app.entry,
+                &app.browser_ui[app.text_target.id].edit, to));
             ++stripe;
         };
         auto tree_row = [&](uint64_t key, int kind, const std::string& name,
@@ -12873,8 +12783,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 cell.id = key;
                 cell.kind = kind;
                 std::string shown = name;
-                if (key == app.preset_rename_key)
-                    shown = ui::caret_text(app.entry);
+                cell.renaming =
+                    app.text_target.kind == TextEntry::PresetRename &&
+                    app.text_target.id == key;
                 cell.name = arena.dup(shown.c_str(), shown.size());
                 cell.open_bin = open_bin;
                 cell.clicked = arena.alloc<bool>();
@@ -12905,7 +12816,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 preset_cells.push_back(cell);
                 return;
             }
-            if (key == app.preset_rename_key) {
+            if (app.text_target.kind == TextEntry::PresetRename &&
+                app.text_target.id == key) {
                 rename_row(depth);
                 return;
             }
@@ -12999,7 +12911,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         // Take the cell pointer after the walks: the vector must not move.
         out.preset_cells = std::move(preset_cells);
         if (preset_gal && !out.preset_cells.empty())
-            rows.push_back(LibraryGallery(arena, app,
+            rows.push_back(LibraryGallery(arena, app, out,
                                           out.preset_cells.data(),
                                           out.preset_cells.size(),
                                           &app.preset_sel));
@@ -13326,8 +13238,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     PanelOpts library_well;
     library_well.padding = Edges::all(2);
     library_well.outline = false;
-    library_well.bg = lerp(active_theme().panel_bg,
-                           Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.38f);
+    library_well.bg = active_theme().well_bg();
     StackOpts pcol;
     pcol.gap = 2.0f;
     pcol.cross_align = AlignMode::Stretch;
@@ -13517,9 +13428,9 @@ void commit_text_entry(AppState& app) {
             char* end = nullptr;
             const double num = std::strtod(app.entry.buf.c_str(), &end);
             if (end != app.entry.buf.c_str()) {
-                app.key_commit_mode = app.key_edit_mode;
-                app.key_commit_target = app.key_edit_target;
-                app.key_commit_frame = app.key_edit_frame;
+                app.key_commit_mode = app.text_target.mode;
+                app.key_commit_target = app.text_target.key;
+                app.key_commit_frame = app.text_target.at;
                 app.key_commit_num = num;
             }
             break;
@@ -13528,32 +13439,32 @@ void commit_text_entry(AppState& app) {
             char* endp = nullptr;
             const double typed = std::strtod(app.entry.buf.c_str(), &endp);
             if (endp != app.entry.buf.c_str()) {
-                const float scale = app.rail_edit_scale != 0.0f
-                                        ? app.rail_edit_scale
+                const float scale = app.text_target.scale != 0.0f
+                                        ? app.text_target.scale
                                         : 1.0f;
-                app.rail_commit_key = app.rail_edit_key;
+                app.rail_commit_key = app.text_target.key;
                 app.rail_commit_value = typed / scale;
             }
             break;
         }
         case TextEntry::ValueEdit:
             if (!app.entry.buf.empty()) {
-                app.value_commit_node = app.value_edit_node;
-                app.value_commit_row = app.value_edit_row;
+                app.value_commit_node = app.text_target.id;
+                app.value_commit_row = app.text_target.index;
                 app.value_commit_typed = std::atof(app.entry.buf.c_str());
             }
             break;
         case TextEntry::FrameRename:
             app.undo.execute(app.document,
                              doc::set_frame_title_command(
-                                 app.scope_look, app.frame_rename_id,
+                                 app.scope_look, app.text_target.id,
                                  app.entry.buf));
             break;
         case TextEntry::GroupRename: {
             size_t gli = 0;
-            if (doc::find_group(app.look(), app.group_rename_id, &gli))
+            if (doc::find_group(app.look(), app.text_target.id, &gli))
                 for (const doc::Group& gr : app.look().layers[gli].groups)
-                    if (gr.id == app.group_rename_id) {
+                    if (gr.id == app.text_target.id) {
                         doc::Group edited = gr;
                         edited.name = app.entry.buf;
                         app.undo.execute(app.document,
@@ -13565,7 +13476,7 @@ void commit_text_entry(AppState& app) {
         }
         case TextEntry::TextEdit: {
             size_t li = 0, fi = 0;
-            if (find_effect_by_id(app.look(), app.text_edit_id, &li, &fi))
+            if (find_effect_by_id(app.look(), app.text_target.id, &li, &fi))
                 app.undo.execute(app.document,
                                  doc::set_effect_text_command(
                                      app.scope_look, li, fi,
@@ -13578,28 +13489,11 @@ void commit_text_entry(AppState& app) {
         case TextEntry::PresetRename:
             preset_rename_apply(app);
             break;
-        case TextEntry::BrowserSearch:
-        case TextEntry::PresetSearch:
-        case TextEntry::FxSearch:
-            break;
     }
     close_text_entry(app);
 }
 
-void cancel_text_entry(AppState& app) {
-    switch (active_text_entry(app)) {
-        case TextEntry::BrowserSearch:
-            app.browser_filter.set("");
-            break;
-        case TextEntry::FxSearch:
-            app.canvas_state.add_open = false;
-            app.find_mode = false;
-            break;
-        default:
-            break;
-    }
-    close_text_entry(app);
-}
+void cancel_text_entry(AppState& app) { close_text_entry(app); }
 
 // Returns false when no lane drives the param: the caller writes the base.
 bool autokey_lane(AppState& app, const doc::ParamKey& pk, float value,
@@ -13928,10 +13822,9 @@ void find_node(AppState& a, KeyIntents&) {
     close_text_entry(a);
     a.find_mode = true;
     a.fx_filter.set("");
-    a.fx_search_focus = true;
     a.canvas_state.add_open = true;
     a.canvas_state.add_anchor = a.canvas_state.last_mouse;
-    a.canvas_state.add_scroll = 0.0f;
+    a.add_menu_scroll.offset = 0.0f;
     a.canvas_state.splice_from = 0;
     a.canvas_state.splice_to = 0;
     a.canvas_state.splice_port = 0;
@@ -14285,32 +14178,9 @@ void pump_action_queue(AppState& app, KeyIntents& ki) {
 }
 
 // Two passes: input at frame start, draw at frame end, layout rebuilt.
-struct SettingsRow {
-    enum class Kind : uint8_t {
-        Heading, MacroRow, StepRow, AddStep, NewMacro, ScriptRow,
-        BindScript, ActionRow
-    };
-    Kind kind{};
-    std::string label;
-    std::string key;     // action id, macro name or script path
-    int index = -1;      // step position in the open macro; -1 = none
-    bool dim = false;
-    ui::Rect rect;       // view space, already scrolled
-};
-
-struct SettingsLayout {
-    ui::Rect panel, tabs, tab_keys, filter, view;
-    std::vector<SettingsRow> rows;
-    float content_h = 0.0f;
-    // The popup overlays the list: typing does not reflow the rows.
-    ui::Rect edit_anchor;
-    bool edit_active = false;
-};
-
 constexpr float kSetRowH = 22.0f;
 constexpr float kSetHeadH = 30.0f;
 constexpr float kSetChordW = 170.0f;
-constexpr float kSetBtnH = 18.0f;
 
 struct StepCompletion {
     std::string display;
@@ -14391,187 +14261,6 @@ bool settings_filter_hits(const AppState& app, std::string_view name) {
            name.find(app.settings.filter.buf) != std::string_view::npos;
 }
 
-SettingsLayout settings_layout(const AppState& app, const ui::Font&,
-                               const ui::Rect& viewport) {
-    const SettingsUi& s = app.settings;
-    SettingsLayout sl;
-    const float pw = std::min(720.0f, viewport.w - 80.0f);
-    const float ph = std::min(viewport.h * 0.78f, viewport.h - 64.0f);
-    sl.panel = {std::round((viewport.w - pw) * 0.5f),
-                std::round((viewport.h - ph) * 0.42f), pw, ph};
-    const float pad = 14.0f;
-    sl.tabs = {sl.panel.x, sl.panel.y, 118.0f, sl.panel.h};
-    sl.tab_keys = {sl.tabs.x + 8.0f, sl.tabs.y + 44.0f, sl.tabs.w - 16.0f,
-                   24.0f};
-    const float cx = sl.tabs.right() + pad;
-    const float cw = sl.panel.right() - pad - cx;
-    sl.filter = {cx, sl.panel.y + 40.0f, cw, kSetRowH};
-    sl.view = {cx, sl.filter.bottom() + 8.0f, cw,
-               sl.panel.bottom() - pad - (sl.filter.bottom() + 8.0f)};
-
-    auto row = [&](SettingsRow::Kind k, std::string label, std::string key,
-                   int index, bool dim, float h) {
-        SettingsRow r;
-        r.kind = k;
-        r.label = std::move(label);
-        r.key = std::move(key);
-        r.index = index;
-        r.dim = dim;
-        r.rect = {sl.view.x, sl.view.y - s.scroll + sl.content_h,
-                  sl.view.w, h};
-        sl.content_h += h;
-        sl.rows.push_back(std::move(r));
-    };
-
-    row(SettingsRow::Kind::Heading, "macro", "", -1, false, kSetHeadH);
-    for (const auto& [name, steps] : app.macros) {
-        if (!settings_filter_hits(app, name)) continue;
-        row(SettingsRow::Kind::MacroRow, name, name, -1, false, kSetRowH);
-        if (s.macro_open != name) continue;
-        int i = 0;
-        for (const std::string& step : steps) {
-            const bool editing =
-                s.step_edit_macro == name && s.step_edit_index == i;
-            row(SettingsRow::Kind::StepRow,
-                editing ? ui::caret_text(s.step_buf) : step, step, i,
-                !editing && !macro_step_error(step).empty(), kSetRowH);
-            if (editing) {
-                sl.edit_anchor = sl.rows.back().rect;
-                sl.edit_active = true;
-            }
-            ++i;
-        }
-        if (s.step_edit_macro == name &&
-            s.step_edit_index == static_cast<int>(steps.size())) {
-            row(SettingsRow::Kind::StepRow, ui::caret_text(s.step_buf), "", i,
-                false, kSetRowH);
-            sl.edit_anchor = sl.rows.back().rect;
-            sl.edit_active = true;
-        }
-        row(SettingsRow::Kind::AddStep, "+ add step", name, -1, false,
-            kSetRowH);
-    }
-    row(SettingsRow::Kind::NewMacro,
-        s.adding ? "name: " + ui::caret_text(s.name_buf) : "+ new macro", "", -1,
-        false, kSetRowH);
-
-    row(SettingsRow::Kind::Heading, "script", "", -1, false, kSetHeadH);
-    std::set<std::string> script_paths;
-    for (const auto& [chord, b] : app.keybinds)
-        if (b.kind == KeyBinding::Kind::Script)
-            script_paths.insert(b.value);
-    for (const std::string& path : script_paths) {
-        const std::string fname = path_to_u8(u8_to_path(path).filename());
-        if (!settings_filter_hits(app, fname)) continue;
-        std::error_code ec;
-        const bool missing = !std::filesystem::exists(u8_to_path(path), ec);
-        row(SettingsRow::Kind::ScriptRow, fname, path, -1, missing,
-            kSetRowH);
-    }
-    row(SettingsRow::Kind::BindScript, "+ bind script...", "", -1, false,
-        kSetRowH);
-
-    row(SettingsRow::Kind::Heading, "action", "", -1, false, kSetHeadH);
-    for (const ActionDef* a : actions_by_name())
-        if (settings_filter_hits(app, a->name))
-            row(SettingsRow::Kind::ActionRow, a->name, a->id, -1, false,
-                kSetRowH);
-    return sl;
-}
-
-struct SettingsOverlay {
-    ui::Rect rect;
-    std::vector<std::string> rows;
-    int shown = 0;                   // interactive rows, not the hint line
-    float pad = 4.0f;
-    bool open() const { return !rows.empty(); }
-    ui::Rect row_rect(int i) const {
-        return {rect.x, rect.y + pad + static_cast<float>(i) * kSetRowH,
-                rect.w, kSetRowH};
-    }
-};
-
-SettingsOverlay settings_overlay(const AppState& app,
-                                 const SettingsLayout& sl) {
-    SettingsOverlay ov;
-    const SettingsUi& s = app.settings;
-    if (s.step_edit_index < 0 || !sl.edit_active) return ov;
-    if (sl.edit_anchor.bottom() <= sl.view.y ||
-        sl.edit_anchor.y >= sl.view.bottom())
-        return ov;
-    const auto comps = step_completions(app, s.step_buf.buf);
-    if (!comps.empty()) {
-        ov.shown = std::min<int>(kCompleteShown,
-                                 static_cast<int>(comps.size()));
-        for (int i = 0; i < ov.shown; ++i)
-            ov.rows.push_back(comps[i].display);
-        if (static_cast<int>(comps.size()) > ov.shown)
-            ov.rows.push_back(
-                "(" + std::to_string(comps.size() - ov.shown) +
-                " more - keep typing)");
-    } else {
-        std::string word;
-        for (const char c : s.step_buf.buf) {
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                c == '_' || (!word.empty() && c >= '0' && c <= '9'))
-                word.push_back(c);
-            else
-                break;
-        }
-        if (!word.empty()) {
-            for (const auto& [n, sig] : app.op_help)
-                if (n == word) {
-                    ov.rows.push_back(sig);
-                    break;
-                }
-            if (ov.rows.empty())
-                if (const ActionDef* a = find_action(word))
-                    ov.rows.push_back(std::string("action: ") + a->name);
-        }
-    }
-    if (ov.rows.empty()) return ov;
-    const float w = std::min(480.0f, sl.view.w - 40.0f);
-    const float h =
-        static_cast<float>(ov.rows.size()) * kSetRowH + ov.pad * 2.0f;
-    const float x = std::min(sl.edit_anchor.x + 20.0f,
-                             sl.view.right() - w - 4.0f);
-    float y = sl.edit_anchor.bottom() + 2.0f;
-    if (y + h > sl.panel.bottom() - 6.0f)
-        y = sl.edit_anchor.y - 2.0f - h;
-    ov.rect = {x, y, w, h};
-    return ov;
-}
-
-// Slot 0 is the rightmost control in the row.
-// MacroRow: delete rename edit run chord. StepRow: down up x.
-ui::Rect settings_btn(const SettingsRow& r, int slot, float w) {
-    float right = r.rect.right() - 4.0f;
-    static const float kMacroW[] = {50.0f, 56.0f, 40.0f, 36.0f, kSetChordW};
-    static const float kStepW[] = {20.0f, 20.0f, 20.0f};
-    static const float kScriptW[] = {20.0f, kSetChordW};
-    const float* widths = nullptr;
-    int count = 0;
-    switch (r.kind) {
-        case SettingsRow::Kind::MacroRow: widths = kMacroW; count = 5; break;
-        case SettingsRow::Kind::StepRow: widths = kStepW; count = 3; break;
-        case SettingsRow::Kind::ScriptRow: widths = kScriptW; count = 2; break;
-        case SettingsRow::Kind::ActionRow: {
-            static const float kActW[] = {kSetChordW};
-            widths = kActW;
-            count = 1;
-            break;
-        }
-        default: return {right - w, r.rect.y + 2.0f, w, kSetBtnH};
-    }
-    for (int i = 0; i < count && i <= slot; ++i) {
-        right -= widths[i];
-        if (i == slot)
-            return {right, r.rect.y + 2.0f, widths[i], kSetBtnH};
-        right -= 4.0f;
-    }
-    return {right, r.rect.y + 2.0f, w, kSetBtnH};
-}
-
 void settings_commit_name(AppState& app);
 void settings_commit_step(AppState& app);
 
@@ -14639,511 +14328,6 @@ void settings_commit_step(AppState& app) {
     s.step_edit_index = -1;
     s.step_buf.set("");
     s.complete_sel = 0;
-}
-
-// Escape cancels a capture here, so it never binds through this panel.
-void settings_key_event(AppState& app, const platform::Event& e) {
-    SettingsUi& s = app.settings;
-    const bool key_down = e.type == platform::Event::Type::KeyDown;
-    if (!s.capture.empty()) {
-        if (!key_down) return;
-        if (e.key == platform::Key::Escape) {
-            s.capture.clear();
-            return;
-        }
-        if (e.key == platform::Key::Shift ||
-            e.key == platform::Key::Ctrl ||
-            e.key == platform::Key::Alt ||
-            e.key == platform::Key::CapsLock)
-            return;   // modifiers alone never finish a chord
-        const std::string chord = chord_of(e.key, e.mods);
-        if (chord.empty()) return;
-        const std::string target = s.capture;
-        s.capture.clear();
-        const size_t colon = target.find(':');
-        if (colon == std::string::npos) return;
-        const std::string kind_s = target.substr(0, colon);
-        KeyBinding b;
-        b.kind = kind_s == "macro"    ? KeyBinding::Kind::Macro
-                 : kind_s == "script" ? KeyBinding::Kind::Script
-                                      : KeyBinding::Kind::Action;
-        b.value = target.substr(colon + 1);
-        for (auto it = app.keybinds.begin(); it != app.keybinds.end();)
-            if (it->second == b)
-                it = app.keybinds.erase(it);
-            else
-                ++it;
-        app.keybinds[chord] = std::move(b);
-        save_ui_prefs(app);
-        return;
-    }
-    const bool step = s.step_edit_index >= 0;
-    // Autocomplete owns arrows and tab while the dropdown has rows.
-    if (key_down && step) {
-        const auto comps = step_completions(app, s.step_buf.buf);
-        if (!comps.empty()) {
-            const int count = std::min<int>(
-                kCompleteShown, static_cast<int>(comps.size()));
-            if (e.key == platform::Key::Down) {
-                s.complete_sel = std::min(count - 1, s.complete_sel + 1);
-                return;
-            }
-            if (e.key == platform::Key::Up) {
-                s.complete_sel = std::max(0, s.complete_sel - 1);
-                return;
-            }
-            if (e.key == platform::Key::Tab) {
-                settings_apply_completion(
-                    app, static_cast<size_t>(
-                             std::min(s.complete_sel, count - 1)));
-                return;
-            }
-        }
-    }
-    ui::TextField& dst = step ? s.step_buf
-                         : (s.adding || !s.rename_macro.empty())
-                             ? s.name_buf
-                             : s.filter;
-    switch (ui::text_field_key(dst, e)) {
-        case ui::TextResult::Edit:
-            if (step) s.complete_sel = 0;
-            break;
-        case ui::TextResult::Commit:
-            if (step) settings_commit_step(app);
-            else settings_commit_name(app);
-            break;
-        case ui::TextResult::Cancel:
-            if (step || s.adding || !s.rename_macro.empty())
-                settings_end_entry(s);
-            else if (!s.filter.buf.empty())
-                s.filter.set("");
-            else
-                settings_close(app);
-            break;
-        case ui::TextResult::None:
-            break;
-    }
-}
-
-// This pass reads live input; the caller then deadens the frame below.
-void settings_interact(AppState& app, const ui::UiInput& input,
-                       const ui::Font& font, const ui::Rect& viewport,
-                       platform::Window* window) {
-    SettingsUi& s = app.settings;
-    SettingsLayout sl = settings_layout(app, font, viewport);
-    s.hover.clear();
-    const Vec2 m = input.mouse;
-    if (input.wheel_y != 0.0f && sl.panel.contains(m)) {
-        const float span = std::max(0.0f, sl.content_h - sl.view.h);
-        s.scroll = std::clamp(s.scroll - input.wheel_y * 48.0f, 0.0f, span);
-    }
-    s.scroll = std::clamp(
-        s.scroll, 0.0f, std::max(0.0f, sl.content_h - sl.view.h));
-
-    // Hover names double as probe ids; the draw pass highlights them.
-    auto over = [&](const ui::Rect& r, const std::string& name) {
-        const bool in = r.contains(m) && sl.view.contains(m);
-        if (in) s.hover = name;
-        return in;
-    };
-    const bool clicked = input.left_pressed();
-    if (clicked && !sl.panel.contains(m)) {
-        settings_close(app);
-        return;
-    }
-    const SettingsOverlay ov = settings_overlay(app, sl);
-    if (ov.open() && ov.rect.contains(m)) {
-        for (int ci = 0; ci < ov.shown; ++ci)
-            if (ov.row_rect(ci).contains(m)) {
-                s.hover = "complete:" + std::to_string(ci);
-                if (clicked)
-                    settings_apply_completion(app,
-                                              static_cast<size_t>(ci));
-            }
-        return;
-    }
-    // Commit first: the handlers below can reopen their own entry.
-    if (clicked) {
-        if (s.adding || !s.rename_macro.empty())
-            settings_commit_name(app);
-        if (!s.step_edit_macro.empty()) settings_commit_step(app);
-        settings_end_entry(s);
-    }
-    if (sl.tab_keys.contains(m)) {
-        s.hover = "tab:keybinds";
-        if (clicked) s.tab = 0;
-    }
-    for (const SettingsRow& r : sl.rows) {
-        if (r.rect.bottom() <= sl.view.y || r.rect.y >= sl.view.bottom())
-            continue;
-        switch (r.kind) {
-            case SettingsRow::Kind::Heading:
-                break;
-            case SettingsRow::Kind::MacroRow: {
-                const ui::Rect chord = settings_btn(r, 4, 0);
-                const ui::Rect run = settings_btn(r, 3, 0);
-                const ui::Rect edit = settings_btn(r, 2, 0);
-                const ui::Rect ren = settings_btn(r, 1, 0);
-                const ui::Rect del = settings_btn(r, 0, 0);
-                if (over(chord, "set:macro:" + r.key)) {
-                    if (clicked) s.capture = "macro:" + r.key;
-                } else if (over(run, "macro-run:" + r.key)) {
-                    if (clicked) {
-                        settings_close(app);
-                        app.pending_macro = r.key;
-                    }
-                } else if (over(edit, "macro-edit:" + r.key)) {
-                    if (clicked)
-                        s.macro_open = s.macro_open == r.key ? "" : r.key;
-                } else if (over(ren, "macro-ren:" + r.key)) {
-                    if (clicked) {
-                        s.rename_macro = r.key;
-                        s.name_buf.set(r.key);
-                    }
-                } else if (over(del, "macro-del:" + r.key)) {
-                    if (clicked) {
-                        ConfirmDialog d;
-                        d.kind = ConfirmDialog::Kind::YesNo;
-                        d.action = ConfirmDialog::Action::DeleteMacro;
-                        d.title = "delete macro";
-                        d.text = "delete macro \"" + r.key +
-                                 "\" and its key binds?";
-                        d.primary = "delete";
-                        d.secondary = "keep";
-                        d.name = r.key;
-                        app.confirm = std::move(d);
-                    }
-                } else if (over(r.rect, "macro:" + r.key)) {
-                    if (clicked)
-                        s.macro_open = s.macro_open == r.key ? "" : r.key;
-                }
-                break;
-            }
-            case SettingsRow::Kind::StepRow: {
-                auto steps = app.macros.find(s.macro_open);
-                if (steps == app.macros.end()) break;
-                const ui::Rect down = settings_btn(r, 0, 0);
-                const ui::Rect up = settings_btn(r, 1, 0);
-                const ui::Rect x = settings_btn(r, 2, 0);
-                const std::string si = std::to_string(r.index);
-                const size_t n = steps->second.size();
-                const size_t i = static_cast<size_t>(r.index);
-                if (over(x, "step-del:" + si)) {
-                    if (clicked && i < n) {
-                        steps->second.erase(steps->second.begin() +
-                                            static_cast<ptrdiff_t>(i));
-                        save_ui_prefs(app);
-                    }
-                } else if (over(up, "step-up:" + si)) {
-                    if (clicked && i > 0 && i < n) {
-                        std::swap(steps->second[i - 1], steps->second[i]);
-                        save_ui_prefs(app);
-                    }
-                } else if (over(down, "step-down:" + si)) {
-                    if (clicked && i + 1 < n) {
-                        std::swap(steps->second[i], steps->second[i + 1]);
-                        save_ui_prefs(app);
-                    }
-                } else if (over(r.rect, "step-edit:" + si)) {
-                    if (clicked && i < n) {
-                        s.step_edit_macro = s.macro_open;
-                        s.step_edit_index = r.index;
-                        s.step_buf.set(steps->second[i]);
-                    }
-                }
-                break;
-            }
-            case SettingsRow::Kind::AddStep:
-                if (over(r.rect, "add-step")) {
-                    if (clicked) {
-                        const auto it = app.macros.find(r.key);
-                        if (it != app.macros.end()) {
-                            s.step_edit_macro = r.key;
-                            s.step_edit_index =
-                                static_cast<int>(it->second.size());
-                        }
-                    }
-                }
-                break;
-            case SettingsRow::Kind::NewMacro:
-                if (over(r.rect, "new-macro")) {
-                    if (clicked) s.adding = true;
-                }
-                break;
-            case SettingsRow::Kind::ScriptRow: {
-                const ui::Rect chord = settings_btn(r, 1, 0);
-                const ui::Rect x = settings_btn(r, 0, 0);
-                if (over(chord, "set:script:" + r.key)) {
-                    if (clicked) s.capture = "script:" + r.key;
-                } else if (over(x, "script-del:" + r.label)) {
-                    if (clicked) {
-                        for (auto it = app.keybinds.begin();
-                             it != app.keybinds.end();)
-                            if (it->second.kind ==
-                                    KeyBinding::Kind::Script &&
-                                it->second.value == r.key)
-                                it = app.keybinds.erase(it);
-                            else
-                                ++it;
-                        save_ui_prefs(app);
-                    }
-                }
-                break;
-            }
-            case SettingsRow::Kind::BindScript:
-                if (over(r.rect, "bind-script")) {
-                    if (clicked) {
-                        auto picked = platform::show_open_dialog(
-                            window, {{"lookscript", "*.lks"}});
-                        if (picked)
-                            s.capture = "script:" + path_to_u8(*picked);
-                    }
-                }
-                break;
-            case SettingsRow::Kind::ActionRow: {
-                const ui::Rect chord = settings_btn(r, 0, 0);
-                if (over(chord, "set:action:" + r.key)) {
-                    if (clicked) s.capture = "action:" + r.key;
-                }
-                break;
-            }
-        }
-    }
-}
-
-void draw_settings(ui::Canvas2D& canvas, const ui::Font& font,
-                   const ui::Font* header_font, const ui::Rect& viewport,
-                   AppState& app) {
-    const ui::Theme& th = ui::active_theme();
-    const SettingsUi& s = app.settings;
-    const SettingsLayout sl = settings_layout(app, font, viewport);
-    const float fs = th.font_size;
-    const float text_dy = (kSetRowH - font.line_height() * fs) * 0.5f;
-    canvas.draw_sdf_rect(viewport, 0.0f,
-                         ui::Color{0.0f, 0.0f, 0.0f, 0.45f});
-    const float radius = th.corner_radius * 2.0f;
-    canvas.draw_sdf_rect(sl.panel, radius, th.panel_bg);
-    canvas.draw_sdf_rect_outline(sl.panel, radius, th.stroke_width,
-                                 th.hairline);
-    canvas.draw_rect({sl.tabs.right(), sl.panel.y + 8.0f, 1.0f,
-                      sl.panel.h - 16.0f},
-                     th.hairline);
-    ui::draw_text(canvas, header_font ? *header_font : font, "settings",
-                  {sl.tabs.x + 12.0f, sl.panel.y + 12.0f},
-                  th.font_size_heading, th.text);
-
-    {
-        const bool hov = s.hover == "tab:keybinds";
-        ui::Color bg = th.control_bg;
-        if (s.tab == 0) bg = th.control_bg_active;
-        else if (hov) bg = th.control_bg_hover;
-        canvas.draw_sdf_rect(sl.tab_keys, th.corner_radius, bg);
-        ui::probe_add("tab:keybinds", sl.tab_keys);
-        ui::draw_text(canvas, font, "keybinds",
-                      {sl.tab_keys.x + 8.0f, sl.tab_keys.y + 4.0f}, fs,
-                      s.tab == 0 ? th.text : th.text_dim);
-    }
-
-    canvas.draw_sdf_rect_outline(sl.filter, th.corner_radius,
-                                 th.stroke_width, th.hairline);
-    // The filter is the fallback typing target: its caret yields to entries.
-    const bool filter_live = s.capture.empty() &&
-                             s.step_edit_index < 0 && !s.adding &&
-                             s.rename_macro.empty();
-    ui::draw_text(canvas, font,
-                  "filter: " + (filter_live ? ui::caret_text(s.filter)
-                                            : s.filter.buf),
-                  {sl.filter.x + 6.0f, sl.filter.y + text_dy}, fs,
-                  s.filter.buf.empty() ? th.text_dim : th.text);
-
-    canvas.push_clip(sl.view);
-    auto btn = [&](const ui::Rect& r, const std::string& label,
-                   const std::string& probe, bool accent, bool dim) {
-        const bool hov = s.hover == probe;
-        canvas.draw_sdf_rect(r, th.corner_radius,
-                             hov ? th.control_bg_hover : th.control_bg);
-        canvas.draw_sdf_rect_outline(r, th.corner_radius, th.stroke_width,
-                                     accent ? th.accent_dim : th.hairline);
-        ui::probe_add(probe, r);
-        canvas.push_clip(r);
-        ui::draw_text(canvas, font, label,
-                      {r.x + 5.0f,
-                       r.y + (r.h - font.line_height() * fs) * 0.5f},
-                      fs,
-                      accent ? th.accent : (dim ? th.text_dim : th.text));
-        canvas.pop_clip();
-    };
-    auto glyph_btn = [&](const ui::Rect& r, ui::Icon icon,
-                         const std::string& probe) {
-        const bool hov = s.hover == probe;
-        if (hov)
-            canvas.draw_sdf_rect(r, th.corner_radius, th.control_bg_hover);
-        ui::probe_add(probe, r);
-        ui::draw_icon_glyph(canvas, font, icon,
-                            {r.x + r.w * 0.5f, r.y + r.h * 0.5f},
-                            hov ? th.text : th.text_dim, fs);
-    };
-    auto chord_btn = [&](const SettingsRow& r, int slot,
-                         const std::string& target,
-                         const std::string& probe) {
-        const bool capturing = s.capture == target;
-        KeyBinding::Kind kind = KeyBinding::Kind::Action;
-        if (target.rfind("macro:", 0) == 0) kind = KeyBinding::Kind::Macro;
-        if (target.rfind("script:", 0) == 0)
-            kind = KeyBinding::Kind::Script;
-        const std::string bound =
-            chords_of(app, kind, target.substr(target.find(':') + 1));
-        btn(settings_btn(r, slot, 0),
-            capturing ? "press keys..." : bound.empty() ? "unbound" : bound,
-            probe, capturing, bound.empty());
-    };
-    for (const SettingsRow& r : sl.rows) {
-        if (r.rect.bottom() <= sl.view.y || r.rect.y >= sl.view.bottom())
-            continue;
-        switch (r.kind) {
-            case SettingsRow::Kind::Heading:
-                ui::draw_text(canvas, header_font ? *header_font : font,
-                              r.label,
-                              {r.rect.x, r.rect.y + 8.0f}, fs + 2.0f,
-                              th.text);
-                break;
-            case SettingsRow::Kind::MacroRow: {
-                const bool open_row = s.macro_open == r.key;
-                const bool renaming = s.rename_macro == r.key;
-                if (s.hover == "macro:" + r.key)
-                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
-                ui::probe_add("macro:" + r.key, r.rect);
-                ui::draw_text(canvas, font,
-                              renaming ? ui::caret_text(s.name_buf) : r.label,
-                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
-                              open_row || renaming ? th.accent : th.text);
-                chord_btn(r, 4, "macro:" + r.key, "set:macro:" + r.key);
-                btn(settings_btn(r, 3, 0), "run", "macro-run:" + r.key,
-                    false, false);
-                btn(settings_btn(r, 2, 0), "edit", "macro-edit:" + r.key,
-                    open_row, false);
-                btn(settings_btn(r, 1, 0), "rename",
-                    "macro-ren:" + r.key, renaming, false);
-                btn(settings_btn(r, 0, 0), "delete",
-                    "macro-del:" + r.key, false, false);
-                break;
-            }
-            case SettingsRow::Kind::StepRow: {
-                const std::string si = std::to_string(r.index);
-                const bool editing =
-                    s.step_edit_macro == s.macro_open &&
-                    s.step_edit_index == r.index;
-                const ui::Rect text_rect = {
-                    r.rect.x, r.rect.y,
-                    settings_btn(r, 2, 0).x - 4.0f - r.rect.x, r.rect.h};
-                if (s.hover == "step-edit:" + si && !editing)
-                    canvas.draw_sdf_rect(text_rect, 0.0f, th.control_bg);
-                ui::probe_add("step-edit:" + si, text_rect);
-                canvas.push_clip(text_rect);
-                ui::draw_text(canvas, font,
-                              std::to_string(r.index + 1) + ". " + r.label,
-                              {r.rect.x + 20.0f, r.rect.y + text_dy}, fs,
-                              editing  ? th.accent
-                              : r.dim  ? th.text_dim
-                                       : th.text);
-                canvas.pop_clip();
-                glyph_btn(settings_btn(r, 2, 0), ui::Icon::Close,
-                          "step-del:" + si);
-                glyph_btn(settings_btn(r, 1, 0), ui::Icon::Up,
-                          "step-up:" + si);
-                glyph_btn(settings_btn(r, 0, 0), ui::Icon::Down,
-                          "step-down:" + si);
-                break;
-            }
-            case SettingsRow::Kind::AddStep:
-                if (s.hover == "add-step")
-                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
-                ui::probe_add("add-step", r.rect);
-                ui::draw_text(canvas, font, r.label,
-                              {r.rect.x + 20.0f, r.rect.y + text_dy}, fs,
-                              th.text_dim);
-                break;
-            case SettingsRow::Kind::NewMacro:
-                if (s.hover == "new-macro")
-                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
-                ui::probe_add("new-macro", r.rect);
-                ui::draw_text(canvas, font, r.label,
-                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
-                              s.adding ? th.text : th.text_dim);
-                break;
-            case SettingsRow::Kind::ScriptRow: {
-                ui::draw_text(canvas, font, r.label,
-                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
-                              r.dim ? th.text_dim : th.text);
-                const float name_w =
-                    ui::measure_text(font, r.label, fs).x;
-                const ui::Rect chord = settings_btn(r, 1, 0);
-                const float px = r.rect.x + 4.0f + name_w + 10.0f;
-                canvas.push_clip({px, r.rect.y,
-                                  std::max(0.0f, chord.x - 8.0f - px),
-                                  r.rect.h});
-                ui::draw_text(canvas, font, r.key,
-                              {px, r.rect.y + text_dy},
-                              th.font_size_small, th.text_dim);
-                canvas.pop_clip();
-                chord_btn(r, 1, "script:" + r.key,
-                          "set:script:" + r.key);
-                glyph_btn(settings_btn(r, 0, 0), ui::Icon::Close,
-                          "script-del:" + r.label);
-                break;
-            }
-            case SettingsRow::Kind::BindScript:
-                if (s.hover == "bind-script")
-                    canvas.draw_sdf_rect(r.rect, 0.0f, th.control_bg);
-                ui::probe_add("bind-script", r.rect);
-                ui::draw_text(canvas, font, r.label,
-                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
-                              th.text_dim);
-                break;
-            case SettingsRow::Kind::ActionRow:
-                ui::draw_text(canvas, font, r.label,
-                              {r.rect.x + 4.0f, r.rect.y + text_dy}, fs,
-                              th.text);
-                chord_btn(r, 0, "action:" + r.key,
-                          "set:action:" + r.key);
-                break;
-        }
-    }
-    canvas.pop_clip();
-    if (sl.content_h > sl.view.h) {
-        const float frac = sl.view.h / sl.content_h;
-        const float top = s.scroll / sl.content_h;
-        canvas.draw_sdf_rect({sl.view.right() - 3.0f,
-                              sl.view.y + top * sl.view.h, 3.0f,
-                              std::max(16.0f, frac * sl.view.h)},
-                             1.5f, th.hairline);
-    }
-    const SettingsOverlay ov = settings_overlay(app, sl);
-    if (ov.open()) {
-        canvas.draw_sdf_rect(ov.rect, th.corner_radius, th.control_bg);
-        canvas.draw_sdf_rect_outline(ov.rect, th.corner_radius,
-                                     th.stroke_width, th.hairline);
-        for (int ci = 0; ci < static_cast<int>(ov.rows.size()); ++ci) {
-            const ui::Rect rr = ov.row_rect(ci);
-            const bool inter = ci < ov.shown;
-            const std::string probe = "complete:" + std::to_string(ci);
-            const bool selected = inter && ci == s.complete_sel;
-            if (selected)
-                canvas.draw_sdf_rect(rr, 0.0f, th.control_bg_active);
-            else if (inter && s.hover == probe)
-                canvas.draw_sdf_rect(rr, 0.0f, th.control_bg_hover);
-            if (inter) ui::probe_add(probe, rr);
-            canvas.push_clip(rr);
-            ui::draw_text(canvas, font, ov.rows[static_cast<size_t>(ci)],
-                          {rr.x + 8.0f,
-                           rr.y + (rr.h - font.line_height() *
-                                              th.font_size_small) *
-                                      0.5f},
-                          th.font_size_small,
-                          selected ? th.text : th.text_dim);
-            canvas.pop_clip();
-        }
-    }
 }
 
 // One definition keeps a video block and its linked audio block in step.
@@ -19670,6 +18854,741 @@ void register_script_ops(ScriptHost& sh) {
 
 }  // namespace
 
+ui::LayoutNode* build_confirm_dialog(ui::LayoutArena& arena, AppState& app,
+                                     FrameUi& out, const ui::Font& font,
+                                     const ui::Rect& viewport) {
+    using namespace ui;
+    ConfirmDialog& d = app.confirm;
+    if (!d.open()) return nullptr;
+    const Theme& th = active_theme();
+    const float pad = 20.0f;
+    const float panel_w = std::min(400.0f, viewport.w - 48.0f);
+    const float inner_w = panel_w - pad * 2.0f;
+    LabelOpts dim;
+    dim.color = th.text_dim;
+    StackOpts col;
+    col.cross_align = AlignMode::Stretch;
+    col.width = SizeSpec::fill();
+    std::vector<LayoutNode*> body{
+        Heading(arena, d.title),
+        SizedBox(arena, SizeSpec::fill(), SizeSpec::fixed(10.0f), nullptr)};
+    std::string line;
+    size_t pos = 0;
+    while (pos <= d.text.size()) {
+        size_t next = d.text.find(' ', pos);
+        if (next == std::string::npos) next = d.text.size();
+        const std::string word = d.text.substr(pos, next - pos);
+        const std::string cand = line.empty() ? word : line + " " + word;
+        if (!line.empty() &&
+            measure_text(font, cand, th.font_size).x > inner_w) {
+            body.push_back(Label(arena, line, dim));
+            line = word;
+        } else {
+            line = cand;
+        }
+        pos = next + 1;
+    }
+    if (!line.empty()) body.push_back(Label(arena, line, dim));
+    body.push_back(
+        SizedBox(arena, SizeSpec::fill(), SizeSpec::fixed(16.0f), nullptr));
+    const int count = d.kind == ConfirmDialog::Kind::SaveDiscard ? 3 : 2;
+    const char* labels[3] = {d.primary.c_str(), d.secondary.c_str(), "cancel"};
+    std::vector<LayoutNode*> btns{Spacer(arena)};
+    for (int i = count - 1; i >= 0; --i) {
+        bool* b = arena.alloc<bool>();
+        out.confirm_clicks[i] = b;
+        ButtonOpts bo;
+        bo.active = i == 0;
+        btns.push_back(Button(arena, labels[i], &d.buttons[i], b, bo));
+    }
+    StackOpts brow;
+    brow.gap = 8.0f;
+    brow.cross_align = AlignMode::Center;
+    brow.width = SizeSpec::fill();
+    body.push_back(HStackDyn(arena, brow, btns));
+    PanelOpts po;
+    po.padding = Edges::all(pad);
+    po.corner_radius = th.corner_radius * 2.0f;
+    LayoutNode* panel =
+        SizedBox(arena, SizeSpec::fixed(panel_w), SizeSpec{},
+                 Panel(arena, VStackDyn(arena, col, body), po));
+    OverlayOpts oo;
+    oo.place = OverlayOpts::Place::Centered;
+    oo.center_bias = 0.38f;
+    oo.min_top = 24.0f;
+    oo.exclusive = true;
+    oo.backdrop = true;
+    oo.id = &app.confirm;
+    return Overlay(arena, oo, panel);
+}
+
+void settings_capture_key(AppState& app, const platform::Event& e) {
+    SettingsUi& s = app.settings;
+    if (e.type != platform::Event::Type::KeyDown) return;
+    if (e.key == platform::Key::Escape) {
+        s.capture.clear();
+        return;
+    }
+    if (e.key == platform::Key::Shift || e.key == platform::Key::Ctrl ||
+        e.key == platform::Key::Alt || e.key == platform::Key::CapsLock)
+        return;
+    const std::string chord = chord_of(e.key, e.mods);
+    if (chord.empty()) return;
+    const std::string target = s.capture;
+    s.capture.clear();
+    const size_t colon = target.find(':');
+    if (colon == std::string::npos) return;
+    const std::string kind_s = target.substr(0, colon);
+    KeyBinding b;
+    b.kind = kind_s == "macro"    ? KeyBinding::Kind::Macro
+             : kind_s == "script" ? KeyBinding::Kind::Script
+                                  : KeyBinding::Kind::Action;
+    b.value = target.substr(colon + 1);
+    for (auto it = app.keybinds.begin(); it != app.keybinds.end();)
+        if (it->second == b)
+            it = app.keybinds.erase(it);
+        else
+            ++it;
+    app.keybinds[chord] = std::move(b);
+    save_ui_prefs(app);
+}
+
+void settings_hit(AppState& app, const std::string& hit, ui::Context& ctx,
+                  platform::Window* window) {
+    SettingsUi& s = app.settings;
+    auto starts = [&](const char* p) { return hit.rfind(p, 0) == 0; };
+    auto rest = [&](const char* p) { return hit.substr(std::strlen(p)); };
+    auto focus_name = [&]() { ui::text_input_focus(ctx, &s.name_state); };
+    auto focus_step = [&]() { ui::text_input_focus(ctx, &s.step_state); };
+    if (hit == "tab:keybinds") {
+        s.tab = 0;
+        return;
+    }
+    if (starts("set:")) {
+        s.capture = rest("set:");
+        return;
+    }
+    if (starts("macro-run:")) {
+        const std::string name = rest("macro-run:");
+        settings_close(app);
+        app.pending_macro = name;
+        return;
+    }
+    if (starts("macro-edit:") || starts("macro:")) {
+        const std::string name =
+            starts("macro-edit:") ? rest("macro-edit:") : rest("macro:");
+        s.macro_open = s.macro_open == name ? "" : name;
+        return;
+    }
+    if (starts("macro-ren:")) {
+        const std::string name = rest("macro-ren:");
+        s.rename_macro = name;
+        s.name_buf.set(name);
+        focus_name();
+        return;
+    }
+    if (starts("macro-del:")) {
+        const std::string name = rest("macro-del:");
+        ConfirmDialog d;
+        d.kind = ConfirmDialog::Kind::YesNo;
+        d.action = ConfirmDialog::Action::DeleteMacro;
+        d.title = "delete macro";
+        d.text = "delete macro \"" + name + "\" and its key binds?";
+        d.primary = "delete";
+        d.secondary = "keep";
+        d.name = name;
+        app.confirm = std::move(d);
+        return;
+    }
+    if (starts("step-")) {
+        auto steps = app.macros.find(s.macro_open);
+        if (steps == app.macros.end()) return;
+        const size_t n = steps->second.size();
+        auto index_of = [&](const char* p) {
+            return static_cast<size_t>(std::atoi(rest(p).c_str()));
+        };
+        if (starts("step-del:")) {
+            const size_t i = index_of("step-del:");
+            if (i < n) {
+                steps->second.erase(steps->second.begin() +
+                                    static_cast<ptrdiff_t>(i));
+                save_ui_prefs(app);
+            }
+        } else if (starts("step-up:")) {
+            const size_t i = index_of("step-up:");
+            if (i > 0 && i < n) {
+                std::swap(steps->second[i - 1], steps->second[i]);
+                save_ui_prefs(app);
+            }
+        } else if (starts("step-down:")) {
+            const size_t i = index_of("step-down:");
+            if (i + 1 < n) {
+                std::swap(steps->second[i], steps->second[i + 1]);
+                save_ui_prefs(app);
+            }
+        } else if (starts("step-edit:")) {
+            const size_t i = index_of("step-edit:");
+            if (i < n) {
+                s.step_edit_macro = s.macro_open;
+                s.step_edit_index = static_cast<int>(i);
+                s.step_buf.set(steps->second[i]);
+                focus_step();
+            }
+        }
+        return;
+    }
+    if (starts("add-step:")) {
+        const std::string name = rest("add-step:");
+        const auto it = app.macros.find(name);
+        if (it != app.macros.end()) {
+            s.step_edit_macro = name;
+            s.step_edit_index = static_cast<int>(it->second.size());
+            focus_step();
+        }
+        return;
+    }
+    if (hit == "new-macro") {
+        s.adding = true;
+        focus_name();
+        return;
+    }
+    if (starts("script-del:")) {
+        const std::string path = rest("script-del:");
+        for (auto it = app.keybinds.begin(); it != app.keybinds.end();)
+            if (it->second.kind == KeyBinding::Kind::Script &&
+                it->second.value == path)
+                it = app.keybinds.erase(it);
+            else
+                ++it;
+        save_ui_prefs(app);
+        return;
+    }
+    if (hit == "bind-script") {
+        auto picked =
+            platform::show_open_dialog(window, {{"lookscript", "*.lks"}});
+        if (picked) s.capture = "script:" + path_to_u8(*picked);
+        return;
+    }
+    if (starts("complete:"))
+        settings_apply_completion(
+            app, static_cast<size_t>(std::atoi(rest("complete:").c_str())));
+}
+
+void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
+                    const ui::Rect& viewport, ui::LayoutNode** panel_out,
+                    ui::LayoutNode** complete_out) {
+    using namespace ui;
+    *panel_out = nullptr;
+    *complete_out = nullptr;
+    SettingsUi& s = app.settings;
+    if (!s.open) return;
+    const Theme& th = active_theme();
+    const float pw = std::min(720.0f, viewport.w - 80.0f);
+    const float ph = std::min(viewport.h * 0.78f, viewport.h - 64.0f);
+    const Vec2 pos{std::round((viewport.w - pw) * 0.5f),
+                   std::round((viewport.h - ph) * 0.42f)};
+    size_t need = 8 + static_cast<size_t>(kCompleteShown);
+    for (const auto& [name, steps] : app.macros) need += 7 + steps.size() * 4;
+    need += app.keybinds.size() * 2 + action_registry().size();
+    if (s.row_buttons.size() < need) s.row_buttons.resize(need);
+    size_t bi = 0;
+    auto bstate = [&]() -> ButtonState* {
+        return &s.row_buttons[std::min(bi++, s.row_buttons.size() - 1)];
+    };
+    auto hit = [&](const std::string& name) {
+        bool* b = arena.alloc<bool>();
+        out.settings_hits.push_back({name, b});
+        return b;
+    };
+    auto dup = [&](const std::string& t) {
+        return arena.dup(t.c_str(), t.size());
+    };
+    auto flat_row = [&](const std::string& label, const std::string& hitname,
+                        const char* probe, bool active) {
+        ButtonOpts bo;
+        bo.flat = true;
+        bo.align_left = true;
+        bo.width = SizeSpec::fill();
+        bo.active = active;
+        bo.probe = probe;
+        return Button(arena, label, bstate(), hit(hitname), bo);
+    };
+    auto fixed_btn = [&](const std::string& label, const std::string& hitname,
+                         const char* probe, float w, bool active) {
+        ButtonOpts bo;
+        bo.width = SizeSpec::fixed(w);
+        bo.active = active;
+        bo.probe = probe;
+        return Button(arena, label, bstate(), hit(hitname), bo);
+    };
+    auto icon_btn = [&](Icon icon, const std::string& hitname,
+                        const char* probe) {
+        ButtonOpts bo;
+        bo.width = SizeSpec::fixed(20.0f);
+        bo.probe = probe;
+        return IconButton(arena, icon, bstate(), hit(hitname), bo);
+    };
+    auto chord_btn = [&](const std::string& target, const std::string& probe) {
+        const bool capturing = s.capture == target;
+        KeyBinding::Kind kind = KeyBinding::Kind::Action;
+        if (target.rfind("macro:", 0) == 0) kind = KeyBinding::Kind::Macro;
+        if (target.rfind("script:", 0) == 0) kind = KeyBinding::Kind::Script;
+        const std::string bound =
+            chords_of(app, kind, target.substr(target.find(':') + 1));
+        return fixed_btn(capturing     ? "press keys..."
+                         : bound.empty() ? "unbound"
+                                         : bound,
+                         "set:" + target, dup(probe), kSetChordW, capturing);
+    };
+    auto entry = [&](TextField* field, TextInputState* state,
+                     const char* probe, bool* commit, bool* cancel,
+                     bool* blur, TextNav* nav, bool* changed) {
+        TextInputOpts to;
+        to.grab_focus = true;
+        to.probe = probe;
+        to.out_commit = commit;
+        to.out_cancel = cancel;
+        to.out_blur = blur;
+        to.nav = nav;
+        to.out_changed = changed;
+        return TextInput(arena, field, state, to);
+    };
+    StackOpts row_opts;
+    row_opts.gap = 4.0f;
+    row_opts.cross_align = AlignMode::Center;
+    row_opts.width = SizeSpec::fill();
+    LabelOpts head;
+    head.header = true;
+    head.size = th.font_size + 2.0f;
+    LabelOpts dim;
+    dim.color = th.text_dim;
+    LabelOpts small_dim;
+    small_dim.color = th.text_dim;
+    small_dim.size = th.font_size_small;
+    std::vector<LayoutNode*> rows;
+    auto heading = [&](const char* text) {
+        rows.push_back(SizedBox(arena, SizeSpec::fill(),
+                                SizeSpec::fixed(kSetHeadH),
+                                Label(arena, text, head)));
+    };
+
+    heading("macro");
+    for (const auto& [name, steps] : app.macros) {
+        if (!settings_filter_hits(app, name)) continue;
+        const bool open_row = s.macro_open == name;
+        const bool renaming = s.rename_macro == name;
+        LayoutNode* name_cell =
+            renaming ? entry(&s.name_buf, &s.name_state, "macro-name",
+                             &out.name_commit, &out.name_cancel,
+                             &out.name_blur, nullptr, nullptr)
+                     : flat_row(name, "macro:" + name, dup("macro:" + name),
+                                open_row);
+        rows.push_back(HStackDyn(
+            arena, row_opts,
+            {name_cell, chord_btn("macro:" + name, "set:macro:" + name),
+             fixed_btn("run", "macro-run:" + name, dup("macro-run:" + name),
+                       36.0f, false),
+             fixed_btn("edit", "macro-edit:" + name,
+                       dup("macro-edit:" + name), 40.0f, open_row),
+             fixed_btn("rename", "macro-ren:" + name,
+                       dup("macro-ren:" + name), 56.0f, renaming),
+             fixed_btn("delete", "macro-del:" + name,
+                       dup("macro-del:" + name), 50.0f, false)}));
+        if (!open_row) continue;
+        int i = 0;
+        for (const std::string& step : steps) {
+            const bool editing =
+                s.step_edit_macro == name && s.step_edit_index == i;
+            const std::string si = std::to_string(i);
+            LayoutNode* cell =
+                editing ? entry(&s.step_buf, &s.step_state, "step-field",
+                                &out.step_commit, &out.step_cancel,
+                                &out.step_blur, &out.step_nav,
+                                &out.step_changed)
+                        : flat_row(std::to_string(i + 1) + ". " + step,
+                                   "step-edit:" + si, dup("step-edit:" + si),
+                                   false);
+            rows.push_back(HStackDyn(
+                arena, row_opts,
+                {cell,
+                 icon_btn(Icon::Close, "step-del:" + si,
+                          dup("step-del:" + si)),
+                 icon_btn(Icon::Up, "step-up:" + si, dup("step-up:" + si)),
+                 icon_btn(Icon::Down, "step-down:" + si,
+                          dup("step-down:" + si))}));
+            ++i;
+        }
+        if (s.step_edit_macro == name &&
+            s.step_edit_index == static_cast<int>(steps.size()))
+            rows.push_back(entry(&s.step_buf, &s.step_state, "step-field",
+                                 &out.step_commit, &out.step_cancel,
+                                 &out.step_blur, &out.step_nav,
+                                 &out.step_changed));
+        rows.push_back(
+            flat_row("+ add step", "add-step:" + name, "add-step", false));
+    }
+    if (s.adding)
+        rows.push_back(HStackDyn(
+            arena, row_opts,
+            {Label(arena, "name: ", dim),
+             entry(&s.name_buf, &s.name_state, "new-macro", &out.name_commit,
+                   &out.name_cancel, &out.name_blur, nullptr, nullptr)}));
+    else
+        rows.push_back(flat_row("+ new macro", "new-macro", "new-macro",
+                                false));
+
+    heading("script");
+    std::set<std::string> script_paths;
+    for (const auto& [chord, b] : app.keybinds)
+        if (b.kind == KeyBinding::Kind::Script) script_paths.insert(b.value);
+    for (const std::string& path : script_paths) {
+        const std::string fname = path_to_u8(u8_to_path(path).filename());
+        if (!settings_filter_hits(app, fname)) continue;
+        std::error_code ec;
+        const bool missing = !std::filesystem::exists(u8_to_path(path), ec);
+        rows.push_back(HStackDyn(
+            arena, row_opts,
+            {Label(arena, fname, missing ? dim : LabelOpts{}),
+             Label(arena, path, small_dim), Spacer(arena),
+             chord_btn("script:" + path, "set:script:" + path),
+             icon_btn(Icon::Close, "script-del:" + path,
+                      dup("script-del:" + fname))}));
+    }
+    rows.push_back(
+        flat_row("+ bind script...", "bind-script", "bind-script", false));
+
+    heading("action");
+    for (const ActionDef* a : actions_by_name())
+        if (settings_filter_hits(app, a->name))
+            rows.push_back(HStackDyn(
+                arena, row_opts,
+                {Label(arena, a->name), Spacer(arena),
+                 chord_btn(std::string("action:") + a->id,
+                           std::string("set:action:") + a->id)}));
+
+    TextInputOpts fo;
+    fo.prefix = "filter: ";
+    fo.probe = "filter";
+    fo.out_cancel = &out.settings_filter_cancel;
+    LayoutNode* filter = TextInput(arena, &s.filter, &s.filter_state, fo);
+    StackOpts list_col;
+    list_col.cross_align = AlignMode::Stretch;
+    list_col.width = SizeSpec::fill();
+    LayoutNode* list =
+        ScrollAreaV(arena, &s.scroll_state, VStackDyn(arena, list_col, rows));
+    StackOpts content_col;
+    content_col.gap = 8.0f;
+    content_col.cross_align = AlignMode::Stretch;
+    content_col.width = SizeSpec::fill();
+    content_col.height = SizeSpec::fill();
+    content_col.padding = Edges{14.0f, 40.0f, 14.0f, 14.0f};
+    LayoutNode* content = VStack(arena, content_col, {filter, list});
+    ButtonOpts tab;
+    tab.width = SizeSpec::fill();
+    tab.active = s.tab == 0;
+    tab.probe = "tab:keybinds";
+    StackOpts tabs_col;
+    tabs_col.gap = 16.0f;
+    tabs_col.cross_align = AlignMode::Stretch;
+    tabs_col.padding = Edges{8.0f, 12.0f, 8.0f, 8.0f};
+    tabs_col.height = SizeSpec::fill();
+    LayoutNode* tabs = SizedBox(
+        arena, SizeSpec::fixed(118.0f), SizeSpec::fill(),
+        VStack(arena, tabs_col,
+               {Heading(arena, "settings"),
+                Button(arena, "keybinds", &s.tab_button, hit("tab:keybinds"),
+                       tab)}));
+    PanelOpts rule_opts;
+    rule_opts.outline = false;
+    rule_opts.corner_radius = 0.0f;
+    rule_opts.bg = th.hairline;
+    rule_opts.padding = Edges{};
+    LayoutNode* rule = SizedBox(arena, SizeSpec::fixed(1.0f), SizeSpec::fill(),
+                                Panel(arena, nullptr, rule_opts));
+    StackOpts body_row;
+    body_row.cross_align = AlignMode::Stretch;
+    body_row.width = SizeSpec::fill();
+    body_row.height = SizeSpec::fill();
+    PanelOpts po;
+    po.padding = Edges{};
+    po.corner_radius = th.corner_radius * 2.0f;
+    LayoutNode* panel = SizedBox(
+        arena, SizeSpec::fixed(pw), SizeSpec::fixed(ph),
+        Panel(arena, HStack(arena, body_row, {tabs, rule, content}), po));
+    OverlayOpts so;
+    so.anchor = pos;
+    so.exclusive = true;
+    so.backdrop = true;
+    so.id = &app.settings;
+    so.out_pressed_outside = &out.settings_outside;
+    *panel_out = Overlay(arena, so, panel);
+
+    if (s.step_edit_index < 0) return;
+    Rect fr;
+    if (!probe_find("step-field", 0, &fr)) return;
+    const auto comps = step_completions(app, s.step_buf.buf);
+    std::vector<LayoutNode*> crow;
+    if (!comps.empty()) {
+        const int shown =
+            std::min<int>(kCompleteShown, static_cast<int>(comps.size()));
+        for (int i = 0; i < shown; ++i) {
+            const std::string si = std::to_string(i);
+            ButtonOpts bo;
+            bo.flat = true;
+            bo.align_left = true;
+            bo.width = SizeSpec::fill();
+            bo.active = i == s.complete_sel;
+            bo.probe = dup("complete:" + si);
+            crow.push_back(Button(arena, comps[static_cast<size_t>(i)].display,
+                                  bstate(), hit("complete:" + si), bo));
+        }
+        if (static_cast<int>(comps.size()) > shown)
+            crow.push_back(
+                Label(arena,
+                      "(" + std::to_string(comps.size() -
+                                           static_cast<size_t>(shown)) +
+                          " more - keep typing)",
+                      small_dim));
+    } else {
+        std::string word;
+        for (const char c : s.step_buf.buf) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                c == '_' || (!word.empty() && c >= '0' && c <= '9'))
+                word.push_back(c);
+            else
+                break;
+        }
+        std::string hint;
+        if (!word.empty()) {
+            for (const auto& [n, sig] : app.op_help)
+                if (n == word) hint = sig;
+            if (hint.empty())
+                if (const ActionDef* a = find_action(word))
+                    hint = std::string("action: ") + a->name;
+        }
+        if (!hint.empty()) crow.push_back(Label(arena, hint, small_dim));
+    }
+    if (crow.empty()) return;
+    const float cw = pw - 118.0f - 1.0f - 28.0f;
+    const float w = std::min(480.0f, cw - 40.0f);
+    const float h = static_cast<float>(crow.size()) * kSetRowH + 8.0f;
+    const float x = std::min(fr.x + 20.0f, pos.x + pw - 18.0f - w);
+    float y = fr.bottom() + 2.0f;
+    if (y + h > pos.y + ph - 6.0f) y = fr.y - 2.0f - h;
+    PanelOpts cpo;
+    cpo.padding = Edges::all(4);
+    OverlayOpts co;
+    co.anchor = {x, y};
+    co.exclusive = true;
+    co.id = &s.complete_sel;
+    *complete_out = Overlay(
+        arena, co,
+        SizedBox(arena, SizeSpec::fixed(w), SizeSpec{},
+                 Panel(arena, VStackDyn(arena, list_col, crow), cpo)));
+}
+
+void handle_settings(AppState& app, FrameUi& fu, ui::Context& ctx,
+                     platform::Window* window) {
+    SettingsUi& s = app.settings;
+    if (s.open && !s.was_open) ctx.clear_focus();
+    s.was_open = s.open;
+    if (!s.open) return;
+    if (fu.settings_outside && !app.confirm.open()) {
+        settings_close(app);
+        return;
+    }
+    bool complete_hit = false;
+    for (const auto& [name, b] : fu.settings_hits)
+        if (*b && name.rfind("complete:", 0) == 0) complete_hit = true;
+    if (fu.name_commit || fu.name_blur) settings_commit_name(app);
+    if (fu.name_cancel) settings_end_entry(s);
+    if (fu.step_changed) s.complete_sel = 0;
+    if (fu.step_commit || (fu.step_blur && !complete_hit))
+        settings_commit_step(app);
+    if (fu.step_cancel) settings_end_entry(s);
+    if (fu.settings_filter_cancel) {
+        if (!s.filter.buf.empty()) {
+            s.filter.set("");
+        } else {
+            settings_close(app);
+            return;
+        }
+    }
+    if (s.step_edit_index >= 0 &&
+        (fu.step_nav.up || fu.step_nav.down || fu.step_nav.tab)) {
+        const auto comps = step_completions(app, s.step_buf.buf);
+        if (!comps.empty()) {
+            const int count =
+                std::min<int>(kCompleteShown, static_cast<int>(comps.size()));
+            if (fu.step_nav.down)
+                s.complete_sel = std::min(count - 1, s.complete_sel + 1);
+            if (fu.step_nav.up) s.complete_sel = std::max(0, s.complete_sel - 1);
+            if (fu.step_nav.tab)
+                settings_apply_completion(
+                    app,
+                    static_cast<size_t>(std::min(s.complete_sel, count - 1)));
+        }
+    }
+    for (const auto& [name, b] : fu.settings_hits)
+        if (*b) settings_hit(app, name, ctx, window);
+    if (s.open && s.capture.empty() && ctx.focus().is_null())
+        ui::text_input_focus(ctx, &s.filter_state);
+}
+
+void build_add_menu(ui::LayoutArena& arena, AppState& app, FrameUi& out,
+                    const FlowBuild& flow_ui, ui::LayoutNode** menu_out,
+                    ui::LayoutNode** fly_out) {
+    using namespace ui;
+    *menu_out = nullptr;
+    *fly_out = nullptr;
+    flow::CanvasState& cs = app.canvas_state;
+    if (!cs.add_open || !flow_ui.graph) return;
+    const flow::Graph& g = *flow_ui.graph;
+    const Theme& th = active_theme();
+    std::vector<int> cats;
+    if (g.add_headers && app.fx_filter.buf.empty())
+        for (size_t i = 0; i < g.add_count; ++i)
+            if (g.add_headers[i]) cats.push_back(static_cast<int>(i));
+    const bool cat_mode = !cats.empty();
+    if (!cat_mode) cs.add_cat = -1;
+    if (cat_mode && cs.add_cat >= 0 &&
+        (cs.add_cat >= static_cast<int>(g.add_count) ||
+         !g.add_headers[cs.add_cat]))
+        cs.add_cat = -1;
+    const size_t rows_needed = cat_mode ? cats.size() : g.add_count;
+    if (app.add_menu_buttons.size() < cats.size() + g.add_count + 1)
+        app.add_menu_buttons.resize(cats.size() + g.add_count + 1);
+    const float kMenuW = 190.0f;
+    const float row_h = kMicroSize + 2.0f;
+    const int menu_rows =
+        std::min(g.add_rows ? static_cast<int>(g.add_rows) : 14, 14);
+    const int visible = std::min(
+        static_cast<int>(std::min<size_t>(rows_needed, 14)), menu_rows);
+
+    TextInputOpts so;
+    so.placeholder = "type to search...";
+    so.flat = true;
+    so.grab_focus = true;
+    so.out_commit = &out.fx_commit;
+    so.out_cancel = &out.fx_cancel;
+    LayoutNode* header =
+        TextInput(arena, &app.fx_filter, &app.add_search_state, so);
+
+    LabelOpts head;
+    head.size = th.font_size_small - 2.0f;
+    head.color = th.text_disabled;
+    std::vector<LayoutNode*> rows;
+    if (cat_mode) {
+        for (size_t c = 0; c < cats.size(); ++c) {
+            const int idx = cats[c];
+            bool* hov = arena.alloc<bool>();
+            out.add_cat_hovers.push_back({idx, hov});
+            ButtonOpts bo;
+            bo.flat = true;
+            bo.align_left = true;
+            bo.width = SizeSpec::fill();
+            bo.active = cs.add_cat == idx;
+            bo.out_hovered = hov;
+            bo.trailing_icon = static_cast<int>(Icon::ChevronRight);
+            rows.push_back(SizedBox(
+                arena, SizeSpec::fill(), SizeSpec::fixed(row_h),
+                Button(arena, g.add_items[idx], &app.add_menu_buttons[c],
+                       nullptr, bo)));
+        }
+    } else {
+        for (size_t i = 0; i < g.add_count; ++i) {
+            if (g.add_headers && g.add_headers[i]) {
+                rows.push_back(Label(arena, g.add_items[i], head));
+                continue;
+            }
+            bool* clicked = arena.alloc<bool>();
+            out.add_menu_clicks.push_back({static_cast<int>(i), clicked});
+            ButtonOpts bo;
+            bo.flat = true;
+            bo.align_left = true;
+            bo.width = SizeSpec::fill();
+            rows.push_back(SizedBox(
+                arena, SizeSpec::fill(), SizeSpec::fixed(row_h),
+                Button(arena, g.add_items[i], &app.add_menu_buttons[i],
+                       clicked, bo)));
+        }
+        if (g.add_count == 0) {
+            LabelOpts none;
+            none.size = th.font_size_small;
+            none.color = th.text_disabled;
+            rows.push_back(Label(arena, "no match", none));
+        }
+    }
+    StackOpts col;
+    col.cross_align = AlignMode::Stretch;
+    col.width = SizeSpec::fill();
+    LayoutNode* list = VStackDyn(arena, col, rows);
+    LayoutNode* body = cat_mode
+        ? list
+        : ScrollAreaV(arena, &app.add_menu_scroll, list, SizeSpec::fill(),
+                      SizeSpec::fixed(static_cast<float>(std::max(1, visible)) *
+                                      row_h));
+    StackOpts vcol;
+    vcol.gap = 2.0f;
+    vcol.cross_align = AlignMode::Stretch;
+    PanelOpts po;
+    po.padding = Edges::all(4);
+    LayoutNode* panel = SizedBox(
+        arena, SizeSpec::fixed(kMenuW), SizeSpec{},
+        Panel(arena, VStack(arena, vcol, {header, Separator(arena), body}),
+              po));
+    const float head_h = 4.0f + th.control_height + 2.0f + 9.0f + 2.0f;
+    const Rect bounds = app.canvas_rect;
+    OverlayOpts oo;
+    oo.anchor = cs.add_anchor;
+    oo.bounds = bounds;
+    oo.id = &app.add_menu_scroll;
+    oo.out_pressed_outside = &out.add_menu_outside;
+    oo.clamp_size = {kMenuW,
+                     head_h + static_cast<float>(menu_rows) * row_h + 4.0f};
+    *menu_out = Overlay(arena, oo, panel);
+
+    if (!cat_mode || cs.add_cat < 0) return;
+    int fly0 = cs.add_cat + 1, fly1 = fly0;
+    while (fly1 < static_cast<int>(g.add_count) && !g.add_headers[fly1])
+        ++fly1;
+    if (fly1 <= fly0) return;
+    int cat_row = 0;
+    for (size_t c = 0; c < cats.size(); ++c)
+        if (cats[c] == cs.add_cat) cat_row = static_cast<int>(c);
+    std::vector<LayoutNode*> frows;
+    for (int i = fly0; i < fly1; ++i) {
+        bool* clicked = arena.alloc<bool>();
+        out.add_menu_clicks.push_back({i, clicked});
+        ButtonOpts bo;
+        bo.flat = true;
+        bo.align_left = true;
+        bo.width = SizeSpec::fill();
+        frows.push_back(SizedBox(
+            arena, SizeSpec::fill(), SizeSpec::fixed(row_h),
+            Button(arena, g.add_items[i],
+                   &app.add_menu_buttons[cats.size() + i], clicked, bo)));
+    }
+    LayoutNode* fpanel =
+        SizedBox(arena, SizeSpec::fixed(kMenuW), SizeSpec{},
+                 Panel(arena, VStackDyn(arena, col, frows), po));
+    const Vec2 menu_pos{
+        std::max(bounds.x + 4.0f,
+                 std::min(cs.add_anchor.x, bounds.right() - kMenuW - 4.0f)),
+        std::max(bounds.y + 4.0f,
+                 std::min(cs.add_anchor.y,
+                          bounds.bottom() - oo.clamp_size.y - 4.0f))};
+    float fx = menu_pos.x + kMenuW + 2.0f;
+    if (fx + kMenuW > bounds.right() - 4.0f) fx = menu_pos.x - kMenuW - 2.0f;
+    OverlayOpts fo;
+    fo.anchor = {fx, menu_pos.y + head_h + static_cast<float>(cat_row) * row_h};
+    fo.bounds = bounds;
+    fo.id = &app.add_menu_buttons;
+    fo.out_pressed_outside = &out.add_fly_outside;
+    out.add_fly_open = true;
+    *fly_out = Overlay(arena, fo, fpanel);
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     platform::init();
     // Pin MF for the process life: the last MFShutdown runs after all MFTs.
@@ -19955,25 +19874,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 case platform::Event::Type::Char:
                 case platform::Event::Type::KeyDown: {
                     if (app.settings.open) {
-                        settings_key_event(app, e);
+                        if (!app.settings.capture.empty()) {
+                            settings_capture_key(app, e);
+                            break;
+                        }
+                        if (!ctx.focus().is_null())
+                            ui_keys.push_back(e);
+                        else if (e.type == platform::Event::Type::KeyDown &&
+                                 e.key == platform::Key::Escape)
+                            settings_close(app);
                         break;
                     }
                     if (script_host.console_key(e)) break;
                     if (!ctx.focus().is_null()) {
                         ui_keys.push_back(e);
-                        break;
-                    }
-                    if (ui::TextField* tf = text_entry_field(app)) {
-                        const TextEntry kind = active_text_entry(app);
-                        const ui::TextResult r = ui::text_field_key(*tf, e);
-                        if (r == ui::TextResult::Commit) {
-                            if (kind == TextEntry::FxSearch &&
-                                app.canvas_state.add_open)
-                                ki.do_add_first = true;
-                            commit_text_entry(app);
-                        } else if (r == ui::TextResult::Cancel) {
-                            cancel_text_entry(app);
-                        }
                         break;
                     }
                     if (e.type == platform::Event::Type::KeyDown)
@@ -20005,8 +19919,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.ctx_menu_dd.open = false;
             } else if (app.canvas_state.dd_open) {
                 app.canvas_state.dd_open = false;
+                app.canvas_state.dd_state.open = false;
             } else if (app.canvas_state.ctx_open) {
                 app.canvas_state.ctx_open = false;
+                app.canvas_state.ctx_dd.open = false;
             } else if (app.open_group && app.sel.kind == SelKind::None) {
                 exit_group_view(app);
             } else if (app.sel.kind != SelKind::None) {
@@ -20246,15 +20162,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         input.begin_frame(events, scale);
         input.keys = std::move(ui_keys);
-        // Snapshot before the handlers: an opening press must not commit.
-        const TextEntryId text_entry_before = text_entry_id(app);
-        app.modal_frame = app.confirm.open() || app.settings.open;
-        if (app.confirm.open()) {
-            confirm_interact(app, input, font, viewport, confirm_pick,
-                             window.get(), &running);
-        } else if (app.settings.open) {
-            settings_interact(app, input, font, viewport, window.get());
-        }
         if (!app.pending_macro.empty()) {
             run_macro(app, macro_host, app.pending_macro);
             app.pending_macro.clear();
@@ -20575,27 +20482,49 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         ui::StackOpts root_opts;
         root_opts.gap = 4.0f;
         root_opts.padding = ui::Edges::all(8);
-        ui::LayoutNode* root = ui::VStack(arena, root_opts,
-                                          {menu_bar, body});
-        root->user = &app;
-        root->hit_fn = [](ui::LayoutNode& node, ui::LayoutFrame& frame) {
-            AppState& a = *static_cast<AppState*>(node.user);
-            if (!a.modal_frame) return;
-            const ui::Rect panel =
-                a.confirm.open()
-                    ? confirm_layout(a, frame.font, node.rect).panel
-                    : (a.settings.open
-                           ? settings_layout(a, frame.font, node.rect).panel
-                           : node.rect);
-            frame.ctx.push_overlay(
-                panel, frame.ctx.acquire_widget_id(&a.modal_frame), true);
-        };
+        root_opts.width = ui::SizeSpec::fill();
+        root_opts.height = ui::SizeSpec::fill();
+        ui::LayoutNode* root_stack = ui::VStack(arena, root_opts,
+                                                {menu_bar, body});
+        ui::LayoutNode* add_menu = nullptr;
+        ui::LayoutNode* add_fly = nullptr;
+        build_add_menu(arena, app, frame_ui, flow_ui, &add_menu, &add_fly);
+        ui::LayoutNode* settings_node = nullptr;
+        ui::LayoutNode* complete_node = nullptr;
+        build_settings(arena, app, frame_ui, viewport, &settings_node,
+                       &complete_node);
+        ui::LayoutNode* confirm_node =
+            build_confirm_dialog(arena, app, frame_ui, font, viewport);
+        ui::LayoutNode* root =
+            ui::ZStack(arena, {root_stack, add_menu, add_fly, settings_node,
+                               complete_node, confirm_node});
+        root->width = ui::SizeSpec::fill();
+        root->height = ui::SizeSpec::fill();
 
         ui::LayoutFrame layout_frame{canvas, input, ctx, font,
                                      ui::active_theme(), dt,
                                      header_font ? &*header_font : nullptr};
         app.win_rect = viewport;
         ui::run_frame(root, viewport, layout_frame);
+        if (frame_ui.canvas_node) app.canvas_rect = frame_ui.canvas_node->rect;
+        if (frame_ui.text_blur || frame_ui.text_commit) commit_text_entry(app);
+        if (frame_ui.text_cancel) cancel_text_entry(app);
+        if (frame_ui.browser_filter_cancel) app.browser_filter.set("");
+        if (frame_ui.fx_commit && app.canvas_state.add_open)
+            ki.do_add_first = true;
+        if (frame_ui.fx_cancel) {
+            app.canvas_state.add_open = false;
+            app.find_mode = false;
+        }
+        {
+            int pick = confirm_pick;
+            for (int i = 0; i < 3 && !pick; ++i)
+                if (frame_ui.confirm_clicks[i] && *frame_ui.confirm_clicks[i])
+                    pick = i + 1;
+            if (app.confirm.open() && pick)
+                resolve_confirm(app, pick, window.get(), &running);
+        }
+        handle_settings(app, frame_ui, ctx, window.get());
         apply_key_commit(app);
 
         auto row_wid = [&](uint64_t id, bool gallery) {
@@ -21117,6 +21046,35 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         // Run the popup here: it acts before the edit handlers and draws
         // on top of the widgets.
         ui::RunPopup(canvas, font, ui::active_theme(), ctx, input);
+        {
+            flow::CanvasState& cs = app.canvas_state;
+            if (cs.ctx_selected >= 0) {
+                flow_ui.events->ctx_pick = cs.ctx_selected;
+                flow_ui.events->ctx_node = cs.ctx_target;
+                cs.ctx_selected = -1;
+                cs.ctx_open = false;
+                cs.ctx_dd.open = false;
+            }
+            if (cs.dd_selected >= 0 && flow_ui.graph) {
+                for (size_t i = 0; i < flow_ui.graph->node_count; ++i) {
+                    const flow::Node& nd = flow_ui.graph->nodes[i];
+                    if (nd.id != cs.dd_node || cs.dd_row < 0 ||
+                        cs.dd_row >= nd.row_count)
+                        continue;
+                    const flow::ParamRow& pr = nd.rows[cs.dd_row];
+                    if (pr.staged) {
+                        *pr.staged =
+                            pr.min_v + static_cast<float>(cs.dd_selected);
+                        if (pr.changed) *pr.changed = true;
+                        if (pr.released) *pr.released = true;
+                    }
+                    break;
+                }
+                cs.dd_selected = -1;
+                cs.dd_open = false;
+                cs.dd_state.open = false;
+            }
+        }
 
         if (app.ctx_menu.kind && app.ctx_menu.pick >= 0 &&
             app.ctx_menu.pick <
@@ -21583,9 +21541,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             cur = app.presets[static_cast<size_t>(cpi)]
                                       .name;
                         }
-                        open_text_entry(app, ui::TextFilter::Printable, 0,
+                        TextTarget t;
+                        t.kind = TextEntry::PresetRename;
+                        t.id = m.a;
+                        open_text_entry(app, t, ui::TextFilter::Printable, 0,
                                         cur);
-                        app.preset_rename_key = m.a;
                         break;
                     }
                     std::string cur;
@@ -21600,8 +21560,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     else
                         for (const doc::Asset& a2 : app.document.assets)
                             if (a2.id == m.a) cur = a2.name;
-                    open_text_entry(app, ui::TextFilter::Printable, 0, cur);
-                    app.browser_rename_id = m.a;
+                    TextTarget t;
+                    t.kind = TextEntry::BrowserRename;
+                    t.id = m.a;
+                    open_text_entry(app, t, ui::TextFilter::Printable, 0, cur);
                     break;
                 }
                 case kActMoveToRoot:
@@ -22074,12 +22036,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 const uint64_t did = tag_doc(target);
                 switch (act) {
                     case CtxAction::Bypass:
-                        for (size_t i = 0;
-                             i < flow_ui.graph->node_count; ++i)
-                            if (flow_ui.graph->nodes[i].id == target &&
-                                flow_ui.graph->nodes[i].bypass_clicked)
-                                *flow_ui.graph->nodes[i].bypass_clicked =
-                                    true;
+                        if (std::find(app.multi_sel.begin(),
+                                      app.multi_sel.end(),
+                                      target) == app.multi_sel.end())
+                            app.multi_sel.assign(1, target);
+                        act::bypass(app, ki);
                         break;
                     case CtxAction::Duplicate:
                         ki.do_duplicate = true;
@@ -22100,9 +22061,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             for (const doc::Group& gr :
                                  app.look().layers[gli].groups)
                                 if (gr.id == did) cur = gr.name;
-                        open_text_entry(app, ui::TextFilter::Printable, 60,
+                        TextTarget t;
+                        t.kind = TextEntry::GroupRename;
+                        t.id = did;
+                        open_text_entry(app, t, ui::TextFilter::Printable, 60,
                                         cur);
-                        app.group_rename_id = did;
+                        ctx.set_focus(ctx.acquire_widget_id(&app.canvas_state));
                         break;
                     }
                     case CtxAction::SavePreset: {
@@ -22919,12 +22883,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             const uint64_t frame_rename_req =
                 fe.frame_rename ? fe.frame_rename : ctx_frame_rename;
+            if (fe.text_blur || fe.text_commit) commit_text_entry(app);
+            if (fe.text_cancel) cancel_text_entry(app);
+            const ui::WidgetId canvas_wid =
+                ctx.acquire_widget_id(&app.canvas_state);
             if (frame_rename_req) {
                 std::string cur;
                 for (const doc::CanvasFrame& f : app.look().frames)
                     if (f.id == frame_rename_req) cur = f.title;
-                open_text_entry(app, ui::TextFilter::Printable, 64, cur);
-                app.frame_rename_id = frame_rename_req;
+                TextTarget t;
+                t.kind = TextEntry::FrameRename;
+                t.id = frame_rename_req;
+                open_text_entry(app, t, ui::TextFilter::Printable, 64, cur);
+                ctx.set_focus(canvas_wid);
             }
             if (fe.group_rename) {
                 const uint64_t gid = tag_doc(fe.group_rename);
@@ -22934,8 +22905,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     for (const doc::Group& gr :
                          app.look().layers[gli].groups)
                         if (gr.id == gid) cur = gr.name;
-                open_text_entry(app, ui::TextFilter::Printable, 60, cur);
-                app.group_rename_id = gid;
+                TextTarget t;
+                t.kind = TextEntry::GroupRename;
+                t.id = gid;
+                open_text_entry(app, t, ui::TextFilter::Printable, 60, cur);
+                ctx.set_focus(canvas_wid);
             }
             if (fe.text_edit) {
                 const uint64_t tid = tag_doc(fe.text_edit);
@@ -22943,8 +22917,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 size_t tli = 0, tfi = 0;
                 if (find_effect_by_id(app.look(), tid, &tli, &tfi))
                     cur = app.look().layers[tli].stack[tfi].text;
-                open_text_entry(app, ui::TextFilter::Printable, 64, cur);
-                app.text_edit_id = tid;
+                TextTarget t;
+                t.kind = TextEntry::TextEdit;
+                t.id = tid;
+                open_text_entry(app, t, ui::TextFilter::Printable, 64, cur);
+                ctx.set_focus(canvas_wid);
             }
             for (size_t f = 0; f < flow_ui.graph->frame_count; ++f) {
                 const flow::FrameBox& fb = flow_ui.graph->frames[f];
@@ -22977,18 +22954,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                     break;
                 }
-                open_text_entry(app, ui::TextFilter::Signed, 16, cur);
-                app.value_edit_node = fe.value_edit_node;
-                app.value_edit_row = fe.value_edit_row;
+                TextTarget t;
+                t.kind = TextEntry::ValueEdit;
+                t.id = fe.value_edit_node;
+                t.index = fe.value_edit_row;
+                open_text_entry(app, t, ui::TextFilter::Signed, 16, cur);
+                ctx.set_focus(canvas_wid);
             }
-            // A left press commits an older text field. Only Escape
-            // abandons one.
-            if (input.left_pressed() &&
-                text_entry_before.kind != TextEntry::None &&
-                !(text_entry_before.kind == TextEntry::FxSearch &&
-                  app.canvas_state.add_open) &&
-                text_entry_id(app) == text_entry_before)
-                commit_text_entry(app);
             if (app.value_commit_node) {
                 const uint64_t vc_node = app.value_commit_node;
                 const int vc_row = app.value_commit_row;
@@ -23132,13 +23104,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (fe.add_menu_opened) {
                 close_text_entry(app);
                 app.fx_filter.set("");
-                app.fx_search_focus = true;
+                app.add_menu_scroll.offset = 0.0f;
                 app.find_mode = false;
             }
+            for (const auto& [cat_idx, hov] : frame_ui.add_cat_hovers)
+                if (*hov) app.canvas_state.add_cat = cat_idx;
+            int add_pick = -1;
+            for (const auto& [pick_idx, clk] : frame_ui.add_menu_clicks)
+                if (*clk) add_pick = pick_idx;
+            if (app.canvas_state.add_open && frame_ui.add_menu_outside &&
+                (!frame_ui.add_fly_open || frame_ui.add_fly_outside))
+                app.canvas_state.add_open = false;
             {
                 const int pick =
                     !app.canvas_state.add_open ? -1
-                    : fe.add_pick >= 0         ? fe.add_pick
+                    : add_pick >= 0            ? add_pick
                     : ki.do_add_first             ? 0
                                                : -1;
                 if (pick >= 0 && !structure_done) {
@@ -23375,7 +23355,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         structure_done = true;
                     }
                     app.canvas_state.add_open = false;
-                    app.fx_search_focus = false;
                 }
             }
 
@@ -24565,20 +24544,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.tag_selected && *frame_ui.tag_selected >= 0)
             app.preset_tag_index = *frame_ui.tag_selected - 1;   // 0 = all tags
-        if (frame_ui.preset_search_clicked && *frame_ui.preset_search_clicked) {
-            const bool was = app.preset_search_focus;
-            close_text_entry(app);
-            app.preset_search_focus = !was;
-        }
-        if (frame_ui.fx_search_clicked && *frame_ui.fx_search_clicked) {
-            const bool was = app.fx_search_focus;
-            close_text_entry(app);
-            app.fx_search_focus = !was;
-        }
-        if (frame_ui.duration_clicked && *frame_ui.duration_clicked) {
-            const bool was = app.duration_focus;
-            open_text_entry(app, ui::TextFilter::Digits, 0, "");
-            app.duration_focus = !was;
+        if (frame_ui.duration_clicked && *frame_ui.duration_clicked &&
+            app.text_target.kind != TextEntry::Duration) {
+            TextTarget t;
+            t.kind = TextEntry::Duration;
+            open_text_entry(app, t, ui::TextFilter::Digits, 0, "");
         }
         if ((frame_ui.preset_import_clicked &&
              *frame_ui.preset_import_clicked) ||
@@ -24777,10 +24747,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (frame_ui.lane_release) app.undo.break_coalescing();
         for (const FrameUi::RailEdit& re : frame_ui.rail_edits) {
             if (!re.clicked || !*re.clicked) continue;
-            open_text_entry(app, ui::TextFilter::Signed, 15,
+            TextTarget t;
+            t.kind = TextEntry::RailEdit;
+            t.key = re.key;
+            t.scale = re.scale;
+            open_text_entry(app, t, ui::TextFilter::Signed, 15,
                             re.seed ? re.seed : "");
-            app.rail_edit_key = re.key;
-            app.rail_edit_scale = re.scale;
             break;
         }
 
@@ -24825,8 +24797,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             size_t tli = 0, tfi = 0;
             if (find_effect_by_id(app.look(), open.effect_id, &tli, &tfi))
                 cur = app.look().layers[tli].stack[tfi].text;
-            open_text_entry(app, ui::TextFilter::Printable, 64, cur);
-            app.text_edit_id = open.effect_id;
+            TextTarget t;
+            t.kind = TextEntry::TextEdit;
+            t.id = open.effect_id;
+            open_text_entry(app, t, ui::TextFilter::Printable, 64, cur);
+            ui::text_input_focus(ctx, &app.fx_ui[open.effect_id].text_state);
         }
 
         for (const FrameUi::LayerRow& lrow : frame_ui.layer_rows) {
@@ -25492,11 +25467,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             else
                 app.bin_closed.insert(br.id);
         }
-        if (frame_ui.browser_search_clicked &&
-            *frame_ui.browser_search_clicked) {
-            close_text_entry(app);
-            app.browser_search_focus = true;
-        }
         if (frame_ui.new_bin_clicked && *frame_ui.new_bin_clicked)
             app.undo.execute(
                 app.document,
@@ -25935,17 +25905,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                           th.font_size_small, th.text);
             ctx.clear_tooltip();
         }
-
-        // Draw order: settings above tooltips, confirm dialog above both.
-        if (app.settings.open)
-            draw_settings(canvas, font,
-                          header_font ? &*header_font : nullptr, viewport,
-                          app);
-
-        if (app.confirm.open())
-            draw_confirm_dialog(canvas, font,
-                                header_font ? &*header_font : nullptr,
-                                viewport, app, dt);
 
         // Draw the console last so it stays topmost.
         draw_console(script_host, canvas, font, viewport);

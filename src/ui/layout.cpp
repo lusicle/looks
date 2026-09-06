@@ -155,18 +155,48 @@ void arrange_stack(LayoutNode& node, const Rect& rect, const Rect& clip,
     }
 }
 
-void route_wheel(LayoutNode& node, LayoutFrame& frame, LayoutNode** target) {
+Rect overlay_child_rect(const LayoutNode& node) {
+    return node.child_count > 0 ? node.children[0]->rect : Rect{};
+}
+
+void route_wheel(LayoutNode& node, LayoutFrame& frame, LayoutNode** target,
+                 bool in_overlay, bool* target_in_overlay) {
+    if (node.kind == NodeKind::Overlay)
+        in_overlay = in_overlay ||
+                     overlay_child_rect(node).contains(frame.input.mouse);
     if (node.kind == NodeKind::ScrollArea && node.scroll &&
-        node.rect.contains(frame.input.mouse))
+        node.rect.contains(frame.input.mouse)) {
         *target = &node;   // deepest wins: children overwrite
+        *target_in_overlay = in_overlay;
+    }
     for (uint16_t i = 0; i < node.child_count; ++i)
-        route_wheel(*node.children[i], frame, target);
+        route_wheel(*node.children[i], frame, target, in_overlay,
+                    target_in_overlay);
 }
 
 void walk_hit(LayoutNode& node, LayoutFrame& frame) {
     if (node.hit_fn) node.hit_fn(node, frame);
+    const bool overlay = node.kind == NodeKind::Overlay && node.overlay;
+    if (overlay) {
+        const HitLayer layer =
+            node.overlay->exclusive ? HitLayer::Modal : HitLayer::Popup;
+        frame.ctx.add_hit(overlay_child_rect(node),
+                          frame.ctx.acquire_widget_id(node.overlay->id),
+                          layer);
+        frame.ctx.push_hit_layer(layer);
+    }
     for (uint16_t i = 0; i < node.child_count; ++i)
         walk_hit(*node.children[i], frame);
+    if (overlay) frame.ctx.pop_hit_layer();
+}
+
+void draw_overlay(LayoutNode& node, LayoutFrame& frame) {
+    const OverlayOpts& o = *node.overlay;
+    if (o.backdrop)
+        frame.canvas.draw_rect(node.rect, Color{0.0f, 0.0f, 0.0f, 0.45f});
+    if (o.out_pressed_outside && frame.input.left_pressed() &&
+        !overlay_child_rect(node).contains(frame.input.mouse))
+        *o.out_pressed_outside = true;
 }
 
 void walk_draw(LayoutNode& node, LayoutFrame& frame, const Rect& active_clip) {
@@ -248,6 +278,18 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
                        resolve_axis(node.height, content.y, c.min_h, c.max_h)};
             break;
         }
+        case NodeKind::Overlay: {
+            Constraints inner = c;
+            inner.min_w = inner.min_h = 0;
+            if (node.overlay && !node.overlay->bounds.empty()) {
+                inner.max_w = node.overlay->bounds.w;
+                inner.max_h = node.overlay->bounds.h;
+            }
+            if (node.child_count > 0) measure(*node.children[0], inner, frame);
+            desired = {c.max_w < kUnboundedAxis * 0.5f ? c.max_w : 0.0f,
+                       c.max_h < kUnboundedAxis * 0.5f ? c.max_h : 0.0f};
+            break;
+        }
     }
     node.desired = desired;
     return desired;
@@ -292,6 +334,30 @@ void arrange(LayoutNode& node, const Rect& rect, const Rect& parent_clip) {
             const float inner_w = rect.w - kScrollbarWidth - kScrollbarPad * 2.0f;
             arrange(child, {rect.x, rect.y - offset, inner_w, content},
                     node.clip);
+            break;
+        }
+        case NodeKind::Overlay: {
+            if (node.child_count == 0 || !node.overlay) break;
+            LayoutNode& child = *node.children[0];
+            const OverlayOpts& o = *node.overlay;
+            const Rect bounds = o.bounds.empty() ? rect : o.bounds;
+            const Vec2 size = child.desired;
+            const Vec2 clamp_size{o.clamp_size.x > 0.0f ? o.clamp_size.x : size.x,
+                                  o.clamp_size.y > 0.0f ? o.clamp_size.y : size.y};
+            Vec2 pos;
+            if (o.place == OverlayOpts::Place::Centered) {
+                pos.x = std::round(bounds.x + (bounds.w - size.x) * 0.5f);
+                pos.y = std::round(std::max(
+                    bounds.y + o.min_top,
+                    bounds.y + bounds.h * o.center_bias - size.y * 0.5f));
+            } else {
+                pos = o.anchor;
+            }
+            pos.x = std::max(bounds.x + 4.0f,
+                             std::min(pos.x, bounds.right() - clamp_size.x - 4.0f));
+            pos.y = std::max(bounds.y + 4.0f,
+                             std::min(pos.y, bounds.bottom() - clamp_size.y - 4.0f));
+            arrange(child, {pos.x, pos.y, size.x, size.y}, node.clip);
             break;
         }
     }
@@ -376,9 +442,11 @@ void run_frame(LayoutNode* root, const Rect& rect, LayoutFrame& frame) {
 
     if (frame.input.wheel_y != 0.0f) {
         LayoutNode* target = nullptr;
-        route_wheel(*root, frame, &target);
+        bool in_overlay = false;
+        route_wheel(*root, frame, &target, false, &in_overlay);
         if (target && target->scroll) {
-            const float dy = frame.ctx.take_wheel_in_tree();
+            const float dy = in_overlay ? frame.ctx.take_wheel_any()
+                                        : frame.ctx.take_wheel_in_tree();
             target->scroll->offset -= dy * kScrollPixelsPerNotch;
         }
     }
@@ -487,6 +555,19 @@ LayoutNode* ScrollAreaV(LayoutArena& arena, ScrollState* state,
     n->draw_fn = [](LayoutNode& node, LayoutFrame& frame) {
         draw_scrollbar(node, frame);
     };
+    return with_children(arena, n, {child});
+}
+
+LayoutNode* Overlay(LayoutArena& arena, const OverlayOpts& opts,
+                    LayoutNode* child) {
+    LayoutNode* n = make_node(arena, NodeKind::Overlay);
+    auto* o = arena.alloc<OverlayOpts>();
+    *o = opts;
+    n->overlay = o;
+    n->width = SizeSpec::fill();
+    n->height = SizeSpec::fill();
+    n->draw_fn = draw_overlay;
+    n->debug_name = "overlay";
     return with_children(arena, n, {child});
 }
 
