@@ -2032,7 +2032,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 // The media fits centered and aspect-preserved.
                 float fit[4];
                 source_fit_rect(it->second.y->width(),
-                                it->second.y->height(), w, h, fit);
+                                it->second.y->height(), w, h, fit,
+                                look.layers[node.layer_index].source == doc::LayerSourceKind::Slideshow
+                                    ? look.layers[node.layer_index].slide_fit : 0);
                 struct {
                     uint32_t w, h;
                     float rx, ry, iw, ih;
@@ -3328,6 +3330,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 matte_apply_->dispatch(rec, arena_, frame_index, sampled, 3,
                                        &dst, 1, push, sizeof(push), w, h,
                                        linear_sampler_);
+                break;
+            }
+            case GraphNode::Kind::Crossfade: {
+                const uint32_t push[4] = {w, h, as_bits(node.p_opacity), as_bits(1.0f)};
+                const GpuImage* sampled[2] = {input_image(0), input_image(1)};
+                group_mix_->dispatch(rec, arena_, frame_index, sampled, 2,
+                    &dst, 1, push, sizeof(push), w, h, linear_sampler_);
                 break;
             }
             case GraphNode::Kind::GroupMix: {

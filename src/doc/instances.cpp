@@ -13,6 +13,13 @@ namespace {
 // The depth guard alone allows kMaxLayers^kMaxLookDepth: cap the walk.
 constexpr size_t kMaxFlattened = 1024;
 
+bool video_source_limit(const std::vector<MediaInstance>& sources) {
+    if (sources.size() < kMaxFlattened) return false;
+    return std::count_if(sources.begin(), sources.end(), [](const auto& source) {
+        return !source.slide_count || source.slide_index == 0;
+    }) >= kMaxFlattened;
+}
+
 struct Cursor {
     uint64_t entity = 0;   // a look or a sequence
     uint64_t path = 0;
@@ -476,8 +483,30 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
     }
     for (const Layer& layer : look.layers) {
         if (!layer.visible) continue;
-        if (out.size() >= kMaxFlattened) return;
-        if (layer_is_media(layer)) {
+        if (video_source_limit(out)) return;
+        if (layer.source == LayerSourceKind::Slideshow) {
+            const auto assets = slideshow_assets(doc, layer);
+            for (size_t i = 0; i < assets.size(); ++i) {
+                MediaInstance c;
+                c.key = media_stream_key(cur.path, layer.id, assets[i]->id, false, 0);
+                c.owner = look.id;
+                c.layer = layer.id;
+                c.asset = assets[i]->id;
+                c.speed = cur.a * std::max(0.01f, layer.slide_speed);
+                c.t_in = cur.r0;
+                c.t_out = cur.r1;
+                c.source_in = (cur.r0 * cur.a + cur.b) * std::max(0.01f, layer.slide_speed);
+                c.rate = assets[i]->still ? 0.0 : media_conform_rate(doc, *assets[i], eff);
+                c.slide_count = static_cast<uint32_t>(assets.size());
+                c.slide_index = static_cast<uint32_t>(i);
+                c.slide_period = slideshow_period(layer, eff);
+                c.slide_fade = std::clamp(static_cast<double>(layer.slide_fade) * eff, 0.0, c.slide_period);
+                c.slide_end = layer.slide_end;
+                c.repeat_frames = layer.slide_video_loop && !assets[i]->still ? assets[i]->frame_count : 0;
+                out.push_back(c);
+            }
+            continue;
+        } else if (layer_is_media(layer)) {
             emit_media(layer, 0);
         } else if (layer_is_nested(layer)) {
             descend_nested(layer, 0);
@@ -486,7 +515,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         }
         for (const auto& [src, off] : vshifts) {
             if (src != layer.id) continue;
-            if (out.size() >= kMaxFlattened) return;
+            if (video_source_limit(out)) return;
             if (layer_is_media(layer))
                 emit_media(layer, off);
             else
@@ -502,7 +531,7 @@ void walk_sequence(const Document& doc, const Sequence& seq,
     for (const SeqTrack& t : seq.tracks) {
         if (t.hidden) continue;
         for (const Placement& p : t.placements) {
-            if (out.size() >= kMaxFlattened) return;
+            if (video_source_limit(out)) return;
             Cursor child;
             if (placement_child(doc, t.id, p, cur, eff, &child))
                 walk(doc, child, out);
@@ -551,6 +580,7 @@ bool entity_has_image_at(const Document& doc, uint64_t id, int depth);
 // A layer draws when its own source can make pixels.
 bool layer_draws(const Document& doc, const Layer& l, int depth) {
     if (!l.visible) return false;
+    if (l.source == LayerSourceKind::Slideshow) return !slideshow_assets(doc, l).empty();
     if (layer_is_media(l)) {
         const Asset* a = l.asset ? doc.find_asset(l.asset) : nullptr;
         return a && (a->frame_count || a->width || a->height);
@@ -691,6 +721,49 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
         paths = resolve_voices(*t);
     }
     return {};
+}
+
+std::vector<const Asset*> slideshow_assets(const Document& doc, const Layer& layer) {
+    std::vector<const Asset*> result;
+    if (layer.slide_bin && !doc.find_bin(layer.slide_bin)) return result;
+    for (const auto& asset : doc.assets) {
+        if (!asset.width || !asset.height) continue;
+        const auto dot = asset.path.find_last_of('.');
+        std::string ext = dot == std::string::npos ? "" : asset.path.substr(dot);
+        for (char& c : ext) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (ext == ".wav" || ext == ".mp3") continue;
+        uint64_t bin = asset.bin;
+        for (size_t depth = 0; depth <= doc.bins.size(); ++depth) {
+            if (bin == layer.slide_bin) { result.push_back(&asset); break; }
+            if (!layer.slide_subbins || !bin) break;
+            const auto* parent = doc.find_bin(bin);
+            if (!parent) break;
+            bin = parent->parent;
+        }
+    }
+    std::sort(result.begin(), result.end(), [&](const Asset* a, const Asset* b) {
+        if (layer.slide_order == 1 && a->byte_size != b->byte_size)
+            return a->byte_size < b->byte_size;
+        if (layer.slide_order == 2) {
+            const uint64_t x = static_cast<uint64_t>(a->width) * a->height;
+            const uint64_t y = static_cast<uint64_t>(b->width) * b->height;
+            if (x != y) return x < y;
+        }
+        if (layer.slide_order == 3) {
+            const double x = a->still || a->fps <= 0 ? 0.0 : a->frame_count / a->fps;
+            const double y = b->still || b->fps <= 0 ? 0.0 : b->frame_count / b->fps;
+            if (x != y) return x < y;
+        }
+        if (layer.slide_order == 4) {
+            const uint64_t x = hash_combine(layer.slide_seed, a->id);
+            const uint64_t y = hash_combine(layer.slide_seed, b->id);
+            if (x != y) return x < y;
+        }
+        if (a->name != b->name) return a->name < b->name;
+        return a->id < b->id;
+    });
+    if (layer.slide_reverse) std::reverse(result.begin(), result.end());
+    return result;
 }
 
 }  // namespace looks::doc

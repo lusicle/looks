@@ -32,7 +32,7 @@ struct ComScope {
 
 std::optional<std::filesystem::path> run_dialog(
     Window* parent, const std::vector<FileFilter>& filters,
-    const std::wstring& default_name, bool save) {
+    const std::wstring& default_name, bool save, bool folder = false) {
     ComScope com;
     if (!com.ok()) return std::nullopt;
 
@@ -55,6 +55,11 @@ std::optional<std::filesystem::path> run_dialog(
     if (!specs.empty())
         dialog->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
     if (!default_name.empty()) dialog->SetFileName(default_name.c_str());
+    if (folder) {
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    }
 
     HWND owner = parent ? static_cast<HWND>(parent->native_window()) : nullptr;
     std::optional<std::filesystem::path> result;
@@ -78,6 +83,10 @@ std::optional<std::filesystem::path> run_dialog(
 std::optional<std::filesystem::path> show_open_dialog(
     Window* parent, const std::vector<FileFilter>& filters) {
     return run_dialog(parent, filters, {}, /*save=*/false);
+}
+
+std::optional<std::filesystem::path> show_folder_dialog(Window* parent) {
+    return run_dialog(parent, {}, {}, false, true);
 }
 
 std::optional<std::filesystem::path> show_save_dialog(

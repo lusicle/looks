@@ -223,7 +223,7 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     layer.source = kind;
     static const char* kNames[] = {"media", "solid", "gradient",
                                    "noise", "pattern", "osc",
-                                   "shape", "look",  "sequence"};
+                                   "shape", "look",  "sequence", "slideshow"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                       static_cast<size_t>(LayerSourceKind::Count),
                   "layer names track the enum");

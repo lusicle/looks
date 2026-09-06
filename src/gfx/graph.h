@@ -26,6 +26,7 @@ struct GraphNode {
                        // layer_index >= 0 = look layer; -1 = sequence lane
         GroupMix,      // inputs: dry, face
                        // wet/opacity: layers[layer_index].groups[effect_index]
+        Crossfade,
     };
     Kind kind = Kind::Source;
     int layer_index = -1;
@@ -100,15 +101,15 @@ inline uint32_t even_down(uint32_t v, uint32_t div) {
 // rect = {x, y, w, h} in output pixels, centered, aspect preserved.
 // Matching aspects return exactly the full target; unknown dims fill.
 inline void source_fit_rect(float src_w, float src_h, float out_w,
-                            float out_h, float rect[4]) {
+                            float out_h, float rect[4], uint32_t mode = 0) {
     float fw = out_w;
     float fh = out_h;
-    if (src_w > 0.0f && src_h > 0.0f && out_w > 0.0f && out_h > 0.0f) {
+    if (mode != 2 && src_w > 0.0f && src_h > 0.0f && out_w > 0.0f && out_h > 0.0f) {
         const float sa = src_w / src_h;
         const float oa = fw / fh;
-        if (sa > oa)
+        if ((sa > oa) != (mode == 1))
             fh = fw / sa;
-        else if (sa < oa)
+        else
             fw = fh * sa;
     }
     rect[0] = (out_w - fw) * 0.5f;

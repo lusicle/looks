@@ -61,6 +61,8 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
 bool rebuild_still_thumbs(const std::filesystem::path& mez_path,
                           const std::filesystem::path& thumbs_path);
 
+bool is_still_image(const std::filesystem::path& source);
+
 // Writes an all-intra H.264 at <stem>.intra.mp4 beside the sidecars.
 // Preview decode prefers it; export keeps the original. Video only.
 ImportResult consolidate_video(const std::filesystem::path& source,

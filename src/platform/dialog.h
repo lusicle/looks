@@ -19,6 +19,8 @@ struct FileFilter {
 std::optional<std::filesystem::path> show_open_dialog(
     Window* parent, const std::vector<FileFilter>& filters);
 
+std::optional<std::filesystem::path> show_folder_dialog(Window* parent);
+
 std::optional<std::filesystem::path> show_save_dialog(
     Window* parent, const std::vector<FileFilter>& filters,
     const std::string& default_name);

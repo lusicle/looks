@@ -95,6 +95,7 @@ struct ImportJob {
     bool import_only = false;
     uint64_t bind_look = 0;
     uint64_t bind_layer = 0;
+    uint64_t import_bin = 0;
     bool announced = false;
     bool video_pass_only = false;
     bool consolidate = false;
@@ -275,9 +276,7 @@ uint64_t group_boundary_member(const doc::Look& look, uint64_t gid,
 }
 
 bool is_still_source(const std::filesystem::path& source) {
-    std::wstring ext = source.extension().wstring();
-    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
-    return ext == L".png" || ext == L".tga";
+    return media::is_still_image(source);
 }
 
 std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
@@ -2130,6 +2129,7 @@ struct LayerUiState {
     ui::ButtonState select_button, visible_check, remove_button;
     ui::ButtonState up_button, down_button;
     ui::DropdownState blend_dd, osc_dd, media_dd;
+    ui::DropdownState slide_dd[10];
     ui::ButtonState media_browse;
     ui::SwatchState swatch_a, swatch_b;
     // One popup owner per anchor: the card needs its own swatch state.
@@ -2437,7 +2437,8 @@ struct AppState {
     std::vector<media::AssetBundle> bundles;
     PcmCache pcm_cache;
     uint64_t bundle_stamp = 1;
-    std::vector<std::filesystem::path> media_import_queue;
+    struct QueuedImport { std::filesystem::path path; uint64_t bin = 0; };
+    std::vector<QueuedImport> media_import_queue;
     // Memo. Recompute only when the bundles, the document, or the base move.
     uint64_t opened_memo_stamp = ~0ull;
     uint64_t opened_memo_revision = ~0ull;
@@ -2790,6 +2791,7 @@ struct AppState {
     };
     std::unordered_map<uint64_t, BrowserRowUi> browser_ui;
     ui::ButtonState new_seq_button, browser_new_look_button, new_bin_button;
+    ui::ButtonState import_folder_button;
     // bin_closed holds the closed bins. Absent means open.
     std::unordered_set<uint64_t> bin_closed;
     uint64_t browser_drag_id = 0;
@@ -2814,7 +2816,7 @@ struct AppState {
     ui::ButtonState proxy_check, lossless_check;
     ui::ButtonState ab_button, bypass_all_button;
     ui::SliderState wipe_slider;
-    ui::ButtonState add_layer_buttons[7];
+    ui::ButtonState add_layer_buttons[8];
     std::unordered_map<uint64_t, EffectUiState> fx_ui;
     std::unordered_map<uint64_t, RouteUiState> route_ui;
     ui::ButtonState add_layer_open_button;
@@ -3777,6 +3779,12 @@ void refresh_bundles(AppState& app) {
     for (size_t i = 0; i < app.document.assets.size(); ++i) {
         doc::Asset& asset = app.document.assets[i];
         const media::AssetBundle& bundle = table[i];
+        std::error_code size_error;
+        const auto size = std::filesystem::file_size(u8_to_path(asset.path), size_error);
+        if (!size_error && asset.byte_size != size) {
+            asset.byte_size = size;
+            doc_changed = true;
+        }
         // Direct write: these are media facts, not undoable edits.
         const bool still =
             !asset.path.empty() && is_still_source(u8_to_path(asset.path));
@@ -4383,13 +4391,15 @@ void ensure_media_placed(AppState& app,
 }
 
 // Import adds the asset only. It does not place or play.
-void import_media(AppState& app, const std::filesystem::path& picked_in) {
+void import_media(AppState& app, const std::filesystem::path& picked_in, uint64_t bin = 0) {
     // Only absolute paths reach the document.
     std::error_code aec;
     const std::filesystem::path picked =
         std::filesystem::absolute(picked_in, aec).lexically_normal();
     for (const doc::Asset& a : app.document.assets)
         if (a.path == path_to_u8(picked)) {
+            if (bin && app.document.find_bin(bin))
+                app.undo.execute(app.document, doc::set_entity_bin_command(a.id, bin));
             app.status =
                 "already imported: " + path_to_u8(picked.filename());
             return;
@@ -4398,6 +4408,7 @@ void import_media(AppState& app, const std::filesystem::path& picked_in) {
     if (paths.ready) {
         doc::Asset asset = doc::make_asset(
             app.document, path_to_u8(picked.filename()), path_to_u8(picked));
+        asset.bin = app.document.find_bin(bin) ? bin : 0;
         app.undo.execute(app.document,
                          doc::add_asset_command(std::move(asset)));
         refresh_bundles(app);
@@ -4414,6 +4425,56 @@ void import_media(AppState& app, const std::filesystem::path& picked_in) {
     app.import = start_import(picked, app.import_lossless,
                               cec ? picked.parent_path() : dest);
     app.import->import_only = true;
+    app.import->import_bin = bin;
+}
+
+uint64_t import_folder_as_bin(AppState& app, const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto folder = std::filesystem::absolute(path, ec).lexically_normal();
+    if (ec || !std::filesystem::is_directory(folder, ec)) {
+        app.status = "cannot open folder";
+        return 0;
+    }
+    std::vector<std::filesystem::path> files;
+    for (std::filesystem::recursive_directory_iterator it(folder,
+             std::filesystem::directory_options::skip_permission_denied, ec), end;
+         it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        auto ext = it->path().extension().wstring();
+        for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
+        if (is_still_source(it->path()) || ext == L".mp4" || ext == L".mov" ||
+            ext == L".mez" || ext == L".m4v" || ext == L".avi" || ext == L".wmv" ||
+            ext == L".wav" || ext == L".mp3")
+            files.push_back(it->path());
+    }
+    if (files.empty()) { app.status = "no supported media in folder"; return 0; }
+    std::sort(files.begin(), files.end());
+    std::map<std::filesystem::path, uint64_t> bins;
+    app.undo.begin_group("Import Folder as Bin");
+    auto make_bin = [&](const std::filesystem::path& directory, uint64_t parent) {
+        auto bin = doc::make_bin(app.document, path_to_u8(directory.filename()));
+        bin.parent = parent;
+        const uint64_t id = bin.id;
+        app.undo.execute(app.document, doc::add_bin_command(std::move(bin)));
+        bins[directory] = id;
+        return id;
+    };
+    const uint64_t root = make_bin(folder, 0);
+    for (const auto& file : files) {
+        auto directory = folder;
+        uint64_t parent = root;
+        for (const auto& part : file.parent_path().lexically_relative(folder)) {
+            if (part == ".") continue;
+            directory /= part;
+            const auto found = bins.find(directory);
+            parent = found != bins.end() ? found->second : make_bin(directory, parent);
+        }
+        app.media_import_queue.push_back({file, parent});
+    }
+    app.undo.end_group();
+    app.browser_sel = root;
+    app.status = "queued " + std::to_string(files.size()) + " files";
+    return root;
 }
 
 // Ready media binds in one undo group. Fresh media runs an import job.
@@ -4691,6 +4752,7 @@ bool preset_move_file(AppState& app, uint64_t key, const std::string& bin) {
         app.presets[static_cast<size_t>(pi)].path;
     std::filesystem::path dir = app.user_preset_dir;
     if (!bin.empty()) dir /= std::filesystem::path(bin);
+    if (dir == from.parent_path()) return true;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     const std::filesystem::path to =
@@ -5612,6 +5674,9 @@ struct FrameUi {
         // Transform scale/rotate pivot (frame fractions, 0.5 = centre).
         AnchorX, AnchorY,
         GradKind, GradSpace, GradLen, GradX, GradY, GradCount,
+        SlideBin, SlideSubbins, SlideFit, SlideOrder, SlideSeed,
+        SlideSeconds, SlideSpeed, SlideFade, SlideEnd, SlideVideoLoop,
+        SlideReverse,
     };
     struct LayerStage {
         uint64_t layer_id;
@@ -5620,6 +5685,7 @@ struct FrameUi {
         float original;
         bool* changed;
         bool* released;
+        int* selected = nullptr;
     };
     std::vector<LayerStage> layer_stages;
     struct BlockStage {
@@ -5667,6 +5733,7 @@ struct FrameUi {
     bool* new_sequence_clicked = nullptr;
     bool* browser_new_look_clicked = nullptr;   // placed nowhere
     bool* new_bin_clicked = nullptr;
+    bool* import_folder_clicked = nullptr;
     struct BinRow {
         uint64_t id;
         bool* toggled;   // click folds/unfolds + selects (view state)
@@ -5679,6 +5746,7 @@ struct FrameUi {
         uint64_t id;
         bool is_bin;
         const ui::Rect* rect;
+        int depth;
     };
     std::vector<BrowserNode> browser_nodes;
     ui::LayoutNode* browser_panel = nullptr;   // background menu + drops
@@ -5691,6 +5759,7 @@ struct FrameUi {
     struct GalleryCell {
         uint64_t id = 0;
         int kind = 0;    // 0 bin, 1 sequence, 2 look, 3 asset, 4 preset
+        int depth = 0;
         const char* name = "";
         bool open_bin = false;
         bool scoped = false;
@@ -5774,7 +5843,7 @@ struct FrameUi {
     };
     std::vector<LayerRow> layer_rows;
     // solid, gradient, noise, test pattern, oscillator, shape, media tap
-    bool* add_layer_clicked[7] = {};
+    bool* add_layer_clicked[8] = {};
 
     struct GroupActions {
         uint64_t group_id;
@@ -6020,6 +6089,92 @@ bool layer_field_reset(FrameUi::LayerField f, float* def) {
     }
 }
 
+struct SlideControl {
+    FrameUi::LayerField field;
+    const char* label;
+    float lo, hi, value;
+    const char* format;
+    std::string options;
+    float hard_max = 0.0f;
+};
+
+std::vector<SlideControl> slideshow_controls(const doc::Document& doc, const doc::Layer& layer) {
+    using LF = FrameUi::LayerField;
+    std::string bins = "project root";
+    float current = layer.slide_bin ? -1.0f : 0.0f;
+    for (size_t i = 0; i < doc.bins.size(); ++i) {
+        std::string label = doc.bins[i].name;
+        uint64_t parent = doc.bins[i].parent;
+        for (size_t depth = 0; parent && depth < doc.bins.size(); ++depth) {
+            const auto* bin = doc.find_bin(parent);
+            if (!bin) break;
+            label = bin->name + "/" + label;
+            parent = bin->parent;
+        }
+        std::replace(label.begin(), label.end(), '|', '/');
+        bins += "|" + label;
+        if (doc.bins[i].id == layer.slide_bin) current = static_cast<float>(i + 1);
+    }
+    std::vector<SlideControl> controls = {
+        {LF::SlideBin, "bin", 0, static_cast<float>(doc.bins.size()), current, "%.0f", bins},
+        {LF::SlideSubbins, "sub-bins", 0, 1, layer.slide_subbins ? 1.0f : 0.0f, "%.0f", "exclude|include"},
+        {LF::SlideFit, "fit", 0, 2, static_cast<float>(layer.slide_fit), "%.0f", "fit to frame|fill frame|stretch to frame"},
+        {LF::SlideOrder, "sort", 0, 4, static_cast<float>(layer.slide_order), "%.0f", "name|file size|dimensions|clip length|random"},
+        {LF::SlideReverse, "direction", 0, 1, layer.slide_reverse ? 1.0f : 0.0f, "%.0f", "forward|reverse"}};
+    if (layer.slide_order == 4)
+        controls.push_back({LF::SlideSeed, "seed", 0, 65535, static_cast<float>(layer.slide_seed), "%.0f", {}});
+    controls.push_back({LF::SlideSeconds, "slide time", 0.05f, 30, layer.slide_seconds, "%.2f s", {}, 3600});
+    controls.push_back({LF::SlideSpeed, "speed", 0.01f, 4, layer.slide_speed, "%.2f x", {}, 16});
+    controls.push_back({LF::SlideFade, "fade time", 0, std::min(layer.slide_seconds, 60.0f), layer.slide_fade, "%.2f s", {}});
+    controls.push_back({LF::SlideEnd, "end", 0, 2, static_cast<float>(layer.slide_end), "%.0f", "loop|hold last|stop"});
+    controls.push_back({LF::SlideVideoLoop, "short video", 0, 1, layer.slide_video_loop ? 1.0f : 0.0f, "%.0f", "hold last frame|loop clip"});
+    return controls;
+}
+
+ui::Color library_bin_color(const ui::Theme& theme, bool active,
+                            float hover) {
+    return ui::lerp(theme.control_bg, theme.control_bg_hover,
+                    active ? 1.0f : hover);
+}
+
+const FrameUi::BrowserNode* library_bin_at(
+    const std::vector<FrameUi::BrowserNode>& nodes, Vec2 mouse,
+    ui::Rect* out_area) {
+    struct BinArea {
+        const FrameUi::BrowserNode* node;
+        ui::Rect rect;
+    };
+    std::vector<BinArea> stack;
+    const FrameUi::BrowserNode* target = nullptr;
+    auto extend = [](ui::Rect& area, const ui::Rect& child) {
+        if (child.empty()) return;
+        const float top = area.empty() ? child.y : std::min(area.y, child.y);
+        const float bottom = area.empty() ? child.bottom()
+                                         : std::max(area.bottom(), child.bottom());
+        area.y = top;
+        area.h = bottom - top;
+    };
+    auto finish = [&]() {
+        const BinArea bin = stack.back();
+        stack.pop_back();
+        if (!target && bin.rect.contains(mouse)) {
+            target = bin.node;
+            *out_area = bin.rect;
+        }
+        if (!stack.empty()) extend(stack.back().rect, bin.rect);
+    };
+    for (const auto& node : nodes) {
+        while (!stack.empty() && stack.back().node->depth >= node.depth)
+            finish();
+        if (node.is_bin)
+            stack.push_back({&node, *node.rect});
+        else if (!stack.empty())
+            extend(stack.back().rect, *node.rect);
+    }
+    while (!stack.empty()) finish();
+    return target;
+}
+
 struct BrowseRowUser {
     AppState* app;
     uint64_t id;
@@ -6052,13 +6207,20 @@ void draw_browser_row(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     const ui::Rect& r = node.rect;
     if (u->out_rect)
         *u->out_rect = node.clip.empty() ? r : r.intersect(node.clip);
+    ui::probe_add(std::string("library:") + u->name, *u->out_rect);
     const ui::WidgetId id =
         frame.ctx.acquire_widget_id(&u->app->browser_ui[u->id].open);
     const ui::Gesture g = frame.ctx.gesture(id, r);
     const bool hover = g.hovered && r.contains(frame.input.mouse);
     ui::ButtonState& hb = u->app->browser_ui[u->id].open;
     hb.hover_t = ui::transition_step(hb.hover_t, hover, frame.dt);
-    if (*u->sel == u->id) {
+    if (u->kind == 0) {
+        frame.canvas.draw_sdf_rect(
+            r, 3.0f, library_bin_color(th, u->open_bin || *u->sel == u->id,
+                                      hb.hover_t));
+        if (*u->sel == u->id)
+            frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
+    } else if (*u->sel == u->id) {
         frame.canvas.draw_rect(r, th.selection_bg());
         frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
     } else {
@@ -6200,6 +6362,13 @@ float gallery_walk(const FrameUi::GalleryCell* items, size_t count,
     float y = 0.0f;
     int col = 0;
     for (size_t i = 0; i < count; ++i) {
+        if (i && items[i].kind != 0 && items[i].depth < items[i - 1].depth) {
+            if (col > 0) {
+                y += card_h + kGalGap;
+                col = 0;
+            }
+            y += 1.0f + kGalGap;
+        }
         if (items[i].kind == 0) {
             if (col > 0) {
                 y += card_h + kGalGap;
@@ -6256,8 +6425,17 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         ui::Rect r = rects[i];
         r.x += node.rect.x;
         r.y += node.rect.y;
-        if (it.out_rect)
-            *it.out_rect = node.clip.empty() ? r : r.intersect(node.clip);
+        if (it.out_rect) {
+            ui::Rect area = r;
+            area.h += kGalGap;
+            *it.out_rect = node.clip.empty() ? area : area.intersect(node.clip);
+        }
+        ui::probe_add(std::string("library:") + it.name,
+                      node.clip.empty() ? r : r.intersect(node.clip));
+        if (i && it.kind != 0 && it.depth < u->items[i - 1].depth)
+            frame.canvas.draw_rect(
+                {node.rect.x, r.y - kGalGap - 1.0f, node.rect.w, 1.0f},
+                library_bin_color(th, true, 0.0f));
         const ui::Gesture g =
             frame.ctx.gesture(frame.ctx.acquire_widget_id(it.id), r);
         const bool hover = g.hovered && r.contains(m);
@@ -6271,8 +6449,7 @@ void draw_gallery(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (it.kind == 0) {
             frame.canvas.draw_sdf_rect(
                 r, 3.0f,
-                selected ? th.selection_bg()
-                         : th.control_bg.with_alpha(0.45f + 0.25f * hover_t));
+                library_bin_color(th, selected || it.open_bin, hover_t));
             if (selected)
                 frame.canvas.draw_rect({r.x, r.y, 2.5f, r.h}, th.accent);
             const float cx = r.x + 11.0f;
@@ -9787,16 +9964,16 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
 static const char* kSrcAddLabels[] = {
     "source: media",  "source: solid", "source: gradient",
     "source: noise", "source: pattern", "source: osc",
-    "source: shape", "source: look"};
+    "source: shape", "source: look", "source: slideshow"};
 static const doc::LayerSourceKind kSrcAddKinds[] = {
     doc::LayerSourceKind::Media,
     doc::LayerSourceKind::Solid, doc::LayerSourceKind::Gradient,
     doc::LayerSourceKind::Noise, doc::LayerSourceKind::TestPattern,
     doc::LayerSourceKind::Oscillator, doc::LayerSourceKind::Shape,
-    doc::LayerSourceKind::LookRef};
+    doc::LayerSourceKind::LookRef, doc::LayerSourceKind::Slideshow};
 // Which entry mints a fresh look to nest instead of binding media.
 static const bool kSrcAddIsLook[] = {false, false, false, false,
-                                     false, false, false, true};
+                                     false, false, false, true, false};
 constexpr int kSrcAddCount =
     static_cast<int>(sizeof(kSrcAddLabels) / sizeof(kSrcAddLabels[0]));
 
@@ -10152,7 +10329,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     rows[srow].kind = 1;
                     rows[srow].option_items =
                         option_items(arena, options, &rows[srow].option_count);
-                } else {
+                } else if (field < FrameUi::LayerField::SlideBin) {
                     const doc::ParamKey lkey{
                         layer.id | doc::kLayerParamBit,
                         static_cast<int>(field)};
@@ -10184,6 +10361,10 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             };
             using LFs = FrameUi::LayerField;
             using LSK = doc::LayerSourceKind;
+            if (layer.source == LSK::Slideshow)
+                for (const auto& control : slideshow_controls(app.document, layer))
+                    layer_row(control.field, control.label, control.lo, control.hi,
+                        control.value, control.format, control.options.empty() ? nullptr : control.options.c_str(), control.hard_max);
             layer_row(LFs::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                       "%.2f");
             // Colors edit through the swatch only, never channel sliders.
@@ -10372,7 +10553,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                                "gradient", "noise",
                                                "pattern",  "osc",
                                                "shape",    "look",
-                                               "sequence"};
+                                               "sequence", "slideshow"};
             static_assert(sizeof(kSrcTitles) / sizeof(kSrcTitles[0]) ==
                               static_cast<size_t>(
                                   doc::LayerSourceKind::Count),
@@ -11653,7 +11834,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             view_picks[0] = out.browser_view_pick[0];
             view_picks[1] = out.browser_view_pick[1];
             StackOpts srow;
-            srow.gap = 4.0f;
+            srow.gap = 8.0f;
+            srow.padding.r = 10.0f;
             srow.cross_align = AlignMode::Center;
             browser_search = HStack(
                 arena, srow,
@@ -11685,10 +11867,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             }
         };
         auto gal_cell = [&](uint64_t id, int kind, const std::string& name,
-                            const char* fallback, bool open_bin) {
+                            const char* fallback, int depth, bool open_bin) {
             FrameUi::GalleryCell cell;
             cell.id = id;
             cell.kind = kind;
+            cell.depth = depth;
             std::string shown = name.empty() ? std::string(fallback) : name;
             cell.renaming = app.text_target.kind == TextEntry::BrowserRename &&
                             app.text_target.id == id;
@@ -11713,7 +11896,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                          app.document.revision * 0x9E3779B97F4A7C15ull +
                              app.bundle_stamp});
             }
-            out.browser_nodes.push_back({id, kind == 0, cell.out_rect});
+            out.browser_nodes.push_back({id, kind == 0, cell.out_rect, depth});
             if (kind == 0) {
                 out.bin_rows.push_back({id, cell.clicked, cell.ctx});
             } else {
@@ -11732,7 +11915,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                             const char* fallback, int depth,
                             bool open_bin) {
             if (browser_gal) {
-                gal_cell(id, kind, name, fallback, open_bin);
+                gal_cell(id, kind, name, fallback, depth, open_bin);
                 return;
             }
             if (app.text_target.kind == TextEntry::BrowserRename &&
@@ -11751,7 +11934,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 arena.dup(shown.c_str(), shown.size()), depth,
                 (stripe++ & 1) != 0, open_bin, id == app.scope_look,
                 &app.browser_sel, clicked, opened, ctx, &rrect);
-            out.browser_nodes.push_back({id, kind == 0, rrect});
+            out.browser_nodes.push_back({id, kind == 0, rrect, depth});
             browser_rows.push_back(n);
             if (kind == 0) {
                 out.bin_rows.push_back({id, clicked, ctx});
@@ -11813,10 +11996,12 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         out.new_sequence_clicked = arena.alloc<bool>();
         out.browser_new_look_clicked = arena.alloc<bool>();
         out.new_bin_clicked = arena.alloc<bool>();
-        ButtonOpts mseq, mlook, mbin;
+        out.import_folder_clicked = arena.alloc<bool>();
+        ButtonOpts mseq, mlook, mbin, mfolder;
         mseq.tooltip = "new sequence";
         mlook.tooltip = "new look (placed nowhere)";
         mbin.tooltip = "new bin";
+        mfolder.tooltip = "import a folder as a bin";
         StackOpts strip;
         strip.gap = 6.0f;
         strip.width = SizeSpec::fill();
@@ -11824,7 +12009,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         strip.padding = Edges{0.0f, 0.0f, 10.0f, 0.0f};
         browser_create = HStack(
             arena, strip,
-            {Button(arena, "+ seq", &app.new_seq_button,
+            {Button(arena, "import folder", &app.import_folder_button,
+                    out.import_folder_clicked, mfolder),
+             Button(arena, "+ seq", &app.new_seq_button,
                     out.new_sequence_clicked, mseq),
              Button(arena, "+ look", &app.browser_new_look_button,
                     out.browser_new_look_clicked, mlook),
@@ -12121,12 +12308,13 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 IconButton(arena, Icon::Close, &ls.remove_button, lrow.remove,
                            x_opts),
             }));
-        layer_rows_ui.push_back(value_row(
+        LayoutNode* blend_control = value_row(
             arena, "blend",
             Dropdown(arena, kBlendNames, 5,
                      static_cast<int>(layer.blend), &ls.blend_dd,
                      lrow.blend_selected, SizeSpec::fill(),
-                     "blend mode over the composite below")));
+                     "blend mode over the composite below"));
+        if (layer.source != doc::LayerSourceKind::Slideshow) layer_rows_ui.push_back(blend_control);
         if (doc::layer_is_media(layer)) {
             const size_t n_assets = app.document.assets.size();
             const char** items =
@@ -12225,6 +12413,38 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             ++lslider;
         };
         using LF = FrameUi::LayerField;
+        if (layer.source == doc::LayerSourceKind::Slideshow) {
+            size_t selector = 0;
+            for (const auto& control : slideshow_controls(app.document, layer)) {
+                FrameUi::LayerStage stage{};
+                stage.layer_id = layer.id;
+                stage.field = control.field;
+                stage.staged = arena.alloc<float>();
+                *stage.staged = control.value;
+                stage.original = control.value;
+                stage.changed = arena.alloc<bool>();
+                stage.released = arena.alloc<bool>();
+                LayoutNode* widget;
+                if (control.options.empty()) {
+                    SliderOpts opts;
+                    opts.format = control.format;
+                    opts.hard_max = control.hard_max;
+                    opts.out_changed = stage.changed;
+                    opts.out_released = stage.released;
+                    widget = SliderF(arena, stage.staged, control.lo, control.hi, &ls.sliders[lslider++], opts);
+                } else {
+                    int count = 0;
+                    const char* const* items = option_items(arena, control.options.c_str(), &count);
+                    stage.selected = arena.alloc<int>();
+                    *stage.selected = -1;
+                    widget = Dropdown(arena, items, count, static_cast<int>(control.value),
+                        &ls.slide_dd[selector++], stage.selected, SizeSpec::fill());
+                }
+                out.layer_stages.push_back(stage);
+                layer_rows_ui.push_back(value_row(arena, control.label, widget));
+            }
+            layer_rows_ui.push_back(blend_control);
+        }
         layer_slider(LF::Opacity, "opacity", 0.0f, 1.0f, layer.opacity,
                      "%.2f");
         auto color_swatch_row = [&](const char* label, const float rgba[4],
@@ -12403,12 +12623,12 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         static const char* kAddLayer[] = {"+ solid",   "+ gradient",
                                           "+ noise",   "+ pattern",
                                           "+ osc",     "+ shape",
-                                          "+ media"};
-        for (int t = 0; t < 7; ++t)
+                                          "+ media", "+ slideshow"};
+        for (int t = 0; t < 8; ++t)
             out.add_layer_clicked[t] = arena.alloc<bool>();
         ButtonOpts half;
         half.width = SizeSpec::fill();
-        for (int r = 0; r < 3; ++r) {
+        for (int r = 0; r < 4; ++r) {
             LayoutNode* pair = HStack(
                 arena, {4.0f},
                 {Button(arena, kAddLayer[r * 2],
@@ -12419,9 +12639,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         out.add_layer_clicked[r * 2 + 1], half)});
             rows.push_back(pair);
         }
-        rows.push_back(Button(arena, kAddLayer[6],
-                              &app.add_layer_buttons[6],
-                              out.add_layer_clicked[6], half));
     }
     rows.push_back(Separator(arena));
     }
@@ -12671,6 +12888,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                       TextInput(arena, &app.preset_filter,
                                 &app.preset_search_state, search_opts),
                       well);
+            well_node->width = SizeSpec::fill();
             static const char* kViewLabels[2] = {"list", "grid"};
             static const char* kViewTips[2] = {"tree list view",
                                                "thumbnail gallery view"};
@@ -12678,7 +12896,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             view_picks[0] = out.preset_view_pick[0];
             view_picks[1] = out.preset_view_pick[1];
             StackOpts srow;
-            srow.gap = 4.0f;
+            srow.gap = 8.0f;
+            srow.padding.r = 10.0f;
             srow.cross_align = AlignMode::Center;
             head_rows.push_back(HStack(
                 arena, srow,
@@ -12720,6 +12939,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 FrameUi::GalleryCell cell;
                 cell.id = key;
                 cell.kind = kind;
+                cell.depth = depth;
                 std::string shown = name;
                 cell.renaming =
                     app.text_target.kind == TextEntry::PresetRename &&
@@ -12739,7 +12959,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                             {key, 0, app.preset_scan_stamp});
                 }
                 out.preset_nodes_r.push_back(
-                    {key, kind == 0, cell.out_rect});
+                    {key, kind == 0, cell.out_rect, depth});
                 if (kind == 0) {
                     out.preset_bin_rows.push_back(
                         {key, cell.clicked, cell.ctx});
@@ -12768,7 +12988,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                 arena.dup(name.c_str(), name.size()), depth,
                 (stripe++ & 1) != 0, open_bin, false, &app.preset_sel,
                 clicked, opened, ctx, &rrect);
-            out.preset_nodes_r.push_back({key, kind == 0, rrect});
+            out.preset_nodes_r.push_back({key, kind == 0, rrect, depth});
             rows.push_back(n);
             if (kind == 0) {
                 out.preset_bin_rows.push_back({key, clicked, ctx});
@@ -15161,7 +15381,8 @@ struct ScriptHost {
                 case Wait::Import:
                     // A curves resume holds the slot, but the asset is
                     // already usable.
-                    ready = !app->import || app->import->video_pass_only;
+                    ready = app->media_import_queue.empty() &&
+                        (!app->import || app->import->video_pass_only);
                     break;
                 case Wait::Track:
                     // The main loop resets the finished job, so no job
@@ -15689,6 +15910,12 @@ void register_ops_app(ScriptHost& sh) {
                 else
                     open_source(*sh.app, p);
                 return Value::boolean(true);
+            });
+    env.add("import_folder", "import_folder(path) -> bin id", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = import_folder_as_bin(*sh.app, u8_to_path(a[0].as_str()));
+                if (!id) return op_err(vm, sh.app->status);
+                return Value::number(static_cast<double>(id));
             });
     env.add("import", "import(path) - media into the project", 1, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
@@ -16483,6 +16710,7 @@ void register_ops_graph(ScriptHost& sh) {
                 else if (kind == "osc")
                     k = doc::LayerSourceKind::Oscillator;
                 else if (kind == "shape") k = doc::LayerSourceKind::Shape;
+                else if (kind == "slideshow") k = doc::LayerSourceKind::Slideshow;
                 else
                     return op_err(vm, "unknown source kind \"" + kind +
                                           "\"");
@@ -16548,7 +16776,7 @@ void register_ops_graph(ScriptHost& sh) {
                 if (!l) return op_err(vm, "no such layer");
                 static const char* kinds[] = {
                     "media", "solid", "gradient", "noise", "pattern",
-                    "osc",   "shape", "look",     "sequence"};
+                    "osc",   "shape", "look",     "sequence", "slideshow"};
                 Value m = Value::make_map();
                 map_num(m, "id", static_cast<double>(l->id));
                 map_str(m, "name", l->name);
@@ -16558,6 +16786,17 @@ void register_ops_graph(ScriptHost& sh) {
                 map_num(m, "slip", l->slip);
                 map_bool(m, "timeline_lock", l->timeline_lock);
                 map_num(m, "target", static_cast<double>(l->target));
+                map_num(m, "slide_bin", static_cast<double>(l->slide_bin));
+                map_num(m, "slide_seconds", l->slide_seconds);
+                map_num(m, "slide_speed", l->slide_speed);
+                map_num(m, "slide_fade", l->slide_fade);
+                map_num(m, "slide_fit", l->slide_fit);
+                map_num(m, "slide_order", l->slide_order);
+                map_bool(m, "slide_reverse", l->slide_reverse);
+                map_num(m, "slide_seed", l->slide_seed);
+                map_num(m, "slide_end", l->slide_end);
+                map_bool(m, "slide_subbins", l->slide_subbins);
+                map_bool(m, "slide_video_loop", l->slide_video_loop);
                 Value ca = Value::make_list(), cb = Value::make_list();
                 for (int i = 0; i < 4; ++i) {
                     ca.list->push_back(Value::number(l->color_a[i]));
@@ -16636,6 +16875,17 @@ void register_ops_graph(ScriptHost& sh) {
                 bool b = false;
                 std::string s;
                 if (map_get_str(m, "name", &s)) up.name = s;
+                if (map_get_num(m, "slide_bin", &n)) up.slide_bin = static_cast<uint64_t>(n);
+                if (map_get_num(m, "slide_seconds", &n)) up.slide_seconds = static_cast<float>(std::clamp(n, 0.05, 3600.0));
+                if (map_get_num(m, "slide_speed", &n)) up.slide_speed = static_cast<float>(std::clamp(n, 0.01, 16.0));
+                if (map_get_num(m, "slide_fade", &n)) up.slide_fade = static_cast<float>(std::clamp(n, 0.0, 60.0));
+                if (map_get_num(m, "slide_fit", &n)) up.slide_fit = static_cast<uint32_t>(std::clamp(n, 0.0, 2.0));
+                if (map_get_num(m, "slide_order", &n)) up.slide_order = static_cast<uint32_t>(std::clamp(n, 0.0, 4.0));
+                if (map_get_bool(m, "slide_reverse", &b)) up.slide_reverse = b;
+                if (map_get_num(m, "slide_seed", &n)) up.slide_seed = static_cast<uint32_t>(std::clamp(n, 0.0, 65535.0));
+                if (map_get_num(m, "slide_end", &n)) up.slide_end = static_cast<uint32_t>(std::clamp(n, 0.0, 2.0));
+                if (map_get_bool(m, "slide_subbins", &b)) up.slide_subbins = b;
+                if (map_get_bool(m, "slide_video_loop", &b)) up.slide_video_loop = b;
                 if (map_get_num(m, "asset", &n))
                     up.asset = static_cast<uint64_t>(n);
                 if (map_get_num(m, "slip", &n))
@@ -19890,6 +20140,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             asset_id = a.id;
                     app.undo.begin_group("Import");
                     asset_id = ensure_asset(app, job->source, asset_id);
+                    if (job->import_bin && app.document.find_bin(job->import_bin))
+                        app.undo.execute(app.document, doc::set_entity_bin_command(asset_id, job->import_bin));
                     if (job->bind_layer) {
                         doc::Look* bl2 =
                             app.document.find_look(job->bind_look);
@@ -19966,10 +20218,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         // Drain user drops before the background resume below.
         if (!app.import && !app.media_import_queue.empty()) {
-            const std::filesystem::path next =
+            const auto next =
                 std::move(app.media_import_queue.front());
             app.media_import_queue.erase(app.media_import_queue.begin());
-            import_media(app, next);
+            import_media(app, next.path, next.bin);
         }
 
         if (app.video_pass_scan_stamp != app.bundle_stamp) {
@@ -20459,6 +20711,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         };
         const bool browser_gal = app.browser_view == 1;
         const bool preset_gal = app.preset_view == 1;
+        ui::Rect browser_bin_area, preset_bin_area;
+        const auto* browser_bin_target = app.browser_drag_id && !ctx.modal_open()
+            ? library_bin_at(frame_ui.browser_nodes, input.mouse, &browser_bin_area)
+            : nullptr;
+        const auto* preset_bin_target = app.preset_drag_key && !ctx.modal_open()
+            ? library_bin_at(frame_ui.preset_nodes_r, input.mouse, &preset_bin_area)
+            : nullptr;
 
         if (app.ctx_menu.kind && app.ctx_menu_dd.open &&
             (input.left_pressed() || input.right_pressed()) &&
@@ -20798,11 +21057,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (!input.left_down()) {
             if (app.browser_drag_live) {
                 bool dropped = false;
-                for (const FrameUi::BrowserNode& bn :
-                     frame_ui.browser_nodes) {
-                    if (!bn.is_bin || bn.id == app.browser_drag_id)
-                        continue;
-                    if (!row_under_mouse(bn, browser_gal)) continue;
+                if (browser_bin_target) {
+                    const FrameUi::BrowserNode& bn = *browser_bin_target;
                     if (app.browser_drag_is_bin) {
                         if (!doc::bin_reaches(app.document, bn.id,
                                               app.browser_drag_id)) {
@@ -20820,7 +21076,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     }
                     app.bin_closed.erase(bn.id);
                     dropped = true;
-                    break;
                 }
                 if (!dropped && !app.browser_drag_is_bin &&
                     !app.scope_is_look()) {
@@ -20936,18 +21191,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
         }
         if (app.browser_drag_live) {
-            for (const FrameUi::BrowserNode& bn : frame_ui.browser_nodes) {
-                if (!bn.is_bin || bn.id == app.browser_drag_id) continue;
-                if (!row_under_mouse(bn, browser_gal)) continue;
+            if (browser_bin_target) {
+                const FrameUi::BrowserNode& bn = *browser_bin_target;
                 const bool ok =
                     !app.browser_drag_is_bin ||
                     !doc::bin_reaches(app.document, bn.id,
                                       app.browser_drag_id);
                 if (ok)
                     canvas.draw_sdf_rect_outline(
-                        *bn.rect, 3.0f, 1.5f,
+                        browser_bin_area, 3.0f, 1.5f,
                         ui::active_theme().accent);
-                break;
             }
             if (!app.browser_drag_is_bin && !app.scope_is_look())
                 for (const FrameUi::LaneNode& ln : frame_ui.lane_nodes) {
@@ -24226,14 +24479,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 const char* pname =
                     app.presets[static_cast<size_t>(dpi)].name.c_str();
                 const ui::Theme& th = ui::active_theme();
-                for (const FrameUi::BrowserNode& pn :
-                     frame_ui.preset_nodes_r) {
-                    if (!pn.is_bin || !row_under_mouse(pn, preset_gal))
-                        continue;
-                    if (preset_bin_of(app, pn.id))
-                        canvas.draw_sdf_rect_outline(*pn.rect, 3.0f, 1.5f,
+                if (preset_bin_target) {
+                    if (preset_bin_of(app, preset_bin_target->id))
+                        canvas.draw_sdf_rect_outline(preset_bin_area, 3.0f, 1.5f,
                                                      th.accent);
-                    break;
                 }
                 const Vec2 ts = ui::measure_text(font, pname, 11.0f);
                 const ui::Rect gr{input.mouse.x + 12.0f,
@@ -24253,17 +24502,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             const int pi = preset_index_of(app, key);
             if (live && pi >= 0) {
                 bool dropped = false;
-                for (const FrameUi::BrowserNode& pn :
-                     frame_ui.preset_nodes_r) {
-                    if (!pn.is_bin || !row_under_mouse(pn, preset_gal))
-                        continue;
+                if (preset_bin_target) {
+                    const FrameUi::BrowserNode& pn = *preset_bin_target;
                     if (const std::string* bin =
                             preset_bin_of(app, pn.id)) {
                         preset_move_file(app, key, *bin);
                         app.preset_bin_closed.erase(pn.id);
                     }
                     dropped = true;
-                    break;
                 }
                 if (!dropped && !ctx.modal_open() && frame_ui.canvas_node &&
                     frame_ui.canvas_node->rect.contains(input.mouse)) {
@@ -24869,6 +25115,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
         for (const FrameUi::LayerStage& stage : frame_ui.layer_stages) {
+            if (stage.selected && *stage.selected >= 0) {
+                *stage.staged = static_cast<float>(*stage.selected);
+                *stage.changed = true;
+                *stage.released = true;
+            }
             if (*stage.changed && *stage.staged != stage.original) {
                 doc::Layer* layer = nullptr;
                 for (doc::Layer& l : app.look().layers)
@@ -24878,6 +25129,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 using LF = FrameUi::LayerField;
                 doc::Layer edited = *layer;
                 switch (stage.field) {
+                    case LF::SlideBin: {
+                        const int index = static_cast<int>(v + 0.5f);
+                        if (index >= 0 && index <= static_cast<int>(app.document.bins.size()))
+                            edited.slide_bin = index == 0 ? 0 : app.document.bins[index - 1].id;
+                        break;
+                    }
+                    case LF::SlideSubbins: edited.slide_subbins = v >= 0.5f; break;
+                    case LF::SlideFit: edited.slide_fit = static_cast<uint32_t>(v + 0.5f); break;
+                    case LF::SlideOrder: edited.slide_order = static_cast<uint32_t>(v + 0.5f); break;
+                    case LF::SlideReverse: edited.slide_reverse = v >= 0.5f; break;
+                    case LF::SlideSeed: edited.slide_seed = static_cast<uint32_t>(v + 0.5f); break;
+                    case LF::SlideSeconds:
+                        edited.slide_seconds = v;
+                        edited.slide_fade = std::min(edited.slide_fade, v);
+                        break;
+                    case LF::SlideSpeed: edited.slide_speed = v; break;
+                    case LF::SlideFade: edited.slide_fade = v; break;
+                    case LF::SlideEnd: edited.slide_end = static_cast<uint32_t>(v + 0.5f); break;
+                    case LF::SlideVideoLoop: edited.slide_video_loop = v >= 0.5f; break;
                     case LF::Opacity: edited.opacity = v; break;
                     case LF::ColorAR: edited.color_a[0] = v; break;
                     case LF::ColorAG: edited.color_a[1] = v; break;
@@ -25007,13 +25277,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
         }
         {
-            static const doc::LayerSourceKind kAddKinds[7] = {
+            static const doc::LayerSourceKind kAddKinds[8] = {
                 doc::LayerSourceKind::Solid, doc::LayerSourceKind::Gradient,
                 doc::LayerSourceKind::Noise, doc::LayerSourceKind::TestPattern,
                 doc::LayerSourceKind::Oscillator,
                 doc::LayerSourceKind::Shape,
-                doc::LayerSourceKind::Media};
-            for (int t = 0; t < 7; ++t) {
+                doc::LayerSourceKind::Media, doc::LayerSourceKind::Slideshow};
+            for (int t = 0; t < 8; ++t) {
                 if (frame_ui.add_layer_clicked[t] &&
                     *frame_ui.add_layer_clicked[t] &&
                     app.look().layers.size() < doc::kMaxLayers) {
@@ -25091,6 +25361,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                              u8_to_path(app.recent_projects[rrow.index]),
                              window.get());
             break;
+        }
+        if (frame_ui.import_folder_clicked && *frame_ui.import_folder_clicked) {
+            if (auto folder = platform::show_folder_dialog(window.get()))
+                import_folder_as_bin(app, *folder);
         }
         if (frame_ui.cache_open_clicked && *frame_ui.cache_open_clicked) {
             const std::wstring dir =
@@ -25262,7 +25536,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             app, p, timeline_frame_at(app, at.x), 0);
                     if (!placed) open_source(app, p);
                 } else {
-                    app.media_import_queue.push_back(p);
+                    app.media_import_queue.push_back({p, 0});
                     app.status =
                         "queued for import: " + path_to_u8(p.filename());
                 }

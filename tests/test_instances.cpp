@@ -8,6 +8,8 @@
 #include "doc/group_commands.h"
 #include "doc/layer_commands.h"
 #include "doc/stack_commands.h"
+#include "doc/serialize.h"
+#include "media/decode_pool.h"
 #include "gfx/graph.h"
 #include "doc_fixture.h"
 #include "test_framework.h"
@@ -62,6 +64,191 @@ TEST(flatten_block_spans_its_target) {
     const uint64_t layer_id = rig.doc.looks[0].layers[0].id;
     CHECK_EQ(c.key,
              hash_combine(hash_combine(path, layer_id), rig.asset));
+}
+
+TEST(slideshow_bins_sort_and_serialization) {
+    auto d = doc_with_look();
+    d.fps = 30;
+    d.bins = {{30, "selected", 0}, {31, "child", 30}, {32, "other", 0}};
+    auto& layer = d.looks[0].layers[0];
+    layer.source = doc::LayerSourceKind::Slideshow;
+    layer.slide_bin = 30;
+    layer.slide_seconds = 2;
+    layer.slide_speed = 2;
+    for (int i = 0; i < 4; ++i) {
+        doc::Asset a;
+        a.id = 100 + i;
+        a.name = std::string(1, static_cast<char>('d' - i));
+        a.width = 100 + i * 100;
+        a.height = 100;
+        a.byte_size = 400 - i * 100;
+        a.frame_count = 60 + i * 30;
+        a.fps = 30;
+        a.bin = i == 0 ? 30 : i == 1 ? 31 : 32;
+        d.assets.push_back(a);
+    }
+    doc::Asset audio = d.assets[0];
+    audio.id = 200;
+    audio.path = "cover.MP3";
+    d.assets.push_back(audio);
+    CHECK_EQ(doc::slideshow_assets(d, layer).size(), size_t{2});
+    CHECK_EQ(doc::slideshow_assets(d, layer)[0]->id, uint64_t{101});
+    CHECK_EQ(doc::layer_source_length(d, layer, 30), 60u);
+    layer.slide_subbins = false;
+    CHECK_EQ(doc::slideshow_assets(d, layer).size(), size_t{1});
+    layer.slide_subbins = true;
+    layer.slide_order = 1;
+    CHECK_EQ(doc::slideshow_assets(d, layer)[0]->id, uint64_t{101});
+    layer.slide_order = 2;
+    CHECK_EQ(doc::slideshow_assets(d, layer)[0]->id, uint64_t{100});
+    layer.slide_order = 3;
+    CHECK_EQ(doc::slideshow_assets(d, layer)[0]->id, uint64_t{100});
+    layer.slide_reverse = true;
+    CHECK_EQ(doc::slideshow_assets(d, layer)[0]->id, uint64_t{101});
+    layer.slide_order = 4;
+    layer.slide_seed = 43;
+    const uint64_t shuffled = doc::slideshow_assets(d, layer)[0]->id;
+    std::reverse(d.assets.begin(), d.assets.end());
+    CHECK_EQ(doc::slideshow_assets(d, layer)[0]->id, shuffled);
+    layer.slide_fade = 0.4f;
+    layer.slide_fit = 2;
+    layer.slide_video_loop = true;
+    layer.slide_end = 1;
+    const auto json = doc::doc_to_json(d);
+    const Document loaded = doc::doc_from_json(json);
+    const auto& copy = loaded.looks[0].layers[0];
+    CHECK(copy.source == doc::LayerSourceKind::Slideshow);
+    CHECK_EQ(copy.slide_bin, layer.slide_bin);
+    CHECK_EQ(copy.slide_fit, layer.slide_fit);
+    CHECK_EQ(copy.slide_order, layer.slide_order);
+    CHECK_EQ(copy.slide_seed, layer.slide_seed);
+    CHECK_EQ(copy.slide_seconds, layer.slide_seconds);
+    CHECK_EQ(copy.slide_speed, layer.slide_speed);
+    CHECK_EQ(copy.slide_fade, layer.slide_fade);
+    CHECK(copy.slide_reverse && copy.slide_video_loop);
+    CHECK_EQ(copy.slide_end, layer.slide_end);
+    CHECK_EQ(loaded.assets[0].byte_size, d.assets[0].byte_size);
+}
+
+TEST(slideshow_decode_plan_matches_graph_through_time_maps) {
+    Rig rig;
+    rig.doc.fps = 30;
+    auto& look = rig.doc.looks[0];
+    auto& layer = look.layers[0];
+    layer.source = doc::LayerSourceKind::Slideshow;
+    layer.slide_seconds = 1;
+    layer.slide_fade = 0.2f;
+    auto& first = rig.doc.assets[0];
+    first.width = 160;
+    first.height = 120;
+    first.name = "a";
+    first.still = true;
+    doc::Asset second = first;
+    second.id = rig.doc.next_effect_id++;
+    second.name = "b";
+    second.still = false;
+    second.fps = 24;
+    rig.doc.assets.push_back(second);
+    std::vector<media::AssetBundle> bundles;
+    for (const auto& a : rig.doc.assets) {
+        media::AssetBundle bundle;
+        bundle.asset = a.id;
+        bundle.frames = a.frame_count;
+        bundle.mez = "unused.mez";
+        bundles.push_back(bundle);
+    }
+    rig.placement().t_in = 10;
+    rig.placement().t_out = 400;
+    rig.placement().source_in = 12;
+    rig.placement().speed = 0.5f;
+    media::DecodePool pool("slideshow-test");
+    uint64_t revision = 0;
+    for (uint32_t end = 0; end < 3; ++end) {
+        layer.slide_end = end;
+        for (float speed : {0.5f, 2.0f}) {
+            layer.slide_speed = speed;
+            pool.set_document(rig.doc, rig.doc.root_sequence, bundles, ++revision);
+            for (uint32_t frame : {0u, 10u, 46u, 50u, 70u, 82u, 130u, 250u, 399u, 400u}) {
+                const auto requests = pool.plan(frame);
+                const auto graph = gfx::compile_graph(rig.doc, rig.doc.root_sequence, frame);
+                CHECK(graph.valid);
+                std::vector<uint64_t> keys;
+                for (const auto& node : graph.nodes)
+                    if (node.kind == gfx::GraphNode::Kind::Source) keys.push_back(node.key);
+                CHECK_EQ(keys.size(), requests.size());
+                for (const auto& request : requests)
+                    CHECK(std::find(keys.begin(), keys.end(), request.key) != keys.end());
+            }
+        }
+    }
+}
+
+TEST(slideshow_video_frames_and_crossfade) {
+    MediaInstance c;
+    c.t_out = 1000;
+    c.slide_count = 2;
+    c.slide_index = 1;
+    c.slide_period = 30;
+    c.slide_fade = 6;
+    c.rate = 24.0 / 30.0;
+    CHECK(!doc::media_active(c, 29));
+    CHECK(doc::media_active(c, 30));
+    CHECK_EQ(doc::media_asset_frame(c, 40), 8.0);
+    CHECK(doc::media_active(c, 63));
+    CHECK_EQ(doc::media_asset_frame(c, 63), 23.0);
+    CHECK(!doc::media_active(c, 66));
+    c.slide_end = 1;
+    CHECK(doc::media_active(c, 600));
+    c.slide_end = 2;
+    CHECK(!doc::media_active(c, 60));
+    c.slide_end = 0;
+    c.repeat_frames = 6;
+    CHECK_EQ(doc::media_asset_frame(c, 40), 2.0);
+    const auto fade = doc::slideshow_sample(33, 30, 2, 6, 0);
+    CHECK_EQ(fade.current, size_t{1});
+    CHECK_EQ(fade.previous, size_t{0});
+    CHECK_EQ(fade.mix, 0.5f);
+}
+
+TEST(slideshow_large_bin_keeps_other_source_streams) {
+    auto d = doc_with_look();
+    auto& look = d.looks[0];
+    look.layers[0].source = doc::LayerSourceKind::Slideshow;
+    for (uint64_t i = 0; i < 1100; ++i) {
+        doc::Asset asset;
+        asset.id = d.next_effect_id++;
+        asset.width = asset.height = 64;
+        asset.frame_count = 30;
+        asset.still = true;
+        d.assets.push_back(asset);
+    }
+    doc::Layer media;
+    media.id = d.next_effect_id++;
+    media.asset = d.assets[0].id;
+    look.layers.push_back(media);
+    const auto sources = doc::flatten_media_sources(d, look.id);
+    CHECK_EQ(sources.size(), size_t{1101});
+    CHECK_EQ(sources.back().layer, media.id);
+    int active = 0;
+    for (const auto& source : sources) if (doc::media_active(source, 0)) ++active;
+    CHECK_EQ(active, 2);
+}
+
+TEST(slideshow_fit_modes) {
+    float rect[4];
+    gfx::source_fit_rect(100, 200, 400, 300, rect, 0);
+    CHECK_EQ(rect[0], 125.0f);
+    CHECK_EQ(rect[2], 150.0f);
+    CHECK_EQ(rect[3], 300.0f);
+    gfx::source_fit_rect(100, 200, 400, 300, rect, 1);
+    CHECK_EQ(rect[1], -250.0f);
+    CHECK_EQ(rect[2], 400.0f);
+    CHECK_EQ(rect[3], 800.0f);
+    gfx::source_fit_rect(100, 200, 400, 300, rect, 2);
+    CHECK_EQ(rect[0], 0.0f);
+    CHECK_EQ(rect[1], 0.0f);
+    CHECK_EQ(rect[2], 400.0f);
+    CHECK_EQ(rect[3], 300.0f);
 }
 
 TEST(flatten_composes_block_map_and_slip_in_closed_form) {

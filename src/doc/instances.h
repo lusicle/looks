@@ -113,6 +113,12 @@ struct MediaInstance {
     int64_t shift = 0;
     // Composed gain: 0 when anything on the path is muted.
     float gain = 1.0f;
+    uint32_t slide_count = 0;
+    uint32_t slide_index = 0;
+    double slide_period = 0.0;
+    double slide_fade = 0.0;
+    uint32_t slide_end = 0;
+    uint32_t repeat_frames = 0;
 };
 
 // Culls and emits in the same order as compile does.
@@ -145,7 +151,11 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
                                uint64_t node);
 
 inline bool media_active(const MediaInstance& c, double root_frame) {
-    return root_frame >= c.t_in && root_frame < c.t_out;
+    if (root_frame < c.t_in || root_frame >= c.t_out) return false;
+    if (!c.slide_count) return true;
+    const auto sample = slideshow_sample((root_frame - c.t_in) * c.speed + c.source_in,
+        c.slide_period, c.slide_count, c.slide_fade, c.slide_end);
+    return sample.current == c.slide_index || sample.previous == c.slide_index;
 }
 
 // The local-clock position only: no rate, no shift.
@@ -155,8 +165,15 @@ inline double media_source_frame(const MediaInstance& c, double root_frame) {
 
 // Callers must clamp into the asset: a window can outlive its media.
 inline double media_asset_frame(const MediaInstance& c, double root_frame) {
-    return std::floor(media_source_frame(c, root_frame) * c.rate) +
-           static_cast<double>(c.shift);
+    double source = media_source_frame(c, root_frame);
+    if (c.slide_count) {
+        const auto sample = slideshow_sample(source, c.slide_period,
+            c.slide_count, c.slide_fade, c.slide_end);
+        source = sample.current == c.slide_index ? sample.frame :
+            std::max(0.0, c.slide_period - 1.0);
+    }
+    const double frame = std::floor(source * c.rate) + static_cast<double>(c.shift);
+    return c.repeat_frames ? std::fmod(std::max(0.0, frame), c.repeat_frames) : frame;
 }
 
 }  // namespace looks::doc

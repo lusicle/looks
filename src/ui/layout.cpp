@@ -1,4 +1,5 @@
 #include "ui/layout.h"
+#include "ui/theme.h"
 
 #include <algorithm>
 
@@ -380,12 +381,14 @@ struct ScrollBar {
 ScrollBar scrollbar_of(const LayoutNode& node) {
     ScrollBar b;
     const ScrollState* s = node.scroll;
-    if (!s || s->content <= s->viewport + 0.5f) return b;
+    if (!s) return b;
     const Rect& r = node.rect;
     b.track = {r.right() - kScrollbarWidth - kScrollbarPad, r.y + kScrollbarPad,
                kScrollbarWidth, r.h - kScrollbarPad * 2.0f};
+    if (b.track.empty()) return b;
+    if (s->content <= s->viewport + 0.5f) return b;
     const float thumb_h =
-        std::max(24.0f, b.track.h * (s->viewport / s->content));
+        std::min(b.track.h, std::max(24.0f, b.track.h * (s->viewport / s->content)));
     b.range = s->content - s->viewport;
     const float t = b.range > 0.0f ? s->offset / b.range : 0.0f;
     b.thumb = {b.track.x, b.track.y + (b.track.h - thumb_h) * t, b.track.w,
@@ -404,6 +407,9 @@ void hit_scrollbar(LayoutNode& node, LayoutFrame& frame) {
 
 void draw_scrollbar(LayoutNode& node, LayoutFrame& frame) {
     const ScrollBar b = scrollbar_of(node);
+    if (b.track.empty()) return;
+    frame.canvas.draw_sdf_rect(b.track, kScrollbarWidth * 0.5f,
+                               frame.theme.control_bg);
     if (!b.visible) return;
     ScrollState* s = node.scroll;
     const Gesture g =
@@ -416,11 +422,9 @@ void draw_scrollbar(LayoutNode& node, LayoutFrame& frame) {
             denom > 0.0f ? clampf(new_top / denom, 0.0f, 1.0f) * b.range : 0.0f;
     }
 
-    frame.canvas.draw_sdf_rect(b.track, kScrollbarWidth * 0.5f,
-                               Color::hex(0x000000, 0.35f));
     frame.canvas.draw_sdf_rect(
         b.thumb, kScrollbarWidth * 0.5f,
-        Color::hex(0x5A5D63, g.drag_active ? 1.0f : 0.8f));
+        g.drag_active ? frame.theme.text_dim : frame.theme.text_disabled);
 }
 
 }  // namespace

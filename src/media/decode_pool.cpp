@@ -85,6 +85,12 @@ uint64_t mapping_hash(const doc::MediaInstance& c) {
     k = mix64(k, bits_of(c.speed));
     k = mix64(k, bits_of(c.rate));
     k = mix64(k, static_cast<uint64_t>(c.shift));
+    k = mix64(k, c.slide_count);
+    k = mix64(k, c.slide_index);
+    k = mix64(k, bits_of(c.slide_period));
+    k = mix64(k, bits_of(c.slide_fade));
+    k = mix64(k, c.slide_end);
+    k = mix64(k, c.repeat_frames);
     return k;
 }
 
@@ -147,7 +153,10 @@ void DecodePool::set_document(const doc::Document& doc, uint64_t look_id,
                 a.asset != b.asset || a.t_in != b.t_in ||
                 a.t_out != b.t_out || a.source_in != b.source_in ||
                 a.speed != b.speed || a.rate != b.rate ||
-                a.shift != b.shift || a.gain != b.gain) {
+                a.shift != b.shift || a.gain != b.gain ||
+                a.slide_count != b.slide_count || a.slide_index != b.slide_index ||
+                a.slide_period != b.slide_period || a.slide_fade != b.slide_fade ||
+                a.slide_end != b.slide_end || a.repeat_frames != b.repeat_frames) {
                 same = false;
                 break;
             }
@@ -996,6 +1005,8 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         const doc::MediaInstance& c = sources_[i];
         const double first = std::max(horizons[h].lo, std::ceil(c.t_in));
         if (first >= c.t_out || first > horizons[h].hi) continue;
+        if (c.slide_count && !doc::media_active(c, first) &&
+            !doc::media_active(c, std::min(horizons[h].hi, c.t_out - 1.0))) continue;
         const AssetBundle* b = find_bundle(bundles_, c.asset);
         if (!b || bundle_video(*b).empty() || b->frames == 0) continue;
         double at = std::max(

@@ -15,6 +15,7 @@ struct Asset {
     uint64_t id = 0;
     std::string name;
     std::string path;      // mezzanine bundle path
+    uint64_t byte_size = 0;
     uint32_t frame_count = 0;
     double fps = 0.0;
     uint32_t width = 0, height = 0;
@@ -95,6 +96,7 @@ enum class LayerSourceKind : uint32_t {
     Shape,
     LookRef,
     SequenceRef,
+    Slideshow,
     Count,
 };
 
@@ -182,6 +184,17 @@ struct Layer {
     // Placement speed and source_in stop applying to a locked node.
     bool timeline_lock = false;
     uint64_t target = 0;
+    uint64_t slide_bin = 0;
+    float slide_seconds = 3.0f;
+    float slide_speed = 1.0f;
+    float slide_fade = 0.0f;
+    uint32_t slide_fit = 0;
+    uint32_t slide_order = 0;
+    bool slide_reverse = false;
+    uint32_t slide_seed = 1;
+    uint32_t slide_end = 0;
+    bool slide_subbins = true;
+    bool slide_video_loop = false;
     // Generators: color_a start, color_b end, gen_scale cells, gen_angle dir.
     float color_a[4] = {0.5f, 0.5f, 0.5f, 1.0f};
     float color_b[4] = {0.1f, 0.1f, 0.1f, 1.0f};
@@ -524,10 +537,50 @@ inline uint32_t conform_frames(uint32_t frames, double ratio) {
         std::ceil(static_cast<double>(frames) / ratio));
 }
 
-// Returns frames on the owning look clock. 0 = unbounded.
+std::vector<const Asset*> slideshow_assets(const Document& doc, const Layer& layer);
+
+inline double slideshow_period(const Layer& layer, double fps) {
+    return std::max(1.0, static_cast<double>(layer.slide_seconds) * fps);
+}
+
+inline double slideshow_position(double time, double cycle, uint32_t end) {
+    if (cycle <= 0.0 || time < 0.0) return -1.0;
+    if (time < cycle) return time;
+    if (end == 0) return std::fmod(time, cycle);
+    return end == 1 ? std::nextafter(cycle, 0.0) : -1.0;
+}
+
+struct SlideSample {
+    size_t current = SIZE_MAX;
+    size_t previous = SIZE_MAX;
+    double frame = 0.0;
+    float mix = 1.0f;
+};
+
+inline SlideSample slideshow_sample(double time, double period, size_t count,
+                                     double fade, uint32_t end) {
+    SlideSample sample;
+    const double position = slideshow_position(time, period * count, end);
+    if (position < 0.0 || !count) return sample;
+    sample.current = std::min(static_cast<size_t>(position / period), count - 1);
+    sample.frame = position - sample.current * period;
+    fade = std::clamp(fade, 0.0, period);
+    if (count > 1 && fade > 0.0 && sample.frame < fade &&
+        (sample.current > 0 || time >= period * count)) {
+        sample.previous = (sample.current + count - 1) % count;
+        sample.mix = static_cast<float>(sample.frame / fade);
+    }
+    return sample;
+}
+
 inline uint32_t layer_source_length(const Document& doc, const Layer& l,
                                     double clock_fps, int depth = 0) {
     if (depth >= kMaxLookDepth) return 0;
+    if (l.source == LayerSourceKind::Slideshow) {
+        const double frames = slideshow_assets(doc, l).size() *
+            slideshow_period(l, clock_fps) / std::max(0.01f, l.slide_speed);
+        return static_cast<uint32_t>(std::min(std::ceil(frames), 4294967295.0));
+    }
     if (layer_is_media(l)) {
         const Asset* a = doc.find_asset(l.asset);
         if (!a || !a->frame_count) return 0;

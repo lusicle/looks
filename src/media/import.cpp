@@ -823,6 +823,12 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
     return result;
 }
 
+bool is_still_image(const std::filesystem::path& source) {
+    const auto ext = lower_ext(source);
+    return ext == L".png" || ext == L".tga" || ext == L".jpg" || ext == L".jpeg" ||
+        ext == L".bmp" || ext == L".tif" || ext == L".tiff" || ext == L".gif";
+}
+
 ImportResult import_media(const std::filesystem::path& source,
                           const std::filesystem::path& dest_dir,
                           const ImportOptions& options,
@@ -830,7 +836,7 @@ ImportResult import_media(const std::filesystem::path& source,
     ImportResult result;
 
     const std::wstring ext = lower_ext(source);
-    if (ext == L".png" || ext == L".tga") {
+    if (is_still_image(source)) {
         import_still(source, dest_dir, options, progress, &result);
         return result;
     }

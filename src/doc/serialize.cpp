@@ -18,7 +18,7 @@ const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
 const char* const kSourceKindNames[] = {"media", "solid", "gradient",
                                         "noise", "test",  "oscillator",
-                                        "shape", "look",  "sequence"};
+                                        "shape", "look",  "sequence", "slideshow"};
 static_assert(sizeof(kSourceKindNames) / sizeof(kSourceKindNames[0]) ==
                   static_cast<size_t>(LayerSourceKind::Count),
               "source kind names track the enum");
@@ -366,6 +366,19 @@ Value layer_to_json(const Layer& l) {
     if (l.slip) v.set("slip", static_cast<int64_t>(l.slip));
     if (l.timeline_lock) v.set("timeline_lock", true);
     if (l.target) v.set("target", static_cast<int64_t>(l.target));
+    if (l.source == LayerSourceKind::Slideshow) {
+        v.set("slide_bin", static_cast<int64_t>(l.slide_bin));
+        v.set("slide_seconds", static_cast<double>(l.slide_seconds));
+        v.set("slide_speed", static_cast<double>(l.slide_speed));
+        v.set("slide_fade", static_cast<double>(l.slide_fade));
+        v.set("slide_fit", static_cast<int64_t>(l.slide_fit));
+        v.set("slide_order", static_cast<int64_t>(l.slide_order));
+        v.set("slide_reverse", l.slide_reverse);
+        v.set("slide_seed", static_cast<int64_t>(l.slide_seed));
+        v.set("slide_end", static_cast<int64_t>(l.slide_end));
+        v.set("slide_subbins", l.slide_subbins);
+        v.set("slide_video_loop", l.slide_video_loop);
+    }
     v.set("color_a", fn_to_json(l.color_a));
     v.set("color_b", fn_to_json(l.color_b));
     v.set("gen_scale", static_cast<double>(l.gen_scale));
@@ -451,6 +464,17 @@ Layer layer_from_json(const Value& v) {
     l.slip = static_cast<uint32_t>(v.get("slip").as_int(0));
     l.timeline_lock = v.get("timeline_lock").as_bool(false);
     l.target = static_cast<uint64_t>(v.get("target").as_int(0));
+    l.slide_bin = static_cast<uint64_t>(v.get("slide_bin").as_int(0));
+    l.slide_seconds = std::clamp(num(v, "slide_seconds", 3.0f), 0.05f, 3600.0f);
+    l.slide_speed = std::clamp(num(v, "slide_speed", 1.0f), 0.01f, 16.0f);
+    l.slide_fade = std::clamp(num(v, "slide_fade", 0.0f), 0.0f, 60.0f);
+    l.slide_fit = static_cast<uint32_t>(std::clamp<int64_t>(v.get("slide_fit").as_int(0), 0, 2));
+    l.slide_order = static_cast<uint32_t>(std::clamp<int64_t>(v.get("slide_order").as_int(0), 0, 4));
+    l.slide_reverse = v.get("slide_reverse").as_bool(false);
+    l.slide_seed = static_cast<uint32_t>(v.get("slide_seed").as_int(1));
+    l.slide_end = static_cast<uint32_t>(std::clamp<int64_t>(v.get("slide_end").as_int(0), 0, 2));
+    l.slide_subbins = v.get("slide_subbins").as_bool(true);
+    l.slide_video_loop = v.get("slide_video_loop").as_bool(false);
     fn_from_json(v.get("color_a"), l.color_a);
     fn_from_json(v.get("color_b"), l.color_b);
     l.gen_scale = num(v, "gen_scale", 6.0f);
@@ -529,6 +553,7 @@ Value asset_to_json(const Asset& a) {
     v.set("id", static_cast<int64_t>(a.id));
     v.set("name", a.name);
     v.set("path", a.path);
+    if (a.byte_size) v.set("bytes", static_cast<int64_t>(a.byte_size));
     if (a.frame_count)
         v.set("frames", static_cast<int64_t>(a.frame_count));
     if (a.fps > 0.0) v.set("fps", a.fps);
@@ -549,6 +574,7 @@ Asset asset_from_json(const Value& v) {
     a.id = static_cast<uint64_t>(v.get("id").as_int(0));
     a.name = v.get("name").as_string();
     a.path = v.get("path").as_string();
+    a.byte_size = static_cast<uint64_t>(std::max<int64_t>(0, v.get("bytes").as_int(0)));
     a.frame_count = static_cast<uint32_t>(v.get("frames").as_int(0));
     a.fps = v.get("fps").as_number(0.0);
     a.width = static_cast<uint32_t>(v.get("width").as_int(0));

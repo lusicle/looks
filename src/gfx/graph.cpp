@@ -39,7 +39,8 @@ struct Compiler {
             node.kind == GraphNode::Kind::LayerTransform ||
             node.kind == GraphNode::Kind::MatteExtract ||
             node.kind == GraphNode::Kind::MatteApply ||
-            node.kind == GraphNode::Kind::GroupMix) {
+            node.kind == GraphNode::Kind::GroupMix ||
+            node.kind == GraphNode::Kind::Crossfade) {
             key = hash_combine(key, static_cast<uint64_t>(node.kind));
             for (int input : node.inputs) key = hash_combine(key, graph.nodes[input].key);
         }
@@ -250,7 +251,28 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         const doc::Layer& layer = look.layers[li];
         if (!layer.visible) continue;
         int cur = -1;
-        if (doc::layer_is_media(layer)) {
+        if (layer.source == doc::LayerSourceKind::Slideshow) {
+            const auto assets = doc::slideshow_assets(doc, layer);
+            const auto sample = doc::slideshow_sample(self.local_time * std::max(0.01f, layer.slide_speed),
+                doc::slideshow_period(layer, eff), assets.size(), layer.slide_fade * eff, layer.slide_end);
+            if (sample.current == SIZE_MAX) continue;
+            auto slide_source = [&](size_t index) {
+                GraphNode src;
+                src.kind = GraphNode::Kind::Source;
+                src.layer_index = static_cast<int>(li);
+                return add(std::move(src), inst,
+                    doc::media_stream_key(path, layer.id, assets[index]->id, false, 0));
+            };
+            cur = slide_source(sample.current);
+            if (graph.source < 0) graph.source = cur;
+            if (sample.previous != SIZE_MAX) {
+                GraphNode mix;
+                mix.kind = GraphNode::Kind::Crossfade;
+                mix.inputs = {slide_source(sample.previous), cur};
+                mix.p_opacity = sample.mix;
+                cur = add(std::move(mix), inst, subject_key(layer.id));
+            }
+        } else if (doc::layer_is_media(layer)) {
             // An unbound media node is dormant, like an unwired port.
             // A timeline-locked node reads and windows on the root clock.
             if (!layer.asset) continue;
