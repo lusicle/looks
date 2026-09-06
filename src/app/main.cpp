@@ -2105,7 +2105,6 @@ struct EffectUiState {
     ui::ButtonState route_buttons[18], key_buttons[18], expose_buttons[18];
     ui::ButtonState group_button, rnd_button;
     ui::ButtonState solo_button, copy_button;
-    ui::TextInputState value_edit_state;
     ui::DropdownState param_dd[16];
     ui::SwatchState param_swatch[18];
     ui::TextInputState text_state;
@@ -2138,7 +2137,6 @@ struct LayerUiState {
     std::unordered_map<uint64_t, ui::SwatchState> stop_swatch;
     std::unordered_map<uint64_t, ui::SwatchState> hue_swatch;
     ui::SliderState sliders[22];
-    ui::TextInputState value_edit_state;
     ui::ButtonState route_buttons[22], key_buttons[22];
     bool xf_open = false;
     ui::ButtonState xf_header, flip_h_btn, flip_v_btn, lock_btn;
@@ -2368,7 +2366,7 @@ struct ConfirmDialog {
 };
 
 enum class TextEntry : uint8_t {
-    None, Duration, KeyEdit, RailEdit, ValueEdit, FrameRename, GroupRename,
+    None, Duration, KeyEdit, FrameRename, GroupRename,
     TextEdit, BrowserRename, PresetRename
 };
 
@@ -2379,7 +2377,6 @@ struct TextTarget {
     int mode = 0;
     doc::ParamKey key{};
     double at = 0.0;
-    float scale = 1.0f;
 };
 
 struct AppState {
@@ -2548,9 +2545,6 @@ struct AppState {
     // sel stays the primary rail selection.
     std::vector<uint64_t> multi_sel;
     std::vector<flow::Wire> sel_wires;
-    uint64_t value_commit_node = 0;
-    int value_commit_row = -1;
-    double value_commit_typed = 0.0;
     bool find_mode = false;
     // Ids remap on paste.
     struct CanvasClipboard {
@@ -2731,8 +2725,6 @@ struct AppState {
     doc::ParamKey key_commit_target{};
     double key_commit_frame = 0.0;
     double key_commit_num = 0.0;
-    doc::ParamKey rail_commit_key{};
-    double rail_commit_value = 0.0;
     // Paste only onto an instance of the same type.
     bool param_clip_valid = false;
     doc::EffectType param_clip_type = doc::EffectType::RgbSplit;
@@ -2867,6 +2859,7 @@ struct AppState {
     Vec2 mon_anchor{};
     doc::Placement mon_orig{};
     ui::SliderState block_xf_sliders[7];
+    ui::ScrollState block_scroll;
     ui::ButtonState block_anchor_media_btn, block_anchor_screen_btn;
     // view_bounds are canvas fractions for the displayed revision.
     // xf_history maps a staged revision to its placement values.
@@ -5511,14 +5504,6 @@ struct FrameUi {
     bool* seek_changed = nullptr;
     ui::LayoutNode* preview = nullptr;
 
-    struct RailEdit {
-        doc::ParamKey key;
-        float scale;         // display multiplier (deg rows)
-        const char* seed;    // current shown value, pre-formatted
-        bool* clicked;
-    };
-    std::vector<RailEdit> rail_edits;
-
     bool* export_cancel_clicked = nullptr;
     bool* mute_clicked = nullptr;
     float* volume_staged = nullptr;
@@ -7853,11 +7838,10 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
                   &app.block_anchor_screen_btn, px.snap_screen,
                   "anchor onto the canvas centre")}));
     }
-    rows.push_back(Label(arena,
-                         "drag the block on the monitor: body moves, "
-                         "corners scale, the stub rotates, the "
-                         "crosshair re-pins the anchor",
-                         dim));
+    rows.push_back(Label(arena, "Drag body to move.", dim));
+    rows.push_back(Label(arena, "Drag corners to scale.", dim));
+    rows.push_back(Label(arena, "Drag stub to rotate.", dim));
+    rows.push_back(Label(arena, "Drag crosshair to set anchor.", dim));
     return Panel(arena, VStackDyn(arena, col, rows),
                  PanelOpts{Edges::all(0), -1.0f});
 }
@@ -9458,34 +9442,6 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         FrameUi::AddRoute add_route{key, arena.alloc<bool>()};
         FrameUi::KeyToggle key_toggle{key, value, arena.alloc<bool>()};
 
-        // The type-in commit lands through this row staged path.
-        const bool editing = app.text_target.kind == TextEntry::RailEdit &&
-                             app.text_target.key == key;
-        if (app.rail_commit_key == key) {
-            // A typed value never snaps. Only drags snap.
-            *stage.staged = std::clamp(
-                static_cast<float>(app.rail_commit_value), min_v, max_v);
-            *stage.changed = true;
-            *stage.released = true;
-            app.rail_commit_key = {};
-        }
-        FrameUi::RailEdit redit{};
-        redit.key = key;
-        redit.scale = display_scale;
-        redit.clicked = arena.alloc<bool>();
-        {
-            char seed[32];
-            std::snprintf(seed, sizeof(seed), "%g",
-                          value * display_scale);
-            redit.seed = arena.dup(seed, std::strlen(seed));
-        }
-        out.rail_edits.push_back(redit);
-        opts.out_value_clicked = redit.clicked;
-        opts.edit = editing ? &app.entry : nullptr;
-        opts.edit_state = &state.value_edit_state;
-        opts.out_commit = &out.text_commit;
-        opts.out_cancel = &out.text_cancel;
-        opts.out_blur = &out.text_blur;
         const uint32_t o = ordinal < 18 ? ordinal : 17;
         ++ordinal;
         ui::ButtonState* expose_state = nullptr;
@@ -11402,8 +11358,6 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             : (tt.kind == TextEntry::TextEdit
                    ? flow::node_id(flow::NodeKind::Effect, tt.id)
                    : 0);
-    graph->value_edit_node = tt.kind == TextEntry::ValueEdit ? tt.id : 0;
-    graph->value_edit_row = tt.kind == TextEntry::ValueEdit ? tt.index : -1;
     graph->edit_field = &app.entry;
     if (!app.multi_sel.empty()) {
         uint64_t* multi_arr =
@@ -12241,35 +12195,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             pctx.has_def = layer_field_reset(field, &pctx.def_v);
             out.param_ctxs.push_back(pctx);
             opts.out_ctx = pctx.clicked;
-            // Typed values do not snap and clamp to the hard range.
-            const bool editing =
-                app.text_target.kind == TextEntry::RailEdit &&
-                app.text_target.key == lkey;
-            if (app.rail_commit_key == lkey) {
-                *stage.staged = std::clamp(
-                    static_cast<float>(app.rail_commit_value), min_v,
-                    hard_max > max_v ? hard_max : max_v);
-                *stage.changed = true;
-                *stage.released = true;
-                app.rail_commit_key = {};
-            }
-            FrameUi::RailEdit redit{};
-            redit.key = lkey;
-            redit.scale = display_scale;
-            redit.clicked = arena.alloc<bool>();
-            {
-                char seed[32];
-                std::snprintf(seed, sizeof(seed), "%g",
-                              value * display_scale);
-                redit.seed = arena.dup(seed, std::strlen(seed));
-            }
-            out.rail_edits.push_back(redit);
-            opts.out_value_clicked = redit.clicked;
-            opts.edit = editing ? &app.entry : nullptr;
-            opts.edit_state = &ls.value_edit_state;
-            opts.out_commit = &out.text_commit;
-            opts.out_cancel = &out.text_cancel;
-            opts.out_blur = &out.text_blur;
+            opts.hard_max = hard_max;
             LayoutNode* control;
             if (format && std::strstr(format, "deg")) {
                 control = DialF(arena, stage.staged, min_v, max_v,
@@ -13435,25 +13361,6 @@ void commit_text_entry(AppState& app) {
             }
             break;
         }
-        case TextEntry::RailEdit: {
-            char* endp = nullptr;
-            const double typed = std::strtod(app.entry.buf.c_str(), &endp);
-            if (endp != app.entry.buf.c_str()) {
-                const float scale = app.text_target.scale != 0.0f
-                                        ? app.text_target.scale
-                                        : 1.0f;
-                app.rail_commit_key = app.text_target.key;
-                app.rail_commit_value = typed / scale;
-            }
-            break;
-        }
-        case TextEntry::ValueEdit:
-            if (!app.entry.buf.empty()) {
-                app.value_commit_node = app.text_target.id;
-                app.value_commit_row = app.text_target.index;
-                app.value_commit_typed = std::atof(app.entry.buf.c_str());
-            }
-            break;
         case TextEntry::FrameRename:
             app.undo.execute(app.document,
                              doc::set_frame_title_command(
@@ -20400,7 +20307,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         ui::LayoutNode* preview_cell;
         if (seq_monitor) {
-            preview_cell = build_block_panel(arena, app, frame_ui);
+            preview_cell = ui::ScrollAreaV(
+                arena, &app.block_scroll,
+                build_block_panel(arena, app, frame_ui));
         } else {
             ui::StackOpts rc;
             rc.gap = 6.0f;
@@ -22933,162 +22842,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 }
             }
 
-            if (fe.value_edit_node) {
-                std::string cur;
-                for (size_t i = 0; i < flow_ui.graph->node_count; ++i) {
-                    const flow::Node& nd = flow_ui.graph->nodes[i];
-                    if (nd.id != fe.value_edit_node) continue;
-                    if (fe.value_edit_row >= 0 &&
-                        fe.value_edit_row < nd.row_count &&
-                        nd.rows[fe.value_edit_row].staged) {
-                        const flow::ParamRow& vr =
-                            nd.rows[fe.value_edit_row];
-                        const float vds = vr.display_scale != 0.0f
-                                              ? vr.display_scale
-                                              : 1.0f;
-                        char vb[32];
-                        std::snprintf(vb, sizeof(vb), "%.4g",
-                                      static_cast<double>(*vr.staged *
-                                                          vds));
-                        cur = vb;
-                    }
-                    break;
-                }
-                TextTarget t;
-                t.kind = TextEntry::ValueEdit;
-                t.id = fe.value_edit_node;
-                t.index = fe.value_edit_row;
-                open_text_entry(app, t, ui::TextFilter::Signed, 16, cur);
-                ctx.set_focus(canvas_wid);
-            }
-            if (app.value_commit_node) {
-                const uint64_t vc_node = app.value_commit_node;
-                const int vc_row = app.value_commit_row;
-                app.value_commit_node = 0;
-                for (size_t i = 0; i < flow_ui.graph->node_count; ++i) {
-                    const flow::Node& nd = flow_ui.graph->nodes[i];
-                    if (nd.id != vc_node) continue;
-                    if (vc_row >= 0 && vc_row < nd.row_count &&
-                        nd.rows[vc_row].staged) {
-                        const flow::ParamRow& row = nd.rows[vc_row];
-                        // Typed values use the row hard range: drags snap,
-                        // typing does not. Scaled rows type display units.
-                        const float vds = row.display_scale != 0.0f
-                                              ? row.display_scale
-                                              : 1.0f;
-                        const float v = std::clamp(
-                            static_cast<float>(app.value_commit_typed) /
-                                vds,
-                            row.min_v,
-                            row.hard_max > row.max_v ? row.hard_max
-                                                     : row.max_v);
-                        // Effect rows commit directly: the staged path
-                        // already ran this frame.
-                        bool applied = false;
-                        doc::ParamKey face_key{0, 0};
-                        bool face = false;
-                        bool own_knob = false;
-                        if (tag_kind(nd.id) == flow::NodeKind::Group) {
-                            const uint64_t gid = tag_doc(nd.id);
-                            size_t gli = 0;
-                            if (vc_row < 2) {
-                                face_key = {gid | doc::kGroupParamBit,
-                                            vc_row == 0
-                                                ? doc::kWetParam
-                                                : doc::kOpacityParam};
-                                own_knob = true;
-                            } else if (doc::find_group(app.look(), gid,
-                                                        &gli)) {
-                                const doc::Layer& gl =
-                                    app.look().layers[gli];
-                                for (const doc::Group& gr : gl.groups) {
-                                    if (gr.id != gid) continue;
-                                    int vrow = 1;
-                                    for (const doc::ParamKey& k :
-                                         gr.exposed) {
-                                        bool member = false;
-                                        for (const doc::EffectInstance&
-                                                 e : gl.stack)
-                                            member = member ||
-                                                     e.id == k.effect_id;
-                                        if (!member) continue;
-                                        if (++vrow ==
-                                            vc_row) {
-                                            face_key = k;
-                                            face = true;
-                                            break;
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        if (own_knob) {
-                            std::vector<doc::Keyframe> keys2;
-                            if (autokey_lane(app, face_key, v, &keys2)) {
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_lane_command(app.scope_look,
-                                        face_key, std::move(keys2)));
-                            } else {
-                                size_t gli2 = 0;
-                                if (doc::Group* gset = doc::find_group(
-                                        app.look(),
-                                        face_key.effect_id &
-                                            ~doc::kGroupParamBit,
-                                        &gli2)) {
-                                    doc::Group edited = *gset;
-                                    (face_key.param_index ==
-                                             doc::kWetParam
-                                         ? edited.wet
-                                         : edited.opacity) = v;
-                                    app.undo.execute(
-                                        app.document,
-                                        doc::set_group_props_command(
-                                            app.scope_look, gli2,
-                                            edited));
-                                }
-                            }
-                            applied = true;
-                        }
-                        if (tag_kind(nd.id) == flow::NodeKind::Effect ||
-                            face) {
-                            const int pi = face ? face_key.param_index
-                                : vc_row == 0
-                                ? doc::kWetParam
-                                : vc_row == 1
-                                    ? doc::kOpacityParam
-                                    : vc_row - 2;
-                            const doc::ParamKey pk =
-                                face ? face_key
-                                     : doc::ParamKey{tag_doc(nd.id), pi};
-                            std::vector<doc::Keyframe> keys2;
-                            size_t li = 0, fi = 0;
-                            if (autokey_lane(app, pk, v, &keys2)) {
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_lane_command(app.scope_look,
-                                        pk, std::move(keys2)));
-                                applied = true;
-                            } else if (find_effect_by_id(app.look(),
-                                                         pk.effect_id,
-                                                         &li, &fi)) {
-                                app.undo.execute(
-                                    app.document,
-                                    doc::set_param_command(app.scope_look,li, fi, pi,
-                                                           v));
-                                applied = true;
-                            }
-                        }
-                        if (!applied) {
-                            *row.staged = v;
-                            if (row.changed) *row.changed = true;
-                            if (row.released) *row.released = true;
-                        }
-                    }
-                    break;
-                }
-            }
 
             for (size_t f = 0;
                  f < flow_ui.graph->frame_count && !structure_done; ++f) {
@@ -24745,17 +24498,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 /*coalesce=*/true);
         }
         if (frame_ui.lane_release) app.undo.break_coalescing();
-        for (const FrameUi::RailEdit& re : frame_ui.rail_edits) {
-            if (!re.clicked || !*re.clicked) continue;
-            TextTarget t;
-            t.kind = TextEntry::RailEdit;
-            t.key = re.key;
-            t.scale = re.scale;
-            open_text_entry(app, t, ui::TextFilter::Signed, 15,
-                            re.seed ? re.seed : "");
-            break;
-        }
-
         if (frame_ui.add_layer_open && *frame_ui.add_layer_open)
             app.sel = {SelKind::AddLayer, 0};
         if (frame_ui.open_add_clicked && *frame_ui.open_add_clicked) {

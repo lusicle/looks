@@ -38,7 +38,7 @@ void UndoStack::execute(Document& doc, std::unique_ptr<Command> cmd, bool coales
 }
 
 void UndoStack::push_entry(std::unique_ptr<Command> cmd, bool coalesce) {
-    if (group_depth_ > 0) {
+    if (!open_groups_.empty()) {
         auto& cmds = open_groups_.back().commands;
         if (coalesce && !coalesce_barrier_ && !cmds.empty() && cmds.back()->merge(*cmd))
             return;
@@ -84,12 +84,10 @@ std::string UndoStack::undo_name() const {
 
 void UndoStack::begin_group(std::string name) {
     open_groups_.push_back({std::move(name), {}});
-    ++group_depth_;
 }
 
 void UndoStack::end_group() {
-    assert(group_depth_ > 0);
-    --group_depth_;
+    assert(!open_groups_.empty());
     Group group = std::move(open_groups_.back());
     open_groups_.pop_back();
     if (group.commands.empty()) return;
@@ -104,7 +102,6 @@ void UndoStack::clear() {
     undo_.clear();
     redo_.clear();
     open_groups_.clear();
-    group_depth_ = 0;
     coalesce_barrier_ = false;
 }
 

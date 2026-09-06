@@ -23,6 +23,154 @@ LayoutNode* fixed_box(LayoutArena& arena, float w, float h) {
 
 }  // namespace
 
+TEST(slider_value_entry_commit_cancel_and_blur) {
+    for (bool dial : {false, true}) {
+        Fixture f;
+        LayoutArena arena;
+        SliderState state;
+        float value = 0.5f;
+        float hard_max = 0.0f;
+        bool changed = false, released = false;
+        auto tick = [&](UiInput input) {
+            f.input = std::move(input);
+            f.canvas.begin_frame(1.0f, {800, 600});
+            arena.reset();
+            changed = released = false;
+            SliderOpts opts;
+            opts.format = "%.0f px";
+            opts.display_scale = 100.0f;
+            opts.display_offset = 50.0f;
+            opts.hard_max = hard_max;
+            opts.out_changed = &changed;
+            opts.out_released = &released;
+            LayoutNode* node = dial
+                ? DialF(arena, &value, -1.0f, 2.0f, &state, opts)
+                : SliderF(arena, &value, -1.0f, 2.0f, &state, opts);
+            run_frame(node, {0, 0, 300, 24}, f.frame);
+        };
+        auto press = [&](Vec2 mouse) {
+            UiInput input;
+            input.mouse = mouse;
+            input.buttons_pressed = input.buttons_down = kMouseLeft;
+            tick(input);
+        };
+        auto type = [&](const char* text, platform::Key key) {
+            UiInput input;
+            input.mouse = {290, 12};
+            for (const char* p = text; *p; ++p) {
+                platform::Event event{};
+                event.type = platform::Event::Type::Char;
+                event.codepoint = static_cast<uint32_t>(*p);
+                input.keys.push_back(event);
+            }
+            if (key != platform::Key::Unknown) {
+                platform::Event event{};
+                event.type = platform::Event::Type::KeyDown;
+                event.key = key;
+                input.keys.push_back(event);
+            }
+            tick(std::move(input));
+        };
+        press({290, 12});
+        CHECK(state.editing);
+        CHECK(!state.dragging);
+        CHECK(!f.ctx.focus().is_null());
+        type("125.5", platform::Key::Enter);
+        CHECK(!state.editing);
+        CHECK(changed && released);
+        CHECK_EQ(value, 0.755f);
+        press({290, 12});
+        type("200", platform::Key::Escape);
+        CHECK(!state.editing);
+        CHECK(!changed);
+        CHECK_EQ(value, 0.755f);
+        press({290, 12});
+        type("-25", platform::Key::Unknown);
+        CHECK_EQ(value, 0.755f);
+        press({400, 12});
+        CHECK(!state.editing);
+        CHECK(changed && released);
+        CHECK_EQ(value, -0.75f);
+        tick({});
+        press({290, 12});
+        type("9999", platform::Key::Enter);
+        CHECK_EQ(value, 2.0f);
+        press({290, 12});
+        type("-", platform::Key::Enter);
+        CHECK(!state.editing);
+        CHECK(!changed);
+        CHECK_EQ(value, 2.0f);
+        hard_max = 8.0f;
+        press({290, 12});
+        type("450.25", platform::Key::Enter);
+        CHECK_EQ(value, 4.0025f);
+        CHECK(changed && released);
+    }
+}
+
+TEST(slider_drag_uses_display_units_and_scaled_geometry) {
+    for (float zoom : {0.5f, 1.0f, 2.0f}) {
+        SliderState state;
+        SliderOpts opts;
+        opts.format = "%.0f px";
+        opts.display_scale = 640.0f;
+        opts.display_offset = 320.0f;
+        bool changed = false, released = false;
+        opts.out_changed = &changed;
+        opts.out_released = &released;
+        float value = 0.0f;
+        const Rect track{20, 30, 200 * zoom, 20 * zoom};
+        UiInput input;
+        input.mouse = {track.x + track.w * 0.625f, track.y};
+        Gesture gesture;
+        gesture.pressed = true;
+        slider_input_frame(input, gesture, track, {}, false,
+                             value, -1.0f, 1.0f, state, opts);
+        CHECK_EQ(value, 0.25f);
+        CHECK(changed && state.dragging && !released);
+        gesture.pressed = false;
+        input.mods = platform::kModShift;
+        slider_input_frame(input, gesture, track, {}, false,
+                             value, -1.0f, 1.0f, state, opts);
+        CHECK_EQ(value, 0.25f);
+        input.mouse.x += track.w * 0.25f;
+        gesture.drag_released = true;
+        slider_input_frame(input, gesture, track, {}, false,
+                             value, -1.0f, 1.0f, state, opts);
+        CHECK_EQ(value, 0.3f);
+        CHECK(released && !state.dragging);
+    }
+}
+
+TEST(dial_drag_wraps_and_releases) {
+    SliderState state;
+    SliderOpts opts;
+    opts.format = "%.0f deg";
+    opts.display_scale = 360.0f;
+    bool released = false;
+    opts.out_released = &released;
+    float value = 0.0f;
+    UiInput input;
+    input.mouse = {1, 100};
+    Gesture gesture;
+    gesture.pressed = true;
+    slider_input_frame(input, gesture, {}, {}, true,
+                         value, -1.0f, 1.0f, state, opts);
+    CHECK_EQ(value, 0.0f);
+    gesture.pressed = false;
+    input.mouse = {-1, 100};
+    slider_input_frame(input, gesture, {}, {}, true,
+                         value, -1.0f, 1.0f, state, opts);
+    CHECK(value > 0.0f && value < 0.01f);
+    input.mods = platform::kModShift;
+    input.mouse = {-100, 0};
+    gesture.drag_released = true;
+    slider_input_frame(input, gesture, {}, {}, true,
+                         value, -1.0f, 1.0f, state, opts);
+    CHECK(value > 0.02f && value < 0.04f);
+    CHECK(released && !state.dragging);
+}
+
 TEST(layout_vstack_fixed_and_fill) {
     Fixture f;
     LayoutArena arena;

@@ -62,8 +62,8 @@ public:
 
     bool undo(Document& doc);
     bool redo(Document& doc);
-    bool can_undo() const { return group_depth_ == 0 && !undo_.empty(); }
-    bool can_redo() const { return group_depth_ == 0 && !redo_.empty(); }
+    bool can_undo() const { return open_groups_.empty() && !undo_.empty(); }
+    bool can_redo() const { return open_groups_.empty() && !redo_.empty(); }
 
     std::string undo_name() const;
 
@@ -95,7 +95,6 @@ private:
     std::vector<std::unique_ptr<Command>> redo_;
     std::vector<Group> open_groups_;
     size_t max_depth_ = 1024;
-    int group_depth_ = 0;
     bool coalesce_barrier_ = false;
     bool coalescing_active_ = false;
 };

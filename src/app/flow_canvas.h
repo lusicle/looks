@@ -152,8 +152,6 @@ struct Graph {
     size_t sel_wire_count = 0;
     uint64_t rename_frame = 0;
     uint64_t rename_node = 0;
-    uint64_t value_edit_node = 0;
-    int value_edit_row = -1;
     ui::TextField* edit_field = nullptr;
     const char* crumb = nullptr;
     const char* hint = nullptr;
@@ -165,7 +163,6 @@ struct CanvasState {
     float zoom = 1.0f;
     bool view_inited = false;
     uint64_t hover = 0;
-    // 1 node 2 pan 3 slider 4 wire 5 rewire 6 marquee 7 resize 8 dial+reverse
     uint8_t drag_kind = 0;
     uint64_t drag_id = 0;
     int drag_row = -1;
@@ -184,7 +181,7 @@ struct CanvasState {
     float add_gx = 0.0f, add_gy = 0.0f;
     // Flat index into add_items of the open category. -1 = none.
     int add_cat = -1;
-    bool edit_had_focus = false;
+    ui::TextInputState edit_state;
     ui::Rect edit_rect{};
     uint64_t splice_from = 0, splice_to = 0;
     uint32_t splice_port = 0;
@@ -201,10 +198,10 @@ struct CanvasState {
     int ctx_selected = -1;
     ui::SwatchState* swatch_open = nullptr;
     ui::Rect swatch_anchor{};
-    // dial_accum stays unsnapped so drags below one degree accumulate.
-    Vec2 dial_center{};
-    float dial_last = 0.0f;
-    float dial_accum = 0.0f;
+    ui::SliderState slider_state;
+    uint64_t value_edit_node = 0;
+    int value_edit_row = -1;
+    ui::Rect value_edit_rect{};
     uint64_t drag_splice_from = 0, drag_splice_to = 0;
     uint32_t drag_splice_port = 0;
     // ctx_target holds a tagged node id, not a raw document id.
@@ -269,8 +266,6 @@ struct Output {
     uint64_t group_open = 0;
     uint64_t look_open = 0;
     bool crumb_clicked = false;
-    uint64_t value_edit_node = 0;
-    int value_edit_row = -1;
     bool node_splice_requested = false;
     uint64_t splice_node = 0;
     uint64_t splice_wire_from = 0, splice_wire_to = 0;

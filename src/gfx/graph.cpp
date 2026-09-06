@@ -188,13 +188,15 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     };
 
     // Solo mutes only within the owner layer.
-    std::unordered_map<uint64_t, size_t> owner;    // fx id to layer index
-    std::unordered_map<uint64_t, const doc::EffectInstance*> fx_by_id;
+    struct EffectOwner {
+        size_t layer;
+        const doc::EffectInstance* effect;
+    };
+    std::unordered_map<uint64_t, EffectOwner> owner;
     std::vector<char> layer_solo(look.layers.size(), 0);
     for (size_t li = 0; li < look.layers.size(); ++li)
         for (const doc::EffectInstance& fx : look.layers[li].stack) {
-            owner[fx.id] = li;
-            fx_by_id[fx.id] = &fx;
+            owner[fx.id] = {li, &fx};
             if (fx.solo && !fx.bypass) layer_solo[li] = 1;
         }
     auto group_bypassed_in = [&](size_t li, uint64_t gid) {
@@ -207,8 +209,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (strip_effects) return false;
         const auto ito = owner.find(id);
         if (ito == owner.end()) return false;
-        const size_t li = ito->second;
-        const doc::EffectInstance& fx = *fx_by_id[id];
+        const size_t li = ito->second.layer;
+        const doc::EffectInstance& fx = *ito->second.effect;
         // Audio effects are image-identity; the image graph routes past them.
         // Offset never dispatches; pass A2 turns adjacent ones into shims.
         if (doc::is_audio_effect(fx.type) ||
@@ -445,7 +447,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         return it == port_links.end() ? kNoLinks : it->second;
     };
     auto owner_layer_index = [&](uint64_t id) -> size_t {
-        if (auto it = owner.find(id); it != owner.end()) return it->second;
+        if (auto it = owner.find(id); it != owner.end()) return it->second.layer;
         for (size_t k = 0; k < look.layers.size(); ++k)
             if (look.layers[k].id == id) return k;
         return SIZE_MAX;
@@ -549,34 +551,25 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (auto it = merge_memo.find(memo_key); it != merge_memo.end())
             return it->second;
         if (depth > 64) return -1;
-        struct Feed {
-            int node;
-            size_t li;
-        };
-        std::vector<Feed> feeds;
-        for (uint64_t from : links_into_port(to, port)) {
-            const int n = resolve_node(from, depth + 1);
-            if (n < 0) continue;   // dormant / culled: contributes nothing
-            feeds.push_back({n, owner_layer_index(from)});
-        }
         // The layer matte already gated the head, so the stack carried it
         // down. Alpha-over reveals what is below wherever the gate closed.
         int below = -1;
-        for (const Feed& feed : feeds) {
-            const int cur = feed.node;
+        for (uint64_t from : links_into_port(to, port)) {
+            const int cur = resolve_node(from, depth + 1);
+            if (cur < 0) continue;
             if (below < 0) {
                 below = cur;
             } else {
+                const size_t li = owner_layer_index(from);
                 GraphNode blend;
                 blend.kind = GraphNode::Kind::LayerBlend;
                 blend.layer_index =
-                    feed.li == SIZE_MAX ? -1
-                                        : static_cast<int>(feed.li);
+                    li == SIZE_MAX ? -1 : static_cast<int>(li);
                 blend.inputs = {below, cur};
                 below = add(std::move(blend), inst,
-                            feed.li == SIZE_MAX
+                            li == SIZE_MAX
                                 ? 0
-                                : subject_key(look.layers[feed.li].id));
+                                : subject_key(look.layers[li].id));
             }
         }
         merge_memo[memo_key] = below;

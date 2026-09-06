@@ -44,6 +44,11 @@ enum class Icon : uint8_t {
     Solo, SoloOn, Copy, Lock, Magnet, ChevronRight,
 };
 
+struct TextInputState {
+    ButtonState button;
+    bool had_focus = false;
+};
+
 struct SliderState {
     bool dragging = false;
     float hover_seconds = 0.0f;   // sustained-hover clock for tooltips
@@ -53,6 +58,9 @@ struct SliderState {
     float fine_anchor_x = 0.0f;
     // DialF: last pointer angle in degrees; drags apply relative deltas.
     float dial_angle = 0.0f;
+    bool editing = false;
+    TextField edit;
+    TextInputState edit_state;
 };
 
 struct ScrubberState {
@@ -147,11 +155,6 @@ void RunPopup(Canvas2D& canvas, const Font& font, const Theme& theme,
 LayoutNode* Checkbox(LayoutArena& arena, std::string_view label, bool* value,
                      ButtonState* state, bool* out_changed = nullptr);
 
-struct TextInputState {
-    ButtonState button;
-    bool had_focus = false;
-};
-
 struct TextNav {
     bool up = false;
     bool down = false;
@@ -213,21 +216,25 @@ struct SliderOpts {
     const char* format = "%.2f";   // value readout; nullptr hides it
     bool* out_changed = nullptr;   // value moved this frame
     bool* out_released = nullptr;  // drag ended this frame (undo coalescing)
-    // A press on the value text sets this instead of starting a drag.
-    bool* out_value_clicked = nullptr;
-    // Display multiplier; type-in callers must divide by it on commit.
     float display_scale = 1.0f;
-    // Added after the multiplier; type-in subtracts it before it divides.
     float display_offset = 0.0f;
+    float hard_max = 0.0f;
     const char* tooltip = nullptr;   // sustained-hover tip (range/default)
     // Right-click sets this flag.
     bool* out_ctx = nullptr;
-    TextField* edit = nullptr;
-    TextInputState* edit_state = nullptr;
-    bool* out_commit = nullptr;
-    bool* out_cancel = nullptr;
-    bool* out_blur = nullptr;
 };
+
+void begin_slider_edit(LayoutFrame& frame, SliderState& state,
+                        float value, const SliderOpts& opts);
+TextHostResult slider_edit_frame(LayoutFrame& frame, SliderState& state,
+                                  const Rect& box, float& value,
+                                  float min_value, float max_value,
+                                  const SliderOpts& opts);
+
+void slider_input_frame(const UiInput& input, const Gesture& gesture,
+                         const Rect& track, Vec2 center, bool dial,
+                         float& value, float min_value, float max_value,
+                         SliderState& state, const SliderOpts& opts);
 
 LayoutNode* SliderF(LayoutArena& arena, float* value, float min_value,
                     float max_value, SliderState* state,

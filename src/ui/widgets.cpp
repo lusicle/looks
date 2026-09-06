@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "ui/probe.h"
@@ -603,6 +604,11 @@ TextHostResult text_host_frame(LayoutFrame& frame, WidgetId id,
         }
         if (outs.clicked) *outs.clicked = true;
     }
+    if (focused && frame.input.left_pressed() &&
+        !r.contains(frame.input.mouse)) {
+        frame.ctx.clear_focus();
+        focused = false;
+    }
     if (focused) {
         const TextResult k = text_input_keys(field, frame.input, outs.nav);
         if (k == TextResult::Edit && outs.changed) *outs.changed = true;
@@ -618,6 +624,124 @@ TextHostResult text_host_frame(LayoutFrame& frame, WidgetId id,
     st.had_focus = focused;
     res.focused = focused;
     return res;
+}
+
+static bool parse_number(const TextField& field, double& value,
+                         float scale, float offset) {
+    char* end = nullptr;
+    const double typed = std::strtod(field.buf.c_str(), &end);
+    const double next = (typed - offset) / (scale != 0.0f ? scale : 1.0f);
+    if (end == field.buf.c_str() || *end != '\0' || !std::isfinite(next))
+        return false;
+    value = next;
+    return true;
+}
+
+void begin_slider_edit(LayoutFrame& frame, SliderState& state,
+                        float value, const SliderOpts& opts) {
+    char seed[32];
+    const float scale = opts.display_scale != 0.0f ? opts.display_scale : 1.0f;
+    std::snprintf(seed, sizeof(seed), "%.9g", value * scale + opts.display_offset);
+    state.edit.set(seed);
+    state.edit.sel_anchor = 0;
+    state.edit.filter = TextFilter::Signed;
+    state.edit.cap = 32;
+    state.edit_state = {};
+    state.edit_state.had_focus = true;
+    state.editing = true;
+    frame.ctx.set_focus(frame.ctx.acquire_widget_id(&state.edit_state));
+}
+
+TextHostResult slider_edit_frame(LayoutFrame& frame, SliderState& state,
+                                  const Rect& box, float& value,
+                                  float min_value, float max_value,
+                                  const SliderOpts& opts) {
+    if (!state.editing) return {};
+    bool commit = false, cancel = false, blur = false;
+    TextHostOuts outs;
+    outs.commit = &commit;
+    outs.cancel = &cancel;
+    outs.blur = &blur;
+    const TextHostResult result = text_host_frame(
+        frame, frame.ctx.acquire_widget_id(&state.edit_state),
+        state.edit_state, state.edit, box, false, outs);
+    if (commit || cancel || blur) {
+        state.editing = false;
+        double next = 0.0;
+        if (!cancel && parse_number(state.edit, next, opts.display_scale,
+                                    opts.display_offset)) {
+            const float next_value = static_cast<float>(std::clamp(
+                next, double(min_value), double(opts.hard_max != 0.0f
+                    ? std::max(max_value, opts.hard_max) : max_value)));
+            if (next_value != value) {
+                value = next_value;
+                if (opts.out_changed) *opts.out_changed = true;
+            }
+            if (opts.out_released) *opts.out_released = true;
+        }
+    }
+    return result;
+}
+
+void slider_input_frame(const UiInput& input, const Gesture& gesture,
+                         const Rect& track, Vec2 center, bool dial,
+                         float& value, float min_value, float max_value,
+                         SliderState& state, const SliderOpts& opts) {
+    if (!gesture.pressed && !state.dragging) return;
+    const float angle = dial
+        ? std::atan2(input.mouse.x - center.x, center.y - input.mouse.y) *
+              57.29578f
+        : 0.0f;
+    if (gesture.pressed) {
+        state.dragging = true;
+        state.fine = false;
+        state.dial_angle = angle;
+        state.fine_anchor_value = value;
+    }
+    const bool fine = (input.mods & platform::kModShift) != 0;
+    const float scale = opts.display_scale != 0.0f ? opts.display_scale : 1.0f;
+    float next;
+    if (dial) {
+        float delta = angle - state.dial_angle;
+        while (delta > 180.0f) delta -= 360.0f;
+        while (delta < -180.0f) delta += 360.0f;
+        state.dial_angle = angle;
+        if (fine) delta *= 0.1f;
+        state.fine_anchor_value = std::clamp(
+            state.fine_anchor_value + delta / scale, min_value, max_value);
+        next = state.fine_anchor_value;
+    } else {
+        if (fine != state.fine) {
+            state.fine = fine;
+            state.fine_anchor_value = value;
+            state.fine_anchor_x = input.mouse.x;
+        }
+        const float span = max_value - min_value;
+        if (fine) {
+            next = state.fine_anchor_value +
+                   (track.w > 1.0f
+                        ? (input.mouse.x - state.fine_anchor_x) / track.w
+                        : 0.0f) * span * 0.1f;
+        } else {
+            const float t = track.w > 1.0f
+                ? std::clamp((input.mouse.x - track.x) / track.w, 0.0f, 1.0f)
+                : 0.0f;
+            next = min_value + t * span;
+        }
+        next = std::clamp(next, min_value, max_value);
+    }
+    next = std::clamp(
+        (snap_to_format(next * scale + opts.display_offset, opts.format) -
+         opts.display_offset) / scale, min_value, max_value);
+    if (next != value) {
+        value = next;
+        if (opts.out_changed) *opts.out_changed = true;
+    }
+    if (gesture.drag_released) {
+        state.dragging = false;
+        state.fine = false;
+        if (opts.out_released) *opts.out_released = true;
+    }
 }
 
 namespace {
@@ -1122,27 +1246,15 @@ struct SliderUser {
     float min_value;
     float max_value;
     SliderState* state;
-    const char* format;
-    bool* out_changed;
-    bool* out_released;
-    bool* out_value_clicked;
-    float display_scale;
-    float display_offset;
-    const char* tooltip;
-    bool* out_ctx;
-    TextField* edit;
-    TextInputState* edit_state;
-    bool* out_commit;
-    bool* out_cancel;
-    bool* out_blur;
+    SliderOpts opts;
 };
 
 float slider_box_width(const SliderUser& u, const LayoutFrame& frame,
                        const char* value) {
-    const bool editing = u.edit && u.edit_state;
-    if (!u.format && !editing) return 0.0f;
+    const bool editing = u.state->editing;
+    if (!u.opts.format && !editing) return 0.0f;
     return value_box_width(frame.font,
-                           editing ? std::string_view(u.edit->buf)
+                           editing ? std::string_view(u.state->edit.buf)
                                    : std::string_view(value),
                            frame.theme.font_size_small, 1.0f);
 }
@@ -1150,32 +1262,27 @@ float slider_box_width(const SliderUser& u, const LayoutFrame& frame,
 void hit_slider(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const SliderUser*>(node.user);
     register_rect_hit(node, frame, u->state);
-    if (u->edit && u->edit_state) {
+    if (u->state->editing) {
         Rect box = slider_value_rect(node.rect,
                                      slider_box_width(*u, frame, ""));
         if (!node.clip.empty()) box = box.intersect(node.clip);
-        frame.ctx.add_hit(box, frame.ctx.acquire_widget_id(u->edit_state));
+        frame.ctx.add_hit(box, frame.ctx.acquire_widget_id(&u->state->edit_state));
     }
 }
 
 void draw_slider_box(const SliderUser& u, const Rect& box, const char* value,
                      LayoutFrame& frame) {
     const Theme& theme = frame.theme;
-    if (u.edit && u.edit_state) {
-        TextHostOuts outs;
-        outs.commit = u.out_commit;
-        outs.cancel = u.out_cancel;
-        outs.blur = u.out_blur;
-        const TextHostResult h = text_host_frame(
-            frame, frame.ctx.acquire_widget_id(u.edit_state), *u.edit_state,
-            *u.edit, box, true, outs);
+    if (u.state->editing) {
+        const TextHostResult h = slider_edit_frame(
+            frame, *u.state, box, *u.value, u.min_value, u.max_value, u.opts);
         draw_text_input_face(
-            frame.canvas, frame.font, theme, box, u.edit->buf,
-            h.focused ? field_caret(*u.edit, 0, caret_blink_on(frame.ctx))
+            frame.canvas, frame.font, theme, box, u.state->edit.buf,
+            h.focused ? field_caret(u.state->edit, 0, caret_blink_on(frame.ctx))
                       : TextCaret{},
             h.focused, false, false, 0.0f, theme.font_size_small,
             theme.corner_radius, 1.0f);
-    } else if (u.format) {
+    } else if (u.opts.format) {
         draw_text_input_face(frame.canvas, frame.font, theme, box, value,
                              TextCaret{}, false, false, false, 0.0f,
                              theme.font_size_small, theme.corner_radius, 1.0f);
@@ -1187,168 +1294,56 @@ Vec2 measure_slider(LayoutNode&, const Constraints& c, const LayoutFrame& frame)
     return {w, frame.theme.control_height};
 }
 
-void draw_slider(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const SliderUser*>(node.user);
+void draw_slider_control(LayoutNode& node, LayoutFrame& frame, bool dial) {
+    const auto& u = *static_cast<const SliderUser*>(node.user);
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
-    SliderState& s = *u->state;
-
-    // The value box opens the editor; the track always drags.
+    SliderState& s = *u.state;
+    const float scale = u.opts.display_scale != 0.0f
+        ? u.opts.display_scale : 1.0f;
     char buf[32] = {};
-    if (u->format)
-        std::snprintf(buf, sizeof(buf), u->format,
-                      *u->value * u->display_scale + u->display_offset);
-    const float box_w = slider_box_width(*u, frame, buf);
+    if (u.opts.format)
+        std::snprintf(buf, sizeof(buf), u.opts.format,
+                      *u.value * scale + u.opts.display_offset);
+    const float box_w = slider_box_width(u, frame, buf);
     const Rect box = slider_value_rect(r, box_w);
     const Rect track = slider_track_rect(r, box_w, 1.0f);
-    const bool editing = u->edit && u->edit_state;
-
+    const Vec2 center{r.x + 11.0f, r.y + r.h * 0.5f};
     const WidgetId id = frame.ctx.acquire_widget_id(&s);
-    const Gesture g = frame.ctx.gesture(id, r);
-    if (u->out_ctx && g.right_clicked && !s.dragging) *u->out_ctx = true;
-    if (g.pressed) {
-        if (box_w > 0.0f && box.contains(frame.input.mouse)) {
-            if (u->out_value_clicked && !editing) *u->out_value_clicked = true;
-        } else {
-            s.dragging = true;
-            s.fine = false;
-        }
+    Gesture gesture = frame.ctx.gesture(id, r);
+    if (u.opts.out_ctx && gesture.right_clicked && !s.dragging)
+        *u.opts.out_ctx = true;
+    if (gesture.pressed && box_w > 0.0f && box.contains(frame.input.mouse)) {
+        if (!s.editing) begin_slider_edit(frame, s, *u.value, u.opts);
+        gesture.pressed = false;
     }
-    if (s.dragging) {
-        const float span = u->max_value - u->min_value;
-        // Shift gives a 0.1x drag from an anchor, so the handle never jumps.
-        const bool want_fine =
-            (frame.input.mods & platform::kModShift) != 0;
-        if (want_fine != s.fine) {
-            s.fine = want_fine;
-            s.fine_anchor_value = *u->value;
-            s.fine_anchor_x = frame.input.mouse.x;
-        }
-        float next;
-        if (s.fine) {
-            next = s.fine_anchor_value +
-                   (track.w > 1.0f
-                        ? (frame.input.mouse.x - s.fine_anchor_x) / track.w
-                        : 0.0f) *
-                       span * 0.1f;
-            next = std::clamp(next, u->min_value, u->max_value);
-        } else {
-            const float t = track.w > 1.0f
-                ? std::clamp((frame.input.mouse.x - track.x) / track.w, 0.0f,
-                             1.0f)
-                : 0.0f;
-            next = u->min_value + t * span;
-        }
-        // Snap in display space so the readout matches the stored value.
-        const float ds =
-            u->display_scale != 0.0f ? u->display_scale : 1.0f;
-        next = (snap_to_format(next * ds + u->display_offset, u->format) -
-                u->display_offset) /
-               ds;
-        next = std::clamp(next, u->min_value, u->max_value);
-        if (next != *u->value) {
-            *u->value = next;
-            if (u->out_changed) *u->out_changed = true;
-        }
-        if (g.drag_released) {
-            s.dragging = false;
-            s.fine = false;
-            if (u->out_released) *u->out_released = true;
-        }
-    }
-    s.hover_seconds =
-        g.hovered && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
-    if (u->tooltip && s.hover_seconds > 0.5f)
-        frame.ctx.set_tooltip(u->tooltip,
+    slider_input_frame(frame.input, gesture, track, center, dial,
+                       *u.value, u.min_value, u.max_value, s, u.opts);
+    s.hover_seconds = gesture.hovered && !s.dragging
+        ? s.hover_seconds + frame.dt : 0.0f;
+    if (u.opts.tooltip && s.hover_seconds > 0.5f)
+        frame.ctx.set_tooltip(u.opts.tooltip,
                               {frame.input.mouse.x + 12.0f,
                                frame.input.mouse.y + 18.0f});
-
-    const float span = u->max_value - u->min_value;
-    const float t = span != 0.0f
-        ? std::clamp((*u->value - u->min_value) / span, 0.0f, 1.0f) : 0.0f;
-    draw_slider_track(frame.canvas, theme, track, t, -1.0f, s.dragging, 1.0f);
-    draw_slider_box(*u, box, buf, frame);
+    if (dial) {
+        draw_dial_face(frame.canvas, theme, center, 8.0f,
+                       *u.value * scale, s.dragging, 0.0f, false, 1.0f);
+    } else {
+        const float span = u.max_value - u.min_value;
+        const float t = span != 0.0f
+            ? std::clamp((*u.value - u.min_value) / span, 0.0f, 1.0f) : 0.0f;
+        draw_slider_track(frame.canvas, theme, track, t, -1.0f,
+                          s.dragging, 1.0f);
+    }
+    draw_slider_box(u, box, buf, frame);
 }
 
-constexpr float kDialRadius = 8.0f;
-
-// Angle in degrees: 0 at 12 o'clock, clockwise positive.
-float dial_mouse_angle(Vec2 mouse, Vec2 center) {
-    return std::atan2(mouse.x - center.x, center.y - mouse.y) * 57.29578f;
-}
-
-float wrap_half_turn(float deg) {
-    while (deg > 180.0f) deg -= 360.0f;
-    while (deg < -180.0f) deg += 360.0f;
-    return deg;
+void draw_slider(LayoutNode& node, LayoutFrame& frame) {
+    draw_slider_control(node, frame, false);
 }
 
 void draw_dial(LayoutNode& node, LayoutFrame& frame) {
-    const auto* u = static_cast<const SliderUser*>(node.user);
-    const Theme& theme = frame.theme;
-    const Rect& r = node.rect;
-    SliderState& s = *u->state;
-
-    char buf[32] = {};
-    if (u->format)
-        std::snprintf(buf, sizeof(buf), u->format,
-                      *u->value * u->display_scale + u->display_offset);
-    const float box_w = slider_box_width(*u, frame, buf);
-    const Rect box = slider_value_rect(r, box_w);
-    const bool editing = u->edit && u->edit_state;
-    const Vec2 center{r.x + kDialRadius + 3.0f, r.y + r.h * 0.5f};
-
-    const WidgetId id = frame.ctx.acquire_widget_id(&s);
-    const Gesture g = frame.ctx.gesture(id, r);
-    if (u->out_ctx && g.right_clicked && !s.dragging) *u->out_ctx = true;
-    if (g.pressed) {
-        if (box_w > 0.0f && box.contains(frame.input.mouse)) {
-            if (u->out_value_clicked && !editing) *u->out_value_clicked = true;
-        } else {
-            s.dragging = true;
-            s.dial_angle = dial_mouse_angle(frame.input.mouse, center);
-            // Integrate unsnapped, or sub-step drags never accumulate.
-            s.fine_anchor_value = *u->value;
-            frame.ctx.begin_drag(id);
-        }
-    }
-    if (s.dragging) {
-        const float a = dial_mouse_angle(frame.input.mouse, center);
-        float delta = wrap_half_turn(a - s.dial_angle);
-        s.dial_angle = a;
-        if (frame.input.mods & platform::kModShift) delta *= 0.1f;
-        const float scale =
-            u->display_scale != 0.0f ? u->display_scale : 1.0f;
-        s.fine_anchor_value = std::clamp(
-            s.fine_anchor_value + delta / scale, u->min_value,
-            u->max_value);
-        const float next = std::clamp(
-            (snap_to_format(
-                 s.fine_anchor_value * scale + u->display_offset,
-                 u->format) -
-             u->display_offset) /
-                scale,
-            u->min_value, u->max_value);
-        if (next != *u->value) {
-            *u->value = next;
-            if (u->out_changed) *u->out_changed = true;
-        }
-        if (g.drag_released) {
-            s.dragging = false;
-            if (u->out_released) *u->out_released = true;
-        }
-    }
-    s.hover_seconds =
-        g.hovered && !s.dragging ? s.hover_seconds + frame.dt : 0.0f;
-    if (u->tooltip && s.hover_seconds > 0.5f)
-        frame.ctx.set_tooltip(u->tooltip,
-                              {frame.input.mouse.x + 12.0f,
-                               frame.input.mouse.y + 18.0f});
-
-    draw_dial_face(frame.canvas, theme, center, kDialRadius,
-                   *u->value * u->display_scale, s.dragging, 0.0f, false,
-                   1.0f);
-    draw_slider_box(*u, box, buf, frame);
+    draw_slider_control(node, frame, true);
 }
 
 }  // namespace
@@ -2209,19 +2204,7 @@ static LayoutNode* slider_node(LayoutArena& arena, float* value,
     u->min_value = min_value;
     u->max_value = max_value;
     u->state = state;
-    u->format = opts.format;
-    u->out_changed = opts.out_changed;
-    u->out_released = opts.out_released;
-    u->out_value_clicked = opts.out_value_clicked;
-    u->display_scale = opts.display_scale;
-    u->display_offset = opts.display_offset;
-    u->tooltip = opts.tooltip;
-    u->out_ctx = opts.out_ctx;
-    u->edit = opts.edit;
-    u->edit_state = opts.edit_state;
-    u->out_commit = opts.out_commit;
-    u->out_cancel = opts.out_cancel;
-    u->out_blur = opts.out_blur;
+    u->opts = opts;
     n->user = u;
     n->width = SizeSpec::fill();
     n->measure_fn = measure_slider;

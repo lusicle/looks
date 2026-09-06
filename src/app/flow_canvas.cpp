@@ -37,6 +37,16 @@ struct CanvasUser {
     Output* out;
 };
 
+ui::SliderOpts row_slider_opts(const ParamRow& row) {
+    ui::SliderOpts opts;
+    opts.format = row.format;
+    opts.display_scale = row.display_scale;
+    opts.hard_max = row.hard_max;
+    opts.out_changed = row.changed;
+    opts.out_released = row.released;
+    return opts;
+}
+
 bool node_has_preview(const Node& nd) {
     return nd.kind != NodeKind::ModSource &&
            nd.kind != NodeKind::GroupIn && nd.kind != NodeKind::GroupOut;
@@ -61,6 +71,11 @@ void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<CanvasUser*>(node.user);
     CanvasState& st = *u->state;
     ui::register_rect_hit(node, frame, u->state);
+    if (st.slider_state.editing) {
+        Rect box = st.value_edit_rect.intersect(node.rect);
+        if (!node.clip.empty()) box = box.intersect(node.clip);
+        frame.ctx.add_hit(box, frame.ctx.acquire_widget_id(&st.slider_state.edit_state));
+    }
     st.menu_up = st.ctx_open || st.port_menu_open || st.dd_open;
     if (st.menu_up)
         frame.ctx.push_overlay(node.rect,
@@ -358,32 +373,19 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 
     const bool hosting = g.edit_field && (g.rename_frame != 0 ||
-                                          g.rename_node != 0 ||
-                                          g.value_edit_node != 0);
-    if (hosting && frame.ctx.focus().is_null() && !st.edit_had_focus)
-        frame.ctx.set_focus(wid);
-    bool efocus = hosting && frame.ctx.has_focus(wid);
-    bool eended = false;
-    if (efocus) {
-        const ui::TextResult res =
-            ui::text_input_keys(*g.edit_field, frame.input);
-        if (res == ui::TextResult::Commit || res == ui::TextResult::Cancel) {
-            if (res == ui::TextResult::Commit) out.text_commit = true;
-            else out.text_cancel = true;
-            eended = true;
-        } else if (frame.input.left_pressed() && owns &&
-                   !st.edit_rect.contains(mouse)) {
-            out.text_blur = true;
-            eended = true;
-        }
-        if (eended) {
-            frame.ctx.clear_focus();
-            efocus = false;
-        }
+                                          g.rename_node != 0);
+    bool efocus = false;
+    if (hosting) {
+        ui::TextHostOuts outs;
+        outs.commit = &out.text_commit;
+        outs.cancel = &out.text_cancel;
+        outs.blur = &out.text_blur;
+        efocus = ui::text_host_frame(frame, wid, st.edit_state,
+                                     *g.edit_field, st.edit_rect, true,
+                                     outs).focused;
+    } else {
+        st.edit_state = {};
     }
-    if (hosting && st.edit_had_focus && !efocus && !eended)
-        out.text_blur = true;
-    st.edit_had_focus = efocus;
     const std::string edit_shown = hosting ? g.edit_field->buf : std::string();
     const ui::TextCaret edit_caret =
         efocus ? ui::field_caret(*g.edit_field, 0,
@@ -447,7 +449,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         }
         return h;
     };
-    auto slider_value = [&](const Node& nd, int row) {
+    auto slider_input = [&](const Node& nd, int row, bool pressed,
+                            bool released) {
         const ParamRow& pr = nd.rows[row];
         const Rect fr = row_field_rect(nd, row);
         char val[32] = {};
@@ -459,14 +462,32 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         const float bw =
             pr.format ? ui::value_box_width(frame.font, val, rs, z) : 0.0f;
         const Rect track = ui::slider_track_rect(fr, bw, z);
-        const float t = std::clamp(
-            (mouse.x - track.x) / std::max(track.w, 1.0f), 0.0f, 1.0f);
-        // Snap to the readout format: the stored value equals the shown one.
-        return std::clamp(
-            ui::snap_to_format(pr.min_v + t * (pr.max_v - pr.min_v),
-                               pr.format),
-            pr.min_v, pr.max_v);
+        ui::Gesture gesture;
+        gesture.pressed = pressed;
+        gesture.drag_released = released;
+        ui::slider_input_frame(
+            frame.input, gesture, track,
+            {fr.x + 7.0f * z, fr.y + fr.h * 0.5f},
+            pr.format && std::strstr(pr.format, "deg"),
+            *pr.staged, pr.min_v, pr.max_v, st.slider_state, row_slider_opts(pr));
     };
+
+    if (st.slider_state.editing) {
+        const Node* nd = find_node(st.value_edit_node);
+        if (nd && st.value_edit_row >= 0 && st.value_edit_row < nd->row_count &&
+            nd->rows[st.value_edit_row].kind == 0 &&
+            nd->rows[st.value_edit_row].staged) {
+            const ParamRow& pr = nd->rows[st.value_edit_row];
+            ui::slider_edit_frame(frame, st.slider_state, st.value_edit_rect,
+                                    *pr.staged, pr.min_v, pr.max_v,
+                                    row_slider_opts(pr));
+        } else {
+            const ui::WidgetId edit_id =
+                frame.ctx.acquire_widget_id(&st.slider_state.edit_state);
+            if (frame.ctx.has_focus(edit_id)) frame.ctx.clear_focus();
+            st.slider_state.editing = false;
+        }
+    }
 
     if (owns && (frame.input.buttons_pressed & ui::kMouseMiddle) &&
         st.drag_kind == 0) {
@@ -789,7 +810,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             const Node& nd = g.nodes[static_cast<size_t>(hover_i)];
             const Rect cr = node_rect_s(nd);
             bool handled = false;
-            if (frame.input.mods & platform::kModShift) {
+            if ((frame.input.mods & platform::kModShift) &&
+                hit_row(nd).zone == 0) {
                 out.clicked = nd.id;
                 out.clicked_shift = true;
                 handled = true;
@@ -839,38 +861,20 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     }
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 1 &&
-                           nd.rows[rh.row].staged &&
-                           nd.rows[rh.row].format &&
-                           std::strstr(nd.rows[rh.row].format, "deg")) {
-                    // A dial press must not jump the angle: the drag is
-                    // relative.
-                    const ParamRow& pr = nd.rows[rh.row];
-                    st.drag_kind = 8;
-                    st.drag_id = nd.id;
-                    st.drag_row = rh.row;
-                    const Rect fr2 = row_field_rect(nd, rh.row);
-                    st.dial_center = {fr2.x + 7.0f * z,
-                                      fr2.y + fr2.h * 0.5f};
-                    st.dial_last =
-                        std::atan2(mouse.y - st.dial_center.y,
-                                   mouse.x - st.dial_center.x);
-                    st.dial_accum = *pr.staged;
-                    frame.ctx.begin_drag(wid);
-                    handled = true;
-                } else if (rh.row >= 0 && rh.zone == 1 &&
                            nd.rows[rh.row].staged) {
                     st.drag_kind = 3;
                     st.drag_id = nd.id;
                     st.drag_row = rh.row;
-                    *nd.rows[rh.row].staged = slider_value(nd, rh.row);
-                    if (nd.rows[rh.row].changed)
-                        *nd.rows[rh.row].changed = true;
+                    slider_input(nd, rh.row, true, false);
                     frame.ctx.begin_drag(wid);
                     handled = true;
                 } else if (rh.row >= 0 && rh.zone == 2 &&
                            nd.rows[rh.row].staged) {
-                    out.value_edit_node = nd.id;
-                    out.value_edit_row = rh.row;
+                    st.value_edit_node = nd.id;
+                    st.value_edit_row = rh.row;
+                    const ParamRow& pr = nd.rows[rh.row];
+                    ui::begin_slider_edit(frame, st.slider_state, *pr.staged,
+                                            row_slider_opts(pr));
                     handled = true;
                 }
             }
@@ -990,32 +994,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             const Node* nd = find_node(st.drag_id);
             if (nd && st.drag_row >= 0 && st.drag_row < nd->row_count &&
                 nd->rows[st.drag_row].staged) {
-                *nd->rows[st.drag_row].staged =
-                    slider_value(*nd, st.drag_row);
-                *nd->rows[st.drag_row].changed = true;
-            }
-        } else if (st.drag_kind == 8) {
-            const Node* nd = find_node(st.drag_id);
-            if (nd && st.drag_row >= 0 && st.drag_row < nd->row_count &&
-                nd->rows[st.drag_row].staged) {
-                const ParamRow& pr = nd->rows[st.drag_row];
-                const float a = std::atan2(mouse.y - st.dial_center.y,
-                                           mouse.x - st.dial_center.x);
-                float delta = a - st.dial_last;
-                while (delta > 3.14159265f) delta -= 6.2831853f;
-                while (delta < -3.14159265f) delta += 6.2831853f;
-                st.dial_last = a;
-                const float ds =
-                    pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
-                // Knob radians go to display degrees, then to the stored unit.
-                st.dial_accum = std::clamp(
-                    st.dial_accum + delta * 57.29578f / ds, pr.min_v,
-                    pr.max_v);
-                *pr.staged = std::clamp(
-                    ui::snap_to_format(st.dial_accum * ds, pr.format) /
-                        ds,
-                    pr.min_v, pr.max_v);
-                *pr.changed = true;
+                slider_input(*nd, st.drag_row, false, false);
             }
         } else if (st.drag_kind == 7) {
             for (size_t f = 0; f < g.frame_count; ++f) {
@@ -1132,11 +1111,11 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     }
                 }
             }
-        } else if (st.drag_kind == 3 || st.drag_kind == 8) {
+        } else if (st.drag_kind == 3) {
             const Node* nd = find_node(st.drag_id);
             if (nd && st.drag_row >= 0 && st.drag_row < nd->row_count &&
-                nd->rows[st.drag_row].released)
-                *nd->rows[st.drag_row].released = true;
+                nd->rows[st.drag_row].staged)
+                slider_input(*nd, st.drag_row, false, true);
         } else if (st.drag_kind == 1 && cg.drag_moved) {
             out.move_released = true;
             if (st.drag_splice_to) {
@@ -1667,14 +1646,15 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                     pr.format && std::strstr(pr.format, "deg");
                 const float row_ds =
                     pr.display_scale != 0.0f ? pr.display_scale : 1.0f;
-                const bool row_editing = g.value_edit_node == nd.id &&
-                                         g.value_edit_row == row;
+                const bool row_editing = st.slider_state.editing &&
+                                         st.value_edit_node == nd.id &&
+                                         st.value_edit_row == row;
                 char val[32] = {};
                 if (pr.staged && pr.format)
                     std::snprintf(val, sizeof(val), pr.format,
                                   *pr.staged * row_ds);
                 const std::string_view box_text =
-                    row_editing ? std::string_view(edit_shown)
+                    row_editing ? std::string_view(st.slider_state.edit.buf)
                                 : std::string_view(val);
                 const float box_w =
                     pr.format || row_editing
@@ -1703,11 +1683,15 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                                           dragging_row, z);
                 }
                 if (box_w > 0.0f) {
-                    if (row_editing) st.edit_rect = box;
+                    if (row_editing) st.value_edit_rect = box;
+                    const bool focused = row_editing && frame.ctx.has_focus(
+                        frame.ctx.acquire_widget_id(&st.slider_state.edit_state));
                     ui::draw_text_input_face(
                         canvas, frame.font, theme, box, box_text,
-                        row_editing ? edit_caret : ui::TextCaret{},
-                        row_editing && efocus, false, false, 0.0f, rs,
+                        focused ? ui::field_caret(st.slider_state.edit, 0,
+                                                   ui::caret_blink_on(frame.ctx))
+                                : ui::TextCaret{},
+                        focused, false, false, 0.0f, rs,
                         2.0f * z, z);
                 }
             }
