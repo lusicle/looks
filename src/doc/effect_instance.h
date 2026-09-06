@@ -6,6 +6,9 @@
 
 namespace looks::doc {
 
+inline constexpr int kWetParam = -1;
+inline constexpr int kOpacityParam = -2;
+
 enum class EffectType : uint32_t {
     RgbSplit = 0,
     Vignette,

@@ -9,10 +9,6 @@
 
 namespace looks::doc {
 
-// param_index addresses EffectInstance::params. These ids are built-ins.
-inline constexpr int kWetParam = -1;
-inline constexpr int kOpacityParam = -2;
-
 std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
                                            size_t effect_index,
                                            int param_index, float new_value);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <crtdbg.h>
 #include <cstdio>
 #include <cstring>
@@ -311,6 +312,119 @@ bool matte_alpha_check(gfx::Device& device,
     return true;
 }
 
+bool crt_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
+    doc::Document doc;
+    doc::Look look = doc::make_look(doc, "CRT check");
+    look.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
+    look.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::CrtSim));
+    doc.looks.push_back(std::move(look));
+    auto& layer = doc.looks[0].layers[0];
+    auto& fx = layer.stack[0];
+    layer.opacity = 1.0f;
+    layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.35f;
+    fx.params[0] = fx.params[5] = fx.params[7] = fx.params[8] = 0.0f;
+    fx.params[1] = 1.0f;
+    fx.params[2] = 240.0f;
+    auto engine = gfx::Engine::create(device, shader_dir);
+    auto readback = gfx::Nv12Readback::create(device, shader_dir);
+    if (!engine || !readback) return false;
+    constexpr uint32_t width = 960, height = 720;
+    std::vector<uint8_t> pixels;
+    auto render = [&](uint32_t frame) {
+        return readback->render(*engine, doc, doc.looks[0].id, frame, 60.0,
+                                width, height, pixels);
+    };
+    auto mean_light = [&]() {
+        double sum = 0.0;
+        for (uint32_t y = 60; y < height - 60; ++y)
+            for (uint32_t x = 60; x < width - 60; ++x) {
+                double v = (pixels[y * width + x] - 16.0) / 219.0;
+                sum += v <= 0.04045 ? v / 12.92 :
+                    std::pow((v + 0.055) / 1.055, 2.4);
+            }
+        return sum / ((width - 120) * (height - 120));
+    };
+    for (float beam : {0.15f, 0.3f, 0.45f}) {
+        fx.params[9] = beam;
+        for (float bloom : {0.0f, 1.0f}) {
+            fx.params[3] = bloom;
+            if (!render(0)) return false;
+            const double mean = mean_light();
+            std::printf("CRT beam %.2f bloom %.1f mean %.5f\n", beam, bloom, mean);
+            if (std::abs(mean - 0.10048) > 0.003) return false;
+        }
+    }
+    fx.params[0] = 1.0f;
+    fx.params[1] = 0.0f;
+    if (!render(0)) return false;
+    uint32_t filtered_rows = 0;
+    for (uint32_t y = 90; y < height - 90; ++y) {
+        for (uint32_t x = 1; x < width / 4; ++x) {
+            const uint8_t v = pixels[y * width + x];
+            if (v <= 16) continue;
+            if (v + 3 < pixels[y * width + x + 2]) ++filtered_rows;
+            break;
+        }
+    }
+    std::printf("CRT curved edge: %u rows have partial coverage\n", filtered_rows);
+    if (filtered_rows < 200) return false;
+    fx.params[0] = 0.0f;
+    fx.params[11] = 70.0f;
+    if (!render(100)) return false;
+    const uint8_t lit = pixels[height / 2 * width + width / 2];
+    layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.0f;
+    if (!render(101)) return false;
+    const uint8_t decay = pixels[height / 2 * width + width / 2];
+    const auto repeated = pixels;
+    if (!render(101) || pixels != repeated) return false;
+    if (!render(102)) return false;
+    const uint8_t later = pixels[height / 2 * width + width / 2];
+    std::printf("CRT decay: %u -> %u -> %u; paused frame is stable\n", lit, decay, later);
+    if (!(lit > decay && decay > later && later > 16)) return false;
+    if (!render(120)) return false;
+    const auto seek = pixels;
+    if (pixels[height / 2 * width + width / 2] != 16 ||
+        !render(120) || pixels != seek) return false;
+    fx.params[11] = 0.0f;
+    fx.params[12] = 1.0f;
+    fx.params[1] = 1.0f;
+    fx.params[2] = 160.0f;
+    layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.35f;
+    if (!render(0)) return false;
+    const auto even_field = pixels;
+    if (!render(1) || pixels == even_field) return false;
+    fx.params[12] = 0.0f;
+    fx.params[1] = 0.0f;
+    fx.params[5] = 1.0f;
+    fx.params[6] = 8.0f;
+    for (uint32_t divisor : {1u, 2u, 4u}) {
+        engine->set_preview_divisor(divisor);
+        if (!render(0)) return false;
+        const uint32_t pw = width / divisor, ph = height / divisor;
+        const uint32_t lag = 24 / divisor;
+        double error = 0.0;
+        for (uint32_t x = 120 / divisor; x < (width - 144) / divisor; ++x)
+            error += std::abs(int(pixels[ph / 2 * pw + x]) -
+                              int(pixels[ph / 2 * pw + x + lag]));
+        error /= (width - 264) / divisor;
+        std::printf("CRT preview /%u: mask period error %.3f\n", divisor, error);
+        if (error > 1.0) return false;
+    }
+    engine->set_preview_divisor(1);
+    fx = doc::make_effect(doc, doc::EffectType::CrtSim);
+    double total_ms = 0.0;
+    for (uint32_t f = 0; f < 12; ++f) {
+        const auto start = std::chrono::steady_clock::now();
+        if (!readback->render(*engine, doc, doc.looks[0].id, f, 60.0,
+                              1920, 1080, pixels)) return false;
+        if (f >= 4)
+            total_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+    }
+    std::printf("CRT 1920x1080: %.3f ms mean, render and readback\n", total_ms / 8.0);
+    return true;
+}
+
 bool render_pass(gfx::Device& device, const std::filesystem::path& shader_dir,
                  const doc::Document& doc, uint32_t frames,
                  std::vector<uint64_t>& hashes) {
@@ -505,6 +619,10 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!matte_alpha_check(*device, shader_dir)) {
         std::fprintf(stderr, "MATTE ALPHA FAILURE\n");
+        return 1;
+    }
+    if (!crt_check(*device, shader_dir)) {
+        std::fprintf(stderr, "CRT FAILURE\n");
         return 1;
     }
 

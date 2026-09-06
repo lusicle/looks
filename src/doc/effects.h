@@ -86,6 +86,14 @@ struct EffectInfo {
     const ParamDesc* params;
     uint32_t param_count;
     FxCategory category = FxCategory::Signal;
+    const int* control_order = nullptr;
+
+    int control_param(uint32_t row) const {
+        if (control_order) return control_order[row];
+        if (row == 0) return kWetParam;
+        if (row == 1) return kOpacityParam;
+        return static_cast<int>(row - 2);
+    }
 };
 
 const EffectInfo& effect_info(EffectType type);

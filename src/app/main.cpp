@@ -9505,13 +9505,20 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
         out.params.push_back(stage);
     };
 
-    stage_slider(doc::kWetParam, "wet/dry", 0.0f, 1.0f, fx.wet, "%.2f",
-                 &state.wet, nullptr,
-                 "processed vs input mix - click the value to type it");
-    stage_slider(doc::kOpacityParam, "opacity", 0.0f, 1.0f, fx.opacity, "%.2f",
-                 &state.opacity, nullptr,
-                 "final blend over the input - click the value to type it");
-    for (uint32_t p = 0; p < info.param_count && p < 16; ++p) {
+    for (uint32_t row = 0; row < info.param_count + 2 && row < 18; ++row) {
+        const int p = info.control_param(row);
+        if (p == doc::kWetParam) {
+            stage_slider(p, "wet/dry", 0.0f, 1.0f, fx.wet, "%.2f",
+                         &state.wet, nullptr,
+                         "processed vs input mix - click the value to type it");
+            continue;
+        }
+        if (p == doc::kOpacityParam) {
+            stage_slider(p, "opacity", 0.0f, 1.0f, fx.opacity, "%.2f",
+                         &state.opacity, nullptr,
+                         "final blend over the input - click the value to type it");
+            continue;
+        }
         const doc::ParamDesc& desc = info.params[p];
         // Selector-dependent rows hide with their controlling mode.
         if (!doc::param_visible(fx, desc)) continue;
@@ -10674,12 +10681,16 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     row.swatch = &hsw;
                 }
             };
-            stage_row(0, doc::kWetParam, "wet/dry", 0.0f, 1.0f, fx.wet,
-                      "%.2f");
-            stage_row(1, doc::kOpacityParam, "opacity", 0.0f, 1.0f,
-                      fx.opacity, "%.2f");
-            uint32_t row_slot = 2;
-            for (uint32_t p = 0; p < info.param_count && p < 16; ++p) {
+            uint32_t row_slot = 0;
+            for (uint32_t row = 0; row < info.param_count + 2 && row < 18; ++row) {
+                const int p = info.control_param(row);
+                if (p == doc::kWetParam || p == doc::kOpacityParam) {
+                    stage_row(row_slot++, p,
+                              p == doc::kWetParam ? "wet/dry" : "opacity",
+                              0.0f, 1.0f, p == doc::kWetParam ? fx.wet : fx.opacity,
+                              "%.2f");
+                    continue;
+                }
                 const doc::ParamDesc& desc = info.params[p];
                 if (!doc::param_visible(fx, desc)) continue;
                 const char* options =

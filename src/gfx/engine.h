@@ -182,6 +182,14 @@ private:
     std::unique_ptr<ComputePipeline> matte_extract_, matte_apply_;
     std::unique_ptr<ComputePipeline> glow_pass_[4];   // bright, H, V, comp
     std::unique_ptr<ComputePipeline> flow_;
+    std::unique_ptr<ComputePipeline> crt_prepare_, crt_blur_;
+    struct CrtSlot {
+        std::unique_ptr<GpuImage> previous, current;
+        uint32_t last_frame = 0xFFFFFFFFu;
+        bool previous_valid = false;
+    };
+    std::unordered_map<uint64_t, CrtSlot> crt_state_;
+    std::vector<std::unique_ptr<GpuImage>> crt_retired_[kFramesInFlight];
 
     // A codec effect splits the graph into fenced CPU roundtrip segments.
     struct CodecIo {

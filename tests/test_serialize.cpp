@@ -401,6 +401,41 @@ TEST(serialize_roundtrip_stable) {
     CHECK(d2.next_effect_id >= d.next_effect_id);
 }
 
+TEST(crt_parameters_and_cache_state) {
+    Document d = doc_with_look();
+    auto fx = make_effect(d, EffectType::CrtSim);
+    fx.params.resize(9);
+    fx.params[2] = 240.0f;
+    fx.params[6] = 5.0f;
+    d.looks[0].layers[0].stack.push_back(fx);
+    Document loaded = doc::doc_from_json(doc::doc_to_json(d));
+    auto& restored = loaded.looks[0].layers[0].stack[0];
+    CHECK_EQ(restored.params.size(), size_t{13});
+    CHECK_EQ(restored.params[2], 240.0f);
+    CHECK_EQ(restored.params[6], 5.0f);
+    CHECK_EQ(restored.params[9], 0.3f);
+    CHECK_EQ(restored.params[11], 0.0f);
+    CHECK(!doc::document_uses_history(loaded));
+    restored.params[12] = 1.0f;
+    CHECK(!doc::document_uses_history(loaded));
+    restored.params[11] = 30.0f;
+    CHECK(doc::document_uses_history(loaded));
+    restored.params[4] = 3.0f;
+    CHECK(!doc::document_uses_history(loaded));
+    restored.params[4] = 0.0f;
+    restored.bypass = true;
+    CHECK(!doc::document_uses_history(loaded));
+    restored.bypass = false;
+    restored.params[11] = 0.0f;
+    doc::KeyframeLane lane;
+    lane.target = {restored.id, 11};
+    lane.keys.push_back({0.0, 50.0f});
+    loaded.looks[0].lanes.push_back(lane);
+    CHECK(doc::document_uses_history(loaded));
+    loaded.looks[0].lanes[0].muted = true;
+    CHECK(!doc::document_uses_history(loaded));
+}
+
 TEST(serialize_tolerant_load) {
     // The loader skips unknown types and re-derives counters above the ids.
     const char* text = R"({

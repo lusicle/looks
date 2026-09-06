@@ -77,6 +77,8 @@ add_slang_shaders(looks_shaders
         fx_pixel_sort.comp.slang
         fx_wave_warp.comp.slang
         fx_crt_sim.comp.slang
+        fx_crt_prepare.comp.slang
+        fx_crt_blur.comp.slang
         fx_halftone.comp.slang
         fx_star_filter.comp.slang
         fx_streak.comp.slang
@@ -155,6 +157,7 @@ add_slang_shaders(looks_shaders
         matte_apply.comp.slang
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_common.slang
+        ${CMAKE_CURRENT_SOURCE_DIR}/fx_crt_common.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_glow_blur_body.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_pattern.slang
         ${CMAKE_CURRENT_SOURCE_DIR}/fx_seg7.slang

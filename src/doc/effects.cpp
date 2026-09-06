@@ -535,6 +535,10 @@ constexpr ParamDesc kWaveWarpParams[] = {
      "horizontal|vertical|ripple"},
 };
 
+constexpr int kCrtSimControlOrder[] = {
+    4, 0, 5, 6, 12, 2, 1, 10, 9, 3, 7, 11, 8, kWetParam, kOpacityParam,
+};
+
 constexpr ParamDesc kCrtSimParams[] = {
     // LCD mode has no tube terms; scanline drives its row gaps.
     {"curvature", "curvature", 0.0f, 1.0f, 0.35f, "%.2f", nullptr, false,
@@ -547,11 +551,19 @@ constexpr ParamDesc kCrtSimParams[] = {
     {"mask_mode", "screen", 0.0f, 3.0f, 0.0f, "%.0f",
      "aperture grille|slot mask|shadow mask|lcd"},
     {"mask", "mask", 0.0f, 1.0f, 0.4f, "%.2f"},
-    {"triad", "triad size", 2.0f, 8.0f, 3.0f, "%.0f px"},
+    {"triad", "phosphor pitch", 2.0f, 8.0f, 3.0f, "%.1f px"},
     {"converge", "convergence", 0.0f, 3.0f, 0.6f, "%.1f px", nullptr,
      false, 4, 0x7},
     {"halation", "halation", 0.0f, 1.0f, 0.25f, "%.2f", nullptr, false,
      4, 0x7},
+    {"beam_width", "beam width", 0.15f, 0.45f, 0.3f, "%.2f", nullptr,
+     false, 4, 0x7},
+    {"bandwidth", "signal blur", 0.0f, 3.0f, 0.5f, "%.1f px", nullptr,
+     false, 4, 0x7},
+    {"persistence", "phosphor decay", 0.0f, 100.0f, 0.0f, "%.0f ms", nullptr,
+     false, 4, 0x7},
+    {"interlaced", "scan mode", 0.0f, 1.0f, 0.0f, "%.0f",
+     "progressive|interlaced", false, 4, 0x7},
 };
 
 constexpr ParamDesc kHalftoneParams[] = {
@@ -1163,7 +1175,8 @@ constexpr EffectInfo kEffectInfos[] = {
      FxCategory::Texture},
     {"pixel_sort", "Pixel Sort", kPixelSortParams, 4, FxCategory::Signal},
     {"wave_warp", "Wave Warp", kWaveWarpParams, 4, FxCategory::Warp},
-    {"crt_sim", "CRT Tube", kCrtSimParams, 9, FxCategory::Signal},
+    {"crt_sim", "CRT Tube", kCrtSimParams, 13, FxCategory::Signal,
+     kCrtSimControlOrder},
     {"halftone", "Halftone", kHalftoneParams, 7, FxCategory::PaintPrint},
     {"star_filter", "Star Filter", kStarFilterParams, 4,
      FxCategory::Optics},
@@ -1332,6 +1345,9 @@ namespace {
 // Quantize dither mode 9 (rd stipple) accumulates state across frames.
 bool instance_uses_history(const EffectInstance& fx) {
     if (effect_uses_history(fx.type)) return true;
+    if (fx.type == EffectType::CrtSim && fx.params.size() > 11 &&
+        fx.params[4] < 2.5f && fx.params[11] > 0.0f)
+        return true;
     // Motion lock reads the previous frame: history in that mode only.
     if (fx.type == EffectType::Quantize && fx.params.size() > 8 &&
         fx.params[8] >= 0.5f)
@@ -1351,8 +1367,21 @@ bool instance_uses_history(const EffectInstance& fx) {
 
 bool look_uses_history(const Look& look) {
     for (const Layer& layer : look.layers)
-        for (const EffectInstance& fx : layer.stack)
-            if (!fx.bypass && instance_uses_history(fx)) return true;
+        for (const EffectInstance& fx : layer.stack) {
+            if (fx.bypass) continue;
+            if (instance_uses_history(fx)) return true;
+            if (fx.type != EffectType::CrtSim || fx.params.size() <= 11) continue;
+            auto changes_decay = [&](const ParamKey& key) {
+                return key.effect_id == fx.id &&
+                    (key.param_index == 11 ||
+                     (key.param_index == 4 && fx.params[11] > 0.0f));
+            };
+            for (const auto& lane : look.lanes)
+                if (!lane.muted && !lane.keys.empty() && changes_decay(lane.target))
+                    return true;
+            for (const auto& route : look.mod_routes)
+                if (changes_decay(route.target)) return true;
+        }
     return false;
 }
 

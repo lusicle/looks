@@ -119,7 +119,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_zoom_crunch.comp.spv", 1},
     {"fx_pixel_sort.comp.spv", 1},
     {"fx_wave_warp.comp.spv", 1},
-    {"fx_crt_sim.comp.spv", 1},
+    {"fx_crt_sim.comp.spv", 3},
     {"fx_halftone.comp.spv", 1},
     {"fx_star_filter.comp.spv", 1},
     {"fx_streak.comp.spv", 1},
@@ -351,7 +351,8 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
                            type_i == doc::EffectType::Text ||
                            type_i == doc::EffectType::MotionExtract
                        ? 4u
-                       : (type_i == doc::EffectType::TrackPin ? 9u : 0u));
+                       : (type_i == doc::EffectType::TrackPin ? 9u :
+                          type_i == doc::EffectType::CrtSim ? 3u : 0u));
         desc.push_bytes = static_cast<uint32_t>(
             (kFxPreludeWords + info.param_count + extra) * sizeof(uint32_t));
         fx_[i] = ComputePipeline::create(device_, shader_dir, desc);
@@ -360,6 +361,12 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
 
     flow_ = mk("flow.comp.spv", 2, 1, 7 * sizeof(uint32_t));
     if (!flow_) return false;
+    const uint32_t crt_push = static_cast<uint32_t>(
+        (kFxPreludeWords + doc::effect_info(doc::EffectType::CrtSim).param_count + 3) *
+        sizeof(uint32_t));
+    crt_prepare_ = mk("fx_crt_prepare.comp.spv", 2, 1, crt_push);
+    crt_blur_ = mk("fx_crt_blur.comp.spv", 1, 1, 4 * sizeof(uint32_t));
+    if (!crt_prepare_ || !crt_blur_) return false;
 
     // Inputs: front state, then the video frame.
     vs_front_ = mk("vs_front.comp.spv", 2, 1, 12 * sizeof(uint32_t));
@@ -1573,6 +1580,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     arena_.reset(frame_index);
     pool_ = &pools_[frame_index % kFramesInFlight];
     pool_->release_all();
+    crt_retired_[frame_index % kFramesInFlight].clear();
     StagingBuffer& staging = *staging_[frame_index % kFramesInFlight];
     staging.reset();
 
@@ -2362,7 +2370,102 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                         bytes, w, h, linear_sampler_);
                 };
 
-                if (fx.type == doc::EffectType::Glow) {
+                if (fx.type == doc::EffectType::CrtSim) {
+                    uint32_t* extra = &push[kFxPreludeWords + param_count];
+                    extra[0] = as_bits(static_cast<float>(canvas_w));
+                    extra[1] = as_bits(static_cast<float>(canvas_h));
+                    extra[2] = 0;
+                    const uint32_t bytes = push_bytes + 3 * sizeof(uint32_t);
+                    GpuImage* signal = input_image(0);
+                    GpuImage* glow = signal;
+                    const bool tube = fx.params[4] < 2.5f;
+                    const bool history = tube && fx.params[11] > 0.0f;
+                    if (tube) {
+                        const uint32_t rows = static_cast<uint32_t>(
+                            std::clamp(fx.params[2] + 0.5f, 64.0f, 1080.0f));
+                        const GpuImage* previous = input_image(0);
+                        if (history) {
+                            CrtSlot& slot = crt_state_[skey];
+                            if (!slot.current || slot.current->width() != w ||
+                                slot.current->height() != rows) {
+                                auto& retired = crt_retired_[frame_index % kFramesInFlight];
+                                if (slot.previous) retired.push_back(std::move(slot.previous));
+                                if (slot.current) retired.push_back(std::move(slot.current));
+                                const auto usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                                slot.previous = GpuImage::create(device_,
+                                    VK_FORMAT_R16G16B16A16_SFLOAT, w, rows, usage);
+                                slot.current = GpuImage::create(device_,
+                                    VK_FORMAT_R16G16B16A16_SFLOAT, w, rows, usage);
+                                slot.last_frame = 0xFFFFFFFFu;
+                            }
+                            if (!slot.previous || !slot.current) return nullptr;
+                            if (slot.last_frame != 0xFFFFFFFFu &&
+                                timeline_frame == slot.last_frame + 1) {
+                                std::swap(slot.previous, slot.current);
+                                slot.previous_valid = true;
+                            } else if (slot.last_frame == 0xFFFFFFFFu ||
+                                       timeline_frame != slot.last_frame) {
+                                clear_color(rec, *slot.previous,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {});
+                                slot.previous_valid = false;
+                            }
+                            extra[2] = slot.previous_valid;
+                            slot.previous->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                            previous = slot.previous.get();
+                            signal = slot.current.get();
+                            slot.last_frame = timeline_frame;
+                        } else {
+                            auto it = crt_state_.find(skey);
+                            if (it != crt_state_.end()) it->second.last_frame = 0xFFFFFFFFu;
+                            signal = pool_->acquire(w, rows);
+                        }
+                        if (!signal) return nullptr;
+                        signal->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                        push[1] = rows;
+                        const GpuImage* sampled[2] = {input_image(0), previous};
+                        crt_prepare_->dispatch(rec, arena_, frame_index,
+                            sampled, 2, &signal, 1, push, bytes, w, rows, linear_sampler_);
+                        signal->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        push[1] = h;
+                        glow = signal;
+                        if (fx.params[8] > 0.0f) {
+                            auto blur = [&](uint32_t bw, uint32_t bh, uint32_t pass) {
+                                GpuImage* target = pool_->acquire(bw, bh);
+                                if (!target) return false;
+                                target->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                                const GpuImage* source[1] = {glow};
+                                const float span = pass == 1
+                                    ? static_cast<float>(bw) * canvas_h / canvas_w
+                                    : static_cast<float>(bh);
+                                const uint32_t blur_push[4] = {
+                                    bw, bh, pass, as_bits(std::max(0.5f, span * 0.012f))};
+                                crt_blur_->dispatch(rec, arena_, frame_index,
+                                    source, 1, &target, 1, blur_push, sizeof(blur_push),
+                                    bw, bh, linear_sampler_);
+                                target->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                                if (glow != signal) pool_->release(glow);
+                                glow = target;
+                                return true;
+                            };
+                            while (glow->height() > 128 || glow->width() > 512) {
+                                if (!blur(std::max(2u, (glow->width() + 1) / 2),
+                                          std::max(2u, (glow->height() + 1) / 2), 0))
+                                    return nullptr;
+                            }
+                            if (!blur(glow->width(), glow->height(), 1) ||
+                                !blur(glow->width(), glow->height(), 2)) return nullptr;
+                        }
+                    } else {
+                        auto it = crt_state_.find(skey);
+                        if (it != crt_state_.end()) it->second.last_frame = 0xFFFFFFFFu;
+                    }
+                    const GpuImage* sampled[3] = {input_image(0), signal, glow};
+                    fx_[static_cast<size_t>(fx.type)]->dispatch(rec, arena_, frame_index,
+                        sampled, 3, &dst, 1, push, bytes, w, h, linear_sampler_);
+                    if (glow != signal) pool_->release(glow);
+                    if (tube && !history) pool_->release(signal);
+                } else if (fx.type == doc::EffectType::Glow) {
                     ComputePipeline& pipe = *glow_pass_[node.pass_index];
                     if (node.pass_index == 3) {
                         const GpuImage* sampled[2] = {input_image(0),
