@@ -18,7 +18,7 @@ const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
 const char* const kSourceKindNames[] = {"media", "solid", "gradient",
                                         "noise", "test",  "oscillator",
-                                        "shape", "look",  "sequence", "slideshow"};
+                                        "shape", "look",  "sequence", "slideshow", "none"};
 static_assert(sizeof(kSourceKindNames) / sizeof(kSourceKindNames[0]) ==
                   static_cast<size_t>(LayerSourceKind::Count),
               "source kind names track the enum");

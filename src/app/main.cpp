@@ -2369,6 +2369,7 @@ struct GroupUiState {
     ui::SliderState face_sliders[8];
     ui::ButtonState face_remove[8];
     ui::DropdownState face_dd[8];
+    ui::SwatchState face_swatch[8];
 };
 
 struct RouteUiState {
@@ -2589,10 +2590,9 @@ struct SettingsUi {
     ui::TextField cache_size{.buf = "20", .filter = ui::TextFilter::Uint, .cap = 6};
     ui::TextField cache_age{.buf = "30", .filter = ui::TextFilter::Uint, .cap = 5};
     ui::TextInputState cache_size_state, cache_age_state;
-    ui::ButtonState cache_tab_button;
+    ui::ButtonState category_buttons[2];
     ui::TextField filter{.cap = 40};
     ui::TextInputState filter_state, name_state, step_state;
-    ui::ButtonState tab_button;
     std::vector<ui::ButtonState> row_buttons;
     // Format: action:<id>, macro:<name>, or script:<path>. Empty = none.
     std::string capture;
@@ -3160,7 +3160,7 @@ struct AppState {
     ui::ButtonState snap_apply[3], snap_store[3];
     ui::ScrubberState scrubber;
     ui::ButtonState loop_check;
-    ui::ScrollState sidebar_scroll, right_scroll, preset_scroll;
+    ui::ScrollState sidebar_scroll, right_scroll, preset_scroll, composition_scroll;
     ui::ScrollState browser_scroll;
     uint64_t browser_sel = 0;
     ui::TextField browser_filter;
@@ -3309,7 +3309,8 @@ float shown_param_value(const AppState& app, const doc::ParamKey& key,
 
 int layer_index_by_id(const doc::Look& look, uint64_t id) {
     for (size_t li = 0; li < look.layers.size(); ++li)
-        if (look.layers[li].id == id) return static_cast<int>(li);
+        if (look.layers[li].id == id && look.layers[li].source != doc::LayerSourceKind::None)
+            return static_cast<int>(li);
     return -1;
 }
 
@@ -8403,14 +8404,12 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
     using namespace ui;
     LabelOpts dim;
     dim.color = active_theme().text_dim;
+    dim.wrap = true;
     StackOpts col;
-    col.gap = 6.0f;
+    col.gap = active_theme().panel_gap;
     col.cross_align = AlignMode::Stretch;
-    col.padding = Edges::all(12);
     col.width = SizeSpec::fill();
-    col.height = SizeSpec::fill();
     std::vector<LayoutNode*> rows;
-    rows.push_back(Heading(arena, "block"));
     const doc::Placement* p =
         app.sel_placement
             ? video_placement_of(app.sequence(), app.sel_placement)
@@ -8421,8 +8420,8 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
         rows.push_back(
             Label(arena, "then move / scale / rotate it here or", dim));
         rows.push_back(Label(arena, "directly on the monitor", dim));
-        return Panel(arena, VStackDyn(arena, col, rows),
-                     PanelOpts{Edges::all(0), -1.0f});
+        return PanelPage(arena, {"transform", &app.block_scroll,
+                         VStackDyn(arena, col, rows)});
     }
     const doc::Look* tl = app.document.find_look(p->target);
     const doc::Sequence* ts =
@@ -8450,19 +8449,9 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
         so.out_released = px.released;
         so.display_scale = dscale;
         so.display_offset = doffset;
-        LabelOpts ldim;
-        ldim.color = active_theme().text_dim;
-        StackOpts hs;
-        hs.gap = 6.0f;
-        hs.cross_align = AlignMode::Center;
-        hs.width = SizeSpec::fill();
-        rows.push_back(HStack(
-            arena, hs,
-            {SizedBox(arena, SizeSpec::fixed(64),
-                      SizeSpec::fixed(active_theme().control_height),
-                      Label(arena, label, ldim)),
-             SliderF(arena, value, min_v, max_v,
-                     &app.block_xf_sliders[si++], so)}));
+        rows.push_back(FormRow(arena, label,
+            SliderF(arena, value, min_v, max_v,
+                    &app.block_xf_sliders[si++], so)));
     };
     // The document unit is a canvas fraction. The readouts show px from
     // the top left, and percent for scale and opacity.
@@ -8485,27 +8474,24 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
             p->anchor_x == 0.5f - p->pos_x &&
             p->anchor_y == 0.5f - p->pos_y;
         StackOpts hs;
-        hs.gap = 6.0f;
+        hs.gap = active_theme().panel_gap;
         hs.cross_align = AlignMode::Center;
         hs.width = SizeSpec::fill();
-        rows.push_back(HStack(
+        rows.push_back(FormRow(arena, "snap", Wrap(
             arena, hs,
-            {SizedBox(arena, SizeSpec::fixed(64),
-                      SizeSpec::fixed(active_theme().control_height),
-                      Label(arena, "snap", dim)),
-             Chip(arena, "media centre", at_media,
+            {Chip(arena, "media centre", at_media,
                   &app.block_anchor_media_btn, px.snap_media,
                   "anchor onto the block's own centre"),
              Chip(arena, "screen centre", at_screen,
                   &app.block_anchor_screen_btn, px.snap_screen,
-                  "anchor onto the canvas centre")}));
+                  "anchor onto the canvas centre")})));
     }
     rows.push_back(Label(arena, "Drag body to move.", dim));
     rows.push_back(Label(arena, "Drag corners to scale.", dim));
     rows.push_back(Label(arena, "Drag stub to rotate.", dim));
     rows.push_back(Label(arena, "Drag crosshair to set anchor.", dim));
-    return Panel(arena, VStackDyn(arena, col, rows),
-                 PanelOpts{Edges::all(0), -1.0f});
+    return PanelPage(arena, {"transform", &app.block_scroll,
+                     VStackDyn(arena, col, rows)});
 }
 
 struct MenuUser {
@@ -9900,7 +9886,6 @@ void draw_lane(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     }
 }
 
-// Rows without mod targets keep a blank gutter to hold the columns.
 ui::LayoutNode* param_row(ui::LayoutArena& arena, const char* label,
                           ui::LayoutNode* slider,
                           ui::ButtonState* route_state, bool* route_clicked,
@@ -9914,12 +9899,11 @@ ui::LayoutNode* param_row(ui::LayoutArena& arena, const char* label,
     small_dim.color = keyed ? active_theme().accent
                      : routed ? active_theme().accent_dim
                               : active_theme().text_dim;
-    small_dim.size = active_theme().font_size_small;
-    // The mod gutter is always three 18 px slots. Leave blanks, not gaps.
     std::vector<LayoutNode*> cells;
     if (route_clicked) {
         ButtonOpts micro;
-        micro.width = SizeSpec::fixed(18);
+        micro.width = SizeSpec::fixed(active_theme().control_height);
+        micro.framed = true;
         micro.tooltip = routed ? "add modulation route (routed)"
                                : "add modulation route";
         micro.active = routed;
@@ -9936,22 +9920,13 @@ ui::LayoutNode* param_row(ui::LayoutArena& arena, const char* label,
                                        : "expose on the group face";
             cells.push_back(IconButton(arena, Icon::Knob, expose_state,
                                        expose_clicked, micro));
-        } else {
-            cells.push_back(SizedBox(arena, SizeSpec::fixed(18),
-                                     SizeSpec::fixed(1), nullptr));
         }
-    } else {
-        cells.push_back(
-            SizedBox(arena, SizeSpec::fixed(58), SizeSpec::fixed(1), nullptr));
     }
-    cells.push_back(SizedBox(arena, SizeSpec::fixed(80), SizeSpec::fixed(18),
-                             Label(arena, label, small_dim)));
-    cells.push_back(slider);
     StackOpts row;
-    row.gap = 2.0f;
+    row.gap = kSpaceTight;
     row.cross_align = AlignMode::Center;
-    LayoutNode* n = HStackDyn(arena, row, cells);
-    return n;
+    return FormRow(arena, label, slider,
+        cells.empty() ? nullptr : HStackDyn(arena, row, cells), small_dim);
 }
 
 // Sorted by label. The enum order stays frozen for the shader tables.
@@ -9977,7 +9952,6 @@ const std::vector<doc::EffectType>& category_effects_sorted(
     return tables[static_cast<size_t>(cat)];
 }
 
-// Keeps the 58/80/18 column rhythm in one place.
 ui::LayoutNode* value_row(ui::LayoutArena& arena, const char* label,
                           ui::LayoutNode* value) {
     return param_row(arena, label, value, nullptr, nullptr, nullptr,
@@ -10016,9 +9990,9 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
          app.look().layers[app.selected_layer].groups)
         if (g.id == fx.group_id) fx_group = &g;
 
-    // Fixed-width icon columns line up across every card.
     ButtonOpts tiny;
-    tiny.width = SizeSpec::fixed(20);
+    tiny.width = SizeSpec::fixed(active_theme().control_height);
+    tiny.framed = true;
     ButtonOpts eye_opts = tiny;
     eye_opts.tooltip = fx.bypass ? "enable effect" : "bypass effect";
     ButtonOpts solo_opts = tiny;
@@ -10043,11 +10017,10 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
 
     *row.bypass_staged = !fx.bypass;   // eye click applies this
     std::vector<LayoutNode*> rows;
-    rows.push_back(HStack(
-        arena, {2.0f},
+    rows.push_back(Label(arena, info.label));
+    rows.push_back(Wrap(
+        arena, {kSpaceTight},
         {
-            Label(arena, info.label),
-            Spacer(arena),
             IconButton(arena, fx.bypass ? Icon::EyeOff : Icon::Eye,
                        &state.bypass_button, row.bypass_changed, eye_opts),
             IconButton(arena, fx.solo ? Icon::SoloOn : Icon::Solo,
@@ -10225,10 +10198,9 @@ ui::LayoutNode* build_effect_panel(ui::LayoutArena& arena, AppState& app,
     out.rows.push_back(row);
 
     StackOpts column;
-    column.gap = 4.0f;
+    column.gap = active_theme().panel_gap;
     column.cross_align = AlignMode::Stretch;
-    return Panel(arena, VStackDyn(arena, column, rows),
-                 PanelOpts{Edges::all(8), -1.0f, /*outline=*/false});
+    return VStackDyn(arena, column, rows);
 }
 
 // Both faces resolve through this, so they cannot drift.
@@ -10241,6 +10213,7 @@ struct FaceParam {
     const char* name = "?";
     const char* format = "%.2f";
     const char* options = nullptr;
+    float hue_bar = -1.0f;
 };
 bool resolve_face_param(const doc::EffectInstance& mfx,
                         const doc::EffectInfo& minfo,
@@ -10260,6 +10233,7 @@ bool resolve_face_param(const doc::EffectInstance& mfx,
         out->cur = mfx.params[static_cast<size_t>(fkey.param_index)];
         out->min_v = d.min_value;
         out->max_v = d.max_value;
+        out->hue_bar = d.hue_bar;
         out->name = d.label;
         out->format = d.display_deg ? "%.0f deg" : d.format;
         if (d.display_deg) out->scale = 57.29578f;
@@ -10294,28 +10268,30 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
     actions.save = arena.alloc<bool>();
 
     ButtonOpts save_opts;
-    save_opts.flat = true;
-    save_opts.width = SizeSpec::fixed(28);
+    save_opts.framed = true;
+    save_opts.width = SizeSpec::fixed(active_theme().control_height);
     save_opts.tooltip = "save group as preset";
     ButtonOpts ungroup_opts;
-    ungroup_opts.width = SizeSpec::fixed(20);
+    ungroup_opts.width = SizeSpec::fixed(active_theme().control_height);
+    ungroup_opts.framed = true;
     ungroup_opts.tooltip = "ungroup";
 
     std::vector<LayoutNode*> rows;
     const char* title = group.name.empty() ? "group" : group.name.c_str();
     *actions.bypass_staged = !group.bypass;   // eye click applies this
     StackOpts hdr;
-    hdr.gap = 2.0f;
+    hdr.gap = kSpaceTight;
     hdr.cross_align = AlignMode::Center;
     ButtonOpts group_eye;
-    group_eye.width = SizeSpec::fixed(20);
+    group_eye.width = SizeSpec::fixed(active_theme().control_height);
+    group_eye.framed = true;
     group_eye.tooltip = group.bypass ? "enable group" : "bypass group";
     std::vector<LayoutNode*> hdr_cells{
         SectionHeader(arena, title, !group.folded, &state.fold_button,
-                      actions.fold, /*small=*/true),
+                      actions.fold),
         IconButton(arena, group.bypass ? Icon::EyeOff : Icon::Eye,
                    &state.bypass_check, actions.bypass_changed, group_eye),
-        Button(arena, "sv", &state.save_button, actions.save, save_opts),
+        IconButton(arena, Icon::Save, &state.save_button, actions.save, save_opts),
         IconButton(arena, Icon::Close, &state.ungroup_button, actions.ungroup,
                    ungroup_opts)};
     LayoutNode* hdr_stack = HStackDyn(arena, hdr, hdr_cells);
@@ -10375,7 +10351,7 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
         const char* fmt = fp.format;
         const char* fopts = fp.options;
         ParamStage stage{fli, ffi, fkey.param_index,
-                         arena.alloc<float>(), cur, arena.alloc<bool>(),
+                         arena.alloc<float>(fp.hue_bar >= 0 ? 4 : 1), cur, arena.alloc<bool>(),
                          arena.alloc<bool>()};
         *stage.staged = cur;
         SliderOpts opts;
@@ -10389,7 +10365,8 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
         char mline[80];
         std::snprintf(mline, sizeof(mline), "%s: %s", minfo.label, pname);
         ButtonOpts mx;
-        mx.width = SizeSpec::fixed(20);
+        mx.width = SizeSpec::fixed(active_theme().control_height);
+        mx.framed = true;
         mx.tooltip = "hide from the group face";
         LayoutNode* fctl;
         if (fopts && fkey.param_index >= 0) {
@@ -10410,6 +10387,12 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
                                        0, fn > 0 ? fn - 1 : 0),
                             &state.face_dd[face_i], fpick.selected,
                             SizeSpec::fill());
+        } else if (fp.hue_bar >= 0) {
+            SwatchOpts swatch;
+            swatch.mode = SwatchMode::Hue;
+            swatch.hue_light = fp.hue_bar;
+            fctl = ColorSwatch(arena, stage.staged, &state.face_swatch[face_i],
+                stage.staged, stage.changed, stage.released, swatch);
         } else if (fmt && std::strstr(fmt, "deg")) {
             fctl = DialF(arena, stage.staged, min_v, max_v,
                          &state.face_sliders[face_i], opts);
@@ -10417,18 +10400,9 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
             fctl = SliderF(arena, stage.staged, min_v, max_v,
                            &state.face_sliders[face_i], opts);
         }
-        StackOpts mrow;
-        mrow.gap = 2.0f;
-        mrow.cross_align = AlignMode::Center;
-        std::vector<LayoutNode*> mcells{
-            SizedBox(arena, SizeSpec::fixed(58), SizeSpec::fixed(1), nullptr),
-            SizedBox(arena, SizeSpec::fixed(80), SizeSpec::fixed(18),
-                     Label(arena, mline, small_dim)),
-            fctl,
+        rows.push_back(FormRow(arena, mline, fctl,
             IconButton(arena, Icon::Close, &state.face_remove[face_i],
-                       out.expose_toggles.back().clicked, mx)};
-        LayoutNode* mstack = HStackDyn(arena, mrow, mcells);
-        rows.push_back(mstack);
+                       out.expose_toggles.back().clicked, mx)));
         out.params.push_back(stage);
         ++face_i;
     }
@@ -10440,10 +10414,10 @@ ui::LayoutNode* build_group_panel(ui::LayoutArena& arena, AppState& app,
 
     out.group_actions.push_back(actions);
     StackOpts column;
-    column.gap = 4.0f;
+    column.gap = active_theme().panel_gap;
     column.cross_align = AlignMode::Stretch;
     return Panel(arena, VStackDyn(arena, column, rows),
-                 PanelOpts{Edges::all(6), -1.0f, /*outline=*/true});
+                 PanelOpts{Edges::all(active_theme().panel_gap), -1.0f});
 }
 
 // The order here must match the pick handler walk.
@@ -10783,7 +10757,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             40.0f + static_cast<float>(n_layers - 1 - li) * kLanePitch;
         float auto_x = kAutoX0;
 
-        if (!scope) {
+        if (!scope && layer.source != doc::LayerSourceKind::None) {
             const FrameUi::LayerRow lrow = stage_layer_row(arena, li, layer);
             out.layer_rows.push_back(lrow);
 
@@ -11039,7 +11013,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                                "gradient", "noise",
                                                "pattern",  "osc",
                                                "shape",    "look",
-                                               "sequence", "slideshow"};
+                                               "sequence", "slideshow", "none"};
             static_assert(sizeof(kSrcTitles) / sizeof(kSrcTitles[0]) ==
                               static_cast<size_t>(
                                   doc::LayerSourceKind::Count),
@@ -11156,7 +11130,7 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     const char* fmt = fp.format;
                     const char* fopts = fp.options;
                     ParamStage stage{li, ffi, fkey.param_index,
-                                     arena.alloc<float>(), cur,
+                                     arena.alloc<float>(fp.hue_bar >= 0 ? 4 : 1), cur,
                                      arena.alloc<bool>(),
                                      arena.alloc<bool>()};
                     *stage.staged = cur;
@@ -11174,6 +11148,13 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         rows[slot].kind = 1;
                         rows[slot].option_items = option_items(
                             arena, fopts, &rows[slot].option_count);
+                    } else if (fp.hue_bar >= 0) {
+                        auto& swatch = app.layer_ui[layer.id].hue_swatch[
+                            fkey.effect_id * 64u + uint64_t(fkey.param_index + 2)];
+                        swatch.mode = ui::SwatchMode::Hue;
+                        swatch.hue_light = fp.hue_bar;
+                        rows[slot].kind = 3;
+                        rows[slot].swatch = &swatch;
                     }
                     rows[slot].staged = stage.staged;
                     rows[slot].changed = stage.changed;
@@ -12213,10 +12194,10 @@ FlowBuild build_flow(ui::LayoutArena& arena, AppState& app, FrameUi& out,
 }
 
 void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
-                       float fps, ui::LayoutNode** left_out,
-                       ui::LayoutNode** right_out,
-                       ui::LayoutNode** preset_out,
-                       ui::LayoutNode** browser_out,
+                       float fps, ui::PanelContent* left_out,
+                       ui::PanelContent* right_out,
+                       ui::PanelContent* preset_out,
+                       ui::PanelContent* browser_out,
                        const ui::UiTexture* gallery_tex,
                        const std::unordered_map<uint64_t, uint32_t>*
                            gallery_cell_map) {
@@ -12254,17 +12235,20 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
 
     std::vector<LayoutNode*> rows;
     std::vector<LayoutNode*> right_rows;
+    dim.wrap = true;
+    small_dim.wrap = true;
+    std::vector<LayoutNode*> project_toolbar;
+    std::vector<LayoutNode*> node_footer;
     {
         out.open_clicked = arena.alloc<bool>();
         out.import_media_clicked = arena.alloc<bool>();
         ButtonOpts open_opts;
-        open_opts.width = SizeSpec::fixed(90);
-        open_opts.tooltip = "open an mp4/mov file";
+        open_opts.tooltip = "open supported media";
         StackOpts hdr;
         hdr.gap = kSpaceTight;
         hdr.cross_align = AlignMode::Center;
         std::vector<LayoutNode*> hdr_cells{
-            Heading(arena, "looks"), Spacer(arena),
+            Label(arena, "media", dim), Spacer(arena),
             Button(arena, "open media...", &app.open_button, out.open_clicked,
                    open_opts)};
         LayoutNode* hdr_stack = HStackDyn(arena, hdr, hdr_cells);
@@ -12300,19 +12284,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         {
             TextInputOpts so;
             so.placeholder = "search...";
-            so.flat = true;
             so.tooltip = "type to filter the project";
             so.out_cancel = &out.browser_filter_cancel;
-            PanelOpts well;
-            well.padding = Edges::all(1);
-            well.bg = active_theme().well_bg();
-            LayoutNode* well_node =
-                Panel(arena,
-                      TextInput(arena, &app.browser_filter,
-                                &app.browser_search_state, so),
-                      well);
-            // Fill, or the well hugs the text and resizes on every keypress.
-            well_node->width = SizeSpec::fill();
+            LayoutNode* search = TextInput(arena, &app.browser_filter,
+                                           &app.browser_search_state, so);
             static const char* kViewLabels[2] = {"list", "grid"};
             static const char* kViewTips[2] = {"tree list view",
                                                "thumbnail gallery view"};
@@ -12321,11 +12296,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             view_picks[1] = out.browser_view_pick[1];
             StackOpts srow;
             srow.gap = 8.0f;
-            srow.padding.r = 10.0f;
             srow.cross_align = AlignMode::Center;
             browser_search = HStack(
                 arena, srow,
-                {well_node,
+                {search,
                  Segmented(arena, kViewLabels, kViewTips, 2,
                            app.browser_view, app.browser_view_btns,
                            view_picks, SizeSpec::fixed(88.0f))});
@@ -12479,6 +12453,8 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             browser_rows.push_back(LibraryGallery(
                 arena, app, out, out.browser_cells.data(),
                 out.browser_cells.size(), &app.browser_sel));
+        if (browser_rows.empty())
+            browser_rows.push_back(Label(arena, "No items match the search.", dim));
         out.new_sequence_clicked = arena.alloc<bool>();
         out.browser_new_look_clicked = arena.alloc<bool>();
         out.new_bin_clicked = arena.alloc<bool>();
@@ -12489,11 +12465,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         mbin.tooltip = "new bin";
         mfolder.tooltip = "import a folder as a bin";
         StackOpts strip;
-        strip.gap = 6.0f;
+        strip.gap = active_theme().panel_gap;
         strip.width = SizeSpec::fill();
         strip.justify = Justify::End;
-        strip.padding = Edges{0.0f, 0.0f, 10.0f, 0.0f};
-        browser_create = HStack(
+        browser_create = Wrap(
             arena, strip,
             {Button(arena, "import folder", &app.import_folder_button,
                     out.import_folder_clicked, mfolder),
@@ -12505,6 +12480,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                     out.new_bin_clicked, mbin)});
     }
 
+    std::vector<LayoutNode*> media_rows = std::move(rows);
+    rows.clear();
+    rows.push_back(Label(arena, "format", dim));
     {
         static const char* kFpsItems[] = {"auto", "24", "25", "30", "48",
                                           "50",   "60", "90", "120"};
@@ -12518,11 +12496,19 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         for (int i = 1; i < kFpsCount; ++i)
             if (std::abs(app.document.fps - kProjectFpsValues[i]) < 0.01)
                 fps_cur = i;
+        const char** fps_items = arena.alloc<const char*>(kFpsCount + 1);
+        std::copy_n(kFpsItems, kFpsCount, fps_items);
+        const bool custom_fps = fps_cur == 0 && app.document.fps > 0;
+        if (custom_fps) {
+            std::snprintf(line, sizeof(line), "%.6g", app.document.fps);
+            fps_items[kFpsCount] = arena.dup(line, std::strlen(line));
+            fps_cur = kFpsCount;
+        }
         out.project_fps_selected = arena.alloc<int>();
         *out.project_fps_selected = -1;
         rows.push_back(value_row(
-            arena, "fps",
-            Dropdown(arena, kFpsItems, kFpsCount, fps_cur,
+            arena, "frame rate",
+            Dropdown(arena, fps_items, kFpsCount + (custom_fps ? 1 : 0), fps_cur,
                      &app.project_fps_dd, out.project_fps_selected,
                      SizeSpec::fill(),
                      "timeline frame rate (auto = first asset)")));
@@ -12534,14 +12520,24 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             if (app.document.canvas_w == kProjectResW[i] &&
                 app.document.canvas_h == kProjectResH[i])
                 res_cur = i;
+        const char** res_items = arena.alloc<const char*>(7);
+        std::copy_n(kResItems, 6, res_items);
+        const bool custom_res = res_cur == 0 && app.document.canvas_w && app.document.canvas_h;
+        if (custom_res) {
+            std::snprintf(line, sizeof(line), "%u x %u", app.document.canvas_w, app.document.canvas_h);
+            res_items[6] = arena.dup(line, std::strlen(line));
+            res_cur = 6;
+        }
         out.project_res_selected = arena.alloc<int>();
         *out.project_res_selected = -1;
         rows.push_back(value_row(
             arena, "canvas",
-            Dropdown(arena, kResItems, 6, res_cur, &app.project_res_dd,
+            Dropdown(arena, res_items, custom_res ? 7 : 6, res_cur, &app.project_res_dd,
                      out.project_res_selected, SizeSpec::fill(),
                      "canvas size (auto = first asset)")));
     }
+    rows.push_back(Separator(arena));
+    rows.insert(rows.end(), media_rows.begin(), media_rows.end());
 
     if (has_media_file) {
         const doc::Asset* opened = opened_asset(app);
@@ -12555,7 +12551,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             std::snprintf(buf, sizeof(buf), "%.1f s", secs);
             TextInputOpts dur_opts;
             dur_opts.text = editing ? nullptr : arena.dup(buf, std::strlen(buf));
-            dur_opts.flat = true;
             dur_opts.grab_focus = editing;
             dur_opts.tooltip = "still length in seconds: click, type, enter";
             dur_opts.out_clicked = out.duration_clicked;
@@ -12662,22 +12657,23 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             : path_to_u8(app.project_path.filename());
         if (dirty) proj += " *";
         ButtonOpts small_act;
-        small_act.width = SizeSpec::fixed(56);
         StackOpts prow_opts;
-        prow_opts.gap = 4.0f;
+        prow_opts.gap = active_theme().panel_gap;
         prow_opts.cross_align = AlignMode::Center;
+        project_toolbar.push_back(Label(arena, proj.c_str(), dim));
         std::vector<LayoutNode*> prow{
-            Label(arena, proj.c_str(), small_dim), Spacer(arena),
             Button(arena, "save", &app.save_button, out.save_clicked,
                    small_act),
-            Button(arena, "proj...", &app.open_project_button,
+            Button(arena, "open project...", &app.open_project_button,
                    out.open_project_clicked, small_act)};
-        LayoutNode* pstack = HStackDyn(arena, prow_opts, prow);
-        rows.push_back(pstack);
+        project_toolbar.push_back(WrapDyn(arena, prow_opts, prow));
     }
     if (!app.status.empty())
         rows.push_back(Label(arena, app.status.c_str(), small_dim));
-    // The click handler does the dirty check, not this row builder.
+    if (!app.recent_projects.empty()) {
+        rows.push_back(Separator(arena));
+        rows.push_back(Label(arena, "recent projects", dim));
+    }
     for (size_t r = 0; r < app.recent_projects.size() && r < 6; ++r) {
         const std::filesystem::path rp =
             u8_to_path(app.recent_projects[r]);
@@ -12711,7 +12707,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     if (app.sel.kind == SelKind::LayerSource ||
         app.sel.kind == SelKind::AddLayer) {
     std::vector<LayoutNode*>& rows = right_rows;
-    rows.push_back(Heading(arena, app.sel.kind == SelKind::AddLayer
+    rows.push_back(Label(arena, app.sel.kind == SelKind::AddLayer
                                       ? "new layer"
                                       : "layer"));
     if (app.sel.kind == SelKind::AddLayer) {
@@ -12737,28 +12733,32 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         name_opts.width = SizeSpec::fill();
         name_opts.flat = true;
         name_opts.align_left = true;
+        name_opts.active = selected;
         name_opts.tooltip = "select layer (the stack panel edits it)";
         // The arrows permute the Output link order; up draws later, on top.
         const int feed_idx = output_feed_index(app.look(), layer.id);
         const int feed_n = output_feed_count(app.look());
         ButtonOpts up_opts;
-        up_opts.width = SizeSpec::fixed(20);
+        up_opts.width = SizeSpec::fixed(active_theme().control_height);
+        up_opts.framed = true;
         up_opts.disabled = feed_idx < 0 || feed_idx + 1 >= feed_n;
         up_opts.tooltip = "raise the chain in the composite";
         ButtonOpts down_opts = up_opts;
         down_opts.disabled = feed_idx <= 0;
         down_opts.tooltip = "lower the chain in the composite";
         ButtonOpts x_opts;
-        x_opts.width = SizeSpec::fixed(20);
+        x_opts.width = SizeSpec::fixed(active_theme().control_height);
+        x_opts.framed = true;
         x_opts.tooltip = "remove layer";
         ButtonOpts eye_opts;
-        eye_opts.width = SizeSpec::fixed(20);
+        eye_opts.width = SizeSpec::fixed(active_theme().control_height);
+        eye_opts.framed = true;
         eye_opts.tooltip = layer.visible ? "hide layer" : "show layer";
-        layer_rows_ui.push_back(HStack(
-            arena, {2.0f},
+        layer_rows_ui.push_back(Button(arena, select_label.c_str(), &ls.select_button,
+                                       lrow.select, name_opts));
+        layer_rows_ui.push_back(Wrap(
+            arena, {kSpaceTight},
             {
-                Button(arena, select_label.c_str(), &ls.select_button,
-                       lrow.select, name_opts),
                 IconButton(arena, layer.visible ? Icon::Eye : Icon::EyeOff,
                            &ls.visible_check, lrow.visible_changed, eye_opts),
                 IconButton(arena, Icon::Up, &ls.up_button, lrow.up, up_opts),
@@ -13069,12 +13069,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         }
 
         StackOpts layer_col;
-        layer_col.gap = 4.0f;
+        layer_col.gap = active_theme().panel_gap;
         layer_col.cross_align = AlignMode::Stretch;
-        rows.push_back(Panel(arena, VStackDyn(arena, layer_col, layer_rows_ui),
-                             PanelOpts{Edges::all(6), -1.0f,
-                                       /*outline=*/false,
-                                       /*accent_edge=*/selected}));
+        rows.push_back(VStackDyn(arena, layer_col, layer_rows_ui));
         out.layer_rows.push_back(lrow);
     }
     if (app.sel.kind == SelKind::AddLayer &&
@@ -13104,27 +13101,19 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
 
     {
     std::vector<LayoutNode*>& rows = right_rows;
-    const bool stack_sel = app.sel.kind == SelKind::Effect ||
-                           app.sel.kind == SelKind::Group ||
-                           app.sel.kind == SelKind::AddEffect ||
-                           app.sel.kind == SelKind::None;
-    if (stack_sel) {
-        const char* insp_title =
-            app.sel.kind == SelKind::Effect        ? "effect"
-            : app.sel.kind == SelKind::Group       ? "group"
-            : app.sel.kind == SelKind::AddEffect   ? "add effect"
-                                                   : "inspector";
-        rows.push_back(Heading(arena, insp_title));
-    }
+    LayoutNode* randomize_controls = nullptr;
+    if (app.sel.kind == SelKind::AddEffect)
+        rows.push_back(Label(arena, "add effect"));
     // Gate on look scope: at sequence scope these edit the fallback look.
     if (app.sel.kind == SelKind::None && app.scope_is_look()) {
         rows.push_back(Label(arena,
-                             "select a node below - double-click the "
-                             "canvas to add",
+                             "Select a node, or double-click the canvas to add one.",
                              small_dim));
         out.open_add_clicked = arena.alloc<bool>();
-        rows.push_back(Button(arena, "+ add node...", &app.open_add_button,
-                              out.open_add_clicked));
+        rows.push_back(Wrap(arena, {active_theme().panel_gap}, {
+            Button(arena, "+ add node...", &app.open_add_button, out.open_add_clicked)}));
+    } else if (app.sel.kind == SelKind::None && !app.scope_is_look()) {
+        rows.push_back(Label(arena, "Open a look to edit its nodes.", dim));
     }
     if (app.scope_is_look() &&
         (app.sel.kind == SelKind::None || app.sel.kind == SelKind::Effect ||
@@ -13138,15 +13127,15 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         chaos_opts.format = "%.2f";
         chaos_opts.out_changed = out.chaos_changed;
         ButtonOpts rnd_opts;
-        rnd_opts.width = SizeSpec::fixed(110);
+        rnd_opts.tooltip = "randomize all effects in this look";
         std::vector<LayoutNode*> rnd_row{
             Button(arena, "randomize", &app.randomize_all_button,
                    out.randomize_all, rnd_opts),
             SliderF(arena, out.chaos_staged, 0.0f, 1.0f, &app.chaos_slider,
                     chaos_opts)};
         LayoutNode* rnd_stack = HStackDyn(arena, {}, rnd_row);
-        rnd_stack->gap = 6.0f;
-        rows.push_back(rnd_stack);
+        rnd_stack->gap = active_theme().panel_gap;
+        randomize_controls = rnd_stack;
     }
     if (app.sel.kind == SelKind::Effect) {
         size_t li = 0, fi = 0;
@@ -13214,7 +13203,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                         out.add_frame_clicked, half)}));
             TextInputOpts search_opts;
             search_opts.placeholder = "search...";
-            search_opts.flat = true;
             search_opts.tooltip = "type to filter effects by name";
             search_opts.out_commit = &out.fx_commit;
             search_opts.out_cancel = &out.fx_cancel;
@@ -13305,6 +13293,11 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                            /*outline=*/true}));
         }
     }
+    if (randomize_controls) {
+        rows.push_back(Separator(arena));
+        rows.push_back(Label(arena, "look randomization", dim));
+        rows.push_back(randomize_controls);
+    }
     rows.push_back(Separator(arena));
     }
 
@@ -13337,17 +13330,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             out.preset_view_pick[1] = arena.alloc<bool>();
             TextInputOpts search_opts;
             search_opts.placeholder = "search...";
-            search_opts.flat = true;
             search_opts.tooltip = "type to filter presets by name";
-            PanelOpts well;
-            well.padding = Edges::all(1);
-            well.bg = active_theme().well_bg();
-            LayoutNode* well_node =
-                Panel(arena,
-                      TextInput(arena, &app.preset_filter,
-                                &app.preset_search_state, search_opts),
-                      well);
-            well_node->width = SizeSpec::fill();
+            LayoutNode* search = TextInput(arena, &app.preset_filter,
+                                           &app.preset_search_state, search_opts);
             static const char* kViewLabels[2] = {"list", "grid"};
             static const char* kViewTips[2] = {"tree list view",
                                                "thumbnail gallery view"};
@@ -13356,21 +13341,20 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             view_picks[1] = out.preset_view_pick[1];
             StackOpts srow;
             srow.gap = 8.0f;
-            srow.padding.r = 10.0f;
             srow.cross_align = AlignMode::Center;
             head_rows.push_back(HStack(
                 arena, srow,
-                {well_node,
-                 Dropdown(arena, tag_items, tag_count + 1,
-                          app.preset_tag_index + 1, &app.tag_dd,
-                          out.tag_selected, SizeSpec::fixed(86.0f),
-                          "filter presets by tag"),
+                {search,
                  Segmented(arena, kViewLabels, kViewTips, 2,
                            app.preset_view, app.preset_view_btns,
                            view_picks, SizeSpec::fixed(88.0f))}));
+            head_rows.push_back(FormRow(arena, "tag",
+                Dropdown(arena, tag_items, tag_count + 1,
+                         app.preset_tag_index + 1, &app.tag_dd,
+                         out.tag_selected, SizeSpec::fill(), "filter presets by tag")));
         }
         StackOpts head_col;
-        head_col.gap = 6.0f;
+        head_col.gap = active_theme().panel_gap;
         head_col.cross_align = AlignMode::Stretch;
         preset_head = VStackDyn(arena, head_col, head_rows);
 
@@ -13532,24 +13516,24 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                           out.preset_cells.data(),
                                           out.preset_cells.size(),
                                           &app.preset_sel));
-        if (app.presets.empty())
-            rows.push_back(Label(arena, "no presets found", small_dim));
+        if (rows.empty())
+            rows.push_back(Label(arena, app.presets.empty()
+                ? "No presets found." : "No presets match the filters.", dim));
         out.preset_new_bin_clicked = arena.alloc<bool>();
         out.preset_import_clicked = arena.alloc<bool>();
         ButtonOpts mbin, mimp;
         mbin.tooltip = "new preset bin (a folder under ./presets)";
         mimp.tooltip = "copy a preset file into ./presets";
         StackOpts pstrip;
-        pstrip.gap = 6.0f;
+        pstrip.gap = active_theme().panel_gap;
         pstrip.width = SizeSpec::fill();
         pstrip.justify = Justify::End;
-        pstrip.padding = Edges{0.0f, 0.0f, 10.0f, 0.0f};
-        preset_strip = HStack(
+        preset_strip = Wrap(
             arena, pstrip,
-            {Button(arena, "+ bin", &app.preset_new_bin_btn,
-                    out.preset_new_bin_clicked, mbin),
-             Button(arena, "import...", &app.preset_import_btn,
-                    out.preset_import_clicked, mimp)});
+            {Button(arena, "import...", &app.preset_import_btn,
+                    out.preset_import_clicked, mimp),
+             Button(arena, "+ bin", &app.preset_new_bin_btn,
+                    out.preset_new_bin_clicked, mbin)});
     }
 
     {
@@ -13576,7 +13560,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         StackOpts arow;
         arow.gap = 4.0f;
         arow.cross_align = AlignMode::Center;
-        LayoutNode* astack = HStackDyn(arena, arow, cells);
+        LayoutNode* astack = WrapDyn(arena, arow, cells);
         rows.push_back(astack);
         rows.push_back(Separator(arena));
     }
@@ -13584,9 +13568,9 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                              app.sel.kind == SelKind::ModSource ||
                              app.sel.kind == SelKind::Output;
     if (app.sel.kind == SelKind::Output)
-        rows.push_back(Heading(arena, "project & output"));
+        rows.push_back(Label(arena, "project & output"));
     else if (app.sel.kind == SelKind::ModSource)
-        rows.push_back(Heading(arena, "value node"));
+        rows.push_back(Label(arena, "value node"));
     else if (show_wires)
         rows.push_back(Label(arena, "modulation", small_dim));
     size_t routes_shown = 0;
@@ -13733,19 +13717,17 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(Separator(arena));
     }
 
+    {
+    std::vector<LayoutNode*>& rows = node_footer;
     out.undo_clicked = arena.alloc<bool>();
     out.redo_clicked = arena.alloc<bool>();
     ButtonOpts undo_opts;
     undo_opts.disabled = !app.undo.can_undo();
     ButtonOpts redo_opts;
     redo_opts.disabled = !app.undo.can_redo();
-    rows.push_back(HStack(arena, {8.0f},
-                          {
-                              Button(arena, "undo", &app.undo_button,
-                                     out.undo_clicked, undo_opts),
-                              Button(arena, "redo", &app.redo_button,
-                                     out.redo_clicked, redo_opts),
-                          }));
+    std::vector<LayoutNode*> actions{
+        Button(arena, "undo", &app.undo_button, out.undo_clicked, undo_opts),
+        Button(arena, "redo", &app.redo_button, out.redo_clicked, redo_opts)};
     const std::string undo_name = app.undo.undo_name();
     if (!undo_name.empty()) {
         std::snprintf(line, sizeof(line), "undo: %s", undo_name.c_str());
@@ -13764,21 +13746,24 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
             std::snprintf(line, sizeof(line), "rendering preview history %u/%u", history_done, history_total);
         out.export_cancel_clicked = arena.alloc<bool>();
         ButtonOpts cancel_opts;
-        cancel_opts.width = SizeSpec::fixed(56);
-        std::vector<LayoutNode*> prow{
-            Label(arena, line, dim), Spacer(arena),
-            Button(arena, "cancel", &app.export_cancel_button,
-                   out.export_cancel_clicked, cancel_opts)};
-        LayoutNode* pstack = HStackDyn(arena, {}, prow);
-        pstack->gap = 4.0f;
-        rows.push_back(pstack);
+        rows.push_back(Label(arena, line, dim));
+        actions.push_back(Button(arena, "cancel", &app.export_cancel_button,
+                                 out.export_cancel_clicked, cancel_opts));
     }
     if (has_media_file) {
         out.export_clicked = arena.alloc<bool>();
-        rows.push_back(Button(arena,
+        ButtonOpts export_opts;
+        export_opts.primary = true;
+        actions.push_back(Button(arena,
                               app.export_job ? "export (queue)..."
                                              : "export...",
-                              &app.export_button, out.export_clicked));
+                              &app.export_button, out.export_clicked, export_opts));
+    }
+    StackOpts action_row;
+    action_row.gap = active_theme().panel_gap;
+    action_row.justify = Justify::End;
+    action_row.width = SizeSpec::fill();
+    rows.push_back(WrapDyn(arena, action_row, actions));
     }
     for (size_t q = 0; q < app.export_queue.size(); ++q) {
         FrameUi::QueueRow qrow{q, arena.alloc<bool>()};
@@ -13811,60 +13796,19 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     rows.push_back(Label(arena, line, small_dim));
 
     StackOpts column;
-    column.gap = 8.0f;
+    column.gap = active_theme().panel_gap;
     column.cross_align = AlignMode::Stretch;
-    // The right pad stays small: the scroll gutter is the right margin.
-    const Edges panel_pad{12.0f, 12.0f, 2.0f, 12.0f};
-    *left_out = Panel(
-        arena,
-        ScrollAreaV(arena, &app.sidebar_scroll, VStackDyn(arena, column, rows)),
-        PanelOpts{panel_pad, -1.0f});
-    *right_out = Panel(
-        arena,
-        ScrollAreaV(arena, &app.right_scroll,
-                    VStackDyn(arena, column, right_rows)),
-        PanelOpts{panel_pad, -1.0f});
-    PanelOpts library_well;
-    library_well.padding = Edges::all(2);
-    library_well.outline = false;
-    library_well.bg = active_theme().well_bg();
+    *left_out = {"project", &app.sidebar_scroll, VStackDyn(arena, column, rows),
+                 VStackDyn(arena, column, project_toolbar)};
+    *right_out = {"node", &app.right_scroll, VStackDyn(arena, column, right_rows),
+                  nullptr, VStackDyn(arena, column, node_footer)};
     StackOpts pcol;
     pcol.gap = 2.0f;
     pcol.cross_align = AlignMode::Stretch;
-    StackOpts pwrap;
-    pwrap.gap = 6.0f;
-    pwrap.cross_align = AlignMode::Stretch;
-    pwrap.height = SizeSpec::fill();
-    LayoutNode* preset_well =
-        Panel(arena,
-              ScrollAreaV(arena, &app.preset_scroll,
-                          VStackDyn(arena, pcol, preset_rows)),
-              library_well);
-    preset_well->height = SizeSpec::fill();
-    *preset_out = Panel(
-        arena,
-        VStack(arena, pwrap, {preset_head, preset_well, preset_strip}),
-        PanelOpts{panel_pad, -1.0f});
-    out.preset_panel_node = *preset_out;
-    StackOpts bcol;
-    bcol.gap = 2.0f;
-    bcol.cross_align = AlignMode::Stretch;
-    StackOpts bwrap;
-    bwrap.gap = 6.0f;
-    bwrap.cross_align = AlignMode::Stretch;
-    bwrap.height = SizeSpec::fill();
-    LayoutNode* browser_well =
-        Panel(arena,
-              ScrollAreaV(arena, &app.browser_scroll,
-                          VStackDyn(arena, bcol, browser_rows)),
-              library_well);
-    browser_well->height = SizeSpec::fill();
-    *browser_out = Panel(
-        arena,
-        VStack(arena, bwrap,
-               {browser_search, browser_well, browser_create}),
-        PanelOpts{panel_pad, -1.0f});
-    out.browser_panel = *browser_out;
+    *preset_out = {"presets", &app.preset_scroll, VStackDyn(arena, pcol, preset_rows),
+                   preset_head, preset_strip, true, &out.preset_panel_node};
+    *browser_out = {"browser", &app.browser_scroll, VStackDyn(arena, pcol, browser_rows),
+                    browser_search, browser_create, true, &out.browser_panel};
 }
 
 ui::LayoutNode* build_transport(ui::LayoutArena& arena, AppState& app,
@@ -17286,7 +17230,8 @@ void register_ops_graph(ScriptHost& sh) {
                 doc::Look* lk = arg_look(sh, vm, a[0]);
                 if (!lk) return Value::nil();
                 std::vector<uint64_t> ids;
-                for (const doc::Layer& l : lk->layers) ids.push_back(l.id);
+                for (const doc::Layer& l : lk->layers)
+                    if (l.source != doc::LayerSourceKind::None) ids.push_back(l.id);
                 return id_list(ids);
             });
     env.add("add_layer",
@@ -19805,8 +19750,8 @@ void settings_hit(AppState& app, const std::string& hit, ui::Context& ctx,
     auto focus_step = [&]() { ui::text_input_focus(ctx, &s.step_state); };
     if (hit == "tab:keybinds" || hit == "tab:cache") {
         settings_end_entry(s);
-        ctx.clear_focus();
         s.tab = hit == "tab:cache" ? 1 : 0;
+        ctx.set_focus(ctx.acquire_widget_id(&s.category_buttons[s.tab]));
         if (s.tab == 1) app.cache_scan_requested = true;
         return;
     }
@@ -20469,15 +20414,12 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         content_col.padding.t = 12;
         content = VStack(arena, content_col, {header, list});
     }
-    ButtonOpts tab;
-    tab.width = SizeSpec::fill();
-    tab.active = s.tab == 0;
-    tab.probe = "tab:keybinds";
-    ButtonOpts cache_tab = tab;
-    cache_tab.active = s.tab == 1;
-    cache_tab.probe = "tab:cache";
+    static const char* categories[] = {"keybinds", "cache"};
+    static const char* category_probes[] = {"tab:keybinds", "tab:cache"};
+    bool** category_picks = arena.alloc<bool*>(2);
+    for (int i = 0; i < 2; ++i) category_picks[i] = hit(category_probes[i]);
     StackOpts tabs_col;
-    tabs_col.gap = 16.0f;
+    tabs_col.gap = th.panel_gap;
     tabs_col.cross_align = AlignMode::Stretch;
     tabs_col.padding = Edges{8.0f, 12.0f, 8.0f, 8.0f};
     tabs_col.height = SizeSpec::fill();
@@ -20485,9 +20427,8 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         arena, SizeSpec::fixed(118.0f), SizeSpec::fill(),
         VStack(arena, tabs_col,
                {Heading(arena, "settings"),
-                Button(arena, "keybinds", &s.tab_button, hit("tab:keybinds"),
-                       tab),
-                Button(arena, "cache", &s.cache_tab_button, hit("tab:cache"), cache_tab)}));
+                CategoryList(arena, categories, category_probes, 2, s.tab,
+                             s.category_buttons, category_picks)}));
     PanelOpts rule_opts;
     rule_opts.outline = false;
     rule_opts.corner_radius = 0.0f;
@@ -21080,6 +21021,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                             settings_capture_key(app, e);
                             break;
                         }
+                        if (e.type == platform::Event::Type::KeyDown &&
+                            e.key == platform::Key::Escape &&
+                            ctx.has_focus(ctx.acquire_widget_id(
+                                &app.settings.category_buttons[app.settings.tab]))) {
+                            settings_close(app);
+                            ctx.clear_focus();
+                            break;
+                        }
                         if (!ctx.focus().is_null())
                             ui_keys.push_back(e);
                         else if (e.type == platform::Event::Type::KeyDown &&
@@ -21468,10 +21417,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                                            : nullptr);
         // Build both rails every frame: their staged pointers feed the
         // post-frame handlers. Only the active tab joins the tree.
-        ui::LayoutNode* left_panel = nullptr;
-        ui::LayoutNode* right_panel = nullptr;
-        ui::LayoutNode* preset_panel = nullptr;
-        ui::LayoutNode* browser_panel = nullptr;
+        ui::PanelContent left_panel, right_panel, preset_panel, browser_panel;
         build_side_panels(arena, app, frame_ui, 1.0f / smoothed_dt,
                           &left_panel, &right_panel, &preset_panel,
                           &browser_panel, gallery_tex,
@@ -21606,9 +21552,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         ui::LayoutNode* preview_cell;
         if (seq_monitor) {
-            preview_cell = ui::ScrollAreaV(
-                arena, &app.block_scroll,
-                build_block_panel(arena, app, frame_ui));
+            preview_cell = build_block_panel(arena, app, frame_ui);
         } else {
             ui::StackOpts rc;
             rc.gap = 6.0f;
@@ -21629,32 +21573,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         bool* composition_apply = arena.alloc<bool>();
         bool* composition_resize = arena.alloc<bool>();
         bool* tab_presets = arena.alloc<bool>();
-        ui::StackOpts tabs_row;
-        tabs_row.gap = 4.0f;
-        tabs_row.cross_align = ui::AlignMode::Center;
-        tabs_row.width = ui::SizeSpec::fill();
-        ui::LayoutNode* tabs = ui::HStack(
-            arena, tabs_row,
-            {ui::Chip(arena, "node", app.inspector_tab == 0,
-                      &app.tab_buttons[0], tab_node,
-                      "selection inspector"),
-             ui::Chip(arena, "browser", app.inspector_tab == 3,
-                      &app.tab_buttons[3], tab_browser,
-                      "project browser: bins, looks, sequences, media"),
-             ui::Chip(arena, "project", app.inspector_tab == 1,
-                      &app.tab_buttons[1], tab_project,
-                      "media & project settings"),
-             ui::Chip(arena, "composition", app.inspector_tab == 4,
-                      &app.tab_buttons[4], tab_composition,
-                      "current look or sequence format"),
-             ui::Chip(arena, "presets", app.inspector_tab == 2,
-                      &app.tab_buttons[2], tab_presets,
-                      "preset browser")});
-        ui::LayoutNode* tab_panel = right_panel;
-        if (app.inspector_tab == 1) tab_panel = left_panel;
-        else if (app.inspector_tab == 2) tab_panel = preset_panel;
-        else if (app.inspector_tab == 3) tab_panel = browser_panel;
-        else if (app.inspector_tab == 4) {
+        ui::PanelContent composition_panel;
+        if (app.inspector_tab == 4) {
             const auto f = doc::entity_format(app.document, app.scope_look);
             if (app.composition_entity != app.scope_look ||
                 app.composition_revision != app.document.revision) {
@@ -21669,8 +21589,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 app.composition_fields[4].set(std::to_string(f.origin_y));
             }
             std::vector<ui::LayoutNode*> rows;
+            ui::LabelOpts context_label;
+            context_label.wrap = true;
+            context_label.color = ui::active_theme().text_dim;
             rows.push_back(ui::Label(arena, app.scope_is_look()
-                ? app.look().name.c_str() : app.sequence().name.c_str()));
+                ? app.look().name.c_str() : app.sequence().name.c_str(), context_label));
             static const char* labels[] = {"width", "height", "frame rate", "canvas x", "canvas y"};
             for (int i = 0; i < 5; ++i) {
                 ui::TextInputOpts opts;
@@ -21685,29 +21608,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             char effective[128];
             std::snprintf(effective, sizeof(effective), "%u x %u | %.6g fps",
                           cw, ch, app.scoped_fps());
-            rows.push_back(ui::Label(arena, arena.dup(effective, std::strlen(effective))));
-            rows.push_back(value_row(arena, "", ui::Button(arena, "apply canvas", &app.composition_apply,
-                                      composition_apply)));
-            rows.push_back(value_row(arena, "", ui::Button(arena, "resize composition", &app.composition_resize,
-                                      composition_resize)));
+            rows.push_back(ui::FormRow(arena, "effective", ui::Label(arena, effective, context_label)));
+            rows.push_back(ui::Label(arena, "Set width, height, or frame rate to 0 to use the project format.", context_label));
             if (!app.composition_error.empty())
-                rows.push_back(ui::Label(arena, app.composition_error.c_str()));
+                rows.push_back(ui::Label(arena, app.composition_error.c_str(), context_label));
             ui::StackOpts opts;
-            opts.gap = 8.0f;
+            opts.gap = ui::active_theme().panel_gap;
             opts.width = ui::SizeSpec::fill();
-            opts.padding = ui::Edges{8, 8, 8, 8};
-            tab_panel = ui::VStackDyn(arena, opts, rows);
+            ui::ButtonOpts canvas_opts, resize_opts;
+            canvas_opts.tooltip = "change the canvas boundary; retain content outside it";
+            resize_opts.tooltip = "scale the full composition to these dimensions around its centre";
+            ui::StackOpts action_row = opts;
+            action_row.justify = ui::Justify::End;
+            ui::LayoutNode* actions = ui::Wrap(arena, action_row, {
+                ui::Button(arena, "apply canvas", &app.composition_apply, composition_apply, canvas_opts),
+                ui::Button(arena, "resize composition", &app.composition_resize, composition_resize, resize_opts)});
+            composition_panel = {"composition", &app.composition_scroll,
+                ui::VStackDyn(arena, opts, rows), nullptr, actions};
         }
-        ui::StackOpts insp_col;
-        insp_col.gap = 4.0f;
-        insp_col.cross_align = ui::AlignMode::Stretch;
-        insp_col.width = ui::SizeSpec::fill();
-        insp_col.height = ui::SizeSpec::fill();
-        ui::LayoutNode* inspector = ui::VStack(
-            arena, insp_col,
-            {tabs,
-             ui::SizedBox(arena, ui::SizeSpec::fill(),
-                          ui::SizeSpec::fill(), tab_panel)});
+        static constexpr int tab_order[] = {0, 2, 4, 1, 3};
+        ui::LayoutNode* inspector = ui::TabContainer(arena, tab_order[app.inspector_tab], {
+            {"node", "selection inspector", &app.tab_buttons[0], tab_node, right_panel},
+            {"browser", "project browser: bins, looks, sequences, media", &app.tab_buttons[3], tab_browser, browser_panel},
+            {"project", "media & project settings", &app.tab_buttons[1], tab_project, left_panel},
+            {"composition", "current look or sequence format", &app.tab_buttons[4], tab_composition, composition_panel},
+            {"presets", "preset browser", &app.tab_buttons[2], tab_presets, preset_panel}});
         const float right_w = std::clamp(app.split_right * viewport.w,
                                          280.0f, 560.0f);
         ui::StackOpts rc2;

@@ -58,6 +58,76 @@ TEST(look_add_remove_undo) {
     CHECK_EQ(d.look(id).name, "second");
 }
 
+TEST(source_delete_preserves_shared_effects_groups_and_undo) {
+    Document d = doc_with_look();
+    auto& look = d.looks[0];
+    const auto look_id = look.id;
+    auto& layer = look.layers[0];
+    const auto source_id = layer.id;
+    layer.source = doc::LayerSourceKind::Solid;
+    layer.visible = false;
+    auto first = make_effect(d, EffectType::Blur);
+    auto second = make_effect(d, EffectType::Blur);
+    doc::Group group;
+    group.id = d.next_effect_id++;
+    group.name = "retained";
+    first.group_id = second.group_id = group.id;
+    layer.stack = {first, second};
+    layer.groups = {group};
+    layer.stack[0].node_x = 123;
+    auto other = doc::make_layer(d, doc::LayerSourceKind::Solid);
+    look.layers.push_back(other);
+    look.links = {{source_id, first.id, 0}, {other.id, first.id, 0},
+                  {first.id, second.id, 0}, {second.id, 0, 0}};
+    look.lanes.push_back({{first.id, 0}, {{0, 0.5f}}});
+    const auto before = json::write(doc::doc_to_json(d), false);
+    doc::UndoStack undo;
+    undo.execute(d, doc::remove_layer_command(look_id, 0));
+    CHECK(!doc::find_layer(look, source_id));
+    CHECK(doc::find_effect(look, first.id));
+    CHECK(doc::find_effect(look, second.id));
+    CHECK(doc::find_group(look, group.id));
+    CHECK_EQ(look.layers[0].stack[0].node_x, 123.0f);
+    CHECK(look.layers[0].visible);
+    CHECK_EQ(look.links.size(), size_t{3});
+    CHECK_EQ(look.links[0].from, other.id);
+    CHECK_EQ(look.lanes.size(), size_t{1});
+    const auto saved = doc::doc_to_json(d);
+    auto loaded = doc::doc_from_json(saved);
+    CHECK(!doc::find_layer(loaded.look(look_id), source_id));
+    CHECK(doc::find_effect(loaded.look(look_id), first.id));
+    CHECK(doc::find_group(loaded.look(look_id), group.id));
+    undo.undo(d);
+    CHECK_EQ(json::write(doc::doc_to_json(d), false), before);
+    undo.redo(d);
+    CHECK(!doc::wire_producer_live(look, source_id));
+    CHECK(doc::wire_producer_live(look, first.id));
+}
+
+TEST(last_source_delete_keeps_effect_chain_without_auto_wiring) {
+    Document d = doc_with_look();
+    auto& look = d.looks[0];
+    const auto source_id = look.layers[0].id;
+    const auto first = make_effect(d, EffectType::Blur);
+    const auto second = make_effect(d, EffectType::Blur);
+    look.layers[0].stack = {first, second};
+    doc::UndoStack undo;
+    undo.execute(d, doc::remove_layer_command(look.id, 0));
+    CHECK(!doc::find_layer(look, source_id));
+    CHECK_EQ(look.links.size(), size_t{2});
+    CHECK_EQ(look.links[0].from, first.id);
+    CHECK_EQ(look.links[0].to, second.id);
+    CHECK_EQ(look.links[1].to, uint64_t{0});
+    undo.undo(d);
+    CHECK(look.links.empty());
+    CHECK(doc::find_layer(look, source_id));
+    look.layers[0].stack.clear();
+    undo.execute(d, doc::remove_layer_command(look.id, 0));
+    CHECK(look.layers.empty());
+    CHECK_EQ(look.links.size(), size_t{1});
+    CHECK(doc::link_is_tombstone(look.links[0]));
+}
+
 TEST(look_audio_split_toggle_undo) {
     Document d = doc_with_look();
     doc::UndoStack undo;

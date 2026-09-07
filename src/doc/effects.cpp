@@ -544,7 +544,7 @@ constexpr ParamDesc kWaveWarpParams[] = {
 };
 
 constexpr int kCrtSimControlOrder[] = {
-    4, 0, 5, 6, 12, 2, 1, 10, 9, 3, 7, 11, 8, kWetParam, kOpacityParam,
+    kWetParam, kOpacityParam, 4, 0, 5, 6, 12, 2, 1, 10, 9, 3, 7, 11, 8,
 };
 
 constexpr ParamDesc kCrtSimParams[] = {
@@ -1317,6 +1317,8 @@ const EffectInfo& effect_info(EffectType type) {
                 if (info[effect].control_order) continue;
                 bool emitted[32] = {};
                 uint32_t row = 0;
+                order[effect][row++] = kWetParam;
+                order[effect][row++] = kOpacityParam;
                 for (int phase = 0; phase < 2; ++phase) {
                     for (uint32_t pass = 0; pass < info[effect].param_count; ++pass) {
                         for (uint32_t p = 0; p < info[effect].param_count; ++p) {
@@ -1328,8 +1330,6 @@ const EffectInfo& effect_info(EffectType type) {
                         }
                     }
                 }
-                order[effect][row++] = kWetParam;
-                order[effect][row] = kOpacityParam;
                 info[effect].control_order = order[effect];
             }
         }

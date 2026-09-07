@@ -82,6 +82,82 @@ int g_theme_index = 0;
 
 }  // namespace
 
+LayoutNode* FormRow(LayoutArena& arena, std::string_view label,
+                    LayoutNode* value, LayoutNode* actions,
+                    const LabelOpts& opts) {
+    const Theme& theme = active_theme();
+    LabelOpts text = opts;
+    if (text.color.a == 0) text.color = theme.text_dim;
+    text.wrap = true;
+    StackOpts row;
+    row.gap = theme.panel_gap;
+    row.cross_align = AlignMode::Center;
+    row.width = SizeSpec::fill();
+    return HStack(arena, row,
+        {SizedBox(arena, SizeSpec::fixed(theme.form_label_width),
+                  {}, Label(arena, label, text)),
+         SizedBox(arena, SizeSpec::fill(), {}, value), actions});
+}
+
+LayoutNode* PanelPage(LayoutArena& arena, const PanelContent& page) {
+    const Theme& theme = active_theme();
+    StackOpts column;
+    column.gap = theme.panel_gap;
+    column.width = SizeSpec::fill();
+    column.height = SizeSpec::fill();
+    LayoutNode* content = ScrollAreaV(arena, page.scroll, page.body);
+    if (page.inset_body) {
+        PanelOpts well;
+        well.padding = Edges::all(kSpaceTight);
+        well.outline = false;
+        well.bg = theme.well_bg();
+        content = Panel(arena, content, well);
+        content->height = SizeSpec::fill();
+    }
+    PanelOpts panel;
+    panel.padding = Edges::all(theme.panel_padding);
+    const std::string probe = "panel:" + std::string(page.title);
+    panel.probe = arena.dup(probe.data(), probe.size());
+    LayoutNode* result = Panel(arena, VStack(arena, column,
+        {Heading(arena, page.title), page.toolbar, content, page.footer}), panel);
+    if (page.out_panel) *page.out_panel = result;
+    return result;
+}
+
+LayoutNode* TabContainer(LayoutArena& arena, int selected,
+                         std::initializer_list<PanelTab> tabs) {
+    return TabContainer(arena, selected, tabs.begin(), tabs.size());
+}
+
+LayoutNode* TabContainer(LayoutArena& arena, int selected,
+                         const PanelTab* tabs, size_t count) {
+    StackOpts column;
+    column.gap = kSpaceTight;
+    column.width = SizeSpec::fill();
+    column.height = SizeSpec::fill();
+    StackOpts strip;
+    strip.gap = kSpaceTight;
+    strip.width = SizeSpec::fill();
+    strip.cross_align = AlignMode::Center;
+    std::vector<LayoutNode*> buttons;
+    buttons.reserve(count);
+    LayoutNode* page = nullptr;
+    int index = 0;
+    selected = std::clamp(selected, 0, std::max(0, static_cast<int>(count) - 1));
+    for (size_t i = 0; i < count; ++i) {
+        const PanelTab& tab = tabs[i];
+        if (tab.content.out_panel) *tab.content.out_panel = nullptr;
+        const bool active = index++ == selected;
+        buttons.push_back(Chip(arena, tab.label, active, tab.state,
+                                tab.clicked, tab.tooltip ? tab.tooltip
+                                    : arena.dup(tab.label.data(), tab.label.size())));
+        if (active) page = PanelPage(arena, tab.content);
+    }
+    return VStack(arena, column,
+        {WrapDyn(arena, strip, buttons),
+         SizedBox(arena, SizeSpec::fill(), SizeSpec::fill(), page)});
+}
+
 const Theme& default_theme() { return theme_preset(0); }
 
 int theme_count() { return 4; }
@@ -297,15 +373,18 @@ struct LabelUser {
     float size;
     Color color;
     bool header;
+    bool wrap;
 };
 
 const Font& label_font(const LabelUser& u, const LayoutFrame& frame) {
     return u.header && frame.header_font ? *frame.header_font : frame.font;
 }
 
-Vec2 measure_label(LayoutNode& node, const Constraints&,
+Vec2 measure_label(LayoutNode& node, const Constraints& c,
                    const LayoutFrame& frame) {
     const auto* u = static_cast<const LabelUser*>(node.user);
+    if (u->wrap) return measure_text_wrapped(label_font(*u, frame),
+        {u->text, u->length}, u->size, c.max_w);
     return measure_text(label_font(*u, frame), {u->text, u->length}, u->size);
 }
 
@@ -315,10 +394,18 @@ void draw_label(LayoutNode& node, LayoutFrame& frame) {
     const float text_h = font.line_height() * u->size;
     const float inner_h = node.rect.h - node.padding.t - node.padding.b;
     const float y_off = std::max(0.0f, (inner_h - text_h) * 0.5f);
+    if (node.rect.empty()) return;
+    frame.canvas.push_clip(node.rect);
+    if (u->wrap)
+        draw_text_wrapped(frame.canvas, font, {u->text, u->length},
+            {node.rect.x + node.padding.l, node.rect.y + node.padding.t},
+            u->size, node.rect.w - node.padding.l - node.padding.r, u->color);
+    else
     draw_text(frame.canvas, font, {u->text, u->length},
               {node.rect.x + node.padding.l,
                node.rect.y + node.padding.t + y_off},
               u->size, u->color);
+    frame.canvas.pop_clip();
 }
 
 struct ButtonUser {
@@ -908,10 +995,8 @@ void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
     const Theme& theme = frame.theme;
     const Rect& r = node.rect;
 
-    const Color track = lerp(theme.control_bg,
-                             Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
-    const Color lit_fill = lerp(theme.control_bg,
-                                Color{1.0f, 1.0f, 1.0f, 1.0f}, 0.10f);
+    const Color track = theme.control_bg;
+    const Color lit_fill = theme.selection_bg();
     frame.canvas.draw_sdf_rect(r, theme.corner_radius, track);
 
     for (int i = 0; i < u->count; ++i) {
@@ -931,7 +1016,7 @@ void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
         } else {
             draw_hover(frame, seg.inset(1.5f), seg_radius, st.hover_t);
         }
-        const Color fg = lit ? theme.text : theme.text_dim;
+        const Color fg = lit ? theme.accent : theme.text_dim;
         const Vec2 ts = measure_text(frame.font, u->labels[i],
                                      theme.font_size);
         draw_text(frame.canvas, frame.font, u->labels[i],
@@ -946,6 +1031,84 @@ void draw_segmented(LayoutNode& node, LayoutFrame& frame) {
     }
     frame.canvas.draw_sdf_rect_outline(r, theme.corner_radius,
                                        theme.stroke_width, theme.hairline);
+}
+
+struct CategoryUser {
+    const char* const* labels;
+    const char* const* probes;
+    int count;
+    int active;
+    ButtonState* states;
+    bool* const* out_clicked;
+};
+
+Rect category_rect(const LayoutNode& node, const Theme& theme, int index) {
+    const float height = theme.control_height + theme.panel_gap;
+    return {node.rect.x, node.rect.y + index * height, node.rect.w, height};
+}
+
+Vec2 measure_categories(LayoutNode& node, const Constraints&, const LayoutFrame& frame) {
+    const auto& u = *static_cast<const CategoryUser*>(node.user);
+    float width = 0;
+    for (int i = 0; i < u.count; ++i)
+        width = std::max(width, measure_text(frame.font, u.labels[i], frame.theme.font_size).x);
+    return {width + frame.theme.control_text_inset * 2,
+            u.count * (frame.theme.control_height + frame.theme.panel_gap)};
+}
+
+void hit_categories(LayoutNode& node, LayoutFrame& frame) {
+    const auto& u = *static_cast<const CategoryUser*>(node.user);
+    for (int i = 0; i < u.count; ++i) {
+        Rect row = category_rect(node, frame.theme, i);
+        if (!node.clip.empty()) row = row.intersect(node.clip);
+        frame.ctx.add_hit(row, frame.ctx.acquire_widget_id(&u.states[i]));
+    }
+}
+
+void draw_categories(LayoutNode& node, LayoutFrame& frame) {
+    const auto& u = *static_cast<const CategoryUser*>(node.user);
+    const Theme& theme = frame.theme;
+    int focus = -1;
+    for (int i = 0; i < u.count; ++i) {
+        const Rect row = category_rect(node, theme, i);
+        const WidgetId id = frame.ctx.acquire_widget_id(&u.states[i]);
+        const bool clicked = tick_press_release(u.states[i], id, row, frame);
+        if (u.states[i].pressed) frame.ctx.set_focus(id);
+        if (clicked && u.out_clicked[i]) *u.out_clicked[i] = true;
+        if (frame.ctx.has_focus(id)) focus = i;
+        probe_add(u.probes && u.probes[i] ? u.probes[i] : u.labels[i], row);
+        maybe_tooltip(u.states[i], u.labels[i], frame);
+        if (i == u.active) {
+            frame.canvas.draw_rect(row, theme.selection_bg());
+            frame.canvas.draw_rect({row.x, row.y, theme.stroke_width * 2, row.h}, theme.accent);
+        } else if (u.states[i].hover_t > 0) {
+            frame.canvas.draw_rect(row, theme.control_bg_hover.with_alpha(u.states[i].hover_t));
+        }
+        frame.canvas.draw_rect({row.x, row.bottom() - theme.stroke_width, row.w, theme.stroke_width}, theme.hairline);
+        frame.canvas.push_clip(row);
+        draw_text(frame.canvas, frame.font, u.labels[i],
+            {row.x + theme.control_text_inset,
+             row.y + (row.h - frame.font.line_height() * theme.font_size) * 0.5f},
+            theme.font_size, i == u.active ? theme.text : theme.text_dim);
+        frame.canvas.pop_clip();
+    }
+    if (focus < 0) return;
+    bool activate = false;
+    for (auto it = frame.input.keys.begin(); it != frame.input.keys.end();) {
+        if (it->type != platform::Event::Type::KeyDown) { ++it; continue; }
+        const auto key = it->key;
+        if (key == platform::Key::Up) focus = std::max(0, focus - 1);
+        else if (key == platform::Key::Down) focus = std::min(u.count - 1, focus + 1);
+        else if (key == platform::Key::Home) focus = 0;
+        else if (key == platform::Key::End) focus = u.count - 1;
+        else if (key != platform::Key::Enter && key != platform::Key::Space) { ++it; continue; }
+        activate = true;
+        it = frame.input.keys.erase(it);
+    }
+    if (activate) {
+        frame.ctx.set_focus(frame.ctx.acquire_widget_id(&u.states[focus]));
+        if (u.out_clicked[focus]) *u.out_clicked[focus] = true;
+    }
 }
 
 struct ChipUser {
@@ -1007,11 +1170,14 @@ void draw_chip(LayoutNode& node, LayoutFrame& frame) {
         r.w - (u->close_state ? kChipCloseW : 0.0f);
     const Vec2 ts = measure_text(frame.font, {u->label, u->length},
                                  theme.font_size_small);
+    frame.canvas.push_clip({r.x + kSpaceTight, r.y,
+                           std::max(0.0f, label_w - kSpaceTight * 2), r.h});
     draw_text(frame.canvas, frame.font, {u->label, u->length},
-              {r.x + (label_w - ts.x) * 0.5f,
+              {r.x + std::max(kSpaceTight, (label_w - ts.x) * 0.5f),
                r.y + (r.h - frame.font.line_height() *
                                 theme.font_size_small) * 0.5f},
               theme.font_size_small, fg);
+    frame.canvas.pop_clip();
     if (u->close_state) {
         const Rect cr = chip_close_rect(r);
         const WidgetId cid = frame.ctx.acquire_widget_id(u->close_state);
@@ -1547,6 +1713,7 @@ void draw_swatch(LayoutNode& node, LayoutFrame& frame) {
     if (st.open && !owns && !over_popup && frame.input.left_pressed())
         close();
 
+    probe_add(st.mode == SwatchMode::Hue ? "swatch:hue" : "swatch:color", r);
     draw_swatch_face(frame.canvas, r, 3.0f, st.mode, u->rgba, st.hue_light);
     frame.canvas.draw_sdf_rect_outline(
         r, 3.0f, theme.stroke_width,
@@ -1657,6 +1824,7 @@ void run_color_popup(Canvas2D& canvas, const Font& font, const Theme& theme,
                   hue_only ? 0.0f : kPickerSvH};
     const Rect hue{sv.x, hue_only ? r.y + 6.0f : sv.bottom() + 6.0f, sv.w,
                    kPickerHueH};
+    probe_add("picker:hue", hue);
     const Rect alpha_bar{sv.x, hue.bottom() + 6.0f, sv.w,
                          has_alpha ? kPickerHueH : 0.0f};
     const float rows_y =
@@ -1931,6 +2099,7 @@ void draw_section(LayoutNode& node, LayoutFrame& frame) {
     if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
         *u->out_clicked = true;
     probe_add(std::string("sec:") + std::string(u->label, u->length), r);
+    maybe_tooltip(*u->state, u->label, frame);
 
     const Color fg = lerp(theme.text_dim, theme.text, u->state->hover_t);
     const float cx = r.x + (u->small ? 13.0f : 5.0f);
@@ -1949,11 +2118,14 @@ void draw_section(LayoutNode& node, LayoutFrame& frame) {
 
     const Font& font = !u->small && frame.header_font ? *frame.header_font
                                                       : frame.font;
-    const float size = u->small ? theme.font_size : theme.font_size + 4.0f;
+    const float size = u->small ? theme.font_size : theme.font_size_heading;
+    const float indent = u->small ? 24.0f : 16.0f;
+    frame.canvas.push_clip({r.x + indent, r.y, std::max(0.0f, r.w - indent), r.h});
     draw_text(frame.canvas, font, {u->label, u->length},
               {r.x + (u->small ? 24.0f : 16.0f),
                r.y + (r.h - font.line_height() * size) * 0.5f},
               size, fg);
+    frame.canvas.pop_clip();
 }
 
 struct PanelUser {
@@ -1961,10 +2133,12 @@ struct PanelUser {
     bool outline;
     bool accent_edge;
     Color bg;
+    const char* probe;
 };
 
 void draw_panel(LayoutNode& node, LayoutFrame& frame) {
     const auto* u = static_cast<const PanelUser*>(node.user);
+    if (u->probe) probe_add(u->probe, node.rect);
     const float radius =
         u->corner_radius < 0.0f ? frame.theme.corner_radius : u->corner_radius;
     frame.canvas.draw_sdf_rect(
@@ -1996,6 +2170,7 @@ LayoutNode* Label(LayoutArena& arena, std::string_view text,
     u->size = opts.size > 0.0f ? opts.size : active_theme().font_size;
     u->color = opts.color.a > 0.0f ? opts.color : active_theme().text;
     u->header = opts.header;
+    u->wrap = opts.wrap;
     n->user = u;
     n->measure_fn = measure_label;
     n->draw_fn = draw_label;
@@ -2086,6 +2261,21 @@ LayoutNode* Chip(LayoutArena& arena, std::string_view label, bool on,
     n->hit_fn = hit_chip;
     n->debug_name = "chip";
     return n;
+}
+
+LayoutNode* CategoryList(LayoutArena& arena, const char* const* labels,
+                         const char* const* probes, int count, int active,
+                         ButtonState* states, bool* const* out_clicked) {
+    LayoutNode* node = make_node(arena, NodeKind::Leaf);
+    auto* user = arena.alloc<CategoryUser>();
+    *user = {labels, probes, std::max(0, count), active, states, out_clicked};
+    node->user = user;
+    node->width = SizeSpec::fill();
+    node->measure_fn = measure_categories;
+    node->hit_fn = hit_categories;
+    node->draw_fn = draw_categories;
+    node->debug_name = "category_list";
+    return node;
 }
 
 LayoutNode* Segmented(LayoutArena& arena, const char* const* labels,
@@ -2307,6 +2497,7 @@ LayoutNode* Panel(LayoutArena& arena, LayoutNode* child, const PanelOpts& opts) 
     u->outline = opts.outline;
     u->accent_edge = opts.accent_edge;
     u->bg = opts.bg;
+    u->probe = opts.probe;
     n->user = u;
     n->draw_fn = draw_panel;
     n->debug_name = "panel";

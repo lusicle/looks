@@ -1349,7 +1349,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             for (size_t m = 0; m < g.multi_count && !in_multi; ++m)
                 in_multi = g.multi[m] == nd.id;
 
-            // Draw the outline last so the title bar does not cover it.
             canvas.draw_sdf_rect(cr, 5.0f * z,
                                  nd.bypassed ? theme.control_bg_active
                                              : theme.panel_bg);
@@ -1364,12 +1363,6 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                      tb.h - 6.0f * z},
                     ui::category_palette()[nd.tint & 7].with_alpha(
                         nd.bypassed ? 0.35f : 0.9f));
-            canvas.draw_sdf_rect_outline(
-                cr, 5.0f * z, selected || in_multi ? 2.0f : 1.0f,
-                selected ? theme.accent
-                         : (in_multi ? theme.accent_dim
-                                     : (hovered ? theme.text_disabled
-                                                : theme.hairline)));
             bool has_text_row = false;
             for (int tr = 0; tr < nd.row_count; ++tr)
                 if (nd.rows[tr].kind == 2) has_text_row = true;
@@ -1696,6 +1689,12 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                 }
             }
 
+            canvas.draw_sdf_rect_outline(
+                cr, 5.0f * z, selected || in_multi ? 2.0f : 1.0f,
+                selected ? theme.accent
+                         : (in_multi ? theme.accent_dim
+                                     : (hovered ? theme.text_disabled
+                                                : theme.hairline)));
             const float pr2 = 4.0f * z;
             bool in_fed = false, matte_fed = false, aux_fed = false,
                  out_fed = false;

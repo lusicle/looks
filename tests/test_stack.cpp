@@ -95,7 +95,7 @@ TEST(effect_controls_follow_dependencies) {
         if (!info.control_order || info.param_count > 30) continue;
         bool seen[32] = {};
         for (uint32_t row = 0; row < info.param_count; ++row) {
-            const int p = info.control_order[row];
+            const int p = info.control_param(row + 2);
             CHECK(p >= 0 && p < static_cast<int>(info.param_count));
             if (p < 0 || p >= static_cast<int>(info.param_count)) continue;
             CHECK(!seen[p]);
@@ -103,8 +103,8 @@ TEST(effect_controls_follow_dependencies) {
             if (dependency >= 0) CHECK(seen[dependency]);
             seen[p] = true;
         }
-        CHECK_EQ(info.control_order[info.param_count], kWetParam);
-        CHECK_EQ(info.control_order[info.param_count + 1], kOpacityParam);
+        CHECK_EQ(info.control_param(0), kWetParam);
+        CHECK_EQ(info.control_param(1), kOpacityParam);
     }
 }
 

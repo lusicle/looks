@@ -6,6 +6,25 @@
 using namespace looks;
 using namespace looks::ui;
 
+TEST(ui_text_wrap_preserves_words_and_splits_long_names) {
+    Font font = Font::create_debug();
+    const float size = 13;
+    const float word = measure_text(font, "alpha", size).x;
+    const float height = font.line_height() * size;
+    Vec2 wrapped = measure_text_wrapped(font, "alpha beta", size, word + 1);
+    CHECK(wrapped.x <= word + 1);
+    CHECK_EQ(wrapped.y, height * 2);
+    wrapped = measure_text_wrapped(font, "abcdefghij", size, word + 1);
+    CHECK(wrapped.x <= word + 1);
+    CHECK_EQ(wrapped.y, height * 2);
+    wrapped = measure_text_wrapped(font, "a\nb", size, word);
+    CHECK_EQ(wrapped.y, height * 2);
+    wrapped = measure_text_wrapped(font, "", size, 0);
+    CHECK_EQ(wrapped.y, height);
+    wrapped = measure_text_wrapped(font, "ab", size, 0);
+    CHECK_EQ(wrapped.y, height * 2);
+}
+
 TEST(ui_color_packing) {
     // Black and white are exact through the sRGB round trip.
     CHECK_EQ(Color::rgba(0, 0, 0, 1).to_rgba8(), 0xFF000000u);

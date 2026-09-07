@@ -98,6 +98,7 @@ enum class LayerSourceKind : uint32_t {
     LookRef,
     SequenceRef,
     Slideshow,
+    None,
     Count,
 };
 
@@ -823,7 +824,7 @@ inline bool nest_reaches(const Document& doc, uint64_t from, uint64_t to,
 
 inline Layer* find_layer(Look& look, uint64_t layer_id) {
     for (Layer& l : look.layers)
-        if (l.id == layer_id) return &l;
+        if (l.id == layer_id && l.source != LayerSourceKind::None) return &l;
     return nullptr;
 }
 inline const Layer* find_layer(const Look& look, uint64_t layer_id) {
@@ -1017,12 +1018,12 @@ inline bool find_placement_slot(Sequence& seq, uint64_t placement_id,
 inline std::vector<NodeLink> synthesize_links(const Look& look) {
     std::vector<NodeLink> links;
     for (const Layer& layer : look.layers) {
-        uint64_t prev = layer.id;
+        uint64_t prev = layer.source == LayerSourceKind::None ? 0 : layer.id;
         for (const EffectInstance& fx : layer.stack) {
-            links.push_back({prev, fx.id, 0});
+            if (prev) links.push_back({prev, fx.id, 0});
             prev = fx.id;
         }
-        links.push_back({prev, 0, 0});
+        if (prev) links.push_back({prev, 0, 0});
     }
     return links;
 }

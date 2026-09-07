@@ -104,6 +104,10 @@ struct SpatialImage {
 std::vector<SpatialImage> spatial_images(const doc::Document& doc,
                                         const RenderGraph& graph);
 
+std::vector<std::array<double, 2>> render_demands(const doc::Document& doc,
+    const RenderGraph& graph, const std::vector<SpatialImage>& spatial,
+    uint32_t width, uint32_t height);
+
 // False on a cycle; order is left partial.
 bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order);
 

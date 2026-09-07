@@ -37,7 +37,7 @@ struct SizeSpec {
 };
 
 enum class NodeKind : uint8_t {
-    Leaf, VStack, HStack, ZStack, Padding, ScrollArea, Overlay
+    Leaf, VStack, HStack, Wrap, ZStack, Padding, ScrollArea, Overlay
 };
 
 struct OverlayOpts {
@@ -127,6 +127,10 @@ LayoutNode* VStackDyn(LayoutArena& arena, const StackOpts& opts,
                       const std::vector<LayoutNode*>& children);
 LayoutNode* HStackDyn(LayoutArena& arena, const StackOpts& opts,
                       const std::vector<LayoutNode*>& children);
+LayoutNode* Wrap(LayoutArena& arena, const StackOpts& opts,
+                 std::initializer_list<LayoutNode*> children);
+LayoutNode* WrapDyn(LayoutArena& arena, const StackOpts& opts,
+                    const std::vector<LayoutNode*>& children);
 LayoutNode* ZStack(LayoutArena& arena,
                    std::initializer_list<LayoutNode*> children);
 LayoutNode* Padding_(LayoutArena& arena, Edges edges, LayoutNode* child);

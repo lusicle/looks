@@ -288,7 +288,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     const LookInstance self = graph.instances[static_cast<size_t>(inst)];
     for (size_t li = 0; li < look.layers.size(); ++li) {
         const doc::Layer& layer = look.layers[li];
-        if (!layer.visible) continue;
+        if (!layer.visible || layer.source == doc::LayerSourceKind::None) continue;
         int cur = -1;
         if (layer.source == doc::LayerSourceKind::Slideshow) {
             const auto assets = doc::slideshow_assets(doc, layer);
@@ -895,6 +895,54 @@ std::vector<SpatialImage> spatial_images(const doc::Document& doc,
         path.opacity *= std::clamp(opacity, 0.0f, 1.0f);
     }
     return paths;
+}
+
+std::vector<std::array<double, 2>> render_demands(const doc::Document& doc,
+    const RenderGraph& graph, const std::vector<SpatialImage>& spatial,
+    uint32_t width, uint32_t height) {
+    std::vector<std::array<double, 2>> demand(graph.nodes.size(), {0, 0});
+    auto require = [&](int index, double rw, double rh) {
+        if (index < 0) return;
+        const auto& node = graph.nodes[index];
+        const double scale = std::max(rw / node.canvas_w, rh / node.canvas_h);
+        demand[index][0] = std::max(demand[index][0], node.canvas_w * scale);
+        demand[index][1] = std::max(demand[index][1], node.canvas_h * scale);
+    };
+    require(graph.output, width, height);
+    require(graph.preview, width, height);
+    require(graph.before, width, height);
+    require(graph.measure, width, height);
+    for (const auto& tap : graph.thumb_taps) require(tap.second, width, height);
+    for (auto it = graph.order.rbegin(); it != graph.order.rend(); ++it) {
+        const int index = *it;
+        const auto& node = graph.nodes[index];
+        const auto& path = spatial[index];
+        if (node.kind == GraphNode::Kind::Effect) {
+            const auto& fx = doc.look(graph.instances[node.instance].look)
+                .layers[node.layer_index].stack[node.effect_index];
+            if (doc::is_codec_box(fx.type) || fx.type == doc::EffectType::ErrorDiffusion)
+                for (auto& d : demand[index]) if (d > 0) d = std::max(2.0, std::ceil(d / 2) * 2);
+        }
+        const auto d = demand[index];
+        if (d[0] == 0) continue;
+        if (path.source != index) {
+            const auto& m = path.map.m;
+            const double det = double(m[0]) * m[4] - double(m[1]) * m[3];
+            if (std::abs(det) < 1e-20) {
+                demand[index] = {INFINITY, INFINITY};
+                continue;
+            }
+            require(path.source, std::hypot(d[0] * m[4], d[1] * m[3]) / std::abs(det),
+                    std::hypot(d[0] * m[1], d[1] * m[0]) / std::abs(det));
+        } else {
+            for (size_t i = 0; i < node.inputs.size(); ++i) {
+                const double scale = node.kind == GraphNode::Kind::LayerBlend &&
+                    node.layer_index < 0 && i == 1 ? std::max(1.0f, node.p_scale) : 1.0;
+                require(node.inputs[i], d[0] * scale, d[1] * scale);
+            }
+        }
+    }
+    return demand;
 }
 
 RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,

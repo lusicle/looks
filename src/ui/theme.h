@@ -30,14 +30,17 @@ public:
     float font_size_heading = 16.0f;
     float control_height = 22.0f;
     float control_text_inset = 8.0f;
+    float panel_padding = 12.0f;
+    float panel_gap = 8.0f;
+    float form_label_width = 80.0f;
     float row_height_compact = 18.0f;
     float font_size_compact = 10.0f;
 
     Color selection_bg() const {
-        return lerp(panel_bg, Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.5f);
+        return lerp(panel_bg, accent, 0.18f);
     }
     Color well_bg() const {
-        return lerp(panel_bg, Color{0.0f, 0.0f, 0.0f, 1.0f}, 0.55f);
+        return window_bg;
     }
 };
 

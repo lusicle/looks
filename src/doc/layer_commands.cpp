@@ -1,5 +1,6 @@
 #include "doc/layer_commands.h"
 
+#include <algorithm>
 #include <cassert>
 #include <utility>
 
@@ -40,17 +41,37 @@ public:
         Look& look = entity_of(doc);
         assert(layer_index_ < look.layers.size());
         removed_ = look.layers[layer_index_];
-        look.layers.erase(look.layers.begin() + layer_index_);
+        old_links_ = look.links;
+        ensure_links(look);
+        look.links.erase(std::remove_if(look.links.begin(), look.links.end(),
+            [&](const NodeLink& link) { return link.from == removed_.id || link.to == removed_.id; }),
+            look.links.end());
+        seal_links(look);
+        retained_ = !removed_.stack.empty() || !removed_.groups.empty();
+        if (retained_) {
+            Layer& layer = look.layers[layer_index_];
+            auto stack = std::move(layer.stack);
+            auto groups = std::move(layer.groups);
+            layer = {};
+            layer.id = removed_.id;
+            layer.source = LayerSourceKind::None;
+            layer.stack = std::move(stack);
+            layer.groups = std::move(groups);
+        } else look.layers.erase(look.layers.begin() + layer_index_);
     }
 
     void revert(Document& doc) override {
         Look& look = entity_of(doc);
-        look.layers.insert(look.layers.begin() + layer_index_, removed_);
+        if (retained_) look.layers[layer_index_] = removed_;
+        else look.layers.insert(look.layers.begin() + layer_index_, removed_);
+        look.links = old_links_;
     }
 
 private:
     size_t layer_index_;
     Layer removed_;
+    std::vector<NodeLink> old_links_;
+    bool retained_ = false;
 };
 
 class SetLayerPropsCommand final : public LookCommand {
@@ -223,7 +244,7 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     layer.source = kind;
     static const char* kNames[] = {"media", "solid", "gradient",
                                    "noise", "pattern", "osc",
-                                   "shape", "look",  "sequence", "slideshow"};
+                                   "shape", "look",  "sequence", "slideshow", "none"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                       static_cast<size_t>(LayerSourceKind::Count),
                   "layer names track the enum");

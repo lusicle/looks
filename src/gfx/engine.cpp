@@ -2008,43 +2008,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     thumb_next_cell_ = 0;
 
     const auto spatial = spatial_images(doc, graph);
-    std::vector<std::array<double, 2>> demand(graph.nodes.size(), {0, 0});
-    auto require = [&](int index, double rw, double rh) {
-        if (index < 0) return;
-        demand[index][0] = std::max(demand[index][0], rw);
-        demand[index][1] = std::max(demand[index][1], rh);
-    };
-    require(graph.output, w, h);
-    require(graph.preview, w, h);
-    require(graph.before, w, h);
-    require(graph.measure, w, h);
-    for (const auto& tap : graph.thumb_taps)
-        require(tap.second, std::min(w, kThumbCellW), std::min(h, kThumbCellH));
-    for (auto it = graph.order.rbegin(); it != graph.order.rend(); ++it) {
-        const int index = *it;
-        const auto& node = graph.nodes[index];
-        const auto& path = spatial[index];
-        if (node.kind == GraphNode::Kind::Effect) {
-            const auto& fx = node_look(node).layers[node.layer_index].stack[node.effect_index];
-            if (doc::is_codec_box(fx.type) || fx.type == doc::EffectType::ErrorDiffusion)
-                for (auto& d : demand[index]) if (d > 0) d = std::max(2.0, std::ceil(d / 2) * 2);
-        }
-        const auto d = demand[index];
-        if (d[0] == 0) continue;
-        if (path.source != index) {
-            const auto& m = path.map.m;
-            const double det = double(m[0]) * m[4] - double(m[1]) * m[3];
-            if (std::abs(det) < 1e-20) return nullptr;
-            require(path.source, std::hypot(d[0] * m[4], d[1] * m[3]) / std::abs(det),
-                    std::hypot(d[0] * m[1], d[1] * m[0]) / std::abs(det));
-        } else {
-            for (size_t i = 0; i < node.inputs.size(); ++i) {
-                const double scale = node.kind == GraphNode::Kind::LayerBlend &&
-                    node.layer_index < 0 && i == 1 ? std::max(1.0f, node.p_scale) : 1.0;
-                require(node.inputs[i], d[0] * scale, d[1] * scale);
-            }
-        }
-    }
+    const auto demand = render_demands(doc, graph, spatial, w, h);
     VkPhysicalDeviceProperties limits{};
     vkGetPhysicalDeviceProperties(device_.physical(), &limits);
     for (const auto& d : demand)
@@ -2174,9 +2138,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 // The media fits centered and aspect-preserved.
                 float fit[4];
                 source_fit_rect(it->second.y->width(),
-                                it->second.y->height(), w, h, fit,
+                                it->second.y->height(), canvas_w, canvas_h, fit,
                                 look.layers[node.layer_index].source == doc::LayerSourceKind::Slideshow
                                     ? look.layers[node.layer_index].slide_fit : 0);
+                fit[0] *= float(w) / canvas_w;
+                fit[2] *= float(w) / canvas_w;
+                fit[1] *= float(h) / canvas_h;
+                fit[3] *= float(h) / canvas_h;
                 struct {
                     uint32_t w, h;
                     float rx, ry, iw, ih;

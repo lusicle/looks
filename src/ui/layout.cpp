@@ -9,7 +9,6 @@ namespace {
 
 constexpr float kScrollPixelsPerNotch = 48.0f;
 constexpr float kScrollbarWidth = 6.0f;
-constexpr float kScrollbarPad = 2.0f;
 
 float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -156,6 +155,60 @@ void arrange_stack(LayoutNode& node, const Rect& rect, const Rect& clip,
     }
 }
 
+Vec2 measure_wrap(LayoutNode& node, const Constraints& c,
+                   const LayoutFrame& frame) {
+    float outer_width = c.max_w;
+    if (node.width.mode == SizeMode::Fixed)
+        outer_width = std::clamp(node.width.value, c.min_w, c.max_w);
+    else if (node.width.mode == SizeMode::Percent && c.bounded_w())
+        outer_width = std::clamp(c.max_w * node.width.value, c.min_w, c.max_w);
+    const float width = std::max(0.0f, outer_width - node.padding.l - node.padding.r);
+    float x = 0, y = 0, row_h = 0, used_w = 0;
+    for (uint16_t i = 0; i < node.child_count; ++i) {
+        const Vec2 size = measure(*node.children[i], {0, width, 0, kUnboundedAxis}, frame);
+        if (x > 0 && x + node.gap + size.x > width) {
+            used_w = std::max(used_w, x);
+            y += row_h + node.gap;
+            x = row_h = 0;
+        }
+        if (x > 0) x += node.gap;
+        x += size.x;
+        row_h = std::max(row_h, size.y);
+    }
+    used_w = std::max(used_w, x);
+    return {resolve_axis(node.width, used_w + node.padding.l + node.padding.r, c.min_w, c.max_w),
+            resolve_axis(node.height, y + row_h + node.padding.t + node.padding.b, c.min_h, c.max_h)};
+}
+
+void arrange_wrap(LayoutNode& node, const Rect& rect, const Rect& clip) {
+    const float width = std::max(0.0f, rect.w - node.padding.l - node.padding.r);
+    float y = rect.y + node.padding.t;
+    for (uint16_t first = 0; first < node.child_count;) {
+        uint16_t end = first;
+        float used = 0, height = 0;
+        while (end < node.child_count) {
+            const Vec2 size = node.children[end]->desired;
+            const float next = used + (end > first ? node.gap : 0) + size.x;
+            if (end > first && next > width) break;
+            used = next;
+            height = std::max(height, size.y);
+            ++end;
+        }
+        float x = rect.x + node.padding.l;
+        if (node.justify == Justify::End) x += std::max(0.0f, width - used);
+        else if (node.justify == Justify::Center) x += std::max(0.0f, width - used) * 0.5f;
+        for (uint16_t i = first; i < end; ++i) {
+            LayoutNode& child = *node.children[i];
+            const float h = node.cross_align == AlignMode::Stretch ? height : child.desired.y;
+            const float dy = node.cross_align == AlignMode::Center ? (height - h) * 0.5f : 0;
+            arrange(child, {x, y + dy, child.desired.x, h}, clip);
+            x += child.desired.x + node.gap;
+        }
+        y += height + node.gap;
+        first = end;
+    }
+}
+
 Rect overlay_child_rect(const LayoutNode& node) {
     return node.child_count > 0 ? node.children[0]->rect : Rect{};
 }
@@ -237,6 +290,9 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
         case NodeKind::HStack:
             desired = measure_stack(node, c, frame, false);
             break;
+        case NodeKind::Wrap:
+            desired = measure_wrap(node, c, frame);
+            break;
         case NodeKind::ZStack:
         case NodeKind::Padding: {
             Constraints inner = c;
@@ -270,7 +326,7 @@ Vec2 measure(LayoutNode& node, const Constraints& c, const LayoutFrame& frame) {
             Constraints inner = c;
             inner.min_w = inner.min_h = 0;
             inner.max_h = kUnboundedAxis;
-            inner.max_w -= kScrollbarWidth + kScrollbarPad * 2.0f;
+            inner.max_w = std::max(0.0f, inner.max_w - kScrollbarWidth - node.gap);
             Vec2 content{};
             if (node.child_count > 0)
                 content = measure(*node.children[0], inner, frame);
@@ -312,6 +368,9 @@ void arrange(LayoutNode& node, const Rect& rect, const Rect& parent_clip) {
         case NodeKind::HStack:
             arrange_stack(node, rect, node.clip, false);
             break;
+        case NodeKind::Wrap:
+            arrange_wrap(node, rect, node.clip);
+            break;
         case NodeKind::ZStack:
         case NodeKind::Padding: {
             const Rect inner{rect.x + node.padding.l, rect.y + node.padding.t,
@@ -332,7 +391,7 @@ void arrange(LayoutNode& node, const Rect& rect, const Rect& parent_clip) {
                 s->offset = clampf(s->offset, 0.0f, std::max(0.0f, content - rect.h));
                 offset = s->offset;
             }
-            const float inner_w = rect.w - kScrollbarWidth - kScrollbarPad * 2.0f;
+            const float inner_w = std::max(0.0f, rect.w - kScrollbarWidth - node.gap);
             arrange(child, {rect.x, rect.y - offset, inner_w, content},
                     node.clip);
             break;
@@ -383,8 +442,7 @@ ScrollBar scrollbar_of(const LayoutNode& node) {
     const ScrollState* s = node.scroll;
     if (!s) return b;
     const Rect& r = node.rect;
-    b.track = {r.right() - kScrollbarWidth - kScrollbarPad, r.y + kScrollbarPad,
-               kScrollbarWidth, r.h - kScrollbarPad * 2.0f};
+    b.track = {r.right() - kScrollbarWidth, r.y, kScrollbarWidth, r.h};
     if (b.track.empty()) return b;
     if (s->content <= s->viewport + 0.5f) return b;
     const float thumb_h =
@@ -525,6 +583,16 @@ LayoutNode* ZStack(LayoutArena& arena,
     return with_children(arena, make_node(arena, NodeKind::ZStack), children);
 }
 
+LayoutNode* Wrap(LayoutArena& arena, const StackOpts& opts,
+                 std::initializer_list<LayoutNode*> children) {
+    return make_stack(arena, NodeKind::Wrap, opts, children);
+}
+
+LayoutNode* WrapDyn(LayoutArena& arena, const StackOpts& opts,
+                    const std::vector<LayoutNode*>& children) {
+    return make_stack(arena, NodeKind::Wrap, opts, children);
+}
+
 LayoutNode* Padding_(LayoutArena& arena, Edges edges, LayoutNode* child) {
     LayoutNode* n = make_node(arena, NodeKind::Padding);
     n->padding = edges;
@@ -551,6 +619,7 @@ LayoutNode* ScrollAreaV(LayoutArena& arena, ScrollState* state,
                         LayoutNode* child, SizeSpec width, SizeSpec height) {
     LayoutNode* n = make_node(arena, NodeKind::ScrollArea);
     n->scroll = state;
+    n->gap = active_theme().panel_gap;
     n->width = width;
     n->height = height;
     n->hit_fn = [](LayoutNode& node, LayoutFrame& frame) {

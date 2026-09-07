@@ -74,6 +74,7 @@ struct LabelOpts {
     float size = 0.0f;          // 0 = theme font_size
     Color color{0, 0, 0, 0};    // alpha 0 = theme text
     bool header = false;        // draw with the frame's header (serif) font
+    bool wrap = false;
 };
 
 void register_rect_hit(LayoutNode& node, LayoutFrame& frame,
@@ -91,6 +92,32 @@ Rect list_popup_rect(const Rect& anchor, float min_w,
 LayoutNode* Label(LayoutArena& arena, std::string_view text,
                   const LabelOpts& opts = {});
 LayoutNode* Heading(LayoutArena& arena, std::string_view text);
+LayoutNode* FormRow(LayoutArena& arena, std::string_view label,
+                    LayoutNode* value, LayoutNode* actions = nullptr,
+                    const LabelOpts& opts = {});
+struct PanelContent {
+    std::string_view title;
+    ScrollState* scroll = nullptr;
+    LayoutNode* body = nullptr;
+    LayoutNode* toolbar = nullptr;
+    LayoutNode* footer = nullptr;
+    bool inset_body = false;
+    LayoutNode** out_panel = nullptr;
+};
+
+struct PanelTab {
+    std::string_view label;
+    const char* tooltip = nullptr;
+    ButtonState* state = nullptr;
+    bool* clicked = nullptr;
+    PanelContent content;
+};
+
+LayoutNode* PanelPage(LayoutArena& arena, const PanelContent& content);
+LayoutNode* TabContainer(LayoutArena& arena, int selected,
+                         std::initializer_list<PanelTab> tabs);
+LayoutNode* TabContainer(LayoutArena& arena, int selected,
+                         const PanelTab* tabs, size_t count);
 
 // open only draws the chevron; the caller skips the body when folded.
 LayoutNode* SectionHeader(LayoutArena& arena, std::string_view text,
@@ -129,6 +156,9 @@ LayoutNode* Segmented(LayoutArena& arena, const char* const* labels,
                       const char* const* tooltips, int count, int active,
                       ButtonState* states, bool* const* out_clicked,
                       SizeSpec width = {});
+LayoutNode* CategoryList(LayoutArena& arena, const char* const* labels,
+                         const char* const* probes, int count, int active,
+                         ButtonState* states, bool* const* out_clicked);
 
 LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
                        bool* out_clicked, const ButtonOpts& opts = {});
@@ -297,6 +327,7 @@ struct PanelOpts {
     bool outline = true;
     bool accent_edge = false;      // 2 px accent bar on the left (selection)
     Color bg{0, 0, 0, 0};          // alpha 0 = theme panel_bg
+    const char* probe = nullptr;
 };
 
 LayoutNode* Panel(LayoutArena& arena, LayoutNode* child,

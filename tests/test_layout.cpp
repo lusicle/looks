@@ -23,6 +23,134 @@ LayoutNode* fixed_box(LayoutArena& arena, float w, float h) {
 
 }  // namespace
 
+TEST(wrap_preserves_order_spacing_and_bounds) {
+    Fixture f;
+    LayoutArena arena;
+    auto* a = fixed_box(arena, 90, 22);
+    auto* b = fixed_box(arena, 90, 22);
+    auto* c = fixed_box(arena, 90, 22);
+    StackOpts opts;
+    opts.gap = 8;
+    opts.padding = Edges::all(12);
+    opts.width = SizeSpec::fill();
+    opts.justify = Justify::End;
+    auto* root = Wrap(arena, opts, {a, nullptr, b, c});
+    measure(*root, Constraints::loose({280, 100}), f.frame);
+    arrange(*root, {0, 0, 280, root->desired.y}, {});
+    CHECK_EQ(root->desired.y, 76.0f);
+    CHECK_EQ(a->rect.y, 12.0f);
+    CHECK_EQ(b->rect.x - a->rect.right(), 8.0f);
+    CHECK_EQ(c->rect.y - a->rect.bottom(), 8.0f);
+    CHECK_EQ(b->rect.right(), 268.0f);
+    CHECK_EQ(c->rect.right(), 268.0f);
+    measure(*root, Constraints::loose({560, 100}), f.frame);
+    arrange(*root, {0, 0, 560, root->desired.y}, {});
+    CHECK_EQ(root->desired.y, 46.0f);
+    CHECK_EQ(a->rect.y, c->rect.y);
+    CHECK_EQ(c->rect.right(), 548.0f);
+}
+
+TEST(panel_page_keeps_header_toolbar_and_footer_outside_scroll) {
+    Fixture f;
+    LayoutArena arena;
+    ScrollState scroll;
+    auto* body = fixed_box(arena, 200, 800);
+    auto* toolbar = fixed_box(arena, 100, 22);
+    auto* footer = fixed_box(arena, 100, 22);
+    auto* root = PanelPage(arena, {"settings", &scroll, body, toolbar, footer});
+    layout(*root, {0, 0, 280, 300}, f.frame);
+    auto* header = root->children[0]->children[0];
+    const Rect title = header->rect, top = toolbar->rect, bottom = footer->rect;
+    const float body_y = body->rect.y;
+    scroll.offset = 150;
+    layout(*root, {0, 0, 280, 300}, f.frame);
+    CHECK(header->rect == title);
+    CHECK(toolbar->rect == top);
+    CHECK(footer->rect == bottom);
+    CHECK_EQ(body->rect.y, body_y - 150);
+    CHECK(body->clip.y > toolbar->rect.bottom());
+    CHECK(body->clip.bottom() < footer->rect.y);
+    CHECK(body->rect.right() + active_theme().panel_gap < root->rect.right());
+    CHECK_EQ(footer->rect.bottom(), 288.0f);
+}
+
+TEST(wrap_measures_fixed_percent_and_oversized_content) {
+    Fixture f;
+    LayoutArena arena;
+    for (SizeSpec width : {SizeSpec::fixed(120), SizeSpec::percent(0.5f)}) {
+        StackOpts opts;
+        opts.width = width;
+        opts.gap = 8;
+        auto* first = fixed_box(arena, 80, 22);
+        auto* last = fixed_box(arena, 180, 22);
+        auto* root = Wrap(arena, opts, {first, last});
+        const Vec2 size = measure(*root, Constraints::loose({240, 200}), f.frame);
+        CHECK_EQ(size.x, 120.0f);
+        CHECK_EQ(size.y, 52.0f);
+        arrange(*root, {0, 0, size.x, size.y}, {});
+        CHECK_EQ(last->rect.y, 30.0f);
+        CHECK(last->rect.right() <= root->rect.right());
+    }
+    auto* empty = Wrap(arena, {}, {});
+    const Vec2 size = measure(*empty, Constraints::loose({240, 200}), f.frame);
+    CHECK_EQ(size.x, 0.0f);
+    CHECK_EQ(size.y, 0.0f);
+}
+
+TEST(tab_container_mounts_only_active_content_and_retains_scroll) {
+    Fixture f;
+    LayoutArena arena;
+    ScrollState first_scroll, second_scroll;
+    first_scroll.offset = 120;
+    second_scroll.offset = 40;
+    ButtonState tabs[2], hidden_button;
+    bool picks[2]{}, hidden_clicked = false;
+    LayoutNode* first_panel = nullptr;
+    LayoutNode* second_panel = nullptr;
+    auto* first = VStack(arena, {}, {
+        Button(arena, "hidden", &hidden_button, &hidden_clicked), fixed_box(arena, 100, 800)});
+    auto* second = fixed_box(arena, 100, 800);
+    auto make = [&](int selected) {
+        return TabContainer(arena, selected, {
+            {"first", nullptr, &tabs[0], &picks[0],
+                {"first", &first_scroll, first, nullptr, nullptr, false, &first_panel}},
+            {"second", nullptr, &tabs[1], &picks[1],
+                {"second", &second_scroll, second, nullptr, nullptr, false, &second_panel}}});
+    };
+    auto* root = make(1);
+    run_frame(root, {0, 0, 280, 300}, f.frame);
+    CHECK(first_panel == nullptr);
+    CHECK(second_panel != nullptr);
+    CHECK_EQ(first_scroll.offset, 120.0f);
+    CHECK_EQ(second_scroll.offset, 40.0f);
+    CHECK(!hidden_clicked);
+    root = make(0);
+    run_frame(root, {0, 0, 280, 300}, f.frame);
+    CHECK(first_panel != nullptr);
+    CHECK(second_panel == nullptr);
+    CHECK_EQ(first_scroll.offset, 120.0f);
+    CHECK_EQ(second_scroll.offset, 40.0f);
+}
+
+TEST(form_row_aligns_different_control_types) {
+    Fixture f;
+    LayoutArena arena;
+    TextField field;
+    TextInputState input;
+    DropdownState dropdown;
+    const char* items[] = {"one", "two"};
+    int selected = -1;
+    auto* text = TextInput(arena, &field, &input);
+    auto* menu = Dropdown(arena, items, 2, 0, &dropdown, &selected, SizeSpec::fill());
+    auto* root = VStack(arena, {8}, {
+        FormRow(arena, "name", text), FormRow(arena, "format", menu)});
+    layout(*root, {0, 0, 280, 100}, f.frame);
+    CHECK_EQ(text->rect.x, menu->rect.x);
+    CHECK_EQ(text->rect.w, menu->rect.w);
+    CHECK_EQ(text->rect.h, menu->rect.h);
+    CHECK_EQ(menu->rect.y - text->rect.bottom(), 8.0f);
+}
+
 TEST(slider_value_entry_commit_cancel_and_blur) {
     for (bool dial : {false, true}) {
         Fixture f;
@@ -686,4 +814,88 @@ TEST(widget_button_click_flow) {
     build_and_run({700, 500}, 0, kMouseLeft, 0);
     CHECK(!clicked);
     CHECK(!bstate.pressed);
+}
+
+TEST(category_list_selection_and_keyboard_focus) {
+    Fixture f;
+    LayoutArena arena;
+    const char* labels[] = {"keybinds", "cache", "render"};
+    ButtonState states[3];
+    bool picked[3]{};
+    bool* outputs[] = {&picked[0], &picked[1], &picked[2]};
+    int active = 0;
+    auto step = [&]() {
+        arena.reset();
+        f.canvas.begin_frame(1, {800, 600});
+        for (bool& value : picked) value = false;
+        auto* list = CategoryList(arena, labels, nullptr, 3, active, states, outputs);
+        auto* root = VStack(arena, {}, {list});
+        run_frame(root, {0, 0, 120, 600}, f.frame);
+        CHECK_EQ(list->rect.h, 3 * (f.frame.theme.control_height + f.frame.theme.panel_gap));
+        for (int i = 0; i < 3; ++i)
+            if (picked[i]) active = i;
+        f.input = {};
+    };
+    f.input.mouse = {110, 45};
+    f.input.buttons_pressed = f.input.buttons_down = kMouseLeft;
+    step();
+    CHECK(!picked[1]);
+    f.input.mouse = {110, 45};
+    f.input.buttons_released = kMouseLeft;
+    step();
+    CHECK(picked[1]);
+    CHECK(f.ctx.has_focus(f.ctx.acquire_widget_id(&states[1])));
+    auto press = [&](platform::Key key) {
+        platform::Event event{};
+        event.type = platform::Event::Type::KeyDown;
+        event.key = key;
+        f.input.keys.push_back(event);
+        step();
+    };
+    press(platform::Key::Down);
+    CHECK(picked[2]);
+    press(platform::Key::Down);
+    CHECK(picked[2]);
+    press(platform::Key::Home);
+    CHECK(picked[0]);
+    press(platform::Key::End);
+    CHECK(picked[2]);
+    press(platform::Key::Up);
+    CHECK(picked[1]);
+    press(platform::Key::Enter);
+    CHECK(picked[1]);
+    press(platform::Key::Space);
+    CHECK(picked[1]);
+    f.ctx.clear_focus();
+    press(platform::Key::Down);
+    CHECK(!picked[0] && !picked[1] && !picked[2]);
+}
+
+TEST(category_list_clips_mouse_targets_and_handles_empty_lists) {
+    Fixture f;
+    LayoutArena arena;
+    const char* labels[] = {"keybinds", "cache"};
+    ButtonState states[2];
+    bool picked[2]{};
+    bool* outputs[] = {&picked[0], &picked[1]};
+    ScrollState scroll;
+    auto step = [&](uint8_t pressed, uint8_t released, uint8_t down) {
+        arena.reset();
+        f.canvas.begin_frame(1, {800, 600});
+        f.input.mouse = {40, 45};
+        f.input.buttons_pressed = pressed;
+        f.input.buttons_released = released;
+        f.input.buttons_down = down;
+        auto* list = CategoryList(arena, labels, nullptr, 2, 0, states, outputs);
+        auto* root = ScrollAreaV(arena, &scroll, list);
+        run_frame(root, {0, 0, 120, 30}, f.frame);
+    };
+    step(kMouseLeft, 0, kMouseLeft);
+    step(0, kMouseLeft, 0);
+    CHECK(!picked[0] && !picked[1]);
+    arena.reset();
+    auto* empty = CategoryList(arena, nullptr, nullptr, 0, -1, nullptr, nullptr);
+    measure(*empty, Constraints::loose({120, 30}), f.frame);
+    CHECK_EQ(empty->desired.y, 0.0f);
+    run_frame(empty, {0, 0, 120, 30}, f.frame);
 }

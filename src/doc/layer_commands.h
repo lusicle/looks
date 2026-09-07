@@ -11,8 +11,6 @@ Layer make_layer(Document& doc, LayerSourceKind kind);
 
 std::unique_ptr<Command> add_layer_command(uint64_t look, Layer layer,
                                            size_t insert_index);
-// This refuses nothing: the app keeps at least one layer in a look.
-// Mod routes and lanes that name removed effects stay and are skipped.
 std::unique_ptr<Command> remove_layer_command(uint64_t look,
                                               size_t layer_index);
 // Replaces all layer fields but the stack. Coalesces per layer id.

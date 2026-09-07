@@ -1,6 +1,7 @@
 #include "gfx/graph.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "doc/command.h"
 #include "doc/effects.h"
@@ -49,6 +50,51 @@ TEST(graph_topo_linear_chain) {
     CHECK_EQ(order[0], 1);
     CHECK_EQ(order[1], 2);
     CHECK_EQ(order[2], 0);
+}
+
+TEST(graph_preview_selection_does_not_change_render_demands) {
+    Document doc = doc_with_look();
+    doc.canvas_w = 640;
+    doc.canvas_h = 480;
+    auto& look = doc.looks[0];
+    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
+    const auto source = look.layers[0].id;
+    auto other = looks::doc::make_layer(doc, looks::doc::LayerSourceKind::Shape);
+    const auto effect = make_effect(doc, EffectType::Blur);
+    other.stack.push_back(effect);
+    look.layers.push_back(other);
+    look.links = {{source, 0, 0}, {other.id, effect.id, 0}};
+    const auto composite = compile_graph(doc, look.id, 0);
+    const auto expected = looks::gfx::render_demands(doc, composite,
+        looks::gfx::spatial_images(doc, composite), 640, 480);
+    for (const auto selected : {source, other.id, effect.id}) {
+        const auto graph = compile_graph(doc, look.id, 0, selected);
+        CHECK(graph.valid);
+        const auto demand = looks::gfx::render_demands(doc, graph,
+            looks::gfx::spatial_images(doc, graph), 640, 480);
+        CHECK(demand == expected);
+        for (const auto& size : demand)
+            if (size[0] > 0) CHECK(std::abs(size[0] / size[1] - 4.0 / 3.0) < 1e-6);
+    }
+}
+
+TEST(graph_deleted_source_keeps_connected_effects_live) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto first = make_effect(doc, EffectType::Blur);
+    look.layers[0].stack.push_back(first);
+    auto other = looks::doc::make_layer(doc, looks::doc::LayerSourceKind::Solid);
+    look.layers.push_back(other);
+    look.links = {{look.layers[0].id, first.id, 0}, {other.id, first.id, 0}, {first.id, 0, 0}};
+    looks::doc::UndoStack undo;
+    undo.execute(doc, looks::doc::remove_layer_command(look.id, 0));
+    auto graph = compile_graph(doc, look.id, 0);
+    CHECK(graph.valid);
+    bool found = false;
+    for (const auto& n : graph.nodes)
+        if (n.kind == GraphNode::Kind::Effect && n.layer_index == 0 && n.effect_index == 0)
+            found = true;
+    CHECK(found);
 }
 
 TEST(graph_motion_uses_and_shares_the_upstream_image) {
