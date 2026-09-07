@@ -24,6 +24,7 @@ struct FrameView {
 
 struct DecodedFrame {
     std::vector<uint8_t> y, u, v;
+    std::vector<uint8_t> rgba;
     uint32_t width = 0;
     uint32_t height = 0;
     size_t y_stride = 0;
@@ -35,6 +36,8 @@ struct DecodedFrame {
     bool nv12 = false;
 
     void alloc_planes(uint32_t w, uint32_t h) {
+        rgba.clear();
+        nv12 = false;
         width = w;
         height = h;
         y_stride = w;
@@ -43,6 +46,8 @@ struct DecodedFrame {
         u.resize(uv_stride * ((h + 1) / 2));
         v.resize(uv_stride * ((h + 1) / 2));
     }
+
+    void set_rgba(const uint8_t* pixels, uint32_t w, uint32_t h);
 
     FrameView view() const {
         if (nv12)
@@ -85,6 +90,10 @@ public:
               int quality);
     // Frames must arrive in presentation order.
     bool add_frame(const FrameView& frame);
+    bool open_rgba(const std::filesystem::path& path, uint32_t width,
+                   uint32_t height, uint32_t timescale, uint32_t frame_duration,
+                   bool animated = false);
+    bool add_rgba_frame(const uint8_t* pixels);
     // Appends count index entries that point at the last frame's payload.
     bool add_hold_frames(size_t count);
     bool finish();   // the file is incomplete until finish()
@@ -121,6 +130,8 @@ public:
     uint32_t frame_count() const { return static_cast<uint32_t>(offsets_.size()); }
     uint32_t timescale() const { return timescale_; }
     uint32_t frame_duration() const { return frame_duration_; }
+    bool rgba() const { return (flags_ & 1u) != 0; }
+    bool animated() const { return (flags_ & 2u) != 0; }
     double fps() const {
         return frame_duration_ ? static_cast<double>(timescale_) / frame_duration_
                                : 0.0;
@@ -140,6 +151,7 @@ private:
     uint32_t height_ = 0;
     uint32_t timescale_ = 0;
     uint32_t frame_duration_ = 0;
+    uint32_t flags_ = 0;
     std::vector<uint64_t> offsets_;
     std::vector<uint8_t> scratch_;
 };

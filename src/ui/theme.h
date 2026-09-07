@@ -29,6 +29,7 @@ public:
     float font_size_small = 11.0f;
     float font_size_heading = 16.0f;
     float control_height = 22.0f;
+    float control_text_inset = 8.0f;
     float row_height_compact = 18.0f;
     float font_size_compact = 10.0f;
 

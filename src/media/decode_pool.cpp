@@ -894,7 +894,7 @@ std::shared_ptr<const codec::DecodedFrame> DecodePool::fetch_native(
 }
 
 const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
-                                                    bool scrub) {
+    bool scrub, const std::vector<std::pair<uint64_t, uint32_t>>* exact) {
     frames_.clear();
     // The idle clock must freeze during a scrub, or streams age into close.
     if (!scrub) ++collect_gen_;
@@ -903,7 +903,14 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         scrub_epoch_.fetch_add(1, std::memory_order_relaxed);
     prev_scrub_ = scrub;
     scrub_.store(scrub, std::memory_order_relaxed);
-    const std::vector<Request> want = plan(root_frame);
+    std::vector<Request> want = plan(root_frame);
+    if (exact) {
+        want.erase(std::remove_if(want.begin(), want.end(), [&](Request& request) {
+            for (const auto& [key, index] : *exact)
+                if (key == request.key) { request.frame = index; return false; }
+            return true;
+        }), want.end());
+    }
     // Ring depth must clear the prewarm span with slack.
     // The budget divides across streams, not requests.
     size_t distinct = 0;
@@ -929,6 +936,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         uint64_t alias;
         uint32_t frame;
         std::shared_ptr<const codec::DecodedFrame> pixels;
+        uint32_t actual;
     };
     std::vector<Served> served;
     for (const Request& req : want) {
@@ -939,7 +947,7 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
                 break;
             }
         if (prior) {
-            frames_.push_back({req.key, prior->pixels});
+            frames_.push_back({req.key, prior->pixels, prior->actual});
             continue;
         }
         Stream* s = stream_for(req);
@@ -956,8 +964,15 @@ const std::vector<SourceFrame>& DecodePool::collect(uint32_t root_frame,
         auto frame = fetch(*s, req.frame, &miss, scrub);
         if (miss) ++misses_;
         if (frame) {
-            served.push_back({req.alias, req.frame, frame});
-            frames_.push_back({req.key, std::move(frame)});
+            uint32_t actual = req.frame;
+            if (scrub) {
+                std::lock_guard<std::mutex> lock(s->m);
+                if (s->ringed(req.frame) != frame)
+                    for (const auto& [index, pixels] : s->ring)
+                        if (pixels == frame) { actual = index; break; }
+            }
+            served.push_back({req.alias, req.frame, frame, actual});
+            frames_.push_back({req.key, std::move(frame), actual});
         }
     }
 

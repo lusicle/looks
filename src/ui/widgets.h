@@ -41,7 +41,7 @@ float transition_step(float current, bool on, float dt);
 
 enum class Icon : uint8_t {
     Play, Pause, Up, Down, Close, Wave, Key, Knob, Eye, EyeOff, Dice, Link,
-    Solo, SoloOn, Copy, Lock, Magnet, ChevronRight,
+    Solo, SoloOn, Copy, Lock, Magnet, ChevronRight, Save,
 };
 
 struct TextInputState {
@@ -98,6 +98,8 @@ LayoutNode* SectionHeader(LayoutArena& arena, std::string_view text,
                           bool small = false);
 
 struct ButtonOpts {
+    bool primary = false;
+    bool framed = false;
     bool disabled = false;
     bool flat = false;          // micro control: chrome only on hover
     bool align_left = false;
@@ -303,6 +305,7 @@ LayoutNode* Panel(LayoutArena& arena, LayoutNode* child,
 LayoutNode* Separator(LayoutArena& arena);
 
 struct ButtonFace {
+    bool primary = false;
     float hover_t = 0.0f;
     float press_t = 0.0f;
     bool active = false;

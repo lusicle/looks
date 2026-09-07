@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,7 @@ struct GraphNode {
         GroupMix,      // inputs: dry, face
                        // wet/opacity: layers[layer_index].groups[effect_index]
         Crossfade,
+        Canvas,
     };
     Kind kind = Kind::Source;
     int layer_index = -1;
@@ -38,6 +40,8 @@ struct GraphNode {
     // hash(instance path, layer or effect id); Source folds the asset in.
     // Engine history and decoded planes key on this; never fold placement ids.
     uint64_t key = 0;
+    double canvas_w = 0, canvas_h = 0;
+    float sample_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
     // Sequence lanes only: the lane's LayerBlend applies this at composite.
     float p_shift_x = 0.0f;
     float p_shift_y = 0.0f;
@@ -80,6 +84,25 @@ struct RenderGraph {
     int before = -1;
     bool valid = false;        // false: cycle or empty
 };
+
+struct ImageMap {
+    std::array<float, 6> m{1, 0, 0, 0, 1, 0};
+};
+
+struct ImageClip {
+    ImageMap map;
+    std::array<float, 4> rect{0, 0, 1, 1};
+};
+
+struct SpatialImage {
+    int source = -1;
+    ImageMap map;
+    std::vector<ImageClip> clips;
+    float opacity = 1.0f;
+};
+
+std::vector<SpatialImage> spatial_images(const doc::Document& doc,
+                                        const RenderGraph& graph);
 
 // False on a cycle; order is left partial.
 bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order);

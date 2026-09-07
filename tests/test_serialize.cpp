@@ -16,6 +16,35 @@
 #include "test_framework.h"
 
 using namespace looks;
+
+TEST(composition_crop_resize_and_storage) {
+    auto d = doc_with_look();
+    d.canvas_w = 1920;
+    d.canvas_h = 1080;
+    const auto id = d.looks[0].id;
+    doc::UndoStack undo;
+    undo.execute(d, doc::set_entity_format_command(id,
+        doc::resize_format(d, id, 854, 480, true)));
+    undo.execute(d, doc::set_entity_format_command(id,
+        doc::resize_format(d, id, 480, 480, false)));
+    auto f = doc::entity_format(d, id);
+    CHECK_EQ(f.w, 480u);
+    CHECK_EQ(f.content_w, 1920.0);
+    CHECK_EQ(f.scale_x, 854.0 / 1920.0);
+    CHECK_EQ(f.origin_x, 187.0);
+    const auto restored = doc::doc_from_json(doc::doc_to_json(d));
+    CHECK_EQ(doc::entity_format(restored, id).origin_x, 187.0);
+    CHECK_EQ(doc::entity_format(restored, id).scale_x, f.scale_x);
+    undo.undo(d);
+    f = doc::entity_format(d, id);
+    CHECK_EQ(f.w, 854u);
+    CHECK_EQ(f.origin_x, 0.0);
+    undo.redo(d);
+    undo.execute(d, doc::set_entity_format_command(id,
+        doc::resize_format(d, id, 854, 480, false)));
+    CHECK_EQ(doc::entity_format(d, id).origin_x, 0.0);
+    CHECK_EQ(doc::entity_format(d, id).content_w, 1920.0);
+}
 using doc::Document;
 using doc::EffectType;
 using doc::make_effect;
@@ -469,9 +498,6 @@ TEST(serialize_tolerant_load) {
 TEST(serialize_v57_roundtrip) {
     Document d = doc_with_look();
     d.root().markers = {12, 45, 90};
-    d.export_bitrate_mbps = 22.0f;
-    d.export_scale = 2;
-    d.export_audio = false;
     doc::KeyframeLane lane;
     lane.target = {d.looks[0].layers[0].id | doc::kLayerParamBit, 8};
     lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
@@ -482,9 +508,6 @@ TEST(serialize_v57_roundtrip) {
     Document d2 = doc::doc_from_json(a);
     CHECK_EQ(d2.root().markers.size(), size_t{3});
     CHECK_EQ(d2.root().markers[1], uint32_t{45});
-    CHECK_EQ(d2.export_bitrate_mbps, 22.0f);
-    CHECK_EQ(d2.export_scale, uint32_t{2});
-    CHECK(!d2.export_audio);
     CHECK_EQ(d2.looks[0].lanes.size(), size_t{1});
     CHECK_EQ(d2.looks[0].lanes[0].target.effect_id,
              d.looks[0].layers[0].id | doc::kLayerParamBit);

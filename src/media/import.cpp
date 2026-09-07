@@ -130,6 +130,36 @@ void downsample_half(const I420Frame& src, I420Frame& dst) {
 struct ThumbStrip {
     ThumbStripData data{0, kThumbStripH, 0, {}, true};
 
+    void add_rgba(const uint8_t* pixels, uint32_t sw, uint32_t sh) {
+        if (!data.w) data.w = std::clamp(data.h * sw / std::max(1u, sh), 1u, 4096u);
+        const size_t base = data.alpha.size();
+        data.alpha.resize(base + size_t(data.w) * data.h);
+        data.rgb.resize(data.alpha.size() * 3);
+        const auto& linear = color::srgb8_linear_table();
+        for (uint32_t y = 0; y < data.h; ++y)
+            for (uint32_t x = 0; x < data.w; ++x) {
+                float sums[3]{}, alpha = 0;
+                uint32_t samples = 0;
+                const uint32_t x0 = x * sw / data.w, y0 = y * sh / data.h;
+                const uint32_t x1 = std::max(x0 + 1, (x + 1) * sw / data.w);
+                const uint32_t y1 = std::max(y0 + 1, (y + 1) * sh / data.h);
+                for (uint32_t sy = y0; sy < y1; ++sy)
+                    for (uint32_t sx = x0; sx < x1; ++sx) {
+                        const auto* p = pixels + (size_t(sy) * sw + sx) * 4;
+                        const float a = p[3] / 255.0f;
+                        for (int c = 0; c < 3; ++c) sums[c] += linear[p[c]] * a;
+                        alpha += a;
+                        ++samples;
+                    }
+                const size_t i = base + size_t(y) * data.w + x;
+                data.alpha[i] = uint8_t(std::clamp(alpha / samples * 255 + 0.5f, 0.0f, 255.0f));
+                for (int c = 0; c < 3; ++c)
+                    data.rgb[i * 3 + c] = alpha > 0 ? uint8_t(std::clamp(
+                        color::srgb_oetf(sums[c] / alpha) * 255 + 0.5f, 0.0f, 255.0f)) : 0;
+            }
+        ++data.count;
+    }
+
     void add(const I420Frame& f) {
         const auto& linear = color::srgb8_linear_table();
         uint32_t& w = data.w;
@@ -362,8 +392,8 @@ bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
     // sRGB RGB to BT.709 limited-range I420; it must invert ycbcr_to_rgb.
     // The dims must stay even for the codec and NV12 paths.
     I420Frame frame;
-    frame.width = std::max(2u, img.width & ~1u);
-    frame.height = std::max(2u, img.height & ~1u);
+    frame.width = img.width;
+    frame.height = img.height;
     const uint32_t cw = (frame.width + 1) / 2;
     const uint32_t ch = (frame.height + 1) / 2;
     frame.y.resize(static_cast<size_t>(frame.width) * frame.height);
@@ -414,32 +444,20 @@ bool write_still_bundle(const ImageRgba& img, const SidecarPaths& sc,
     }
 
     codec::MezWriter writer;
-    if (!writer.open(mez_path, frame.width, frame.height, kStillFps * 1000,
-                     1000, options.quality)) {
+    if (!writer.open_rgba(mez_path, img.width, img.height, kStillFps * 1000, 1000)) {
         result->error = "cannot create " + path_to_u8(mez_path);
         return false;
     }
-    if (!writer.add_frame(frame.view()) ||
+    if (!writer.add_rgba_frame(img.pixels.data()) ||
         !writer.add_hold_frames(hold_frames - 1) || !writer.finish()) {
         result->error = "mezzanine write failed";
         return false;
     }
 
-    if (options.proxy) {
-        I420Frame half;
-        downsample_half(frame, half);
-        codec::MezWriter proxy;
-        if (proxy.open(sc.proxy, half.width, half.height, kStillFps * 1000,
-                       1000, options.quality) &&
-            proxy.add_frame(half.view()) &&
-            proxy.add_hold_frames(hold_frames - 1) && proxy.finish())
-            result->proxy_path = sc.proxy;
-    }
-
     // One thumb only; the ruler stretches it across the timeline.
     if (options.thumb_count > 0) {
         ThumbStrip strip;
-        strip.add(frame);
+        strip.add_rgba(img.pixels.data(), img.width, img.height);
         if (strip.write(sc.thumbs)) result->thumbs_path = sc.thumbs;
     }
 
@@ -472,6 +490,72 @@ bool import_still(const std::filesystem::path& source,
                   const std::filesystem::path& dest_dir,
                   const ImportOptions& options, ImportProgress* progress,
                   ImportResult* result) {
+    std::error_code directory_error;
+    std::filesystem::create_directories(dest_dir, directory_error);
+    if (directory_error) { result->error = "cannot create image cache directory"; return false; }
+    if (lower_ext(source) == L".gif") {
+        const auto bytes = read_file_bytes(source);
+        if (!bytes) { result->error = "cannot read GIF"; return false; }
+        const auto sc = sidecars_for(dest_dir, source);
+        codec::MezWriter writer;
+        mod::AnalysisData analysis;
+        analysis.fps = 100;
+        mod::VideoAnalyzer analyzer;
+        bool opened = false;
+        const bool decoded = platform::decode_gif(bytes->data(), bytes->size(),
+            [&](const platform::AnimationFrame& f) {
+                if (progress) {
+                    if (progress->cancel.load()) return false;
+                    progress->frames_total.store(f.count);
+                    progress->frames_done.store(f.index);
+                }
+                if (!opened) {
+                    if (!writer.open_rgba(sc.mez, f.width, f.height, 1000, 10, true)) return false;
+                    opened = true;
+                    result->width = f.width;
+                    result->height = f.height;
+                }
+                const uint32_t ticks = f.delay_ms / 10;
+                if (uint64_t(writer.frame_count()) + ticks > UINT32_MAX ||
+                    !writer.add_rgba_frame(f.rgba) || !writer.add_hold_frames(ticks - 1)) return false;
+                std::vector<uint8_t> luma(size_t(f.width) * f.height);
+                for (size_t i = 0; i < luma.size(); ++i)
+                    luma[i] = uint8_t(color::luma709(f.rgba[i * 4], f.rgba[i * 4 + 1], f.rgba[i * 4 + 2]) *
+                                     f.rgba[i * 4 + 3] / 255.0f);
+                for (uint32_t tick = 0; tick < ticks; ++tick)
+                    analyzer.push_frame(luma.data(), f.width, f.width, f.height);
+                if (progress) progress->frames_done.store(f.index + 1);
+                return true;
+            }, &result->error);
+        if (!decoded || !writer.finish()) {
+            if (result->error.empty()) result->error = "GIF cache write failed";
+            return false;
+        }
+        analysis.frame_count = writer.frame_count();
+        analyzer.finish(&analysis);
+        if (mod::write_analysis(sc.analysis, analysis)) result->analysis_path = sc.analysis;
+        if (options.thumb_count > 0) {
+            codec::MezReader reader;
+            if (!reader.open(sc.mez, &result->error)) return false;
+            {
+                ThumbStrip strip;
+                const uint32_t count = std::min(reader.frame_count(), uint32_t(options.thumb_count));
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (progress && progress->cancel.load()) return false;
+                    codec::DecodedFrame decoded_frame;
+                    if (!reader.decode(uint32_t(uint64_t(i) * reader.frame_count() / count), decoded_frame))
+                        return false;
+                    strip.add_rgba(decoded_frame.rgba.data(), decoded_frame.width, decoded_frame.height);
+                }
+                if (strip.write(sc.thumbs)) result->thumbs_path = sc.thumbs;
+            }
+        }
+        result->mez_path = sc.mez;
+        result->frame_count = writer.frame_count();
+        result->fps = 100;
+        result->ok = true;
+        return true;
+    }
     ImageRgba img;
     std::string error;
     if (!load_image(source, &img, &error)) {
@@ -767,6 +851,15 @@ bool rebuild_still_thumbs(const std::filesystem::path& mez_path,
     if (!reader.open(mez_path, &error)) return false;
     codec::DecodedFrame frame;
     if (!reader.decode(0, frame) || frame.nv12) return false;
+    if (!frame.rgba.empty()) {
+        ThumbStrip strip;
+        const uint32_t count = reader.animated() ? std::min(60u, reader.frame_count()) : 1;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (i && !reader.decode(uint32_t(uint64_t(i) * reader.frame_count() / count), frame)) return false;
+            strip.add_rgba(frame.rgba.data(), frame.width, frame.height);
+        }
+        return strip.write(thumbs_path);
+    }
     I420Frame f;
     f.width = frame.width;
     f.height = frame.height;

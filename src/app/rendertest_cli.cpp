@@ -501,6 +501,8 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     };
     auto render = [&](uint32_t frame, bool edited = true, uint32_t divisor = 1) {
         if (edited) ++doc.revision;
+        doc.canvas_w = w * divisor;
+        doc.canvas_h = h * divisor;
         engine->set_preview_divisor(divisor);
         if (!begin_probe()) return false;
         return read_pixels(engine->render(probe.cmd, 0, doc, doc.looks[0].id,
@@ -1077,6 +1079,70 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             color::srgb_eotf(rgba[2] / 255.0f) * alpha, alpha};
         expect_color("media thumbnail", expected, 0.001f);
     }
+    {
+        doc::Document nested;
+        nested.canvas_w = w;
+        nested.canvas_h = h;
+        auto child = doc::make_look(nested, "detail source");
+        child.layers.push_back(doc::make_layer(nested, doc::LayerSourceKind::TestPattern));
+        child.layers[0].osc_shape = 1;
+        child.layers[0].gen_scale = 1.0f;
+        const uint64_t child_id = child.id;
+        nested.looks.push_back(child);
+        engine->set_preview_divisor(1);
+        auto sample = [&](uint64_t id) {
+            if (!begin_probe()) return false;
+            return read_pixels(engine->render(probe.cmd, 0, nested, id, 0, 30, w, h));
+        };
+        if (!sample(child_id)) return false;
+        const auto original = pixels;
+        nested.looks[0].layers[0].gen_scale = 7.0f;
+        if (!sample(child_id)) return false;
+        const auto resize_reference = pixels;
+        nested.looks[0].format = doc::resize_format(nested, child_id, w / 2, h / 2, true);
+        if (!sample(child_id)) return false;
+        float resize_error = 0;
+        for (size_t i = 0; i < pixels.size(); ++i)
+            resize_error = std::max(resize_error, std::abs(pixels[i] - resize_reference[i]));
+        ++cases;
+        if (resize_error > 0.002f) {
+            std::fprintf(stderr, "Composition resize changed procedural detail: %.6f\n", resize_error);
+            ++failures;
+        }
+        nested.looks[0].format = {};
+        nested.looks[0].layers[0].gen_scale = 1.0f;
+        nested.looks[0].layers[0].xf_scale = 0.1f;
+        auto parent = doc::make_look(nested, "detail parent");
+        parent.layers.push_back(doc::make_layer(nested, doc::LayerSourceKind::LookRef));
+        parent.layers[0].target = child_id;
+        parent.layers[0].xf_scale = 10.0f;
+        const uint64_t parent_id = parent.id;
+        nested.looks.push_back(parent);
+        if (!sample(parent_id)) return false;
+        float error = 0;
+        for (size_t i = 0; i < pixels.size(); ++i)
+            error = std::max(error, std::abs(pixels[i] - original[i]));
+        ++cases;
+        if (error > 0.002f) {
+            std::fprintf(stderr, "Nested 10%% / 1000%% detail error: %.6f\n", error);
+            ++failures;
+        }
+        nested.looks[0].layers[0].stack.push_back(doc::make_effect(nested, doc::EffectType::Invert));
+        nested.looks[0].layers[0].xf_scale = 1.0f;
+        if (!sample(child_id)) return false;
+        const auto effected = pixels;
+        nested.looks[0].layers[0].xf_scale = 0.1f;
+        if (!sample(parent_id)) return false;
+        ++cases;
+        error = 0;
+        for (size_t i = 0; i < pixels.size(); i += 4)
+            for (int c = 0; c < 3; ++c)
+                error = std::max(error, std::abs(pixels[i + c] - effected[i + c]));
+        if (error > 0.01f) {
+            std::fprintf(stderr, "Nested intermediate detail error: %.6f\n", error);
+            ++failures;
+        }
+    }
     std::printf("Alpha/color: %d cases, %d faults\n", cases, failures);
     return failures == 0;
 }
@@ -1097,6 +1163,8 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
     uint32_t width = 256, height = 192, divisor = 1;
     std::vector<uint8_t> pixels;
     auto render = [&](uint32_t frame = 0) {
+        doc.canvas_w = width;
+        doc.canvas_h = height;
         engine->set_preview_divisor(divisor);
         return readback->render(*engine, doc, doc.looks[0].id, frame, 60.0,
                                 width, height, pixels);

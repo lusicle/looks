@@ -27,6 +27,7 @@ struct SourcePlanes {
     uint32_t height = 0;
     // NV12: u is the interleaved CbCr plane and v is unused.
     bool nv12 = false;
+    const uint8_t* rgba = nullptr;
 };
 
 class Engine {
@@ -167,6 +168,9 @@ private:
     bool prev_frame_valid_ = false;
     VkSampler linear_sampler_ = VK_NULL_HANDLE;
     std::unique_ptr<ComputePipeline> to_rgb_;
+    std::unique_ptr<ComputePipeline> rgba_import_;
+    std::unique_ptr<ComputePipeline> canvas_sample_;
+    std::unique_ptr<GpuImage> spatial_maps_[kFramesInFlight];
     // Alpha bounds: a 4x1 r32ui atomic min/max target and a mapped readback.
     // The UI harvests it after the worker fence; export never uses it.
     std::unique_ptr<ComputePipeline> alpha_bounds_;
@@ -350,6 +354,7 @@ private:
 
     // Keyed by the instance-scoped node key, not by a layer index.
     struct LayerPlanes {
+        std::unique_ptr<GpuImage> rgba, rgba_upload;
         std::unique_ptr<GpuImage> y, u, v;   // v empty for NV12 media
         uint32_t width = 0, height = 0;
         bool nv12 = false;   // u is the interleaved RG8 CbCr texture

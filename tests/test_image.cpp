@@ -2,11 +2,166 @@
 #include "util/inflate.h"
 #include "util/file.h"
 #include "media/import.h"
+#include "media/export.h"
 #include "media/thumbs.h"
+#include "codec/mez.h"
+#include "platform/win/wic_image.h"
 
 #include "test_framework.h"
 
 using namespace looks;
+
+TEST(gif_disposal_timing_and_lossless_cache) {
+    std::vector<uint8_t> gif{'G','I','F','8','9','a',2,0,1,0,0x81,3,0,
+        255,0,0, 0,255,0, 0,0,255, 0,0,0};
+    auto frame = [&](uint8_t x, uint8_t color, uint8_t disposal, uint8_t delay, bool gce) {
+        if (gce) gif.insert(gif.end(), {0x21,0xf9,4,uint8_t((disposal << 2) | 1),delay,0,3,0});
+        gif.insert(gif.end(), {0x2c,x,0,0,0,1,0,1,0,0,2,2,uint8_t(0x44 + color * 8),1,0});
+    };
+    frame(0, 0, 1, 2, true);
+    frame(1, 1, 3, 5, true);
+    frame(0, 2, 2, 0, true);
+    frame(1, 1, 0, 0, false);
+    gif.push_back(0x3b);
+    const std::filesystem::path fixture = std::filesystem::path(LOOKS_REPO_ROOT) / "temp/gif_stage_fixture.gif";
+    CHECK(write_file_bytes(fixture, gif.data(), gif.size()));
+    std::string error;
+    std::vector<std::vector<uint8_t>> frames;
+    CHECK(platform::decode_gif(gif.data(), gif.size(), [&](const platform::AnimationFrame& f) {
+        CHECK_EQ(f.width, 2u);
+        CHECK_EQ(f.height, 1u);
+        CHECK_EQ(f.count, 4u);
+        CHECK_EQ(f.delay_ms, f.index == 0 ? 20u : (f.index == 1 ? 50u : 100u));
+        frames.emplace_back(f.rgba, f.rgba + 8);
+        return true;
+    }, &error));
+    CHECK_EQ(frames.size(), size_t{4});
+    if (frames.size() != 4) return;
+    CHECK_EQ(frames[0][0], 255);
+    CHECK_EQ(frames[0][7], 0);
+    CHECK_EQ(frames[1][0], 255);
+    CHECK_EQ(frames[1][5], 255);
+    CHECK_EQ(frames[2][2], 255);
+    CHECK_EQ(frames[2][7], 0);
+    CHECK_EQ(frames[3][3], 0);
+    CHECK_EQ(frames[3][5], 255);
+    const auto imported = media::import_media(fixture, fixture.parent_path() / "gif_stage_cache");
+    CHECK(imported.ok);
+    CHECK_EQ(imported.frame_count, 27u);
+    codec::MezReader reader;
+    CHECK(reader.open(imported.mez_path, &error));
+    CHECK(reader.rgba());
+    CHECK(reader.animated());
+    CHECK_EQ(reader.payload_offset(0), reader.payload_offset(1));
+    const uint32_t ticks[] = {0, 2, 7, 17};
+    for (size_t i = 0; i < 4; ++i) {
+        codec::DecodedFrame decoded;
+        CHECK(reader.decode(ticks[i], decoded));
+        CHECK(decoded.rgba == frames[i]);
+    }
+    media::ThumbStripData thumbs;
+    CHECK(media::read_thumbs(imported.thumbs_path, &thumbs));
+    CHECK(!thumbs.alpha.empty());
+}
+
+TEST(native_png_and_gif_export) {
+    const auto dir = std::filesystem::path(LOOKS_REPO_ROOT) / "temp";
+    const uint8_t first[] = {255,0,0,255, 0,0,0,0};
+    const uint8_t second[] = {0,0,255,255, 0,255,0,255};
+    std::string error;
+    const auto png = dir / "native_png_export.png";
+    CHECK(platform::encode_png(png, first, 2, 1, &error));
+    ImageRgba read;
+    CHECK(load_image(png, &read, &error));
+    CHECK(read.pixels == std::vector<uint8_t>(first, first + 8));
+    platform::GifEncoder encoder;
+    const auto gif = dir / "native_gif_export.gif";
+    CHECK(encoder.open(gif, 2, 1, 0, &error));
+    CHECK(encoder.add(first, 2, 16, false, true, 50, &error));
+    CHECK(encoder.add(second, 5, 16, false, true, 50, &error));
+    CHECK(encoder.finish(&error));
+    const auto bytes = read_file_bytes(gif);
+    CHECK(bytes.has_value());
+    if (!bytes) return;
+    uint32_t count = 0;
+    CHECK(platform::decode_gif(bytes->data(), bytes->size(), [&](const platform::AnimationFrame& frame) {
+        CHECK_EQ(frame.count, 2u);
+        CHECK_EQ(frame.delay_ms, frame.index == 0 ? 20u : 50u);
+        const auto* expected = frame.index == 0 ? first : second;
+        for (size_t i = 0; i < 8; ++i) CHECK_EQ(frame.rgba[i], expected[i]);
+        ++count;
+        return true;
+    }, &error));
+    CHECK_EQ(count, 2u);
+}
+
+TEST(image_export_jobs_preserve_pixels_timing_and_cancel) {
+    const auto dir = std::filesystem::path(LOOKS_REPO_ROOT) / "temp";
+    media::RenderSettings settings;
+    settings.format = media::RenderFormat::PngSequence;
+    media::ExportProgress progress;
+    auto producer = [](uint32_t frame, std::vector<uint8_t>& pixels) {
+        pixels.resize(65 * 37 * 4);
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            pixels[i] = frame == 0 ? 255 : 0;
+            pixels[i + 1] = frame == 1 ? 255 : 0;
+            pixels[i + 2] = frame == 2 ? 255 : 0;
+            pixels[i + 3] = i % 12 == 0 ? 0 : 255;
+        }
+        return true;
+    };
+    const auto path = dir / "image_job.png";
+    CHECK(media::export_images(65, 37, 30, 1, 3, producer, path, settings, true, &progress).ok);
+    CHECK_EQ(progress.frames_done.load(), 3u);
+    for (uint32_t f = 0; f < 3; ++f) {
+        ImageRgba image;
+        CHECK(load_image(media::image_output_path(path, settings.format, f), &image));
+        CHECK_EQ(image.width, 65u);
+        CHECK_EQ(image.height, 37u);
+        std::vector<uint8_t> expected;
+        producer(f, expected);
+        CHECK(image.pixels == expected);
+    }
+    settings.format = media::RenderFormat::Gif;
+    settings.gif_colors = 4;
+    settings.gif_dither = false;
+    const auto gif_path = dir / "image_job.gif";
+    CHECK(media::export_images(65, 37, 30, 1, 3, producer, gif_path, settings, true, &progress).ok);
+    const auto bytes = read_file_bytes(gif_path);
+    CHECK(bytes.has_value());
+    if (bytes) {
+        uint32_t duration = 0, count = 0;
+        CHECK(platform::decode_gif(bytes->data(), bytes->size(), [&](const platform::AnimationFrame& frame) {
+            ++count;
+            duration += frame.delay_ms;
+            CHECK_EQ(frame.width, 65u);
+            CHECK_EQ(frame.height, 37u);
+            CHECK_EQ(frame.rgba[3], 0u);
+            CHECK_EQ(frame.rgba[4 + frame.index], 255u);
+            return true;
+        }, nullptr));
+        CHECK_EQ(duration, 100u);
+        CHECK_EQ(count, 3u);
+    }
+    progress.cancel.store(true);
+    uint32_t produced = 0;
+    const auto cancelled = media::export_images(65, 37, 30, 1, 3,
+        [&](uint32_t frame, std::vector<uint8_t>& pixels) { ++produced; return producer(frame, pixels); },
+        dir / "cancelled_image_job.gif", settings, true, &progress);
+    CHECK(!cancelled.ok);
+    CHECK_EQ(produced, 0u);
+    settings.width = 65;
+    settings.height = 37;
+    settings.fps = 24;
+    const auto preset = media::render_settings_json(settings);
+    CHECK(!preset.find("source"));
+    CHECK(!preset.find("first"));
+    CHECK(!preset.find("path"));
+    media::RenderSettings loaded;
+    std::string error;
+    CHECK(media::read_render_settings(preset, loaded, error));
+    CHECK(media::render_settings_json(loaded) == preset);
+}
 
 namespace {
 

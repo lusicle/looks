@@ -8,8 +8,99 @@
 
 #include "gfx/vk_device.h"
 #include "util/log.h"
+#include "util/color.h"
 
 namespace looks::gfx {
+
+std::unique_ptr<RgbaReadback> RgbaReadback::create(Device& device) {
+    auto r = std::unique_ptr<RgbaReadback>(new RgbaReadback(device));
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.queueFamilyIndex = device.graphics_family();
+    if (vkCreateCommandPool(device.device(), &pi, nullptr, &r->pool_) != VK_SUCCESS) return nullptr;
+    VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ci.commandPool = r->pool_;
+    ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ci.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device.device(), &ci, &r->cmd_) != VK_SUCCESS) return nullptr;
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(device.device(), &fi, nullptr, &r->fence_) != VK_SUCCESS) return nullptr;
+    return r;
+}
+
+RgbaReadback::~RgbaReadback() {
+    if (buffer_) vmaDestroyBuffer(device_.allocator(), buffer_, allocation_);
+    if (fence_) vkDestroyFence(device_.device(), fence_, nullptr);
+    if (pool_) vkDestroyCommandPool(device_.device(), pool_, nullptr);
+}
+
+bool RgbaReadback::render(Engine& engine, const doc::Document& doc, uint64_t entity,
+                          uint32_t frame, double fps, uint32_t width, uint32_t height,
+                          std::vector<uint8_t>& rgba, const Engine::LayerSourceFrame* sources,
+                          size_t source_count, bool alpha, bool read_pixels,
+                          uint64_t preview_node, uint64_t preview_layer, uint32_t clock_frame) {
+    if (!begin(width, height, read_pixels)) return false;
+    GpuImage* result = engine.render(cmd_, 0, doc, entity, frame, fps, width, height,
+        0, clock_frame == UINT32_MAX ? frame : clock_frame, nullptr, sources, source_count,
+        preview_node, preview_layer);
+    if (!result || result->width() != width || result->height() != height) {
+        vkEndCommandBuffer(cmd_);
+        return false;
+    }
+    return finish(*result, rgba, alpha, read_pixels);
+}
+
+bool RgbaReadback::read(GpuImage& image, std::vector<uint8_t>& rgba, bool alpha) {
+    return begin(image.width(), image.height(), true) && finish(image, rgba, alpha, true);
+}
+
+bool RgbaReadback::begin(uint32_t width, uint32_t height, bool read_pixels) {
+    if (!width || !height || uint64_t(width) * height > SIZE_MAX / 8) return false;
+    const size_t bytes = size_t(width) * height * 8;
+    if (read_pixels && capacity_ < bytes) {
+        if (buffer_) vmaDestroyBuffer(device_.allocator(), buffer_, allocation_);
+        buffer_ = VK_NULL_HANDLE;
+        if (!create_mapped_buffer(device_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   &buffer_, &allocation_, &mapped_)) return false;
+        capacity_ = bytes;
+    }
+    vkResetCommandPool(device_.device(), pool_, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    return vkBeginCommandBuffer(cmd_, &bi) == VK_SUCCESS;
+}
+
+bool RgbaReadback::finish(GpuImage& image, std::vector<uint8_t>& rgba, bool alpha, bool read_pixels) {
+    auto* result = &image;
+    const uint32_t width = image.width(), height = image.height();
+    const size_t bytes = size_t(width) * height * 8;
+    if (read_pixels) {
+        result->transition(cmd_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        vkCmdCopyImageToBuffer(cmd_, result->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               buffer_, 1, &copy);
+        memory_barrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        result->transition(cmd_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) return false;
+    submit_and_wait(device_, device_.graphics_queue(), cmd_, fence_, "RGBA readback");
+    if (!read_pixels) return true;
+    vmaInvalidateAllocation(device_.allocator(), allocation_, 0, bytes);
+    const auto* half = static_cast<const uint16_t*>(mapped_);
+    rgba.resize(size_t(width) * height * 4);
+    for (size_t i = 0; i < rgba.size(); i += 4) {
+        const float a = std::clamp(half_to_float(half[i + 3]), 0.0f, 1.0f);
+        for (int c = 0; c < 3; ++c) {
+            const float value = half_to_float(half[i + c]);
+            const float straight = alpha ? (a > 0 ? value / a : 0) : value;
+            rgba[i + c] = uint8_t(std::clamp(color::srgb_oetf(std::max(0.0f, straight)) * 255 + 0.5f, 0.0f, 255.0f));
+        }
+        rgba[i + 3] = alpha ? uint8_t(a * 255 + 0.5f) : 255;
+    }
+    return true;
+}
 
 std::unique_ptr<Nv12Readback> Nv12Readback::create(
     Device& device, const std::filesystem::path& shader_dir) {

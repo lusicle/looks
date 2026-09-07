@@ -507,6 +507,10 @@ bool Engine::init(const std::filesystem::path& shader_dir) {
     layer_blend_ = mk("layer_blend.comp.spv", 2, 1, 11 * sizeof(uint32_t));
     layer_transform_ =
         mk("layer_transform.comp.spv", 1, 1, 12 * sizeof(uint32_t));
+    canvas_sample_ = mk("canvas_sample.comp.spv", 2, 1, 6 * sizeof(uint32_t));
+    rgba_import_ = mk("rgba_import.comp.spv", 1, 1, 2 * sizeof(uint32_t));
+    if (!rgba_import_) return false;
+    if (!canvas_sample_) return false;
     if (!generator_ || !layer_blend_ || !layer_transform_) return false;
 
     codec_io_.staging = std::make_unique<StagingBuffer>(device_);
@@ -1673,8 +1677,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
     // The canvas is the project's, so a cut must not resize the graph.
     // The proxy shrinks the working size; even dims keep the codec paths safe.
-    const uint32_t w = even_down(canvas_w, preview_divisor_);
-    const uint32_t h = even_down(canvas_h, preview_divisor_);
+    const uint32_t w = std::max(1u, canvas_w / preview_divisor_);
+    const uint32_t h = std::max(1u, canvas_h / preview_divisor_);
 
     // Harvest the readback this slot recorded kFramesInFlight renders ago.
     // The caller waited the slot's fence, so the copy is complete.
@@ -1757,7 +1761,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             break;
         }
     }
-    if (segmented && ((w & 1) || (h & 1) || !ensure_codec_io(w, h))) {
+    if (segmented && !ensure_codec_io(std::max(2u, (w + 1) & ~1u),
+                                      std::max(2u, (h + 1) & ~1u))) {
         log_error("engine: codec-box setup failed (odd dims?)");
         return nullptr;
     }
@@ -1810,12 +1815,21 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             continue;
         LayerPlanes& lp = layer_planes_[lf.key];
         if (lp.width != lf.planes.width || lp.height != lf.planes.height ||
-            lp.nv12 != lf.planes.nv12) {
+            lp.nv12 != lf.planes.nv12 || bool(lp.rgba) != (lf.planes.rgba != nullptr)) {
             device_.wait_idle();
             const VkImageUsageFlags lu =
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             const uint32_t lcw = (lf.planes.width + 1) / 2;
             const uint32_t lch = (lf.planes.height + 1) / 2;
+            lp.rgba.reset();
+            lp.rgba_upload.reset();
+            if (lf.planes.rgba) {
+                lp.rgba_upload = GpuImage::create(device_, VK_FORMAT_R8G8B8A8_UNORM,
+                    lf.planes.width, lf.planes.height, lu);
+                lp.rgba = GpuImage::create(device_, VK_FORMAT_R16G16B16A16_SFLOAT,
+                    lf.planes.width, lf.planes.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+                if (!lp.rgba || !lp.rgba_upload) return nullptr;
+            }
             // Y also feeds the prev-luma copy, so it needs TRANSFER_SRC.
             lp.y = GpuImage::create(device_, VK_FORMAT_R8_UNORM,
                                     lf.planes.width, lf.planes.height,
@@ -1848,6 +1862,18 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             continue;
         }
         const uint32_t lch = (lp.height + 1) / 2;
+        if (lp.rgba) {
+            if (!staging.upload_image(rec, lf.planes.rgba, size_t(lp.width) * lp.height * 4,
+                                       lp.width, *lp.rgba_upload)) return nullptr;
+            lp.rgba_upload->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            lp.rgba->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+            const GpuImage* sampled[] = {lp.rgba_upload.get()};
+            GpuImage* target = lp.rgba.get();
+            const uint32_t push[] = {lp.width, lp.height};
+            rgba_import_->dispatch(rec, arena_, frame_index, sampled, 1, &target, 1,
+                push, sizeof(push), lp.width, lp.height, linear_sampler_);
+            lp.rgba->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
         if (!staging.upload_image(rec, lf.planes.y,
                                   lf.planes.y_stride * lp.height,
                                   lf.planes.y_stride, *lp.y))
@@ -1981,11 +2007,90 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     thumb_cells_.clear();
     thumb_next_cell_ = 0;
 
+    const auto spatial = spatial_images(doc, graph);
+    std::vector<std::array<double, 2>> demand(graph.nodes.size(), {0, 0});
+    auto require = [&](int index, double rw, double rh) {
+        if (index < 0) return;
+        demand[index][0] = std::max(demand[index][0], rw);
+        demand[index][1] = std::max(demand[index][1], rh);
+    };
+    require(graph.output, w, h);
+    require(graph.preview, w, h);
+    require(graph.before, w, h);
+    require(graph.measure, w, h);
+    for (const auto& tap : graph.thumb_taps)
+        require(tap.second, std::min(w, kThumbCellW), std::min(h, kThumbCellH));
+    for (auto it = graph.order.rbegin(); it != graph.order.rend(); ++it) {
+        const int index = *it;
+        const auto& node = graph.nodes[index];
+        const auto& path = spatial[index];
+        if (node.kind == GraphNode::Kind::Effect) {
+            const auto& fx = node_look(node).layers[node.layer_index].stack[node.effect_index];
+            if (doc::is_codec_box(fx.type) || fx.type == doc::EffectType::ErrorDiffusion)
+                for (auto& d : demand[index]) if (d > 0) d = std::max(2.0, std::ceil(d / 2) * 2);
+        }
+        const auto d = demand[index];
+        if (d[0] == 0) continue;
+        if (path.source != index) {
+            const auto& m = path.map.m;
+            const double det = double(m[0]) * m[4] - double(m[1]) * m[3];
+            if (std::abs(det) < 1e-20) return nullptr;
+            require(path.source, std::hypot(d[0] * m[4], d[1] * m[3]) / std::abs(det),
+                    std::hypot(d[0] * m[1], d[1] * m[0]) / std::abs(det));
+        } else {
+            for (size_t i = 0; i < node.inputs.size(); ++i) {
+                const double scale = node.kind == GraphNode::Kind::LayerBlend &&
+                    node.layer_index < 0 && i == 1 ? std::max(1.0f, node.p_scale) : 1.0;
+                require(node.inputs[i], d[0] * scale, d[1] * scale);
+            }
+        }
+    }
+    VkPhysicalDeviceProperties limits{};
+    vkGetPhysicalDeviceProperties(device_.physical(), &limits);
+    for (const auto& d : demand)
+        if (!std::isfinite(d[0]) || !std::isfinite(d[1]) ||
+            std::ceil(d[0]) > limits.limits.maxImageDimension2D ||
+            std::ceil(d[1]) > limits.limits.maxImageDimension2D) {
+            log_error("composition exceeds the GPU image dimension limit");
+            return nullptr;
+        }
+    std::vector<float> maps;
+    std::vector<uint32_t> map_rows(graph.nodes.size());
+    auto append_map = [&](const ImageMap& map, const std::array<float, 4>& rect) {
+        maps.insert(maps.end(), {map.m[0], map.m[1], map.m[2], 0,
+                                map.m[3], map.m[4], map.m[5], 0,
+                                rect[0], rect[1], rect[2], rect[3]});
+    };
+    for (int index : graph.order) {
+        if (demand[index][0] == 0 || spatial[index].source == index) continue;
+        map_rows[index] = uint32_t(maps.size() / 12);
+        append_map(spatial[index].map, {});
+        for (const auto& clip : spatial[index].clips) append_map(clip.map, clip.rect);
+    }
+    GpuImage* map_image = nullptr;
+    if (!maps.empty()) {
+        const uint32_t rows = uint32_t(maps.size() / 12);
+        auto& image = spatial_maps_[frame_index % kFramesInFlight];
+        if (!image || image->height() < rows) {
+            image = GpuImage::create(device_, VK_FORMAT_R32G32B32A32_SFLOAT, 3, rows,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        }
+        if (!image) return nullptr;
+        maps.resize(size_t(image->height()) * 12, 0);
+        if (!staging.upload_image(rec, maps.data(), maps.size() * sizeof(float),
+                                  3, *image)) return nullptr;
+        image->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        map_image = image.get();
+    }
     std::vector<GpuImage*> results(graph.nodes.size(), nullptr);
     std::vector<int> remaining_uses(graph.nodes.size(), 0);
-    for (const GraphNode& node : graph.nodes)
-        for (int input : node.inputs)
-            remaining_uses[static_cast<size_t>(input)]++;
+    std::vector<std::vector<int>> dependencies(graph.nodes.size());
+    for (size_t i = 0; i < graph.nodes.size(); ++i) {
+        if (demand[i][0] == 0) continue;
+        dependencies[i] = spatial[i].source != int(i)
+            ? std::vector<int>{spatial[i].source} : graph.nodes[i].inputs;
+        for (int input : dependencies[i]) remaining_uses[input]++;
+    }
     // These extra uses keep the published images alive to the tail.
     remaining_uses[static_cast<size_t>(graph.output)]++;
     if (graph.preview >= 0)
@@ -1996,6 +2101,11 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         remaining_uses[static_cast<size_t>(graph.measure)]++;
     for (int index : graph.order) {
         const GraphNode& node = graph.nodes[static_cast<size_t>(index)];
+        if (demand[index][0] == 0) continue;
+        const uint32_t canvas_w = std::max(1u, uint32_t(std::ceil(node.canvas_w)));
+        const uint32_t canvas_h = std::max(1u, uint32_t(std::ceil(node.canvas_h)));
+        const uint32_t w = std::max(1u, uint32_t(std::ceil(demand[index][0] - 1e-5)));
+        const uint32_t h = std::max(1u, uint32_t(std::ceil(demand[index][1] - 1e-5)));
         // look and timeline_frame below are per instance and shadow the root.
         // skey is the instance-scoped state key, never the bare effect id.
         const LookInstance& linst =
@@ -2003,7 +2113,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         const doc::Look& look = *inst_look[static_cast<size_t>(node.instance)];
         const uint32_t timeline_frame = linst.local_frame;
         const uint64_t skey = node.key;
-        for (int input : node.inputs)
+        for (int input : dependencies[index])
             results[static_cast<size_t>(input)]->transition(
                 rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         // Flow lives at block resolution; everything else at frame size.
@@ -2014,11 +2124,40 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         if (!dst) return nullptr;
         dst->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
 
+        std::vector<GpuImage*> inputs;
+        std::vector<GpuImage*> resized;
+        for (int input : dependencies[index]) inputs.push_back(results[input]);
+        const bool spatial_node = spatial[index].source != index;
+        if (!spatial_node) {
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                if (graph.nodes[node.inputs[i]].kind == GraphNode::Kind::Flow ||
+                    (inputs[i]->width() == w && inputs[i]->height() == h) ||
+                    (node.kind == GraphNode::Kind::LayerBlend && node.layer_index < 0 && i == 1)) continue;
+                GpuImage* scaled = pool_->acquire(w, h);
+                if (!scaled) return nullptr;
+                scaled->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                const uint32_t push[12] = {w, h, 0, 0, 0, 0, 0, as_bits(1.0f),
+                                           0, as_bits(0.5f), as_bits(0.5f), as_bits(1.0f)};
+                const GpuImage* sampled[] = {inputs[i]};
+                layer_transform_->dispatch(rec, arena_, frame_index, sampled, 1,
+                    &scaled, 1, push, sizeof(push), w, h, linear_sampler_);
+                scaled->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                inputs[i] = scaled;
+                resized.push_back(scaled);
+            }
+        }
         auto input_image = [&](size_t i) {
-            return results[static_cast<size_t>(node.inputs[i])];
+            return inputs[i];
         };
 
-        switch (node.kind) {
+        if (spatial_node) {
+            const uint32_t push[6] = {w, h, map_rows[index],
+                uint32_t(spatial[index].clips.size()), map_image->height(), as_bits(spatial[index].opacity)};
+            const GpuImage* sampled[] = {input_image(0), map_image};
+            canvas_sample_->dispatch(rec, arena_, frame_index, sampled, 2,
+                &dst, 1, push, sizeof(push), w, h, linear_sampler_);
+        } else switch (node.kind) {
+            case GraphNode::Kind::Canvas: return nullptr;
             case GraphNode::Kind::Source: {
                 // A key with no frame reads black, never another layer.
                 auto it = layer_planes_.find(skey);
@@ -2029,7 +2168,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 }
                 // NV12 binds one chroma texture to both slots; Cr is in .g.
                 const GpuImage* planes[3] = {
-                    it->second.y.get(), it->second.u.get(),
+                    it->second.rgba ? it->second.rgba.get() : it->second.y.get(), it->second.u.get(),
                     it->second.v ? it->second.v.get()
                                  : it->second.u.get()};
                 // The media fits centered and aspect-preserved.
@@ -2046,7 +2185,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                           fit[0], fit[1],
                           1.0f / std::max(fit[2], 1.0f),
                           1.0f / std::max(fit[3], 1.0f),
-                          it->second.nv12 ? 1u : 0u};
+                          it->second.rgba ? 2u : (it->second.nv12 ? 1u : 0u)};
                 to_rgb_->dispatch(rec, arena_, frame_index, planes, 3, &dst, 1,
                                   &push, sizeof(push), w, h, linear_sampler_);
                 break;
@@ -2232,6 +2371,12 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_ptr = &blended_fx;
                 }
                 const auto& fx = *fx_ptr;
+                if ((doc::is_codec_box(fx.type) || fx.type == doc::EffectType::ErrorDiffusion) &&
+                    (codec_io_.nv_y->width() != w || codec_io_.nv_y->height() != h)) {
+                    codec_flush_segment();
+                    if (!ensure_codec_io(w, h)) return nullptr;
+                    rec = codec_begin_segment();
+                }
 
                 if ((fx_optical_filter(fx.type) || fx.type == doc::EffectType::Normalise) &&
                     (fx.wet <= 0.0f || fx.opacity <= 0.0f ||
@@ -3389,7 +3534,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
         for (const auto& tap : graph.thumb_taps)
             if (tap.second == index)
                 record_thumb_tap(rec, frame_index, dst, tap.first);
-        for (int input : node.inputs)
+        for (GpuImage* image : resized) pool_->release(image);
+        for (int input : dependencies[index])
             if (--remaining_uses[static_cast<size_t>(input)] == 0)
                 pool_->release(results[static_cast<size_t>(input)]);
         if (remaining_uses[static_cast<size_t>(index)] == 0) pool_->release(dst);
@@ -3427,6 +3573,18 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     // Cell key 0 always takes the output, never the preview tap.
     GpuImage* out = results[static_cast<size_t>(
         graph.preview >= 0 ? graph.preview : graph.output)];
+    if (out->width() != w || out->height() != h) {
+        GpuImage* scaled = pool_->acquire(w, h);
+        if (!scaled) return nullptr;
+        out->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        scaled->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+        const uint32_t push[12] = {w, h, 0, 0, 0, 0, 0, as_bits(1.0f),
+                                   0, as_bits(0.5f), as_bits(0.5f), as_bits(1.0f)};
+        const GpuImage* sampled[] = {out};
+        layer_transform_->dispatch(rec, arena_, frame_index, sampled, 1,
+            &scaled, 1, push, sizeof(push), w, h, linear_sampler_);
+        out = scaled;
+    }
     record_thumb_tap(rec, frame_index,
                      results[static_cast<size_t>(graph.output)], 0);
     out->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);

@@ -23,6 +23,7 @@ struct Asset {
     uint32_t still_duration_frames = 0;
     // A true still counts frames on the project clock: no conform rate.
     bool still = false;
+    bool animated = false;
     // Browser bin. 0 = the project root.
     uint64_t bin = 0;
 };
@@ -282,11 +283,25 @@ inline constexpr float kMaxSpeed = 4.0f;  // time-remap speed range 0..4
 struct EntityFormat {
     uint32_t w = 0, h = 0;
     double fps = 0.0;
+    double content_w = 0.0, content_h = 0.0;
+    double origin_x = 0.0, origin_y = 0.0;
+    double scale_x = 1.0, scale_y = 1.0;
 };
 
 inline bool format_has_fps(const EntityFormat& f) { return f.fps > 0.0; }
 inline bool format_has_canvas(const EntityFormat& f) {
     return f.w > 0 && f.h > 0;
+}
+
+inline bool valid_format(const EntityFormat& f) {
+    return std::isfinite(f.fps) && f.fps >= 0.0 &&
+           std::isfinite(f.content_w) && std::isfinite(f.content_h) &&
+           std::isfinite(f.origin_x) && std::isfinite(f.origin_y) &&
+           std::isfinite(f.scale_x) && std::isfinite(f.scale_y) &&
+           f.scale_x > 0 && f.scale_y > 0 &&
+           ((f.content_w == 0.0 && f.content_h == 0.0) ||
+            (f.content_w > 0.0 && f.content_h > 0.0)) &&
+           ((f.w == 0 && f.h == 0) || (f.w > 0 && f.h > 0));
 }
 
 struct Look {
@@ -295,6 +310,10 @@ struct Look {
     // Local length in frames. 0 = derived from the longest source.
     uint32_t duration = 0;
     EntityFormat format;
+    uint32_t trim_in = 0;
+    uint32_t trim_out = 0;
+    uint32_t loop_in = 0;
+    uint32_t loop_out = 0;
     // Browser bin. 0 = the project root.
     uint64_t bin = 0;
     // false = the voice is the port-0 In fan-in; true = a port-1 audio-in.
@@ -372,11 +391,6 @@ struct Document {
     bool sidechain_mux = false;
     // Shifts audio against video everywhere: curves, monitoring, export.
     float audio_offset_ms = 0.0f;
-
-    float export_bitrate_mbps = 8.0f;
-    // 1 = source size, 2 and 4 = half and quarter.
-    uint32_t export_scale = 1;
-    bool export_audio = true;
 
     Document() {
         Sequence seq;
@@ -469,7 +483,6 @@ struct Document {
     }
 };
 
-// Returns even dimensions: the NV12 and codec paths need them.
 inline void canvas_size(const Document& doc, uint32_t* w, uint32_t* h) {
     uint32_t cw = doc.canvas_w, cvh = doc.canvas_h;
     if (!cw || !cvh) {
@@ -486,8 +499,55 @@ inline void canvas_size(const Document& doc, uint32_t* w, uint32_t* h) {
         cw = 1920;
         cvh = 1080;
     }
-    *w = std::max(cw & ~1u, 2u);
-    *h = std::max(cvh & ~1u, 2u);
+    *w = cw;
+    *h = cvh;
+}
+
+inline EntityFormat entity_format(const Document& doc, uint64_t id) {
+    if (const Look* l = doc.find_look(id)) return l->format;
+    if (const Sequence* s = doc.find_sequence(id)) return s->format;
+    return {};
+}
+
+inline void canvas_size(const Document& doc, uint64_t id,
+                        uint32_t* w, uint32_t* h) {
+    const EntityFormat f = entity_format(doc, id);
+    if (format_has_canvas(f)) {
+        *w = f.w;
+        *h = f.h;
+    } else canvas_size(doc, w, h);
+}
+
+inline void content_size(const Document& doc, uint64_t id,
+                         double* w, double* h) {
+    const EntityFormat f = entity_format(doc, id);
+    uint32_t cw = 0, ch = 0;
+    canvas_size(doc, id, &cw, &ch);
+    *w = f.content_w > 0 ? f.content_w : cw;
+    *h = f.content_h > 0 ? f.content_h : ch;
+}
+
+inline EntityFormat resize_format(const Document& doc, uint64_t id,
+                                  uint32_t w, uint32_t h, bool scale_content) {
+    EntityFormat f = entity_format(doc, id);
+    uint32_t old_w = 0, old_h = 0, new_w = w, new_h = h;
+    canvas_size(doc, id, &old_w, &old_h);
+    if (!w && !h) canvas_size(doc, &new_w, &new_h);
+    content_size(doc, id, &f.content_w, &f.content_h);
+    if (scale_content) {
+        const double sx = double(new_w) / old_w;
+        const double sy = double(new_h) / old_h;
+        f.scale_x *= sx;
+        f.scale_y *= sy;
+        f.origin_x *= sx;
+        f.origin_y *= sy;
+    } else {
+        f.origin_x += (double(old_w) - new_w) * 0.5;
+        f.origin_y += (double(old_h) - new_h) * 0.5;
+    }
+    f.w = w;
+    f.h = h;
+    return f;
 }
 
 template <class Seq, class F>
@@ -504,7 +564,7 @@ inline uint32_t sequence_duration(const Document& doc, const Sequence& seq,
 inline double project_fps(const Document& doc) {
     if (doc.fps > 0.0) return doc.fps;
     for (const Asset& a : doc.assets)
-        if (a.fps > 0.0) return a.fps;
+        if (a.fps > 0.0 && !a.animated) return a.fps;
     return 30.0;
 }
 

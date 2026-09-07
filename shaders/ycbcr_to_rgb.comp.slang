@@ -36,6 +36,10 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
+    if (nv12 == 2u) {
+        output[tid.xy] = plane_y.SampleLevel(uv, 0);
+        return;
+    }
     const float y = plane_y.SampleLevel(uv, 0).r;
     const float cb = plane_u.SampleLevel(uv, 0).r;
     const float cr = nv12 != 0 ? plane_u.SampleLevel(uv, 0).g

@@ -156,6 +156,8 @@ add_slang_shaders(looks_shaders
         gen.comp.slang
         layer_blend.comp.slang
         layer_transform.comp.slang
+        canvas_sample.comp.slang
+        rgba_import.comp.slang
         matte_extract.comp.slang
         matte_apply.comp.slang
     DEPENDS

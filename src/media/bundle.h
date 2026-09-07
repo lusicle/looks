@@ -18,6 +18,7 @@ struct AssetBundle {
     double fps = 0.0;
     // Use the ratio for the exact rate; a double cannot hold 30000/1001.
     uint32_t timescale = 0, frame_duration = 0;
+    bool animated = false;
 };
 
 inline const AssetBundle* find_bundle(const std::vector<AssetBundle>& table,

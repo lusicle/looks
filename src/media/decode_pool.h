@@ -26,6 +26,7 @@ namespace looks::media {
 struct SourceFrame {
     uint64_t key = 0;
     std::shared_ptr<const codec::DecodedFrame> frame;
+    uint32_t index = 0;
 };
 
 class DecodePool {
@@ -58,7 +59,7 @@ public:
     // Frames stay alive until the next collect().
     // With scrub, a frame can be approximate; the caller must not store it.
     const std::vector<SourceFrame>& collect(uint32_t root_frame,
-                                            bool scrub = false);
+        bool scrub = false, const std::vector<std::pair<uint64_t, uint32_t>>* exact = nullptr);
 
     // Point of no return: every roll bails and later misses return null.
     void abort();

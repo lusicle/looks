@@ -35,6 +35,8 @@ struct Compiler {
 
     int add(GraphNode node, int instance, uint64_t key = 0) {
         node.instance = instance;
+        doc::content_size(doc, graph.instances[instance].look,
+                         &node.canvas_w, &node.canvas_h);
         if (node.kind == GraphNode::Kind::LayerBlend ||
             node.kind == GraphNode::Kind::LayerTransform ||
             node.kind == GraphNode::Kind::MatteExtract ||
@@ -111,9 +113,45 @@ struct Compiler {
     }
 
     int emit_entity(uint64_t id, int inst, bool is_root) {
-        if (doc.find_look(id)) return emit_look(id, inst, is_root);
-        if (doc.find_sequence(id)) return emit_sequence(id, inst, is_root);
-        return -1;
+        int out = -1;
+        if (doc.find_look(id)) out = emit_look(id, inst, is_root);
+        else if (doc.find_sequence(id)) out = emit_sequence(id, inst, is_root);
+        if (out < 0) return out;
+        uint32_t w = 0, h = 0;
+        doc::canvas_size(doc, id, &w, &h);
+        const auto f = doc::entity_format(doc, id);
+        const auto& child = graph.nodes[out];
+        if (child.canvas_w == w && child.canvas_h == h &&
+            f.origin_x == 0 && f.origin_y == 0 && f.scale_x == 1 && f.scale_y == 1) return out;
+        GraphNode n;
+        n.kind = GraphNode::Kind::Canvas;
+        n.inputs = {out};
+        n.sample_rect[0] = float(f.origin_x / (child.canvas_w * f.scale_x));
+        n.sample_rect[1] = float(f.origin_y / (child.canvas_h * f.scale_y));
+        n.sample_rect[2] = float(w / (child.canvas_w * f.scale_x));
+        n.sample_rect[3] = float(h / (child.canvas_h * f.scale_y));
+        const int result = add(std::move(n), inst);
+        graph.nodes[result].canvas_w = w;
+        graph.nodes[result].canvas_h = h;
+        return result;
+    }
+
+    int fit_child(int out, int inst) {
+        double w = 0, h = 0;
+        doc::content_size(doc, graph.instances[inst].look, &w, &h);
+        const auto& child = graph.nodes[out];
+        if (child.canvas_w == w && child.canvas_h == h) return out;
+        GraphNode n;
+        n.kind = GraphNode::Kind::Canvas;
+        n.inputs = {out};
+        float rect[4];
+        source_fit_rect(float(child.canvas_w), float(child.canvas_h),
+                        float(w), float(h), rect);
+        n.sample_rect[0] = -rect[0] / rect[2];
+        n.sample_rect[1] = -rect[1] / rect[3];
+        n.sample_rect[2] = float(w) / rect[2];
+        n.sample_rect[3] = float(h) / rect[3];
+        return add(std::move(n), inst);
     }
 
     int emit_look(uint64_t look_id, int inst, bool is_root);
@@ -150,8 +188,9 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
             : static_cast<uint32_t>(std::floor(child.local_time));
         graph.instances.push_back(child);
         const int ci = static_cast<int>(graph.instances.size()) - 1;
-        const int out = emit_entity(place->target, ci, /*is_root=*/false);
+        int out = emit_entity(place->target, ci, /*is_root=*/false);
         if (out < 0) continue;
+        out = fit_child(out, inst);
         // Pre-Motion by design: the monitor's box math applies the transform.
         if (is_root && measure_placement && place->id == measure_placement)
             graph.measure = out;
@@ -336,7 +375,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             const int out =
                 emit_entity(layer.target, ci, /*is_root=*/false);
             if (out < 0) continue;
-            cur = out;
+            cur = fit_child(out, inst);
         } else {
             // Generators have no media and no end: always on.
             GraphNode gen;
@@ -447,6 +486,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     shifted =
                         emit_entity(sl->target, ci, /*is_root=*/false);
                     if (shifted < 0) continue;
+                    shifted = fit_child(shifted, inst);
                 }
                 if (doc::layer_has_transform(*sl) || sl->opacity != 1.0f) {
                     GraphNode xf;
@@ -785,6 +825,76 @@ bool topo_sort(const std::vector<GraphNode>& nodes, std::vector<int>& order) {
             if (--indegree[static_cast<size_t>(c)] == 0) ready.push_back(c);
     }
     return order.size() == n;
+}
+
+std::vector<SpatialImage> spatial_images(const doc::Document& doc,
+                                        const RenderGraph& graph) {
+    auto compose = [](const ImageMap& a, const ImageMap& b) {
+        ImageMap out;
+        for (int r = 0; r < 2; ++r) {
+            const int i = r * 3;
+            out.m[i] = a.m[i] * b.m[0] + a.m[i + 1] * b.m[3];
+            out.m[i + 1] = a.m[i] * b.m[1] + a.m[i + 1] * b.m[4];
+            out.m[i + 2] = a.m[i] * b.m[2] + a.m[i + 1] * b.m[5] + a.m[i + 2];
+        }
+        return out;
+    };
+    std::vector<SpatialImage> paths(graph.nodes.size());
+    for (int index : graph.order) {
+        const auto& node = graph.nodes[index];
+        auto& path = paths[index];
+        path.source = index;
+        int upstream = -1;
+        ImageMap map;
+        ImageClip clip;
+        float opacity = 1;
+        if (node.kind == GraphNode::Kind::Canvas) {
+            upstream = node.inputs[0];
+            map.m = {node.sample_rect[2], 0, node.sample_rect[0],
+                     0, node.sample_rect[3], node.sample_rect[1]};
+        } else if (node.kind == GraphNode::Kind::LayerTransform ||
+                   (node.kind == GraphNode::Kind::LayerBlend && node.layer_index < 0 &&
+                    graph.nodes[node.inputs[0]].kind == GraphNode::Kind::Generator &&
+                    graph.nodes[node.inputs[0]].layer_index < 0)) {
+            const bool layer_xf = node.kind == GraphNode::Kind::LayerTransform;
+            const auto& layer = layer_xf
+                ? doc.look(graph.instances[node.instance].look).layers[node.layer_index]
+                : doc::Layer{};
+            upstream = node.inputs[layer_xf ? 0 : 1];
+            const float scale = std::max(0.0001f, layer_xf ? layer.xf_scale : node.p_scale);
+            const float angle = layer_xf ? layer.xf_rotate * doc::kDeg2Rad : node.p_rotate;
+            const float ax = layer_xf ? layer.xf_anchor_x : node.p_anchor_x;
+            const float ay = layer_xf ? layer.xf_anchor_y : node.p_anchor_y;
+            const float sx = layer_xf ? 0 : node.p_shift_x;
+            const float sy = layer_xf ? 0 : node.p_shift_y;
+            const float aspect = float(node.canvas_w / node.canvas_h);
+            const float c = std::cos(angle) / scale, s = std::sin(angle) / scale;
+            map.m = {c, s / aspect, 0, -s * aspect, c, 0};
+            map.m[2] = ax - map.m[0] * (ax + sx) - map.m[1] * (ay + sy);
+            map.m[5] = ay - map.m[3] * (ax + sx) - map.m[4] * (ay + sy);
+            if (layer_xf) {
+                if (layer.flip_h) {
+                    for (int i = 0; i < 3; ++i) map.m[i] = -map.m[i];
+                    map.m[2] += 1;
+                }
+                if (layer.flip_v) {
+                    for (int i = 3; i < 6; ++i) map.m[i] = -map.m[i];
+                    map.m[5] += 1;
+                }
+                clip.rect = {layer.crop_l, layer.crop_t, 1 - layer.crop_r, 1 - layer.crop_b};
+            }
+            opacity = layer_xf ? layer.opacity : node.p_opacity;
+        }
+        if (upstream < 0) continue;
+        path = paths[upstream];
+        path.map = compose(path.map, map);
+        for (auto& c : path.clips) c.map = compose(c.map, map);
+        clip.map = map;
+        path.clips.push_back(clip);
+        path.clips.push_back({});
+        path.opacity *= std::clamp(opacity, 0.0f, 1.0f);
+    }
+    return paths;
 }
 
 RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,

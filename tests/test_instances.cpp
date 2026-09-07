@@ -987,11 +987,11 @@ TEST(canvas_size_derives_from_the_first_asset) {
     CHECK_EQ(h, uint32_t{1080});
     doc::Asset a;
     a.id = d.next_effect_id++;
-    a.width = 641;   // odd: rounded down to even for NV12
+    a.width = 641;
     a.height = 480;
     d.assets.push_back(a);
     doc::canvas_size(d, &w, &h);
-    CHECK_EQ(w, uint32_t{640});
+    CHECK_EQ(w, uint32_t{641});
     CHECK_EQ(h, uint32_t{480});
     d.canvas_w = 1280;
     d.canvas_h = 720;

@@ -8,6 +8,7 @@
 
 #include "codec/core.h"
 #include "util/bytes.h"
+#include "util/color.h"
 
 namespace looks::codec {
 
@@ -51,6 +52,32 @@ bool decode_plane_lossless(BitReader& br, uint8_t* data, size_t stride,
 }
 
 }  // namespace
+
+void DecodedFrame::set_rgba(const uint8_t* pixels, uint32_t w, uint32_t h) {
+    alloc_planes(w, h);
+    rgba.assign(pixels, pixels + size_t(w) * h * 4);
+    auto byte = [](float value) { return uint8_t(std::clamp(std::lround(value), 0l, 255l)); };
+    for (uint32_t yy = 0; yy < h; ++yy)
+        for (uint32_t x = 0; x < w; ++x) {
+            const auto* p = pixels + (size_t(yy) * w + x) * 4;
+            y[size_t(yy) * w + x] = byte(16 + 219 * color::luma709(p[0], p[1], p[2]) / 255);
+        }
+    for (uint32_t yy = 0; yy < (h + 1) / 2; ++yy)
+        for (uint32_t x = 0; x < (w + 1) / 2; ++x) {
+            float r = 0, g = 0, b = 0;
+            for (uint32_t dy = 0; dy < 2; ++dy)
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    const auto* p = pixels + (size_t(std::min(yy * 2 + dy, h - 1)) * w +
+                                               std::min(x * 2 + dx, w - 1)) * 4;
+                    r += p[0] / 1020.0f;
+                    g += p[1] / 1020.0f;
+                    b += p[2] / 1020.0f;
+                }
+            const float luma = color::luma709(r, g, b);
+            u[size_t(yy) * uv_stride + x] = byte(128 + 224 * (b - luma) / color::kCb709);
+            v[size_t(yy) * uv_stride + x] = byte(128 + 224 * (r - luma) / color::kCr709);
+        }
+}
 
 void encode_frame(const FrameView& frame, int quality,
                   std::vector<uint8_t>& out) {
@@ -375,6 +402,23 @@ bool decode_frame_parallel(const uint8_t* data, size_t size, uint32_t width,
 bool decode_frame(const uint8_t* data, size_t size, uint32_t width,
                   uint32_t height, DecodedFrame& out, bool parallel) {
     if (size < 1) return false;
+    if (data[0] == 255) {
+        if (!width || !height || size_t(width) * height > SIZE_MAX / 4) return false;
+        const size_t stride = size_t(width) * 4;
+        std::vector<uint8_t> rgba(stride * height);
+        BitReader br(data + 1, size - 1);
+        for (uint32_t y = 0; y < height; ++y)
+            for (size_t x = 0; x < stride; ++x) {
+                const size_t i = size_t(y) * stride + x;
+                const int pred = x >= 4 ? rgba[i - 4] : (y ? rgba[i - stride] : 0);
+                const int value = pred + br.get_se();
+                if (!br.ok() || value < 0 || value > 255) return false;
+                rgba[i] = uint8_t(value);
+            }
+        out.set_rgba(rgba.data(), width, height);
+        return true;
+    }
+    if (data[0] > 100) return false;
     if (data[0] == 0) {
         // Lossless is serial; the parallel flag is ignored by intent.
         const int w = static_cast<int>(width);
@@ -484,6 +528,33 @@ bool MezWriter::open(const std::filesystem::path& path, uint32_t width,
 
 bool MezWriter::add_frame(const FrameView& frame) {
     encode_frame(frame, quality_, scratch_);
+    return add_encoded_frame(scratch_);
+}
+
+bool MezWriter::open_rgba(const std::filesystem::path& path, uint32_t width,
+                          uint32_t height, uint32_t timescale,
+                          uint32_t frame_duration, bool animated) {
+    if (!open(path, width, height, timescale, frame_duration, 0)) return false;
+    auto* f = static_cast<FILE*>(file_);
+    uint8_t flags[4];
+    put_le32(flags, 1u | (animated ? 2u : 0u));
+    return _fseeki64(f, 32, SEEK_SET) == 0 && std::fwrite(flags, 1, 4, f) == 4 &&
+           _fseeki64(f, kHeaderSize, SEEK_SET) == 0;
+}
+
+bool MezWriter::add_rgba_frame(const uint8_t* pixels) {
+    if (!pixels || !file_ || !width_ || !height_) return false;
+    scratch_.clear();
+    scratch_.push_back(255);
+    BitWriter bw(scratch_);
+    const size_t stride = size_t(width_) * 4;
+    for (uint32_t y = 0; y < height_; ++y)
+        for (size_t x = 0; x < stride; ++x) {
+            const size_t i = size_t(y) * stride + x;
+            const int pred = x >= 4 ? pixels[i - 4] : (y ? pixels[i - stride] : 0);
+            bw.put_se(int(pixels[i]) - pred);
+        }
+    bw.finish();
     return add_encoded_frame(scratch_);
 }
 
@@ -598,6 +669,7 @@ bool MezReader::open(const std::filesystem::path& path, std::string* error) {
     const uint32_t frame_count = le32(header + 16);
     timescale_ = le32(header + 20);
     frame_duration_ = le32(header + 24);
+    flags_ = le32(header + 32);
     const uint64_t index_offset = le64(header + 36);
 
     if (frame_count == 0 || index_offset < kHeaderSize) {

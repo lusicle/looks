@@ -134,6 +134,12 @@ TextResult text_field_key(TextField& f, const platform::Event& e) {
     }
     if (e.type != platform::Event::Type::KeyDown) return TextResult::None;
 
+    if ((e.mods & platform::kModCtrl) && e.key == platform::Key::A) {
+        f.sel_anchor = 0;
+        f.caret = len;
+        return TextResult::Edit;
+    }
+
     const bool shift = (e.mods & platform::kModShift) != 0;
     switch (e.key) {
         case platform::Key::Backspace:

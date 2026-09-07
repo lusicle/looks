@@ -127,6 +127,10 @@ TEST(text_field_selection_and_home_end) {
 
     text_field_key(f, key_ev(platform::Key::End));
     CHECK_EQ(f.caret, 4);
+    text_field_key(f, key_ev(platform::Key::A, platform::kModCtrl));
+    type_in(f, "3");
+    CHECK_EQ(f.buf, std::string("3"));
+    CHECK(!f.has_selection());
 }
 
 TEST(text_field_filters_and_cap) {

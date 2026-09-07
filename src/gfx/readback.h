@@ -10,6 +10,31 @@
 
 namespace looks::gfx {
 
+class RgbaReadback {
+public:
+    static std::unique_ptr<RgbaReadback> create(Device& device);
+    ~RgbaReadback();
+    bool read(GpuImage& image, std::vector<uint8_t>& rgba, bool alpha = true);
+    bool render(Engine& engine, const doc::Document& doc, uint64_t entity,
+                uint32_t frame, double fps, uint32_t width, uint32_t height,
+                std::vector<uint8_t>& rgba, const Engine::LayerSourceFrame* sources,
+                size_t source_count, bool alpha = true, bool read_pixels = true,
+                uint64_t preview_node = 0, uint64_t preview_layer = 0,
+                uint32_t clock_frame = UINT32_MAX);
+private:
+    bool begin(uint32_t width, uint32_t height, bool read_pixels);
+    bool finish(GpuImage& image, std::vector<uint8_t>& rgba, bool alpha, bool read_pixels);
+    explicit RgbaReadback(Device& device) : device_(device) {}
+    Device& device_;
+    VkCommandPool pool_ = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+    VkFence fence_ = VK_NULL_HANDLE;
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+    VmaAllocation allocation_ = nullptr;
+    void* mapped_ = nullptr;
+    size_t capacity_ = 0;
+};
+
 class Nv12Readback {
 public:
     static std::unique_ptr<Nv12Readback> create(

@@ -5,6 +5,7 @@
 
 #include "doc/effects.h"
 #include "doc/layer_commands.h"
+#include "doc/mod_commands.h"
 #include "doc/placement_commands.h"
 #include "doc/serialize.h"
 #include "doc/stack_commands.h"
@@ -334,6 +335,52 @@ TEST(look_placement_maps_local_to_source) {
     past.t_in = 7;
     past.source_in = 900;
     CHECK_EQ(doc::placement_end(past, 100), uint32_t{8});
+}
+
+TEST(look_still_duration_grows_and_regions_preserve_content) {
+    Document d = doc_with_look();
+    d.fps = 30;
+    const uint64_t target = d.looks[0].id;
+    doc::Asset still;
+    still.id = d.next_effect_id++;
+    still.frame_count = 300;
+    still.still = true;
+    d.assets.push_back(still);
+    d.looks[0].layers[0].asset = still.id;
+    CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{300});
+    doc::Asset video;
+    video.id = d.next_effect_id++;
+    video.frame_count = 480;
+    video.fps = 24;
+    d.assets.push_back(video);
+    doc::Layer layer = doc::make_layer(d, doc::LayerSourceKind::Media);
+    layer.asset = video.id;
+    doc::UndoStack undo;
+    undo.execute(d, doc::add_layer_command(target, layer, d.looks[0].layers.size()));
+    CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{600});
+    undo.execute(d, doc::set_look_region_command(target, 30, 450, 60, 120), true);
+    undo.execute(d, doc::set_look_region_command(target, 45, 420, 60, 150), true);
+    CHECK_EQ(d.looks[0].trim_in, uint32_t{45});
+    CHECK_EQ(d.looks[0].trim_out, uint32_t{420});
+    CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{600});
+    CHECK_EQ(d.root().trim_out, uint32_t{0});
+    const auto restored_doc = doc::doc_from_json(doc::doc_to_json(d));
+    const auto& restored = restored_doc.looks[0];
+    CHECK_EQ(restored.trim_in, uint32_t{45});
+    CHECK_EQ(restored.trim_out, uint32_t{420});
+    CHECK_EQ(restored.loop_in, uint32_t{60});
+    CHECK_EQ(restored.loop_out, uint32_t{150});
+    undo.execute(d, doc::set_timeline_region_command(d.root_sequence, 7, 90, 0, 0));
+    CHECK(undo.undo(d));
+    CHECK(undo.undo(d));
+    CHECK_EQ(d.looks[0].trim_in, uint32_t{0});
+    CHECK_EQ(d.looks[0].trim_out, uint32_t{0});
+    CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{600});
+    CHECK(undo.undo(d));
+    CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{300});
+    CHECK(undo.redo(d));
+    CHECK(undo.redo(d));
+    CHECK_EQ(d.looks[0].trim_out, uint32_t{420});
 }
 
 TEST(look_duration_is_lockstep_content) {

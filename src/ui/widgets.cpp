@@ -162,7 +162,8 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
                              color);
             break;
         case Icon::Close:
-            glyph("x");
+            canvas.draw_line({cx - 4.0f, cy - 4.0f}, {cx + 4.0f, cy + 4.0f}, 1.2f, color);
+            canvas.draw_line({cx + 4.0f, cy - 4.0f}, {cx - 4.0f, cy + 4.0f}, 1.2f, color);
             break;
         case Icon::Wave: {
             const float a = 2.6f;
@@ -256,6 +257,13 @@ void draw_icon_glyph(Canvas2D& canvas, const Font& font, Icon icon,
             canvas.draw_line({cx + 2.0f, cy}, {cx - 1.5f, cy + 3.5f}, 1.2f,
                              color);
             break;
+        case Icon::Save:
+            canvas.draw_line({cx - 5.0f, cy - 5.0f}, {cx + 2.0f, cy - 5.0f}, 1.0f, color);
+            canvas.draw_line({cx + 2.0f, cy - 5.0f}, {cx + 5.0f, cy - 2.0f}, 1.0f, color);
+            canvas.draw_line({cx + 5.0f, cy - 2.0f}, {cx + 5.0f, cy + 5.0f}, 1.0f, color);
+            canvas.draw_line({cx + 5.0f, cy + 5.0f}, {cx - 5.0f, cy + 5.0f}, 1.0f, color);
+            canvas.draw_line({cx - 5.0f, cy + 5.0f}, {cx - 5.0f, cy - 5.0f}, 1.0f, color);
+            break;
     }
 }
 
@@ -314,6 +322,7 @@ void draw_label(LayoutNode& node, LayoutFrame& frame) {
 }
 
 struct ButtonUser {
+    bool primary;
     const char* label;
     size_t length;
     ButtonState* state;
@@ -369,6 +378,11 @@ void draw_button_face(Canvas2D& canvas, const Font& font, const Theme& theme,
                       : theme.text;
     if (f.disabled) fg = theme.text_disabled;
     if (f.active && !f.disabled) fg = theme.accent;
+    if (f.primary && !f.disabled) {
+        bg = lerp(theme.accent, theme.accent_dim, f.press_t);
+        const float luminance = 0.2126f * bg.r + 0.7152f * bg.g + 0.0722f * bg.b;
+        fg = luminance > 0.179f ? Color{0, 0, 0, 1} : Color{1, 1, 1, 1};
+    }
     if (f.flat) {
         if (!f.disabled && f.hover_t > 0.01f)
             canvas.draw_sdf_rect(r, f.radius,
@@ -378,7 +392,7 @@ void draw_button_face(Canvas2D& canvas, const Font& font, const Theme& theme,
         canvas.draw_sdf_rect(r, f.radius, bg);
         canvas.draw_sdf_rect_outline(
             r, f.radius, theme.stroke_width,
-            f.active && !f.disabled ? theme.accent : theme.hairline);
+            (f.active || f.primary) && !f.disabled ? theme.accent : theme.hairline);
     }
     const float icon_w = f.trailing_icon >= 0 ? 14.0f * f.scale : 0.0f;
     const Rect text_r{r.x, r.y, std::max(0.0f, r.w - icon_w), r.h};
@@ -404,7 +418,8 @@ void draw_button_face(Canvas2D& canvas, const Font& font, const Theme& theme,
 float value_box_width(const Font& font, std::string_view value,
                       float font_size, float scale) {
     return std::max(38.0f * scale,
-                    measure_text(font, value, font_size).x + 10.0f * scale);
+                    measure_text(font, value, font_size).x +
+                    2.0f * active_theme().control_text_inset * scale);
 }
 
 Rect slider_value_rect(const Rect& r, float box_w) {
@@ -482,7 +497,7 @@ void draw_dropdown_face(Canvas2D& canvas, const Font& font, const Theme& theme,
     const Rect text_clip = clip.empty() ? text_r : text_r.intersect(clip);
     canvas.push_clip(text_clip);
     draw_text(canvas, font, text,
-              {r.x + 8.0f * scale,
+              {r.x + theme.control_text_inset * scale,
                r.y + (r.h - font.line_height() * font_size) * 0.5f},
               font_size, theme.text);
     canvas.pop_clip();
@@ -514,7 +529,7 @@ void draw_text_input_face(Canvas2D& canvas, const Font& font,
     }
     const Rect text_clip = clip.empty() ? r : r.intersect(clip);
     canvas.push_clip(text_clip);
-    const float tx = r.x + 4.0f * scale;
+    const float tx = r.x + theme.control_text_inset * scale;
     const float ty = r.y + (r.h - font.line_height() * font_size) * 0.5f;
     auto x_at = [&](int index) {
         const int n = std::clamp(index, 0, static_cast<int>(text.size()));
@@ -770,6 +785,7 @@ void draw_button(LayoutNode& node, LayoutFrame& frame) {
         face.press_t = u->state->press_t;
     }
     face.active = u->active;
+    face.primary = u->primary;
     face.disabled = u->disabled;
     face.flat = u->flat;
     face.align_left = u->align_left;
@@ -1012,6 +1028,7 @@ void draw_chip(LayoutNode& node, LayoutFrame& frame) {
 }
 
 struct IconUser {
+    bool framed;
     Icon icon;
     ButtonState* state;
     bool* out_clicked;
@@ -1033,7 +1050,7 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
         static const char* names[] = {
             "play", "pause", "up", "down", "close", "wave", "key", "knob",
             "eye", "eyeoff", "dice", "link", "solo", "soloon", "copy",
-            "lock", "magnet", "chevronright"};
+            "lock", "magnet", "chevronright", "save"};
         const size_t ii = static_cast<size_t>(u->icon);
         if (u->probe)
             probe_add(u->probe, r);
@@ -1042,6 +1059,15 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
     }
 
     Color fg = theme.text_dim;
+    if (u->framed) {
+        ButtonFace face;
+        face.disabled = u->disabled;
+        face.active = u->active;
+        face.hover_t = u->state->hover_t;
+        face.press_t = u->state->press_t;
+        face.radius = theme.corner_radius;
+        draw_button_face(frame.canvas, frame.font, theme, r, "", face, node.clip);
+    }
     if (u->disabled) {
         fg = theme.text_disabled;
     } else {
@@ -1049,7 +1075,7 @@ void draw_icon_button(LayoutNode& node, LayoutFrame& frame) {
         if (tick_press_release(*u->state, id, r, frame) && u->out_clicked)
             *u->out_clicked = true;
         maybe_tooltip(*u->state, u->tooltip, frame);
-        draw_hover(frame, r, theme.corner_radius, u->state->hover_t);
+        if (!u->framed) draw_hover(frame, r, theme.corner_radius, u->state->hover_t);
         fg = u->active
             ? theme.accent
             : lerp(theme.text_dim, theme.text, u->state->hover_t);
@@ -1989,6 +2015,7 @@ LayoutNode* Button(LayoutArena& arena, std::string_view label,
                    const ButtonOpts& opts) {
     LayoutNode* n = make_node(arena, NodeKind::Leaf);
     auto* u = arena.alloc<ButtonUser>();
+    u->primary = opts.primary;
     u->label = arena.dup(label.data(), label.size());
     u->length = label.size();
     u->state = state;
@@ -2086,6 +2113,7 @@ LayoutNode* IconButton(LayoutArena& arena, Icon icon, ButtonState* state,
                        bool* out_clicked, const ButtonOpts& opts) {
     LayoutNode* n = make_node(arena, NodeKind::Leaf);
     auto* u = arena.alloc<IconUser>();
+    u->framed = opts.framed;
     u->icon = icon;
     u->state = state;
     u->out_clicked = out_clicked;

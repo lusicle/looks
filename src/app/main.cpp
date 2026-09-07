@@ -241,6 +241,12 @@ BundlePaths resolve_bundle(const std::filesystem::path& source,
         }
         return out;
     }
+    if (media::is_still_image(source)) {
+        codec::MezReader reader;
+        std::string error;
+        if (!reader.open(mez, &error) || !reader.rgba() ||
+            (ext == L".gif" && !reader.animated())) return out;
+    }
     out.mez = mez;
     out.base = mez;
     out.pcm = mez;
@@ -276,7 +282,9 @@ uint64_t group_boundary_member(const doc::Look& look, uint64_t gid,
 }
 
 bool is_still_source(const std::filesystem::path& source) {
-    return media::is_still_image(source);
+    std::wstring ext = source.extension().wstring();
+    for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
+    return ext != L".gif" && media::is_still_image(source);
 }
 
 std::unique_ptr<ImportJob> start_import(const std::filesystem::path& source,
@@ -382,6 +390,7 @@ inline std::vector<gfx::Engine::LayerSourceFrame> to_layer_sources(
         lf.key = sf.key;
         lf.content_stamp = sf.frame->stamp;
         lf.planes.nv12 = sf.frame->nv12;
+        lf.planes.rgba = sf.frame->rgba.empty() ? nullptr : sf.frame->rgba.data();
         lf.planes.y = view.y.data;
         lf.planes.y_stride = view.y.stride;
         lf.planes.u = view.u.data;
@@ -421,9 +430,9 @@ inline double project_fps(const doc::Document& doc,
                           const std::vector<media::AssetBundle>& bundles) {
     if (doc.fps > 0.0) return doc.fps;
     for (const doc::Asset& a : doc.assets)
-        if (a.fps > 0.0) return a.fps;
+        if (a.fps > 0.0 && !a.animated) return a.fps;
     for (const media::AssetBundle& b : bundles)
-        if (b.fps > 0.0) return b.fps;
+        if (b.fps > 0.0 && !b.animated) return b.fps;
     return 30.0;
 }
 
@@ -582,6 +591,40 @@ protected:
 
 // The worker thread owns the preview Engine.
 // Do not rewrite a published image until the UI frame that read it retires.
+struct PreviewHistory {
+    struct Assets {
+        std::vector<uint8_t> glyph;
+        uint32_t glyph_w = 0, glyph_h = 0, cols = 16, rows = 6;
+        float tile = 8;
+        bool color = false;
+        std::shared_ptr<const std::vector<int16_t>> scope;
+        uint32_t scope_rate = 0;
+    };
+    struct Context {
+        std::shared_ptr<const doc::Document> doc;
+        std::shared_ptr<const mod::AnalysisCurves> analysis;
+        std::shared_ptr<const mod::NodeAudioMap> audio;
+        std::shared_ptr<const mod::NodeCameraMap> camera;
+        std::shared_ptr<const gfx::Engine::PinPlaneMap> pins;
+        std::shared_ptr<const Assets> assets;
+        uint64_t entity = 0, preview_node = 0, preview_layer = 0;
+        double fps = 30;
+        uint32_t width = 0, height = 0, divisor = 1;
+        bool has_history = false;
+    };
+    struct Frame {
+        uint32_t source = 0, clock = 0;
+        double seconds = -1, env_time = -1;
+        std::vector<std::pair<uint64_t, uint32_t>> media;
+        bool operator==(const Frame&) const = default;
+    };
+    struct Segment {
+        std::shared_ptr<const Context> context;
+        std::vector<Frame> frames;
+    };
+    std::vector<Segment> segments;
+};
+
 struct RenderWorker : WorkerGate {
     struct Job {
         // Immutable snapshot. The UI builds it outside the lock.
@@ -695,6 +738,11 @@ struct RenderWorker : WorkerGate {
         for (Published& p : published_) p.ready = false;
     }
 
+    std::shared_ptr<const PreviewHistory> history_snapshot() {
+        std::lock_guard<std::mutex> lock(m_);
+        return std::make_shared<PreviewHistory>(history_);
+    }
+
     // Call once per UI frame. The worker keeps the image until the fence waits.
     View acquire(uint64_t ui_frame) {
         std::lock_guard<std::mutex> lock(m_);
@@ -782,6 +830,7 @@ struct RenderWorker : WorkerGate {
     uint64_t job_serial_ = 0;
 
 private:
+    PreviewHistory history_;
     struct Published {
         std::unique_ptr<gfx::GpuImage> final_img, source_img;
         // Fixed size atlas. Do not retire it on resize.
@@ -853,7 +902,7 @@ bool RenderWorker::ensure_published(Published& p, uint32_t w, uint32_t h,
         if (img) graveyard_.emplace_back(p.last_ui_frame, std::move(img));
     };
     const VkImageUsageFlags usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (p.w != w || p.h != h) {
         retire(p.final_img);
         retire(p.source_img);
@@ -962,6 +1011,10 @@ void RenderWorker::run() {
     mod::TimeRemap remap;
 
     std::shared_ptr<const doc::Document> doc_snap;
+    std::shared_ptr<const PreviewHistory::Context> history_context;
+    std::shared_ptr<const PreviewHistory::Assets> history_assets = std::make_shared<PreviewHistory::Assets>();
+    std::shared_ptr<const mod::AnalysisCurves> history_analysis;
+    uint64_t history_revision = ~0ull, history_bundle_stamp = ~0ull;
     // doc_revision is the effective revision. It keys the pool and the
     // cache hash.
     doc::Document doc_local;
@@ -1080,6 +1133,7 @@ void RenderWorker::run() {
                 analysis = job_.analysis;
                 has_analysis = job_.has_analysis;
                 analysis_stamp = job_.analysis_stamp;
+                history_analysis = has_analysis ? std::make_shared<mod::AnalysisCurves>(analysis) : nullptr;
                 doc_changed = true;
             }
             if (job_.node_audio != node_audio) {
@@ -1107,6 +1161,15 @@ void RenderWorker::run() {
                 const float gt = job_.glyph_tile;
                 const uint32_t gc = job_.glyph_cols, gr = job_.glyph_rows;
                 const bool color = job_.glyph_is_color;
+                auto updated = std::make_shared<PreviewHistory::Assets>(*history_assets);
+                updated->glyph = bytes;
+                updated->glyph_w = gw;
+                updated->glyph_h = gh;
+                updated->tile = gt;
+                updated->cols = gc;
+                updated->rows = gr;
+                updated->color = color;
+                history_assets = std::move(updated);
                 lock.unlock();
                 if (color)
                     engine->set_glyph_atlas_rgba(bytes.data(), gw, gh, gt,
@@ -1121,6 +1184,10 @@ void RenderWorker::run() {
                 job_.scope_pending = false;
                 std::vector<int16_t> mono = std::move(job_.scope_data);
                 const uint32_t rate = job_.scope_rate;
+                auto updated = std::make_shared<PreviewHistory::Assets>(*history_assets);
+                updated->scope = std::make_shared<std::vector<int16_t>>(mono);
+                updated->scope_rate = rate;
+                history_assets = std::move(updated);
                 lock.unlock();
                 engine->set_scope_audio(std::move(mono), rate);
                 lock.lock();
@@ -1162,7 +1229,7 @@ void RenderWorker::run() {
 
         const double mod_fps = player.fps();   // normalized > 0 by Player
         uint32_t canvas_w = 0, canvas_h = 0;
-        doc::canvas_size(doc, &canvas_w, &canvas_h);
+        doc::canvas_size(doc, look_id, &canvas_w, &canvas_h);
 
         // Render on the remapped frame. Modulation stays on the raw playhead.
         uint32_t play_frame = mod_frame;
@@ -1197,6 +1264,30 @@ void RenderWorker::run() {
             &sfv, node_audio ? node_audio.get() : nullptr,
             node_camera ? node_camera.get() : nullptr);
         const auto tp2 = std::chrono::steady_clock::now();
+        if (!history_context || history_revision != doc_revision || history_bundle_stamp != bundle_stamp ||
+            history_context->entity != look_id || history_context->preview_node != preview_node ||
+            history_context->preview_layer != preview_layer || history_context->analysis != history_analysis ||
+            history_context->audio != node_audio || history_context->camera != node_camera ||
+            history_context->pins != pin_planes || history_context->assets != history_assets ||
+            history_context->fps != mod_fps || history_context->divisor != preview_div) {
+            auto context = std::make_shared<PreviewHistory::Context>();
+            context->doc = local_valid ? std::make_shared<doc::Document>(doc) : doc_snap;
+            context->analysis = history_analysis;
+            context->audio = node_audio;
+            context->camera = node_camera;
+            context->pins = pin_planes;
+            context->assets = history_assets;
+            context->entity = look_id;
+            context->preview_node = preview_node;
+            context->preview_layer = preview_layer;
+            context->fps = mod_fps;
+            context->has_history = doc::document_uses_history(doc);
+            context->divisor = preview_div;
+            doc::canvas_size(doc, look_id, &context->width, &context->height);
+            history_context = std::move(context);
+            history_revision = doc_revision;
+            history_bundle_stamp = bundle_stamp;
+        }
         engine->set_preview_divisor(preview_div);
         engine->cache().set_budget(static_cast<size_t>(doc.cache_mb) << 20);
 
@@ -1232,16 +1323,16 @@ void RenderWorker::run() {
 
         // Render at working res. Publish auto-fits the display, but the
         // root sequence stays native.
-        const uint32_t fw = gfx::even_down(canvas_w, preview_div);
-        const uint32_t fh = gfx::even_down(canvas_h, preview_div);
+        const uint32_t fw = std::max(1u, canvas_w / preview_div);
+        const uint32_t fh = std::max(1u, canvas_h / preview_div);
         // Snap to a full, half, or quarter rung that still covers the display.
         uint32_t vdiv = 1;
         if (look_id != doc.root_sequence && pub_w && pub_h) {
             if (fw / 2 >= pub_w && fh / 2 >= pub_h) vdiv = 2;
             if (fw / 4 >= pub_w && fh / 4 >= pub_h) vdiv = 4;
         }
-        const uint32_t pw = gfx::even_down(fw, vdiv);
-        const uint32_t ph = gfx::even_down(fh, vdiv);
+        const uint32_t pw = std::max(1u, fw / vdiv);
+        const uint32_t ph = std::max(1u, fh / vdiv);
         int target = -1;
         {
             std::lock_guard<std::mutex> lock(m_);
@@ -1368,6 +1459,20 @@ void RenderWorker::run() {
         fl.cycle_seq = this_cycle;
         fl.sel_placement = sel_placement;
         fl.measured = engine->measure_recorded();
+        if (published_ok) {
+            PreviewHistory::Frame recorded;
+            recorded.source = play_frame;
+            recorded.clock = mod_frame;
+            recorded.seconds = live_mode ? app_seconds : -1;
+            recorded.env_time = live_mode ? env_key_time : -1;
+            for (const auto& source : decoded) recorded.media.emplace_back(source.key, source.index);
+            std::lock_guard<std::mutex> lock(m_);
+            if (history_.segments.empty() || history_.segments.back().context != history_context)
+                history_.segments.push_back({history_context, {}});
+            auto& frames = history_.segments.back().frames;
+            if (!history_context->has_history && !frames.empty()) frames.back() = std::move(recorded);
+            else if (frames.empty() || frames.back() != recorded) frames.push_back(std::move(recorded));
+        }
         slot = (slot + 1) % gfx::kFramesInFlight;
 
         double phase_now[4] = {};
@@ -1700,7 +1805,7 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
     std::vector<gfx::Engine::LayerSourceFrame> lsrc;
     if (req.entity) {
         uint32_t cw2 = 0, ch2 = 0;
-        doc::canvas_size(rdoc, &cw2, &ch2);
+        doc::canvas_size(rdoc, req.entity, &cw2, &ch2);
         const double ca =
             ch2 ? static_cast<double>(cw2) / ch2 : 16.0 / 9.0;
         uint32_t tw = 320, th2 = 180;
@@ -1732,16 +1837,10 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
                     static_cast<uint32_t>(sf * strip->count / frames));
             // Convert to limited-range I420. Chroma comes from the top
             // left of each 2x2 block.
-            const uint32_t sw = strip->w & ~1u, sh = strip->h & ~1u;
+            const uint32_t sw = strip->w, sh = strip->h;
             if (!sw || !sh) continue;
             codec::DecodedFrame df;
-            df.width = sw;
-            df.height = sh;
-            df.y_stride = sw;
-            df.uv_stride = sw / 2;
-            df.y.resize(static_cast<size_t>(sw) * sh);
-            df.u.resize(static_cast<size_t>(sw / 2) * (sh / 2));
-            df.v.resize(static_cast<size_t>(sw / 2) * (sh / 2));
+            std::vector<uint8_t> rgba(size_t(sw) * sh * 4);
             const uint8_t* rgb = strip->rgb.data() +
                                  static_cast<size_t>(ci) * strip->w *
                                      strip->h * 3;
@@ -1749,17 +1848,12 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
                 for (uint32_t x = 0; x < sw; ++x) {
                     const uint8_t* p =
                         rgb + (static_cast<size_t>(y) * strip->w + x) * 3;
-                    uint8_t yy, cb, cr;
-                    color::rgb8_to_ycbcr709(p[0], p[1], p[2], &yy, &cb,
-                                            &cr);
-                    df.y[static_cast<size_t>(y) * sw + x] = yy;
-                    if (!(y & 1) && !(x & 1)) {
-                        const size_t co =
-                            static_cast<size_t>(y / 2) * (sw / 2) + x / 2;
-                        df.u[co] = cb;
-                        df.v[co] = cr;
-                    }
+                    const size_t i = size_t(y) * sw + x;
+                    std::copy_n(p, 3, rgba.data() + i * 4);
+                    rgba[i * 4 + 3] = strip->alpha.empty() ? 255
+                        : strip->alpha[size_t(ci) * sw * sh + i];
                 }
+            df.set_rgba(rgba.data(), sw, sh);
             planes.push_back(std::move(df));
             const codec::DecodedFrame& back = planes.back();
             gfx::Engine::LayerSourceFrame lf;
@@ -1769,7 +1863,7 @@ void ThumbWorker::render_one(const Req& req, const doc::Document& rdoc) {
                          back.u.data(),      back.uv_stride,
                          back.v.data(),      back.uv_stride,
                          back.width,         back.height,
-                         false};
+                         false, back.rgba.data()};
             lsrc.push_back(lf);
         }
         const doc::Document resolved =
@@ -1955,7 +2049,9 @@ std::vector<int16_t> scope_audio_from_mix(const media::MixState& mix,
     return mono;
 }
 
-// Runs on its own thread with a private Engine. Queue submits use the mutex.
+std::vector<uint8_t> build_ascii_atlas(const ui::Font& font);
+std::vector<media::AssetBundle> build_bundle_table(const doc::Document& doc, bool preview);
+
 std::unique_ptr<ExportJob> start_export(
     gfx::Device& device, const std::filesystem::path& shader_dir,
     const std::vector<media::AssetBundle>& bundles, const PcmCache& pcm,
@@ -1964,7 +2060,8 @@ std::unique_ptr<ExportJob> start_export(
     std::shared_ptr<const mod::NodeAudioMap> node_audio,
     std::shared_ptr<const mod::NodeCameraMap> node_camera,
     std::shared_ptr<const gfx::Engine::PinPlaneMap> pin_planes,
-    const std::filesystem::path& out_path) {
+    const std::filesystem::path& out_path, media::ExportRequest request,
+    std::shared_ptr<const PreviewHistory> history) {
     auto job = std::make_unique<ExportJob>();
     job->out_path = out_path;
     ExportJob* raw = job.get();
@@ -1983,23 +2080,43 @@ std::unique_ptr<ExportJob> start_export(
                                node_camera = std::move(node_camera),
                                pin_planes = std::move(pin_planes),
                                has_analysis, raw, out_path,
-                               export_look_id] {
+                               export_look_id, request, history = std::move(history)] {
         auto engine = gfx::Engine::create(device, shader_dir);
-        auto readback = gfx::Nv12Readback::create(device, shader_dir);
-        if (!engine || !readback) {
+        const bool mp4 = request.render.format == media::RenderFormat::Mp4;
+        auto readback = mp4 ? gfx::Nv12Readback::create(device, shader_dir) : nullptr;
+        auto rgba_readback = gfx::RgbaReadback::create(device);
+        if (!engine || (mp4 && !readback) || !rgba_readback) {
             raw->result.error = "export renderer init failed";
             raw->done = true;
             return;
         }
-        // Export uses the same divisor as preview: kernels sample by uv.
         engine->set_track_planes(pin_planes);
-        engine->set_preview_divisor(doc_copy.export_scale);
+        engine->set_preview_divisor(1);
+        const auto ascii = build_ascii_atlas(ui::Font::create_debug());
+        engine->set_glyph_atlas(ascii.data(), 128, 48);
         uint32_t canvas_w = 0, canvas_h = 0;
-        doc::canvas_size(doc_copy, &canvas_w, &canvas_h);
-        const uint32_t out_w =
-            gfx::even_down(canvas_w, doc_copy.export_scale);
-        const uint32_t out_h =
-            gfx::even_down(canvas_h, doc_copy.export_scale);
+        doc::canvas_size(doc_copy, export_look_id, &canvas_w, &canvas_h);
+        const uint32_t out_w = request.render.width ? request.render.width : canvas_w;
+        const uint32_t out_h = request.render.height ? request.render.height : canvas_h;
+        if ((mp4 && ((out_w & 1) || (out_h & 1))) || !out_w || !out_h) {
+            raw->result.error = "MP4 requires even dimensions";
+            raw->done = true;
+            return;
+        }
+        std::error_code path_error;
+        if (!request.overwrite && std::filesystem::exists(out_path, path_error)) {
+            raw->result.error = "output already exists";
+            raw->done = true;
+            return;
+        }
+        if (mp4 && !out_path.parent_path().empty()) {
+            std::filesystem::create_directories(out_path.parent_path(), path_error);
+            if (path_error) {
+                raw->result.error = "cannot create output directory: " + path_error.message();
+                raw->done = true;
+                return;
+            }
+        }
         // MezReaders are single-thread objects, so this pool must be private.
         media::DecodePool pool("export");
         pool.set_document(doc_copy, export_look_id, bundle_copy, 1);
@@ -2026,7 +2143,8 @@ std::unique_ptr<ExportJob> start_export(
         uint32_t total = 0, t_in = 0, t_out = 0;
         if (const doc::Look* el = doc_copy.find_look(export_look_id)) {
             total = doc::look_duration(doc_copy, *el);
-            t_out = total;
+            t_in = total ? std::min(el->trim_in, total - 1) : 0;
+            t_out = el->trim_out ? std::min(el->trim_out, total) : total;
         } else if (const doc::Sequence* es =
                        doc_copy.find_sequence(export_look_id)) {
             total = doc::sequence_duration(doc_copy, *es);
@@ -2038,9 +2156,25 @@ std::unique_ptr<ExportJob> start_export(
             raw->done = true;
             return;
         }
-        const uint32_t span = t_out > t_in ? t_out - t_in : total;
-        auto producer = [&](uint32_t f, std::vector<uint8_t>& nv12) {
-            const uint32_t abs_f = t_in + f;
+        if (request.range_override) {
+            t_in = request.first;
+            t_out = request.last;
+        }
+        if (t_in >= total || t_out > total || t_out <= t_in) {
+            raw->result.error = "range must be within the source, with end after start";
+            raw->done = true;
+            return;
+        }
+        const double output_fps = request.render.fps > 0 ? request.render.fps : fps;
+        const double count = std::ceil((t_out - t_in) * output_fps / fps - 1e-9);
+        if (!std::isfinite(output_fps) || output_fps <= 0 || count > UINT32_MAX ||
+            (request.render.format == media::RenderFormat::Gif && output_fps > 100)) {
+            raw->result.error = "invalid export frame rate (GIF maximum is 100 fps)";
+            raw->done = true;
+            return;
+        }
+        const uint32_t span = request.render.format == media::RenderFormat::PngFrame ? 1 : uint32_t(count);
+        auto render_frame = [&](uint32_t abs_f, std::vector<uint8_t>& pixels, bool read_pixels) {
             // Export walks frames in order, so the prefix sum is incremental.
             uint32_t play_frame = abs_f;
             if (export_look_id == doc_copy.root_sequence)
@@ -2057,15 +2191,85 @@ std::unique_ptr<ExportJob> start_export(
                 -1.0, -1.0, &sfv,
                 node_audio ? node_audio.get() : nullptr,
                 node_camera ? node_camera.get() : nullptr);
+            if (!mp4 || !read_pixels)
+                return rgba_readback->render(*engine, resolved, export_look_id,
+                    play_frame, fps, out_w, out_h, pixels,
+                    lsrc.empty() ? nullptr : lsrc.data(), lsrc.size(),
+                    request.render.alpha, read_pixels, 0, 0, abs_f);
             return readback->render(*engine, resolved, export_look_id,
-                                    play_frame, fps, canvas_w, canvas_h, nv12,
+                                    play_frame, fps, out_w, out_h, pixels,
                                     0, abs_f,
                                     lsrc.empty() ? nullptr : lsrc.data(),
                                     lsrc.size());
         };
+        bool replayed = false;
+        const bool temporal = doc::document_uses_history(doc_copy);
+        uint32_t next_frame = 0;
+        auto producer = [&](uint32_t f, std::vector<uint8_t>& pixels) {
+            const uint32_t target = std::min(t_out - 1,
+                t_in + uint32_t(std::floor(f * fps / output_fps + 1e-9)));
+            if (!replayed && request.render.format == media::RenderFormat::PngFrame && history &&
+                !history->segments.empty()) {
+                replayed = true;
+                uint32_t history_count = 0;
+                for (const auto& segment : history->segments) history_count += uint32_t(segment.frames.size());
+                if (!temporal) history_count = 1;
+                raw->progress.history_total.store(history_count);
+                const auto& last = history->segments.back();
+                const double scale_x = double(out_w) / std::max(1u, canvas_w / last.context->divisor);
+                const double scale_y = double(out_h) / std::max(1u, canvas_h / last.context->divisor);
+                uint64_t revision = 1;
+                for (const auto& segment : history->segments) {
+                    if (!temporal && &segment != &last) continue;
+                    const auto& context = *segment.context;
+                    engine->set_track_planes(context.pins);
+                    if (context.assets) {
+                        const auto& assets = *context.assets;
+                        if (!assets.glyph.empty()) {
+                            if (assets.color) engine->set_glyph_atlas_rgba(assets.glyph.data(), assets.glyph_w,
+                                assets.glyph_h, assets.tile, assets.cols, assets.rows, 2);
+                            else engine->set_glyph_atlas(assets.glyph.data(), assets.glyph_w,
+                                assets.glyph_h, assets.tile, assets.cols, assets.rows, 2);
+                        }
+                        engine->set_scope_audio(assets.scope ? *assets.scope : std::vector<int16_t>{}, assets.scope_rate);
+                    }
+                    pool.set_document(*context.doc, context.entity, build_bundle_table(*context.doc, false), ++revision);
+                    const uint32_t width = uint32_t(std::max(1.0, std::round(std::max(1u, context.width / context.divisor) * scale_x)));
+                    const uint32_t height = uint32_t(std::max(1.0, std::round(std::max(1u, context.height / context.divisor) * scale_y)));
+                    for (const auto& frame : segment.frames) {
+                        if (!temporal && &frame != &segment.frames.back()) continue;
+                        if (raw->progress.cancel.load()) return false;
+                        const auto sources = to_layer_sources(pool.collect(frame.source, false, &frame.media));
+                        mod::SourceFrameView view;
+                        if (!sources.empty()) view = source_view(sources.front().planes);
+                        const auto resolved = mod::resolve(*context.doc, frame.clock, context.fps,
+                            context.analysis.get(), frame.seconds, frame.env_time, &view,
+                            context.audio.get(), context.camera.get());
+                        const bool final = &segment == &last && &frame == &segment.frames.back() &&
+                            context.entity == export_look_id && frame.clock == target &&
+                            context.doc->revision == doc_copy.revision && width == out_w && height == out_h;
+                        if (!rgba_readback->render(*engine, resolved, context.entity, frame.source,
+                            context.fps, width, height, pixels, sources.data(), sources.size(),
+                            request.render.alpha, final, context.preview_node, context.preview_layer, frame.clock)) return false;
+                        raw->progress.history_done.fetch_add(1);
+                        if (final) return true;
+                    }
+                }
+                pool.set_document(doc_copy, export_look_id, bundle_copy, ++revision);
+                engine->set_track_planes(pin_planes);
+                return render_frame(target, pixels, true);
+            }
+            if (!temporal) next_frame = target;
+            while (next_frame < target) {
+                if (raw->progress.cancel.load() || !render_frame(next_frame++, pixels, false)) return false;
+            }
+            if (raw->progress.cancel.load() || !render_frame(target, pixels, true)) return false;
+            next_frame = target + 1;
+            return true;
+        };
         media::ExportOptions options;
         options.video_bitrate_bps = static_cast<uint32_t>(
-            std::clamp(doc_copy.export_bitrate_mbps, 1.0f, 60.0f) *
+            std::clamp(request.render.bitrate_mbps, 1.0f, 60.0f) *
             1'000'000.0f);
         // A positive audio_offset_ms moves audio later, so subtract it.
         options.audio_skip_samples =
@@ -2074,7 +2278,7 @@ std::unique_ptr<ExportJob> start_export(
                 static_cast<double>(doc_copy.audio_offset_ms) * 0.001,
                 media::Player::kClockRate);
         media::ExportAudio audio;
-        if (doc_copy.export_audio && mix->root >= 0) {
+        if (request.render.audio && mix->root >= 0) {
             audio.channels = mix->channels;
             audio.rate = mix->rate;
             auto scratch = std::make_shared<std::vector<float>>();
@@ -2084,11 +2288,13 @@ std::unique_ptr<ExportJob> start_export(
             };
         }
         uint32_t fps_num = 0, fps_den = 0;
-        frame_rate_ratio(fps, bundle_copy, &fps_num, &fps_den);
+        frame_rate_ratio(output_fps, bundle_copy, &fps_num, &fps_den);
         raw->result =
-            media::export_movie(out_w, out_h, fps_num, fps_den, span,
+            mp4 ? media::export_movie(out_w, out_h, fps_num, fps_den, span,
                                 producer, audio, out_path, options,
-                                &raw->progress);
+                                &raw->progress)
+                : media::export_images(out_w, out_h, fps_num, fps_den, span,
+                    producer, out_path, request.render, request.overwrite, &raw->progress);
         // Abort the pool: the destructor must not wait for prewarm rolls.
         pool.abort();
         raw->done = true;
@@ -2302,6 +2508,33 @@ std::map<std::string, KeyBinding> default_keybinds();
 void save_ui_prefs(const AppState& app);
 
 // View state only. Never put settings state in the project.
+struct ExportUi {
+    bool open = false;
+    media::ExportRequest request;
+    std::map<std::string, media::RenderSettings> presets;
+    std::string selected_preset, error;
+    bool preset_naming = false;
+    ui::TextField fields[12];
+    ui::TextInputState inputs[12];
+    ui::DropdownState format_dd, source_dd, preset_dd;
+    ui::ButtonState buttons[10];
+    ui::ScrollState scroll;
+
+    void sync() {
+        const auto& r = request.render;
+        fields[0].set(std::to_string(r.width));
+        fields[1].set(std::to_string(r.height));
+        char fps[32];
+        std::snprintf(fps, sizeof(fps), "%.6g", r.fps);
+        fields[2].set(fps);
+        fields[5].set(std::to_string(int(r.bitrate_mbps)));
+        fields[6].set(std::to_string(r.gif_colors));
+        char threshold[32];
+        std::snprintf(threshold, sizeof(threshold), "%.6g", r.gif_alpha_threshold);
+        fields[7].set(threshold);
+    }
+};
+
 struct SettingsUi {
     bool open = false;
     bool was_open = false;
@@ -2411,6 +2644,10 @@ struct AppState {
         if (scope_is_look()) return doc::look_duration(document, look());
         return doc::sequence_duration(document, sequence());
     }
+    uint32_t scope_trim_in() const { return scope_is_look() ? look().trim_in : sequence().trim_in; }
+    uint32_t scope_trim_out() const { return scope_is_look() ? look().trim_out : sequence().trim_out; }
+    uint32_t scope_loop_in() const { return scope_is_look() ? look().loop_in : sequence().loop_in; }
+    uint32_t scope_loop_out() const { return scope_is_look() ? look().loop_out : sequence().loop_out; }
     double scoped_fps() const {
         const doc::EntityFormat& f =
             scope_is_look() ? look().format : sequence().format;
@@ -2535,6 +2772,7 @@ struct AppState {
     // Name-sorted (op name, signature) pairs snapshotted at startup.
     std::vector<std::pair<std::string, std::string>> op_help;
     SettingsUi settings;
+    ExportUi export_ui;
     bool loop = true;
 
     size_t selected_layer = 0;
@@ -2574,7 +2812,13 @@ struct AppState {
     ui::SliderState split_drag[3];
     // 0 = node, 1 = project, 2 = presets.
     int inspector_tab = 0;
-    ui::ButtonState tab_buttons[4];
+    ui::ButtonState tab_buttons[5];
+    ui::TextField composition_fields[5];
+    ui::TextInputState composition_inputs[5];
+    ui::ButtonState composition_apply;
+    ui::ButtonState composition_resize;
+    uint64_t composition_entity = 0, composition_revision = ~uint64_t{0};
+    std::string composition_error;
     // menu_states: 0 file, 1 edit, 2 view.
     ui::DropdownState menu_states[3];
 
@@ -2749,6 +2993,8 @@ struct AppState {
 
     // Each entry is a full snapshot, so later edits cannot leak into a job.
     struct QueuedExport {
+        media::ExportRequest request;
+        std::shared_ptr<const PreviewHistory> history;
         std::filesystem::path out_path;
         doc::Document doc;
         uint64_t look_id = 0;
@@ -2825,9 +3071,7 @@ struct AppState {
     std::map<std::pair<uint64_t, int>, LaneUiState> lane_ui;
     ui::ButtonState open_button, open_big_button, play_button, undo_button,
         redo_button, export_button, new_look_button;
-    ui::ButtonState export_cancel_button, export_audio_check;
-    ui::SliderState export_bitrate_slider;
-    ui::DropdownState export_scale_dd;
+    ui::ButtonState export_cancel_button;
     // App preference in ui.json.
     bool audio_muted = false;
     float audio_gain = 1.0f;
@@ -3604,6 +3848,10 @@ void sync_sidechain(AppState& app) {
 // App view state in ui.json, never in the project.
 void save_ui_prefs(const AppState& app) {
     json::Value v = json::Value::make_object();
+    auto renders = json::Value::make_object();
+    for (const auto& [name, settings] : app.export_ui.presets)
+        renders.set(name, media::render_settings_json(settings));
+    v.set("render_presets", std::move(renders));
     v.set("theme", ui::theme_name(app.theme_index));
     v.set("tab", static_cast<int64_t>(app.inspector_tab));
     if (app.import_lossless) v.set("lossless_import", true);
@@ -3657,11 +3905,17 @@ void load_ui_prefs(AppState& app) {
     const auto parsed = json::parse(std::string_view(
         reinterpret_cast<const char*>(bytes->data()), bytes->size()));
     if (!parsed.value) return;
+    for (const auto& [name, settings] : parsed.value->get("render_presets").object()) {
+        media::RenderSettings render;
+        std::string error;
+        if (!name.empty() && media::read_render_settings(settings, render, error))
+            app.export_ui.presets[name] = render;
+    }
     for (int i = 0; i < ui::theme_count(); ++i)
         if (parsed.value->get("theme").as_string() == ui::theme_name(i))
             app.theme_index = i;
     app.inspector_tab = std::clamp(
-        static_cast<int>(parsed.value->get("tab").as_int(0)), 0, 3);
+        static_cast<int>(parsed.value->get("tab").as_int(0)), 0, 4);
     app.import_lossless =
         parsed.value->get("lossless_import").as_bool(false);
     auto load_frac = [&](const char* key, float* dst, float lo, float hi) {
@@ -3744,7 +3998,7 @@ std::vector<media::AssetBundle> build_bundle_table(const doc::Document& doc,
                     }
                 } else if (!paths.mez.empty()) {
                     std::filesystem::path open_path = paths.mez;
-                    if (preview && doc.use_proxy) {
+                    if (preview && doc.use_proxy && !media::is_still_image(u8_to_path(asset.path))) {
                         std::filesystem::path proxy = paths.mez;
                         proxy.replace_extension(".proxy.mez");
                         std::error_code ec;
@@ -3761,6 +4015,7 @@ std::vector<media::AssetBundle> build_bundle_table(const doc::Document& doc,
                         bundle.fps = reader.fps();
                         bundle.timescale = reader.timescale();
                         bundle.frame_duration = reader.frame_duration();
+                        bundle.animated = reader.animated();
                     }
                 }
                 // Audio-only bundles have no mez and no native video.
@@ -3790,12 +4045,13 @@ void refresh_bundles(AppState& app) {
             !asset.path.empty() && is_still_source(u8_to_path(asset.path));
         if (asset.frame_count != bundle.frames || asset.fps != bundle.fps ||
             asset.width != bundle.width || asset.height != bundle.height ||
-            asset.still != still) {
+            asset.still != still || asset.animated != bundle.animated) {
             asset.frame_count = bundle.frames;
             asset.fps = bundle.fps;
             asset.width = bundle.width;
             asset.height = bundle.height;
             asset.still = still;
+            asset.animated = bundle.animated;
             doc_changed = true;
         }
         if (!bundle.pcm.empty() && !app.pcm_cache.count(asset.id)) {
@@ -3891,6 +4147,7 @@ const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
             d[0] = sp[0];
             d[1] = sp[1];
             d[2] = sp[2];
+            d[3] = strip.alpha.empty() ? 255 : strip.alpha[size_t(y) * strip.w + x];
         }
 
     // Lane strip: box-filter each kept cell down to the lane height.
@@ -3920,25 +4177,31 @@ const AppState::AssetStrip* ensure_asset_strip(AppState& app, uint64_t id) {
                 const uint32_t sx0 = x * strip.w / lw;
                 const uint32_t sx1 =
                     std::max(sx0 + 1, (x + 1) * strip.w / lw);
-                float rs = 0.0f, gs = 0.0f, bs = 0.0f;
+                float rs = 0.0f, gs = 0.0f, bs = 0.0f, coverage = 0.0f;
                 uint32_t n = 0;
                 for (uint32_t sy = sy0; sy < sy1; ++sy)
                     for (uint32_t sx = sx0; sx < sx1; ++sx) {
                         const uint8_t* sp =
                             src +
                             (static_cast<size_t>(sy) * strip.w + sx) * 3;
-                        rs += linear[sp[0]];
-                        gs += linear[sp[1]];
-                        bs += linear[sp[2]];
+                        const float alpha = strip.alpha.empty() ? 1.0f : strip.alpha[
+                            size_t(std::min(t * step, strip.count - 1)) * strip.w * strip.h +
+                            size_t(sy) * strip.w + sx] / 255.0f;
+                        rs += linear[sp[0]] * alpha;
+                        gs += linear[sp[1]] * alpha;
+                        bs += linear[sp[2]] * alpha;
+                        coverage += alpha;
                         ++n;
                     }
                 uint8_t* d = app.strip_stage_rgba.data() +
                              (static_cast<size_t>(y) * lw * lcount +
                               t * lw + x) *
                                  4;
-                d[0] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(rs / n) * 255.0f + 0.5f, 0.0f, 255.0f));
-                d[1] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(gs / n) * 255.0f + 0.5f, 0.0f, 255.0f));
-                d[2] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(bs / n) * 255.0f + 0.5f, 0.0f, 255.0f));
+                const float weight = std::max(coverage, 1e-12f);
+                d[0] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(rs / weight) * 255.0f + 0.5f, 0.0f, 255.0f));
+                d[1] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(gs / weight) * 255.0f + 0.5f, 0.0f, 255.0f));
+                d[2] = static_cast<uint8_t>(std::clamp(color::srgb_oetf(bs / weight) * 255.0f + 0.5f, 0.0f, 255.0f));
+                d[3] = static_cast<uint8_t>(std::clamp(coverage / n * 255.0f + 0.5f, 0.0f, 255.0f));
             }
         }
     }
@@ -5549,6 +5812,12 @@ struct FxRowActions {
 };
 
 struct FrameUi {
+    struct ExportActions {
+        int format = -1, source = -1, preset = -1;
+        bool close = false, submit = false, browse = false, save = false, remove = false;
+    } export_actions;
+    bool* export_actions_loop = nullptr;
+    bool* export_actions_loop_changed = nullptr;
     std::vector<ParamStage> params;
     std::vector<FxRowActions> rows;
     bool* add_clicked[static_cast<size_t>(doc::EffectType::Count)] = {};
@@ -5575,12 +5844,6 @@ struct FrameUi {
     std::vector<RecentRow> recent_rows;
     bool* cache_open_clicked = nullptr;
     bool* cache_clear_clicked = nullptr;
-    float* export_bitrate_staged = nullptr;
-    bool* export_bitrate_changed = nullptr;
-    bool* export_bitrate_released = nullptr;
-    int* export_scale_selected = nullptr;
-    bool* export_audio_staged = nullptr;
-    bool* export_audio_changed = nullptr;
 
     struct RouteRow {
         uint64_t id;
@@ -5960,6 +6223,7 @@ struct FrameUi {
     };
     std::vector<LaneCtx> lane_ctxs;
     bool* ruler_ctx = nullptr;
+    bool region_started = false;
     float* ruler_ctx_frame = nullptr;
     struct ParamCtx {
         doc::ParamKey key;
@@ -6013,6 +6277,7 @@ enum CtxItemAct : int {
     kActLoopInHere,
     kActLoopOutHere,
     kActClearLoop,
+    kActClearTrim,
     kActTrimInHere,
     kActTrimOutHere,
     kActKeyHere,
@@ -7979,12 +8244,12 @@ ui::LayoutNode* build_block_panel(ui::LayoutArena& arena, AppState& app,
     // The document unit is a canvas fraction. The readouts show px from
     // the top left, and percent for scale and opacity.
     uint32_t cw = 0, chh = 0;
-    doc::canvas_size(app.document, &cw, &chh);
+    doc::canvas_size(app.document, app.scope_look, &cw, &chh);
     row("x", &px.staged->pos_x, -1.0f, 1.0f, "%.0f px",
         static_cast<float>(cw), static_cast<float>(cw) * 0.5f);
     row("y", &px.staged->pos_y, -1.0f, 1.0f, "%.0f px",
         static_cast<float>(chh), static_cast<float>(chh) * 0.5f);
-    row("scale", &px.staged->scale, 0.02f, 8.0f, "%.0f%%", 100.0f);
+    row("scale", &px.staged->scale, 0.01f, 10.0f, "%.0f%%", 100.0f);
     row("rotation", &px.staged->rotate, -360.0f, 360.0f, "%.0f deg");
     row("opacity", &px.staged->opacity, 0.0f, 1.0f, "%.0f%%", 100.0f);
     // The pivot is in block-local canvas fractions.
@@ -8310,6 +8575,7 @@ void hit_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
 void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
     auto* u = static_cast<RulerUser*>(node.user);
     const ui::Rect& r = node.rect;
+    ui::probe_add("timeline-ruler", r);
     const ui::Theme& theme = frame.theme;
     frame.canvas.draw_sdf_rect(r, 2.0f, theme.control_bg_active);
 
@@ -8429,6 +8695,7 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         pick.add_inside(my <= r.y + band_h + 2.0f, 1, 4);
         pick.add_inside(true, 0, 1);
         state.drag_mode = static_cast<uint8_t>(pick.best());
+        u->out->region_started = state.drag_mode >= 2;
         if (state.drag_mode == 4) {
             state.loop_anchor = mouse_frame();
         } else if (state.drag_mode == 1) {
@@ -8436,7 +8703,7 @@ void draw_ruler(ui::LayoutNode& node, ui::LayoutFrame& frame) {
             state.scrub_moved = false;
         }
     }
-    if (g.right_clicked && !u->app->scope_is_look() && u->out->ruler_ctx) {
+    if (g.right_clicked && u->out->ruler_ctx) {
         *u->out->ruler_ctx = true;
         *u->out->ruler_ctx_frame = static_cast<float>(mouse_frame());
     }
@@ -12560,7 +12827,7 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                          "%.2f");
             layer_slider(LF::CropB, "crop b", 0.0f, 0.45f, layer.crop_b,
                          "%.2f");
-            layer_slider(LF::XfScale, "scale", 0.25f, 4.0f, layer.xf_scale,
+            layer_slider(LF::XfScale, "scale", 0.01f, 10.0f, layer.xf_scale,
                          "%.2f x");
             layer_slider(LF::Rotate, "rotate", -180.0f, 180.0f,
                          layer.xf_rotate, "%.0f deg");
@@ -13295,6 +13562,10 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         std::snprintf(line, sizeof(line), "exporting %s %u%%",
                       path_to_u8(app.export_job->out_path.filename()).c_str(),
                       total ? done * 100 / total : 0);
+        const uint32_t history_total = app.export_job->progress.history_total.load();
+        const uint32_t history_done = app.export_job->progress.history_done.load();
+        if (history_done < history_total)
+            std::snprintf(line, sizeof(line), "rendering preview history %u/%u", history_done, history_total);
         out.export_cancel_clicked = arena.alloc<bool>();
         ButtonOpts cancel_opts;
         cancel_opts.width = SizeSpec::fixed(56);
@@ -13307,38 +13578,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         rows.push_back(pstack);
     }
     if (has_media_file) {
-        out.export_bitrate_staged = arena.alloc<float>();
-        *out.export_bitrate_staged = app.document.export_bitrate_mbps;
-        out.export_bitrate_changed = arena.alloc<bool>();
-        out.export_bitrate_released = arena.alloc<bool>();
-        SliderOpts bopts;
-        bopts.format = "%.0f mbps";
-        bopts.out_changed = out.export_bitrate_changed;
-        bopts.out_released = out.export_bitrate_released;
-        rows.push_back(value_row(
-            arena, "bitrate",
-            SliderF(arena, out.export_bitrate_staged, 1.0f, 60.0f,
-                    &app.export_bitrate_slider, bopts)));
-        static const char* kExportScaleItems[] = {"full size", "half",
-                                                  "quarter"};
-        const int scale_current = app.document.export_scale >= 4   ? 2
-                                  : app.document.export_scale == 2 ? 1
-                                                                   : 0;
-        out.export_scale_selected = arena.alloc<int>();
-        *out.export_scale_selected = -1;
-        rows.push_back(value_row(
-            arena, "size",
-            Dropdown(arena, kExportScaleItems, 3, scale_current,
-                     &app.export_scale_dd, out.export_scale_selected,
-                     SizeSpec::fill(),
-                     "output resolution: source / half / quarter")));
-        out.export_audio_staged = arena.alloc<bool>();
-        *out.export_audio_staged = app.document.export_audio;
-        out.export_audio_changed = arena.alloc<bool>();
-        rows.push_back(Checkbox(arena, "export audio",
-                                out.export_audio_staged,
-                                &app.export_audio_check,
-                                out.export_audio_changed));
         out.export_clicked = arena.alloc<bool>();
         rows.push_back(Button(arena,
                               app.export_job ? "export (queue)..."
@@ -13912,20 +14151,20 @@ void mark_next(AppState& a, KeyIntents& k) {
 }
 
 void set_in(AppState& a, KeyIntents& k) {
-    if (!a.has_timeline() || a.scope_is_look()) return;
+    if (!a.has_timeline()) return;
     const uint32_t ph = a.player.current_frame_index();
     const uint32_t fc = a.player.frame_count();
     const uint32_t cur_out =
-        a.sequence().trim_out ? a.sequence().trim_out : fc;
+        a.scope_trim_out() ? a.scope_trim_out() : a.scope_duration() ? a.scope_duration() : fc;
     k.key_trim_in =
         static_cast<float>(std::min(ph, cur_out ? cur_out - 1 : 0u));
 }
 
 void set_out(AppState& a, KeyIntents& k) {
-    if (!a.has_timeline() || a.scope_is_look()) return;
+    if (!a.has_timeline()) return;
     const uint32_t ph = a.player.current_frame_index();
     const uint32_t fc = a.player.frame_count();
-    const uint32_t cur_in = a.sequence().trim_in;
+    const uint32_t cur_in = a.scope_trim_in();
     k.key_trim_out =
         static_cast<float>(std::max(std::min(ph + 1, fc), cur_in + 1));
 }
@@ -14309,7 +14548,7 @@ std::string macro_step_source(const std::string& step) {
 
 void pump_action_queue(AppState& app, KeyIntents& ki) {
     if (app.action_queue.empty()) return;
-    if (app.confirm.open() || app.settings.open) return;
+    if (app.confirm.open() || app.settings.open || app.export_ui.open) return;
     const std::string id = app.action_queue.front();
     app.action_queue.pop_front();
     if (!run_action_id(app, ki, id)) app.status = "unknown action " + id;
@@ -14591,16 +14830,12 @@ ui::LayoutNode* build_timeline(ui::LayoutArena& arena, AppState& app,
     ruler_user->v0 = v0;
     ruler_user->v1 = v1;
     const bool seq_scope = !app.scope_is_look();
-    ruler_user->trim_in = seq_scope
-        ? std::min(app.sequence().trim_in,
-                   frame_count ? frame_count - 1 : 0u)
-        : 0u;
+    ruler_user->trim_in = std::min(app.scope_trim_in(), frame_count ? frame_count - 1 : 0u);
     ruler_user->trim_out =
-        seq_scope && app.sequence().trim_out
-            ? std::min(app.sequence().trim_out, frame_count)
-            : frame_count;
-    ruler_user->loop_in = seq_scope ? app.sequence().loop_in : 0u;
-    ruler_user->loop_out = seq_scope ? app.sequence().loop_out : 0u;
+        app.scope_trim_out() ? std::min(app.scope_trim_out(), frame_count)
+            : app.scope_duration() ? app.scope_duration() : frame_count;
+    ruler_user->loop_in = app.scope_loop_in();
+    ruler_user->loop_out = app.scope_loop_out();
     // The lane builds below add their block edges to this same list.
     app.tl_snap_edges.clear();
     app.tl_snap_edges.push_back({0.0, 0, 0});
@@ -15725,18 +15960,28 @@ bool try_import_preset_file(AppState& app, const std::filesystem::path& p) {
 void begin_or_queue_export(AppState& app, gfx::Device& device,
                            const std::filesystem::path& shader_dir,
                            const std::filesystem::path& out,
-                           const std::filesystem::path& scope_pcm) {
+                           const std::filesystem::path& scope_pcm,
+                           media::ExportRequest request = {}) {
+    if (!request.source) request.source = app.scope_look;
+    std::shared_ptr<const PreviewHistory> history;
+    if (request.render.format == media::RenderFormat::PngFrame && app.render_worker) {
+        app.render_worker->pause();
+        history = app.render_worker->history_snapshot();
+        app.render_worker->resume();
+    }
     if (!app.export_job) {
         app.export_job = start_export(
             device, shader_dir, build_bundle_table(app.document, false),
-            app.pcm_cache, scope_pcm, app.document, app.scope_look,
+            app.pcm_cache, scope_pcm, app.document, request.source,
             app.has_analysis ? &app.analysis : nullptr, app.node_audio_map,
-            app.node_camera_map, app.pin_plane_map, out);
+            app.node_camera_map, app.pin_plane_map, out, request, history);
     } else {
         AppState::QueuedExport q;
+        q.request = request;
+        q.history = history;
         q.out_path = out;
         q.doc = app.document;
-        q.look_id = app.scope_look;
+        q.look_id = request.source;
         q.has_analysis = app.has_analysis;
         if (app.has_analysis) q.analysis = app.analysis;
         q.node_audio = app.node_audio_map;
@@ -15747,6 +15992,29 @@ void begin_or_queue_export(AppState& app, gfx::Device& device,
         q.scope_pcm = scope_pcm;
         app.export_queue.push_back(std::move(q));
     }
+}
+
+void open_export(AppState& app);
+
+json::Value script_settings(const script::Value& value) {
+    auto out = json::Value::make_object();
+    if (value.map) for (const auto& [key, item] : *value.map) {
+        if (item.is_num()) out.set(key, item.num);
+        else if (item.is_str()) out.set(key, item.as_str());
+        else if (item.kind == script::Value::Kind::Bool) out.set(key, item.b);
+    }
+    return out;
+}
+
+script::Value settings_value(const media::RenderSettings& settings) {
+    auto out = script::Value::make_map();
+    const auto json = media::render_settings_json(settings);
+    for (const auto& [key, value] : json.object()) {
+        if (value.is_number()) (*out.map)[key] = script::Value::number(value.as_number());
+        else if (value.is_bool()) (*out.map)[key] = script::Value::boolean(value.as_bool());
+        else (*out.map)[key] = script::Value::string(value.as_string());
+    }
+    return out;
 }
 
 void register_ops_app(ScriptHost& sh) {
@@ -15944,6 +16212,116 @@ void register_ops_app(ScriptHost& sh) {
                 save_project(*sh.app, p);
                 return Value::boolean(true);
             });
+    env.add("export_popup", "export_popup() - open export settings", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                open_export(*sh.app);
+                return Value::nil();
+            });
+    env.add("preview_matches", "preview_matches(png_path, tolerance?) -> published pixels match PNG", 1, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                ImageRgba expected;
+                std::string error;
+                if (!load_image(u8_to_path(a[0].as_str()), &expected, &error)) return op_err(vm, error);
+                const double tolerance = a.size() > 1 && a[1].is_num() ? a[1].num : 1;
+                if (!sh.worker) return op_err(vm, "preview worker is unavailable");
+                sh.worker->pause();
+                struct Resume { RenderWorker* worker; ~Resume() { worker->resume(); } } resume{sh.worker};
+                const auto view = sh.worker->acquire(sh.app->ui_frame_counter);
+                if (!view.final_img) return op_err(vm, "preview has no image");
+                if (view.final_img->width() != expected.width || view.final_img->height() != expected.height)
+                    return op_err(vm, "PNG and published preview dimensions differ");
+                auto reader = gfx::RgbaReadback::create(sh.renderer->device());
+                std::vector<uint8_t> pixels;
+                if (!reader || !reader->read(*view.final_img, pixels)) return op_err(vm, "preview readback failed");
+                int maximum = 0;
+                for (size_t i = 0; i < pixels.size(); ++i)
+                    maximum = std::max(maximum, std::abs(int(pixels[i]) - int(expected.pixels[i])));
+                sh.log("preview pixel difference: " + std::to_string(maximum));
+                return Value::boolean(maximum <= tolerance);
+            });
+    env.add("render_settings", "render_settings(map?) -> current render settings", 0, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                auto& s = sh.app->export_ui;
+                if (!a.empty()) {
+                    std::string error;
+                    if (!a[0].map || !media::read_render_settings(script_settings(a[0]), s.request.render, error))
+                        return op_err(vm, error.empty() ? "expected a settings map" : error);
+                    s.sync();
+                }
+                return settings_value(s.request.render);
+            });
+    env.add("render_presets", "render_presets() -> application render presets", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                auto out = Value::make_map();
+                for (const auto& [name, settings] : sh.app->export_ui.presets)
+                    (*out.map)[name] = settings_value(settings);
+                return out;
+            });
+    env.add("save_render_preset", "save_render_preset(name) - save render settings only", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str() || a[0].as_str().empty()) return op_err(vm, "preset name is empty");
+                auto& s = sh.app->export_ui;
+                s.presets[a[0].as_str()] = s.request.render;
+                s.selected_preset = a[0].as_str();
+                save_ui_prefs(*sh.app);
+                return Value::boolean(true);
+            });
+    env.add("use_render_preset", "use_render_preset(name) - keep job source, range and path", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                auto& s = sh.app->export_ui;
+                const auto it = s.presets.find(a[0].as_str());
+                if (it == s.presets.end()) return op_err(vm, "render preset not found");
+                s.request.render = it->second;
+                s.selected_preset = it->first;
+                s.sync();
+                return Value::boolean(true);
+            });
+    env.add("remove_render_preset", "remove_render_preset(name)", 1, 1,
+            [&sh](Vm&, std::vector<Value>& a) {
+                const bool removed = sh.app->export_ui.presets.erase(a[0].as_str()) != 0;
+                save_ui_prefs(*sh.app);
+                return Value::boolean(removed);
+            });
+    env.add("export_file", "export_file(path, options?) - queue MP4, GIF, PNG frame or sequence", 1, 2,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                if (!a[0].is_str()) return op_err(vm, "expected output path");
+                auto& app = *sh.app;
+                media::ExportRequest request;
+                request.render = app.export_ui.request.render;
+                request.source = app.scope_look;
+                if (a.size() > 1) {
+                    if (!a[1].map) return op_err(vm, "expected export options map");
+                    const auto options = script_settings(a[1]);
+                    std::string error;
+                    if (!media::read_render_settings(options, request.render, error)) return op_err(vm, error);
+                    for (const char* key : {"source", "first", "last"}) {
+                        if (!options.find(key)) continue;
+                        const double n = options.get(key).as_number(-1);
+                        if (!std::isfinite(n) || n < 0 || n > UINT32_MAX || n != std::floor(n))
+                            return op_err(vm, std::string("invalid ") + key);
+                    }
+                    request.source = uint64_t(options.get("source").as_number(double(request.source)));
+                    request.first = uint32_t(options.get("first").as_number(0));
+                    request.last = uint32_t(options.get("last").as_number(0));
+                    request.range_override = options.find("first") || options.find("last");
+                    request.overwrite = options.get("overwrite").as_bool(false);
+                }
+                const auto* look = app.document.find_look(request.source);
+                const auto* seq = app.document.find_sequence(request.source);
+                if (!look && !seq) return op_err(vm, "export source does not exist");
+                if (request.render.format == media::RenderFormat::PngFrame) {
+                    if (!request.range_override) request.first = app.player.current_frame_index();
+                    request.last = request.first + 1;
+                    request.range_override = true;
+                } else if (request.range_override && !request.last)
+                    request.last = look ? doc::look_duration(app.document, *look) : doc::sequence_duration(app.document, *seq);
+                auto path = u8_to_path(a[0].as_str());
+                const auto f = request.render.format;
+                path.replace_extension(f == media::RenderFormat::Mp4 ? ".mp4" : f == media::RenderFormat::Gif ? ".gif" : ".png");
+                const auto scope_pcm = app.document.sidechain_mux && app.sc_ok ? app.sc_pcm_path : std::filesystem::path();
+                begin_or_queue_export(app, sh.renderer->device(), *sh.shader_dir, path, scope_pcm, request);
+                return Value::boolean(true);
+            });
     env.add("export_mp4",
             "export_mp4(path) - the scoped entity; wait_export() joins it",
             1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
@@ -15958,8 +16336,11 @@ void register_ops_app(ScriptHost& sh) {
                     app.document.sidechain_mux && app.sc_ok
                         ? app.sc_pcm_path
                         : std::filesystem::path();
+                media::ExportRequest request;
+                request.render = app.export_ui.request.render;
+                request.render.format = media::RenderFormat::Mp4;
                 begin_or_queue_export(app, sh.renderer->device(),
-                                      *sh.shader_dir, out, scope_pcm);
+                                      *sh.shader_dir, out, scope_pcm, request);
                 return Value::boolean(true);
             });
 
@@ -16008,7 +16389,7 @@ void register_ops_app(ScriptHost& sh) {
                 return Value::number(static_cast<double>(
                     sh.app->player.frame_count()));
             });
-    env.add("fps", "fps() -> project rate", 0, 0,
+    env.add("fps", "fps() -> current scope rate", 0, 0,
             [&sh](Vm&, std::vector<Value>&) {
                 return Value::number(sh.app->player.fps());
             });
@@ -16619,6 +17000,7 @@ void register_ops_entities(ScriptHost& sh) {
                 map_num(m, "h", as->height);
                 map_num(m, "bin", static_cast<double>(as->bin));
                 map_num(m, "still", as->still_duration_frames);
+                (*m.map)["animated"] = Value::boolean(as->animated);
                 return m;
             });
     env.add("asset_look",
@@ -18734,11 +19116,13 @@ void register_ops_sequence(ScriptHost& sh) {
                     p ? static_cast<double>(p->target) : 0.0);
             });
     env.add("set_region",
-            "set_region(seq, trim_in, trim_out, loop_in?, loop_out?) - 0 "
+            "set_region(entity, trim_in, trim_out, loop_in?, loop_out?) - 0 "
             "= full / off",
             3, 5, [&sh](Vm& vm, std::vector<Value>& a) {
-                doc::Sequence* s = arg_seq(sh, vm, a[0]);
-                if (!s) return Value::nil();
+                const uint64_t id = a[0].as_id();
+                const bool look = sh.app->document.find_look(id) != nullptr;
+                if (!look && !sh.app->document.find_sequence(id))
+                    return op_err(vm, "expected a look or sequence");
                 double ti = 0.0, to = 0.0, li = 0.0, lo = 0.0;
                 if (!arg_num(vm, a[1], "trim_in", &ti) ||
                     !arg_num(vm, a[2], "trim_out", &to))
@@ -18747,12 +19131,36 @@ void register_ops_sequence(ScriptHost& sh) {
                 if (a.size() > 4) lo = a[4].is_num() ? a[4].num : 0.0;
                 sh.app->undo.execute(
                     sh.app->document,
-                    doc::set_timeline_region_command(
-                        s->id, static_cast<uint32_t>(std::max(0.0, ti)),
+                    (look ? doc::set_look_region_command : doc::set_timeline_region_command)(
+                        id, static_cast<uint32_t>(std::max(0.0, ti)),
                         static_cast<uint32_t>(std::max(0.0, to)),
                         static_cast<uint32_t>(std::max(0.0, li)),
                         static_cast<uint32_t>(std::max(0.0, lo))));
                 return Value::boolean(true);
+            });
+    env.add("region", "region(entity) -> trim_in, trim_out, loop_in, loop_out", 1, 1,
+            [&sh](Vm& vm, std::vector<Value>& a) {
+                auto out = Value::make_map();
+                auto read = [&](const auto& entity) {
+                    (*out.map)["trim_in"] = Value::number(entity.trim_in);
+                    (*out.map)["trim_out"] = Value::number(entity.trim_out);
+                    (*out.map)["loop_in"] = Value::number(entity.loop_in);
+                    (*out.map)["loop_out"] = Value::number(entity.loop_out);
+                };
+                const auto& d = sh.app->document;
+                if (const auto* l = d.find_look(a[0].as_id())) read(*l);
+                else if (const auto* s = d.find_sequence(a[0].as_id())) read(*s);
+                else return op_err(vm, "expected a look or sequence");
+                return out;
+            });
+    env.add("timeline_view", "timeline_view() -> first, last, trim_in, trim_out", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                auto out = Value::make_map();
+                (*out.map)["first"] = Value::number(sh.app->tl_v0);
+                (*out.map)["last"] = Value::number(sh.app->tl_v1);
+                (*out.map)["trim_in"] = Value::number(sh.app->player.trim_in());
+                (*out.map)["trim_out"] = Value::number(sh.app->player.trim_out());
+                return out;
             });
     env.add("markers", "markers(seq) -> frame list", 1, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
@@ -18804,15 +19212,79 @@ void register_ops_sequence(ScriptHost& sh) {
                 if (!arg_num(vm, a[1], "fps", &fps)) return Value::nil();
                 if (a.size() > 2 && a[2].is_num()) w = a[2].num;
                 if (a.size() > 3 && a[3].is_num()) h = a[3].num;
-                doc::EntityFormat f;
-                f.fps = std::max(0.0, fps);
-                f.w = static_cast<uint32_t>(std::max(0.0, w));
-                f.h = static_cast<uint32_t>(std::max(0.0, h));
+                if (!std::isfinite(fps) || fps < 0.0 ||
+                    !std::isfinite(w) || !std::isfinite(h) ||
+                    w < 0 || h < 0 || w > UINT32_MAX || h > UINT32_MAX ||
+                    w != std::floor(w) || h != std::floor(h))
+                    return op_err(vm, "invalid composition format");
+                doc::EntityFormat f = doc::entity_format(sh.app->document, id);
+                f.fps = fps;
+                if (a.size() > 2) {
+                    if (a.size() != 4) return op_err(vm, "width and height are required together");
+                    f = doc::resize_format(sh.app->document, id,
+                        static_cast<uint32_t>(w), static_cast<uint32_t>(h), false);
+                    f.fps = fps;
+                }
+                if (!doc::valid_format(f)) return op_err(vm, "invalid composition format");
                 sh.app->undo.execute(
                     sh.app->document,
                     doc::set_entity_format_command(id, f));
                 return Value::boolean(true);
             });
+    env.add("entity_format", "entity_format(id) -> {w,h,fps,content_w,content_h,x,y,scale_x,scale_y,inherit_size,inherit_fps}",
+            1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                const auto& d = sh.app->document;
+                if (!d.find_look(id) && !d.find_sequence(id))
+                    return op_err(vm, "no look or sequence with that id");
+                const auto f = doc::entity_format(d, id);
+                uint32_t w = 0, h = 0;
+                doc::canvas_size(d, id, &w, &h);
+                Value out = Value::make_map();
+                map_num(out, "w", w);
+                map_num(out, "h", h);
+                map_num(out, "fps", doc::entity_fps(d, id));
+                double content_w = 0, content_h = 0;
+                doc::content_size(d, id, &content_w, &content_h);
+                map_num(out, "content_w", content_w);
+                map_num(out, "content_h", content_h);
+                map_num(out, "scale_x", f.scale_x);
+                map_num(out, "scale_y", f.scale_y);
+                map_num(out, "x", f.origin_x);
+                map_num(out, "y", f.origin_y);
+                (*out.map)["inherit_size"] = Value::boolean(!doc::format_has_canvas(f));
+                (*out.map)["inherit_fps"] = Value::boolean(!doc::format_has_fps(f));
+                return out;
+            });
+    for (const char* operation : {"canvas_size", "resize_composition", "crop_canvas"}) {
+        const bool crop = std::strcmp(operation, "crop_canvas") == 0;
+        const bool scale = std::strcmp(operation, "resize_composition") == 0;
+        env.add(operation, crop ? "crop_canvas(id, x, y, w, h) - relative to the current canvas"
+            : (scale ? "resize_composition(id, w, h) - scale canvas and content"
+                     : "canvas_size(id, w, h) - change the boundary about its centre"),
+            crop ? 5 : 3, crop ? 5 : 3,
+            [&sh, crop, scale](Vm& vm, std::vector<Value>& a) {
+                const uint64_t id = a[0].as_id();
+                const auto& d = sh.app->document;
+                if (!d.find_look(id) && !d.find_sequence(id))
+                    return op_err(vm, "no look or sequence with that id");
+                for (size_t i = 1; i < a.size(); ++i)
+                    if (!a[i].is_num() || !std::isfinite(a[i].num))
+                        return op_err(vm, "canvas fields must be finite numbers");
+                const double w = a[crop ? 3 : 1].num, h = a[crop ? 4 : 2].num;
+                if (w < 1 || h < 1 || w > UINT32_MAX || h > UINT32_MAX ||
+                    w != std::floor(w) || h != std::floor(h))
+                    return op_err(vm, "canvas dimensions must be positive integers");
+                auto f = doc::resize_format(d, id, uint32_t(w), uint32_t(h), scale);
+                if (crop) {
+                    const auto old = doc::entity_format(d, id);
+                    f.origin_x = old.origin_x + a[1].num;
+                    f.origin_y = old.origin_y + a[2].num;
+                }
+                sh.app->undo.execute(sh.app->document, doc::set_entity_format_command(id, f));
+                return Value::boolean(true);
+            });
+    }
     env.add("set_speed",
             "set_speed(speed, mode?) - 0 forward, 1 reverse, 2 ping-pong",
             1, 2, [&sh](Vm& vm, std::vector<Value>& a) {
@@ -18828,21 +19300,6 @@ void register_ops_sequence(ScriptHost& sh) {
                         std::clamp(static_cast<float>(sp), 0.0f,
                                    doc::kMaxSpeed),
                         mode));
-                return Value::boolean(true);
-            });
-    env.add("set_export_config",
-            "set_export_config(bitrate_mbps, scale 1|2|4, audio)", 3, 3,
-            [&sh](Vm& vm, std::vector<Value>& a) {
-                double br = 8.0;
-                if (!arg_num(vm, a[0], "bitrate", &br))
-                    return Value::nil();
-                const uint32_t sc = static_cast<uint32_t>(a[1].as_id());
-                if (sc != 1 && sc != 2 && sc != 4)
-                    return op_err(vm, "scale is 1, 2 or 4");
-                sh.app->undo.execute(sh.app->document,
-                                     doc::set_export_config_command(
-                                         static_cast<float>(br), sc,
-                                         a[2].truthy()));
                 return Value::boolean(true);
             });
     env.add("set_audio_config",
@@ -19240,6 +19697,220 @@ void settings_hit(AppState& app, const std::string& hit, ui::Context& ctx,
     if (starts("complete:"))
         settings_apply_completion(
             app, static_cast<size_t>(std::atoi(rest("complete:").c_str())));
+}
+
+namespace {
+void open_export(AppState& app) {
+    auto& s = app.export_ui;
+    s.open = true;
+    s.preset_naming = false;
+    s.error.clear();
+    s.request.source = app.scope_look;
+    s.request.range_override = true;
+    s.request.overwrite = false;
+    const auto* look = app.document.find_look(s.request.source);
+    const auto* seq = app.document.find_sequence(s.request.source);
+    const uint32_t total = look ? doc::look_duration(app.document, *look)
+        : seq ? doc::sequence_duration(app.document, *seq) : 0;
+    s.request.first = s.request.render.format == media::RenderFormat::PngFrame
+        ? app.player.current_frame_index() : app.scope_trim_in();
+    s.request.last = s.request.render.format == media::RenderFormat::PngFrame
+        ? s.request.first + 1 : app.scope_trim_out() ? std::min(app.scope_trim_out(), total) : total;
+    s.fields[3].set(std::to_string(s.request.first));
+    s.fields[4].set(std::to_string(s.request.last));
+    std::string name = look ? look->name : seq ? seq->name : "export";
+    for (char& c : name) if (std::string("<>:\"/\\|?*").find(c) != std::string::npos) c = '_';
+    s.fields[8].set(name.empty() ? "export" : name);
+    if (s.fields[9].buf.empty()) s.fields[9].set(path_to_u8(app.project_path.empty()
+        ? std::filesystem::current_path() : app.project_path.parent_path()));
+    s.sync();
+}
+}
+
+bool read_export_fields(ExportUi& s, bool job) {
+    s.error.clear();
+    auto v = media::render_settings_json(s.request.render);
+    const char* keys[] = {"width", "height", "fps", "", "", "bitrate", "colors", "alpha_threshold"};
+    for (int i : {0, 1, 2, 5, 6, 7}) {
+        char* end = nullptr;
+        const double n = std::strtod(s.fields[i].buf.c_str(), &end);
+        if (!end || end == s.fields[i].buf.c_str() || *end || !std::isfinite(n)) {
+            s.error = std::string("invalid ") + keys[i];
+            return false;
+        }
+        v.set(keys[i], n);
+    }
+    if (!media::read_render_settings(v, s.request.render, s.error)) return false;
+    if (!job) return true;
+    uint32_t* targets[] = {&s.request.first, &s.request.last};
+    for (int i = 0; i < 2; ++i) {
+        if (i && s.request.render.format == media::RenderFormat::PngFrame) {
+            s.request.last = s.request.first + 1;
+            break;
+        }
+        char* end = nullptr;
+        const double n = std::strtod(s.fields[3 + i].buf.c_str(), &end);
+        if (!end || end == s.fields[3 + i].buf.c_str() || *end || !std::isfinite(n) ||
+            n < 0 || n >= UINT32_MAX || n != std::floor(n)) {
+            s.error = "range requires whole source frames";
+            return false;
+        }
+        *targets[i] = uint32_t(n);
+    }
+    if (s.fields[8].buf.empty() || s.fields[8].buf.find_first_of("<>:\"/\\|?*") != std::string::npos ||
+        s.fields[8].buf == "." || s.fields[8].buf == ".." || s.fields[9].buf.empty()) {
+        s.error = "set a valid filename and location";
+        return false;
+    }
+    return true;
+}
+
+ui::LayoutNode* build_export(ui::LayoutArena& arena, AppState& app, FrameUi& out,
+                             const ui::Rect& viewport) {
+    using namespace ui;
+    auto& s = app.export_ui;
+    if (!s.open) return nullptr;
+    auto& actions = out.export_actions;
+    StackOpts col;
+    col.gap = 8;
+    col.width = SizeSpec::fill();
+    std::vector<LayoutNode*> rows;
+    auto row = [&](const char* label, LayoutNode* control) {
+        LabelOpts label_opts;
+        label_opts.color = active_theme().text_dim;
+        StackOpts opts;
+        opts.gap = 12;
+        opts.width = SizeSpec::fill();
+        opts.cross_align = AlignMode::Center;
+        control->width = SizeSpec::fill();
+        return HStack(arena, opts, {SizedBox(arena, SizeSpec::fixed(166), SizeSpec{},
+            Label(arena, label, label_opts)), control});
+    };
+    auto field = [&](const char* label, int index, const char* probe) {
+        TextInputOpts opts;
+        opts.probe = probe;
+        rows.push_back(row(label, TextInput(arena, &s.fields[index], &s.inputs[index], opts)));
+    };
+    field("filename", 8, "export-name");
+    TextInputOpts path_opts;
+    path_opts.probe = "export-location";
+    path_opts.width = SizeSpec::fill();
+    ButtonOpts bo;
+    bo.width = SizeSpec::fixed(active_theme().control_height * 2 + col.gap);
+    bo.probe = "export-browse";
+    rows.push_back(row("location", HStack(arena, col, {
+        TextInput(arena, &s.fields[9], &s.inputs[9], path_opts),
+        Button(arena, "browse", &s.buttons[3], &actions.browse, bo)})));
+    const int pn = int(s.presets.size());
+    auto** presets = arena.alloc<const char*>(pn + 1);
+    presets[0] = "custom settings";
+    int pi = 1, current = 0;
+    for (const auto& [name, render] : s.presets) {
+        presets[pi] = arena.dup(name.c_str(), name.size());
+        if (name == s.selected_preset) current = pi;
+        ++pi;
+    }
+    bo.probe = "export-preset-save";
+    bo.width = SizeSpec::fixed(active_theme().control_height);
+    bo.framed = true;
+    bo.tooltip = "save render preset";
+    auto* save = IconButton(arena, Icon::Save, &s.buttons[5], &actions.save, bo);
+    bo.probe = "export-preset-remove";
+    bo.tooltip = "remove render preset";
+    bo.disabled = s.selected_preset.empty();
+    rows.push_back(row("render preset", HStack(arena, col, {
+        Dropdown(arena, presets, pn + 1, current, &s.preset_dd, &actions.preset, SizeSpec::fill()),
+        save, IconButton(arena, Icon::Close, &s.buttons[6], &actions.remove, bo)})));
+    if (s.preset_naming) {
+        TextInputOpts opts;
+        opts.probe = "export-preset-name";
+        opts.out_commit = &actions.save;
+        rows.push_back(row("preset name", TextInput(arena, &s.fields[10], &s.inputs[10], opts)));
+    }
+    rows.push_back(Separator(arena));
+    rows.push_back(Heading(arena, "video"));
+    static const char* formats[] = {"MP4 video", "GIF animation", "PNG frame", "PNG sequence"};
+    rows.push_back(row("format", Dropdown(arena, formats, 4,
+        int(s.request.render.format), &s.format_dd, &actions.format, SizeSpec::fill())));
+    const size_t count = app.document.looks.size() + app.document.sequences.size();
+    auto** sources = arena.alloc<const char*>(count);
+    int selected = -1, i = 0;
+    for (const auto& seq : app.document.sequences) {
+        const auto text = "Sequence: " + seq.name;
+        sources[i] = arena.dup(text.c_str(), text.size());
+        if (seq.id == s.request.source) selected = i;
+        ++i;
+    }
+    for (const auto& look : app.document.looks) {
+        const auto text = "Look: " + look.name;
+        sources[i] = arena.dup(text.c_str(), text.size());
+        if (look.id == s.request.source) selected = i;
+        ++i;
+    }
+    rows.push_back(row("source", Dropdown(arena, sources, int(count), selected,
+        &s.source_dd, &actions.source, SizeSpec::fill())));
+    field("width (0 = source)", 0, "export-width");
+    field("height (0 = source)", 1, "export-height");
+    const bool still = s.request.render.format == media::RenderFormat::PngFrame;
+    const bool mp4 = s.request.render.format == media::RenderFormat::Mp4;
+    const bool gif = s.request.render.format == media::RenderFormat::Gif;
+    if (!still) field("fps (0 = source)", 2, "export-fps");
+    field(still ? "frame" : "first frame", 3, "export-first");
+    if (!still) field("end frame (exclusive)", 4, "export-last");
+    if (mp4) {
+        field("quality (Mbps)", 5, "export-bitrate");
+    } else {
+        rows.push_back(row("", Checkbox(arena, "transparent background", &s.request.render.alpha, &s.buttons[0])));
+    }
+    if (gif) {
+        field("palette colors (2-256)", 6, "export-colors");
+        if (s.request.render.alpha) field("alpha threshold (%)", 7, "export-alpha-threshold");
+        rows.push_back(row("", Checkbox(arena, "dither colors", &s.request.render.gif_dither, &s.buttons[1])));
+        bool* repeat = arena.alloc<bool>();
+        *repeat = s.request.render.gif_loops == 0;
+        bool* changed = arena.alloc<bool>();
+        rows.push_back(row("", Checkbox(arena, "loop forever", repeat, &s.buttons[2], changed)));
+        out.export_actions_loop = repeat;
+        out.export_actions_loop_changed = changed;
+    }
+    if (mp4) {
+        rows.push_back(Separator(arena));
+        rows.push_back(Heading(arena, "audio"));
+        rows.push_back(row("", Checkbox(arena, "include audio", &s.request.render.audio, &s.buttons[0])));
+    }
+    bo.disabled = false;
+    bo.probe = "export-close";
+    bo.width = SizeSpec::fixed(active_theme().control_height);
+    bo.tooltip = "close export";
+    auto* close = IconButton(arena, Icon::Close, &s.buttons[7], &actions.close, bo);
+    auto* header = HStack(arena, col, {Heading(arena, "export"), Spacer(arena), close});
+    bo.width = SizeSpec::fixed(128);
+    bo.tooltip = nullptr;
+    bo.primary = true;
+    bo.probe = "export-submit";
+    auto* submit = Button(arena, app.export_job ? "add to queue" : "export", &s.buttons[8], &actions.submit, bo);
+    const float w = std::min(680.0f, viewport.w - 48);
+    const float h = std::min(780.0f, viewport.h - 48);
+    StackOpts settings_col = col;
+    settings_col.padding.r = kSpaceUnit;
+    auto* scroll = ScrollAreaV(arena, &s.scroll, VStackDyn(arena, settings_col, rows));
+    scroll->height = SizeSpec::fill();
+    PanelOpts panel;
+    panel.padding = Edges::all(16);
+    StackOpts body = col;
+    body.height = SizeSpec::fill();
+    std::vector<LayoutNode*> content{header, Separator(arena), scroll, Separator(arena)};
+    if (!s.error.empty()) content.push_back(Label(arena, s.error));
+    content.push_back(HStack(arena, col, {
+        Checkbox(arena, "replace existing output files", &s.request.overwrite, &s.buttons[4]),
+        Spacer(arena), submit}));
+    OverlayOpts overlay;
+    overlay.anchor = {(viewport.w - w) * 0.5f, (viewport.h - h) * 0.5f};
+    overlay.exclusive = true;
+    overlay.backdrop = true;
+    overlay.id = &s;
+    return Overlay(arena, overlay, SizedBox(arena, SizeSpec::fixed(w), SizeSpec::fixed(h),
+        Panel(arena, VStackDyn(arena, body, content), panel)));
 }
 
 void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
@@ -20041,6 +20712,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
                 case platform::Event::Type::Char:
                 case platform::Event::Type::KeyDown: {
+                    if (app.export_ui.open) {
+                        if (e.type == platform::Event::Type::KeyDown && e.key == platform::Key::Escape) {
+                            app.export_ui.open = false;
+                            ctx.clear_focus();
+                        } else ui_keys.push_back(e);
+                        break;
+                    }
                     if (app.settings.open) {
                         if (!app.settings.capture.empty()) {
                             settings_capture_key(app, e);
@@ -20063,7 +20741,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     break;
                 }
                 case platform::Event::Type::FileDrop:
-                    if (!app.settings.open)
+                    if (!app.settings.open && !app.export_ui.open)
                         dropped_files.emplace_back(
                             e.drop_path, Vec2{e.mouse_x, e.mouse_y});
                     break;
@@ -20299,7 +20977,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     next.scope_pcm, next.doc, next.look_id,
                     next.has_analysis ? &next.analysis : nullptr,
                     next.node_audio, next.node_camera, next.pin_planes,
-                    next.out_path);
+                    next.out_path, next.request, next.history);
             }
         }
 
@@ -20353,7 +21031,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         mon->app = &app;
         {
             uint32_t cw = 0, ch = 0;
-            doc::canvas_size(app.document, &cw, &ch);
+            doc::canvas_size(app.document, app.scope_look, &cw, &ch);
             const float fallback =
                 static_cast<float>(cw) /
                 std::max(1.0f, static_cast<float>(ch));
@@ -20508,6 +21186,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             arena, flow_ui.graph, &app.canvas_state, flow_ui.events);
         frame_ui.canvas_node = canvas_band;
         const bool blank_start = app.document.assets.empty() &&
+                                 app.document.looks.empty() &&
                                  app.document.revision == 0 && !app.import;
         // Build the transport once: it goes under the slot with the picture.
         ui::LayoutNode* transport = build_transport(arena, app, frame_ui);
@@ -20590,6 +21269,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         bool* tab_node = arena.alloc<bool>();
         bool* tab_browser = arena.alloc<bool>();
         bool* tab_project = arena.alloc<bool>();
+        bool* tab_composition = arena.alloc<bool>();
+        bool* composition_apply = arena.alloc<bool>();
+        bool* composition_resize = arena.alloc<bool>();
         bool* tab_presets = arena.alloc<bool>();
         ui::StackOpts tabs_row;
         tabs_row.gap = 4.0f;
@@ -20606,6 +21288,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
              ui::Chip(arena, "project", app.inspector_tab == 1,
                       &app.tab_buttons[1], tab_project,
                       "media & project settings"),
+             ui::Chip(arena, "composition", app.inspector_tab == 4,
+                      &app.tab_buttons[4], tab_composition,
+                      "current look or sequence format"),
              ui::Chip(arena, "presets", app.inspector_tab == 2,
                       &app.tab_buttons[2], tab_presets,
                       "preset browser")});
@@ -20613,6 +21298,50 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (app.inspector_tab == 1) tab_panel = left_panel;
         else if (app.inspector_tab == 2) tab_panel = preset_panel;
         else if (app.inspector_tab == 3) tab_panel = browser_panel;
+        else if (app.inspector_tab == 4) {
+            const auto f = doc::entity_format(app.document, app.scope_look);
+            if (app.composition_entity != app.scope_look ||
+                app.composition_revision != app.document.revision) {
+                app.composition_entity = app.scope_look;
+                app.composition_revision = app.document.revision;
+                app.composition_fields[0].set(std::to_string(f.w));
+                app.composition_fields[1].set(std::to_string(f.h));
+                char rate[32];
+                std::snprintf(rate, sizeof(rate), "%.6g", f.fps);
+                app.composition_fields[2].set(rate);
+                app.composition_fields[3].set(std::to_string(f.origin_x));
+                app.composition_fields[4].set(std::to_string(f.origin_y));
+            }
+            std::vector<ui::LayoutNode*> rows;
+            rows.push_back(ui::Label(arena, app.scope_is_look()
+                ? app.look().name.c_str() : app.sequence().name.c_str()));
+            static const char* labels[] = {"width", "height", "frame rate", "canvas x", "canvas y"};
+            for (int i = 0; i < 5; ++i) {
+                ui::TextInputOpts opts;
+                opts.probe = labels[i];
+                opts.tooltip = i < 3 ? "0 inherits the project; set width and height together"
+                    : "canvas origin within the retained composition";
+                rows.push_back(value_row(arena, labels[i], ui::TextInput(arena,
+                    &app.composition_fields[i], &app.composition_inputs[i], opts)));
+            }
+            uint32_t cw = 0, ch = 0;
+            doc::canvas_size(app.document, app.scope_look, &cw, &ch);
+            char effective[128];
+            std::snprintf(effective, sizeof(effective), "%u x %u | %.6g fps",
+                          cw, ch, app.scoped_fps());
+            rows.push_back(ui::Label(arena, arena.dup(effective, std::strlen(effective))));
+            rows.push_back(value_row(arena, "", ui::Button(arena, "apply canvas", &app.composition_apply,
+                                      composition_apply)));
+            rows.push_back(value_row(arena, "", ui::Button(arena, "resize composition", &app.composition_resize,
+                                      composition_resize)));
+            if (!app.composition_error.empty())
+                rows.push_back(ui::Label(arena, app.composition_error.c_str()));
+            ui::StackOpts opts;
+            opts.gap = 8.0f;
+            opts.width = ui::SizeSpec::fill();
+            opts.padding = ui::Edges{8, 8, 8, 8};
+            tab_panel = ui::VStackDyn(arena, opts, rows);
+        }
         ui::StackOpts insp_col;
         insp_col.gap = 4.0f;
         insp_col.cross_align = ui::AlignMode::Stretch;
@@ -20668,9 +21397,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                        &complete_node);
         ui::LayoutNode* confirm_node =
             build_confirm_dialog(arena, app, frame_ui, font, viewport);
+        ui::LayoutNode* export_node = build_export(arena, app, frame_ui, viewport);
         ui::LayoutNode* root =
             ui::ZStack(arena, {root_stack, add_menu, add_fly, settings_node,
-                               complete_node, confirm_node});
+                               complete_node, export_node, confirm_node});
         root->width = ui::SizeSpec::fill();
         root->height = ui::SizeSpec::fill();
 
@@ -20825,18 +21555,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             }
             if (!app.ctx_menu.kind && label_ctx)
                 open_lane_ctx(label_track, label_audio);
-            if (frame_ui.ruler_ctx && *frame_ui.ruler_ctx &&
-                !app.scope_is_look()) {
+            if (frame_ui.ruler_ctx && *frame_ui.ruler_ctx) {
                 auto& m = ctx_open(kCtxRuler);
                 m.at_frame = *frame_ui.ruler_ctx_frame;
-                const doc::Sequence& sq = app.sequence();
-                ctx_item("marker here (m)", kActMarkerHere);
+                if (!app.scope_is_look()) ctx_item("marker here (m)", kActMarkerHere);
                 ctx_item("loop start here", kActLoopInHere);
                 ctx_item("loop end here", kActLoopOutHere);
-                if (sq.loop_out > sq.loop_in)
+                if (app.scope_loop_out() > app.scope_loop_in())
                     ctx_item("clear loop", kActClearLoop);
                 ctx_item("trim in here", kActTrimInHere);
                 ctx_item("trim out here", kActTrimOutHere);
+                if (app.scope_trim_in() || app.scope_trim_out())
+                    ctx_item("reset in/out", kActClearTrim);
             }
             for (const FrameUi::ParamCtx& pc : frame_ui.param_ctxs) {
                 if (!*pc.clicked || !app.scope_is_look()) continue;
@@ -21398,31 +22128,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 case kActLoopInHere:
                 case kActLoopOutHere:
                 case kActClearLoop:
+                case kActClearTrim:
                 case kActTrimInHere:
                 case kActTrimOutHere: {
-                    const doc::Sequence& sq = app.sequence();
                     const uint32_t fc = app.player.frame_count();
-                    uint32_t ti = sq.trim_in;
-                    uint32_t to = sq.trim_out ? sq.trim_out : fc;
-                    uint32_t li = sq.loop_in, lo = sq.loop_out;
+                    uint32_t ti = app.scope_trim_in();
+                    uint32_t to = app.scope_trim_out();
+                    const uint32_t end = to ? to : app.scope_duration() ? app.scope_duration() : fc;
+                    uint32_t li = app.scope_loop_in(), lo = app.scope_loop_out();
                     const uint32_t f =
                         static_cast<uint32_t>(std::llround(m.at_frame));
                     if (act == kActLoopInHere) {
                         li = f;
-                        if (lo <= li) lo = to;
+                        if (lo <= li) lo = end;
                     } else if (act == kActLoopOutHere) {
                         lo = f;
                         if (li >= lo) li = ti;
                     } else if (act == kActClearLoop) {
                         li = lo = 0;
+                    } else if (act == kActClearTrim) {
+                        ti = to = 0;
                     } else if (act == kActTrimInHere) {
-                        ti = std::min(f, to > 0 ? to - 1 : 0);
+                        ti = std::min(f, end > 0 ? end - 1 : 0);
                     } else {
                         to = std::max(f, ti + 1);
                     }
                     app.undo.execute(app.document,
-                                     doc::set_timeline_region_command(
-                                         sq.id, ti, to, li, lo));
+                        (app.scope_is_look() ? doc::set_look_region_command : doc::set_timeline_region_command)(
+                            app.scope_look, ti, to, li, lo));
                     break;
                 }
                 case kActKeyHere:
@@ -21583,7 +22316,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                         }
                     if (ra && ra->width && ra->height) {
                         uint32_t scw = 0, sch = 0;
-                        doc::canvas_size(app.document, &scw, &sch);
+                        doc::canvas_size(app.document, app.scope_look, &scw, &sch);
                         float fit[4];
                         gfx::source_fit_rect(ra->width, ra->height, scw,
                                              sch, fit);
@@ -21779,6 +22512,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (*tab_project) app.inspector_tab = 1;
         if (*tab_presets) app.inspector_tab = 2;
         if (*tab_browser) app.inspector_tab = 3;
+        if (*tab_composition) app.inspector_tab = 4;
+        if (*composition_apply || *composition_resize) {
+            double values[5]{};
+            bool valid = true;
+            for (int i = 0; i < 5; ++i) {
+                const char* start = app.composition_fields[i].buf.c_str();
+                char* end = nullptr;
+                values[i] = std::strtod(start, &end);
+                valid &= end != start && *end == '\0' && std::isfinite(values[i]) && (i > 2 || values[i] >= 0);
+            }
+            valid &= values[0] <= UINT32_MAX && values[1] <= UINT32_MAX &&
+                     values[0] == std::floor(values[0]) && values[1] == std::floor(values[1]);
+            if (valid) {
+                const auto old = doc::entity_format(app.document, app.composition_entity);
+                auto f = doc::resize_format(app.document, app.composition_entity,
+                    uint32_t(values[0]), uint32_t(values[1]), *composition_resize);
+                f.fps = values[2];
+                if (values[3] != old.origin_x) f.origin_x = values[3];
+                if (values[4] != old.origin_y) f.origin_y = values[4];
+                valid = doc::valid_format(f);
+                if (valid) app.undo.execute(app.document,
+                    doc::set_entity_format_command(app.composition_entity, f));
+            }
+            app.composition_error = valid ? "" : "Enter a valid rate and size. Use 0 to inherit.";
+        }
 
         // Apply staged edits before the render so this frame shows them.
         // ui_layer names the layer the panel was built for, not a new pick.
@@ -24219,40 +24977,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.undo.break_coalescing();
             did_break = true;
         }
-        if (frame_ui.export_bitrate_changed &&
-            *frame_ui.export_bitrate_changed &&
-            *frame_ui.export_bitrate_staged !=
-                app.document.export_bitrate_mbps) {
-            app.undo.execute(app.document,
-                             doc::set_export_config_command(
-                                 *frame_ui.export_bitrate_staged,
-                                 app.document.export_scale,
-                                 app.document.export_audio),
-                             /*coalesce=*/true);
-        }
-        if (frame_ui.export_bitrate_released &&
-            *frame_ui.export_bitrate_released && !did_break) {
-            app.undo.break_coalescing();
-            did_break = true;
-        }
-        if (frame_ui.export_scale_selected &&
-            *frame_ui.export_scale_selected >= 0) {
-            const uint32_t div = *frame_ui.export_scale_selected == 2   ? 4u
-                                 : *frame_ui.export_scale_selected == 1 ? 2u
-                                                                        : 1u;
-            if (div != app.document.export_scale)
-                app.undo.execute(app.document,
-                                 doc::set_export_config_command(
-                                     app.document.export_bitrate_mbps, div,
-                                     app.document.export_audio));
-        }
-        if (frame_ui.export_audio_changed && *frame_ui.export_audio_changed) {
-            app.undo.execute(app.document,
-                             doc::set_export_config_command(
-                                 app.document.export_bitrate_mbps,
-                                 app.document.export_scale,
-                                 *frame_ui.export_audio_staged));
-        }
         if (frame_ui.export_cancel_clicked &&
             *frame_ui.export_cancel_clicked && app.export_job) {
             // Cancel also clears the queue: the next export does not start.
@@ -25627,6 +26351,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             app.player.seek_frame(
                 static_cast<uint32_t>(frame_ui.seek_to + 0.5f));
         // A trim keypress is a discrete edit: send it as a released drag.
+        if (frame_ui.region_started || ki.key_trim_in >= 0.0f || ki.key_trim_out >= 0.0f)
+            app.undo.break_coalescing();
         if (ki.key_trim_in >= 0.0f) {
             frame_ui.trim_in_to = ki.key_trim_in;
             frame_ui.region_released = true;
@@ -25637,10 +26363,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
         if (frame_ui.trim_in_to >= 0.0f || frame_ui.trim_out_to >= 0.0f ||
             frame_ui.loop_in_to >= 0.0f || frame_ui.loop_clear) {
-            uint32_t t_in = app.sequence().trim_in;
-            uint32_t t_out = app.sequence().trim_out;
-            uint32_t l_in = app.sequence().loop_in;
-            uint32_t l_out = app.sequence().loop_out;
+            uint32_t t_in = app.scope_trim_in();
+            uint32_t t_out = app.scope_trim_out();
+            uint32_t l_in = app.scope_loop_in();
+            uint32_t l_out = app.scope_loop_out();
             if (frame_ui.trim_in_to >= 0.0f)
                 t_in = static_cast<uint32_t>(frame_ui.trim_in_to + 0.5f);
             if (frame_ui.trim_out_to >= 0.0f)
@@ -25656,12 +26382,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             // t_out 0 means full length. It keeps saved files byte-stable.
             if (app.has_timeline() && t_out >= app.player.frame_count())
                 t_out = 0;
-            if (!app.scope_is_look())
-                app.undo.execute(
-                    app.document,
-                    doc::set_timeline_region_command(
-                        app.sequence().id, t_in, t_out, l_in, l_out),
-                    /*coalesce=*/true);
+            app.undo.execute(app.document,
+                app.scope_is_look()
+                    ? doc::set_look_region_command(app.scope_look, t_in, t_out, l_in, l_out)
+                    : doc::set_timeline_region_command(app.scope_look, t_in, t_out, l_in, l_out), true);
         }
         if (frame_ui.region_released) app.undo.break_coalescing();
         for (const FrameUi::LaneLoop& ll : frame_ui.lane_loops) {
@@ -25699,23 +26423,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                 content ? content + timeline_buffer_frames(rate)
                         : static_cast<uint32_t>(rate * kEmptyTimelineSeconds +
                                                 0.5);
+            if (span != app.player.frame_count() && app.tl_v0 == 0.0 &&
+                app.tl_v1 >= app.player.frame_count())
+                app.tl_v0 = app.tl_v1 = 0.0;
             app.player.configure(rate, span);
             const uint32_t play_end = content ? content : span;
-            const bool look_scope = app.scope_is_look();
-            const uint32_t seq_trim_in =
-                look_scope ? 0u : app.sequence().trim_in;
-            const uint32_t seq_trim_out =
-                look_scope ? 0u : app.sequence().trim_out;
             const uint32_t t_in =
-                std::min(seq_trim_in, play_end ? play_end - 1 : 0u);
+                std::min(app.scope_trim_in(), play_end ? play_end - 1 : 0u);
             const uint32_t t_out =
-                seq_trim_out ? std::min(seq_trim_out, span) : play_end;
+                app.scope_trim_out() ? std::min(app.scope_trim_out(), span) : play_end;
             if (t_in != app.player.trim_in() ||
                 t_out != app.player.trim_out())
                 app.player.set_trim(t_in, t_out);
             app.player.set_loop_region(
-                look_scope ? 0u : app.sequence().loop_in,
-                look_scope ? 0u : app.sequence().loop_out);
+                app.scope_loop_in(), app.scope_loop_out());
             app.player.set_audio_offset(
                 static_cast<double>(app.document.audio_offset_ms) * 0.001);
         }
@@ -25833,22 +26554,80 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         if (((frame_ui.export_clicked && *frame_ui.export_clicked) ||
              ki.do_export) &&
             app.has_timeline()) {
-            const doc::Look* sl = app.document.find_look(app.scope_look);
-            const doc::Sequence* ss =
-                sl ? nullptr : app.document.find_sequence(app.scope_look);
-            std::string ename = sl ? sl->name : (ss ? ss->name : "");
-            if (ename.empty()) ename = "export";
-            auto out = platform::show_save_dialog(
-                window.get(), {{"MP4 video", "*.mp4"}}, ename + ".mp4");
-            if (out) {
-                if (out->extension() != ".mp4") out->replace_extension(".mp4");
-                const std::filesystem::path scope_pcm =
-                    app.document.sidechain_mux && app.sc_ok
-                        ? app.sc_pcm_path
-                        : std::filesystem::path();
-                // Export resolves original media, never proxy or intra files.
-                begin_or_queue_export(app, renderer->device(), shader_dir,
-                                      *out, scope_pcm);
+            open_export(app);
+            ctx.clear_focus();
+        }
+        if (app.export_ui.open) {
+            auto& s = app.export_ui;
+            const auto& a = frame_ui.export_actions;
+            if (a.close) { s.open = false; ctx.clear_focus(); }
+            if (a.format >= 0) {
+                s.request.render.format = media::RenderFormat(a.format);
+                if (s.request.render.format == media::RenderFormat::PngFrame)
+                    s.fields[3].set(std::to_string(app.player.current_frame_index()));
+            }
+            if (a.source >= 0) {
+                const int ns = int(app.document.sequences.size());
+                s.request.source = a.source < ns ? app.document.sequences[a.source].id
+                    : app.document.looks[a.source - ns].id;
+                const auto* look = app.document.find_look(s.request.source);
+                const auto* seq = app.document.find_sequence(s.request.source);
+                const uint32_t total = look ? doc::look_duration(app.document, *look)
+                    : doc::sequence_duration(app.document, *seq);
+                const uint32_t first = look ? look->trim_in : seq->trim_in;
+                const uint32_t last = look ? look->trim_out : seq->trim_out;
+                s.fields[3].set(std::to_string(first));
+                s.fields[4].set(std::to_string(last ? std::min(last, total) : total));
+            }
+            if (frame_ui.export_actions_loop_changed && *frame_ui.export_actions_loop_changed)
+                s.request.render.gif_loops = *frame_ui.export_actions_loop ? 0 : 1;
+            if (a.browse) {
+                auto location = platform::show_folder_dialog(window.get());
+                if (location) s.fields[9].set(path_to_u8(*location));
+            }
+            if (a.preset >= 0) {
+                s.preset_naming = false;
+                s.selected_preset.clear();
+                s.fields[10].set("");
+                if (a.preset > 0 && a.preset <= int(s.presets.size())) {
+                    auto it = s.presets.begin();
+                    std::advance(it, a.preset - 1);
+                    s.selected_preset = it->first;
+                    s.request.render = it->second;
+                    s.fields[10].set(it->first);
+                    s.sync();
+                }
+            }
+            if (a.save) {
+                if (!s.preset_naming) {
+                    s.preset_naming = true;
+                    s.fields[10].set(s.selected_preset);
+                } else if (read_export_fields(s, false)) {
+                    if (s.fields[10].buf.empty()) s.error = "set a preset name";
+                    else {
+                        s.selected_preset = s.fields[10].buf;
+                        s.presets[s.selected_preset] = s.request.render;
+                        s.preset_naming = false;
+                        s.error.clear();
+                        save_ui_prefs(app);
+                    }
+                }
+            }
+            if (a.remove && !s.selected_preset.empty()) {
+                s.presets.erase(s.selected_preset);
+                s.selected_preset.clear();
+                s.fields[10].set("");
+                s.preset_naming = false;
+                save_ui_prefs(app);
+            }
+            if (a.submit && read_export_fields(s, true)) {
+                const auto f = s.request.render.format;
+                auto path = u8_to_path(s.fields[9].buf) / u8_to_path(s.fields[8].buf);
+                path.replace_extension(f == media::RenderFormat::Mp4 ? ".mp4" : f == media::RenderFormat::Gif ? ".gif" : ".png");
+                const auto scope_pcm = app.document.sidechain_mux && app.sc_ok ? app.sc_pcm_path : std::filesystem::path();
+                begin_or_queue_export(app, renderer->device(), shader_dir, path, scope_pcm, s.request);
+                s.open = false;
+                ctx.clear_focus();
             }
         }
         for (const FrameUi::QueueRow& qrow : frame_ui.queue_rows) {

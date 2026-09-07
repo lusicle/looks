@@ -53,17 +53,18 @@ private:
     float old_pos_ = 0.0f;
 };
 
-class SetTimelineRegionCommand final : public SequenceCommand {
+template <class Base>
+class SetTimelineRegionCommand final : public Base {
 public:
     SetTimelineRegionCommand(uint64_t sequence, uint32_t trim_in,
                              uint32_t trim_out, uint32_t loop_in,
                              uint32_t loop_out)
-        : SequenceCommand(sequence), trim_in_(trim_in), trim_out_(trim_out),
+        : Base(sequence), trim_in_(trim_in), trim_out_(trim_out),
           loop_in_(loop_in), loop_out_(loop_out) {}
     std::string name() const override { return "Edit Timeline Region"; }
 
     void apply(Document& doc) override {
-        Sequence& seq = entity_of(doc);
+        auto& seq = this->entity_of(doc);
         old_[0] = seq.trim_in;
         old_[1] = seq.trim_out;
         old_[2] = seq.loop_in;
@@ -75,7 +76,7 @@ public:
     }
 
     void revert(Document& doc) override {
-        Sequence& seq = entity_of(doc);
+        auto& seq = this->entity_of(doc);
         seq.trim_in = old_[0];
         seq.trim_out = old_[1];
         seq.loop_in = old_[2];
@@ -85,7 +86,7 @@ public:
     bool merge(const Command& next) override {
         const auto* other =
             dynamic_cast<const SetTimelineRegionCommand*>(&next);
-        if (!other || !same_entity(*other)) return false;
+        if (!other || !this->same_entity(*other)) return false;
         trim_in_ = other->trim_in_;
         trim_out_ = other->trim_out_;
         loop_in_ = other->loop_in_;
@@ -206,46 +207,6 @@ private:
     bool removed_ = false;
 };
 
-class SetExportConfigCommand final : public Command {
-public:
-    SetExportConfigCommand(float bitrate_mbps, uint32_t scale, bool audio)
-        : bitrate_(bitrate_mbps), scale_(scale), audio_(audio) {}
-    std::string name() const override { return "Export Settings"; }
-
-    void apply(Document& doc) override {
-        old_bitrate_ = doc.export_bitrate_mbps;
-        old_scale_ = doc.export_scale;
-        old_audio_ = doc.export_audio;
-        doc.export_bitrate_mbps = bitrate_;
-        doc.export_scale = scale_;
-        doc.export_audio = audio_;
-    }
-
-    void revert(Document& doc) override {
-        doc.export_bitrate_mbps = old_bitrate_;
-        doc.export_scale = old_scale_;
-        doc.export_audio = old_audio_;
-    }
-
-    bool merge(const Command& next) override {
-        const auto* other =
-            dynamic_cast<const SetExportConfigCommand*>(&next);
-        if (!other) return false;
-        bitrate_ = other->bitrate_;
-        scale_ = other->scale_;
-        audio_ = other->audio_;
-        return true;
-    }
-
-private:
-    float bitrate_;
-    uint32_t scale_;
-    bool audio_;
-    float old_bitrate_ = 8.0f;
-    uint32_t old_scale_ = 1;
-    bool old_audio_ = true;
-};
-
 class SetUseProxyCommand final : public Command {
 public:
     explicit SetUseProxyCommand(bool use_proxy) : use_proxy_(use_proxy) {}
@@ -301,6 +262,7 @@ public:
     std::string name() const override { return "Entity Format"; }
 
     void apply(Document& doc) override {
+        if (!valid_format(next_)) return;
         if (Look* l = doc.find_look(entity_)) {
             old_ = l->format;
             l->format = next_;
@@ -859,8 +821,16 @@ std::unique_ptr<Command> set_timeline_region_command(uint64_t look,
                                                      uint32_t trim_out,
                                                      uint32_t loop_in,
                                                      uint32_t loop_out) {
-    return std::make_unique<SetTimelineRegionCommand>(look, trim_in, trim_out,
+    return std::make_unique<SetTimelineRegionCommand<SequenceCommand>>(look, trim_in, trim_out,
                                                       loop_in, loop_out);
+}
+std::unique_ptr<Command> set_look_region_command(uint64_t look,
+                                                uint32_t trim_in,
+                                                uint32_t trim_out,
+                                                uint32_t loop_in,
+                                                uint32_t loop_out) {
+    return std::make_unique<SetTimelineRegionCommand<LookCommand>>(look, trim_in, trim_out,
+                                                                  loop_in, loop_out);
 }
 std::unique_ptr<Command> set_lane_loop_command(uint64_t look, ParamKey target,
                                                bool loop) {
@@ -878,13 +848,6 @@ std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
     return std::make_unique<SetAudioConfigCommand>(std::move(sidechain_path),
                                                    sidechain_mux,
                                                    audio_offset_ms);
-}
-
-std::unique_ptr<Command> set_export_config_command(float bitrate_mbps,
-                                                   uint32_t scale,
-                                                   bool audio) {
-    return std::make_unique<SetExportConfigCommand>(bitrate_mbps, scale,
-                                                    audio);
 }
 
 std::unique_ptr<Command> toggle_marker_command(uint64_t look, uint32_t frame) {

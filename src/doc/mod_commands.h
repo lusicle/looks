@@ -53,6 +53,11 @@ std::unique_ptr<Command> set_timeline_region_command(uint64_t sequence,
                                                      uint32_t trim_out,
                                                      uint32_t loop_in,
                                                      uint32_t loop_out);
+std::unique_ptr<Command> set_look_region_command(uint64_t look,
+                                                uint32_t trim_in,
+                                                uint32_t trim_out,
+                                                uint32_t loop_in,
+                                                uint32_t loop_out);
 
 // This adds the marker if it is absent, or removes it if it is present.
 // The marker list stays sorted.
@@ -79,11 +84,6 @@ std::unique_ptr<Command> set_entity_format_command(uint64_t entity,
 std::unique_ptr<Command> set_audio_config_command(std::string sidechain_path,
                                                   bool sidechain_mux,
                                                   float audio_offset_ms);
-
-// scale is a divisor: a scale of 2 gives half resolution.
-std::unique_ptr<Command> set_export_config_command(float bitrate_mbps,
-                                                   uint32_t scale,
-                                                   bool audio);
 
 // The proxy is half resolution.
 std::unique_ptr<Command> set_use_proxy_command(bool use_proxy);

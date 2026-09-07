@@ -565,6 +565,7 @@ Value asset_to_json(const Asset& a) {
         v.set("still_duration",
               static_cast<int64_t>(a.still_duration_frames));
     if (a.still) v.set("still", true);
+    if (a.animated) v.set("animated", true);
     if (a.bin) v.set("bin", static_cast<int64_t>(a.bin));
     return v;
 }
@@ -582,6 +583,7 @@ Asset asset_from_json(const Value& v) {
     a.still_duration_frames =
         static_cast<uint32_t>(v.get("still_duration").as_int(0));
     a.still = v.get("still").as_bool(false);
+    a.animated = v.get("animated").as_bool(false);
     a.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
     return a;
 }
@@ -605,9 +607,21 @@ Value look_to_json(const Look& look) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(look.id));
     v.set("name", look.name);
+    if (look.trim_in) v.set("trim_in", static_cast<int64_t>(look.trim_in));
+    if (look.trim_out) v.set("trim_out", static_cast<int64_t>(look.trim_out));
+    if (look.loop_out > look.loop_in) {
+        v.set("loop_in", static_cast<int64_t>(look.loop_in));
+        v.set("loop_out", static_cast<int64_t>(look.loop_out));
+    }
     if (look.duration)
         v.set("duration", static_cast<int64_t>(look.duration));
     if (format_has_fps(look.format)) v.set("fmt_fps", look.format.fps);
+    v.set("content_w", look.format.content_w);
+    v.set("content_h", look.format.content_h);
+    v.set("canvas_x", look.format.origin_x);
+    v.set("canvas_y", look.format.origin_y);
+    if (look.format.scale_x != 1) v.set("content_scale_x", look.format.scale_x);
+    if (look.format.scale_y != 1) v.set("content_scale_y", look.format.scale_y);
     if (format_has_canvas(look.format)) {
         v.set("fmt_w", static_cast<int64_t>(look.format.w));
         v.set("fmt_h", static_cast<int64_t>(look.format.h));
@@ -677,10 +691,21 @@ Look look_from_json(const Value& v) {
     Look look;
     look.id = static_cast<uint64_t>(v.get("id").as_int(0));
     look.name = v.get("name").as_string();
+    look.trim_in = static_cast<uint32_t>(v.get("trim_in").as_int(0));
+    look.trim_out = static_cast<uint32_t>(v.get("trim_out").as_int(0));
+    look.loop_in = static_cast<uint32_t>(v.get("loop_in").as_int(0));
+    look.loop_out = static_cast<uint32_t>(v.get("loop_out").as_int(0));
     look.duration = static_cast<uint32_t>(v.get("duration").as_int(0));
     look.format.fps = v.get("fmt_fps").as_number(0.0);
     look.format.w = static_cast<uint32_t>(v.get("fmt_w").as_int(0));
     look.format.h = static_cast<uint32_t>(v.get("fmt_h").as_int(0));
+    look.format.content_w = v.get("content_w").as_number();
+    look.format.content_h = v.get("content_h").as_number();
+    look.format.origin_x = v.get("canvas_x").as_number();
+    look.format.origin_y = v.get("canvas_y").as_number();
+    look.format.scale_x = v.get("content_scale_x").as_number(1);
+    look.format.scale_y = v.get("content_scale_y").as_number(1);
+    if (!valid_format(look.format)) look.format = {};
     look.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
     look.audio_split = v.get("audio_split").as_bool(false);
 
@@ -772,6 +797,12 @@ Value sequence_to_json(const Sequence& seq) {
     v.set("id", static_cast<int64_t>(seq.id));
     v.set("name", seq.name);
     if (format_has_fps(seq.format)) v.set("fmt_fps", seq.format.fps);
+    v.set("content_w", seq.format.content_w);
+    v.set("content_h", seq.format.content_h);
+    v.set("canvas_x", seq.format.origin_x);
+    v.set("canvas_y", seq.format.origin_y);
+    if (seq.format.scale_x != 1) v.set("content_scale_x", seq.format.scale_x);
+    if (seq.format.scale_y != 1) v.set("content_scale_y", seq.format.scale_y);
     if (format_has_canvas(seq.format)) {
         v.set("fmt_w", static_cast<int64_t>(seq.format.w));
         v.set("fmt_h", static_cast<int64_t>(seq.format.h));
@@ -832,6 +863,13 @@ Sequence sequence_from_json(const Value& v) {
     seq.format.fps = v.get("fmt_fps").as_number(0.0);
     seq.format.w = static_cast<uint32_t>(v.get("fmt_w").as_int(0));
     seq.format.h = static_cast<uint32_t>(v.get("fmt_h").as_int(0));
+    seq.format.content_w = v.get("content_w").as_number();
+    seq.format.content_h = v.get("content_h").as_number();
+    seq.format.origin_x = v.get("canvas_x").as_number();
+    seq.format.origin_y = v.get("canvas_y").as_number();
+    seq.format.scale_x = v.get("content_scale_x").as_number(1);
+    seq.format.scale_y = v.get("content_scale_y").as_number(1);
+    if (!valid_format(seq.format)) seq.format = {};
     seq.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
 
     tracks_from_json(v.get("tracks"), seq.tracks,
@@ -1004,12 +1042,6 @@ json::Value doc_to_json(const Document& doc) {
     }
     if (doc.audio_offset_ms != 0.0f)
         v.set("audio_offset_ms", static_cast<double>(doc.audio_offset_ms));
-    if (doc.export_bitrate_mbps != 8.0f)
-        v.set("export_bitrate_mbps",
-              static_cast<double>(doc.export_bitrate_mbps));
-    if (doc.export_scale != 1)
-        v.set("export_scale", static_cast<int64_t>(doc.export_scale));
-    if (!doc.export_audio) v.set("export_audio", false);
 
     return v;
 }
@@ -1031,11 +1063,6 @@ Document doc_from_json(const json::Value& v) {
     doc.sidechain_path = v.get("sidechain").as_string();
     doc.sidechain_mux = v.get("sidechain_mux").as_bool(false);
     doc.audio_offset_ms = num(v, "audio_offset_ms", 0.0f);
-    doc.export_bitrate_mbps =
-        std::clamp(num(v, "export_bitrate_mbps", 8.0f), 1.0f, 60.0f);
-    doc.export_scale = std::clamp(
-        static_cast<uint32_t>(v.get("export_scale").as_int(1)), 1u, 4u);
-    doc.export_audio = v.get("export_audio").as_bool(true);
 
     for (const Value& av : v.get("assets").array())
         doc.assets.push_back(asset_from_json(av));
