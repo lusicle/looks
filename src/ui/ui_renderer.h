@@ -85,7 +85,7 @@ private:
 
     gfx::Device& device_;
     VkDescriptorSetLayout texture_set_layout_ = VK_NULL_HANDLE;
-    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorPool> descriptor_pools_;
     VkSampler nearest_sampler_ = VK_NULL_HANDLE;
     VkSampler linear_sampler_ = VK_NULL_HANDLE;
     VkPipelineLayout solid_layout_ = VK_NULL_HANDLE;

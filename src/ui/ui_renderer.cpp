@@ -55,7 +55,8 @@ UiRenderer::~UiRenderer() {
     if (text_pipeline_) vkDestroyPipeline(dev, text_pipeline_, nullptr);
     if (solid_layout_) vkDestroyPipelineLayout(dev, solid_layout_, nullptr);
     if (textured_layout_) vkDestroyPipelineLayout(dev, textured_layout_, nullptr);
-    if (descriptor_pool_) vkDestroyDescriptorPool(dev, descriptor_pool_, nullptr);
+    for (VkDescriptorPool pool : descriptor_pools_)
+        vkDestroyDescriptorPool(dev, pool, nullptr);
     if (texture_set_layout_) vkDestroyDescriptorSetLayout(dev, texture_set_layout_, nullptr);
     if (nearest_sampler_) vkDestroySampler(dev, nearest_sampler_, nullptr);
     if (linear_sampler_) vkDestroySampler(dev, linear_sampler_, nullptr);
@@ -118,14 +119,6 @@ bool UiRenderer::init(VkFormat color_format, const std::filesystem::path& shader
     gfx::vk_check(vkCreateDescriptorSetLayout(dev, &set_layout_info, nullptr,
                                               &texture_set_layout_),
                   "vkCreateDescriptorSetLayout(ui)");
-
-    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64};
-    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool_info.maxSets = 64;
-    pool_info.poolSizeCount = 1;
-    pool_info.pPoolSizes = &pool_size;
-    gfx::vk_check(vkCreateDescriptorPool(dev, &pool_info, nullptr, &descriptor_pool_),
-                  "vkCreateDescriptorPool(ui)");
 
     VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sampler_info.magFilter = VK_FILTER_NEAREST;
@@ -290,8 +283,22 @@ bool UiRenderer::upload_texture(UiTexture& tex, VkFormat format,
 UiTexture* UiRenderer::commit_texture(std::unique_ptr<UiTexture> tex,
                                       VkSampler sampler, const char* set_label) {
     VkDevice dev = device_.device();
+    constexpr uint32_t kSetsPerPool = 64;
+    if (textures_.size() % kSetsPerPool == 0) {
+        VkDescriptorPoolSize pool_size{
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSetsPerPool};
+        VkDescriptorPoolCreateInfo pool_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool_info.maxSets = kSetsPerPool;
+        pool_info.poolSizeCount = 1;
+        pool_info.pPoolSizes = &pool_size;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        gfx::vk_check(vkCreateDescriptorPool(dev, &pool_info, nullptr, &pool),
+                      "vkCreateDescriptorPool(ui)");
+        descriptor_pools_.push_back(pool);
+    }
     VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    set_info.descriptorPool = descriptor_pool_;
+    set_info.descriptorPool = descriptor_pools_.back();
     set_info.descriptorSetCount = 1;
     set_info.pSetLayouts = &texture_set_layout_;
     gfx::vk_check(vkAllocateDescriptorSets(dev, &set_info, &tex->set), set_label);

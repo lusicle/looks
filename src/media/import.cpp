@@ -27,6 +27,19 @@ namespace looks::media {
 
 namespace {
 
+struct MediaExtension {
+    const wchar_t* extension;
+    bool still;
+};
+
+constexpr MediaExtension kMediaExtensions[] = {
+    {L".mp4", false}, {L".mov", false}, {L".mez", false},
+    {L".m4v", false},
+    {L".png", true}, {L".tga", true}, {L".jpg", true}, {L".jpeg", true},
+    {L".bmp", true}, {L".tif", true}, {L".tiff", true}, {L".gif", true},
+    {L".wav", false}, {L".mp3", false},
+};
+
 std::wstring lower_ext(const std::filesystem::path& p) {
     std::wstring ext = p.extension().native();
     for (wchar_t& c : ext) c = static_cast<wchar_t>(towlower(c));
@@ -825,8 +838,29 @@ ImportResult resume_video_pass(const std::filesystem::path& source,
 
 bool is_still_image(const std::filesystem::path& source) {
     const auto ext = lower_ext(source);
-    return ext == L".png" || ext == L".tga" || ext == L".jpg" || ext == L".jpeg" ||
-        ext == L".bmp" || ext == L".tif" || ext == L".tiff" || ext == L".gif";
+    for (const auto& format : kMediaExtensions)
+        if (ext == format.extension) return format.still;
+    return false;
+}
+
+bool is_supported_media(const std::filesystem::path& source) {
+    const auto ext = lower_ext(source);
+    for (const auto& format : kMediaExtensions)
+        if (ext == format.extension) return true;
+    return false;
+}
+
+const std::string& media_file_pattern() {
+    static const std::string pattern = [] {
+        std::string result;
+        for (const auto& format : kMediaExtensions) {
+            if (!result.empty()) result += ';';
+            result += '*';
+            result += std::filesystem::path(format.extension).string();
+        }
+        return result;
+    }();
+    return pattern;
 }
 
 ImportResult import_media(const std::filesystem::path& source,

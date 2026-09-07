@@ -4440,11 +4440,7 @@ uint64_t import_folder_as_bin(AppState& app, const std::filesystem::path& path) 
              std::filesystem::directory_options::skip_permission_denied, ec), end;
          it != end && !ec; it.increment(ec)) {
         if (!it->is_regular_file(ec)) continue;
-        auto ext = it->path().extension().wstring();
-        for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
-        if (is_still_source(it->path()) || ext == L".mp4" || ext == L".mov" ||
-            ext == L".mez" || ext == L".m4v" || ext == L".avi" || ext == L".wmv" ||
-            ext == L".wav" || ext == L".mp3")
+        if (media::is_supported_media(it->path()))
             files.push_back(it->path());
     }
     if (files.empty()) { app.status = "no supported media in folder"; return 0; }
@@ -4485,7 +4481,7 @@ void browse_and_bind_media(AppState& app, platform::Window* window,
         return;
     }
     auto picked = platform::show_open_dialog(
-        window, {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
+        window, {{"media", media::media_file_pattern()},
                  {"all files", "*.*"}});
     if (!picked) return;
     uint64_t asset_id = 0;
@@ -13863,6 +13859,7 @@ struct KeyIntents {
     bool do_cut = false;
     bool do_paste = false;
     bool open_media = false, import_media = false;
+    bool import_folder = false;
     bool import_preset = false, do_export = false;
     float nudge_dx = 0.0f, nudge_dy = 0.0f;
     float key_seek = -1.0f;      // playhead target in frames, -1 = none
@@ -13951,6 +13948,7 @@ void open_project(AppState&, KeyIntents& k) { k.do_open_project = true; }
 void select_all(AppState&, KeyIntents& k) { k.do_select_all = true; }
 void open_media(AppState&, KeyIntents& k) { k.open_media = true; }
 void import_media(AppState&, KeyIntents& k) { k.import_media = true; }
+void import_folder(AppState&, KeyIntents& k) { k.import_folder = true; }
 void import_preset(AppState&, KeyIntents& k) { k.import_preset = true; }
 void export_out(AppState&, KeyIntents& k) { k.do_export = true; }
 
@@ -14182,6 +14180,7 @@ const std::vector<ActionDef>& action_registry() {
         {"go_start", "go to start", "home", true, act::go_start},
         {"group", "group selection", "ctrl+g", false, act::group},
         {"import_media", "import media...", "", false, act::import_media},
+        {"import_folder", "import folder...", "", false, act::import_folder},
         {"import_preset", "import preset...", "", false,
          act::import_preset},
         {"mark_next", "next mark", "]", true, act::mark_next},
@@ -20446,6 +20445,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
 
         static const char* kFileItems[] = {
             "open media...",           "import media...",
+            "import folder...",
             "open project...  (ctrl+o)",
             "save project  (ctrl+s)", "save project as...",
             "import preset...",       "export..."};
@@ -20491,7 +20491,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         bar.width = ui::SizeSpec::fill();
         ui::LayoutNode* menu_bar = ui::HStack(
             arena, bar,
-            {MenuButton(arena, "file", kFileItems, 7,
+            {MenuButton(arena, "file", kFileItems, std::size(kFileItems),
                         &app.menu_states[0], &menu_picks[0]),
              MenuButton(arena, "edit", kEditItems, 7,
                         &app.menu_states[1], &menu_picks[1]),
@@ -21760,7 +21760,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
         }
 
         static const char* kFileActs[] = {
-            "open_media",   "import_media",    "open_project",
+            "open_media",   "import_media",    "import_folder", "open_project",
             "save_project", "save_project_as", "import_preset",
             "export"};
         static const char* kEditActs[] = {
@@ -25362,7 +25362,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                              window.get());
             break;
         }
-        if (frame_ui.import_folder_clicked && *frame_ui.import_folder_clicked) {
+        if ((frame_ui.import_folder_clicked && *frame_ui.import_folder_clicked) ||
+            ki.import_folder) {
             if (auto folder = platform::show_folder_dialog(window.get()))
                 import_folder_as_bin(app, *folder);
         }
@@ -25418,7 +25419,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             import_slot_free(app)) {
             auto picked = platform::show_open_dialog(
                 window.get(),
-                {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
+                {{"media", media::media_file_pattern()},
                  {"all files", "*.*"}});
             if (picked) open_source(app, *picked);
         }
@@ -25428,7 +25429,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             import_slot_free(app)) {
             auto picked = platform::show_open_dialog(
                 window.get(),
-                {{"media", "*.mp4;*.mov;*.mez;*.png;*.tga;*.wav;*.mp3"},
+                {{"media", media::media_file_pattern()},
                  {"all files", "*.*"}});
             if (picked) import_media(app, *picked);
         }

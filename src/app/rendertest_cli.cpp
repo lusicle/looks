@@ -1038,11 +1038,18 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     auto ui_target = gfx::GpuImage::create(device, VK_FORMAT_R16G16B16A16_SFLOAT, w, h,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (!ui_renderer || !ui_target) return false;
-    for (const auto& rgba : {std::array<uint8_t, 4>{128, 64, 192, 255},
-                             std::array<uint8_t, 4>{128, 128, 128, 128},
-                             std::array<uint8_t, 4>{12, 200, 80, 255}}) {
-        const auto* texture = ui_renderer->register_image(rgba.data(), 1, 1);
-        if (!texture || !begin_probe()) return false;
+    constexpr std::array<uint8_t, 4> thumbnail_colors[] = {
+        {128, 64, 192, 255}, {128, 128, 128, 128}, {12, 200, 80, 255}};
+    std::array<const ui::UiTexture*, 193> thumbnails{};
+    for (size_t i = 0; i < thumbnails.size(); ++i) {
+        const auto& rgba = thumbnail_colors[i % std::size(thumbnail_colors)];
+        thumbnails[i] = ui_renderer->register_image(rgba.data(), 1, 1);
+        if (!thumbnails[i]) return false;
+    }
+    for (size_t i = 0; i < thumbnails.size(); ++i) {
+        const auto& rgba = thumbnail_colors[i % std::size(thumbnail_colors)];
+        const auto* texture = thumbnails[i];
+        if (!begin_probe()) return false;
         ui_target->transition(probe.cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         attachment.imageView = ui_target->view();

@@ -62,6 +62,8 @@ bool rebuild_still_thumbs(const std::filesystem::path& mez_path,
                           const std::filesystem::path& thumbs_path);
 
 bool is_still_image(const std::filesystem::path& source);
+bool is_supported_media(const std::filesystem::path& source);
+const std::string& media_file_pattern();
 
 // Writes an all-intra H.264 at <stem>.intra.mp4 beside the sidecars.
 // Preview decode prefers it; export keeps the original. Video only.
