@@ -93,6 +93,7 @@ add_library(looks_media STATIC
     media/wav.cpp
     media/mp3.cpp
     media/import.cpp
+    media/cache.cpp
     media/export.cpp
     media/player.cpp
     media/audio_mix.cpp

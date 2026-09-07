@@ -402,7 +402,7 @@ void draw_button_face(Canvas2D& canvas, const Font& font, const Theme& theme,
     const Vec2 text_size = measure_text(font, label, f.font_size);
     const float pad = 4.0f * f.scale;
     const float tx = f.align_left
-        ? r.x + pad
+        ? r.x + (f.flat ? pad : theme.control_text_inset * f.scale)
         : r.x + std::max(pad, (text_r.w - text_size.x) * 0.5f);
     draw_text(canvas, font, label,
               {tx, r.y + (r.h - font.line_height() * f.font_size) * 0.5f},

@@ -34,6 +34,7 @@
 #include "doc/instances.h"
 #include "media/audio_mix.h"
 #include "media/bundle.h"
+#include "media/cache.h"
 #include "media/decode_pool.h"
 #include "media/export.h"
 #include "media/frame_index.h"
@@ -124,6 +125,12 @@ struct TrackJob {
     }
 };
 
+std::filesystem::path cache_directory_override;
+
+std::filesystem::path cache_directory() {
+    return cache_directory_override.empty() ? executable_dir() / "cache" : cache_directory_override;
+}
+
 // Hash the lowercased absolute path: one bundle per source on Windows.
 std::filesystem::path bundle_dir_for(const std::filesystem::path& source) {
     std::error_code ec;
@@ -134,7 +141,7 @@ std::filesystem::path bundle_dir_for(const std::filesystem::path& source) {
     const uint64_t hash = fnv1a(key.data(), key.size() * sizeof(wchar_t));
     wchar_t hex[17];
     swprintf(hex, 17, L"%016llx", static_cast<unsigned long long>(hash));
-    return executable_dir() / "cache" / hex;
+    return cache_directory() / hex;
 }
 
 // A bundle is fresh when it is not older than its source.
@@ -627,6 +634,7 @@ struct PreviewHistory {
 
 struct RenderWorker : WorkerGate {
     struct Job {
+        bool release_cache = false;
         // Immutable snapshot. The UI builds it outside the lock.
         std::shared_ptr<const doc::Document> doc;
         uint64_t doc_revision = ~0ull;
@@ -741,6 +749,28 @@ struct RenderWorker : WorkerGate {
     std::shared_ptr<const PreviewHistory> history_snapshot() {
         std::lock_guard<std::mutex> lock(m_);
         return std::make_shared<PreviewHistory>(history_);
+    }
+
+    std::atomic<bool> cache_released{false};
+
+    std::map<std::filesystem::path, uint32_t> cache_sources() {
+        std::lock_guard<std::mutex> lock(m_);
+        std::map<std::filesystem::path, uint32_t> out;
+        std::set<const doc::Document*> seen;
+        for (const auto& segment : history_.segments) {
+            const auto* doc = segment.context->doc.get();
+            if (!doc || !seen.insert(doc).second) continue;
+            for (const auto& asset : doc->assets)
+                if (!asset.path.empty()) out[u8_to_path(asset.path)] = asset.still_duration_frames;
+        }
+        return out;
+    }
+
+    void hold_cache(bool hold) {
+        std::lock_guard<std::mutex> lock(m_);
+        job_.release_cache = hold;
+        ++job_serial_;
+        cv_.notify_all();
     }
 
     // Call once per UI frame. The worker keeps the image until the fence waits.
@@ -1103,6 +1133,21 @@ void RenderWorker::run() {
                 lock.lock();
                 continue;
             }
+            if (job_.release_cache) {
+                idle_ = false;
+                lock.unlock();
+                if (!cache_released.load()) {
+                    for (uint32_t s = 0; s < gfx::kFramesInFlight; ++s) complete_slot(s);
+                    const doc::Document empty;
+                    pool.set_document(empty, empty.root_sequence, {}, 0);
+                    engine->cache().clear();
+                    cache_released = true;
+                }
+                lock.lock();
+                last_serial = job_serial_;
+                continue;
+            }
+            cache_released = false;
             idle_ = false;
             this_cycle = cycle_seq_.fetch_add(1) + 1;
             fields_changed = job_serial_ != last_serial;
@@ -2538,8 +2583,13 @@ struct ExportUi {
 struct SettingsUi {
     bool open = false;
     bool was_open = false;
-    int tab = 0;              // 0 = keybinds
+    int tab = 0;
     ui::ScrollState scroll_state;
+    ui::ScrollState cache_scroll;
+    ui::TextField cache_size{.buf = "20", .filter = ui::TextFilter::Uint, .cap = 6};
+    ui::TextField cache_age{.buf = "30", .filter = ui::TextFilter::Uint, .cap = 5};
+    ui::TextInputState cache_size_state, cache_age_state;
+    ui::ButtonState cache_tab_button;
     ui::TextField filter{.cap = 40};
     ui::TextInputState filter_state, name_state, step_state;
     ui::ButtonState tab_button;
@@ -3080,8 +3130,29 @@ struct AppState {
     // Newest first, capped, persisted in ui.json.
     std::vector<std::string> recent_projects;
     ui::ButtonState recent_buttons[6];
-    uint64_t cache_bytes = 0;
-    ui::ButtonState cache_open_button, cache_clear_button;
+    uint32_t cache_size_gb = 20, cache_age_days = 30;
+    bool cache_size_enabled = true, cache_age_enabled = true;
+    media::CacheScan cache_scan;
+    std::set<std::filesystem::path> cache_protected;
+    struct CacheJob {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        media::CacheScan scan;
+        size_t removed = 0, failed = 0;
+        bool cleanup = false;
+        bool force = false;
+        media::ImportProgress progress;
+        media::CacheClearResult force_result;
+        std::map<std::filesystem::path, std::shared_ptr<const media::PcmBuffer>> pcm;
+        ~CacheJob() { progress.cancel = true; if (thread.joinable()) thread.join(); }
+    };
+    std::unique_ptr<CacheJob> cache_job;
+    bool cache_scan_requested = true, cache_cleanup_requested = false, cache_clear_all = false;
+    bool cache_force_requested = false, cache_force_active = false;
+    std::vector<media::CacheSource> cache_rebuild_sources;
+    std::string cache_status;
+    std::chrono::steady_clock::time_point cache_next_cleanup =
+        std::chrono::steady_clock::now() + std::chrono::minutes(5);
     // Every distinct status line, newest last.
     std::vector<std::string> status_log;
     std::string status_log_last;
@@ -3596,6 +3667,7 @@ uint64_t track_settings_hash(const doc::Asset& a) {
 // A matching cache makes this a no-op.
 void start_track_job(AppState& app, uint64_t asset_id,
                      uint32_t range_start = 0, uint32_t range_end = 0) {
+    if (app.cache_force_active) { app.status = "wait for the cache rebuild"; return; }
     if (app.track_job && !app.track_job->done) {
         app.status = "a track solve is already running";
         return;
@@ -3848,6 +3920,12 @@ void sync_sidechain(AppState& app) {
 // App view state in ui.json, never in the project.
 void save_ui_prefs(const AppState& app) {
     json::Value v = json::Value::make_object();
+    auto cache = json::Value::make_object();
+    cache.set("size_enabled", app.cache_size_enabled);
+    cache.set("age_enabled", app.cache_age_enabled);
+    cache.set("size_gb", app.cache_size_gb);
+    cache.set("age_days", app.cache_age_days);
+    v.set("cache", std::move(cache));
     auto renders = json::Value::make_object();
     for (const auto& [name, settings] : app.export_ui.presets)
         renders.set(name, media::render_settings_json(settings));
@@ -3905,6 +3983,13 @@ void load_ui_prefs(AppState& app) {
     const auto parsed = json::parse(std::string_view(
         reinterpret_cast<const char*>(bytes->data()), bytes->size()));
     if (!parsed.value) return;
+    const auto& cache = parsed.value->get("cache");
+    app.cache_size_enabled = cache.get("size_enabled").as_bool(true);
+    app.cache_age_enabled = cache.get("age_enabled").as_bool(true);
+    app.cache_size_gb = static_cast<uint32_t>(std::clamp<int64_t>(cache.get("size_gb").as_int(20), 1, 65536));
+    app.cache_age_days = static_cast<uint32_t>(std::clamp<int64_t>(cache.get("age_days").as_int(30), 1, 36500));
+    app.settings.cache_size.set(std::to_string(app.cache_size_gb));
+    app.settings.cache_age.set(std::to_string(app.cache_age_days));
     for (const auto& [name, settings] : parsed.value->get("render_presets").object()) {
         media::RenderSettings render;
         std::string error;
@@ -4028,6 +4113,15 @@ std::vector<media::AssetBundle> build_bundle_table(const doc::Document& doc,
 }
 
 void refresh_bundles(AppState& app) {
+    app.cache_scan_requested = true;
+    for (const auto& asset : app.document.assets) {
+        if (asset.path.empty()) continue;
+        const auto path = u8_to_path(asset.path);
+        const auto dir = bundle_dir_for(path);
+        app.cache_protected.insert(path);
+        app.cache_protected.insert(dir);
+        media::touch_disk_cache(dir);
+    }
     std::vector<media::AssetBundle> table =
         build_bundle_table(app.document, true);
     bool doc_changed = false;
@@ -4655,6 +4749,7 @@ void ensure_media_placed(AppState& app,
 
 // Import adds the asset only. It does not place or play.
 void import_media(AppState& app, const std::filesystem::path& picked_in, uint64_t bin = 0) {
+    if (app.cache_force_active) { app.status = "wait for the cache rebuild"; return; }
     // Only absolute paths reach the document.
     std::error_code aec;
     const std::filesystem::path picked =
@@ -4790,6 +4885,7 @@ struct WorkerResume {
 };
 
 void open_source(AppState& app, const std::filesystem::path& picked_in) {
+    if (app.cache_force_active) { app.status = "wait for the cache rebuild"; return; }
     // Paths persist in the document, so absolutize at the door.
     std::error_code aec;
     const std::filesystem::path picked =
@@ -4859,6 +4955,7 @@ doc::Asset* opened_asset(AppState& app) {
 
 // A background video pass yields the slot. Real imports keep it.
 bool import_slot_free(AppState& app) {
+    if (app.cache_force_active) return false;
     if (!app.import) return true;
     if (!app.import->video_pass_only) return false;
     const std::filesystem::path src = app.import->source;
@@ -5116,17 +5213,143 @@ void browser_rename_apply(AppState& app) {
     }
 }
 
-// Call on demand only, never per frame.
-uint64_t scan_cache_bytes() {
-    uint64_t total = 0;
-    std::error_code ec;
-    for (auto it = std::filesystem::recursive_directory_iterator(
-             executable_dir() / "cache", ec);
-         !ec && it != std::filesystem::recursive_directory_iterator();
-         it.increment(ec)) {
-        if (it->is_regular_file(ec)) total += it->file_size(ec);
+void tick_cache(AppState& app) {
+    const auto root = cache_directory();
+    if (app.cache_force_active) app.player.pause();
+    if (app.cache_job) {
+        if (!app.cache_job->done.load()) return;
+        auto& job = *app.cache_job;
+        app.cache_scan = std::move(job.scan);
+        if (job.cleanup)
+            app.cache_status = "cleared " + std::to_string(job.removed) + " bundles" +
+                (job.failed ? "; some files are in use" : "");
+        if (!app.cache_scan.error.empty()) app.cache_status = app.cache_scan.error;
+        const bool force = job.force;
+        const bool rebuilt = job.force_result.removed > 0 || job.force_result.rebuilt > 0;
+        if (force) {
+            const auto& result = job.force_result;
+            app.cache_status = "cleared " + std::to_string(result.removed) + " bundles; rebuilt " +
+                std::to_string(result.rebuilt) +
+                (result.failed ? "; some files could not be cleared or rebuilt" : "");
+            if (!result.error.empty()) app.cache_status = result.error;
+            if (result.kept) app.cache_status += "; kept " + std::to_string(result.kept) +
+                " folders with source files or unrecognized contents";
+            for (const auto& asset : app.document.assets) {
+                const auto found = job.pcm.find(u8_to_path(asset.path));
+                if (found != job.pcm.end()) app.pcm_cache[asset.id] = found->second;
+            }
+        }
+        app.cache_job.reset();
+        if (force) {
+            if (rebuilt) {
+                app.asset_strips.clear();
+                app.asset_analysis.clear();
+                app.analysis_revision = ~0ull;
+                refresh_bundles(app);
+            }
+            if (app.thumb_worker) app.thumb_worker->resume();
+            if (app.render_worker) app.render_worker->hold_cache(false);
+            app.cache_force_active = false;
+            app.cache_rebuild_sources.clear();
+        }
     }
-    return total;
+    if (app.cache_force_requested || app.cache_force_active) {
+        if (!app.cache_force_active) {
+            if (app.import || !app.media_import_queue.empty() || app.export_job ||
+                !app.export_queue.empty() || app.track_job) {
+                app.cache_status = "force clear waits for import, export, and tracking";
+                return;
+            }
+            auto sources = app.render_worker ? app.render_worker->cache_sources()
+                : std::map<std::filesystem::path, uint32_t>{};
+            auto collect = [&](const doc::Document& doc) {
+                for (const auto& asset : doc.assets)
+                    if (!asset.path.empty()) sources[u8_to_path(asset.path)] = asset.still_duration_frames;
+            };
+            collect(app.document);
+            for (const auto& [source, frames] : sources)
+                app.cache_rebuild_sources.push_back({source, bundle_dir_for(source), frames});
+            app.cache_force_requested = false;
+            app.cache_force_active = true;
+            app.cache_cleanup_requested = false;
+            app.cache_clear_all = false;
+            app.player.pause();
+            if (app.thumb_worker) app.thumb_worker->pause();
+            if (app.render_worker) app.render_worker->hold_cache(true);
+        }
+        if (app.render_worker && !app.render_worker->cache_released.load()) return;
+        auto job = std::make_unique<AppState::CacheJob>();
+        job->force = true;
+        media::ImportOptions options;
+        if (app.import_lossless) options.quality = 0;
+        job->thread = std::thread([root, sources = app.cache_rebuild_sources, options, p = job.get()] {
+            p->force_result = media::force_clear_disk_cache(root, sources, options, &p->progress);
+            for (const auto& source : sources) {
+                if (p->progress.cancel.load()) break;
+                const auto pcm = media::sidecars_for(source.directory, source.source).pcm;
+                if (auto data = media::load_pcm(pcm)) p->pcm[source.source] = std::move(data);
+            }
+            p->scan = media::scan_disk_cache(root);
+            p->done = true;
+        });
+        app.cache_job = std::move(job);
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= app.cache_next_cleanup) {
+        app.cache_next_cleanup = now + std::chrono::minutes(5);
+        if (app.cache_size_enabled || app.cache_age_enabled) {
+            app.cache_scan_requested = true;
+            app.cache_cleanup_requested = true;
+        }
+    }
+    if (app.cache_scan_requested) {
+        app.cache_scan_requested = false;
+        for (const auto& path : app.cache_protected) media::touch_disk_cache(path);
+        auto job = std::make_unique<AppState::CacheJob>();
+        job->thread = std::thread([root, p = job.get()] {
+            p->scan = media::scan_disk_cache(root);
+            p->done = true;
+        });
+        app.cache_job = std::move(job);
+        return;
+    }
+    if (!app.cache_cleanup_requested) return;
+    if (app.import || !app.media_import_queue.empty() || app.export_job ||
+        !app.export_queue.empty() || app.track_job) {
+        app.cache_status = "cleanup waits for import, export, and tracking";
+        return;
+    }
+    media::CachePolicy policy;
+    policy.max_bytes = app.cache_size_enabled ? uint64_t{app.cache_size_gb} << 30 : 0;
+    policy.max_age_days = app.cache_age_enabled ? app.cache_age_days : 0;
+    const std::vector<std::filesystem::path> keep(app.cache_protected.begin(), app.cache_protected.end());
+    const auto plan = media::cache_cleanup_plan(app.cache_scan, policy, keep, app.cache_clear_all);
+    app.cache_cleanup_requested = false;
+    app.cache_clear_all = false;
+    std::vector<std::filesystem::path> staged;
+    size_t failed = 0;
+    for (const auto& path : plan) {
+        auto target = media::stage_cache_removal(root, path);
+        if (target.empty()) ++failed;
+        else staged.push_back(std::move(target));
+    }
+    if (plan.empty()) {
+        app.cache_status = "no unused cache to clear";
+        return;
+    }
+    auto job = std::make_unique<AppState::CacheJob>();
+    job->cleanup = true;
+    job->failed = failed;
+    job->thread = std::thread([root, paths = std::move(staged), p = job.get()] {
+        for (const auto& path : paths) {
+            if (media::remove_staged_cache(root, path)) ++p->removed;
+            else ++p->failed;
+        }
+        p->scan = media::scan_disk_cache(root);
+        p->done = true;
+    });
+    app.cache_job = std::move(job);
 }
 
 void remember_recent_project(AppState& app,
@@ -5143,7 +5366,7 @@ void remember_recent_project(AppState& app,
 // This overload is the one place the autosave naming rule lives.
 std::filesystem::path autosave_path_for(const std::filesystem::path& project) {
     if (project.empty())
-        return executable_dir() / "cache" / "untitled.autosave.json";
+        return cache_directory() / "untitled.autosave.json";
     std::filesystem::path p = project;
     p.replace_extension(".autosave.json");
     return p;
@@ -5237,6 +5460,7 @@ void save_project(AppState& app, const std::filesystem::path& path) {
 // This function owns the full adopt-a-document reset.
 void open_project_load(AppState& app, const std::filesystem::path& load_from,
                        const std::filesystem::path& path, bool restored) {
+    if (app.cache_force_active) { app.status = "wait for the cache rebuild"; return; }
     std::string error;
     auto loaded = doc::load_document(load_from, &error);
     if (!loaded && restored && !path.empty())
@@ -5617,6 +5841,7 @@ void resolve_confirm(AppState& app, int pick, platform::Window* window,
 // The interaction pass and the draw pass share this layout.
 // Copy only what changed, then bump the serial to wake the worker.
 void push_render_job(RenderWorker& w, AppState& app) {
+    if (app.cache_force_active) return;
     bool changed = false;
     // Never refresh the analysis composite mid-gesture.
     if ((app.analysis_revision != app.document.revision ||
@@ -5842,8 +6067,6 @@ struct FrameUi {
         bool* clicked;
     };
     std::vector<RecentRow> recent_rows;
-    bool* cache_open_clicked = nullptr;
-    bool* cache_clear_clicked = nullptr;
 
     struct RouteRow {
         uint64_t id;
@@ -12471,33 +12694,6 @@ void build_side_panels(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                               arena.dup(rname.c_str(), rname.size()),
                               &app.recent_buttons[r], rrow.clicked, ropts));
     }
-    {
-        char cache_line[64];
-        std::snprintf(cache_line, sizeof(cache_line), "cache  %.1f gb",
-                      app.cache_bytes / (1024.0 * 1024.0 * 1024.0));
-        out.cache_open_clicked = arena.alloc<bool>();
-        out.cache_clear_clicked = arena.alloc<bool>();
-        ButtonOpts tiny;
-        tiny.width = SizeSpec::fixed(48);
-        tiny.flat = true;
-        StackOpts crow_opts;
-        crow_opts.gap = 4.0f;
-        crow_opts.cross_align = AlignMode::Center;
-        ButtonOpts tiny_clear = tiny;
-        tiny_clear.tooltip =
-            "delete every cached import bundle except the open project's";
-        tiny.tooltip = "open the cache folder";
-        std::vector<LayoutNode*> crow{
-            Label(arena, arena.dup(cache_line, std::strlen(cache_line)),
-                  small_dim),
-            Spacer(arena),
-            Button(arena, "open", &app.cache_open_button,
-                   out.cache_open_clicked, tiny),
-            Button(arena, "clear", &app.cache_clear_button,
-                   out.cache_clear_clicked, tiny_clear)};
-        LayoutNode* cstack = HStackDyn(arena, crow_opts, crow);
-        rows.push_back(cstack);
-    }
     if (!app.status_log.empty()) {
         LabelOpts log_dim = small_dim;
         log_dim.color = active_theme().text_disabled;
@@ -15962,6 +16158,10 @@ void begin_or_queue_export(AppState& app, gfx::Device& device,
                            const std::filesystem::path& out,
                            const std::filesystem::path& scope_pcm,
                            media::ExportRequest request = {}) {
+    if (app.cache_force_active) {
+        app.status = "wait for the cache rebuild before exporting";
+        return;
+    }
     if (!request.source) request.source = app.scope_look;
     std::shared_ptr<const PreviewHistory> history;
     if (request.render.format == media::RenderFormat::PngFrame && app.render_worker) {
@@ -16239,6 +16439,22 @@ void register_ops_app(ScriptHost& sh) {
                 sh.log("preview pixel difference: " + std::to_string(maximum));
                 return Value::boolean(maximum <= tolerance);
             });
+    env.add("cache_info", "cache_info() -> application cache settings and disk usage", 0, 0,
+            [&sh](Vm&, std::vector<Value>&) {
+                const auto& app = *sh.app;
+                auto out = Value::make_map();
+                (*out.map)["size_enabled"] = Value::boolean(app.cache_size_enabled);
+                (*out.map)["age_enabled"] = Value::boolean(app.cache_age_enabled);
+                (*out.map)["size_gb"] = Value::number(app.cache_size_gb);
+                (*out.map)["age_days"] = Value::number(app.cache_age_days);
+                (*out.map)["bytes"] = Value::number(static_cast<double>(app.cache_scan.bytes));
+                (*out.map)["folders"] = Value::number(static_cast<double>(app.cache_scan.entries.size()));
+                (*out.map)["busy"] = Value::boolean(app.cache_job || app.cache_scan_requested || app.cache_cleanup_requested ||
+                    app.cache_force_requested || app.cache_force_active);
+                (*out.map)["status"] = Value::string(app.cache_status);
+                (*out.map)["path"] = Value::string(path_to_u8(cache_directory()));
+                return out;
+            });
     env.add("render_settings", "render_settings(map?) -> current render settings", 0, 1,
             [&sh](Vm& vm, std::vector<Value>& a) {
                 auto& s = sh.app->export_ui;
@@ -16287,6 +16503,7 @@ void register_ops_app(ScriptHost& sh) {
                 if (!a[0].is_str()) return op_err(vm, "expected output path");
                 auto& app = *sh.app;
                 media::ExportRequest request;
+                if (app.cache_force_active) return op_err(vm, "wait for the cache rebuild before exporting");
                 request.render = app.export_ui.request.render;
                 request.source = app.scope_look;
                 if (a.size() > 1) {
@@ -16327,6 +16544,7 @@ void register_ops_app(ScriptHost& sh) {
             1, 1, [&sh](Vm& vm, std::vector<Value>& a) {
                 if (!a[0].is_str()) return op_err(vm, "export_mp4(path)");
                 AppState& app = *sh.app;
+                if (app.cache_force_active) return op_err(vm, "wait for the cache rebuild before exporting");
                 if (!app.has_timeline())
                     return op_err(vm, "nothing to export");
                 std::filesystem::path out = u8_to_path(a[0].as_str());
@@ -19585,8 +19803,62 @@ void settings_hit(AppState& app, const std::string& hit, ui::Context& ctx,
     auto rest = [&](const char* p) { return hit.substr(std::strlen(p)); };
     auto focus_name = [&]() { ui::text_input_focus(ctx, &s.name_state); };
     auto focus_step = [&]() { ui::text_input_focus(ctx, &s.step_state); };
-    if (hit == "tab:keybinds") {
-        s.tab = 0;
+    if (hit == "tab:keybinds" || hit == "tab:cache") {
+        settings_end_entry(s);
+        ctx.clear_focus();
+        s.tab = hit == "tab:cache" ? 1 : 0;
+        if (s.tab == 1) app.cache_scan_requested = true;
+        return;
+    }
+    if (hit == "settings-close") {
+        settings_close(app);
+        return;
+    }
+    if (hit == "cache-open") {
+        const auto dir = cache_directory();
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (hit == "cache-force") {
+        if (!app.cache_force_active) app.cache_force_requested = true;
+        return;
+    }
+    if (hit == "cache-refresh" || hit == "cache-clear") {
+        if (app.cache_force_active) return;
+        app.cache_status.clear();
+        app.cache_scan_requested = true;
+        if (hit == "cache-clear") {
+            app.cache_cleanup_requested = true;
+            app.cache_clear_all = true;
+        }
+        return;
+    }
+    if (hit == "cache-save") {
+        auto read = [](const std::string& text, uint32_t max, uint32_t& out) {
+            if (text.empty() || text.size() > 6) return false;
+            uint32_t value = 0;
+            for (char c : text) {
+                if (c < '0' || c > '9') return false;
+                value = value * 10 + static_cast<uint32_t>(c - '0');
+            }
+            if (!value || value > max) return false;
+            out = value;
+            return true;
+        };
+        uint32_t size = 0, days = 0;
+        if (!read(s.cache_size.buf, 65536, size) || !read(s.cache_age.buf, 36500, days)) {
+            s.cache_size.set(std::to_string(app.cache_size_gb));
+            s.cache_age.set(std::to_string(app.cache_age_days));
+            save_ui_prefs(app);
+            app.cache_status = "use 1-65536 GB and 1-36500 days";
+            return;
+        }
+        app.cache_size_gb = size;
+        app.cache_age_days = days;
+        save_ui_prefs(app);
+        app.cache_status = "cache settings saved";
         return;
     }
     if (starts("set:")) {
@@ -19926,7 +20198,7 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     const float ph = std::min(viewport.h * 0.78f, viewport.h - 64.0f);
     const Vec2 pos{std::round((viewport.w - pw) * 0.5f),
                    std::round((viewport.h - ph) * 0.42f)};
-    size_t need = 8 + static_cast<size_t>(kCompleteShown);
+    size_t need = 20 + static_cast<size_t>(kCompleteShown);
     for (const auto& [name, steps] : app.macros) need += 7 + steps.size() * 4;
     need += app.keybinds.size() * 2 + action_registry().size();
     if (s.row_buttons.size() < need) s.row_buttons.resize(need);
@@ -20011,6 +20283,7 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                                 Label(arena, text, head)));
     };
 
+    if (s.tab == 0) {
     heading("macro");
     for (const auto& [name, steps] : app.macros) {
         if (!settings_filter_hits(app, name)) continue;
@@ -20105,6 +20378,8 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
                  chord_btn(std::string("action:") + a->id,
                            std::string("set:action:") + a->id)}));
 
+    }
+
     TextInputOpts fo;
     fo.prefix = "filter: ";
     fo.probe = "filter";
@@ -20122,10 +20397,85 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
     content_col.height = SizeSpec::fill();
     content_col.padding = Edges{14.0f, 40.0f, 14.0f, 14.0f};
     LayoutNode* content = VStack(arena, content_col, {filter, list});
+    if (s.tab == 1) {
+        rows.clear();
+        row_opts.gap = 8;
+        const float label_width = 150;
+        const float action_width = 92;
+        heading("disk cache");
+        char usage[80];
+        std::snprintf(usage, sizeof(usage), "%.2f GB (%zu bundles)",
+            app.cache_scan.bytes / double(uint64_t{1} << 30), app.cache_scan.entries.size());
+        auto row = [&](const char* label, LayoutNode* control) {
+            rows.push_back(HStack(arena, row_opts, {
+                SizedBox(arena, SizeSpec::fixed(label_width), SizeSpec{}, Label(arena, label, dim)),
+                control}));
+        };
+        row("current size", HStack(arena, row_opts, {
+            SizedBox(arena, SizeSpec::fill(), SizeSpec{}, Label(arena, dup(usage))),
+            fixed_btn("refresh", "cache-refresh", "cache-refresh", action_width, false)}));
+        ButtonOpts path_opts;
+        path_opts.width = SizeSpec::fill();
+        path_opts.align_left = true;
+        path_opts.probe = "cache-path";
+        const auto path = path_to_u8(cache_directory());
+        path_opts.tooltip = dup(path);
+        row("location", HStack(arena, row_opts, {
+            Button(arena, path, bstate(), hit("cache-open"), path_opts),
+            fixed_btn("open folder", "cache-open", "cache-open", action_width, false)}));
+        heading("automatic cleanup");
+        auto limit = [&](const char* label, bool* enabled, TextField* field,
+                         TextInputState* state, const char* probe, const char* unit) {
+            TextInputOpts options;
+            options.probe = probe;
+            options.out_commit = hit("cache-save");
+            options.out_blur = hit("cache-save");
+            StackOpts unit_opts = row_opts;
+            unit_opts.padding.l = th.control_text_inset;
+            rows.push_back(HStack(arena, row_opts, {
+                SizedBox(arena, SizeSpec::fixed(label_width), SizeSpec{},
+                    Checkbox(arena, label, enabled, bstate(), hit("cache-save"))),
+                TextInput(arena, field, state, options),
+                SizedBox(arena, SizeSpec::fixed(action_width), SizeSpec{},
+                    HStack(arena, unit_opts, {Label(arena, unit, dim)}))}));
+        };
+        limit("size limit", &app.cache_size_enabled, &s.cache_size, &s.cache_size_state, "cache-size", "GB");
+        limit("unused for", &app.cache_age_enabled, &s.cache_age, &s.cache_age_state, "cache-age", "days");
+        rows.push_back(Label(arena, "Checks every 5 minutes. Oldest unused bundles go first.", small_dim));
+        rows.push_back(Separator(arena));
+        rows.push_back(HStack(arena, row_opts, {
+            Spacer(arena), fixed_btn("clear unused", "cache-clear", "cache-clear", action_width, false),
+            fixed_btn("force clear", "cache-force", "cache-force", action_width, false)}));
+        rows.push_back(Label(arena, "Media used this session stays cached for undo and preview.", small_dim));
+        rows.push_back(Label(arena, "Active work and recovery files stay protected.", small_dim));
+        rows.push_back(Label(arena, "Protected files can keep the cache above its size limit.", small_dim));
+        rows.push_back(Label(arena, "Force clear rebuilds media needed by the open project.", small_dim));
+        std::string cache_status = app.cache_job ? "working..." : app.cache_status;
+        if (app.cache_job && app.cache_job->force) {
+            const auto& progress = app.cache_job->progress;
+            cache_status = "clearing and rebuilding cache: " + std::to_string(progress.frames_done.load()) +
+                " / " + std::to_string(progress.frames_total.load()) + " frames";
+        }
+        rows.push_back(Label(arena, cache_status, dim));
+        list_col.gap = 10;
+        list_col.padding = Edges{0, 0, 8, 0};
+        list = ScrollAreaV(arena, &s.cache_scroll, VStackDyn(arena, list_col, rows));
+        ButtonOpts close;
+        close.width = SizeSpec::fixed(22);
+        close.framed = true;
+        close.probe = "settings-close";
+        auto* header = HStack(arena, row_opts, {Heading(arena, "cache"), Spacer(arena),
+            IconButton(arena, Icon::Close, bstate(), hit("settings-close"), close)});
+        content_col.padding.t = 12;
+        content = VStack(arena, content_col, {header, list});
+    }
     ButtonOpts tab;
     tab.width = SizeSpec::fill();
     tab.active = s.tab == 0;
     tab.probe = "tab:keybinds";
+    ButtonOpts cache_tab = tab;
+    cache_tab.active = s.tab == 1;
+    cache_tab.probe = "tab:cache";
     StackOpts tabs_col;
     tabs_col.gap = 16.0f;
     tabs_col.cross_align = AlignMode::Stretch;
@@ -20136,7 +20486,8 @@ void build_settings(ui::LayoutArena& arena, AppState& app, FrameUi& out,
         VStack(arena, tabs_col,
                {Heading(arena, "settings"),
                 Button(arena, "keybinds", &s.tab_button, hit("tab:keybinds"),
-                       tab)}));
+                       tab),
+                Button(arena, "cache", &s.cache_tab_button, hit("tab:cache"), cache_tab)}));
     PanelOpts rule_opts;
     rule_opts.outline = false;
     rule_opts.corner_radius = 0.0f;
@@ -20535,7 +20886,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     app.keybinds = default_keybinds();
     load_ui_prefs(app);
     rescan_presets(app);
-    app.cache_bytes = scan_cache_bytes();
 
     // The worker owns the preview engine. The UI thread must not touch it.
     RenderWorker render_worker(renderer->device(), app.player,
@@ -20606,6 +20956,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             return true;
         };
         std::wstring script_arg;
+        std::wstring cache_arg;
+        if (take_flag(L"--cache-dir", &cache_arg) && !cache_arg.empty()) {
+            std::error_code ec;
+            cache_directory_override = std::filesystem::absolute(cache_arg, ec).lexically_normal();
+            if (ec) return 2;
+        }
         if (take_flag(L"--script-exit", nullptr))
             script_host.exit_when_done = true;
         if (take_flag(L"--script", &script_arg))
@@ -20637,7 +20993,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             return 2;
     } else {
         const std::filesystem::path unsaved =
-            executable_dir() / "cache" / "untitled.autosave.json";
+            cache_directory() / "untitled.autosave.json";
         std::error_code ec;
         if (std::filesystem::exists(unsaved, ec)) {
             ConfirmDialog d;
@@ -20914,7 +21270,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
                     app.video_pass_pending.push_back(src);
             }
         }
-        if (!app.import && !app.video_pass_pending.empty()) {
+        if (!app.cache_force_active && !app.import && !app.video_pass_pending.empty()) {
             const std::filesystem::path src = app.video_pass_pending.back();
             app.video_pass_pending.pop_back();
             std::wstring key = src.native();
@@ -26091,40 +26447,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
             if (auto folder = platform::show_folder_dialog(window.get()))
                 import_folder_as_bin(app, *folder);
         }
-        if (frame_ui.cache_open_clicked && *frame_ui.cache_open_clicked) {
-            const std::wstring dir =
-                (executable_dir() / "cache").wstring();
-            ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr,
-                          SW_SHOWNORMAL);
-        }
-        if (frame_ui.cache_clear_clicked &&
-            *frame_ui.cache_clear_clicked) {
-            // Keep open-project bundles. The filter spares autosave files.
-            const std::filesystem::path root = executable_dir() / "cache";
-            std::vector<std::filesystem::path> keep;
-            for (const doc::Asset& a : app.document.assets)
-                if (!a.path.empty()) keep.push_back(bundle_dir_for(a.path));
-            std::error_code ec;
-            uint64_t removed = 0;
-            for (auto it = std::filesystem::directory_iterator(root, ec);
-                 !ec && it != std::filesystem::directory_iterator();
-                 it.increment(ec)) {
-                if (!it->is_directory(ec)) continue;
-                bool kept = false;
-                for (const std::filesystem::path& k : keep)
-                    if (it->path() == k) {
-                        kept = true;
-                        break;
-                    }
-                if (kept) continue;
-                std::error_code rec_ec;
-                removed +=
-                    std::filesystem::remove_all(it->path(), rec_ec);
-            }
-            app.cache_bytes = scan_cache_bytes();
-            app.status =
-                "cache cleared (" + std::to_string(removed) + " files)";
-        }
+        tick_cache(app);
         if (!app.status.empty() && app.status != app.status_log_last) {
             app.status_log_last = app.status;
             app.status_log.push_back(app.status);
@@ -26736,6 +27059,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     if (app.export_job) app.export_job->progress.cancel = true;
     if (app.track_job) app.track_job->cancel = true;
     if (app.audio_analysis_job) app.audio_analysis_job->cancel = true;
+    if (app.cache_job) app.cache_job->progress.cancel = true;
     app.render_worker = nullptr;
     app.thumb_worker = nullptr;
     if (app.import)
@@ -26766,6 +27090,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     sd = std::chrono::steady_clock::now();
     app.scope_job.reset();
     app.export_job.reset();
+    app.cache_job.reset();
     log_info("shutdown: scope/export %.0f ms", ms_since(sd));
     sd = std::chrono::steady_clock::now();
     app.track_job.reset();
