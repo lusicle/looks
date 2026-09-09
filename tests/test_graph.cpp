@@ -5,6 +5,7 @@
 
 #include "doc/command.h"
 #include "doc/effects.h"
+#include "doc/group_commands.h"
 #include "doc/layer_commands.h"
 #include "doc/stack_commands.h"
 #include "doc_fixture.h"
@@ -52,17 +53,98 @@ TEST(graph_topo_linear_chain) {
     CHECK_EQ(order[2], 0);
 }
 
+TEST(mode_analysis_uses_full_input_and_prunes_downstream) {
+    auto doc = doc_with_look();
+    doc.fps = 30;
+    auto& look = doc.looks[0];
+    look.sources[0].asset = bind_asset(doc, 900);
+    look.duration = 300;
+    look.trim_in = 120;
+    look.trim_out = 180;
+    auto before = make_effect(doc, EffectType::Invert);
+    auto mode = make_effect(doc, EffectType::Mode);
+    auto after = make_effect(doc, EffectType::Feedback);
+    look.effects = {before, mode, after};
+    look.links = {{look.sources[0].id, before.id, 0}, {before.id, mode.id, 0},
+        {mode.id, after.id, 0}, {after.id, 0, 0}};
+    CHECK_EQ(looks::gfx::mode_input_length(doc, look.id, mode.id), 900u);
+    const auto samples = looks::gfx::mode_sample_frames(900, 64);
+    CHECK_EQ(samples.front(), 0u);
+    CHECK_EQ(samples.back(), 899u);
+    CHECK_EQ(samples.size(), size_t{64});
+    CHECK_EQ(looks::gfx::mode_sample_frames(2, 64).size(), size_t{2});
+    auto graph = compile_graph(doc, look.id, 0, 0, 0, 0, false, mode.id);
+    CHECK(graph.valid);
+    int effects = 0;
+    for (int index : graph.order)
+        if (graph.nodes[index].kind == GraphNode::Kind::Effect) {
+            CHECK_EQ(graph.nodes[index].effect_index, 0);
+            ++effects;
+        }
+    CHECK_EQ(effects, 1);
+    CHECK(graph.thumb_taps.empty());
+    const auto signature = looks::gfx::mode_signature(doc, look.id, mode.id);
+    look.effects[2].params[0] = 0.2f;
+    look.effects[1].wet = 0.4f;
+    look.effects[1].node_x = 600;
+    CHECK_EQ(looks::gfx::mode_signature(doc, look.id, mode.id), signature);
+    look.effects[0].wet = 0.5f;
+    CHECK(looks::gfx::mode_signature(doc, look.id, mode.id) != signature);
+}
+
+TEST(mode_span_follows_offset_and_requires_a_finite_generator) {
+    auto doc = doc_with_look();
+    auto& look = doc.looks[0];
+    const auto source = look.sources[0].id;
+    look.sources[0].asset = bind_asset(doc, 900);
+    auto offset = make_effect(doc, EffectType::Offset);
+    auto mode = make_effect(doc, EffectType::Mode);
+    look.effects = {offset, mode};
+    look.links = {{source, offset.id, 0}, {offset.id, mode.id, 0}, {mode.id, 0, 0}};
+    look.effects[0].params[0] = 100;
+    CHECK_EQ(looks::gfx::mode_input_length(doc, look.id, mode.id), 800u);
+    look.effects[0].params[0] = -100;
+    CHECK_EQ(looks::gfx::mode_input_length(doc, look.id, mode.id), 1000u);
+    look.effects[0].bypass = true;
+    CHECK_EQ(looks::gfx::mode_input_length(doc, look.id, mode.id), 900u);
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    look.duration = 0;
+    CHECK_EQ(looks::gfx::mode_input_length(doc, look.id, mode.id), 0u);
+    look.duration = 30;
+    CHECK_EQ(looks::gfx::mode_input_length(doc, look.id, mode.id), 30u);
+}
+
+TEST(mode_signature_tracks_group_matte_connection_settings) {
+    auto doc = doc_with_look();
+    auto& look = doc.looks[0];
+    auto before = make_effect(doc, EffectType::Invert);
+    auto mode = make_effect(doc, EffectType::Mode);
+    looks::doc::Group group;
+    group.id = doc.next_effect_id++;
+    group.face_out = before.id;
+    before.group_id = group.id;
+    auto matte = looks::doc::make_source(doc, looks::doc::SourceKind::Solid);
+    look.sources.push_back(matte);
+    look.groups = {group};
+    look.effects = {before, mode};
+    look.links = {{look.sources[0].id, before.id, 0}, {before.id, mode.id, 0},
+        {matte.id, group.id, 1}, {mode.id, 0, 0}};
+    const auto signature = looks::gfx::mode_signature(doc, look.id, mode.id);
+    look.links[2].blend = looks::doc::BlendMode::Multiply;
+    CHECK(looks::gfx::mode_signature(doc, look.id, mode.id) != signature);
+}
+
 TEST(graph_preview_selection_does_not_change_render_demands) {
     Document doc = doc_with_look();
     doc.canvas_w = 640;
     doc.canvas_h = 480;
     auto& look = doc.looks[0];
-    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
-    const auto source = look.layers[0].id;
-    auto other = looks::doc::make_layer(doc, looks::doc::LayerSourceKind::Shape);
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    const auto source = look.sources[0].id;
+    auto other = looks::doc::make_source(doc, looks::doc::SourceKind::Shape);
     const auto effect = make_effect(doc, EffectType::Blur);
-    other.stack.push_back(effect);
-    look.layers.push_back(other);
+    look.effects.push_back(effect);
+    look.sources.push_back(other);
     look.links = {{source, 0, 0}, {other.id, effect.id, 0}};
     const auto composite = compile_graph(doc, look.id, 0);
     const auto expected = looks::gfx::render_demands(doc, composite,
@@ -82,28 +164,62 @@ TEST(graph_deleted_source_keeps_connected_effects_live) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
     auto first = make_effect(doc, EffectType::Blur);
-    look.layers[0].stack.push_back(first);
-    auto other = looks::doc::make_layer(doc, looks::doc::LayerSourceKind::Solid);
-    look.layers.push_back(other);
-    look.links = {{look.layers[0].id, first.id, 0}, {other.id, first.id, 0}, {first.id, 0, 0}};
+    look.effects.push_back(first);
+    auto other = looks::doc::make_source(doc, looks::doc::SourceKind::Solid);
+    look.sources.push_back(other);
+    look.links = {{look.sources[0].id, first.id, 0}, {other.id, first.id, 0}, {first.id, 0, 0}};
     looks::doc::UndoStack undo;
-    undo.execute(doc, looks::doc::remove_layer_command(look.id, 0));
+    undo.execute(doc, looks::doc::remove_source_command(look.id, look.sources[0].id));
     auto graph = compile_graph(doc, look.id, 0);
     CHECK(graph.valid);
     bool found = false;
     for (const auto& n : graph.nodes)
-        if (n.kind == GraphNode::Kind::Effect && n.layer_index == 0 && n.effect_index == 0)
+        if (n.kind == GraphNode::Kind::Effect && n.effect_index == 0)
             found = true;
     CHECK(found);
+}
+
+TEST(graph_solo_uses_the_whole_look_and_ignores_bypassed_groups) {
+    Document doc = doc_with_look();
+    auto& look = doc.looks[0];
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    auto a = make_effect(doc, EffectType::Invert);
+    auto b = make_effect(doc, EffectType::Blur);
+    auto group = looks::doc::make_group(doc, "solo group");
+    b.group_id = group.id;
+    b.solo = true;
+    group.face_out = b.id;
+    look.groups.push_back(group);
+    look.effects = {a, b};
+    look.links = {{look.sources[0].id, a.id, 0}, {a.id, b.id, 0}, {b.id, 0, 0}};
+    auto active = [&]() {
+        const auto graph = compile_graph(doc, look.id, 0);
+        CHECK(graph.valid);
+        std::vector<int> ids;
+        for (const auto& n : graph.nodes)
+            if (n.kind == GraphNode::Kind::Effect) ids.push_back(n.effect_index);
+        return ids;
+    };
+    CHECK(active() == std::vector<int>{1});
+    look.groups[0].bypass = true;
+    CHECK(active() == std::vector<int>{0});
+    look.groups[0].bypass = false;
+    look.effects[1].bypass = true;
+    CHECK(active() == std::vector<int>{0});
+    look.effects[1].bypass = false;
+    look.effects[0].solo = true;
+    CHECK(active() == (std::vector<int>{0, 1}));
 }
 
 TEST(graph_motion_uses_and_shares_the_upstream_image) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = looks::doc::LayerSourceKind::Solid;
-    layer.stack.push_back(make_effect(doc, EffectType::RollingShutter));
-    layer.stack.push_back(make_effect(doc, EffectType::Datamosh));
+    auto& layer = look.sources[0];
+    layer.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::RollingShutter));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Datamosh));
+    look.links = {{layer.id, look.effects[0].id, 0},
+        {look.effects[0].id, look.effects[1].id, 0}, {look.effects[1].id, 0, 0}};
     auto graph = compile_graph(doc, look.id, 0);
     CHECK(graph.valid);
     int flows = 0;
@@ -118,9 +234,9 @@ TEST(graph_motion_uses_and_shares_the_upstream_image) {
         }
     }
     CHECK_EQ(flows, 2);
-    look.links = {{layer.id, layer.stack[0].id, 0},
-                  {layer.id, layer.stack[1].id, 0},
-                  {layer.stack[0].id, 0, 0}, {layer.stack[1].id, 0, 0}};
+    look.links = {{layer.id, doc.looks[0].effects[0].id, 0},
+                  {layer.id, doc.looks[0].effects[1].id, 0},
+                  {doc.looks[0].effects[0].id, 0, 0}, {doc.looks[0].effects[1].id, 0, 0}};
     graph = compile_graph(doc, look.id, 1);
     CHECK(graph.valid);
     flows = 0;
@@ -145,14 +261,14 @@ TEST(graph_topo_diamond) {
 TEST(graph_anaglyph_keeps_the_right_image_separate_from_the_matte) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
-    look.layers[0].stack.push_back(make_effect(doc, EffectType::Anaglyph));
-    const auto left = look.layers[0].id;
-    const auto fx = look.layers[0].stack[0].id;
-    looks::doc::Layer right;
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    look.effects.push_back(make_effect(doc, EffectType::Anaglyph));
+    const auto left = look.sources[0].id;
+    const auto fx = look.effects[0].id;
+    looks::doc::Source right;
     right.id = doc.next_effect_id++;
-    right.source = looks::doc::LayerSourceKind::Gradient;
-    look.layers.push_back(right);
+    right.source = looks::doc::SourceKind::Gradient;
+    look.sources.push_back(right);
     look.links = {{left, fx, 0}, {right.id, fx, 2}, {fx, 0, 0}};
     const auto graph = compile_graph(doc, look.id, 0);
     CHECK(graph.valid);
@@ -163,7 +279,7 @@ TEST(graph_anaglyph_keeps_the_right_image_separate_from_the_matte) {
         ++effects;
         CHECK_EQ(n.inputs.size(), size_t{2});
         CHECK(n.inputs[0] != n.inputs[1]);
-        CHECK_EQ(graph.nodes[static_cast<size_t>(n.inputs[1])].layer_index, 1);
+        CHECK_EQ(graph.nodes[static_cast<size_t>(n.inputs[1])].source_index, 1);
     }
     CHECK_EQ(effects, 1);
 }
@@ -171,10 +287,10 @@ TEST(graph_anaglyph_keeps_the_right_image_separate_from_the_matte) {
 TEST(graph_jitter_camera_motion_is_independent_of_content) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
-    look.layers[0].stack.push_back(make_effect(doc, EffectType::Jitter));
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    look.effects.push_back(make_effect(doc, EffectType::Jitter));
     for (int mode = 0; mode < 4; ++mode) {
-        look.layers[0].stack[0].params[2] = static_cast<float>(mode);
+        look.effects[0].params[2] = static_cast<float>(mode);
         const auto graph = compile_graph(doc, look.id, 0);
         CHECK(graph.valid);
         int flows = 0;
@@ -199,44 +315,51 @@ TEST(graph_topo_detects_cycle) {
 TEST(graph_live_branch_survives_an_empty_peer) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = looks::doc::LayerSourceKind::Solid;
-    layer.stack.push_back(make_effect(doc, EffectType::Invert));
-    layer.stack.push_back(make_effect(doc, EffectType::Blur));
-    const uint64_t empty = layer.stack[0].id, live = layer.stack[1].id;
+    auto& layer = look.sources[0];
+    layer.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Invert));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Blur));
+    const uint64_t empty = doc.looks[0].effects[0].id, live = doc.looks[0].effects[1].id;
     look.links = {{layer.id, live, 0}, {empty, live, 0}, {live, 0, 0}};
     for (int order = 0; order < 2; ++order) {
         const auto g = compile_graph(doc, look.id, 0);
         CHECK(g.valid);
         CHECK(g.nodes[g.output].kind == GraphNode::Kind::Effect);
         if (g.nodes[g.output].kind == GraphNode::Kind::Effect)
-            CHECK_EQ(look.layers[0].stack[g.nodes[g.output].effect_index].id, live);
-        std::reverse(layer.stack.begin(), layer.stack.end());
+            CHECK_EQ(look.effects[g.nodes[g.output].effect_index].id, live);
+        std::reverse(doc.looks[0].effects.begin(), doc.looks[0].effects.end());
     }
 }
 
 TEST(graph_long_bypass_chain_keeps_its_source) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = looks::doc::LayerSourceKind::Solid;
+    auto& layer = look.sources[0];
+    layer.source = looks::doc::SourceKind::Solid;
     for (int i = 0; i < 100; ++i) {
-        layer.stack.push_back(make_effect(doc, EffectType::Invert));
-        layer.stack.back().bypass = true;
+        doc.looks[0].effects.push_back(make_effect(doc, EffectType::Invert));
+        doc.looks[0].effects.back().bypass = true;
     }
+    look.links.clear();
+    uint64_t previous = layer.id;
+    for (const auto& fx : look.effects) {
+        look.links.push_back({previous, fx.id, 0});
+        previous = fx.id;
+    }
+    look.links.push_back({previous, 0, 0});
     const auto g = compile_graph(doc, look.id, 0);
     CHECK(g.valid);
-    CHECK_EQ(g.nodes[g.output].layer_index, 0);
+    CHECK_EQ(g.nodes[g.output].source_index, 0);
 }
 
 TEST(graph_rejects_main_and_mask_cycles) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = looks::doc::LayerSourceKind::Solid;
-    layer.stack.push_back(make_effect(doc, EffectType::Invert));
-    layer.stack.push_back(make_effect(doc, EffectType::Blur));
-    const uint64_t a = layer.stack[0].id, b = layer.stack[1].id;
+    auto& layer = look.sources[0];
+    layer.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Invert));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Blur));
+    const uint64_t a = doc.looks[0].effects[0].id, b = doc.looks[0].effects[1].id;
     look.links = {{a, b, 0}, {b, a, 0}, {a, 0, 0}};
     CHECK(!compile_graph(doc, look.id, 0).valid);
     look.links = {{layer.id, a, 0}, {a, layer.id, 1}, {a, 0, 0}};
@@ -246,21 +369,21 @@ TEST(graph_rejects_main_and_mask_cycles) {
 TEST(graph_group_mix_survives_a_bypassed_face) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = looks::doc::LayerSourceKind::Solid;
-    layer.stack.push_back(make_effect(doc, EffectType::Invert));
-    layer.stack.push_back(make_effect(doc, EffectType::Blur));
+    auto& layer = look.sources[0];
+    layer.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Invert));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Blur));
     looks::doc::Group group;
     group.id = doc.next_effect_id++;
     group.inputs = {doc.next_effect_id++};
-    group.face_out = layer.stack[1].id;
+    group.face_out = doc.looks[0].effects[1].id;
     group.wet = 0.25f;
-    layer.groups.push_back(group);
-    for (auto& fx : layer.stack) fx.group_id = group.id;
-    layer.stack[1].bypass = true;
+    doc.looks[0].groups.push_back(group);
+    for (auto& fx : doc.looks[0].effects) fx.group_id = group.id;
+    doc.looks[0].effects[1].bypass = true;
     look.links = {{layer.id, group.inputs[0], 0},
-        {group.inputs[0], layer.stack[0].id, 0},
-        {layer.stack[0].id, group.face_out, 0}, {group.face_out, 0, 0}};
+        {group.inputs[0], doc.looks[0].effects[0].id, 0},
+        {doc.looks[0].effects[0].id, group.face_out, 0}, {group.face_out, 0, 0}};
     const auto g = compile_graph(doc, look.id, 0);
     CHECK(g.valid);
     CHECK(g.nodes[g.output].kind == GraphNode::Kind::GroupMix);
@@ -269,16 +392,16 @@ TEST(graph_group_mix_survives_a_bypassed_face) {
 TEST(graph_offset_keeps_source_mask_and_multiple_inputs) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    look.layers[0].asset = bind_asset(doc);
-    look.layers[0].stack.push_back(make_effect(doc, EffectType::Offset));
-    auto& offset = look.layers[0].stack[0];
+    look.sources[0].asset = bind_asset(doc);
+    look.effects.push_back(make_effect(doc, EffectType::Offset));
+    auto& offset = look.effects[0];
     offset.params[0] = 10.0f;
     offset.params[1] = 2.0f;
-    const uint64_t source = look.layers[0].id, fx = offset.id;
-    looks::doc::Layer mask;
+    const uint64_t source = look.sources[0].id, fx = offset.id;
+    looks::doc::Source mask;
     mask.id = doc.next_effect_id++;
-    mask.source = looks::doc::LayerSourceKind::Solid;
-    look.layers.push_back(mask);
+    mask.source = looks::doc::SourceKind::Solid;
+    look.sources.push_back(mask);
     look.links = {{source, fx, 0}, {mask.id, source, 1}, {fx, 0, 0}};
     auto graph = compile_graph(doc, look.id, 20);
     CHECK(graph.valid);
@@ -296,15 +419,15 @@ TEST(graph_offset_keeps_source_mask_and_multiple_inputs) {
 TEST(graph_motion_separates_different_merged_inputs) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    look.layers[0].source = looks::doc::LayerSourceKind::Solid;
-    const uint64_t a = look.layers[0].id;
-    looks::doc::Layer second;
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    const uint64_t a = look.sources[0].id;
+    looks::doc::Source second;
     second.id = doc.next_effect_id++;
-    second.source = looks::doc::LayerSourceKind::Gradient;
-    second.stack.push_back(make_effect(doc, EffectType::RollingShutter));
-    second.stack.push_back(make_effect(doc, EffectType::Datamosh));
-    const uint64_t x = second.stack[0].id, y = second.stack[1].id;
-    look.layers.push_back(second);
+    second.source = looks::doc::SourceKind::Gradient;
+    look.effects.push_back(make_effect(doc, EffectType::RollingShutter));
+    look.effects.push_back(make_effect(doc, EffectType::Datamosh));
+    const uint64_t x = look.effects[0].id, y = look.effects[1].id;
+    look.sources.push_back(second);
     look.links = {{a, x, 0}, {second.id, x, 0},
         {second.id, y, 0}, {a, y, 0}, {x, 0, 0}, {y, 0, 0}};
     const auto graph = compile_graph(doc, look.id, 0);
@@ -319,13 +442,13 @@ TEST(graph_motion_separates_different_merged_inputs) {
 TEST(graph_ports_keep_all_node_id_bits) {
     Document doc = doc_with_look();
     auto& look = doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = looks::doc::LayerSourceKind::Solid;
-    layer.stack.push_back(make_effect(doc, EffectType::Invert));
-    layer.stack.push_back(make_effect(doc, EffectType::Blur));
-    const uint64_t a = layer.stack[0].id;
-    layer.stack[1].id = a + (uint64_t{1} << 56);
-    const uint64_t b = layer.stack[1].id;
+    auto& layer = look.sources[0];
+    layer.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Invert));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Blur));
+    const uint64_t a = doc.looks[0].effects[0].id;
+    doc.looks[0].effects[1].id = a + (uint64_t{1} << 56);
+    const uint64_t b = doc.looks[0].effects[1].id;
     look.links = {{layer.id, a, 0}, {a, b, 0}, {b, 0, 0}};
     const auto graph = compile_graph(doc, look.id, 0);
     CHECK(graph.valid);
@@ -335,15 +458,15 @@ TEST(graph_ports_keep_all_node_id_bits) {
 }
 
 TEST(graph_compile_empty_stack) {
-    // Unbound media is dormant; layer_index -1 is the black display generator.
+    // Unbound media is dormant; source_index -1 is the black display generator.
     Document doc = doc_with_look();
     RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
     CHECK_EQ(graph.nodes.size(), size_t{1});
     CHECK(graph.nodes[0].kind == GraphNode::Kind::Generator);
-    CHECK_EQ(graph.nodes[0].layer_index, -1);
+    CHECK_EQ(graph.nodes[0].source_index, -1);
 
-    doc.looks[0].layers[0].asset = bind_asset(doc);
+    doc.looks[0].sources[0].asset = bind_asset(doc);
     RenderGraph bound = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(bound.valid);
     CHECK(bound.nodes[static_cast<size_t>(bound.output)].kind ==
@@ -352,11 +475,13 @@ TEST(graph_compile_empty_stack) {
 
 TEST(graph_audio_effects_compile_out_of_the_image_graph) {
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::AudioDelay));
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::Posterize));
+    doc.looks[0].links = {{doc.looks[0].sources[0].id, doc.looks[0].effects[0].id, 0},
+        {doc.looks[0].effects[0].id, doc.looks[0].effects[1].id, 0}, {doc.looks[0].effects[1].id, 0, 0}};
     RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g.valid);
     int effects = 0;
@@ -371,20 +496,22 @@ TEST(graph_audio_effects_compile_out_of_the_image_graph) {
 
 TEST(graph_compile_layers) {
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    looks::doc::Layer overlay;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    looks::doc::Source overlay;
     overlay.id = doc.next_effect_id++;
-    overlay.source = looks::doc::LayerSourceKind::Noise;
-    overlay.blend = looks::doc::BlendMode::Screen;
-    overlay.stack.push_back(make_effect(doc, EffectType::Pixelate));
-    doc.looks[0].layers.push_back(overlay);
-    looks::doc::Layer adjust;
+    overlay.source = looks::doc::SourceKind::Noise;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Pixelate));
+    doc.looks[0].sources.push_back(overlay);
+    looks::doc::Source adjust;
     adjust.id = doc.next_effect_id++;
-    adjust.source = looks::doc::LayerSourceKind::Media;
+    adjust.source = looks::doc::SourceKind::Media;
     adjust.asset = bind_asset(doc);
-    adjust.stack.push_back(make_effect(doc, EffectType::Grain));
-    doc.looks[0].layers.push_back(adjust);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Grain));
+    doc.looks[0].sources.push_back(adjust);
+    doc.looks[0].links.clear();
+    for (size_t i = 0; i < 3; ++i)
+        connect_test_chain(doc.looks[0], doc.looks[0].sources[i].id, {doc.looks[0].effects[i].id});
 
     RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g.valid);
@@ -397,12 +524,12 @@ TEST(graph_compile_layers) {
     CHECK_EQ(blends, 2);
     const GraphNode& out = g.nodes[static_cast<size_t>(g.output)];
     CHECK(out.kind == GraphNode::Kind::LayerBlend);
-    CHECK_EQ(out.layer_index, 2);
+    CHECK_EQ(out.source_index, -1);
     for (const GraphNode& n : g.nodes)
-        if (n.kind == GraphNode::Kind::Effect && n.layer_index == 2)
+        if (n.kind == GraphNode::Kind::Effect && n.effect_index == 2)
             CHECK(g.nodes[static_cast<size_t>(n.inputs[0])].kind ==
                   GraphNode::Kind::Source);
-    doc.looks[0].layers[1].visible = false;
+    doc.looks[0].sources[1].visible = false;
     RenderGraph g2 = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g2.valid);
     int generators2 = 0;
@@ -413,11 +540,11 @@ TEST(graph_compile_layers) {
 
 TEST(graph_compile_dormant_unwired) {
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
-    const uint64_t layer_id = doc.looks[0].layers[0].id;
-    doc.looks[0].links.push_back({layer_id, 0, 0});
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.looks[0].effects[0].id;
+    const uint64_t layer_id = doc.looks[0].sources[0].id;
+    doc.looks[0].links = {{layer_id, 0, 0}};
 
     RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g.valid);
@@ -445,29 +572,31 @@ TEST(graph_compile_dormant_unwired) {
     CHECK(g3.valid);
     CHECK(g3.nodes[static_cast<size_t>(g3.output)].kind ==
           GraphNode::Kind::Generator);
-    CHECK_EQ(g3.nodes[static_cast<size_t>(g3.output)].layer_index, -1);
+    CHECK_EQ(g3.nodes[static_cast<size_t>(g3.output)].source_index, -1);
 }
 
-TEST(graph_preview_layer_taps_the_chain_end) {
-    // The layer tap gives the chain end, and the node tap gives the head.
+TEST(graph_preview_source_taps_its_own_output) {
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Grain));
-    const uint64_t base_id = doc.looks[0].layers[0].id;
-    const uint64_t last_fx = doc.looks[0].layers[0].stack[1].id;
-    looks::doc::Layer solid;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Grain));
+    const uint64_t base_id = doc.looks[0].sources[0].id;
+    const uint64_t last_fx = doc.looks[0].effects[1].id;
+    looks::doc::Source solid;
     solid.id = doc.next_effect_id++;
-    solid.source = looks::doc::LayerSourceKind::Solid;
-    doc.looks[0].layers.push_back(solid);
+    solid.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].sources.push_back(solid);
     const uint64_t solid_id = solid.id;
-
-    // Synthesized wiring: the base chain ends at its last stack effect.
+    doc.looks[0].links.clear();
+    connect_test_chain(doc.looks[0], base_id, {doc.looks[0].effects[0].id, last_fx});
+    connect_test_chain(doc.looks[0], solid_id, {});
     RenderGraph by_node = compile_graph(doc, doc.looks[0].id, 0, last_fx);
     RenderGraph by_layer = compile_graph(doc, doc.looks[0].id, 0, 0, base_id);
     CHECK(by_node.valid);
     CHECK(by_node.preview >= 0);
-    CHECK_EQ(by_layer.preview, by_node.preview);
+    CHECK(by_layer.preview >= 0);
+    CHECK_EQ(by_layer.nodes[by_layer.preview].kind, GraphNode::Kind::Source);
+    CHECK_EQ(by_node.nodes[by_node.preview].effect_index, 1);
     // A bare layer's contribution IS its head: both taps agree there.
     RenderGraph solid_node = compile_graph(doc, doc.looks[0].id, 0, solid_id);
     RenderGraph solid_layer =
@@ -486,15 +615,16 @@ TEST(graph_preview_layer_taps_the_chain_end) {
 TEST(graph_preview_layer_resolves_a_mask_only_feed) {
     // The tap resolves the link leaving the layer, Output or not.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    const uint64_t base_id = doc.looks[0].layers[0].id;
-    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
-    looks::doc::Layer solid;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t base_id = doc.looks[0].sources[0].id;
+    const uint64_t fx_id = doc.looks[0].effects[0].id;
+    looks::doc::Source solid;
     solid.id = doc.next_effect_id++;
-    solid.source = looks::doc::LayerSourceKind::Solid;
-    doc.looks[0].layers.push_back(solid);
+    solid.source = looks::doc::SourceKind::Solid;
+    doc.looks[0].sources.push_back(solid);
     const uint64_t mask_id = solid.id;
+    doc.looks[0].links.clear();
     doc.looks[0].links.push_back({base_id, fx_id, 0});
     doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({mask_id, fx_id, 1});   // matte feed only
@@ -508,11 +638,14 @@ TEST(graph_preview_layer_resolves_a_mask_only_feed) {
 
 TEST(graph_compile_chain_and_bypass) {
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::RgbSplit));
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Pixelate));
-    doc.looks[0].layers[0].stack[1].bypass = true;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::RgbSplit));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Pixelate));
+    doc.looks[0].effects[1].bypass = true;
+    doc.looks[0].links.clear();
+    connect_test_chain(doc.looks[0], doc.looks[0].sources[0].id,
+        {doc.looks[0].effects[0].id, doc.looks[0].effects[1].id, doc.looks[0].effects[2].id});
 
     RenderGraph graph = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(graph.valid);
@@ -530,23 +663,23 @@ TEST(graph_compile_chain_and_bypass) {
 }
 
 TEST(graph_layer_matte_gates_the_head) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     // A port-1 wire gates the layer HEAD, so its whole stack sees the crop.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    Layer overlay;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    Source overlay;
     overlay.id = doc.next_effect_id++;
-    overlay.source = LayerSourceKind::Noise;
-    overlay.stack.push_back(make_effect(doc, EffectType::Vignette));
-    const uint64_t fx_id = overlay.stack[0].id;
-    doc.looks[0].layers.push_back(overlay);
-    Layer matte;
+    overlay.source = SourceKind::Noise;
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.looks[0].effects[0].id;
+    doc.looks[0].sources.push_back(overlay);
+    Source matte;
     matte.id = doc.next_effect_id++;
-    matte.source = LayerSourceKind::Shape;
-    doc.looks[0].layers.push_back(matte);
-    doc.looks[0].links.push_back({doc.looks[0].layers[0].id, 0, 0});
+    matte.source = SourceKind::Shape;
+    doc.looks[0].sources.push_back(matte);
+    doc.looks[0].links = {{doc.looks[0].sources[0].id, 0, 0}};
     doc.looks[0].links.push_back({overlay.id, fx_id, 0});
     doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({matte.id, overlay.id, 1});
@@ -577,19 +710,20 @@ TEST(graph_layer_matte_gates_the_head) {
 }
 
 TEST(graph_effect_matte_diamond) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     // A port-1 wire on an effect gates it with an extract and an apply.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
-    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
-    Layer matte;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    const uint64_t fx_id = doc.looks[0].effects[0].id;
+    Source matte;
     matte.id = doc.next_effect_id++;
-    matte.source = LayerSourceKind::Shape;
-    doc.looks[0].layers.push_back(matte);
-    doc.looks[0].links.push_back({doc.looks[0].layers[0].id, fx_id, 0});
+    matte.source = SourceKind::Shape;
+    doc.looks[0].sources.push_back(matte);
+    doc.looks[0].links.clear();
+    doc.looks[0].links.push_back({doc.looks[0].sources[0].id, fx_id, 0});
     doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({matte.id, fx_id, 1});
 
@@ -613,20 +747,21 @@ TEST(graph_effect_matte_diamond) {
 }
 
 TEST(graph_thumb_tap_follows_the_matte) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     // A card ends past its matte, so the thumbnail must tap the apply.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::Vignette));
-    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
-    const uint64_t src_id = doc.looks[0].layers[0].id;
-    Layer matte;
+    const uint64_t fx_id = doc.looks[0].effects[0].id;
+    const uint64_t src_id = doc.looks[0].sources[0].id;
+    Source matte;
     matte.id = doc.next_effect_id++;
-    matte.source = LayerSourceKind::Shape;
-    doc.looks[0].layers.push_back(matte);
+    matte.source = SourceKind::Shape;
+    doc.looks[0].sources.push_back(matte);
+    doc.looks[0].links.clear();
     doc.looks[0].links.push_back({src_id, fx_id, 0});
     doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({matte.id, fx_id, 1});
@@ -657,8 +792,10 @@ TEST(graph_thumb_tap_follows_the_matte) {
 TEST(graph_layer_transform_and_source_keys) {
     // A non-identity transform inserts a LayerTransform before the stack.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Vignette));
+    doc.looks[0].links.clear();
+    connect_test_chain(doc.looks[0], doc.looks[0].sources[0].id, {doc.looks[0].effects[0].id});
 
     RenderGraph plain = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(plain.valid);
@@ -668,7 +805,7 @@ TEST(graph_layer_transform_and_source_keys) {
     for (const GraphNode& n : plain.nodes)
         if (n.kind == GraphNode::Kind::Source) {
             ++sources;
-            CHECK_EQ(n.layer_index, 0);
+            CHECK_EQ(n.source_index, 0);
             CHECK(n.key != 0);
         }
     CHECK_EQ(sources, 1);
@@ -676,7 +813,7 @@ TEST(graph_layer_transform_and_source_keys) {
     CHECK(plain.nodes[static_cast<size_t>(plain.source)].kind ==
           GraphNode::Kind::Source);
 
-    doc.looks[0].layers[0].xf_rotate = 15.0f;
+    doc.looks[0].sources[0].xf_rotate = 15.0f;
     RenderGraph xf = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(xf.valid);
     int transforms = 0;
@@ -687,7 +824,7 @@ TEST(graph_layer_transform_and_source_keys) {
     for (const GraphNode& n : xf.nodes) {
         if (n.kind != GraphNode::Kind::LayerTransform) continue;
         ++transforms;
-        CHECK_EQ(n.layer_index, 0);
+        CHECK_EQ(n.source_index, 0);
         CHECK_EQ(n.inputs.size(), size_t{1});
         CHECK_EQ(n.inputs[0], source_node);
     }
@@ -700,45 +837,46 @@ TEST(graph_layer_transform_and_source_keys) {
 
 TEST(graph_time_culled_matte_reads_as_closed_gate) {
     // A time-culled matte closes the gate to black, not to unwired.
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     Document doc = doc_with_look();
     Asset asset;
     asset.id = doc.next_effect_id++;
     asset.frame_count = 100;
     doc.assets.push_back(asset);
-    doc.looks[0].layers[0].asset = asset.id;
+    doc.looks[0].sources[0].asset = asset.id;
 
     looks::doc::Look mask_look;
     mask_look.id = doc.next_effect_id++;
     mask_look.duration = 10;   // the mask ends at local 10
-    Layer shape;
+    Source shape;
     shape.id = doc.next_effect_id++;
-    shape.source = LayerSourceKind::Shape;
-    mask_look.layers.push_back(std::move(shape));
+    shape.source = SourceKind::Shape;
+    mask_look.links.push_back({shape.id, 0, 0});
+    mask_look.sources.push_back(std::move(shape));
     const uint64_t mask_look_id = mask_look.id;
     doc.looks.push_back(std::move(mask_look));
 
-    Layer mask;
+    Source mask;
     mask.id = doc.next_effect_id++;
-    mask.source = LayerSourceKind::LookRef;
+    mask.source = SourceKind::LookRef;
     mask.target = mask_look_id;
-    doc.looks[0].layers.push_back(mask);
-    const uint64_t mask_id = doc.looks[0].layers.back().id;
-    const uint64_t base_id = doc.looks[0].layers[0].id;
-    doc.looks[0].links.push_back({base_id, 0, 0});
+    doc.looks[0].sources.push_back(mask);
+    const uint64_t mask_id = doc.looks[0].sources.back().id;
+    const uint64_t base_id = doc.looks[0].sources[0].id;
+    doc.looks[0].links = {{base_id, 0, 0}};
     doc.looks[0].links.push_back({mask_id, base_id, 1});   // layer matte
 
     auto gate_feed = [&](uint32_t frame) -> int {
-        // Returns -2 for no gate, else the feed generator's layer_index.
-        // Layer index -1 is the black stand-in.
+        // Returns -2 for no gate, else the feed generator's source_index.
+        // Source index -1 is the black stand-in.
         const RenderGraph g = compile_graph(doc, doc.looks[0].id, frame);
         for (const GraphNode& n : g.nodes) {
             if (n.kind != GraphNode::Kind::MatteExtract) continue;
             const GraphNode& feed =
                 g.nodes[static_cast<size_t>(n.inputs[0])];
-            return feed.layer_index;
+            return feed.source_index;
         }
         return -2;
     };
@@ -749,18 +887,18 @@ TEST(graph_time_culled_matte_reads_as_closed_gate) {
 
 TEST(graph_generator_has_no_when_but_a_placed_look_does) {
     // A generator is always on: only a placement gives it a time window.
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = LayerSourceKind::Solid;
+    doc.looks[0].sources[0].source = SourceKind::Solid;
 
     auto gen_count = [&](uint64_t root, uint32_t frame) {
         const RenderGraph g = compile_graph(doc, root, frame);
         int n = 0;
         for (const GraphNode& node : g.nodes)
             if (node.kind == GraphNode::Kind::Generator &&
-                node.layer_index >= 0)
+                node.source_index >= 0)
                 ++n;
         return n;
     };
@@ -786,7 +924,7 @@ TEST(graph_media_source_culled_past_its_media) {
     asset.id = doc.next_effect_id++;
     asset.frame_count = 10;
     doc.assets.push_back(asset);
-    doc.looks[0].layers[0].asset = asset.id;
+    doc.looks[0].sources[0].asset = asset.id;
 
     auto source_count = [&](uint64_t root, uint32_t frame) {
         const RenderGraph g = compile_graph(doc, root, frame);
@@ -799,10 +937,10 @@ TEST(graph_media_source_culled_past_its_media) {
     CHECK_EQ(source_count(doc.looks[0].id, 9), 1);
     CHECK_EQ(source_count(doc.looks[0].id, 10), 0);
     // Slip shortens what remains of the media.
-    doc.looks[0].layers[0].slip = 4;
+    doc.looks[0].sources[0].slip = 4;
     CHECK_EQ(source_count(doc.looks[0].id, 5), 1);
     CHECK_EQ(source_count(doc.looks[0].id, 6), 0);
-    doc.looks[0].layers[0].slip = 0;
+    doc.looks[0].sources[0].slip = 0;
 
     looks::doc::Placement wp;
     wp.id = doc.next_effect_id++;
@@ -819,7 +957,7 @@ TEST(graph_media_source_culled_past_its_media) {
 TEST(graph_placement_transform_and_opacity) {
     // The lane over-blend carries Motion, so no transform node appears.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
     looks::doc::Sequence& seq = doc.root();
     looks::doc::Placement a;
     a.id = doc.next_effect_id++;
@@ -839,7 +977,7 @@ TEST(graph_placement_transform_and_opacity) {
         CHECK(n.kind != GraphNode::Kind::LayerTransform);
         if (n.kind == GraphNode::Kind::LayerBlend) {
             ++blends;
-            CHECK_EQ(n.layer_index, -1);
+            CHECK_EQ(n.source_index, -1);
             CHECK_EQ(n.p_shift_x, 0.25f);
             CHECK_EQ(n.p_scale, 0.5f);
             CHECK(std::fabs(n.p_rotate - 1.5707963f) < 1e-3f);
@@ -868,21 +1006,21 @@ TEST(graph_placement_transform_and_opacity) {
 TEST(graph_output_stacks_in_link_order) {
     // Stacking order is the link order, not the layer array order.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
-    looks::doc::Layer second;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
+    looks::doc::Source second;
     second.id = doc.next_effect_id++;
-    second.source = looks::doc::LayerSourceKind::Gradient;
-    doc.looks[0].layers.push_back(second);
-    const uint64_t l0 = doc.looks[0].layers[0].id;
-    const uint64_t l1 = doc.looks[0].layers[1].id;
+    second.source = looks::doc::SourceKind::Gradient;
+    doc.looks[0].sources.push_back(second);
+    const uint64_t l0 = doc.looks[0].sources[0].id;
+    const uint64_t l1 = doc.looks[0].sources[1].id;
     doc.looks[0].links = {{l0, 0, 0}, {l1, 0, 0}};
 
     auto top_layer = [&]() -> int {
         const RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
         int li = -2;
         for (const GraphNode& n : g.nodes)
-            if (n.kind == GraphNode::Kind::LayerBlend) li = n.layer_index;
-        return li;   // the LAST blend's layer = the top contribution
+            if (n.kind == GraphNode::Kind::LayerBlend) li = g.nodes[n.inputs[1]].source_index;
+        return li;
     };
     CHECK_EQ(top_layer(), 1);
     doc.looks[0].links = {{l1, 0, 0}, {l0, 0, 0}};
@@ -897,20 +1035,41 @@ TEST(graph_output_stacks_in_link_order) {
     CHECK_EQ(top_layer(), 0);
 }
 
+TEST(graph_bypassed_effect_thumbnail_uses_its_merged_input) {
+    auto doc = doc_with_look();
+    auto& look = doc.looks[0];
+    look.sources[0].source = looks::doc::SourceKind::Solid;
+    look.sources.push_back(looks::doc::make_source(doc, looks::doc::SourceKind::Noise));
+    auto effect = make_effect(doc, EffectType::BlendNode);
+    effect.bypass = true;
+    look.effects.push_back(effect);
+    look.links = {{look.sources[0].id, effect.id, 0},
+        {look.sources[1].id, effect.id, 0, looks::doc::BlendMode::Screen}, {effect.id, 0, 0}};
+    const auto graph = compile_graph(doc, look.id, 0);
+    bool found = false;
+    for (const auto& tap : graph.thumb_taps)
+        if (tap.first == effect.id) {
+            found = true;
+            CHECK_EQ(tap.second, graph.output);
+            CHECK(graph.nodes[tap.second].blend == looks::doc::BlendMode::Screen);
+        }
+    CHECK(found);
+}
+
 TEST(graph_effect_port_fan_in_merges_in_link_order) {
     // A fan-in port takes the composite, with the first link at the bottom.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
-    looks::doc::Layer second;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
+    looks::doc::Source second;
     second.id = doc.next_effect_id++;
-    second.source = looks::doc::LayerSourceKind::Gradient;
-    doc.looks[0].layers.push_back(second);
-    doc.looks[0].layers[0].stack.push_back(
+    second.source = looks::doc::SourceKind::Gradient;
+    doc.looks[0].sources.push_back(second);
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::Blur));
-    const uint64_t l0 = doc.looks[0].layers[0].id;
-    const uint64_t l1 = doc.looks[0].layers[1].id;
-    const uint64_t fx = doc.looks[0].layers[0].stack[0].id;
-    doc.looks[0].links = {{l0, fx, 0}, {l1, fx, 0}, {fx, 0, 0}};
+    const uint64_t l0 = doc.looks[0].sources[0].id;
+    const uint64_t l1 = doc.looks[0].sources[1].id;
+    const uint64_t fx = doc.looks[0].effects[0].id;
+    doc.looks[0].links = {{l0, fx, 0}, {l1, fx, 0, looks::doc::BlendMode::Multiply}, {fx, 0, 0}};
 
     const RenderGraph g = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(g.valid);
@@ -923,25 +1082,26 @@ TEST(graph_effect_port_fan_in_merges_in_link_order) {
     const int in = g.nodes[static_cast<size_t>(fx_node)].inputs[0];
     const GraphNode& merge = g.nodes[static_cast<size_t>(in)];
     CHECK(merge.kind == GraphNode::Kind::LayerBlend);
-    CHECK_EQ(merge.layer_index, 1);   // the top feed wears l1's blend
+    CHECK(merge.blend == looks::doc::BlendMode::Multiply);
+    CHECK_EQ(g.nodes[merge.inputs[1]].source_index, 1);
     const GraphNode& below = g.nodes[static_cast<size_t>(merge.inputs[0])];
     CHECK(below.kind == GraphNode::Kind::Generator);
-    CHECK_EQ(below.layer_index, 0);
+    CHECK_EQ(below.source_index, 0);
 }
 
 TEST(graph_reconnect_lands_in_place) {
     // reconnect_command replaces a link at its position in the fan-in.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
-    looks::doc::Layer second;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
+    looks::doc::Source second;
     second.id = doc.next_effect_id++;
-    second.source = looks::doc::LayerSourceKind::Gradient;
-    doc.looks[0].layers.push_back(second);
-    doc.looks[0].layers[0].stack.push_back(
+    second.source = looks::doc::SourceKind::Gradient;
+    doc.looks[0].sources.push_back(second);
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::Blur));
-    const uint64_t l0 = doc.looks[0].layers[0].id;
-    const uint64_t l1 = doc.looks[0].layers[1].id;
-    const uint64_t fx = doc.looks[0].layers[0].stack[0].id;
+    const uint64_t l0 = doc.looks[0].sources[0].id;
+    const uint64_t l1 = doc.looks[0].sources[1].id;
+    const uint64_t fx = doc.looks[0].effects[0].id;
     doc.looks[0].links = {{l0, 0, 0}, {l1, 0, 0}};
 
     looks::doc::UndoStack undo;
@@ -994,7 +1154,7 @@ TEST(graph_placement_anchor_math) {
 TEST(graph_measure_taps_selected_block_pre_motion) {
     // The measure tap reads the block image before its placement Motion.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
     looks::doc::Sequence& seq = doc.root();
     looks::doc::Placement a;
     a.id = doc.next_effect_id++;
@@ -1021,9 +1181,11 @@ TEST(graph_measure_taps_selected_block_pre_motion) {
 TEST(graph_before_strips_effects_keeps_composition) {
     // The before tree keeps Motion and opacity but drops effect stacks.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::Posterize));
+    doc.looks[0].links = {{doc.looks[0].sources[0].id, doc.looks[0].effects[0].id, 0},
+        {doc.looks[0].effects[0].id, 0, 0}};
     looks::doc::Sequence& seq = doc.root();
     looks::doc::Placement a;
     a.id = doc.next_effect_id++;
@@ -1053,7 +1215,7 @@ TEST(graph_before_strips_effects_keeps_composition) {
     reach(g.before, [&](const GraphNode& n) {
         CHECK(n.kind != GraphNode::Kind::Effect);
         if (n.kind == GraphNode::Kind::LayerBlend &&
-            n.layer_index == -1 && n.p_scale == 0.5f)
+            n.source_index == -1 && n.p_scale == 0.5f)
             motion = true;
     });
     CHECK(motion);
@@ -1094,16 +1256,17 @@ TEST(graph_source_fit_rect_preserves_aspect) {
 }
 
 TEST(graph_sequence_lanes_stack_alpha_over) {
-    // A lane blend has layer_index -1 because no look supplies a mode.
+    // A lane blend has source_index -1 because no look supplies a mode.
     // One lane makes no blend node at all.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
     looks::doc::Look second;
     second.id = doc.next_effect_id++;
-    looks::doc::Layer noise;
+    looks::doc::Source noise;
     noise.id = doc.next_effect_id++;
-    noise.source = looks::doc::LayerSourceKind::Noise;
-    second.layers.push_back(std::move(noise));
+    noise.source = looks::doc::SourceKind::Noise;
+    second.sources.push_back(std::move(noise));
+    second.links = {{second.sources[0].id, 0, 0}};
     const uint64_t second_id = second.id;
     doc.looks.push_back(std::move(second));
 
@@ -1131,7 +1294,7 @@ TEST(graph_sequence_lanes_stack_alpha_over) {
     for (const GraphNode& n : two.nodes)
         if (n.kind == GraphNode::Kind::LayerBlend) {
             ++overs;
-            CHECK_EQ(n.layer_index, -1);
+            CHECK_EQ(n.source_index, -1);
         }
     CHECK_EQ(overs, 1);
 
@@ -1146,12 +1309,12 @@ TEST(graph_sequence_lanes_stack_alpha_over) {
         const RenderGraph g = compile_graph(doc, doc.root_sequence, frame);
         int solids = 0, noises = 0;
         for (const GraphNode& n : g.nodes) {
-            if (n.kind != GraphNode::Kind::Generator || n.layer_index < 0)
+            if (n.kind != GraphNode::Kind::Generator || n.source_index < 0)
                 continue;
             const looks::doc::Look& l = doc.look(
                 g.instances[static_cast<size_t>(n.instance)].look);
-            if (l.layers[static_cast<size_t>(n.layer_index)].source ==
-                looks::doc::LayerSourceKind::Solid)
+            if (l.sources[static_cast<size_t>(n.source_index)].source ==
+                looks::doc::SourceKind::Solid)
                 ++solids;
             else
                 ++noises;
@@ -1165,18 +1328,18 @@ TEST(graph_sequence_lanes_stack_alpha_over) {
 }
 
 TEST(graph_displace_by_matte_second_input) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
-    doc.looks[0].layers[0].stack.push_back(make_effect(doc, EffectType::Displace));
-    const uint64_t fx_id = doc.looks[0].layers[0].stack[0].id;
-    Layer matte;
+    doc.looks[0].sources[0].asset = bind_asset(doc);
+    doc.looks[0].effects.push_back(make_effect(doc, EffectType::Displace));
+    const uint64_t fx_id = doc.looks[0].effects[0].id;
+    Source matte;
     matte.id = doc.next_effect_id++;
-    matte.source = LayerSourceKind::Shape;
-    doc.looks[0].layers.push_back(matte);
-    doc.looks[0].links.push_back({doc.looks[0].layers[0].id, fx_id, 0});
+    matte.source = SourceKind::Shape;
+    doc.looks[0].sources.push_back(matte);
+    doc.looks[0].links.push_back({doc.looks[0].sources[0].id, fx_id, 0});
     doc.looks[0].links.push_back({fx_id, 0, 0});
     doc.looks[0].links.push_back({matte.id, fx_id, 1});
 
@@ -1192,7 +1355,7 @@ TEST(graph_displace_by_matte_second_input) {
     CHECK(saw_apply);
 
     // map_mode 1 makes the matte the displacement map on a second input.
-    doc.looks[0].layers[0].stack[0].params[3] = 1.0f;
+    doc.looks[0].effects[0].params[3] = 1.0f;
     RenderGraph mapped = compile_graph(doc, doc.looks[0].id, 0);
     CHECK(mapped.valid);
     bool saw_two_input_fx = false;
@@ -1233,9 +1396,11 @@ TEST(graph_razor_identity_is_structural) {
     asset.id = doc.next_effect_id++;
     asset.frame_count = 200;
     doc.assets.push_back(asset);
-    doc.looks[0].layers[0].asset = asset.id;
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].sources[0].asset = asset.id;
+    doc.looks[0].effects.push_back(
         make_effect(doc, EffectType::Feedback));
+    doc.looks[0].links = {{doc.looks[0].sources[0].id, doc.looks[0].effects[0].id, 0},
+        {doc.looks[0].effects[0].id, 0, 0}};
 
     looks::doc::Sequence& seq = doc.root();
     looks::doc::Placement block;
@@ -1272,29 +1437,29 @@ TEST(graph_razor_identity_is_structural) {
 }
 
 TEST(graph_glow_uses_one_effect_node_with_a_source_matte) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].asset = bind_asset(doc);
+    doc.looks[0].sources[0].asset = bind_asset(doc);
     looks::doc::Look lab;
     lab.id = doc.next_effect_id++;
     lab.name = "matte lab";
-    Layer grad;
+    Source grad;
     grad.id = doc.next_effect_id++;
-    grad.source = LayerSourceKind::Gradient;
-    lab.layers.push_back(grad);
-    lab.layers[0].stack.push_back(make_effect(doc, EffectType::Glow));
-    const uint64_t glow_id = lab.layers[0].stack[0].id;
-    Layer shape;
+    grad.source = SourceKind::Gradient;
+    lab.sources.push_back(grad);
+    lab.effects.push_back(make_effect(doc, EffectType::Glow));
+    const uint64_t glow_id = lab.effects[0].id;
+    Source shape;
     shape.id = doc.next_effect_id++;
-    shape.source = LayerSourceKind::Shape;
+    shape.source = SourceKind::Shape;
     shape.osc_shape = 3;
     shape.path.resize(3);
     shape.path[0] = {0.5f, 0.2f, 0, 0, 0, 0};
     shape.path[1] = {0.8f, 0.8f, 0, 0, 0, 0};
     shape.path[2] = {0.2f, 0.8f, 0, 0, 0, 0};
-    lab.layers.push_back(shape);
+    lab.sources.push_back(shape);
     lab.links.push_back({grad.id, glow_id, 0});
     lab.links.push_back({glow_id, 0, 0});
     lab.links.push_back({shape.id, glow_id, 1});
@@ -1335,13 +1500,14 @@ TEST(graph_glow_uses_one_effect_node_with_a_source_matte) {
 TEST(graph_hidden_lane_leaves_the_composite) {
     // A hidden lane compiles as if it were not there.
     Document doc = doc_with_look();
-    doc.looks[0].layers[0].source = looks::doc::LayerSourceKind::Solid;
+    doc.looks[0].sources[0].source = looks::doc::SourceKind::Solid;
     looks::doc::Look second;
     second.id = doc.next_effect_id++;
-    looks::doc::Layer noise;
+    looks::doc::Source noise;
     noise.id = doc.next_effect_id++;
-    noise.source = looks::doc::LayerSourceKind::Noise;
-    second.layers.push_back(std::move(noise));
+    noise.source = looks::doc::SourceKind::Noise;
+    second.sources.push_back(std::move(noise));
+    second.links = {{second.sources[0].id, 0, 0}};
     const uint64_t second_id = second.id;
     doc.looks.push_back(std::move(second));
 

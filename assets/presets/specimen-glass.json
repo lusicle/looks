@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "specimen glass",
   "tags": [
     "digital"
@@ -39,7 +39,7 @@
         "param": 0
       }
     ],
-    "face_in": 118,
+    "inputs": [134],
     "face_out": 122
   },
   "effects": [
@@ -139,5 +139,12 @@
       "node_x": 1410,
       "node_y": 40
     }
+  ],
+  "links": [
+    {"from": 118, "to": 119, "port": 0},
+    {"from": 119, "to": 120, "port": 0},
+    {"from": 120, "to": 121, "port": 0},
+    {"from": 121, "to": 122, "port": 0},
+    {"from": 134, "to": 118, "port": 0}
   ]
 }

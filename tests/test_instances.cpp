@@ -7,6 +7,7 @@
 #include "doc/effects.h"
 #include "doc/group_commands.h"
 #include "doc/layer_commands.h"
+#include "doc/look_commands.h"
 #include "doc/stack_commands.h"
 #include "doc/serialize.h"
 #include "media/decode_pool.h"
@@ -33,7 +34,7 @@ struct Rig {
         a.frame_count = frames;
         doc.assets.push_back(a);
         asset = a.id;
-        doc.looks[0].layers[0].asset = asset;
+        doc.looks[0].sources[0].asset = asset;
         look = doc.looks[0].id;
         lane = doc.root().tracks[0].id;
         doc::Placement p;
@@ -61,17 +62,49 @@ TEST(flatten_block_spans_its_target) {
     CHECK_EQ(c.speed, 1.0);
     const uint64_t path = hash_combine(
         hash_combine(rig.doc.root_sequence, rig.lane), rig.look);
-    const uint64_t layer_id = rig.doc.looks[0].layers[0].id;
+    const uint64_t layer_id = rig.doc.looks[0].sources[0].id;
     CHECK_EQ(c.key,
              hash_combine(hash_combine(path, layer_id), rig.asset));
+}
+
+TEST(track_inputs_follow_video_wires_through_nested_split_outputs) {
+    Rig rig;
+    auto& look = rig.doc.looks[0];
+    const auto look_id = look.id;
+    auto audio = doc::make_source(rig.doc, doc::SourceKind::Media);
+    audio.asset = 999;
+    look.sources.push_back(audio);
+    look.audio_split = true;
+    look.links.push_back({audio.id, 0, 1});
+    auto outer = doc::make_look(rig.doc, "tracking");
+    auto nested = doc::make_source(rig.doc, doc::SourceKind::LookRef);
+    nested.target = look_id;
+    auto pin = doc::make_effect(rig.doc, doc::EffectType::TrackPin);
+    outer.sources = {nested};
+    outer.effects = {pin};
+    outer.links = {{nested.id, pin.id, 0}, {pin.id, 0, 0}};
+    const auto outer_id = outer.id;
+    rig.doc.looks.push_back(outer);
+    CHECK(doc::upstream_video_assets(rig.doc, outer_id, pin.id) == std::vector<uint64_t>{rig.asset});
+    const auto graph = gfx::compile_graph(rig.doc, outer_id, 20);
+    CHECK(graph.valid);
+    bool found = false;
+    for (const auto& node : graph.nodes)
+        if (node.kind == gfx::GraphNode::Kind::Effect && node.effect_index == 0 &&
+            graph.instances[node.instance].look == outer_id) {
+            CHECK_EQ(node.media_asset, rig.asset);
+            CHECK_EQ(node.media_frame, 20.0);
+            found = true;
+        }
+    CHECK(found);
 }
 
 TEST(slideshow_bins_sort_and_serialization) {
     auto d = doc_with_look();
     d.fps = 30;
     d.bins = {{30, "selected", 0}, {31, "child", 30}, {32, "other", 0}};
-    auto& layer = d.looks[0].layers[0];
-    layer.source = doc::LayerSourceKind::Slideshow;
+    auto& layer = d.looks[0].sources[0];
+    layer.source = doc::SourceKind::Slideshow;
     layer.slide_bin = 30;
     layer.slide_seconds = 2;
     layer.slide_speed = 2;
@@ -116,8 +149,8 @@ TEST(slideshow_bins_sort_and_serialization) {
     layer.slide_end = 1;
     const auto json = doc::doc_to_json(d);
     const Document loaded = doc::doc_from_json(json);
-    const auto& copy = loaded.looks[0].layers[0];
-    CHECK(copy.source == doc::LayerSourceKind::Slideshow);
+    const auto& copy = loaded.looks[0].sources[0];
+    CHECK(copy.source == doc::SourceKind::Slideshow);
     CHECK_EQ(copy.slide_bin, layer.slide_bin);
     CHECK_EQ(copy.slide_fit, layer.slide_fit);
     CHECK_EQ(copy.slide_order, layer.slide_order);
@@ -134,8 +167,8 @@ TEST(slideshow_decode_plan_matches_graph_through_time_maps) {
     Rig rig;
     rig.doc.fps = 30;
     auto& look = rig.doc.looks[0];
-    auto& layer = look.layers[0];
-    layer.source = doc::LayerSourceKind::Slideshow;
+    auto& layer = look.sources[0];
+    layer.source = doc::SourceKind::Slideshow;
     layer.slide_seconds = 1;
     layer.slide_fade = 0.2f;
     auto& first = rig.doc.assets[0];
@@ -213,7 +246,7 @@ TEST(slideshow_video_frames_and_crossfade) {
 TEST(slideshow_large_bin_keeps_other_source_streams) {
     auto d = doc_with_look();
     auto& look = d.looks[0];
-    look.layers[0].source = doc::LayerSourceKind::Slideshow;
+    look.sources[0].source = doc::SourceKind::Slideshow;
     for (uint64_t i = 0; i < 1100; ++i) {
         doc::Asset asset;
         asset.id = d.next_effect_id++;
@@ -222,10 +255,10 @@ TEST(slideshow_large_bin_keeps_other_source_streams) {
         asset.still = true;
         d.assets.push_back(asset);
     }
-    doc::Layer media;
+    doc::Source media;
     media.id = d.next_effect_id++;
     media.asset = d.assets[0].id;
-    look.layers.push_back(media);
+    look.sources.push_back(media);
     const auto sources = doc::flatten_media_sources(d, look.id);
     CHECK_EQ(sources.size(), size_t{1101});
     CHECK_EQ(sources.back().layer, media.id);
@@ -256,7 +289,7 @@ TEST(flatten_composes_block_map_and_slip_in_closed_form) {
     rig.placement().t_in = 10;
     rig.placement().source_in = 4;
     rig.placement().speed = 2.0f;
-    rig.doc.looks[0].layers[0].slip = 6;
+    rig.doc.looks[0].sources[0].slip = 6;
 
     const auto sources =
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence);
@@ -275,13 +308,13 @@ TEST(flatten_composes_block_map_and_slip_in_closed_form) {
 TEST(flatten_offset_shim_emits_a_shifted_stream) {
     Rig rig(100);
     doc::Look& look = rig.doc.looks[0];
-    const uint64_t layer_id = look.layers[0].id;
+    const uint64_t layer_id = look.sources[0].id;
     doc::EffectInstance off =
         doc::make_effect(rig.doc, doc::EffectType::Offset);
     off.params[0] = 10.0f;   // +10 frames
     off.params[1] = 2.0f;    // 2 = shift video and audio
     const uint64_t off_id = off.id;
-    look.layers[0].stack.push_back(off);
+    look.effects.push_back(off);
     look.links = {{layer_id, off_id, 0}, {off_id, 0, 0}};
     {
         doc::AudioTrack at;
@@ -337,15 +370,50 @@ TEST(flatten_offset_shim_emits_a_shifted_stream) {
     CHECK_EQ(chain.asset, rig.asset);
     CHECK_EQ(chain.offset, int64_t{10});
     CHECK(!chain.locked);
-    look.layers[0].timeline_lock = true;
+    look.sources[0].timeline_lock = true;
     CHECK(doc::resolve_audio_chain(rig.doc, look, off_id).locked);
+}
+
+TEST(solo_has_the_same_scope_for_audio_offset_and_video) {
+    Rig rig(100);
+    auto& look = rig.doc.looks[0];
+    auto offset = doc::make_effect(rig.doc, doc::EffectType::Offset);
+    offset.params[0] = 10;
+    offset.params[1] = 2;
+    auto gain = doc::make_effect(rig.doc, doc::EffectType::AudioGain);
+    auto video = doc::make_effect(rig.doc, doc::EffectType::Invert);
+    video.solo = true;
+    look.effects = {offset, gain, video};
+    look.links = {{look.sources[0].id, offset.id, 0}, {offset.id, gain.id, 0},
+        {gain.id, video.id, 0}, {video.id, 0, 0}};
+    auto chain = doc::resolve_audio_chain(rig.doc, look, video.id);
+    CHECK_EQ(chain.offset, int64_t{0});
+    CHECK_EQ(chain.op_count, uint32_t{0});
+    auto program = doc::flatten_audio_program(rig.doc, look.id);
+    for (const auto& n : program.nodes) CHECK(!n.has_op);
+    look.effects[0].solo = true;
+    look.effects[1].solo = true;
+    chain = doc::resolve_audio_chain(rig.doc, look, video.id);
+    CHECK_EQ(chain.offset, int64_t{10});
+    CHECK_EQ(chain.op_count, uint32_t{1});
+    program = doc::flatten_audio_program(rig.doc, look.id);
+    CHECK(std::any_of(program.nodes.begin(), program.nodes.end(),
+        [&](const doc::AudioNode& n) { return n.has_op && n.doc_id == gain.id; }));
+    auto group = doc::make_group(rig.doc, "bypassed solo");
+    group.bypass = true;
+    look.groups.push_back(group);
+    look.effects[2].group_id = group.id;
+    look.effects[0].solo = look.effects[1].solo = false;
+    chain = doc::resolve_audio_chain(rig.doc, look, video.id);
+    CHECK_EQ(chain.offset, int64_t{10});
+    CHECK_EQ(chain.op_count, uint32_t{1});
 }
 
 TEST(flatten_offset_shim_off_the_source_is_inert) {
     // The shim applies only when it sits directly on a source node.
     Rig rig(100);
     doc::Look& look = rig.doc.looks[0];
-    const uint64_t layer_id = look.layers[0].id;
+    const uint64_t layer_id = look.sources[0].id;
     doc::EffectInstance fx =
         doc::make_effect(rig.doc, doc::EffectType::Vignette);
     doc::EffectInstance off =
@@ -354,8 +422,8 @@ TEST(flatten_offset_shim_off_the_source_is_inert) {
     off.params[1] = 2.0f;
     const uint64_t fx_id = fx.id;
     const uint64_t off_id = off.id;
-    look.layers[0].stack.push_back(fx);
-    look.layers[0].stack.push_back(off);
+    look.effects.push_back(fx);
+    look.effects.push_back(off);
     look.links = {{layer_id, fx_id, 0}, {fx_id, off_id, 0}, {off_id, 0, 0}};
     {
         doc::AudioTrack at;
@@ -407,40 +475,40 @@ TEST(flatten_audio_only_asset_is_image_dormant) {
 }
 
 TEST(entity_has_image_follows_the_wiring_not_the_layers) {
-    using looks::doc::Layer;
-    using looks::doc::LayerSourceKind;
+    using looks::doc::Source;
+    using looks::doc::SourceKind;
 
     // Media with pixels, wired to the Output's video port: an image.
     Rig rig(100);
-    rig.doc.looks[0].links.push_back({rig.doc.looks[0].layers[0].id, 0, 0});
+    rig.doc.looks[0].links.push_back({rig.doc.looks[0].sources[0].id, 0, 0});
     CHECK(doc::entity_has_image(rig.doc, rig.look));
 
     // The same wiring with an asset that has no picture: no image. This is
     // the combined routing, where sound rides the video wire.
     Rig audio(0);
     audio.doc.looks[0].links.push_back(
-        {audio.doc.looks[0].layers[0].id, 0, 0});
+        {audio.doc.looks[0].sources[0].id, 0, 0});
     CHECK(!doc::entity_has_image(audio.doc, audio.look));
 
     // Split routing sends the voice to port 1, so port 0 stays unwired.
     Rig split(0);
     split.doc.looks[0].audio_split = true;
     split.doc.looks[0].links.push_back(
-        {split.doc.looks[0].layers[0].id, 0, 1});
+        {split.doc.looks[0].sources[0].id, 0, 1});
     CHECK(!doc::entity_has_image(split.doc, split.look));
 
     // A drawable layer that reaches nothing still shows nothing.
     Rig unwired(100);
-    unwired.doc.looks[0].links.push_back({0, 0, 9999});   // tombstone
+    unwired.doc.looks[0].links.clear();
     CHECK(!doc::entity_has_image(unwired.doc, unwired.look));
 
     // A generator always draws, and the walk crosses an effect chain.
     Document gen = doc_with_look();
-    gen.looks[0].layers[0].source = LayerSourceKind::Gradient;
-    gen.looks[0].layers[0].stack.push_back(
+    gen.looks[0].sources[0].source = SourceKind::Gradient;
+    gen.looks[0].effects.push_back(
         doc::make_effect(gen, doc::EffectType::Vignette));
-    const uint64_t fx = gen.looks[0].layers[0].stack[0].id;
-    gen.looks[0].links.push_back({gen.looks[0].layers[0].id, fx, 0});
+    const uint64_t fx = gen.looks[0].effects[0].id;
+    gen.looks[0].links.push_back({gen.looks[0].sources[0].id, fx, 0});
     gen.looks[0].links.push_back({fx, 0, 0});
     CHECK(doc::entity_has_image(gen, gen.looks[0].id));
     // A sequence reports what its video lanes carry.
@@ -454,8 +522,8 @@ TEST(flatten_timeline_lock_reads_the_root_clock) {
     rig.placement().t_in = 40;
     rig.placement().source_in = 25;
     rig.placement().speed = 2.0f;
-    rig.doc.looks[0].layers[0].timeline_lock = true;
-    rig.doc.looks[0].layers[0].slip = 3;
+    rig.doc.looks[0].sources[0].timeline_lock = true;
+    rig.doc.looks[0].sources[0].slip = 3;
     doc::Placement second;
     second.id = rig.doc.next_effect_id++;
     second.target = rig.look;
@@ -507,11 +575,11 @@ TEST(flatten_and_compiler_agree_frame_by_frame) {
     rig.doc.assets.push_back(slow);
     doc::Look wrap;
     wrap.id = rig.doc.next_effect_id++;
-    doc::Layer media;
+    doc::Source media;
     media.id = rig.doc.next_effect_id++;
     media.asset = slow.id;
     media.slip = 3;
-    wrap.layers.push_back(std::move(media));
+    wrap.sources.push_back(std::move(media));
     const uint64_t wrap_id = wrap.id;
     rig.doc.looks.push_back(std::move(wrap));
     doc::SeqTrack lane2;
@@ -554,10 +622,10 @@ TEST(flatten_same_lane_overlap_emits_both_compiles_the_winner) {
     Rig rig(100);
     doc::Look second;
     second.id = rig.doc.next_effect_id++;
-    doc::Layer media;
+    doc::Source media;
     media.id = rig.doc.next_effect_id++;
     media.asset = rig.asset;
-    second.layers.push_back(std::move(media));
+    second.sources.push_back(std::move(media));
     const uint64_t second_id = second.id;
     rig.doc.looks.push_back(std::move(second));
     doc::Placement late;
@@ -636,11 +704,12 @@ TEST(flatten_audio_sums_every_output_chain) {
     b.id = rig.doc.next_effect_id++;
     b.frame_count = 60;
     rig.doc.assets.push_back(b);
-    doc::Layer second;
+    doc::Source second;
     second.id = rig.doc.next_effect_id++;
-    second.source = doc::LayerSourceKind::Media;
+    second.source = doc::SourceKind::Media;
     second.asset = b.id;
-    rig.doc.looks[0].layers.push_back(second);
+    rig.doc.looks[0].sources.push_back(second);
+    rig.doc.looks[0].links.push_back({second.id, 0, 0});
     lay_audio_block(rig.doc, rig.look);
 
     CHECK_EQ(
@@ -651,7 +720,7 @@ TEST(flatten_audio_sums_every_output_chain) {
     CHECK_EQ(voice.size(), size_t{2});
     if (voice.size() < 2) return;
     CHECK_EQ(voice[0].asset, rig.asset);
-    CHECK_EQ(voice[0].layer, rig.doc.looks[0].layers[0].id);
+    CHECK_EQ(voice[0].layer, rig.doc.looks[0].sources[0].id);
     CHECK_EQ(voice[1].asset, b.id);
     CHECK_EQ(voice[1].layer, second.id);
 }
@@ -661,20 +730,20 @@ TEST(flatten_audio_fan_in_sums_at_the_op_node) {
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
-    const uint64_t src_a = look.layers[0].id;
+    const uint64_t src_a = look.sources[0].id;
     doc::Asset b;
     b.id = d.next_effect_id++;
     b.frame_count = 60;
     d.assets.push_back(b);
-    doc::Layer second;
+    doc::Source second;
     second.id = d.next_effect_id++;
-    second.source = doc::LayerSourceKind::Media;
+    second.source = doc::SourceKind::Media;
     second.asset = b.id;
     const uint64_t src_b = second.id;
-    look.layers.push_back(second);
-    look.layers[0].stack.push_back(
+    look.sources.push_back(second);
+    look.effects.push_back(
         doc::make_effect(d, doc::EffectType::AudioGain));
-    const uint64_t gain_id = look.layers[0].stack[0].id;
+    const uint64_t gain_id = look.effects[0].id;
     look.links = {{src_a, gain_id, 0}, {src_b, gain_id, 0},
                   {gain_id, 0, 0}};
     lay_audio_block(d, rig.look);
@@ -721,9 +790,8 @@ TEST(flatten_audio_voice_skips_dangling_feeds) {
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
-    const uint64_t media_layer = look.layers[0].id;
+    const uint64_t media_layer = look.sources[0].id;
     lay_audio_block(d, rig.look);
-    doc::ensure_links(look);
     look.links.insert(look.links.begin(), {99991, 0, 0});
     auto voice = doc::flatten_audio_sources(d, d.root_sequence);
     CHECK_EQ(voice.size(), size_t{1});
@@ -731,15 +799,15 @@ TEST(flatten_audio_voice_skips_dangling_feeds) {
 
     // In a group input fan-in the hop must pick the live producer.
     doc::UndoStack undo;
-    look.layers[0].stack.push_back(
+    look.effects.push_back(
         doc::make_effect(d, doc::EffectType::Grain));
-    const uint64_t fx0 = look.layers[0].stack[0].id;
+    const uint64_t fx0 = look.effects[0].id;
     look.links.clear();
     look.links.push_back({media_layer, fx0, 0});
     look.links.push_back({fx0, 0, 0});
     doc::Group g = doc::make_group(d, "wrap");
     const uint64_t gid = g.id;
-    undo.execute(d, doc::group_effects_command(rig.look, 0, g, 0, 0));
+    undo.execute(d, doc::group_effects_command(rig.look, g, {d.look(rig.look).effects[0].id}));
     const doc::Group* placed = doc::find_group(look, gid);
     CHECK(placed && !placed->inputs.empty());
     const uint64_t slot0 = placed->inputs.front();
@@ -754,11 +822,11 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
-    const uint64_t media_layer = look.layers[0].id;
-    doc::Layer top;
+    const uint64_t media_layer = look.sources[0].id;
+    doc::Source top;
     top.id = d.next_effect_id++;
-    top.source = doc::LayerSourceKind::Solid;
-    look.layers.push_back(top);
+    top.source = doc::SourceKind::Solid;
+    look.sources.push_back(top);
     lay_audio_block(d, rig.look);
 
     doc::UndoStack undo;
@@ -769,8 +837,11 @@ TEST(flatten_audio_voice_survives_a_preset_splice) {
     members.push_back(doc::make_effect(d, doc::EffectType::Posterize));
     const uint64_t m0 = members[0].id, m1 = members[1].id;
     const uint64_t gid = g.id;
-    undo.execute(d, doc::insert_group_command(rig.look, 0, g,
-                                              std::move(members), m0));
+    g.inputs = {d.next_effect_id++};
+    g.face_out = m1;
+    for (auto& member : members) member.group_id = gid;
+    undo.execute(d, doc::insert_group_command(rig.look, g, std::move(members),
+        {{g.inputs[0], m0, 0}, {m0, m1, 0}}));
     const doc::Group* placed = doc::find_group(look, gid);
     CHECK(placed && !placed->inputs.empty());
     const uint64_t slot0 = placed->inputs.front();
@@ -802,17 +873,17 @@ TEST(flatten_audio_chains_ops_in_wire_order) {
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
-    const uint64_t src_id = look.layers[0].id;
-    look.layers[0].stack.push_back(
+    const uint64_t src_id = look.sources[0].id;
+    look.effects.push_back(
         doc::make_effect(d, doc::EffectType::AudioDelay));
-    look.layers[0].stack.push_back(
+    look.effects.push_back(
         doc::make_effect(d, doc::EffectType::Posterize));
-    look.layers[0].stack.push_back(
+    look.effects.push_back(
         doc::make_effect(d, doc::EffectType::AudioGain));
-    const uint64_t delay_id = look.layers[0].stack[0].id;
-    const uint64_t poster_id = look.layers[0].stack[1].id;
-    const uint64_t gain_id = look.layers[0].stack[2].id;
-    look.layers[0].stack[2].params[0] = 0.5f;
+    const uint64_t delay_id = look.effects[0].id;
+    const uint64_t poster_id = look.effects[1].id;
+    const uint64_t gain_id = look.effects[2].id;
+    look.effects[2].params[0] = 0.5f;
     look.links = {{src_id, delay_id, 0},
                   {delay_id, poster_id, 0},
                   {poster_id, gain_id, 0},
@@ -835,7 +906,7 @@ TEST(flatten_audio_chains_ops_in_wire_order) {
     CHECK_EQ(delay.inputs.size(), size_t{1});
     CHECK_EQ(prog.nodes[delay.inputs[0]].asset, rig.asset);
 
-    look.layers[0].stack[0].bypass = true;
+    look.effects[0].bypass = true;
     prog = doc::flatten_audio_program(d, d.root_sequence);
     CHECK(prog.root >= 0);
     if (prog.root < 0) return;
@@ -858,8 +929,7 @@ TEST(flatten_audio_split_output_reads_its_own_port) {
     d.looks[0].audio_split = true;
     CHECK_EQ(doc::flatten_audio_sources(d, d.root_sequence).size(),
              size_t{0});
-    doc::ensure_links(d.looks[0]);
-    d.looks[0].links.push_back({d.looks[0].layers[0].id, 0, 1});
+    d.looks[0].links.push_back({d.looks[0].sources[0].id, 0, 1});
     CHECK_EQ(doc::flatten_audio_sources(d, d.root_sequence).size(),
              size_t{1});
 }
@@ -868,20 +938,22 @@ TEST(flatten_audio_nested_program_composes_through_the_hop) {
     // The outer DSP sits above the nested hop and the inner DSP below it.
     Rig rig(60);
     Document& d = rig.doc;
-    d.looks[0].layers[0].stack.push_back(
+    d.looks[0].effects.push_back(
         doc::make_effect(d, doc::EffectType::AudioDelay));
+    d.looks[0].links.clear();
+    connect_test_chain(d.looks[0], d.looks[0].sources[0].id, {d.looks[0].effects[0].id});
 
     doc::Look outer;
     outer.id = d.next_effect_id++;
     outer.name = "outer";
-    doc::Layer ref;
+    doc::Source ref;
     ref.id = d.next_effect_id++;
-    ref.source = doc::LayerSourceKind::LookRef;
+    ref.source = doc::SourceKind::LookRef;
     ref.target = rig.look;
-    ref.stack.push_back(doc::make_effect(d, doc::EffectType::AudioGain));
-    const uint64_t gain_id = ref.stack[0].id;
+    outer.effects.push_back(doc::make_effect(d, doc::EffectType::AudioGain));
+    const uint64_t gain_id = outer.effects[0].id;
     const uint64_t ref_id = ref.id;
-    outer.layers.push_back(std::move(ref));
+    outer.sources.push_back(std::move(ref));
     outer.links = {{ref_id, gain_id, 0}, {gain_id, 0, 0}};
     d.looks.push_back(std::move(outer));
     lay_audio_block(d, d.looks.back().id);
@@ -914,12 +986,11 @@ TEST(resolve_audio_chain_composes_to_closed_form) {
     Rig rig(60);
     Document& d = rig.doc;
     doc::Look& look = d.looks[0];
-    look.layers[0].slip = 3;
-    look.layers[0].stack.push_back(
+    look.sources[0].slip = 3;
+    look.effects.push_back(
         doc::make_effect(d, doc::EffectType::AudioDelay));
-    const uint64_t delay_id = look.layers[0].stack[0].id;
-
-    // The synthesized chain is media -> delay -> Output.
+    const uint64_t delay_id = look.effects[0].id;
+    look.links = {{look.sources[0].id, delay_id, 0}, {delay_id, 0, 0}};
     const doc::AudioChain from_delay =
         doc::resolve_audio_chain(d, look, delay_id);
     CHECK_EQ(from_delay.asset, rig.asset);
@@ -927,20 +998,20 @@ TEST(resolve_audio_chain_composes_to_closed_form) {
     CHECK_EQ(from_delay.op_count, uint32_t{1});
     CHECK(from_delay.ops[0].type == doc::EffectType::AudioDelay);
     const doc::AudioChain from_media =
-        doc::resolve_audio_chain(d, look, look.layers[0].id);
+        doc::resolve_audio_chain(d, look, look.sources[0].id);
     CHECK_EQ(from_media.asset, rig.asset);
     CHECK_EQ(from_media.op_count, uint32_t{0});
 
     doc::Look outer;
     outer.id = d.next_effect_id++;
-    doc::Layer ref;
+    doc::Source ref;
     ref.id = d.next_effect_id++;
-    ref.source = doc::LayerSourceKind::LookRef;
+    ref.source = doc::SourceKind::LookRef;
     ref.target = rig.look;
-    ref.stack.push_back(doc::make_effect(d, doc::EffectType::AudioGain));
-    const uint64_t gain_id = ref.stack[0].id;
+    outer.effects.push_back(doc::make_effect(d, doc::EffectType::AudioGain));
+    const uint64_t gain_id = outer.effects[0].id;
     const uint64_t ref_id = ref.id;
-    outer.layers.push_back(std::move(ref));
+    outer.sources.push_back(std::move(ref));
     outer.links = {{ref_id, gain_id, 0}, {gain_id, 0, 0}};
     d.looks.push_back(std::move(outer));
     const doc::AudioChain nested =
@@ -951,29 +1022,29 @@ TEST(resolve_audio_chain_composes_to_closed_form) {
     CHECK(nested.ops[0].type == doc::EffectType::AudioDelay);
     CHECK(nested.ops[1].type == doc::EffectType::AudioGain);
 
-    doc::Layer sref;
+    doc::Source sref;
     sref.id = d.next_effect_id++;
-    sref.source = doc::LayerSourceKind::SequenceRef;
+    sref.source = doc::SourceKind::SequenceRef;
     sref.target = d.root_sequence;
-    d.looks.back().layers.push_back(sref);
+    d.looks.back().sources.push_back(sref);
     CHECK_EQ(doc::resolve_audio_chain(d, d.looks.back(), sref.id).asset,
              uint64_t{0});
 }
 
 TEST(flatten_skips_hidden_and_dangling_sources) {
     Rig rig(50);
-    rig.doc.looks[0].layers[0].visible = false;
+    rig.doc.looks[0].sources[0].visible = false;
     CHECK_EQ(
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
         size_t{0});
-    rig.doc.looks[0].layers[0].visible = true;
+    rig.doc.looks[0].sources[0].visible = true;
     rig.placement().target = 999999;   // dangling block: dormant
     CHECK_EQ(
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
         size_t{0});
     rig.placement().target = rig.look;
     // A dangling asset id is dormant, like an unbound node.
-    rig.doc.looks[0].layers[0].asset = 888888;
+    rig.doc.looks[0].sources[0].asset = 888888;
     CHECK_EQ(
         doc::flatten_media_sources(rig.doc, rig.doc.root_sequence).size(),
         size_t{0});
@@ -1006,10 +1077,10 @@ TEST(flatten_conforms_mismatched_media_rate) {
     Rig rig(100);
     rig.doc.fps = 60.0;
     rig.doc.assets[0].fps = 30.0;
-    rig.doc.looks[0].layers[0].slip = 10;
+    rig.doc.looks[0].sources[0].slip = 10;
 
     // 90 media frames past the slip = 180 clock frames.
-    CHECK_EQ(doc::layer_source_length(rig.doc, rig.doc.looks[0].layers[0],
+    CHECK_EQ(doc::layer_source_length(rig.doc, rig.doc.looks[0].sources[0],
                                       60.0),
              uint32_t{180});
     CHECK_EQ(doc::sequence_duration(rig.doc, rig.doc.root()),
@@ -1138,7 +1209,7 @@ TEST(still_assets_never_conform) {
     rig.doc.assets[0].still = true;
     CHECK_EQ(doc::media_conform_rate(rig.doc, rig.doc.assets[0], 60.0),
              1.0);
-    CHECK_EQ(doc::layer_source_length(rig.doc, rig.doc.looks[0].layers[0],
+    CHECK_EQ(doc::layer_source_length(rig.doc, rig.doc.looks[0].sources[0],
                                       60.0),
              uint32_t{150});
     const auto sources =

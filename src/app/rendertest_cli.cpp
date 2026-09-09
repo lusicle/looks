@@ -38,7 +38,15 @@ constexpr uint32_t kHeight = 240;
 doc::Document doc_with_media_look() {
     doc::Document doc;
     doc::Look seed = doc::make_look(doc, "look 1");
-    seed.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Media));
+    seed.sources.push_back(doc::make_source(doc, doc::SourceKind::Media));
+    doc::Asset asset;
+    asset.id = doc.next_effect_id++;
+    asset.width = kWidth;
+    asset.height = kHeight;
+    asset.fps = 30;
+    asset.frame_count = 100000;
+    seed.sources[0].asset = asset.id;
+    doc.assets.push_back(asset);
     doc.looks.push_back(std::move(seed));
     return doc;
 }
@@ -48,10 +56,19 @@ gfx::Engine::LayerSourceFrame media_frame(const doc::Document& doc,
                                          const gfx::SourcePlanes& planes) {
     gfx::Engine::LayerSourceFrame lf;
     lf.key = hash_combine(
-        hash_combine(doc.looks[0].id, doc.looks[0].layers[0].id),
-        doc.looks[0].layers[0].asset);
+        hash_combine(doc.looks[0].id, doc.looks[0].sources[0].id),
+        doc.looks[0].sources[0].asset);
     lf.planes = planes;
     return lf;
+}
+
+void replace_effect(doc::Document& document, doc::EffectInstance& effect, doc::EffectType type) {
+    const uint64_t id = effect.id;
+    effect = doc::make_effect(document, type);
+    for (auto& link : document.looks[0].links) {
+        if (link.from == id) link.from = effect.id;
+        if (link.to == id) link.to = effect.id;
+    }
 }
 
 struct SyntheticSource {
@@ -93,86 +110,85 @@ struct SyntheticSource {
 doc::Document make_document() {
     doc::Document doc = doc_with_media_look();
     doc.master_seed = 1234;
-    // The asset id has no Asset entry on purpose: unknown length plays always.
-    doc.looks[0].layers[0].asset = doc.next_effect_id++;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.looks[0].layers[0].stack[1].params[0] = 9.0f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Jitter));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
-    doc.looks[0].layers[0].stack[6].params[0] = 4.5f;
-    doc.looks[0].layers[0].stack[6].params[1] = 1.5f;
-    doc.looks[0].layers[0].stack[6].wet = 0.8f;
-    doc.looks[0].layers[0].stack[6].opacity = 0.9f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Datamosh));
-    doc.looks[0].layers[0].stack[8].params[1] = 8.0f;
-    doc.looks[0].layers[0].stack[8].params[3] = 4.0f;
-    doc.looks[0].layers[0].stack[8].params[4] = 0.15f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Echo));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Feedback));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::FilmStock));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SliceShuffle));
-    doc.looks[0].layers[0].stack.back().params[3] = 0.7f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Turbulence));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
-    doc.looks[0].layers[0].stack.back().wet = 0.6f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Snow));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Composite));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Timestamp));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.looks[0].layers[0].stack.back().params[0] = 5.0f;
-    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;
-    doc.looks[0].layers[0].stack.back().wet = 0.5f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::SlitScan));
-    doc.looks[0].layers[0].stack.back().params[1] = 8.0f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.looks[0].layers[0].stack.back().params[2] = 9.0f;
-    doc.looks[0].layers[0].stack.back().params[3] = 0.8f;
-    doc.looks[0].layers[0].stack.back().wet = 0.5f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Voronoi));
-    doc.looks[0].layers[0].stack.back().wet = 0.6f;
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::FlowSmear));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
+    doc.looks[0].effects[1].params[0] = 9.0f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Glow));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Grain));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Jitter));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
+    doc.looks[0].effects[6].params[0] = 4.5f;
+    doc.looks[0].effects[6].params[1] = 1.5f;
+    doc.looks[0].effects[6].wet = 0.8f;
+    doc.looks[0].effects[6].opacity = 0.9f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Datamosh));
+    doc.looks[0].effects[8].params[1] = 8.0f;
+    doc.looks[0].effects[8].params[3] = 4.0f;
+    doc.looks[0].effects[8].params[4] = 0.15f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Echo));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Feedback));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::FilmStock));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::SliceShuffle));
+    doc.looks[0].effects.back().params[3] = 0.7f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Turbulence));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
+    doc.looks[0].effects.back().wet = 0.6f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Snow));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Composite));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Timestamp));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].effects.back().params[0] = 5.0f;
+    doc.looks[0].effects.back().params[2] = 6.0f;
+    doc.looks[0].effects.back().wet = 0.5f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::SlitScan));
+    doc.looks[0].effects.back().params[1] = 8.0f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].effects.back().params[2] = 9.0f;
+    doc.looks[0].effects.back().params[3] = 0.8f;
+    doc.looks[0].effects.back().wet = 0.5f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Voronoi));
+    doc.looks[0].effects.back().wet = 0.6f;
+    doc.looks[0].effects.push_back(
         doc::make_effect(doc, doc::EffectType::ReactionDiffusion));
-    doc.looks[0].layers[0].stack.back().params[2] = 6.0f;
-    doc.looks[0].layers[0].stack.back().wet = 0.7f;
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.back().params[2] = 6.0f;
+    doc.looks[0].effects.back().wet = 0.7f;
+    doc.looks[0].effects.push_back(
         doc::make_effect(doc, doc::EffectType::ErrorDiffusion));
-    doc.looks[0].layers[0].stack.back().params[0] = 3.0f;
-    doc.looks[0].layers[0].stack.back().params[3] = 0.4f;
-    doc.looks[0].layers[0].stack.back().wet = 0.6f;
-    doc::Layer overlay;
+    doc.looks[0].effects.back().params[0] = 3.0f;
+    doc.looks[0].effects.back().params[3] = 0.4f;
+    doc.looks[0].effects.back().wet = 0.6f;
+    doc::Source overlay;
     overlay.id = doc.next_effect_id++;
     overlay.name = "noise";
-    overlay.source = doc::LayerSourceKind::Noise;
-    overlay.blend = doc::BlendMode::Multiply;
+    overlay.source = doc::SourceKind::Noise;
     overlay.opacity = 0.6f;
     overlay.gen_scale = 24.0f;
-    overlay.stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.looks[0].layers.push_back(std::move(overlay));
+    const size_t overlay_effect = doc.looks[0].effects.size();
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
+    doc.looks[0].sources.push_back(std::move(overlay));
     // The Shape layer feeds only the matte port. It has no composite link.
-    doc::Layer matte;
+    doc::Source matte;
     matte.id = doc.next_effect_id++;
     matte.name = "matte";
-    matte.source = doc::LayerSourceKind::Shape;
+    matte.source = doc::SourceKind::Shape;
     matte.gen_scale = 8.0f;
     matte.gen_angle = 0.35f;
-    doc.looks[0].layers.push_back(std::move(matte));
-    for (const doc::Layer& l : doc.looks[0].layers) {
-        if (l.source == doc::LayerSourceKind::Shape) continue;
-        uint64_t prev = l.id;
-        for (const doc::EffectInstance& fx : l.stack) {
-            doc.looks[0].links.push_back({prev, fx.id, 0});
-            prev = fx.id;
-        }
-        doc.looks[0].links.push_back({prev, 0, 0});
+    doc.looks[0].sources.push_back(std::move(matte));
+    uint64_t prev = doc.looks[0].sources[0].id;
+    for (size_t i = 0; i < overlay_effect; ++i) {
+        const auto& fx = doc.looks[0].effects[i];
+        doc.looks[0].links.push_back({prev, fx.id, 0});
+        prev = fx.id;
     }
+    doc.looks[0].links.push_back({prev, 0, 0});
+    const auto overlay_id = doc.looks[0].effects[overlay_effect].id;
+    doc.looks[0].links.push_back({doc.looks[0].sources[1].id, overlay_id, 0});
+    doc.looks[0].links.push_back({overlay_id, 0, 0, doc::BlendMode::Multiply});
     doc.looks[0].links.push_back(
-        {doc.looks[0].layers.back().id, doc.looks[0].layers[0].stack[1].id, 1});
+        {doc.looks[0].sources.back().id, doc.looks[0].effects[1].id, 1});
     return doc;
 }
 
@@ -180,30 +196,30 @@ doc::Document make_document() {
 doc::Document make_cacheable_document() {
     doc::Document doc = doc_with_media_look();
     doc.master_seed = 555;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glow));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Grain));
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
-    doc.looks[0].layers[0].stack.back().params[2] = 8.0f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
-    doc.looks[0].layers[0].stack.back().wet = 0.5f;
-    doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
-    doc::Layer matte;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::RgbSplit));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Pixelate));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Glow));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Grain));
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Quantize));
+    doc.looks[0].effects.back().params[2] = 8.0f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Kaleido));
+    doc.looks[0].effects.back().wet = 0.5f;
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Vignette));
+    doc::Source matte;
     matte.id = doc.next_effect_id++;
     matte.name = "matte";
-    matte.source = doc::LayerSourceKind::Shape;
+    matte.source = doc::SourceKind::Shape;
     matte.gen_scale = 8.0f;
     matte.gen_angle = 0.35f;
-    doc.looks[0].layers.push_back(std::move(matte));
-    uint64_t prev = doc.looks[0].layers[0].id;
-    for (const doc::EffectInstance& fx : doc.looks[0].layers[0].stack) {
+    doc.looks[0].sources.push_back(std::move(matte));
+    uint64_t prev = doc.looks[0].sources[0].id;
+    for (const doc::EffectInstance& fx : doc.looks[0].effects) {
         doc.looks[0].links.push_back({prev, fx.id, 0});
         prev = fx.id;
     }
     doc.looks[0].links.push_back({prev, 0, 0});
     doc.looks[0].links.push_back(
-        {doc.looks[0].layers.back().id, doc.looks[0].layers[0].stack[1].id, 1});
+        {doc.looks[0].sources.back().id, doc.looks[0].effects[1].id, 1});
     return doc;
 }
 
@@ -270,16 +286,16 @@ bool matte_alpha_check(gfx::Device& device,
                        const std::filesystem::path& shader_dir) {
     doc::Document doc;
     doc::Look seed = doc::make_look(doc, "masked");
-    seed.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
-    doc::Layer matte;
+    seed.sources.push_back(doc::make_source(doc, doc::SourceKind::Solid));
+    doc::Source matte;
     matte.id = doc.next_effect_id++;
     matte.name = "matte";
-    matte.source = doc::LayerSourceKind::Shape;
+    matte.source = doc::SourceKind::Shape;
     matte.gen_scale = 6.0f;
     matte.gen_angle = 0.05f;
-    seed.links.push_back({seed.layers[0].id, 0, 0});
-    seed.links.push_back({matte.id, seed.layers[0].id, 1});
-    seed.layers.push_back(std::move(matte));
+    seed.links.push_back({seed.sources[0].id, 0, 0});
+    seed.links.push_back({matte.id, seed.sources[0].id, 1});
+    seed.sources.push_back(std::move(matte));
     doc.looks.push_back(std::move(seed));
 
     doc::Placement block;
@@ -319,11 +335,12 @@ bool matte_alpha_check(gfx::Device& device,
 bool crt_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     doc::Document doc;
     doc::Look look = doc::make_look(doc, "CRT check");
-    look.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
-    look.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::CrtSim));
+    look.sources.push_back(doc::make_source(doc, doc::SourceKind::Solid));
+    look.effects.push_back(doc::make_effect(doc, doc::EffectType::CrtSim));
+    look.links = {{look.sources[0].id, look.effects[0].id, 0}, {look.effects[0].id, 0, 0}};
     doc.looks.push_back(std::move(look));
-    auto& layer = doc.looks[0].layers[0];
-    auto& fx = layer.stack[0];
+    auto& layer = doc.looks[0].sources[0];
+    auto& fx = doc.looks[0].effects[0];
     layer.opacity = 1.0f;
     layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.35f;
     fx.params[0] = fx.params[5] = fx.params[7] = fx.params[8] = 0.0f;
@@ -415,7 +432,7 @@ bool crt_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         if (error > 1.0) return false;
     }
     engine->set_preview_divisor(1);
-    fx = doc::make_effect(doc, doc::EffectType::CrtSim);
+    replace_effect(doc, fx, doc::EffectType::CrtSim);
     double total_ms = 0.0;
     for (uint32_t f = 0; f < 12; ++f) {
         const auto start = std::chrono::steady_clock::now();
@@ -466,12 +483,13 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     doc.canvas_w = w;
     doc.canvas_h = h;
     auto look = doc::make_look(doc, "Alpha checks");
-    look.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
-    look.layers[0].opacity = 1.0f;
-    look.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Invert));
+    look.sources.push_back(doc::make_source(doc, doc::SourceKind::Solid));
+    look.sources[0].opacity = 1.0f;
+    look.effects.push_back(doc::make_effect(doc, doc::EffectType::Invert));
+    look.links = {{look.sources[0].id, look.effects[0].id, 0}, {look.effects[0].id, 0, 0}};
     doc.looks.push_back(std::move(look));
-    auto& layer = doc.looks[0].layers[0];
-    auto& fx = layer.stack[0];
+    auto& layer = doc.looks[0].sources[0];
+    auto& fx = doc.looks[0].effects[0];
     layer.color_a[0] = 0.7f;
     layer.color_a[1] = 0.35f;
     layer.color_a[2] = 0.15f;
@@ -513,7 +531,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     for (int t = 0; t < int(doc::EffectType::Count); ++t) {
         const auto type = static_cast<doc::EffectType>(t);
         const auto& info = doc::effect_info(type);
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         const auto defaults = fx.params;
         std::vector<std::pair<int, float>> variants{{-1, 0.0f}};
         for (uint32_t p = 0; p < info.param_count; ++p) {
@@ -530,7 +548,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             fx.params = defaults;
             if (variant.first >= 0) fx.params[variant.first] = variant.second;
             for (int input = 0; input < 3; ++input) {
-                layer.source = input == 2 ? doc::LayerSourceKind::Shape : doc::LayerSourceKind::Solid;
+                layer.source = input == 2 ? doc::SourceKind::Shape : doc::SourceKind::Solid;
                 layer.gen_scale = 0.35f;
                 layer.color_a[3] = input == 0 ? 0.0f : 0.5f;
                 if (!render(input == 2 ? 1u : 0u)) return false;
@@ -552,7 +570,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    layer.source = doc::LayerSourceKind::Solid;
+    layer.source = doc::SourceKind::Solid;
     for (int t = 0; t < int(doc::EffectType::Count); ++t) {
         const auto type = static_cast<doc::EffectType>(t);
         const auto& info = doc::effect_info(type);
@@ -564,7 +582,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
              "emulsion", "direct_flash", "oversharpen", "mosquito", "composite_artifacts", "film_stock", "lidar", "normalise"})
             preserves = preserves || std::strcmp(info.id, id) == 0;
         if (!preserves) continue;
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         if (type == doc::EffectType::Photocopy) fx.params[2] = 0.0f;
         for (float wet : {1.0f, 0.37f}) {
             fx.wet = wet;
@@ -589,7 +607,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     for (int t = 0; t < int(doc::EffectType::Count); ++t) {
         const auto type = static_cast<doc::EffectType>(t);
         if (type != doc::EffectType::ErrorDiffusion && !doc::is_codec_box(type)) continue;
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
         for (float alpha : {0.0f, 0.5f, 1.0f, 0.0625f}) {
             layer.color_a[3] = alpha;
@@ -608,11 +626,11 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     }
     fx.wet = 0.0f;
     layer.color_a[3] = 0.5f;
-    layer.blend = doc::BlendMode::Normal;
+    doc.looks[0].links.back().blend = doc::BlendMode::Normal;
     if (!render(0)) return false;
     const auto normal = pixels;
     for (int mode = 1; mode <= 4; ++mode) {
-        layer.blend = static_cast<doc::BlendMode>(mode);
+        doc.looks[0].links.back().blend = static_cast<doc::BlendMode>(mode);
         if (!render(0)) return false;
         ++cases;
         for (size_t i = 0; i < pixels.size(); ++i) {
@@ -623,7 +641,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    layer.blend = doc::BlendMode::Normal;
+    doc.looks[0].links.back().blend = doc::BlendMode::Normal;
     layer.color_a[3] = 1.0f;
     auto expect_color = [&](const char* name, const float* expected, float tolerance) {
         ++cases;
@@ -635,10 +653,10 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     };
-    fx = doc::make_effect(doc, doc::EffectType::Normalise);
+    replace_effect(doc, fx, doc::EffectType::Normalise);
     for (float quality : {0.0f, 1.0f}) {
         fx.params[0] = quality;
-        for (auto source : {doc::LayerSourceKind::Solid, doc::LayerSourceKind::Shape}) {
+        for (auto source : {doc::SourceKind::Solid, doc::SourceKind::Shape}) {
             layer.source = source;
             layer.gen_scale = 0.13f;
             layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.25f;
@@ -668,7 +686,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    layer.source = doc::LayerSourceKind::Noise;
+    layer.source = doc::SourceKind::Noise;
     layer.gen_scale = 9.0f;
     layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 0.95f;
     layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.1f;
@@ -705,7 +723,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    layer.source = doc::LayerSourceKind::TestPattern;
+    layer.source = doc::SourceKind::TestPattern;
     layer.osc_shape = 1u;
     layer.gen_scale = 5.0f;
     fx.params = {0.0f, 0.5f, 0.0f};
@@ -726,10 +744,10 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         ++failures;
     }
     ++cases;
-    layer.source = doc::LayerSourceKind::Solid;
+    layer.source = doc::SourceKind::Solid;
     layer.osc_shape = 0u;
     layer.color_a[3] = 1.0f;
-    fx = doc::make_effect(doc, doc::EffectType::Watercolor);
+    replace_effect(doc, fx, doc::EffectType::Watercolor);
     fx.params.assign(fx.params.size(), 0.0f);
     for (float level : {0.02f, 0.2f, 0.5f, 0.9f}) {
         layer.color_a[0] = level;
@@ -742,7 +760,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         if (!render(0)) return false;
         expect_color("watercolor neutral", expected, 0.0005f);
     }
-    fx = doc::make_effect(doc, doc::EffectType::Risograph);
+    replace_effect(doc, fx, doc::EffectType::Risograph);
     fx.params = {1.0f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f};
     for (float density : {0.25f, 0.5f, 1.0f}) {
         float expected[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -753,7 +771,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         if (!render(0)) return false;
         expect_color("ink transmittance", expected, 0.001f);
     }
-    fx = doc::make_effect(doc, doc::EffectType::Halftone);
+    replace_effect(doc, fx, doc::EffectType::Halftone);
     fx.params[0] = 2.0f;
     for (float level : {0.2f, 0.5f, 0.8f}) {
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = level;
@@ -763,7 +781,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         expect_color("unresolved halftone", expected, 0.001f);
     }
     for (auto type : {doc::EffectType::Halftone, doc::EffectType::CrossHatch}) {
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         fx.params[0] = 8.0f;
         if (type == doc::EffectType::CrossHatch) fx.params[3] = 0.0f;
         for (float level : {0.2f, 0.5f, 0.7f}) {
@@ -784,7 +802,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    fx = doc::make_effect(doc, doc::EffectType::Grain);
+    replace_effect(doc, fx, doc::EffectType::Grain);
     fx.params[0] = 0.5f;
     fx.params[2] = 1.0f;
     fx.params[3] = 1.0f;
@@ -810,7 +828,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             ++failures;
         }
     }
-    layer.source = doc::LayerSourceKind::Gradient;
+    layer.source = doc::SourceKind::Gradient;
     layer.color_a[0] = 0.7f;
     layer.color_a[1] = 0.35f;
     layer.color_a[2] = 0.15f;
@@ -824,7 +842,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         layer.stops[0].color[c] = layer.color_a[c];
         layer.stops[1].color[c] = layer.color_b[c];
     }
-    layer.blend = doc::BlendMode::Normal;
+    doc.looks[0].links.back().blend = doc::BlendMode::Normal;
     for (int t = 0; t < int(doc::EffectType::Count); ++t) {
         const auto type = static_cast<doc::EffectType>(t);
         const auto& info = doc::effect_info(type);
@@ -832,7 +850,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         for (const char* id : {"anaglyph", "rutt_etra", "fm_synth", "engraver", "sharpen", "zoom_crunch", "pixel_sort"})
             check = check || std::strcmp(info.id, id) == 0;
         if (!check) continue;
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         layer.color_a[3] = layer.color_b[3] = 1.0f;
         layer.stops[0].color[3] = layer.stops[1].color[3] = 1.0f;
         if (!render(0)) return false;
@@ -849,13 +867,13 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    layer.source = doc::LayerSourceKind::Shape;
+    layer.source = doc::SourceKind::Shape;
     layer.gen_scale = 0.35f;
     for (auto type : {doc::EffectType::Sharpen, doc::EffectType::ZoomCrunch}) {
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         fx.params[0] = 1.0f;
         fx.wet = 0.0f;
-        layer.blend = doc::BlendMode::Normal;
+        doc.looks[0].links.back().blend = doc::BlendMode::Normal;
         if (!render(0)) return false;
         const auto dry = pixels;
         fx.wet = 1.0f;
@@ -869,29 +887,29 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    layer.source = doc::LayerSourceKind::Solid;
-    layer.stack.clear();
+    layer.source = doc::SourceKind::Solid;
+    doc.looks[0].effects.clear();
     layer.color_a[0] = 1.0f;
     layer.color_a[1] = layer.color_a[2] = 0.0f;
     layer.color_a[3] = 0.25f;
-    auto upper = doc::make_layer(doc, doc::LayerSourceKind::Solid);
+    auto upper = doc::make_source(doc, doc::SourceKind::Solid);
     upper.opacity = 1.0f;
     upper.color_a[0] = upper.color_a[1] = 0.0f;
     upper.color_a[2] = 1.0f;
     upper.color_a[3] = 0.5f;
-    doc.looks[0].layers.push_back(std::move(upper));
+    doc.looks[0].sources.push_back(std::move(upper));
+    doc.looks[0].links = {{doc.looks[0].sources[0].id, 0, 0}, {doc.looks[0].sources[1].id, 0, 0}};
     for (bool node_blend : {false, true}) {
-        auto& bottom = doc.looks[0].layers[0];
-        auto& top = doc.looks[0].layers[1];
+        auto& bottom = doc.looks[0].sources[0];
+        auto& top = doc.looks[0].sources[1];
         if (node_blend) {
-            bottom.stack.push_back(doc::make_effect(doc, doc::EffectType::BlendNode));
-            const uint64_t blend_id = bottom.stack[0].id;
+            doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::BlendNode));
+            const uint64_t blend_id = doc.looks[0].effects[0].id;
             doc.looks[0].links = {{bottom.id, blend_id, 0}, {top.id, blend_id, 2}, {blend_id, 0, 0}};
-            top.blend = doc::BlendMode::Normal;
         }
         for (int mode = 0; mode < (node_blend ? 9 : 5); ++mode) {
-            if (node_blend) bottom.stack[0].params[0] = float(mode);
-            else top.blend = static_cast<doc::BlendMode>(mode);
+            if (node_blend) doc.looks[0].effects[0].params[0] = float(mode);
+            else doc.looks[0].links.back().blend = static_cast<doc::BlendMode>(mode);
             if (!render(0)) return false;
             ++cases;
             float expected[4] = {0.125f, 0.0f, 0.375f, 0.625f};
@@ -910,23 +928,23 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             }
         }
     }
-    auto& mask = doc.looks[0].layers[0];
-    auto& white = doc.looks[0].layers[1];
-    mask.stack.clear();
-    mask.stack.push_back(doc::make_effect(doc, doc::EffectType::Matte));
-    const uint64_t mask_id = mask.stack[0].id;
+    auto& mask = doc.looks[0].sources[0];
+    auto& white = doc.looks[0].sources[1];
+    doc.looks[0].effects.clear();
+    doc.looks[0].effects.push_back(doc::make_effect(doc, doc::EffectType::Matte));
+    const uint64_t mask_id = doc.looks[0].effects[0].id;
     mask.opacity = white.opacity = 1.0f;
     for (int c = 0; c < 4; ++c) {
         mask.color_a[c] = 0.5f;
         white.color_a[c] = 1.0f;
     }
     doc.looks[0].links = {{mask.id, mask_id, 0}, {mask_id, 0, 0}};
-    mask.stack[0].params[7] = 1.0f;
+    doc.looks[0].effects[0].params[7] = 1.0f;
     if (!render(0)) return false;
     const float cutout_alpha = pixels[3];
     ++cases;
     if (std::abs(cutout_alpha - 0.25f) > 0.0005f) ++failures;
-    mask.stack[0].params[7] = 0.0f;
+    doc.looks[0].effects[0].params[7] = 0.0f;
     if (!render(0)) return false;
     ++cases;
     if (std::abs(pixels[0] - cutout_alpha) > 0.0005f) {
@@ -944,11 +962,11 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     composite_doc.cache_mb = 0;
     auto composite_look = doc::make_look(composite_doc, "Composite checks");
     for (int c = 0; c < 3; ++c) {
-        auto source = doc::make_layer(composite_doc, doc::LayerSourceKind::Solid);
+        auto source = doc::make_source(composite_doc, doc::SourceKind::Solid);
         source.color_a[0] = source.color_a[1] = source.color_a[2] = 0.0f;
         source.color_a[c] = 1.0f;
         source.opacity = c == 0 ? 0.5f : c == 1 ? 0.25f : 0.75f;
-        composite_look.layers.push_back(std::move(source));
+        composite_look.sources.push_back(std::move(source));
     }
     composite_doc.looks.push_back(std::move(composite_look));
     auto& cl = composite_doc.looks[0];
@@ -965,7 +983,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         cl.links.clear();
         float expected[4]{};
         for (int c : permutation) {
-            const auto& source = cl.layers[c];
+            const auto& source = cl.sources[c];
             cl.links.push_back({source.id, 0, 0});
             for (int k = 0; k < 4; ++k) expected[k] *= 1.0f - source.opacity;
             expected[c] += source.opacity;
@@ -974,10 +992,10 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         if (!render_composite()) return false;
         expect_color("ordered three-source composite", expected, 0.001f);
     } while (std::next_permutation(permutation.begin(), permutation.end()));
-    const uint64_t red = cl.layers[0].id, green = cl.layers[1].id;
-    cl.layers[0].stack.push_back(doc::make_effect(composite_doc, doc::EffectType::Invert));
-    const uint64_t invert = cl.layers[0].stack[0].id;
-    cl.layers[0].stack[0].opacity = 0.5f;
+    const uint64_t red = cl.sources[0].id, green = cl.sources[1].id;
+    cl.effects.push_back(doc::make_effect(composite_doc, doc::EffectType::Invert));
+    const uint64_t invert = cl.effects[0].id;
+    cl.effects[0].opacity = 0.5f;
     cl.links = {{red, invert, 0}, {invert, 0, 0}};
     if (!render_composite()) return false;
     const float half_effect[4] = {0.25f, 0.25f, 0.25f, 0.5f};
@@ -985,19 +1003,19 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     if (!render_composite(0, red)) return false;
     const float red_source[4] = {0.5f, 0.0f, 0.0f, 0.5f};
     expect_color("source preview opacity", red_source, 0.001f);
-    cl.layers[0].stack[0].opacity = 1.0f;
-    cl.layers[0].stack.push_back(doc::make_effect(composite_doc, doc::EffectType::Blur));
-    const uint64_t face = cl.layers[0].stack[1].id;
-    cl.layers[0].stack[1].bypass = true;
+    cl.effects[0].opacity = 1.0f;
+    cl.effects.push_back(doc::make_effect(composite_doc, doc::EffectType::Blur));
+    const uint64_t face = cl.effects[1].id;
+    cl.effects[1].bypass = true;
     cl.links = {{red, invert, 0}, {red, face, 0}, {face, invert, 0}, {invert, 0, 0}};
     if (!render_composite()) return false;
     const float diamond[4] = {0.0f, 0.75f, 0.75f, 0.75f};
     expect_color("shared source diamond", diamond, 0.001f);
-    std::reverse(cl.layers[0].stack.begin(), cl.layers[0].stack.end());
+    std::reverse(cl.effects.begin(), cl.effects.end());
     if (!render_composite()) return false;
     expect_color("diamond storage order", diamond, 0.001f);
-    std::reverse(cl.layers[0].stack.begin(), cl.layers[0].stack.end());
-    cl.layers[1].color_a[0] = cl.layers[1].color_a[1] = cl.layers[1].color_a[2] = 1.0f;
+    std::reverse(cl.effects.begin(), cl.effects.end());
+    cl.sources[1].color_a[0] = cl.sources[1].color_a[1] = cl.sources[1].color_a[2] = 1.0f;
     cl.links = {{green, red, 1}, {red, invert, 0}, {invert, 0, 0}};
     if (!render_composite()) return false;
     const float masked[4] = {0.0f, 0.125f, 0.125f, 0.125f};
@@ -1007,8 +1025,8 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     composite_group.inputs = {composite_doc.next_effect_id++};
     composite_group.face_out = face;
     composite_group.wet = 0.25f;
-    cl.layers[0].groups.push_back(composite_group);
-    for (auto& effect : cl.layers[0].stack) effect.group_id = composite_group.id;
+    cl.groups.push_back(composite_group);
+    for (auto& effect : cl.effects) effect.group_id = composite_group.id;
     cl.links = {{red, composite_group.inputs[0], 0},
         {composite_group.inputs[0], invert, 0}, {invert, face, 0}, {face, 0, 0}};
     if (!render_composite()) return false;
@@ -1018,15 +1036,15 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
     if (!render_composite()) return false;
     const float grouped_mask[4] = {0.46875f, 0.03125f, 0.03125f, 0.5f};
     expect_color("group mix before mask", grouped_mask, 0.001f);
-    cl.layers[0].groups.clear();
-    for (auto& effect : cl.layers[0].stack) effect.group_id = 0;
+    cl.groups.clear();
+    for (auto& effect : cl.effects) effect.group_id = 0;
     cl.links = {{red, invert, 0}, {invert, 0, 0}};
-    cl.layers[0].stack[0].blend = doc::BlendMode::Add;
-    cl.layers[0].stack[0].opacity = 0.25f;
+    cl.effects[0].blend = doc::BlendMode::Add;
+    cl.effects[0].opacity = 0.25f;
     if (!render_composite()) return false;
     const float effect_blend[4] = {0.5f, 0.125f, 0.125f, 0.5625f};
     expect_color("effect blend and opacity", effect_blend, 0.001f);
-    cl.layers[0].stack[0].blend = doc::BlendMode::Normal;
+    cl.effects[0].blend = doc::BlendMode::Normal;
     cl.links = {{red, 0, 0}};
     doc::Placement placement;
     placement.id = composite_doc.next_effect_id++;
@@ -1084,9 +1102,10 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         nested.canvas_w = w;
         nested.canvas_h = h;
         auto child = doc::make_look(nested, "detail source");
-        child.layers.push_back(doc::make_layer(nested, doc::LayerSourceKind::TestPattern));
-        child.layers[0].osc_shape = 1;
-        child.layers[0].gen_scale = 1.0f;
+        child.sources.push_back(doc::make_source(nested, doc::SourceKind::TestPattern));
+        child.sources[0].osc_shape = 1;
+        child.sources[0].gen_scale = 1.0f;
+        child.links = {{child.sources[0].id, 0, 0}};
         const uint64_t child_id = child.id;
         nested.looks.push_back(child);
         engine->set_preview_divisor(1);
@@ -1096,7 +1115,7 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
         };
         if (!sample(child_id)) return false;
         const auto original = pixels;
-        nested.looks[0].layers[0].gen_scale = 7.0f;
+        nested.looks[0].sources[0].gen_scale = 7.0f;
         if (!sample(child_id)) return false;
         const auto resize_reference = pixels;
         nested.looks[0].format = doc::resize_format(nested, child_id, w / 2, h / 2, true);
@@ -1110,12 +1129,13 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             ++failures;
         }
         nested.looks[0].format = {};
-        nested.looks[0].layers[0].gen_scale = 1.0f;
-        nested.looks[0].layers[0].xf_scale = 0.1f;
+        nested.looks[0].sources[0].gen_scale = 1.0f;
+        nested.looks[0].sources[0].xf_scale = 0.1f;
         auto parent = doc::make_look(nested, "detail parent");
-        parent.layers.push_back(doc::make_layer(nested, doc::LayerSourceKind::LookRef));
-        parent.layers[0].target = child_id;
-        parent.layers[0].xf_scale = 10.0f;
+        parent.sources.push_back(doc::make_source(nested, doc::SourceKind::LookRef));
+        parent.sources[0].target = child_id;
+        parent.sources[0].xf_scale = 10.0f;
+        parent.links = {{parent.sources[0].id, 0, 0}};
         const uint64_t parent_id = parent.id;
         nested.looks.push_back(parent);
         if (!sample(parent_id)) return false;
@@ -1127,11 +1147,13 @@ bool alpha_check(gfx::Device& device, const std::filesystem::path& shader_dir) {
             std::fprintf(stderr, "Nested 10%% / 1000%% detail error: %.6f\n", error);
             ++failures;
         }
-        nested.looks[0].layers[0].stack.push_back(doc::make_effect(nested, doc::EffectType::Invert));
-        nested.looks[0].layers[0].xf_scale = 1.0f;
+        nested.looks[0].effects.push_back(doc::make_effect(nested, doc::EffectType::Invert));
+        nested.looks[0].links = {{nested.looks[0].sources[0].id, nested.looks[0].effects[0].id, 0},
+            {nested.looks[0].effects[0].id, 0, 0}};
+        nested.looks[0].sources[0].xf_scale = 1.0f;
         if (!sample(child_id)) return false;
         const auto effected = pixels;
-        nested.looks[0].layers[0].xf_scale = 0.1f;
+        nested.looks[0].sources[0].xf_scale = 0.1f;
         if (!sample(parent_id)) return false;
         ++cases;
         error = 0;
@@ -1151,12 +1173,13 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
     doc::Document doc;
     doc.cache_mb = 0;
     auto look = doc::make_look(doc, "Simulation checks");
-    look.layers.push_back(doc::make_layer(doc, doc::LayerSourceKind::Solid));
-    look.layers[0].opacity = 1.0f;
-    look.layers[0].stack.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
+    look.sources.push_back(doc::make_source(doc, doc::SourceKind::Solid));
+    look.sources[0].opacity = 1.0f;
+    look.effects.push_back(doc::make_effect(doc, doc::EffectType::Glyph));
+    look.links = {{look.sources[0].id, look.effects[0].id, 0}, {look.effects[0].id, 0, 0}};
     doc.looks.push_back(std::move(look));
-    auto& layer = doc.looks[0].layers[0];
-    auto& fx = layer.stack[0];
+    auto& layer = doc.looks[0].sources[0];
+    auto& fx = doc.looks[0].effects[0];
     auto engine = gfx::Engine::create(device, shader_dir);
     auto readback = gfx::Nv12Readback::create(device, shader_dir);
     if (!engine || !readback) return false;
@@ -1231,7 +1254,7 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
         !render() || std::abs(mean() - 177.0) > 2.0) return false;
     std::printf("Glyph: fine detail in a 64-pixel atlas keeps mean coverage\n");
     divisor = 1;
-    fx = doc::make_effect(doc, doc::EffectType::Glow);
+    replace_effect(doc, fx, doc::EffectType::Glow);
     fx.params[3] = 2.0f;
     fx.params[2] = 0.8f;
     fx.params[0] = 3.0f;
@@ -1241,7 +1264,7 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
     const auto quiet = pixels;
     fx.wet = 0.0f;
     if (!render() || pixels != quiet) return false;
-    layer.source = doc::LayerSourceKind::Shape;
+    layer.source = doc::SourceKind::Shape;
     layer.gen_scale = 0.025f;
     layer.gen_angle = 0.0f;
     layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
@@ -1255,7 +1278,7 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
     if (!render() || pixels[height / 4 * width + width / 2] <= bloom[height / 4 * width + width / 2]) return false;
     if (pixels[height / 4 * width + width / 4] != 16) return false;
     std::printf("CCD: quiet field, column smear and empty columns pass\n");
-    fx = doc::make_effect(doc, doc::EffectType::Streak);
+    replace_effect(doc, fx, doc::EffectType::Streak);
     fx.params[0] = 256.0f;
     fx.params[2] = 0.99f;
     if (!render()) return false;
@@ -1263,8 +1286,8 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
         for (uint32_t x = width / 2; x < width; ++x)
             if (pixels[y * width + x] != 16) return false;
     std::printf("Streak: maximum length preserves cross-axis width\n");
-    fx = doc::make_effect(doc, doc::EffectType::Jitter);
-    layer.source = doc::LayerSourceKind::TestPattern;
+    replace_effect(doc, fx, doc::EffectType::Jitter);
+    layer.source = doc::SourceKind::TestPattern;
     layer.osc_shape = 4;
     for (float mode : {1.0f, 3.0f}) {
         fx.params[2] = mode;
@@ -1275,7 +1298,7 @@ bool simulation_check(gfx::Device& device, const std::filesystem::path& shader_d
     std::printf("Jitter: camera motion changes in time and repeats after a seek\n");
     for (const auto type : {doc::EffectType::Glyph, doc::EffectType::Streak,
                            doc::EffectType::Glow, doc::EffectType::Jitter}) {
-        fx = doc::make_effect(doc, type);
+        replace_effect(doc, fx, type);
         if (type == doc::EffectType::Glyph) { fx.params[0] = 2.0f; fx.params[1] = 3.0f; }
         if (type == doc::EffectType::Streak) fx.params[0] = 256.0f;
         if (type == doc::EffectType::Glow) { fx.params[0] = 3.0f; fx.params[3] = 2.0f; }
@@ -1350,6 +1373,7 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
         }
         doc::Document doc = doc_with_media_look();
         doc.master_seed = 77;
+        doc.looks[0].links = {{doc.looks[0].sources[0].id, 0, 0}};
         doc.canvas_w = source.w;
         doc.canvas_h = source.h;
         std::vector<uint8_t> nv12;
@@ -1372,15 +1396,18 @@ int run_bench(gfx::Device& device, const std::filesystem::path& shader_dir) {
         doc.canvas_w = source.w;
         doc.canvas_h = source.h;
         const char* name = "(baseline: no effects)";
+        doc.looks[0].links = {{doc.looks[0].sources[0].id, 0, 0}};
         if (t >= 0) {
             const auto type = static_cast<doc::EffectType>(
                 t == kTypes ? static_cast<int>(doc::EffectType::ErrorDiffusion)
                             : t);
-            doc.looks[0].layers[0].stack.push_back(doc::make_effect(doc, type));
+            doc.looks[0].effects.push_back(doc::make_effect(doc, type));
+            doc.looks[0].links = {{doc.looks[0].sources[0].id, doc.looks[0].effects[0].id, 0},
+                {doc.looks[0].effects[0].id, 0, 0}};
             name = t == kTypes ? "Error Diffusion (exact)"
                                : doc::effect_info(type).label;
             if (t == kTypes)
-                doc.looks[0].layers[0].stack[0].params[4] = 0.0f;
+                doc.looks[0].effects[0].params[4] = 0.0f;
         }
         auto engine = gfx::Engine::create(device, shader_dir);
         auto readback = gfx::Nv12Readback::create(device, shader_dir);

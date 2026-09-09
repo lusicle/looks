@@ -6,6 +6,7 @@
 
 #include "doc/effects.h"
 #include "doc/group_commands.h"
+#include "doc/layer_commands.h"
 #include "doc/look_commands.h"
 #include "doc/mod_commands.h"
 #include "doc/preset.h"
@@ -16,6 +17,120 @@
 #include "test_framework.h"
 
 using namespace looks;
+
+TEST(connection_blends_survive_storage_presets_and_group_edits) {
+    auto d = doc_with_look();
+    auto& look = d.looks[0];
+    look.sources[0].source = doc::SourceKind::Solid;
+    look.sources.push_back(doc::make_source(d, doc::SourceKind::Noise));
+    look.effects.push_back(doc::make_effect(d, doc::EffectType::Invert));
+    const auto a = look.sources[0].id, b = look.sources[1].id, fx = look.effects[0].id;
+    look.links = {{a, fx, 0}, {b, fx, 0, doc::BlendMode::Multiply},
+        {fx, 0, 0, doc::BlendMode::Screen}, {a, 0, 1}, {b, 0, 1}};
+    look.audio_split = true;
+    const auto original = look.links;
+    auto text = json::parse(json::write(doc::doc_to_json(d)));
+    CHECK(text.value.has_value());
+    auto loaded = doc::doc_from_json(*text.value);
+    CHECK(loaded.looks[0].links == original);
+    auto group = doc::make_group(d, "blend");
+    doc::UndoStack undo;
+    undo.execute(d, doc::group_effects_command(look.id, group, {fx}));
+    auto preset = doc::make_preset_from_group(look, group.id);
+    auto parsed = doc::preset_from_json(doc::preset_to_json(preset));
+    CHECK(parsed.has_value());
+    if (parsed) {
+        CHECK(parsed->links == preset.links);
+        auto instance = doc::instantiate_preset(d, *parsed);
+        CHECK_EQ(instance.links.size(), preset.links.size());
+        for (size_t i = 0; i < preset.links.size(); ++i) {
+            CHECK(instance.links[i].blend == preset.links[i].blend);
+            CHECK(instance.links[i].from != preset.links[i].from);
+        }
+    }
+    undo.execute(d, doc::ungroup_command(look.id, group.id));
+    CHECK(look.links == original);
+    undo.undo(d);
+    const auto slot = look.groups[0].inputs[0];
+    undo.execute(d, doc::connect_command(look.id, {b, slot, 0, doc::BlendMode::Difference}));
+    const auto grouped = look.links;
+    undo.execute(d, doc::ungroup_command(look.id, group.id));
+    CHECK_EQ(look.effects.size(), size_t{2});
+    CHECK(look.effects.back().bypass);
+    CHECK(look.effects.back().type == doc::EffectType::BlendNode);
+    CHECK(doc::valid_look_graph(look));
+    const auto ungrouped = look.links;
+    const auto merge_id = look.effects.back().id;
+    undo.undo(d);
+    CHECK(look.links == grouped);
+    CHECK_EQ(look.effects.size(), size_t{1});
+    undo.redo(d);
+    CHECK(look.links == ungrouped);
+    CHECK_EQ(look.effects.back().id, merge_id);
+    undo.undo(d);
+    undo.execute(d, doc::set_effect_group_command(look.id, fx, 0));
+    CHECK_EQ(doc::find_effect(look, fx)->group_id, uint64_t{0});
+    CHECK_EQ(look.effects.size(), size_t{2});
+    CHECK(look.effects.back().bypass);
+    CHECK(doc::valid_look_graph(look));
+    const auto moved = look.links;
+    undo.undo(d);
+    CHECK(look.links == grouped);
+    CHECK_EQ(look.effects.size(), size_t{1});
+    undo.redo(d);
+    CHECK(look.links == moved);
+    auto invalid = doc::link_to_json(original[0]);
+    invalid.set("blend", "invalid");
+    CHECK(doc::link_from_json(invalid).blend == doc::BlendMode::Count);
+}
+
+TEST(independent_graph_validation_rejects_ambiguous_ids_and_bad_bindings) {
+    auto d = doc_with_look();
+    auto& look = d.looks[0];
+    CHECK(doc::valid_look_graph(look));
+    auto effect = doc::make_effect(d, doc::EffectType::Invert);
+    look.effects.push_back(effect);
+    look.effects[0].id = look.sources[0].id;
+    CHECK(!doc::valid_look_graph(look));
+    look.effects[0].id = effect.id;
+    look.effects[0].group_id = 99999;
+    CHECK(!doc::valid_look_graph(look));
+    look.effects[0].group_id = 0;
+    look.links.push_back({99999, effect.id, 0});
+    CHECK(!doc::valid_look_graph(look));
+    look.links.back() = {look.sources[0].id, effect.id, 50};
+    CHECK(!doc::valid_look_graph(look));
+    look.links.back() = {look.sources[0].id, effect.id, 0};
+    CHECK(doc::valid_look_graph(look));
+    auto group = doc::make_group(d, "invalid face");
+    look.groups.push_back(group);
+    look.groups[0].face_out = effect.id;
+    CHECK(!doc::valid_look_graph(look));
+    look.effects[0].group_id = group.id;
+    CHECK(doc::valid_look_graph(look));
+    look.groups[0].exposed.push_back({effect.id, 10000});
+    CHECK(!doc::valid_look_graph(look));
+}
+
+TEST(parameter_tags_roundtrip_through_json_text_without_losing_ids) {
+    auto d = doc_with_look();
+    const std::vector<uint64_t> ids{7 | doc::kSourceParamBit, 13 | doc::kStopParamBit,
+        17 | doc::kGroupParamBit, 23};
+    for (const auto id : ids) {
+        d.looks[0].lanes.push_back({{id, 0}, {{0, 0.5f}}});
+        doc::ModRoute route;
+        route.target = {id, 0};
+        d.looks[0].mod_routes.push_back(route);
+    }
+    const auto parsed = json::parse(json::write(doc::doc_to_json(d)));
+    CHECK(parsed.value.has_value());
+    if (!parsed.value) return;
+    const auto copy = doc::doc_from_json(*parsed.value);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        CHECK_EQ(copy.looks[0].lanes[i].target.effect_id, ids[i]);
+        CHECK_EQ(copy.looks[0].mod_routes[i].target.effect_id, ids[i]);
+    }
+}
 
 TEST(composition_crop_resize_and_storage) {
     auto d = doc_with_look();
@@ -62,8 +177,8 @@ Document make_rich_doc() {
     media.still = true;
     media.frame_count = 1200;
     d.assets.push_back(media);
-    d.looks[0].layers[0].asset = media.id;
-    d.looks[0].layers[0].slip = 12;
+    d.looks[0].sources[0].asset = media.id;
+    d.looks[0].sources[0].slip = 12;
     d.looks[0].format.fps = 24.0;
     d.sequences[0].format.w = 1280;
     d.sequences[0].format.h = 720;
@@ -72,34 +187,33 @@ Document make_rich_doc() {
     d.speed = 2.0f;
     d.time_mode = 2;
 
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Datamosh));
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::FilmStock));
-    d.looks[0].layers[0].stack[1].params[3] = 6.0f;
-    d.looks[0].layers[0].stack[1].wet = 0.8f;
-    d.looks[0].layers[0].stack[1].blend = doc::BlendMode::Screen;
-    d.looks[0].layers[0].stack[1].seed = 99;
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Datamosh));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::FilmStock));
+    d.looks[0].effects[1].params[3] = 6.0f;
+    d.looks[0].effects[1].wet = 0.8f;
+    d.looks[0].effects[1].blend = doc::BlendMode::Screen;
+    d.looks[0].effects[1].seed = 99;
 
-    doc::Layer overlay;
+    doc::Source overlay;
     overlay.id = d.next_effect_id++;
     overlay.name = "noise";
-    overlay.source = doc::LayerSourceKind::Noise;
-    overlay.blend = doc::BlendMode::Multiply;
+    overlay.source = doc::SourceKind::Noise;
     overlay.opacity = 0.4f;
     overlay.color_a[0] = 0.9f;
     overlay.gen_scale = 3.0f;
-    overlay.stack.push_back(make_effect(d, EffectType::Pixelate));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Pixelate));
     // The one string param: Text's string must survive the trip.
-    overlay.stack.push_back(make_effect(d, EffectType::Text));
-    overlay.stack.back().text = "REC · SP";
-    d.looks[0].layers.push_back(overlay);
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Text));
+    d.looks[0].effects.back().text = "REC · SP";
+    d.looks[0].sources.push_back(overlay);
 
     doc::Group g = doc::make_group(d, "combo");
     g.folded = true;
-    g.exposed.push_back({d.looks[0].layers[0].stack[1].id, 4});
-    d.looks[0].layers[0].stack[0].group_id = g.id;
-    d.looks[0].layers[0].stack[1].group_id = g.id;
-    d.looks[0].layers[0].groups.push_back(g);
+    g.exposed.push_back({d.looks[0].effects[1].id, 4});
+    d.looks[0].effects[0].group_id = g.id;
+    d.looks[0].effects[1].group_id = g.id;
+    d.looks[0].groups.push_back(g);
 
     doc::ValueNode lfo_node;
     lfo_node.id = d.next_route_id++;
@@ -127,25 +241,25 @@ Document make_rich_doc() {
     doc::ModRoute r;
     r.id = d.next_route_id++;
     r.node = math_node.id;
-    r.target = {d.looks[0].layers[0].stack[0].id, 0};
+    r.target = {d.looks[0].effects[0].id, 0};
     r.curve = doc::ResponseCurve::SCurve;
     d.looks[0].mod_routes.push_back(r);
 
     doc::ModRoute env;
     env.id = d.next_route_id++;
     env.node = env_node.id;
-    env.target = {d.looks[0].layers[0].stack[0].id, 1};
+    env.target = {d.looks[0].effects[0].id, 1};
     d.looks[0].mod_routes.push_back(env);
 
     doc::KeyframeLane lane;
-    lane.target = {d.looks[0].layers[0].stack[2].id, 3};
+    lane.target = {d.looks[0].effects[2].id, 3};
     lane.keys.push_back({0.0, 0.0f, 4.0f, 0.1f, 0.0f, 0.0f, false});
     lane.keys.push_back({48.0, 1.0f, 0.0f, 0.0f, -4.0f, -0.1f, true});
     d.looks[0].lanes.push_back(lane);
 
     d.looks[0].snapshots[1].valid = true;
     d.looks[0].snapshots[1].entries.push_back(
-        {d.looks[0].layers[0].stack[0].id, {0.5f, 0.5f, 0.2f}, 0.9f, 1.0f});
+        {d.looks[0].effects[0].id, {0.5f, 0.5f, 0.2f}, 0.9f, 1.0f});
 
     const uint64_t pair = d.next_effect_id++;
     doc::Placement block;
@@ -194,7 +308,7 @@ TEST(serialize_placement_transform_roundtrip) {
     p.anchor_y = 0.8f;
     d.sequences[0].tracks[0].placements.push_back(p);
     // The anchor must persist even when the transform is otherwise identity.
-    d.looks[0].layers[0].xf_anchor_x = 0.1f;
+    d.looks[0].sources[0].xf_anchor_x = 0.1f;
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
     CHECK(doc::doc_to_json(d2) == a);
@@ -207,14 +321,14 @@ TEST(serialize_placement_transform_roundtrip) {
     CHECK_EQ(q->opacity, 0.7f);
     CHECK_EQ(q->anchor_x, 0.2f);
     CHECK_EQ(q->anchor_y, 0.8f);
-    CHECK_EQ(d2.looks[0].layers[0].xf_anchor_x, 0.1f);
-    CHECK_EQ(d2.looks[0].layers[0].xf_anchor_y, 0.5f);
+    CHECK_EQ(d2.looks[0].sources[0].xf_anchor_x, 0.1f);
+    CHECK_EQ(d2.looks[0].sources[0].xf_anchor_y, 0.5f);
 }
 
 TEST(serialize_shape_path_roundtrip) {
     Document d = doc_with_look();
-    doc::Layer& l = d.looks[0].layers[0];
-    l.source = doc::LayerSourceKind::Shape;
+    doc::Source& l = d.looks[0].sources[0];
+    l.source = doc::SourceKind::Shape;
     l.osc_shape = 3;
     doc::PathPoint p0, p1, p2;
     p0.ax = 0.5f;
@@ -231,7 +345,7 @@ TEST(serialize_shape_path_roundtrip) {
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
     CHECK(doc::doc_to_json(d2) == a);
-    const doc::Layer& l2 = d2.looks[0].layers[0];
+    const doc::Source& l2 = d2.looks[0].sources[0];
     CHECK_EQ(l2.path.size(), size_t{3});
     CHECK_EQ(l2.path[0].ax, 0.5f);
     CHECK_EQ(l2.path[0].out_dx, 0.1f);
@@ -242,8 +356,8 @@ TEST(serialize_shape_path_roundtrip) {
     // Pathless layers stay pathless (and closed by default) on reload.
     Document d3 = doc_with_look();
     Document d4 = doc::doc_from_json(doc::doc_to_json(d3));
-    CHECK(d4.looks[0].layers[0].path.empty());
-    CHECK(d4.looks[0].layers[0].path_closed);
+    CHECK(d4.looks[0].sources[0].path.empty());
+    CHECK(d4.looks[0].sources[0].path_closed);
 }
 
 TEST(serialize_camera_node_roundtrip) {
@@ -253,7 +367,7 @@ TEST(serialize_camera_node_roundtrip) {
     n.source.type = doc::ModSourceType::Camera;
     n.source.channel = 2;   // stab rot
     n.source.anchor = 417u; // locked 3D feature-track id
-    n.audio_src = d.looks[0].layers[0].id;
+    n.audio_src = d.looks[0].sources[0].id;
     d.looks[0].value_nodes.push_back(n);
     json::Value a = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(a);
@@ -263,7 +377,7 @@ TEST(serialize_camera_node_roundtrip) {
     CHECK(n2->source.type == doc::ModSourceType::Camera);
     CHECK_EQ(n2->source.channel, 2u);
     CHECK_EQ(n2->source.anchor, 417u);
-    CHECK_EQ(n2->audio_src, d.looks[0].layers[0].id);
+    CHECK_EQ(n2->audio_src, d.looks[0].sources[0].id);
 }
 
 TEST(serialize_bins_roundtrip_and_heal) {
@@ -305,20 +419,20 @@ TEST(serialize_audio_voice_roundtrip) {
     // Defaults stay absent from the JSON.
     Document d = doc_with_look();
     d.looks[0].audio_split = true;
-    d.looks[0].layers[0].asset = d.next_effect_id++;
-    d.looks[0].layers[0].timeline_lock = true;
-    d.looks[0].layers[0].stack.push_back(
+    d.looks[0].sources[0].asset = d.next_effect_id++;
+    d.looks[0].sources[0].timeline_lock = true;
+    d.looks[0].effects.push_back(
         make_effect(d, EffectType::AudioFilter));
-    d.looks[0].layers[0].stack[0].params[0] = 0.25f;
-    d.looks[0].layers[0].stack.push_back(
+    d.looks[0].effects[0].params[0] = 0.25f;
+    d.looks[0].effects.push_back(
         make_effect(d, EffectType::Offset));
-    d.looks[0].layers[0].stack[1].params[0] = -24.0f;
-    d.looks[0].layers[0].stack[1].params[1] = 1.0f;
-    d.looks[0].links.push_back({d.looks[0].layers[0].id, 0, 1});
+    d.looks[0].effects[1].params[0] = -24.0f;
+    d.looks[0].effects[1].params[1] = 1.0f;
+    d.looks[0].links.push_back({d.looks[0].sources[0].id, 0, 1});
     doc::ValueNode vn;
     vn.id = d.next_route_id++;
     vn.source.type = doc::ModSourceType::AudioHigh;
-    vn.audio_src = d.looks[0].layers[0].id;
+    vn.audio_src = d.looks[0].sources[0].id;
     d.looks[0].value_nodes.push_back(vn);
 
     json::Value a = doc::doc_to_json(d);
@@ -326,24 +440,24 @@ TEST(serialize_audio_voice_roundtrip) {
     json::Value b = doc::doc_to_json(d2);
     CHECK(a == b);
     CHECK(d2.looks[0].audio_split);
-    CHECK(d2.looks[0].layers[0].timeline_lock);
-    CHECK(d2.looks[0].layers[0].stack[0].type == EffectType::AudioFilter);
-    CHECK_EQ(d2.looks[0].layers[0].stack[0].params[0], 0.25f);
-    CHECK(d2.looks[0].layers[0].stack[1].type == EffectType::Offset);
-    CHECK_EQ(doc::offset_frames(d2.looks[0].layers[0].stack[1]),
+    CHECK(d2.looks[0].sources[0].timeline_lock);
+    CHECK(d2.looks[0].effects[0].type == EffectType::AudioFilter);
+    CHECK_EQ(d2.looks[0].effects[0].params[0], 0.25f);
+    CHECK(d2.looks[0].effects[1].type == EffectType::Offset);
+    CHECK_EQ(doc::offset_frames(d2.looks[0].effects[1]),
              int64_t{-24});
-    CHECK(doc::offset_targets_audio(d2.looks[0].layers[0].stack[1]));
-    CHECK(!doc::offset_targets_video(d2.looks[0].layers[0].stack[1]));
+    CHECK(doc::offset_targets_audio(d2.looks[0].effects[1]));
+    CHECK(!doc::offset_targets_video(d2.looks[0].effects[1]));
     CHECK_EQ(d2.looks[0].links.back().to, uint64_t{0});
     CHECK_EQ(d2.looks[0].links.back().to_port, uint32_t{1});
     CHECK_EQ(d2.looks[0].value_nodes[0].audio_src,
-             d2.looks[0].layers[0].id);
+             d2.looks[0].sources[0].id);
 
     Document plain = doc_with_look();
     CHECK(!doc::doc_from_json(doc::doc_to_json(plain)).looks[0].audio_split);
     CHECK(!doc::doc_from_json(doc::doc_to_json(plain))
                .looks[0]
-               .layers[0]
+               .sources[0]
                .timeline_lock);
 }
 
@@ -364,26 +478,26 @@ TEST(serialize_roundtrip_stable) {
     CHECK_EQ(d2.sequences[0].format.w, uint32_t{1280});
     CHECK_EQ(d2.sequences[0].format.h, uint32_t{720});
     CHECK_EQ(d2.sequences[0].format.fps, 0.0);
-    CHECK_EQ(d2.looks[0].layers[0].asset, d2.assets[0].id);
-    CHECK_EQ(d2.looks[0].layers[0].slip, uint32_t{12});
+    CHECK_EQ(d2.looks[0].sources[0].asset, d2.assets[0].id);
+    CHECK_EQ(d2.looks[0].sources[0].slip, uint32_t{12});
     CHECK_EQ(d2.master_seed, uint64_t{1234});
     CHECK_EQ(d2.cache_mb, uint32_t{512});
     CHECK_EQ(d2.speed, 2.0f);
     CHECK_EQ(d2.time_mode, uint32_t{2});
-    CHECK_EQ(d2.looks[0].layers.size(), size_t{2});
-    CHECK_EQ(d2.looks[0].layers[0].stack.size(), size_t{3});
-    CHECK(d2.looks[0].layers[0].stack[1].type == EffectType::Datamosh);
-    CHECK_EQ(d2.looks[0].layers[0].stack[1].wet, 0.8f);
-    CHECK(d2.looks[0].layers[0].stack[1].blend == doc::BlendMode::Screen);
-    CHECK_EQ(d2.looks[0].layers[0].stack[1].seed, uint64_t{99});
-    CHECK(d2.looks[0].layers[1].source == doc::LayerSourceKind::Noise);
-    CHECK_EQ(d2.looks[0].layers[1].opacity, 0.4f);
-    CHECK_EQ(d2.looks[0].layers[0].groups.size(), size_t{1});
-    CHECK(d2.looks[0].layers[0].groups[0].folded);
-    CHECK_EQ(d2.looks[0].layers[0].groups[0].exposed.size(), size_t{1});
-    CHECK_EQ(d2.looks[0].layers[0].groups[0].exposed[0].param_index, 4);
-    CHECK_EQ(d2.looks[0].layers[0].stack[0].group_id,
-             d2.looks[0].layers[0].groups[0].id);
+    CHECK_EQ(d2.looks[0].sources.size(), size_t{2});
+    CHECK_EQ(d2.looks[0].effects.size(), size_t{5});
+    CHECK(d2.looks[0].effects[1].type == EffectType::Datamosh);
+    CHECK_EQ(d2.looks[0].effects[1].wet, 0.8f);
+    CHECK(d2.looks[0].effects[1].blend == doc::BlendMode::Screen);
+    CHECK_EQ(d2.looks[0].effects[1].seed, uint64_t{99});
+    CHECK(d2.looks[0].sources[1].source == doc::SourceKind::Noise);
+    CHECK_EQ(d2.looks[0].sources[1].opacity, 0.4f);
+    CHECK_EQ(d2.looks[0].groups.size(), size_t{1});
+    CHECK(d2.looks[0].groups[0].folded);
+    CHECK_EQ(d2.looks[0].groups[0].exposed.size(), size_t{1});
+    CHECK_EQ(d2.looks[0].groups[0].exposed[0].param_index, 4);
+    CHECK_EQ(d2.looks[0].effects[0].group_id,
+             d2.looks[0].groups[0].id);
     CHECK_EQ(d2.looks[0].value_nodes.size(), size_t{3});
     CHECK(d2.looks[0].value_nodes[0].source.shape ==
           doc::LfoShape::Triangle);
@@ -436,9 +550,9 @@ TEST(crt_parameters_and_cache_state) {
     fx.params.resize(9);
     fx.params[2] = 240.0f;
     fx.params[6] = 5.0f;
-    d.looks[0].layers[0].stack.push_back(fx);
+    d.looks[0].effects.push_back(fx);
     Document loaded = doc::doc_from_json(doc::doc_to_json(d));
-    auto& restored = loaded.looks[0].layers[0].stack[0];
+    auto& restored = loaded.looks[0].effects[0];
     CHECK_EQ(restored.params.size(), size_t{13});
     CHECK_EQ(restored.params[2], 240.0f);
     CHECK_EQ(restored.params[6], 5.0f);
@@ -468,28 +582,25 @@ TEST(crt_parameters_and_cache_state) {
 TEST(serialize_tolerant_load) {
     // The loader skips unknown types and re-derives counters above the ids.
     const char* text = R"({
-        "looks_project": 5,
+        "looks_project": 6,
         "name": "sparse",
         "next_effect_id": 1,
-        "root_look": 100,
-        "looks": [{"id": 100, "layers": [
-            {"id": 40, "stack": [
+        "looks": [{"id": 100, "sources": [{"id": 40}], "effects": [
                 {"type": "from_the_future", "id": 41},
                 {"type": "vignette", "id": 42, "params": [0.9]}
-            ]}
-        ]}]
+            ]}]
     })";
     json::ParseResult parsed = json::parse(text);
     CHECK(parsed.value.has_value());
     Document d = doc::doc_from_json(*parsed.value);
-    CHECK_EQ(d.looks[0].layers.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{1});
-    CHECK(d.looks[0].layers[0].stack[0].type == EffectType::Vignette);
-    CHECK_EQ(d.looks[0].layers[0].stack[0].params[0], 0.9f);
-    CHECK_EQ(d.looks[0].layers[0].stack[0].params[1],
+    CHECK_EQ(d.looks[0].sources.size(), size_t{1});
+    CHECK_EQ(d.looks[0].effects.size(), size_t{1});
+    CHECK(d.looks[0].effects[0].type == EffectType::Vignette);
+    CHECK_EQ(d.looks[0].effects[0].params[0], 0.9f);
+    CHECK_EQ(d.looks[0].effects[0].params[1],
              doc::effect_info(EffectType::Vignette).params[1].default_value);
-    CHECK(d.looks[0].layers[0].visible);
-    CHECK_EQ(d.looks[0].layers[0].opacity, 1.0f);
+    CHECK(d.looks[0].sources[0].visible);
+    CHECK_EQ(d.looks[0].sources[0].opacity, 1.0f);
     CHECK(d.next_effect_id > 42);   // not the stored 1
 
     CHECK(!json::parse("{nope").value.has_value());
@@ -499,7 +610,7 @@ TEST(serialize_v57_roundtrip) {
     Document d = doc_with_look();
     d.root().markers = {12, 45, 90};
     doc::KeyframeLane lane;
-    lane.target = {d.looks[0].layers[0].id | doc::kLayerParamBit, 8};
+    lane.target = {d.looks[0].sources[0].id | doc::kSourceParamBit, 8};
     lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     lane.keys.push_back({30.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     d.looks[0].lanes.push_back(lane);
@@ -510,7 +621,7 @@ TEST(serialize_v57_roundtrip) {
     CHECK_EQ(d2.root().markers[1], uint32_t{45});
     CHECK_EQ(d2.looks[0].lanes.size(), size_t{1});
     CHECK_EQ(d2.looks[0].lanes[0].target.effect_id,
-             d.looks[0].layers[0].id | doc::kLayerParamBit);
+             d.looks[0].sources[0].id | doc::kSourceParamBit);
     CHECK_EQ(d2.looks[0].lanes[0].target.param_index, 8);
     json::Value b = doc::doc_to_json(d2);
     CHECK(a == b);
@@ -519,7 +630,10 @@ TEST(serialize_v57_roundtrip) {
 TEST(preset_insert_lands_dormant) {
     // Adding a preset never wires it: the members chain internally only.
     Document d = doc_with_look();
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].links = {{d.looks[0].sources[0].id, d.looks[0].effects[0].id, 0},
+        {d.looks[0].effects[0].id, 0, 0}};
+    const auto original_links = d.looks[0].links;
     doc::UndoStack undo;
 
     doc::Group g;
@@ -530,8 +644,11 @@ TEST(preset_insert_lands_dormant) {
     members.push_back(make_effect(d, EffectType::Posterize));
     const uint64_t m0 = members[0].id, m1 = members[1].id;
     const uint64_t gid = g.id;
-    undo.execute(d, doc::insert_group_command(d.looks[0].id, 0, g,
-                                              std::move(members), m0));
+    g.inputs = {d.next_effect_id++};
+    g.face_out = m1;
+    for (auto& member : members) member.group_id = gid;
+    undo.execute(d, doc::insert_group_command(d.looks[0].id, g, std::move(members),
+        {{g.inputs[0], m0, 0}, {m0, m1, 0}}));
 
     // The group seeds its In slot, and nothing exterior touches the members.
     CHECK(!d.looks[0].links.empty());
@@ -547,7 +664,7 @@ TEST(preset_insert_lands_dormant) {
         if (l.to == m0 && l.from != slot0)
             boundary = true;   // nothing exterior feeds the group
         if (l.to == slot0) boundary = true;   // the slot sits unwired
-        if (l.to == 0 && l.from == d.looks[0].layers[0].stack[0].id)
+        if (l.to == 0 && l.from == d.looks[0].effects[0].id)
             chain_out = true;
     }
     CHECK(internal);
@@ -556,9 +673,9 @@ TEST(preset_insert_lands_dormant) {
     CHECK(chain_out);
 
     undo.undo(d);
-    CHECK(d.looks[0].links.empty());
-    CHECK_EQ(d.looks[0].layers[0].groups.size(), size_t{0});
-    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{1});
+    CHECK(d.looks[0].links == original_links);
+    CHECK_EQ(d.looks[0].groups.size(), size_t{0});
+    CHECK_EQ(d.looks[0].effects.size(), size_t{1});
 }
 
 TEST(serialize_dedupes_input_fanin) {
@@ -624,35 +741,35 @@ TEST(serialize_lane_keys_sorted_on_load) {
 TEST(group_commands_lifecycle) {
     Document d = doc_with_look();
     doc::UndoStack undo;
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Pixelate));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Grain));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Pixelate));
 
     doc::Group g = doc::make_group(d, "duo");
-    undo.execute(d, doc::group_effects_command(d.looks[0].id,0, g, 0, 1));
-    CHECK_EQ(d.looks[0].layers[0].groups.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers[0].stack[0].group_id, g.id);
-    CHECK_EQ(d.looks[0].layers[0].stack[1].group_id, g.id);
-    CHECK_EQ(d.looks[0].layers[0].stack[2].group_id, uint64_t{0});
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, g, {d.looks[0].effects[0].id, d.looks[0].effects[1].id}));
+    CHECK_EQ(d.looks[0].groups.size(), size_t{1});
+    CHECK_EQ(d.looks[0].effects[0].group_id, g.id);
+    CHECK_EQ(d.looks[0].effects[1].group_id, g.id);
+    CHECK_EQ(d.looks[0].effects[2].group_id, uint64_t{0});
 
-    const doc::ParamKey pk{d.looks[0].layers[0].stack[1].id, 0};
-    undo.execute(d, doc::set_group_exposed_command(d.looks[0].id,0, g.id, pk, true));
-    CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});
-    undo.execute(d, doc::set_group_exposed_command(d.looks[0].id,0, g.id, pk, true));
-    CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});   // no dup
-    undo.execute(d, doc::set_group_exposed_command(d.looks[0].id,0, g.id, pk, false));
-    CHECK(d.looks[0].layers[0].groups[0].exposed.empty());
+    const doc::ParamKey pk{d.looks[0].effects[1].id, 0};
+    undo.execute(d, doc::set_group_exposed_command(d.looks[0].id, g.id, pk, true));
+    CHECK_EQ(d.looks[0].groups[0].exposed.size(), size_t{1});
+    undo.execute(d, doc::set_group_exposed_command(d.looks[0].id, g.id, pk, true));
+    CHECK_EQ(d.looks[0].groups[0].exposed.size(), size_t{1});   // no dup
+    undo.execute(d, doc::set_group_exposed_command(d.looks[0].id, g.id, pk, false));
+    CHECK(d.looks[0].groups[0].exposed.empty());
     undo.undo(d);
-    CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});
-    CHECK(d.looks[0].layers[0].groups[0].exposed[0] == pk);
+    CHECK_EQ(d.looks[0].groups[0].exposed.size(), size_t{1});
+    CHECK(d.looks[0].groups[0].exposed[0] == pk);
 
-    undo.execute(d, doc::ungroup_command(d.looks[0].id,0, g.id));
-    CHECK(d.looks[0].layers[0].groups.empty());
-    CHECK_EQ(d.looks[0].layers[0].stack[0].group_id, uint64_t{0});
+    undo.execute(d, doc::ungroup_command(d.looks[0].id, g.id));
+    CHECK(d.looks[0].groups.empty());
+    CHECK_EQ(d.looks[0].effects[0].group_id, uint64_t{0});
     undo.undo(d);
-    CHECK_EQ(d.looks[0].layers[0].groups.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers[0].groups[0].exposed.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers[0].stack[1].group_id, g.id);
+    CHECK_EQ(d.looks[0].groups.size(), size_t{1});
+    CHECK_EQ(d.looks[0].groups[0].exposed.size(), size_t{1});
+    CHECK_EQ(d.looks[0].effects[1].group_id, g.id);
 }
 
 TEST(group_bypass_compiles_out) {
@@ -661,14 +778,17 @@ TEST(group_bypass_compiles_out) {
     media.id = d.next_effect_id++;
     media.frame_count = 100;
     d.assets.push_back(media);
-    d.looks[0].layers[0].asset = media.id;
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Pixelate));
+    d.looks[0].sources[0].asset = media.id;
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Pixelate));
     doc::Group g = doc::make_group(d, "off");
     g.bypass = true;
-    d.looks[0].layers[0].stack[0].group_id = g.id;
-    d.looks[0].layers[0].groups.push_back(g);
+    d.looks[0].effects[0].group_id = g.id;
+    d.looks[0].groups.push_back(g);
 
+    d.looks[0].links.clear();
+    connect_test_chain(d.looks[0], d.looks[0].sources[0].id,
+        {d.looks[0].effects[0].id, d.looks[0].effects[1].id});
     gfx::RenderGraph graph = gfx::compile_graph(d, d.looks[0].id, 0);
     CHECK(graph.valid);
     // Source + pixelate only; the grouped vignette is compiled out.
@@ -680,17 +800,17 @@ TEST(group_creation_slotifies_crossings) {
     // The exterior feed reroutes through a minted In slot.
     Document d = doc_with_look();
     doc::UndoStack undo;
-    doc::Layer& layer = d.looks[0].layers[0];
-    layer.stack.push_back(make_effect(d, EffectType::Vignette));
-    layer.stack.push_back(make_effect(d, EffectType::Grain));
+    doc::Source& layer = d.looks[0].sources[0];
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Grain));
     const uint64_t src = layer.id;
-    const uint64_t f0 = layer.stack[0].id, f1 = layer.stack[1].id;
-    doc::ensure_links(d.looks[0]);
+    const uint64_t f0 = d.looks[0].effects[0].id, f1 = d.looks[0].effects[1].id;
+    d.looks[0].links = {{src, f0, 0}, {f0, f1, 0}, {f1, 0, 0}};
     const std::vector<doc::NodeLink> before = d.looks[0].links;
 
     doc::Group g = doc::make_group(d, "wrap");
     const uint64_t gid = g.id;
-    undo.execute(d, doc::group_effects_command(d.looks[0].id, 0, g, 0, 1));
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, g, {d.looks[0].effects[0].id, d.looks[0].effects[1].id}));
     const doc::Group* placed = doc::find_group(d.looks[0], gid);
     CHECK(placed && placed->inputs.size() == size_t{1});
     const uint64_t slot = placed->inputs.front();
@@ -711,7 +831,7 @@ TEST(group_creation_slotifies_crossings) {
     media.id = d.next_effect_id++;
     media.frame_count = 100;
     d.assets.push_back(media);
-    d.looks[0].layers[0].asset = media.id;
+    d.looks[0].sources[0].asset = media.id;
     gfx::RenderGraph graph = gfx::compile_graph(d, d.looks[0].id, 0);
     CHECK(graph.valid);
     CHECK_EQ(graph.nodes.size(), size_t{3});
@@ -723,7 +843,7 @@ TEST(group_creation_slotifies_crossings) {
         CHECK_EQ(d.looks[0].links[i].to, before[i].to);
         CHECK_EQ(d.looks[0].links[i].to_port, before[i].to_port);
     }
-    CHECK(d.looks[0].layers[0].groups.empty());
+    CHECK(d.looks[0].groups.empty());
     undo.redo(d);
     const doc::Group* again = doc::find_group(d.looks[0], gid);
     CHECK(again && again->inputs.size() == size_t{1});
@@ -734,13 +854,13 @@ TEST(group_creation_slotifies_crossings) {
 TEST(group_wet_serializes_and_snapshots) {
     Document d = doc_with_look();
     doc::UndoStack undo;
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Grain));
     doc::Group g = doc::make_group(d, "wetter");
     g.wet = 0.25f;
     g.opacity = 0.5f;
     const uint64_t gid = g.id;
-    d.looks[0].layers[0].stack[0].group_id = gid;
-    d.looks[0].layers[0].groups.push_back(g);
+    d.looks[0].effects[0].group_id = gid;
+    d.looks[0].groups.push_back(g);
 
     json::Value out = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(out);
@@ -772,13 +892,15 @@ TEST(group_wet_compiles_the_mix_wrapper) {
     media.id = d.next_effect_id++;
     media.frame_count = 100;
     d.assets.push_back(media);
-    doc::Layer& layer = d.looks[0].layers[0];
+    doc::Source& layer = d.looks[0].sources[0];
     layer.asset = media.id;
-    layer.stack.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
     doc::UndoStack undo;
     doc::Group g = doc::make_group(d, "mixed");
     const uint64_t gid = g.id;
-    undo.execute(d, doc::group_effects_command(d.looks[0].id, 0, g, 0, 0));
+    d.looks[0].links = {{layer.id, d.looks[0].effects[0].id, 0},
+        {d.looks[0].effects[0].id, 0, 0}};
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, g, {d.looks[0].effects[0].id}));
 
     // Identity knobs, no matte: no wrapper node.
     gfx::RenderGraph plain = gfx::compile_graph(d, d.looks[0].id, 0);
@@ -808,10 +930,10 @@ TEST(group_wet_compiles_the_mix_wrapper) {
     CHECK_EQ(mixed.output, mix_at);
 
     // A port-1 wire on a group id gates it like any effect.
-    doc::Layer matte_layer;
+    doc::Source matte_layer;
     matte_layer.id = d.next_effect_id++;
-    matte_layer.source = doc::LayerSourceKind::Shape;
-    d.looks[0].layers.push_back(matte_layer);
+    matte_layer.source = doc::SourceKind::Shape;
+    d.looks[0].sources.push_back(matte_layer);
     d.looks[0].links.push_back({matte_layer.id, gid, 1});
     gfx::RenderGraph gated = gfx::compile_graph(d, d.looks[0].id, 0);
     CHECK(gated.valid);
@@ -827,18 +949,18 @@ TEST(group_wet_compiles_the_mix_wrapper) {
 TEST(ungroup_splices_slots_back_to_direct_links) {
     Document d = doc_with_look();
     doc::UndoStack undo;
-    doc::Layer& layer = d.looks[0].layers[0];
-    layer.stack.push_back(make_effect(d, EffectType::Vignette));
+    doc::Source& layer = d.looks[0].sources[0];
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
     const uint64_t src = layer.id;
-    const uint64_t f0 = layer.stack[0].id;
-    doc::ensure_links(d.looks[0]);
+    const uint64_t f0 = d.looks[0].effects[0].id;
+    d.looks[0].links = {{src, f0, 0}, {f0, 0, 0}};
     doc::Group g = doc::make_group(d, "temp");
     const uint64_t gid = g.id;
-    undo.execute(d, doc::group_effects_command(d.looks[0].id, 0, g, 0, 0));
+    undo.execute(d, doc::group_effects_command(d.looks[0].id, g, {d.looks[0].effects[0].id}));
     const uint64_t slot =
         doc::find_group(d.looks[0], gid)->inputs.front();
 
-    undo.execute(d, doc::ungroup_command(d.looks[0].id, 0, gid));
+    undo.execute(d, doc::ungroup_command(d.looks[0].id, gid));
     bool direct = false, slotted = false;
     for (const doc::NodeLink& l : d.looks[0].links) {
         if (l.from == src && l.to == f0 && l.to_port == 0) direct = true;
@@ -852,22 +974,103 @@ TEST(ungroup_splices_slots_back_to_direct_links) {
           back->inputs.front() == slot);
 }
 
+TEST(grouping_preserves_interleaved_feeds_and_exact_undo) {
+    Document d = doc_with_look();
+    auto& look = d.looks[0];
+    look.sources[0].source = doc::SourceKind::Solid;
+    look.sources.push_back(doc::make_source(d, doc::SourceKind::Noise));
+    look.effects.push_back(make_effect(d, EffectType::Invert));
+    look.effects.push_back(make_effect(d, EffectType::Blur));
+    const uint64_t a = look.sources[0].id, b = look.sources[1].id;
+    const uint64_t x = look.effects[0].id, y = look.effects[1].id;
+    look.links = {{a, x, 0}, {a, y, 0}, {x, y, 0}, {b, y, 0}, {y, 0, 0}};
+    const auto original = look.links;
+    auto group = doc::make_group(d, "interleaved");
+    group.face_out = y;
+    doc::UndoStack undo;
+    undo.execute(d, doc::group_effects_command(look.id, group, {y, x}));
+    CHECK_EQ(look.groups[0].inputs.size(), size_t{3});
+    const auto grouped = look.links;
+    std::vector<uint64_t> feeds;
+    for (const auto& link : look.links) {
+        if (link.to != y || link.to_port) continue;
+        uint64_t producer = link.from;
+        if (doc::group_of_input(look, producer))
+            for (const auto& input : look.links)
+                if (input.to == producer && !input.to_port) { producer = input.from; break; }
+        feeds.push_back(producer);
+    }
+    CHECK(feeds == std::vector<uint64_t>({a, x, b}));
+    undo.execute(d, doc::ungroup_command(look.id, group.id));
+    CHECK(look.links == original);
+    undo.undo(d);
+    CHECK(look.links == grouped);
+    undo.undo(d);
+    CHECK(look.links == original);
+    CHECK(look.groups.empty());
+    undo.redo(d);
+    CHECK(look.links == grouped);
+}
+
+TEST(preset_preserves_branches_auxiliary_ports_and_input_ids) {
+    Document d = doc_with_look();
+    auto& look = d.looks[0];
+    look.effects.push_back(make_effect(d, EffectType::Invert));
+    look.effects.push_back(make_effect(d, EffectType::Blur));
+    look.effects.push_back(make_effect(d, EffectType::BlendNode));
+    auto group = doc::make_group(d, "branch");
+    group.inputs = {d.next_effect_id++, d.next_effect_id++};
+    const uint64_t a = look.effects[0].id, b = look.effects[1].id, c = look.effects[2].id;
+    group.face_out = c;
+    for (auto& fx : look.effects) fx.group_id = group.id;
+    look.groups.push_back(group);
+    look.links = {{look.sources[0].id, group.inputs[0], 0},
+        {group.inputs[0], a, 0}, {group.inputs[0], b, 0},
+        {a, c, 0}, {b, c, 0}, {group.inputs[1], c, 2}, {c, 0, 0}};
+    const auto preset = doc::make_preset_from_group(look, group.id);
+    CHECK_EQ(preset.links.size(), size_t{5});
+    const auto parsed = doc::preset_from_json(doc::preset_to_json(preset));
+    CHECK(parsed.has_value());
+    if (!parsed) return;
+    CHECK(parsed->links == preset.links);
+    auto instance = doc::instantiate_preset(d, *parsed);
+    const auto& links = instance.links;
+    CHECK_EQ(instance.group.inputs.size(), size_t{2});
+    CHECK(instance.group.inputs[0] != group.inputs[0]);
+    CHECK_EQ(links[0].from, instance.group.inputs[0]);
+    CHECK_EQ(links[1].from, instance.group.inputs[0]);
+    CHECK_EQ(links[2].from, instance.effects[0].id);
+    CHECK_EQ(links[3].from, instance.effects[1].id);
+    CHECK_EQ(links[4].from, instance.group.inputs[1]);
+    CHECK_EQ(links[4].to_port, uint32_t{2});
+    CHECK_EQ(instance.group.face_out, instance.effects[2].id);
+    auto bad = doc::preset_to_json(preset);
+    bad.set("looks_preset", 1);
+    CHECK(!doc::preset_from_json(bad));
+}
+
 TEST(preset_capture_and_instantiate) {
     Document d = doc_with_look();
     doc::UndoStack undo;
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::FilmStock));
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Grain));
-    d.looks[0].layers[0].stack[0].params[3] = 0.3f;
+    d.looks[0].effects.push_back(make_effect(d, EffectType::FilmStock));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Grain));
+    d.looks[0].effects[0].params[3] = 0.3f;
 
     doc::Group g = doc::make_group(d, "era");
-    g.exposed.push_back({d.looks[0].layers[0].stack[0].id, 3});
+    g.exposed.push_back({d.looks[0].effects[0].id, 3});
     // A dangling face key (no such member) must be dropped on capture.
     g.exposed.push_back({9999, 0});
-    d.looks[0].layers[0].stack[0].group_id = g.id;
-    d.looks[0].layers[0].stack[1].group_id = g.id;
-    d.looks[0].layers[0].groups.push_back(g);
+    d.looks[0].effects[0].group_id = g.id;
+    d.looks[0].effects[1].group_id = g.id;
+    g.inputs = {d.next_effect_id++};
+    g.face_out = d.looks[0].effects[1].id;
+    d.looks[0].links = {{d.looks[0].sources[0].id, g.inputs[0], 0},
+        {g.inputs[0], d.looks[0].effects[0].id, 0},
+        {d.looks[0].effects[0].id, d.looks[0].effects[1].id, 0},
+        {d.looks[0].effects[1].id, 0, 0}};
+    d.looks[0].groups.push_back(g);
 
-    doc::Preset p = doc::make_preset_from_group(d.looks[0], 0, g.id);
+    doc::Preset p = doc::make_preset_from_group(d.looks[0], g.id);
     CHECK_EQ(p.name, "era");
     CHECK_EQ(p.effects.size(), size_t{2});
     CHECK_EQ(p.group.exposed.size(), size_t{1});
@@ -878,43 +1081,42 @@ TEST(preset_capture_and_instantiate) {
     CHECK(doc::preset_to_json(*p2) == pj);
 
     Document target = doc_with_look();
-    doc::Group ng;
-    std::vector<doc::EffectInstance> nfx;
-    uint64_t nface_in = 0;
-    doc::instantiate_preset(target, *p2, &ng, &nfx, &nface_in);
+    auto instance = doc::instantiate_preset(target, *p2);
+    auto& ng = instance.group;
+    auto& nfx = instance.effects;
     CHECK_EQ(nfx.size(), size_t{2});
     CHECK(nfx[0].id != p2->effects[0].id);
     CHECK_EQ(nfx[0].group_id, ng.id);
     CHECK_EQ(ng.exposed.size(), size_t{1});
     CHECK_EQ(ng.exposed[0].effect_id, nfx[0].id);
-    CHECK_EQ(nface_in, nfx[0].id);
+    CHECK_EQ(instance.links[0].from, ng.inputs[0]);
+    CHECK_EQ(instance.links[0].to, nfx[0].id);
     CHECK(ng.folded);
 
-    undo.execute(target, doc::insert_group_command(d.looks[0].id, 0, ng,
-                                                   nfx, nface_in));
-    CHECK_EQ(target.looks[0].layers[0].stack.size(), size_t{2});
-    CHECK_EQ(target.looks[0].layers[0].groups.size(), size_t{1});
+    undo.execute(target, doc::insert_group_command(target.looks[0].id, ng, nfx, instance.links));
+    CHECK_EQ(target.looks[0].effects.size(), size_t{2});
+    CHECK_EQ(target.looks[0].groups.size(), size_t{1});
     undo.undo(target);
-    CHECK(target.looks[0].layers[0].stack.empty());
-    CHECK(target.looks[0].layers[0].groups.empty());
+    CHECK(target.looks[0].effects.empty());
+    CHECK(target.looks[0].groups.empty());
     undo.redo(target);
-    CHECK_EQ(target.looks[0].layers[0].stack.size(), size_t{2});
+    CHECK_EQ(target.looks[0].effects.size(), size_t{2});
 }
 
 TEST(morph_interpolates_snapshots) {
     Document d = doc_with_look();
     doc::UndoStack undo;
-    d.looks[0].layers[0].stack.push_back(make_effect(d, EffectType::Vignette));
+    d.looks[0].effects.push_back(make_effect(d, EffectType::Vignette));
 
-    d.looks[0].layers[0].stack[0].params[0] = 0.0f;
+    d.looks[0].effects[0].params[0] = 0.0f;
     undo.execute(d, doc::store_snapshot_command(d.looks[0].id,0));
-    d.looks[0].layers[0].stack[0].params[0] = 1.0f;
+    d.looks[0].effects[0].params[0] = 1.0f;
     undo.execute(d, doc::store_snapshot_command(d.looks[0].id,1));
-    d.looks[0].layers[0].stack[0].params[0] = 0.5f;   // overridden while morphing
+    d.looks[0].effects[0].params[0] = 0.5f;   // overridden while morphing
 
     undo.execute(d, doc::set_morph_command(d.looks[0].id,0, 1, 0.25f));
     Document r = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK(std::fabs(r.looks[0].layers[0].stack[0].params[0] - 0.25f) < 1e-5f);
+    CHECK(std::fabs(r.looks[0].effects[0].params[0] - 0.25f) < 1e-5f);
 
     // The morph position is the mod target {0, 0}; a sine at t=0 reads 0.5.
     doc::ValueNode sine;
@@ -926,7 +1128,7 @@ TEST(morph_interpolates_snapshots) {
     route.target = {0, 0};
     d.looks[0].mod_routes.push_back(route);
     r = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK(std::fabs(r.looks[0].layers[0].stack[0].params[0] - 0.5f) < 1e-4f);
+    CHECK(std::fabs(r.looks[0].effects[0].params[0] - 0.5f) < 1e-4f);
 
     undo.undo(d);
     CHECK_EQ(d.looks[0].morph_pos, 0.0f);
@@ -984,19 +1186,19 @@ TEST(serialize_lane_flags_roundtrip) {
 
 TEST(serialize_gradient_stops_roundtrip) {
     Document d = doc_with_look();
-    doc::Layer& l = d.looks[0].layers[0];
-    l.source = doc::LayerSourceKind::Gradient;
+    doc::Source& l = d.looks[0].sources[0];
+    l.source = doc::SourceKind::Gradient;
     l.color_a[3] = 0.25f;
     l.color_b[3] = 0.5f;
     doc::GradientStop a;
-    a.id = 41;
+    a.id = d.next_effect_id++;
     a.t = 0.25f;
     a.x = 0.2f;
     a.y = 0.8f;
     a.color[0] = 1.0f;
     a.color[3] = 0.0f;
     doc::GradientStop b;
-    b.id = 42;
+    b.id = d.next_effect_id++;
     b.t = 0.75f;
     b.x = 0.6f;
     b.y = 0.4f;
@@ -1007,7 +1209,7 @@ TEST(serialize_gradient_stops_roundtrip) {
 
     json::Value v = doc::doc_to_json(d);
     Document d2 = doc::doc_from_json(v);
-    const doc::Layer& g = d2.looks[0].layers[0];
+    const doc::Source& g = d2.looks[0].sources[0];
     CHECK_EQ(g.stops.size(), size_t{2});
     CHECK_EQ(g.stops[0].t, 0.25f);
     CHECK_EQ(g.stops[1].t, 0.75f);

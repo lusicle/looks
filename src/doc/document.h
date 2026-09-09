@@ -85,7 +85,7 @@ struct AudioTrack {
     bool lock = false;   // edit guard only; the mix ignores it
 };
 
-enum class LayerSourceKind : uint32_t {
+enum class SourceKind : uint32_t {
     Media = 0,
     // Generator values match gen.comp.slang: renumbering needs a shader edit.
     Solid,
@@ -98,7 +98,6 @@ enum class LayerSourceKind : uint32_t {
     LookRef,
     SequenceRef,
     Slideshow,
-    None,
     Count,
 };
 
@@ -108,6 +107,13 @@ struct NodeLink {
     uint64_t from = 0;
     uint64_t to = 0;
     uint32_t to_port = 0;
+    BlendMode blend = BlendMode::Normal;
+    bool same_endpoints(const NodeLink& other) const {
+        return from == other.from && to == other.to && to_port == other.to_port;
+    }
+    bool operator==(const NodeLink& other) const {
+        return same_endpoints(other) && blend == other.blend;
+    }
 };
 
 struct CanvasFrame {
@@ -133,7 +139,7 @@ struct Group {
     // Slot ids are one-port passthroughs in the link table, in order.
     // Ports are index-derived and links are id-keyed, so wires follow.
     std::vector<uint64_t> inputs;
-    // Which member feeds the card Out. 0 = the last member.
+    // Which member feeds the card Out. 0 = no binding.
     uint64_t face_out = 0;
     // Node-canvas position of the folded card. (0,0) = unplaced.
     float node_x = 0.0f;
@@ -175,10 +181,10 @@ enum class GradientKind : uint32_t {
 
 enum class GradientSpace : uint32_t { Rgb = 0, Hsl, Oklab, Count };
 
-struct Layer {
+struct Source {
     uint64_t id = 0;
     std::string name;
-    LayerSourceKind source = LayerSourceKind::Media;
+    SourceKind source = SourceKind::Media;
     // slip is a static media in-point: local frame 0 reads media frame slip.
     uint64_t asset = 0;
     uint32_t slip = 0;
@@ -216,7 +222,6 @@ struct Layer {
     float gradient_len = 1.0f;
     float gradient_x = 0.5f;
     float gradient_y = 0.5f;
-    BlendMode blend = BlendMode::Normal;
     float opacity = 1.0f;
     bool visible = true;
     // The transform applies to the source before the stack, premultiplied.
@@ -231,17 +236,15 @@ struct Layer {
     // Node-canvas position of the source node. (0,0) = unplaced.
     float node_x = 0.0f;
     float node_y = 0.0f;
-    std::vector<EffectInstance> stack;
-    std::vector<Group> groups;
 };
 
-inline const GradientStop* find_gradient_stop(const Layer& l, uint64_t id) {
+inline const GradientStop* find_gradient_stop(const Source& l, uint64_t id) {
     for (const GradientStop& s : l.stops)
         if (s.id == id) return &s;
     return nullptr;
 }
 
-inline void gradient_lever_uv(const Layer& l, float t, float* ux,
+inline void gradient_lever_uv(const Source& l, float t, float* ux,
                               float* uy) {
     const float ca = std::cos(l.gen_angle), sa = std::sin(l.gen_angle);
     const float u = l.gradient == GradientKind::Linear ? t - 0.5f : t * 0.5f;
@@ -249,7 +252,7 @@ inline void gradient_lever_uv(const Layer& l, float t, float* ux,
     *uy = l.gradient_y + sa * l.gradient_len * u;
 }
 
-inline float gradient_lever_t(const Layer& l, float ux, float uy) {
+inline float gradient_lever_t(const Source& l, float ux, float uy) {
     const float ca = std::cos(l.gen_angle), sa = std::sin(l.gen_angle);
     const float len = l.gradient_len > 1e-4f ? l.gradient_len : 1e-4f;
     const float u = ((ux - l.gradient_x) * ca + (uy - l.gradient_y) * sa) /
@@ -258,22 +261,22 @@ inline float gradient_lever_t(const Layer& l, float ux, float uy) {
                       0.0f, 1.0f);
 }
 
-inline bool layer_has_transform(const Layer& l) {
+inline bool source_has_transform(const Source& l) {
     return l.crop_l > 0.0f || l.crop_r > 0.0f || l.crop_t > 0.0f ||
            l.crop_b > 0.0f || l.flip_h || l.flip_v ||
            l.xf_scale != 1.0f || l.xf_rotate != 0.0f;
 }
 
-inline bool layer_is_media(const Layer& l) {
-    return l.source == LayerSourceKind::Media;
+inline bool source_is_media(const Source& l) {
+    return l.source == SourceKind::Media;
 }
-inline bool layer_is_nested(const Layer& l) {
-    return l.source == LayerSourceKind::LookRef ||
-           l.source == LayerSourceKind::SequenceRef;
+inline bool source_is_nested(const Source& l) {
+    return l.source == SourceKind::LookRef ||
+           l.source == SourceKind::SequenceRef;
 }
 
-// kMaxLayers bounds graph nodes, not edit length.
-inline constexpr size_t kMaxLayers = 16;
+// kMaxSources bounds graph nodes, not edit length.
+inline constexpr size_t kMaxSources = 16;
 inline constexpr size_t kMaxPlacementsPerTrack = 256;
 inline constexpr size_t kMaxLooks = 256;
 inline constexpr int kMaxLookDepth = 8;   // nesting guard, both entities
@@ -321,7 +324,9 @@ struct Look {
     // A split Output with nothing wired is silent, never a fallback.
     bool audio_split = false;
 
-    std::vector<Layer> layers;
+    std::vector<Source> sources;
+    std::vector<EffectInstance> effects;
+    std::vector<Group> groups;
     std::vector<NodeLink> links;
     std::vector<CanvasFrame> frames;
 
@@ -598,9 +603,9 @@ inline uint32_t conform_frames(uint32_t frames, double ratio) {
         std::ceil(static_cast<double>(frames) / ratio));
 }
 
-std::vector<const Asset*> slideshow_assets(const Document& doc, const Layer& layer);
+std::vector<const Asset*> slideshow_assets(const Document& doc, const Source& layer);
 
-inline double slideshow_period(const Layer& layer, double fps) {
+inline double slideshow_period(const Source& layer, double fps) {
     return std::max(1.0, static_cast<double>(layer.slide_seconds) * fps);
 }
 
@@ -634,15 +639,15 @@ inline SlideSample slideshow_sample(double time, double period, size_t count,
     return sample;
 }
 
-inline uint32_t layer_source_length(const Document& doc, const Layer& l,
+inline uint32_t layer_source_length(const Document& doc, const Source& l,
                                     double clock_fps, int depth = 0) {
     if (depth >= kMaxLookDepth) return 0;
-    if (l.source == LayerSourceKind::Slideshow) {
+    if (l.source == SourceKind::Slideshow) {
         const double frames = slideshow_assets(doc, l).size() *
             slideshow_period(l, clock_fps) / std::max(0.01f, l.slide_speed);
         return static_cast<uint32_t>(std::min(std::ceil(frames), 4294967295.0));
     }
-    if (layer_is_media(l)) {
+    if (source_is_media(l)) {
         const Asset* a = doc.find_asset(l.asset);
         if (!a || !a->frame_count) return 0;
         const uint32_t remain =
@@ -650,13 +655,13 @@ inline uint32_t layer_source_length(const Document& doc, const Layer& l,
         return conform_frames(remain, media_conform_rate(doc, *a,
                                                          clock_fps));
     }
-    if (l.source == LayerSourceKind::LookRef) {
+    if (l.source == SourceKind::LookRef) {
         const Look* t = doc.find_look(l.target);
         if (!t) return 0;
         return conform_frames(look_duration(doc, *t, depth + 1),
                               effective_fps(doc, *t) / clock_fps);
     }
-    if (l.source == LayerSourceKind::SequenceRef) {
+    if (l.source == SourceKind::SequenceRef) {
         const Sequence* t = doc.find_sequence(l.target);
         if (!t) return 0;
         return conform_frames(sequence_duration(doc, *t, depth + 1),
@@ -672,7 +677,7 @@ inline uint32_t look_duration(const Document& doc, const Look& look,
     if (depth >= kMaxLookDepth) return 0;
     const double eff = effective_fps(doc, look);
     uint32_t end = 0;
-    for (const Layer& l : look.layers)
+    for (const Source& l : look.sources)
         end = std::max(end, layer_source_length(doc, l, eff, depth));
     return end;
 }
@@ -801,8 +806,8 @@ inline bool nest_reaches(const Document& doc, uint64_t from, uint64_t to,
     if (from == to) return true;
     if (depth >= kMaxLookDepth) return false;
     if (const Look* l = doc.find_look(from)) {
-        for (const Layer& layer : l->layers) {
-            if (!layer_is_nested(layer) || !layer.target) continue;
+        for (const Source& layer : l->sources) {
+            if (!source_is_nested(layer) || !layer.target) continue;
             if (nest_reaches(doc, layer.target, to, depth + 1)) return true;
         }
         return false;
@@ -822,98 +827,86 @@ inline bool nest_reaches(const Document& doc, uint64_t from, uint64_t to,
     return false;
 }
 
-inline Layer* find_layer(Look& look, uint64_t layer_id) {
-    for (Layer& l : look.layers)
-        if (l.id == layer_id && l.source != LayerSourceKind::None) return &l;
+inline Source* find_source(Look& look, uint64_t layer_id) {
+    for (Source& l : look.sources)
+        if (l.id == layer_id) return &l;
     return nullptr;
 }
-inline const Layer* find_layer(const Look& look, uint64_t layer_id) {
-    return find_layer(const_cast<Look&>(look), layer_id);
+inline const Source* find_source(const Look& look, uint64_t layer_id) {
+    return find_source(const_cast<Look&>(look), layer_id);
 }
 
-inline EffectInstance* find_effect(Look& look, uint64_t fx_id,
-                                   Layer** owner = nullptr) {
-    for (Layer& l : look.layers)
-        for (EffectInstance& fx : l.stack)
-            if (fx.id == fx_id) {
-                if (owner) *owner = &l;
-                return &fx;
-            }
+inline EffectInstance* find_effect(Look& look, uint64_t fx_id) {
+    for (EffectInstance& fx : look.effects)
+        if (fx.id == fx_id) return &fx;
     return nullptr;
 }
-inline const EffectInstance* find_effect(const Look& look, uint64_t fx_id,
-                                         const Layer** owner = nullptr) {
-    return find_effect(const_cast<Look&>(look), fx_id,
-                       const_cast<Layer**>(owner));
+inline const EffectInstance* find_effect(const Look& look, uint64_t fx_id) {
+    return find_effect(const_cast<Look&>(look), fx_id);
 }
 
-inline Group* find_group(Layer& layer, uint64_t group_id) {
-    for (Group& g : layer.groups)
+inline Group* find_group(Look& look, uint64_t group_id) {
+    for (Group& g : look.groups)
         if (g.id == group_id) return &g;
     return nullptr;
 }
-inline const Group* find_group(const Layer& layer, uint64_t group_id) {
-    return find_group(const_cast<Layer&>(layer), group_id);
+inline const Group* find_group(const Look& look, uint64_t group_id) {
+    return find_group(const_cast<Look&>(look), group_id);
 }
 
-inline bool group_bypassed(const Layer& layer, uint64_t group_id) {
+inline bool group_bypassed(const Look& look, uint64_t group_id) {
     if (group_id == 0) return false;
-    const Group* g = find_group(layer, group_id);
+    const Group* g = find_group(look, group_id);
     return g && g->bypass;
 }
 
-inline Group* find_group(Look& look, uint64_t group_id,
-                         size_t* layer_index = nullptr) {
-    for (size_t li = 0; li < look.layers.size(); ++li)
-        if (Group* g = find_group(look.layers[li], group_id)) {
-            if (layer_index) *layer_index = li;
-            return g;
-        }
-    return nullptr;
+inline bool look_has_solo(const Look& look) {
+    for (const EffectInstance& fx : look.effects)
+        if (fx.solo && !fx.bypass && !group_bypassed(look, fx.group_id))
+            return true;
+    return false;
 }
-inline const Group* find_group(const Look& look, uint64_t group_id,
-                               size_t* layer_index = nullptr) {
-    return find_group(const_cast<Look&>(look), group_id, layer_index);
+
+inline bool effect_enabled(const Look& look, const EffectInstance& fx,
+                           bool has_solo) {
+    return !fx.bypass && (!has_solo || fx.solo) &&
+           !group_bypassed(look, fx.group_id);
 }
 
 // The one definition of a group card's Out. 0 = an empty group.
-inline uint64_t group_face_member(const Layer& layer, const Group& g) {
-    uint64_t last = 0, bind = 0;
-    for (const EffectInstance& e : layer.stack)
-        if (e.group_id == g.id) {
-            last = e.id;
-            if (e.id == g.face_out) bind = e.id;
-        }
-    return bind ? bind : last;
+inline uint64_t group_face_member(const Look& look, const Group& g) {
+    const EffectInstance* effect = find_effect(look, g.face_out);
+    return effect && effect->group_id == g.id ? effect->id : 0;
 }
 inline uint64_t group_face_member(const Look& look, uint64_t group_id) {
-    for (const Layer& l : look.layers)
-        if (const Group* g = find_group(l, group_id))
-            return group_face_member(l, *g);
+    if (const Group* g = find_group(look, group_id))
+        return group_face_member(look, *g);
     return 0;
 }
 
-inline Group* group_of_input(Look& look, uint64_t slot_id,
-                             size_t* layer_index = nullptr) {
+inline Group* group_of_input(Look& look, uint64_t slot_id) {
     if (!slot_id) return nullptr;
-    for (size_t li = 0; li < look.layers.size(); ++li)
-        for (Group& g : look.layers[li].groups)
-            for (uint64_t s : g.inputs)
-                if (s == slot_id) {
-                    if (layer_index) *layer_index = li;
-                    return &g;
-                }
+    for (Group& g : look.groups)
+        for (uint64_t s : g.inputs)
+            if (s == slot_id) return &g;
     return nullptr;
 }
-inline const Group* group_of_input(const Look& look, uint64_t slot_id,
-                                   size_t* layer_index = nullptr) {
-    return group_of_input(const_cast<Look&>(look), slot_id, layer_index);
+inline const Group* group_of_input(const Look& look, uint64_t slot_id) {
+    return group_of_input(const_cast<Look&>(look), slot_id);
 }
 
-// Deletes leave dangling links, so every wire walk must skip dead feeds.
+// Wire walks must skip missing producers.
 inline bool wire_producer_live(const Look& look, uint64_t id) {
-    return id && (find_layer(look, id) || find_effect(look, id) ||
+    return id && (find_source(look, id) || find_effect(look, id) ||
                   group_of_input(look, id));
+}
+
+inline bool link_endpoints_valid(const Look& look, const NodeLink& link) {
+    if (!wire_producer_live(look, link.from)) return false;
+    if (!link.to) return link.to_port <= 1;
+    if (find_source(look, link.to) || find_group(look, link.to)) return link.to_port == 1;
+    if (group_of_input(look, link.to)) return link.to_port == 0;
+    return find_effect(look, link.to) && link.to_port <= 2;
 }
 
 // Link-vector order is stacking order: a slot reads its bottom feed.
@@ -945,7 +938,7 @@ inline uint64_t offset_source(const Look& look, const std::vector<NodeLink>& lin
             next = link.from;
         }
         if (!next) return 0;
-        if (!group_of_input(look, next)) return find_layer(look, next) ? next : 0;
+        if (!group_of_input(look, next)) return find_source(look, next) ? next : 0;
         id = next;
     }
     return 0;
@@ -1011,48 +1004,6 @@ inline bool find_placement_slot(Sequence& seq, uint64_t placement_id,
                 *out = {&t.placements, t.id, true, i};
                 return true;
             }
-    return false;
-}
-
-// Do not read look.links directly for wiring: use effective_links.
-inline std::vector<NodeLink> synthesize_links(const Look& look) {
-    std::vector<NodeLink> links;
-    for (const Layer& layer : look.layers) {
-        uint64_t prev = layer.source == LayerSourceKind::None ? 0 : layer.id;
-        for (const EffectInstance& fx : layer.stack) {
-            if (prev) links.push_back({prev, fx.id, 0});
-            prev = fx.id;
-        }
-        if (prev) links.push_back({prev, 0, 0});
-    }
-    return links;
-}
-
-// The result can point into scratch, so scratch must outlive it.
-inline const std::vector<NodeLink>& effective_links(
-    const Look& look, std::vector<NodeLink>& scratch) {
-    if (!look.links.empty()) return look.links;
-    scratch = synthesize_links(look);
-    return scratch;
-}
-
-inline void ensure_links(Look& look) {
-    if (look.links.empty()) look.links = synthesize_links(look);
-}
-
-// An empty table means synthesized links: a tombstone keeps it explicit.
-inline bool link_is_tombstone(const NodeLink& l) {
-    return l.from == 0 && l.to == 0 && l.to_port == 9999;
-}
-inline void seal_links(Look& look) {
-    if (look.links.empty()) look.links.push_back({0, 0, 9999});
-}
-inline bool prune_tombstone(Look& look) {
-    for (auto it = look.links.begin(); it != look.links.end(); ++it)
-        if (link_is_tombstone(*it)) {
-            look.links.erase(it);
-            return true;
-        }
     return false;
 }
 

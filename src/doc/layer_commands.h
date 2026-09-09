@@ -7,14 +7,14 @@
 
 namespace looks::doc {
 
-Layer make_layer(Document& doc, LayerSourceKind kind);
+Source make_source(Document& doc, SourceKind kind);
 
-std::unique_ptr<Command> add_layer_command(uint64_t look, Layer layer,
+std::unique_ptr<Command> add_source_command(uint64_t look, Source layer,
                                            size_t insert_index);
-std::unique_ptr<Command> remove_layer_command(uint64_t look,
-                                              size_t layer_index);
+std::unique_ptr<Command> remove_source_command(uint64_t look,
+                                              uint64_t source_id);
 // Replaces all layer fields but the stack. Coalesces per layer id.
-std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated);
+std::unique_ptr<Command> set_source_props_command(uint64_t look, Source updated);
 // Returns null if `at` is not strictly inside a placement, `at` is local.
 // The cut applies to the whole link group, thus the halves stay in sync.
 std::unique_ptr<Command> razor_track_command(Document& doc,

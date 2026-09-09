@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "resin print",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 2
       }
     ],
-    "face_in": 137,
+    "inputs": [173],
     "face_out": 142
   },
   "effects": [
@@ -118,5 +118,12 @@
       "seed": 0,
       "group": 172
     }
+  ],
+  "links": [
+    {"from": 137, "to": 169, "port": 0},
+    {"from": 169, "to": 138, "port": 0},
+    {"from": 138, "to": 141, "port": 0},
+    {"from": 141, "to": 142, "port": 0},
+    {"from": 173, "to": 137, "port": 0}
   ]
 }

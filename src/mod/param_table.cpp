@@ -8,27 +8,20 @@
 namespace looks::mod {
 
 const doc::EffectInstance* find_effect(const doc::Look& look,
-                                       uint64_t effect_id, size_t* layer_out,
-                                       size_t* index_out) {
-    for (size_t l = 0; l < look.layers.size(); ++l) {
-        const auto& stack = look.layers[l].stack;
-        for (size_t i = 0; i < stack.size(); ++i) {
-            if (stack[i].id == effect_id) {
-                if (layer_out) *layer_out = l;
-                if (index_out) *index_out = i;
-                return &stack[i];
-            }
-        }
+                                       uint64_t effect_id, size_t* index_out) {
+    const auto* fx = doc::find_effect(look, effect_id);
+    if (fx && index_out) {
+        *index_out = static_cast<size_t>(fx - look.effects.data());
     }
-    return nullptr;
+    return fx;
 }
 
 const doc::EffectInstance* find_effect(const doc::Document& doc,
                                        uint64_t effect_id, uint64_t* look_out,
-                                       size_t* layer_out, size_t* index_out) {
+                                       size_t* index_out) {
     for (const doc::Look& look : doc.looks) {
         if (const doc::EffectInstance* fx =
-                find_effect(look, effect_id, layer_out, index_out)) {
+                find_effect(look, effect_id, index_out)) {
             if (look_out) *look_out = look.id;
             return fx;
         }
@@ -68,7 +61,7 @@ float param_value(const doc::EffectInstance& fx, int param_index) {
     return 0.0f;
 }
 
-float* layer_param_slot(doc::Layer& layer, int param_index) {
+float* source_param_slot(doc::Source& layer, int param_index) {
     switch (param_index) {
         case 0: return &layer.opacity;
         case 1: return &layer.color_a[0];
@@ -99,7 +92,7 @@ float* layer_param_slot(doc::Layer& layer, int param_index) {
     }
 }
 
-void layer_param_range(int param_index, float* min_value, float* max_value) {
+void source_param_range(int param_index, float* min_value, float* max_value) {
     *min_value = 0.0f;
     *max_value = 1.0f;
     switch (param_index) {
@@ -123,7 +116,7 @@ void layer_param_range(int param_index, float* min_value, float* max_value) {
 
 namespace {
 
-constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
+constexpr const char* kSourceParamIds[doc::kSourceParamCount] = {
     "opacity", "color_a.r", "color_a.g", "color_a.b", "color_b.r",
     "color_b.g", "color_b.b", "scale",   "angle",     "crop_l",
     "crop_r",  "crop_t",    "crop_b",    "xf_scale",  "xf_rotate",
@@ -131,7 +124,7 @@ constexpr const char* kLayerParamIds[doc::kLayerParamCount] = {
     "grad_kind", "grad_space", "grad_len", "grad_x", "grad_y",
     "color_a.a", "color_b.a"};
 
-constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
+constexpr const char* kSourceParamLabels[doc::kSourceParamCount] = {
     "opacity", "color a r", "color a g", "color a b", "color b r",
     "color b g", "color b b", "scale",   "angle",     "crop left",
     "crop right", "crop top", "crop bottom", "transform scale",
@@ -141,9 +134,9 @@ constexpr const char* kLayerParamLabels[doc::kLayerParamCount] = {
 
 }  // namespace
 
-int layer_param_index_of(const std::string& id) {
-    for (int i = 0; i < doc::kLayerParamCount; ++i)
-        if (id == kLayerParamIds[i]) return i;
+int source_param_index_of(const std::string& id) {
+    for (int i = 0; i < doc::kSourceParamCount; ++i)
+        if (id == kSourceParamIds[i]) return i;
     return INT_MIN;
 }
 
@@ -162,12 +155,10 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc,
         e.base = look.morph_pos;
         table.push_back(std::move(e));
     }
-    for (size_t l = 0; l < look.layers.size(); ++l)
-    for (size_t i = 0; i < look.layers[l].stack.size(); ++i) {
-        const doc::EffectInstance& fx = look.layers[l].stack[i];
+    for (size_t i = 0; i < look.effects.size(); ++i) {
+        const doc::EffectInstance& fx = look.effects[i];
         const doc::EffectInfo& info = doc::effect_info(fx.type);
-        const std::string prefix = "layer" + std::to_string(l) + ".fx" +
-                                   std::to_string(i) + ".";
+        const std::string prefix = "fx" + std::to_string(fx.id) + ".";
 
         auto add = [&](int param_index, const char* id, const char* label,
                        float value) {
@@ -186,35 +177,33 @@ std::vector<ParamEntry> build_param_table(const doc::Document& doc,
             add(static_cast<int>(p), info.params[p].id, info.params[p].label,
                 fx.params[p]);
     }
-    for (size_t l = 0; l < look.layers.size(); ++l)
-        for (const doc::Group& g : look.layers[l].groups) {
-            const std::string gname = g.name.empty() ? "group" : g.name;
-            auto add = [&](int param_index, const char* id,
-                           const char* label, float value) {
-                ParamEntry e;
-                e.key = {g.id | doc::kGroupParamBit, param_index};
-                e.path = "group" + std::to_string(g.id) + "." + id;
-                e.label = gname + " " + label;
-                e.min_value = 0.0f;
-                e.max_value = 1.0f;
-                e.base = value;
-                table.push_back(std::move(e));
-            };
-            add(doc::kWetParam, "wet", "wet/dry", g.wet);
-            add(doc::kOpacityParam, "opacity", "opacity", g.opacity);
-        }
-    for (size_t l = 0; l < look.layers.size(); ++l) {
-        doc::Layer probe = look.layers[l];
+    for (const doc::Group& g : look.groups) {
+        const std::string gname = g.name.empty() ? "group" : g.name;
+        auto add = [&](int param_index, const char* id, const char* label, float value) {
+            ParamEntry e;
+            e.key = {g.id | doc::kGroupParamBit, param_index};
+            e.path = "group" + std::to_string(g.id) + "." + id;
+            e.label = gname + " " + label;
+            e.min_value = 0.0f;
+            e.max_value = 1.0f;
+            e.base = value;
+            table.push_back(std::move(e));
+        };
+        add(doc::kWetParam, "wet", "wet/dry", g.wet);
+        add(doc::kOpacityParam, "opacity", "opacity", g.opacity);
+    }
+    for (size_t l = 0; l < look.sources.size(); ++l) {
+        doc::Source probe = look.sources[l];
         const std::string lname =
-            probe.name.empty() ? "layer" + std::to_string(l) : probe.name;
-        for (int p = 0; p < doc::kLayerParamCount; ++p) {
-            float* slot = layer_param_slot(probe, p);
+            probe.name.empty() ? "source " + std::to_string(probe.id) : probe.name;
+        for (int p = 0; p < doc::kSourceParamCount; ++p) {
+            float* slot = source_param_slot(probe, p);
             if (!slot) continue;
             ParamEntry e;
-            e.key = {probe.id | doc::kLayerParamBit, p};
-            e.path = "layer" + std::to_string(l) + "." + kLayerParamIds[p];
-            e.label = lname + " " + kLayerParamLabels[p];
-            layer_param_range(p, &e.min_value, &e.max_value);
+            e.key = {probe.id | doc::kSourceParamBit, p};
+            e.path = "source" + std::to_string(probe.id) + "." + kSourceParamIds[p];
+            e.label = lname + " " + kSourceParamLabels[p];
+            source_param_range(p, &e.min_value, &e.max_value);
             e.base = *slot;
             table.push_back(std::move(e));
         }

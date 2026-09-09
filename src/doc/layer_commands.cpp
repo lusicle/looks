@@ -4,110 +4,104 @@
 #include <cassert>
 #include <utility>
 
+#include "doc/stack_commands.h"
+
 namespace looks::doc {
 
 namespace {
 
-class AddLayerCommand final : public LookCommand {
+class AddSourceCommand final : public LookCommand {
 public:
-    AddLayerCommand(uint64_t look, Layer layer, size_t insert_index)
+    AddSourceCommand(uint64_t look, Source layer, size_t insert_index)
         : LookCommand(look), layer_(std::move(layer)),
           insert_index_(insert_index) {}
-    std::string name() const override { return "Add Layer"; }
+    std::string name() const override { return "Add Source"; }
 
     void apply(Document& doc) override {
         Look& look = entity_of(doc);
-        assert(insert_index_ <= look.layers.size());
-        look.layers.insert(look.layers.begin() + insert_index_, layer_);
+        look.sources.insert(look.sources.begin() + std::min(insert_index_, look.sources.size()), layer_);
     }
 
     void revert(Document& doc) override {
         Look& look = entity_of(doc);
-        look.layers.erase(look.layers.begin() + insert_index_);
+        look.sources.erase(std::remove_if(look.sources.begin(), look.sources.end(),
+            [&](const Source& source) { return source.id == layer_.id; }), look.sources.end());
     }
 
 private:
-    Layer layer_;
+    Source layer_;
     size_t insert_index_;
 };
 
-class RemoveLayerCommand final : public LookCommand {
+class RemoveSourceCommand final : public LookCommand {
 public:
-    RemoveLayerCommand(uint64_t look, size_t layer_index)
-        : LookCommand(look), layer_index_(layer_index) {}
-    std::string name() const override { return "Remove Layer"; }
+    RemoveSourceCommand(uint64_t look, uint64_t source_id)
+        : LookCommand(look), source_id_(source_id) {}
+    std::string name() const override { return "Remove Source"; }
 
     void apply(Document& doc) override {
         Look& look = entity_of(doc);
-        assert(layer_index_ < look.layers.size());
-        removed_ = look.layers[layer_index_];
+        const Source* source = find_source(look, source_id_);
+        applied_ = source != nullptr;
+        if (!applied_) return;
+        layer_index_ = static_cast<size_t>(source - look.sources.data());
+        removed_ = look.sources[layer_index_];
         old_links_ = look.links;
-        ensure_links(look);
+        references_.detach(look, source_id_);
         look.links.erase(std::remove_if(look.links.begin(), look.links.end(),
             [&](const NodeLink& link) { return link.from == removed_.id || link.to == removed_.id; }),
             look.links.end());
-        seal_links(look);
-        retained_ = !removed_.stack.empty() || !removed_.groups.empty();
-        if (retained_) {
-            Layer& layer = look.layers[layer_index_];
-            auto stack = std::move(layer.stack);
-            auto groups = std::move(layer.groups);
-            layer = {};
-            layer.id = removed_.id;
-            layer.source = LayerSourceKind::None;
-            layer.stack = std::move(stack);
-            layer.groups = std::move(groups);
-        } else look.layers.erase(look.layers.begin() + layer_index_);
+        look.sources.erase(look.sources.begin() + layer_index_);
     }
 
     void revert(Document& doc) override {
         Look& look = entity_of(doc);
-        if (retained_) look.layers[layer_index_] = removed_;
-        else look.layers.insert(look.layers.begin() + layer_index_, removed_);
+        if (!applied_) return;
+        look.sources.insert(look.sources.begin() + layer_index_, removed_);
         look.links = old_links_;
+        references_.restore(look, source_id_);
     }
 
 private:
-    size_t layer_index_;
-    Layer removed_;
+    uint64_t source_id_;
+    size_t layer_index_ = 0;
+    Source removed_;
     std::vector<NodeLink> old_links_;
-    bool retained_ = false;
+    NodeReferenceState references_;
+    bool applied_ = false;
 };
 
-class SetLayerPropsCommand final : public LookCommand {
+class SetSourcePropsCommand final : public LookCommand {
 public:
-    SetLayerPropsCommand(uint64_t look, Layer updated)
+    SetSourcePropsCommand(uint64_t look, Source updated)
         : LookCommand(look), updated_(std::move(updated)) {}
-    std::string name() const override { return "Edit Layer"; }
+    std::string name() const override { return "Edit Source"; }
 
     void apply(Document& doc) override {
-        Layer* l = find_layer(entity_of(doc), updated_.id);
-        assert(l);
+        Source* l = find_source(entity_of(doc), updated_.id);
+        applied_ = l != nullptr;
+        if (!applied_) return;
         old_ = *l;
-        assign(*l, updated_);
+        *l = updated_;
     }
 
     void revert(Document& doc) override {
-        if (Layer* l = find_layer(entity_of(doc), updated_.id)) assign(*l, old_);
+        if (applied_)
+            if (Source* l = find_source(entity_of(doc), updated_.id)) *l = old_;
     }
 
     bool merge(const Command& next) override {
-        const auto* other = dynamic_cast<const SetLayerPropsCommand*>(&next);
-        if (!other || !same_entity(*other) || other->updated_.id != updated_.id)
+        const auto* other = dynamic_cast<const SetSourcePropsCommand*>(&next);
+        if (!other || !applied_ || !other->applied_ || !same_entity(*other) || other->updated_.id != updated_.id)
             return false;
         updated_ = other->updated_;
         return true;
     }
 
 private:
-    static void assign(Layer& dst, const Layer& src) {
-        std::vector<EffectInstance> stack = std::move(dst.stack);
-        dst = src;
-        dst.stack = std::move(stack);
-    }
-
-    Layer updated_;
-    Layer old_;
+    Source updated_;
+    Source old_;
+    bool applied_ = false;
 };
 
 struct PlacementSplit {
@@ -238,27 +232,27 @@ std::unique_ptr<Command> razor_audio_command(Document& doc, uint64_t seq_id,
     return razor_lane(doc, seq_id, doc.sequence(seq_id).audio, track_id, at);
 }
 
-Layer make_layer(Document& doc, LayerSourceKind kind) {
-    Layer layer;
+Source make_source(Document& doc, SourceKind kind) {
+    Source layer;
     layer.id = doc.next_effect_id++;
     layer.source = kind;
     static const char* kNames[] = {"media", "solid", "gradient",
                                    "noise", "pattern", "osc",
-                                   "shape", "look",  "sequence", "slideshow", "none"};
+                                   "shape", "look",  "sequence", "slideshow"};
     static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
-                      static_cast<size_t>(LayerSourceKind::Count),
-                  "layer names track the enum");
+                      static_cast<size_t>(SourceKind::Count),
+                  "source names track the enum");
     layer.name = std::string(kNames[static_cast<size_t>(kind)]) + " " +
                  std::to_string(layer.id);
     // The caller must check nest_reaches before it binds a nested ref.
-    if (kind == LayerSourceKind::Media && !doc.assets.empty())
+    if (kind == SourceKind::Media && !doc.assets.empty())
         layer.asset = doc.assets.front().id;
-    if (kind == LayerSourceKind::Solid || kind == LayerSourceKind::Gradient ||
-        kind == LayerSourceKind::Noise ||
-        kind == LayerSourceKind::TestPattern ||
-        kind == LayerSourceKind::Oscillator)
+    if (kind == SourceKind::Solid || kind == SourceKind::Gradient ||
+        kind == SourceKind::Noise ||
+        kind == SourceKind::TestPattern ||
+        kind == SourceKind::Oscillator)
         layer.opacity = 0.5f;
-    if (kind == LayerSourceKind::Gradient) {
+    if (kind == SourceKind::Gradient) {
         GradientStop a;
         a.id = doc.next_effect_id++;
         a.t = 0.0f;
@@ -273,19 +267,19 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
         layer.stops.push_back(a);
         layer.stops.push_back(b);
     }
-    if (kind == LayerSourceKind::Oscillator) {
+    if (kind == SourceKind::Oscillator) {
         // For Oscillator, gen_scale is in cycles, not pixels.
         layer.gen_scale = 8.0f;
         layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
     }
-    if (kind == LayerSourceKind::TestPattern) {
+    if (kind == SourceKind::TestPattern) {
         // For TestPattern, gen_scale is the checker cell size in pixels.
         layer.gen_scale = 64.0f;
         layer.color_a[0] = layer.color_a[1] = layer.color_a[2] = 1.0f;
         layer.color_b[0] = layer.color_b[1] = layer.color_b[2] = 0.0f;
     }
-    if (kind == LayerSourceKind::Shape) {
+    if (kind == SourceKind::Shape) {
         // For Shape, gen_scale is the size and gen_angle is the feather.
         layer.gen_scale = 6.0f;
         layer.gen_angle = 0.35f;
@@ -295,19 +289,19 @@ Layer make_layer(Document& doc, LayerSourceKind kind) {
     return layer;
 }
 
-std::unique_ptr<Command> add_layer_command(uint64_t look, Layer layer,
+std::unique_ptr<Command> add_source_command(uint64_t look, Source layer,
                                            size_t insert_index) {
-    return std::make_unique<AddLayerCommand>(look, std::move(layer),
+    return std::make_unique<AddSourceCommand>(look, std::move(layer),
                                              insert_index);
 }
 
-std::unique_ptr<Command> remove_layer_command(uint64_t look,
-                                              size_t layer_index) {
-    return std::make_unique<RemoveLayerCommand>(look, layer_index);
+std::unique_ptr<Command> remove_source_command(uint64_t look,
+                                              uint64_t source_id) {
+    return std::make_unique<RemoveSourceCommand>(look, source_id);
 }
 
-std::unique_ptr<Command> set_layer_props_command(uint64_t look, Layer updated) {
-    return std::make_unique<SetLayerPropsCommand>(look, std::move(updated));
+std::unique_ptr<Command> set_source_props_command(uint64_t look, Source updated) {
+    return std::make_unique<SetSourcePropsCommand>(look, std::move(updated));
 }
 
 }  // namespace looks::doc

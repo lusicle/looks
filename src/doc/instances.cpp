@@ -1,5 +1,7 @@
 #include "doc/instances.h"
 
+#include <set>
+
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -8,9 +10,37 @@
 
 namespace looks::doc {
 
+std::vector<uint64_t> upstream_video_assets(const Document& doc, uint64_t look, uint64_t node) {
+    std::set<std::pair<uint64_t, uint64_t>> visited;
+    std::set<uint64_t> assets;
+    std::vector<std::pair<uint64_t, uint64_t>> pending{{look, node}};
+    while (!pending.empty()) {
+        const auto [entity, id] = pending.back();
+        pending.pop_back();
+        if (!visited.emplace(entity, id).second) continue;
+        if (const auto* sequence = doc.find_sequence(entity)) {
+            for (const auto& track : sequence->tracks)
+                for (const auto& placement : track.placements) pending.emplace_back(placement.target, 0);
+            continue;
+        }
+        const auto* target = doc.find_look(entity);
+        if (!target) continue;
+        if (const auto* source = find_source(*target, id)) {
+            if (source_is_nested(*source)) pending.emplace_back(source->target, 0);
+            else if (source_is_media(*source) && source->asset) assets.insert(source->asset);
+            else if (source->source == SourceKind::Slideshow)
+                for (const auto* asset : slideshow_assets(doc, *source)) assets.insert(asset->id);
+            continue;
+        }
+        for (const auto& link : target->links)
+            if (link.to == id && link.to_port == 0) pending.emplace_back(entity, link.from);
+    }
+    return {assets.begin(), assets.end()};
+}
+
 namespace {
 
-// The depth guard alone allows kMaxLayers^kMaxLookDepth: cap the walk.
+// The depth guard alone allows kMaxSources^kMaxLookDepth: cap the walk.
 constexpr size_t kMaxFlattened = 1024;
 
 bool video_source_limit(const std::vector<MediaInstance>& sources) {
@@ -66,7 +96,7 @@ uint64_t link_into(const Look& look, const std::vector<NodeLink>& links,
 
 // ops are in play order, source first.
 struct VoicePath {
-    const Layer* root = nullptr;
+    const Source* root = nullptr;
     std::vector<AudioOp> ops;
     int64_t audio_off = 0;   // Offset shims sitting on the path's source
 };
@@ -79,12 +109,12 @@ constexpr int kMaxVoiceDepth = 256;
 // Paths emit bottom-first: paths.front() is the bottom-most chain.
 // On overflow the hops nearest the output win.
 void walk_paths(const Look& look, const std::vector<NodeLink>& links,
-                uint64_t cur, std::vector<AudioOp>& rev, int64_t off,
+                bool has_solo, uint64_t cur, std::vector<AudioOp>& rev, int64_t off,
                 int depth, int& budget, std::vector<VoicePath>& out) {
     if (!cur || out.size() >= kMaxVoicePaths || depth > kMaxVoiceDepth ||
         budget-- <= 0)
         return;
-    if (const Layer* layer = find_layer(look, cur)) {
+    if (const Source* layer = find_source(look, cur)) {
         VoicePath p;
         p.root = layer;
         p.audio_off = off;
@@ -94,19 +124,18 @@ void walk_paths(const Look& look, const std::vector<NodeLink>& links,
         out.push_back(std::move(p));
         return;
     }
-    const Layer* owner = nullptr;
-    const EffectInstance* fx = find_effect(look, cur, &owner);
+    const EffectInstance* fx = find_effect(look, cur);
     if (!fx) {
         if (!group_of_input(look, cur)) return;   // dangling id: silent
         for (const NodeLink& l : links)
             if (l.to == cur && l.to_port == 0 &&
                 wire_producer_live(look, l.from))
-                walk_paths(look, links, l.from, rev, off, depth + 1,
+                walk_paths(look, links, has_solo, l.from, rev, off, depth + 1,
                            budget, out);
         return;
     }
     const bool live =
-        !fx->bypass && !group_bypassed(*owner, fx->group_id);
+        effect_enabled(look, *fx, has_solo);
     bool pushed = false;
     if (is_audio_effect(fx->type) && live) {
         AudioOp op;
@@ -125,9 +154,9 @@ void walk_paths(const Look& look, const std::vector<NodeLink>& links,
         int64_t branch_off = off;
         if (fx->type == EffectType::Offset && live &&
             offset_targets_audio(*fx) &&
-            find_layer(look, hop_group_inputs(look, links, l.from)))
+            find_source(look, hop_group_inputs(look, links, l.from)))
             branch_off += offset_frames(*fx);
-        walk_paths(look, links, l.from, rev, branch_off, depth + 1,
+        walk_paths(look, links, has_solo, l.from, rev, branch_off, depth + 1,
                    budget, out);
     }
     if (pushed) rev.pop_back();
@@ -135,8 +164,8 @@ void walk_paths(const Look& look, const std::vector<NodeLink>& links,
 
 // port 0 = the combined In, port 1 = the split audio-in. Unwired = silent.
 std::vector<VoicePath> resolve_voices(const Look& look) {
-    std::vector<NodeLink> synth;
-    const std::vector<NodeLink>& links = effective_links(look, synth);
+    const bool has_solo = look_has_solo(look);
+    const std::vector<NodeLink>& links = (look).links;
     std::vector<VoicePath> out;
     std::vector<AudioOp> rev;
     int budget = kVoiceVisitBudget;
@@ -144,7 +173,7 @@ std::vector<VoicePath> resolve_voices(const Look& look) {
     for (const NodeLink& l : links)
         if (l.to == 0 && l.to_port == port &&
             wire_producer_live(look, l.from))
-            walk_paths(look, links, l.from, rev, 0, 0, budget, out);
+            walk_paths(look, links, has_solo, l.from, rev, 0, 0, budget, out);
     return out;
 }
 
@@ -170,11 +199,12 @@ struct LookBuild {
     double eff;
     std::unordered_map<uint64_t, int> memo;
     std::unordered_set<uint64_t> building;
+    bool has_solo = look_has_solo(look);
 };
 
 int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift);
 
-bool media_leaf(const Document& doc, const Layer& layer, const Asset& a,
+bool media_leaf(const Document& doc, const Source& layer, const Asset& a,
                 const Cursor& cur, double eff, int64_t off, Cursor* leaf,
                 double* rate, int64_t* shift) {
     *shift = static_cast<int64_t>(layer.slip) + off;
@@ -195,7 +225,7 @@ bool media_leaf(const Document& doc, const Layer& layer, const Asset& a,
     return child_window(cur, lo, hi, 1.0, lo, leaf);
 }
 
-bool nested_child(const Document& doc, const Layer& layer, const Cursor& cur,
+bool nested_child(const Document& doc, const Source& layer, const Cursor& cur,
                   double eff, int64_t off, Cursor* child) {
     if (!layer.target) return false;
     if (cur.depth + 1 >= kMaxLookDepth) return false;
@@ -265,11 +295,11 @@ std::vector<int> collect_feeds(LookBuild& lb, uint64_t to, uint32_t port,
     return children;
 }
 
-int build_layer_audio(LookBuild& lb, const Layer& layer,
+int build_layer_audio(LookBuild& lb, const Source& layer,
                       int64_t src_shift) {
     const Document& doc = lb.pb.doc;
     const Cursor& cur = lb.cur;
-    if (layer_is_media(layer)) {
+    if (source_is_media(layer)) {
         if (!layer.asset) return -1;
         const Asset* a = doc.find_asset(layer.asset);
         if (!a) return -1;   // dangling id: dormant
@@ -298,7 +328,7 @@ int build_layer_audio(LookBuild& lb, const Layer& layer,
         n.w1 = leaf.r1;
         return idx;
     }
-    if (layer_is_nested(layer)) {
+    if (source_is_nested(layer)) {
         Cursor child;
         if (!nested_child(doc, layer, cur, lb.eff, src_shift, &child))
             return -1;
@@ -325,14 +355,13 @@ int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift) {
     if (lb.building.count(id)) return -1;   // Feedback edge: silence
     lb.building.insert(id);
     int result = -1;
-    if (const Layer* layer = find_layer(lb.look, id)) {
-        result = build_layer_audio(lb, *layer, src_shift);
+    if (const Source* layer = find_source(lb.look, id)) {
+        if (layer->visible) result = build_layer_audio(lb, *layer, src_shift);
     } else {
-        const Layer* owner = nullptr;
-        const EffectInstance* fx = find_effect(lb.look, id, &owner);
+        const EffectInstance* fx = find_effect(lb.look, id);
         if (fx) {
             const bool live =
-                !fx->bypass && !group_bypassed(*owner, fx->group_id);
+                effect_enabled(lb.look, *fx, lb.has_solo);
             // Offset shifts only the sources it sits directly on.
             int64_t feed_shift = 0;
             if (fx->type == EffectType::Offset && live &&
@@ -372,8 +401,7 @@ int build_doc_node(LookBuild& lb, uint64_t id, int64_t src_shift) {
 }
 
 int build_look_audio(ProgBuild& pb, const Look& look, const Cursor& cur) {
-    std::vector<NodeLink> synth;
-    const std::vector<NodeLink>& links = effective_links(look, synth);
+    const std::vector<NodeLink>& links = (look).links;
     LookBuild lb{pb,  look, links, cur,
                  effective_fps(pb.doc, look), {}, {}};
     std::vector<int> children =
@@ -425,7 +453,7 @@ int build_entity_audio(ProgBuild& pb, uint64_t entity, const Cursor& cur) {
 void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                std::vector<MediaInstance>& out) {
     const double eff = effective_fps(doc, look);
-    auto emit_media = [&](const Layer& layer, int64_t off) {
+    auto emit_media = [&](const Source& layer, int64_t off) {
         if (!layer.asset) return;
         const Asset* a = doc.find_asset(layer.asset);
         // No frames and no size means audio only: there is no image side.
@@ -451,7 +479,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         c.shift = shift;
         out.push_back(c);
     };
-    auto descend_nested = [&](const Layer& layer, int64_t off) {
+    auto descend_nested = [&](const Source& layer, int64_t off) {
         Cursor child;
         if (nested_child(doc, layer, cur, eff, off, &child))
             walk(doc, child, out);
@@ -460,31 +488,24 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
     // Liveness must mirror compile effect_active exactly.
     std::vector<std::pair<uint64_t, int64_t>> vshifts;
     {
-        std::vector<NodeLink> synth;
-        const std::vector<NodeLink>& links = effective_links(look, synth);
-        for (const Layer& holder : look.layers) {
-            if (!holder.visible) continue;
-            bool any_solo = false;
-            for (const EffectInstance& fx : holder.stack)
-                if (fx.solo && !fx.bypass) any_solo = true;
-            for (const EffectInstance& fx : holder.stack) {
-                if (fx.type != EffectType::Offset || fx.bypass) continue;
-                if (any_solo && !fx.solo) continue;
-                if (group_bypassed(holder, fx.group_id)) continue;
+        const std::vector<NodeLink>& links = (look).links;
+            const bool any_solo = look_has_solo(look);
+            for (const EffectInstance& fx : look.effects) {
+                if (fx.type != EffectType::Offset ||
+                    !effect_enabled(look, fx, any_solo)) continue;
                 if (!offset_targets_video(fx)) continue;
                 const int64_t off = offset_frames(fx);
                 if (!off) continue;
                 // Adjacency looks through group input slots, like the compiler.
                 const uint64_t src = offset_source(look, links, fx.id);
-                for (const Layer& l : look.layers)
+                for (const Source& l : look.sources)
                     if (l.id == src) vshifts.emplace_back(src, off);
             }
-        }
     }
-    for (const Layer& layer : look.layers) {
+    for (const Source& layer : look.sources) {
         if (!layer.visible) continue;
         if (video_source_limit(out)) return;
-        if (layer.source == LayerSourceKind::Slideshow) {
+        if (layer.source == SourceKind::Slideshow) {
             const auto assets = slideshow_assets(doc, layer);
             for (size_t i = 0; i < assets.size(); ++i) {
                 MediaInstance c;
@@ -506,9 +527,9 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
                 out.push_back(c);
             }
             continue;
-        } else if (layer_is_media(layer)) {
+        } else if (source_is_media(layer)) {
             emit_media(layer, 0);
-        } else if (layer_is_nested(layer)) {
+        } else if (source_is_nested(layer)) {
             descend_nested(layer, 0);
         } else {
             continue;
@@ -516,7 +537,7 @@ void walk_look(const Document& doc, const Look& look, const Cursor& cur,
         for (const auto& [src, off] : vshifts) {
             if (src != layer.id) continue;
             if (video_source_limit(out)) return;
-            if (layer_is_media(layer))
+            if (source_is_media(layer))
                 emit_media(layer, off);
             else
                 descend_nested(layer, off);
@@ -578,14 +599,14 @@ namespace {
 bool entity_has_image_at(const Document& doc, uint64_t id, int depth);
 
 // A layer draws when its own source can make pixels.
-bool layer_draws(const Document& doc, const Layer& l, int depth) {
+bool layer_draws(const Document& doc, const Source& l, int depth) {
     if (!l.visible) return false;
-    if (l.source == LayerSourceKind::Slideshow) return !slideshow_assets(doc, l).empty();
-    if (layer_is_media(l)) {
+    if (l.source == SourceKind::Slideshow) return !slideshow_assets(doc, l).empty();
+    if (source_is_media(l)) {
         const Asset* a = l.asset ? doc.find_asset(l.asset) : nullptr;
         return a && (a->frame_count || a->width || a->height);
     }
-    if (layer_is_nested(l))
+    if (source_is_nested(l))
         return l.target && entity_has_image_at(doc, l.target, depth + 1);
     return true;   // a generator always draws
 }
@@ -599,7 +620,7 @@ bool feed_draws(const Document& doc, const Look& look,
     for (uint64_t s : seen)
         if (s == id) return false;
     seen.push_back(id);
-    for (const Layer& l : look.layers)
+    for (const Source& l : look.sources)
         if (l.id == id) return layer_draws(doc, l, depth);
     for (const NodeLink& l : links)
         if (l.to == id && l.to_port == 0 &&
@@ -611,8 +632,7 @@ bool feed_draws(const Document& doc, const Look& look,
 bool entity_has_image_at(const Document& doc, uint64_t id, int depth) {
     if (depth >= kMaxLookDepth) return false;
     if (const Look* look = doc.find_look(id)) {
-        std::vector<NodeLink> synth;
-        const std::vector<NodeLink>& links = effective_links(*look, synth);
+        const std::vector<NodeLink>& links = (*look).links;
         for (const NodeLink& l : links) {
             if (l.to != 0 || l.to_port != 0) continue;
             std::vector<uint64_t> seen;
@@ -685,19 +705,18 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
     // Analysis needs one stream: take the bottom-most resolvable path.
     std::vector<VoicePath> paths;
     {
-        std::vector<NodeLink> synth;
-        const std::vector<NodeLink>& links = effective_links(look, synth);
+        const std::vector<NodeLink>& links = (look).links;
         std::vector<AudioOp> rev;
         int budget = kVoiceVisitBudget;
-        walk_paths(look, links, node, rev, 0, 0, budget, paths);
+        walk_paths(look, links, look_has_solo(look), node, rev, 0, 0, budget, paths);
     }
     for (int depth = 0; depth < kMaxLookDepth; ++depth) {
         if (paths.empty()) return {};
         const VoicePath& p = paths.front();
         chain.insert(chain.begin(), p.ops.begin(), p.ops.end());
         off += p.audio_off;
-        const Layer& root = *p.root;
-        if (layer_is_media(root)) {
+        const Source& root = *p.root;
+        if (source_is_media(root)) {
             // Unbound or dangling: no voice.
             if (!root.asset || !doc.find_asset(root.asset)) return {};
             out.asset = root.asset;
@@ -715,7 +734,7 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
                 out.ops[i] = chain[base + i];
             return out;
         }
-        if (!layer_is_nested(root) || !root.target) return {};
+        if (!source_is_nested(root) || !root.target) return {};
         const Look* t = doc.find_look(root.target);
         if (!t) return {};   // sequence ref: no single voice
         paths = resolve_voices(*t);
@@ -723,7 +742,7 @@ AudioChain resolve_audio_chain(const Document& doc, const Look& look,
     return {};
 }
 
-std::vector<const Asset*> slideshow_assets(const Document& doc, const Layer& layer) {
+std::vector<const Asset*> slideshow_assets(const Document& doc, const Source& layer) {
     std::vector<const Asset*> result;
     if (layer.slide_bin && !doc.find_bin(layer.slide_bin)) return result;
     for (const auto& asset : doc.assets) {

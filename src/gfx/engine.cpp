@@ -19,6 +19,7 @@
 #include "util/file.h"
 #include "util/hash.h"
 #include "util/image.h"
+#include "util/linear_image.h"
 #include "util/log.h"
 
 namespace looks::gfx {
@@ -278,6 +279,7 @@ constexpr FxShaderDesc kFxShaders[] = {
     {"fx_halation.comp.spv", 2},
     {"fx_rolling_shutter.comp.spv", 2},
     {"fx_normalise.comp.spv", 2},
+    {"fx_mode.comp.spv", 2},
 };
 static_assert(sizeof(kFxShaders) / sizeof(kFxShaders[0]) ==
               static_cast<size_t>(doc::EffectType::Count));
@@ -777,6 +779,8 @@ bool Engine::set_glyph_atlas_impl(const uint8_t* pixels, uint32_t width,
     for (auto& io : cache_io_) io.pending = false;
     glyph_meta_[slot] = {cols, rows, tile_px};
     glyph_atlas_color_[slot] = color;
+    glyph_data_[slot] = {std::vector<uint8_t>(pixels, pixels + size_t(width) * height * (color ? 4 : 1)),
+        width, height, cols, rows, tile_px, color};
     return true;
 }
 
@@ -798,6 +802,32 @@ void Engine::set_scope_audio(std::vector<int16_t> mono,
                              uint32_t sample_rate) {
     scope_audio_ = std::move(mono);
     scope_rate_ = scope_audio_.empty() ? 0 : sample_rate;
+}
+
+bool Engine::copy_resources_to(Engine& other) const {
+    other.set_track_planes(pin_planes_);
+    other.set_scope_audio(scope_audio_, scope_rate_);
+    for (int slot = 0; slot < 3; ++slot) {
+        const auto& data = glyph_data_[slot];
+        if (!data.pixels.empty() && !other.set_glyph_atlas_impl(data.pixels.data(),
+                data.width, data.height, data.tile, data.cols, data.rows, slot, data.color))
+            return false;
+    }
+    return true;
+}
+
+void Engine::reset_effect_state() {
+    for (auto& [id, slot] : ed_state_)
+        if (slot && slot->busy) slot->worker.join();
+    ed_state_.clear();
+    crt_state_.clear();
+    feedback_state_.clear();
+    mosh_state_.clear();
+    mosh_gpu_.clear();
+    rd_state_.clear();
+    slit_state_.clear();
+    hold_state_.clear();
+    have_last_frame_ = prev_frame_valid_ = false;
 }
 
 void Engine::codec_planes_to_rgb(VkCommandBuffer rec, uint32_t frame_index,
@@ -1294,7 +1324,7 @@ void oklab_to_linear(const float lab[3], float* out) {
     out[2] = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
 }
 
-float mesh_stop_spacing(const doc::Layer& layer, uint32_t w, uint32_t h) {
+float mesh_stop_spacing(const doc::Source& layer, uint32_t w, uint32_t h) {
     const size_t n = layer.stops.size();
     if (n < 2) return 1.0f;
     const float aspect = static_cast<float>(w) /
@@ -1318,7 +1348,7 @@ float mesh_stop_spacing(const doc::Layer& layer, uint32_t w, uint32_t h) {
 
 const GpuImage* Engine::ensure_gradient_ramp(VkCommandBuffer rec,
                                              StagingBuffer& staging,
-                                             const doc::Layer& layer) {
+                                             const doc::Source& layer) {
     if (layer.stops.empty()) return nullptr;
     uint64_t hash = hash_combine(0x6A0Dull,
                                  static_cast<uint64_t>(layer.gradient_space));
@@ -1661,7 +1691,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                          const LayerSourceFrame* layer_sources,
                          size_t layer_source_count,
                          uint64_t preview_node, uint64_t preview_layer,
-                         uint64_t measure_placement, bool cache_store) {
+                         uint64_t measure_placement, bool cache_store, uint64_t input_target) {
     bounds_recorded_ = false;
     // Only the root instance's clock drives caching and prev-frame tracking.
     if (out_source) *out_source = nullptr;
@@ -1734,7 +1764,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
 
     const RenderGraph graph =
         compile_graph(doc, root_id, root_frame, preview_node, preview_layer,
-                      measure_placement, out_source != nullptr);
+                      measure_placement, out_source != nullptr, input_target);
     if (!graph.valid) {
         log_error("engine: render graph invalid (cycle?)");
         return nullptr;
@@ -1753,8 +1783,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
     for (const GraphNode& n : graph.nodes) {
         if (n.kind != GraphNode::Kind::Effect) continue;
         const doc::EffectInstance& fx =
-            node_look(n).layers[static_cast<size_t>(n.layer_index)]
-                .stack[static_cast<size_t>(n.effect_index)];
+            node_look(n).effects[static_cast<size_t>(n.effect_index)];
         if (doc::is_codec_box(fx.type) ||
             fx.type == doc::EffectType::ErrorDiffusion) {
             segmented = true;
@@ -1991,8 +2020,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             return true;
         };
         for (size_t ii = 0; ii < graph.instances.size(); ++ii)
-        for (const doc::Layer& layer : inst_look[ii]->layers)
-            for (const doc::EffectInstance& fx : layer.stack)
+            for (const doc::EffectInstance& fx : inst_look[ii]->effects)
                 if (!upload_strip(fx)) return nullptr;
     }
 
@@ -2096,7 +2124,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             for (size_t i = 0; i < inputs.size(); ++i) {
                 if (graph.nodes[node.inputs[i]].kind == GraphNode::Kind::Flow ||
                     (inputs[i]->width() == w && inputs[i]->height() == h) ||
-                    (node.kind == GraphNode::Kind::LayerBlend && node.layer_index < 0 && i == 1)) continue;
+                    (node.kind == GraphNode::Kind::LayerBlend && node.source_index < 0 && i == 1)) continue;
                 GpuImage* scaled = pool_->acquire(w, h);
                 if (!scaled) return nullptr;
                 scaled->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
@@ -2139,8 +2167,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 float fit[4];
                 source_fit_rect(it->second.y->width(),
                                 it->second.y->height(), canvas_w, canvas_h, fit,
-                                look.layers[node.layer_index].source == doc::LayerSourceKind::Slideshow
-                                    ? look.layers[node.layer_index].slide_fit : 0);
+                                look.sources[node.source_index].source == doc::SourceKind::Slideshow
+                                    ? look.sources[node.source_index].slide_fit : 0);
                 fit[0] *= float(w) / canvas_w;
                 fit[2] *= float(w) / canvas_w;
                 fit[1] *= float(h) / canvas_h;
@@ -2160,8 +2188,8 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             }
             case GraphNode::Kind::LayerTransform: {
                 // Look layers only; sequence Motion runs in the lane blend.
-                const doc::Layer& layer =
-                    look.layers[static_cast<size_t>(node.layer_index)];
+                const doc::Source& layer =
+                    look.sources[static_cast<size_t>(node.source_index)];
                 uint32_t push[12] = {};
                 push[0] = w;
                 push[1] = h;
@@ -2191,9 +2219,9 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 const GpuImage* sdf_tex = dummy_flow_.get();
                 const GpuImage* ramp_tex = dummy_flow_.get();
-                if (node.layer_index >= 0) {
-                    const doc::Layer& layer =
-                        look.layers[static_cast<size_t>(node.layer_index)];
+                if (node.source_index >= 0) {
+                    const doc::Source& layer =
+                        look.sources[static_cast<size_t>(node.source_index)];
                     push[2] = static_cast<uint32_t>(layer.source);
                     push[3] = static_cast<uint32_t>(
                         hash_combine(doc.master_seed, layer.id));
@@ -2206,7 +2234,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     push[14] = as_bits(layer.gen_angle);
                     push[15] = layer.osc_shape;
                     push[16] = as_bits(layer.gen_phase);
-                    if (layer.source == doc::LayerSourceKind::Gradient) {
+                    if (layer.source == doc::SourceKind::Gradient) {
                         push[17] = static_cast<uint32_t>(layer.gradient);
                         push[18] = as_bits(layer.gradient_len);
                         push[19] = as_bits(layer.gradient_x);
@@ -2221,7 +2249,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                                 ensure_gradient_ramp(rec, staging, layer))
                             ramp_tex = r;
                     }
-                    if (layer.source == doc::LayerSourceKind::Shape &&
+                    if (layer.source == doc::SourceKind::Shape &&
                         layer.osc_shape == 3u && !layer.path.empty()) {
                         // The raster re-runs only on a path or size change.
                         const uint32_t rw =
@@ -2290,19 +2318,13 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 break;
             }
             case GraphNode::Kind::LayerBlend: {
-                // layer_index -1 is a sequence lane: plain alpha-over only.
-                // A look layer uses its own mode; alpha stays premultiplied.
-                doc::BlendMode mode = doc::BlendMode::Normal;
+                doc::BlendMode mode = node.blend;
                 float opacity = node.p_opacity;
                 bool moved = false;
-                if (node.layer_index >= 0) {
-                    const doc::Layer& layer =
-                        look.layers[static_cast<size_t>(node.layer_index)];
-                    if (node.effect_index >= 0) {
-                        const auto& fx = layer.stack[static_cast<size_t>(node.effect_index)];
-                        mode = fx.blend;
-                        opacity = fx.opacity;
-                    } else mode = layer.blend;
+                if (node.effect_index >= 0) {
+                    const auto& fx = look.effects[static_cast<size_t>(node.effect_index)];
+                    mode = fx.blend;
+                    opacity = fx.opacity;
                 } else {
                     moved = node.p_scale != 1.0f || node.p_rotate != 0.0f ||
                             node.p_shift_x != 0.0f ||
@@ -2330,8 +2352,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 effect_frame_ = timeline_frame;
                 const double effect_fps = doc::entity_fps(doc, linst.look);
                 const doc::EffectInstance* fx_ptr =
-                    &look.layers[static_cast<size_t>(node.layer_index)]
-                        .stack[static_cast<size_t>(node.effect_index)];
+                    &look.effects[static_cast<size_t>(node.effect_index)];
                 doc::EffectInstance blended_fx;
                 if (fx_ptr->blend != doc::BlendMode::Normal) {
                     blended_fx = *fx_ptr;
@@ -2339,6 +2360,36 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                     fx_ptr = &blended_fx;
                 }
                 const auto& fx = *fx_ptr;
+                if (fx.type == doc::EffectType::Mode) {
+                    auto& stored = mode_images_[skey];
+                    if (stored.path != fx.generated_path) {
+                        if (stored.image) retired_images_[render_slot_].push_back(std::move(stored.image));
+                        stored.path = fx.generated_path;
+                        LinearImage pixels;
+                        if (!stored.path.empty() && load_linear_image(u8_to_path(stored.path), pixels)) {
+                            stored.image = GpuImage::create(device_, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                pixels.width, pixels.height, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                            if (!stored.image || !staging.upload_image(rec, pixels.pixels.data(),
+                                    pixels.pixels.size() * 2, pixels.width, *stored.image)) return nullptr;
+                            stored.image->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        }
+                    }
+                    GpuImage* mode = stored.image.get();
+                    if (!mode) {
+                        copy_full(rec, *input_image(0), *dst, w, h);
+                        input_image(0)->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        dst->transition(rec, VK_IMAGE_LAYOUT_GENERAL);
+                        break;
+                    }
+                    mode->transition(rec, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    const uint32_t push[] = {w, h, as_bits(fx.wet), as_bits(fx.opacity),
+                        0, timeline_frame, as_bits(float(effect_fps)),
+                        as_bits(fx.params[0]), as_bits(fx.params[1])};
+                    const GpuImage* sampled[] = {input_image(0), mode};
+                    fx_[size_t(fx.type)]->dispatch(rec, arena_, frame_index, sampled, 2,
+                        &dst, 1, push, sizeof(push), w, h, linear_sampler_);
+                    break;
+                }
                 if ((doc::is_codec_box(fx.type) || fx.type == doc::EffectType::ErrorDiffusion) &&
                     (codec_io_.nv_y->width() != w || codec_io_.nv_y->height() != h)) {
                     codec_flush_segment();
@@ -3282,18 +3333,17 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
                 } else if (fx.type == doc::EffectType::TrackPin) {
                     // The CPU composes one 3x3 in double for the kernel.
                     // Rotation stays in metric space to stop a shear.
-                    const doc::Layer& own =
-                        look.layers[static_cast<size_t>(node.layer_index)];
                     double H[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-                    if (pin_planes_ && own.asset) {
+                    if (pin_planes_ && node.media_asset) {
                         const uint64_t key = pin_plane_key(
-                            own.asset, fx.params[1], fx.params[2],
+                            node.media_asset, fx.params[1], fx.params[2],
                             fx.params[3], fx.params[4]);
                         const auto it = pin_planes_->find(key);
                         if (it != pin_planes_->end() &&
                             !it->second.h.empty()) {
                             const uint32_t media_frame =
-                                timeline_frame + own.slip;
+                                static_cast<uint32_t>(std::clamp(node.media_frame, 0.0,
+                                    static_cast<double>(UINT32_MAX)));
                             const uint32_t n = static_cast<uint32_t>(
                                 it->second.h.size() / 9);
                             const uint32_t idx =
@@ -3483,8 +3533,7 @@ GpuImage* Engine::render(VkCommandBuffer cmd, uint32_t frame_index,
             case GraphNode::Kind::GroupMix: {
                 // The group knobs read from the resolved look, like params.
                 const doc::Group& grp =
-                    look.layers[static_cast<size_t>(node.layer_index)]
-                        .groups[static_cast<size_t>(node.effect_index)];
+                    look.groups[static_cast<size_t>(node.effect_index)];
                 const uint32_t push[4] = {w, h, as_bits(grp.wet),
                                           as_bits(grp.opacity)};
                 const GpuImage* sampled[2] = {input_image(0),

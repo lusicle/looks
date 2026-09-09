@@ -36,8 +36,9 @@ int wmain(int argc, wchar_t** argv) {
     doc::Document doc;
     {
         doc::Look seed = doc::make_look(doc, "look 1");
-        seed.layers.push_back(
-            doc::make_layer(doc, doc::LayerSourceKind::Media));
+        seed.sources.push_back(
+            doc::make_source(doc, doc::SourceKind::Media));
+        seed.links = {{seed.sources[0].id, 0, 0}};
         doc.looks.push_back(std::move(seed));
     }
     doc::Asset asset;
@@ -48,7 +49,7 @@ int wmain(int argc, wchar_t** argv) {
     asset.width = probe.width();
     asset.height = probe.height();
     doc.assets.push_back(asset);
-    doc.looks[0].layers[0].asset = asset.id;
+    doc.looks[0].sources[0].asset = asset.id;
     {
         doc::Placement block;
         block.id = doc.next_effect_id++;

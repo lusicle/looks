@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "intrusion",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 0
       }
     ],
-    "face_in": 125,
+    "inputs": [130],
     "face_out": 117
   },
   "effects": [
@@ -130,5 +130,12 @@
       "node_x": 1140,
       "node_y": 40
     }
+  ],
+  "links": [
+    {"from": 125, "to": 114, "port": 0},
+    {"from": 114, "to": 115, "port": 0},
+    {"from": 115, "to": 116, "port": 0},
+    {"from": 116, "to": 117, "port": 0},
+    {"from": 130, "to": 125, "port": 0}
   ]
 }

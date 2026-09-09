@@ -146,6 +146,7 @@ enum class EffectType : uint32_t {
     Halation,
     RollingShutter,
     Normalise,
+    Mode,
     Count,
 };
 
@@ -195,6 +196,8 @@ enum class BlendMode : uint32_t {
 
 // final = mix(input, blend(input, mix(input, fx(input), wet)), opacity)
 struct EffectInstance {
+    std::string generated_path;
+    std::string generated_signature;
     EffectType type = EffectType::RgbSplit;
     uint64_t id = 0;               // stable identity (UI state, mod routes)
     std::vector<float> params;     // one per ParamDesc, same order
@@ -202,10 +205,10 @@ struct EffectInstance {
     float opacity = 1.0f;
     BlendMode blend = BlendMode::Normal;
     bool bypass = false;
-    // If any effect in the stack solos, only soloed effects run.
+    // Active solo effects bypass other effects in the look.
     bool solo = false;
     uint64_t seed = 0;
-    uint64_t group_id = 0;         // 0 = ungrouped; else a Layer group
+    uint64_t group_id = 0;         // 0 = ungrouped; else a look-owned group
     // Only the Text effect reads this string.
     std::string text;
     // Node-canvas position. (0,0) = unplaced. The renderer ignores it.

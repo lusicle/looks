@@ -25,15 +25,14 @@ bool param_randomizable(const ParamDesc& desc) {
 namespace {
 
 void randomize_one(Document& doc, UndoStack& undo, uint64_t look,
-                   size_t layer_index, size_t effect_index, float intensity,
+                   uint64_t effect_id, float intensity,
                    uint64_t rng_seed) {
     // A stale id must not edit the fallback look: check before doc.look().
     const Look* guard = doc.find_look(look);
-    if (!guard || layer_index >= guard->layers.size() ||
-        effect_index >= guard->layers[layer_index].stack.size())
-        return;
-    const EffectInstance& fx =
-        doc.look(look).layers[layer_index].stack[effect_index];
+    if (!guard) return;
+    const EffectInstance* effect = find_effect(*guard, effect_id);
+    if (!effect) return;
+    const EffectInstance& fx = *effect;
     const EffectInfo& info = effect_info(fx.type);
     for (uint32_t p = 0; p < info.param_count; ++p) {
         const ParamDesc& desc = info.params[p];
@@ -44,7 +43,7 @@ void randomize_one(Document& doc, UndoStack& undo, uint64_t look,
         const float cur = fx.params[p];
         const float next = cur + (target - cur) * intensity;
         if (next == cur) continue;
-        undo.execute(doc, set_param_command(look, layer_index, effect_index,
+        undo.execute(doc, set_param_command(look, effect_id,
                                             static_cast<int>(p), next));
     }
 }
@@ -52,22 +51,22 @@ void randomize_one(Document& doc, UndoStack& undo, uint64_t look,
 }  // namespace
 
 void randomize_effect(Document& doc, UndoStack& undo, uint64_t look,
-                      size_t layer_index, size_t effect_index,
+                      uint64_t effect_id,
                       float intensity, uint64_t rng_seed) {
     undo.begin_group("Randomize Effect");
-    randomize_one(doc, undo, look, layer_index, effect_index, intensity,
+    randomize_one(doc, undo, look, effect_id, intensity,
                   rng_seed);
     undo.end_group();
 }
 
-void randomize_stack(Document& doc, UndoStack& undo, uint64_t look,
-                     size_t layer_index, float intensity, uint64_t rng_seed) {
+void randomize_look(Document& doc, UndoStack& undo, uint64_t look,
+                     float intensity, uint64_t rng_seed) {
     const Look* guard = doc.find_look(look);
-    if (!guard || layer_index >= guard->layers.size()) return;
-    undo.begin_group("Randomize Stack");
-    const size_t n = doc.look(look).layers[layer_index].stack.size();
+    if (!guard) return;
+    undo.begin_group("Randomize Look");
+    const size_t n = doc.look(look).effects.size();
     for (size_t i = 0; i < n; ++i)
-        randomize_one(doc, undo, look, layer_index, i, intensity, rng_seed);
+        randomize_one(doc, undo, look, guard->effects[i].id, intensity, rng_seed);
     undo.end_group();
 }
 

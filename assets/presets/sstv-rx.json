@@ -1,10 +1,12 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "sstv rx",
   "tags": [
     "signal"
   ],
   "group": {
+    "face_out": 4,
+    "inputs": [101],
     "id": 100,
     "name": "sstv rx",
     "folded": true,
@@ -96,5 +98,11 @@
       "seed": 0,
       "group": 100
     }
+  ],
+  "links": [
+    {"from": 3, "to": 1, "port": 0},
+    {"from": 1, "to": 2, "port": 0},
+    {"from": 2, "to": 4, "port": 0},
+    {"from": 101, "to": 3, "port": 0}
   ]
 }

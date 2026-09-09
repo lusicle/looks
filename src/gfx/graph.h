@@ -11,33 +11,35 @@
 
 namespace looks::gfx {
 
-// A source card taps on its layer id with this bit; other cards use a bare id.
+// A source card taps on its source id with this bit; other cards use a bare id.
 inline constexpr uint64_t kThumbSourceBit = 1ull << 62;
 
 struct GraphNode {
     enum class Kind : uint8_t {
         Source,        // decode pool feeds it under this node's key
-        Generator,     // layer source; layer_index -1 = premultiplied zero
-        LayerTransform,// pre-stack crop/flip/scale/rotate
+        Generator,     // source_index -1 = premultiplied zero
+        LayerTransform,// source crop/flip/scale/rotate
         Effect,
         Flow,          // motion vectors; the engine feeds the planes
         MatteExtract,  // port-1 matte: luma of the wired image
         MatteApply,    // inputs: dry, fx, matte
         LayerBlend,    // inputs: below, over
-                       // layer_index >= 0 = look layer; -1 = sequence lane
         GroupMix,      // inputs: dry, face
-                       // wet/opacity: layers[layer_index].groups[effect_index]
+                       // wet/opacity: look.groups[effect_index]
         Crossfade,
         Canvas,
     };
     Kind kind = Kind::Source;
-    int layer_index = -1;
-    int effect_index = -1;     // stack index within the layer
+    int source_index = -1;
+    int effect_index = -1;     // look effect index; GroupMix uses a group index
     int pass_index = 0;
+    doc::BlendMode blend = doc::BlendMode::Normal;
+    uint64_t media_asset = 0;
+    double media_frame = 0;
     std::vector<int> inputs;   // upstream node indices
-    // instances index; layer/effect indices address that instance's look.
+    // Source and effect indices address the instance's look.
     int instance = 0;
-    // hash(instance path, layer or effect id); Source folds the asset in.
+    // hash(instance path, source or effect id); Source folds the asset in.
     // Engine history and decoded planes key on this; never fold placement ids.
     uint64_t key = 0;
     double canvas_w = 0, canvas_h = 0;
@@ -80,9 +82,11 @@ struct RenderGraph {
     // Selected block's lane image before its Motion, root sequence only.
     // UI-only: rendered pixels never depend on the measurement.
     int measure = -1;
-    // The composite with every effect stack stripped; -1 unless with_before.
+    // The composite with all effects bypassed; -1 unless with_before.
     int before = -1;
     bool valid = false;        // false: cycle or empty
+    uint64_t input_target = 0;
+    int target_input = -1;
 };
 
 struct ImageMap {
@@ -117,7 +121,11 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
                           uint32_t frame, uint64_t preview_node = 0,
                           uint64_t preview_layer = 0,
                           uint64_t measure_placement = 0,
-                          bool with_before = false);
+                          bool with_before = false, uint64_t input_target = 0);
+
+uint32_t mode_input_length(const doc::Document& doc, uint64_t look_id, uint64_t effect_id);
+std::vector<uint32_t> mode_sample_frames(uint32_t length, uint32_t samples);
+std::string mode_signature(const doc::Document& doc, uint64_t look, uint64_t effect);
 
 // All target sizing must go through this function; a mismatch drops frames.
 inline uint32_t even_down(uint32_t v, uint32_t div) {

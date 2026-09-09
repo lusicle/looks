@@ -71,7 +71,10 @@ public:
                      uint64_t preview_node = 0,
                      uint64_t preview_layer = 0,
                      uint64_t measure_placement = 0,
-                     bool cache_store = true);
+                     bool cache_store = true, uint64_t input_target = 0);
+
+    bool copy_resources_to(Engine& other) const;
+    void reset_effect_state();
 
     // Alpha bounds as a canvas-fraction rect {x, y, w, h}.
     // Valid only after the submission that recorded it has fenced.
@@ -80,6 +83,7 @@ public:
     bool measure_recorded() const;
 
     RenderCache& cache() { return cache_; }
+    void clear_generated_images() { mode_images_.clear(); }
 
     VkSampler linear_sampler() const { return linear_sampler_; }
     DescriptorArena& arena() { return arena_; }
@@ -137,6 +141,18 @@ public:
                             GpuImage* src, uint32_t cell);
 
 private:
+    struct ModeImage {
+        std::string path;
+        std::unique_ptr<GpuImage> image;
+    };
+    std::unordered_map<uint64_t, ModeImage> mode_images_;
+    struct GlyphData {
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0, height = 0, cols = 0, rows = 0;
+        float tile = 0;
+        bool color = false;
+    };
+    GlyphData glyph_data_[3];
     // Internal submissions land here to order before the caller's submit.
     VkQueue submit_queue_ = VK_NULL_HANDLE;
 
@@ -319,7 +335,7 @@ private:
     std::unordered_map<uint64_t, RampSlot> ramp_state_;
     const GpuImage* ensure_gradient_ramp(VkCommandBuffer rec,
                                          StagingBuffer& staging,
-                                         const doc::Layer& layer);
+                                         const doc::Source& layer);
     std::shared_ptr<const PinPlaneMap> pin_planes_;
 
     std::unique_ptr<GpuImage> noise_lut_;

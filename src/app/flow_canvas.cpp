@@ -76,7 +76,7 @@ void hit_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (!node.clip.empty()) box = box.intersect(node.clip);
         frame.ctx.add_hit(box, frame.ctx.acquire_widget_id(&st.slider_state.edit_state));
     }
-    st.menu_up = st.ctx_open || st.port_menu_open || st.dd_open;
+    st.menu_up = st.ctx_open || st.dd_open;
     if (st.menu_up)
         frame.ctx.push_overlay(node.rect,
                                frame.ctx.acquire_widget_id(&st.menu_up),
@@ -628,50 +628,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         if (!st.ctx_dd.open) st.ctx_open = false;
     }
 
-    auto port_feed_count = [&]() -> size_t {
-        size_t feeds = 0;
-        for (size_t w = 0; w < g.wire_count; ++w)
-            if (!g.wires[w].data && g.wires[w].to == st.port_menu_node &&
-                g.wires[w].to_port == st.port_menu_port)
-                ++feeds;
-        return feeds;
-    };
-    auto port_menu_rect = [&](size_t feeds) -> Rect {
-        return {st.port_menu_anchor.x, st.port_menu_anchor.y, 200.0f,
-                static_cast<float>(feeds) * 20.0f + 8.0f};
-    };
-    if (st.port_menu_open) {
-        const size_t feeds = port_feed_count();
-        if (feeds < 2) st.port_menu_open = false;
-        if (st.port_menu_open && frame.input.left_pressed() && menu_owns) {
-            const Rect mr = port_menu_rect(feeds);
-            if (mr.contains(mouse)) {
-                const int row =
-                    static_cast<int>((mouse.y - (mr.y + 4.0f)) / 20.0f);
-                if (row >= 0 && row < static_cast<int>(feeds)) {
-                    const int index =
-                        static_cast<int>(feeds) - 1 - row;
-                    if (mouse.x >= mr.right() - 20.0f) {
-                        out.port_reorder = true;
-                        out.reorder_node = st.port_menu_node;
-                        out.reorder_port = st.port_menu_port;
-                        out.reorder_index = index;
-                        out.reorder_delta = -1;
-                    } else if (mouse.x >= mr.right() - 40.0f) {
-                        out.port_reorder = true;
-                        out.reorder_node = st.port_menu_node;
-                        out.reorder_port = st.port_menu_port;
-                        out.reorder_index = index;
-                        out.reorder_delta = 1;
-                    }
-                }
-            } else {
-                st.port_menu_open = false;
-            }
-        }
-    }
-
-    // Row pointers live one frame: resolve the open row again each frame.
+     // Row pointers live one frame: resolve the open row again each frame.
     const Node* dd_node_p = nullptr;
     const ParamRow* dd_row_p = nullptr;
     if (st.dd_open) {
@@ -774,7 +731,8 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
                         ++feeds;
                 const bool second = frame.ctx.press_is_double(
                     nd.id * 31ull + port + 1ull);
-                if (feeds >= 2 && second) {
+                if (feeds >= 1 && second) {
+                    st.feed_scroll.offset = 0;
                     st.port_menu_open = true;
                     st.port_menu_anchor = mouse;
                     st.port_menu_node = nd.id;
@@ -1939,54 +1897,7 @@ void draw_canvas(ui::LayoutNode& node, ui::LayoutFrame& frame) {
         frame.ctx.set_popup(req);
     }
 
-    if (st.port_menu_open) {
-        const size_t feeds = port_feed_count();
-        const Rect mr = port_menu_rect(feeds);
-        ui::draw_popup_chrome(canvas, theme, mr);
-        size_t seen = 0;
-        for (size_t w = 0; w < g.wire_count; ++w) {
-            const Wire& wr = g.wires[w];
-            if (wr.data || wr.to != st.port_menu_node ||
-                wr.to_port != st.port_menu_port)
-                continue;
-            // The feed index counts from the bottom, so mirror the row.
-            const size_t row = feeds - 1 - seen;
-            const float ry = mr.y + 4.0f + static_cast<float>(row) * 20.0f;
-            const char* title = "?";
-            char exit_title[16];
-            for (size_t i = 0; i < g.node_count; ++i)
-                if (g.nodes[i].id == wr.from) {
-                    if (g.nodes[i].exit_rows > 0) {
-                        std::snprintf(exit_title, sizeof(exit_title),
-                                      "in %u", wr.from_port + 1);
-                        title = exit_title;
-                    } else {
-                        title = g.nodes[i].title;
-                    }
-                }
-            ui::probe_add("stack:" + std::string(title),
-                          {mr.x, ry, mr.w, 20.0f});
-            const bool hot = popup_row(mr, ry);
-            ui::draw_text(canvas, frame.font, title,
-                          {mr.x + 10.0f, ry + 4.0f}, 11.0f,
-                          hot ? theme.text : theme.text_dim);
-            const bool can_up = seen + 1 < feeds;
-            const bool can_dn = seen > 0;
-            ui::draw_icon_glyph(canvas, frame.font, ui::Icon::Up,
-                                {mr.right() - 30.0f, ry + 10.0f},
-                                can_up ? theme.text_dim
-                                       : theme.text_disabled,
-                                11.0f);
-            ui::draw_icon_glyph(canvas, frame.font, ui::Icon::Down,
-                                {mr.right() - 10.0f, ry + 10.0f},
-                                can_dn ? theme.text_dim
-                                       : theme.text_disabled,
-                                11.0f);
-            ++seen;
-        }
-    }
-
-    if (dd_row_p && st.dd_state.open) {
+     if (dd_row_p && st.dd_state.open) {
         const int n = dd_row_p->option_count;
         st.dd_rect = ui::list_popup_rect(st.dd_field,
                                          std::max(st.dd_field.w, 110.0f),
@@ -2124,7 +2035,81 @@ ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,
     node->draw_fn = draw_canvas;
     node->hit_fn = hit_canvas;
     node->debug_name = "flow_canvas";
-    return node;
+    if (!state->port_menu_open) return node;
+    std::vector<const Wire*> feeds;
+    for (size_t i = 0; i < graph->wire_count; ++i) {
+        const auto& wire = graph->wires[i];
+        if (!wire.data && wire.to == state->port_menu_node && wire.to_port == state->port_menu_port)
+            feeds.push_back(&wire);
+    }
+    if (feeds.empty()) {
+        state->port_menu_open = false;
+        return node;
+    }
+    const auto& theme = ui::active_theme();
+    static const char* modes[] = {"normal", "add", "multiply", "screen", "difference"};
+    out->feed_edit_count = feeds.size();
+    out->feed_edits = arena.alloc<Output::FeedEdit>(feeds.size());
+    std::vector<ui::LayoutNode*> rows;
+    bool dropdown_open = false;
+    for (size_t i = feeds.size(); i-- > 0;) {
+        const auto& wire = *feeds[i];
+        auto& edit = out->feed_edits[i];
+        edit = {wire.link_from, wire.link_to, wire.link_port, -1, false, false};
+        auto& buttons = state->feed_states[{wire.link_from, wire.link_to, wire.link_port}];
+        dropdown_open |= buttons.blend.open;
+        std::string title = "input";
+        for (size_t j = 0; j < graph->node_count; ++j)
+            if (graph->nodes[j].id == wire.from) {
+                title = graph->nodes[j].exit_rows > 0
+                    ? "in " + std::to_string(wire.from_port + 1) : graph->nodes[j].title;
+                break;
+            }
+        auto* label = ui::Label(arena, title);
+        label->width = ui::SizeSpec::fill();
+        ui::ButtonOpts up, down;
+        up.width = down.width = ui::SizeSpec::fixed(theme.control_height);
+        up.disabled = i + 1 >= feeds.size();
+        down.disabled = i == 0;
+        up.tooltip = "move input up";
+        down.tooltip = "move input down";
+        ui::StackOpts row;
+        row.gap = theme.panel_gap;
+        row.cross_align = ui::AlignMode::Center;
+        auto* content = ui::HStack(arena, row, {
+            label,
+            ui::Dropdown(arena, modes, 5, wire.blend, &buttons.blend,
+                &edit.blend, ui::SizeSpec::fixed(120), "input blend mode"),
+            ui::IconButton(arena, ui::Icon::Up, &buttons.up, &edit.up, up),
+            ui::IconButton(arena, ui::Icon::Down, &buttons.down, &edit.down, down)});
+        const auto probe = "stack:" + title;
+        content->debug_name = arena.dup(probe.data(), probe.size());
+        content->hit_fn = [](ui::LayoutNode& row, ui::LayoutFrame&) {
+            ui::probe_add(row.debug_name, row.rect);
+        };
+        rows.push_back(content);
+    }
+    ui::StackOpts column;
+    column.gap = theme.panel_gap;
+    column.width = ui::SizeSpec::fill();
+    auto* content = ui::VStackDyn(arena, column, rows);
+    if (feeds.size() > 8)
+        content = ui::ScrollAreaV(arena, &state->feed_scroll, content,
+            ui::SizeSpec::fixed(360), ui::SizeSpec::fixed(8 * theme.control_height + 7 * theme.panel_gap));
+    else content->width = ui::SizeSpec::fixed(360);
+    ui::PanelOpts panel;
+    panel.padding = ui::Edges::all(theme.panel_gap);
+    panel.probe = "layering_popup";
+    ui::OverlayOpts overlay;
+    overlay.anchor = state->port_menu_anchor;
+    overlay.exclusive = true;
+    overlay.id = &state->port_menu_open;
+    overlay.out_pressed_outside = dropdown_open ? nullptr : &out->close_port_menu;
+    auto* root = ui::ZStack(arena, {node, ui::Overlay(arena, overlay,
+        ui::Panel(arena, content, panel))});
+    root->width = ui::SizeSpec::fill();
+    root->height = ui::SizeSpec::fill();
+    return root;
 }
 
 }  // namespace looks::flow

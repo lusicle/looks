@@ -54,12 +54,6 @@ std::unique_ptr<Command> set_bin_props_command(uint64_t bin,
 std::unique_ptr<Command> set_entity_bin_command(uint64_t entity_id,
                                                 uint64_t bin);
 
-// A link that crosses the selection boundary is dropped. Undo restores it.
-// Returns null if the selection is empty or makes the parent look empty.
-std::unique_ptr<Command> nest_layers_command(
-    Document& doc, uint64_t look, const std::vector<uint64_t>& layer_ids,
-    std::string name);
-
 // The fork is one level deep: nested references in the copy stay shared.
 std::unique_ptr<Command> make_unique_command(Document& doc,
                                              uint64_t sequence,

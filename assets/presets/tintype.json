@@ -1,10 +1,12 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "tintype",
   "tags": [
     "film"
   ],
   "group": {
+    "face_out": 1,
+    "inputs": [101],
     "id": 100,
     "name": "tintype",
     "folded": true,
@@ -79,5 +81,10 @@
       "seed": 0,
       "group": 100
     }
+  ],
+  "links": [
+    {"from": 3, "to": 2, "port": 0},
+    {"from": 2, "to": 1, "port": 0},
+    {"from": 101, "to": 3, "port": 0}
   ]
 }

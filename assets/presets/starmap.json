@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "starmap",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 1
       }
     ],
-    "face_in": 145,
+    "inputs": [174],
     "face_out": 149
   },
   "effects": [
@@ -115,5 +115,12 @@
       "seed": 0,
       "group": 173
     }
+  ],
+  "links": [
+    {"from": 145, "to": 146, "port": 0},
+    {"from": 146, "to": 147, "port": 0},
+    {"from": 147, "to": 148, "port": 0},
+    {"from": 148, "to": 149, "port": 0},
+    {"from": 174, "to": 145, "port": 0}
   ]
 }

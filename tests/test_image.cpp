@@ -1,4 +1,5 @@
 #include "util/image.h"
+#include "util/linear_image.h"
 #include "util/inflate.h"
 #include "util/file.h"
 #include "media/import.h"
@@ -10,6 +11,25 @@
 #include "test_framework.h"
 
 using namespace looks;
+
+TEST(linear_frame_preserves_hdr_alpha_and_checks_payload) {
+    const auto root = std::filesystem::temp_directory_path() / "looks_linear_frame_test";
+    std::filesystem::create_directories(root);
+    const auto path = root / "frame.lrgba";
+    LinearImage original{2, 1, {0x4000, 0x3c00, 0x3800, 0x3800, 0, 0, 0, 0}};
+    CHECK(write_linear_image(path, original));
+    LinearImage restored;
+    CHECK(load_linear_image(path, restored));
+    CHECK_EQ(restored.width, 2u);
+    CHECK_EQ(restored.height, 1u);
+    CHECK(restored.pixels == original.pixels);
+    auto bytes = read_file_bytes(path);
+    CHECK(bytes.has_value());
+    bytes->pop_back();
+    const auto truncated = root / "truncated.lrgba";
+    CHECK(write_file_bytes(truncated, bytes->data(), bytes->size()));
+    CHECK(!load_linear_image(truncated, restored));
+}
 
 TEST(gif_disposal_timing_and_lossless_cache) {
     std::vector<uint8_t> gif{'G','I','F','8','9','a',2,0,1,0,0x81,3,0,

@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "one-bit intel",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 0
       }
     ],
-    "face_in": 104,
+    "inputs": [128],
     "face_out": 124
   },
   "effects": [
@@ -143,5 +143,13 @@
       "node_x": 1680,
       "node_y": 40
     }
+  ],
+  "links": [
+    {"from": 104, "to": 105, "port": 0},
+    {"from": 105, "to": 106, "port": 0},
+    {"from": 106, "to": 107, "port": 0},
+    {"from": 107, "to": 108, "port": 0},
+    {"from": 108, "to": 124, "port": 0},
+    {"from": 128, "to": 104, "port": 0}
   ]
 }

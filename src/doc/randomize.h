@@ -12,9 +12,9 @@ namespace looks::doc {
 bool param_randomizable(const ParamDesc& desc);
 
 void randomize_effect(Document& doc, UndoStack& undo, uint64_t look,
-                      size_t layer_index, size_t effect_index,
+                      uint64_t effect_id,
                       float intensity, uint64_t rng_seed);
-void randomize_stack(Document& doc, UndoStack& undo, uint64_t look,
-                     size_t layer_index, float intensity, uint64_t rng_seed);
+void randomize_look(Document& doc, UndoStack& undo, uint64_t look,
+                     float intensity, uint64_t rng_seed);
 
 }  // namespace looks::doc

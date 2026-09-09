@@ -9,8 +9,16 @@
 
 namespace looks::doc {
 
-std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
-                                           size_t effect_index,
+struct NodeReferenceState {
+    std::vector<KeyframeLane> lanes;
+    std::vector<ModRoute> routes;
+    Snapshot snapshots[3];
+    std::vector<uint64_t> media_users;
+    void detach(Look& look, uint64_t node);
+    void restore(Look& look, uint64_t node) const;
+};
+
+std::unique_ptr<Command> set_param_command(uint64_t look, uint64_t effect_id,
                                            int param_index, float new_value);
 // Base writes and lane writes to one effect land in one undo step.
 // A lane write replaces the keys only. Loop and mute stay as they are.
@@ -19,46 +27,41 @@ struct ParamWrite {
     float value;
 };
 std::unique_ptr<Command> set_param_gesture_command(
-    uint64_t look, size_t layer_index, size_t effect_index,
+    uint64_t look, uint64_t effect_id,
     std::vector<ParamWrite> base_writes,
     std::vector<KeyframeLane> lane_writes);
-std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
-                                            size_t effect_index, bool bypass);
+std::unique_ptr<Command> set_bypass_command(uint64_t look, uint64_t effect_id, bool bypass);
 std::unique_ptr<Command> set_effect_blend_command(uint64_t look,
-                                                  size_t layer_index,
-                                                  size_t effect_index,
+                                                  uint64_t effect_id,
                                                   BlendMode blend);
 std::unique_ptr<Command> set_effect_text_command(uint64_t look,
-                                                 size_t layer_index,
-                                                 size_t effect_index,
+                                                 uint64_t effect_id,
                                                  std::string text);
-// A soloed effect mutes the other effects in its stack.
-std::unique_ptr<Command> set_solo_command(uint64_t look, size_t layer_index,
-                                          size_t effect_index, bool solo);
+std::unique_ptr<Command> set_solo_command(uint64_t look, uint64_t effect_id, bool solo);
+std::unique_ptr<Command> set_generated_frame_command(uint64_t look, uint64_t effect,
+    std::string path, std::string signature);
 // The instance must have its id already, from make_effect.
-std::unique_ptr<Command> add_effect_command(uint64_t look, size_t layer_index,
-                                            EffectInstance instance,
+std::unique_ptr<Command> add_effect_command(uint64_t look, EffectInstance instance,
                                             size_t insert_index);
 std::unique_ptr<Command> remove_effect_command(uint64_t look,
-                                               size_t layer_index,
-                                               size_t effect_index);
-std::unique_ptr<Command> move_effect_command(uint64_t look, size_t layer_index,
-                                             size_t from_index,
-                                             size_t to_index);
+                                               uint64_t effect_id);
+std::unique_ptr<Command> move_effect_command(uint64_t look, uint64_t effect_id,
+                                             uint64_t other_id);
+uint64_t effect_chain_neighbor(const Look& look, uint64_t effect_id, int direction);
 
 // Node positions are UI state. The renderer does not read them.
 // Moves of the same node coalesce into one undo step.
 enum class NodeRef : uint32_t {
-    Effect, Layer, Route, Output, Frame, Group,
+    Effect, Source, Route, Output, Frame, Group,
     GroupIn, GroupOut,   // boundary nodes: the id is the group id
 };
 std::unique_ptr<Command> set_node_pos_command(uint64_t look, NodeRef kind,
                                               uint64_t id, float x, float y);
 
-// An empty link table means implicit stack-order wiring. An edit freezes it.
 // The caller must check link_would_cycle first: these apply unconditionally.
 std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link);
 std::unique_ptr<Command> disconnect_command(uint64_t look, NodeLink link);
+std::unique_ptr<Command> set_link_blend_command(uint64_t look, NodeLink link, BlendMode blend);
 // new_link takes the position of old_link, thus stacking order stays.
 std::unique_ptr<Command> reconnect_command(uint64_t look, NodeLink old_link,
                                            NodeLink new_link);
@@ -66,8 +69,6 @@ std::unique_ptr<Command> reconnect_command(uint64_t look, NodeLink old_link,
 std::unique_ptr<Command> move_port_link_command(uint64_t look, uint64_t to,
                                                 uint32_t to_port,
                                                 size_t index, int delta);
-// Run this before any node add, or stack-order wiring chains the new node.
-std::unique_ptr<Command> materialize_links_command(uint64_t look);
 
 bool link_would_cycle(const Look& look, uint64_t from, uint64_t to);
 

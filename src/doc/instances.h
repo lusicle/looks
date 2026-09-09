@@ -150,6 +150,8 @@ struct AudioChain {
 AudioChain resolve_audio_chain(const Document& doc, const Look& look,
                                uint64_t node);
 
+std::vector<uint64_t> upstream_video_assets(const Document& doc, uint64_t look, uint64_t node);
+
 inline bool media_active(const MediaInstance& c, double root_frame) {
     if (root_frame < c.t_in || root_frame >= c.t_out) return false;
     if (!c.slide_count) return true;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <tuple>
 
 #include "ui/layout.h"
 #include "ui/widgets.h"
@@ -118,6 +120,9 @@ struct Wire {
     // -1 means no row: the wire lands on the card edge.
     int to_row = -1;
     uint32_t from_port = 0;
+    uint64_t link_from = 0, link_to = 0;
+    uint32_t link_port = 0;
+    int blend = 0;
 };
 
 struct FrameBox {
@@ -214,10 +219,25 @@ struct CanvasState {
     Vec2 port_menu_anchor{};
     uint64_t port_menu_node = 0;
     uint32_t port_menu_port = 0;
+    struct FeedState {
+        ui::DropdownState blend;
+        ui::ButtonState up, down;
+    };
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t>, FeedState> feed_states;
+    ui::ScrollState feed_scroll;
     bool drag_alt = false;
 };
 
 struct Output {
+    struct FeedEdit {
+        uint64_t from = 0, to = 0;
+        uint32_t port = 0;
+        int blend = -1;
+        bool up = false, down = false;
+    };
+    FeedEdit* feed_edits = nullptr;
+    size_t feed_edit_count = 0;
+    bool close_port_menu = false;
     uint64_t clicked = 0;
     bool clicked_shift = false;
     bool clicked_empty = false;
@@ -271,12 +291,6 @@ struct Output {
     uint64_t splice_wire_from = 0, splice_wire_to = 0;
     uint32_t splice_wire_port = 0;
     bool moved_alt = false;
-    // reorder_index counts from the bottom. A delta of +1 moves to the top.
-    bool port_reorder = false;
-    uint64_t reorder_node = 0;
-    uint32_t reorder_port = 0;
-    int reorder_index = -1;
-    int reorder_delta = 0;
 };
 
 ui::LayoutNode* FlowCanvas(ui::LayoutArena& arena, const Graph* graph,

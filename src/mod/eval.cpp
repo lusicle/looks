@@ -462,7 +462,7 @@ float eval_lane(const doc::KeyframeLane& lane, double frame) {
     if (frame >= keys.back().frame) return keys.back().value;
 
     size_t hi = 1;
-    while (hi < keys.size() && keys[hi].frame < frame) ++hi;
+    while (hi < keys.size() && keys[hi].frame <= frame) ++hi;
     const doc::Keyframe& k0 = keys[hi - 1];
     const doc::Keyframe& k1 = keys[hi];
     if (k0.hold) return k0.value;
@@ -526,9 +526,9 @@ void resolve_look(const doc::Look& look, doc::Look& out,
                         ea.opacity + (eb->opacity - ea.opacity) * pos;
                     continue;
                 }
-                size_t layer = 0, index = 0;
-                if (!find_effect(out, ea.effect_id, &layer, &index)) continue;
-                doc::EffectInstance& fx = out.layers[layer].stack[index];
+                size_t index = 0;
+                if (!find_effect(out, ea.effect_id, &index)) continue;
+                doc::EffectInstance& fx = out.effects[index];
                 const size_t np =
                     std::min({fx.params.size(), ea.params.size(),
                               eb->params.size()});
@@ -541,15 +541,15 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         }
     }
 
-    // Layer targets: keys carry kLayerParamBit + the layer id.
+    // Source targets: keys carry kSourceParamBit + the layer id.
     auto layer_slot = [&](const doc::ParamKey& key, float* min_v,
                           float* max_v) -> float* {
-        if (!(key.effect_id & doc::kLayerParamBit)) return nullptr;
-        const uint64_t id = key.effect_id & ~doc::kLayerParamBit;
-        for (doc::Layer& l : out.layers)
+        if (!(key.effect_id & doc::kSourceParamBit)) return nullptr;
+        const uint64_t id = key.effect_id & ~doc::kSourceParamBit;
+        for (doc::Source& l : out.sources)
             if (l.id == id) {
-                layer_param_range(key.param_index, min_v, max_v);
-                return layer_param_slot(l, key.param_index);
+                source_param_range(key.param_index, min_v, max_v);
+                return source_param_slot(l, key.param_index);
             }
         return nullptr;
     };
@@ -559,7 +559,7 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         const uint64_t id = key.effect_id & ~doc::kStopParamBit;
         *min_v = 0.0f;
         *max_v = 1.0f;
-        for (doc::Layer& l : out.layers)
+        for (doc::Source& l : out.sources)
             for (doc::GradientStop& s : l.stops) {
                 if (s.id != id) continue;
                 if (key.param_index == 0) return &s.t;
@@ -590,10 +590,10 @@ void resolve_look(const doc::Look& look, doc::Look& out,
         if (float* s = layer_slot(target, min_v, max_v)) return s;
         if (float* s = group_slot(target, min_v, max_v)) return s;
         if (float* s = stop_slot(target, min_v, max_v)) return s;
-        size_t layer = 0, index = 0;
-        if (!find_effect(out, target.effect_id, &layer, &index))
+        size_t index = 0;
+        if (!find_effect(out, target.effect_id, &index))
             return nullptr;
-        doc::EffectInstance& fx = out.layers[layer].stack[index];
+        doc::EffectInstance& fx = out.effects[index];
         float* s = param_slot(fx, target.param_index);
         if (s) param_range(fx.type, target.param_index, min_v, max_v);
         return s;
@@ -620,11 +620,9 @@ void resolve_look(const doc::Look& look, doc::Look& out,
     }
 
     // Discrete params snap after all drivers; fractional counts alias kernels.
-    for (doc::Layer& snap_layer : out.layers)
-        for (doc::EffectInstance& fx : snap_layer.stack)
-            for (size_t p = 0; p < fx.params.size(); ++p)
-                if (param_discrete(fx.type, static_cast<int>(p)))
-                    fx.params[p] = std::round(fx.params[p]);
+    for (doc::EffectInstance& fx : out.effects)
+        for (size_t p = 0; p < fx.params.size(); ++p)
+            if (param_discrete(fx.type, static_cast<int>(p))) fx.params[p] = std::round(fx.params[p]);
 }
 
 doc::Document resolve(const doc::Document& doc, uint32_t frame_index,

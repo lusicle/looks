@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "thermal tape",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 0
       }
     ],
-    "face_in": 165,
+    "inputs": [176],
     "face_out": 163
   },
   "effects": [
@@ -137,5 +137,13 @@
       "seed": 0,
       "group": 175
     }
+  ],
+  "links": [
+    {"from": 165, "to": 159, "port": 0},
+    {"from": 159, "to": 160, "port": 0},
+    {"from": 160, "to": 161, "port": 0},
+    {"from": 161, "to": 162, "port": 0},
+    {"from": 162, "to": 163, "port": 0},
+    {"from": 176, "to": 165, "port": 0}
   ]
 }

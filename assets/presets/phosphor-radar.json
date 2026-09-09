@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "phosphor radar",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 0
       }
     ],
-    "face_in": 100,
+    "inputs": [127],
     "face_out": 123
   },
   "effects": [
@@ -124,5 +124,12 @@
       "node_x": 1410,
       "node_y": 40
     }
+  ],
+  "links": [
+    {"from": 100, "to": 101, "port": 0},
+    {"from": 101, "to": 102, "port": 0},
+    {"from": 102, "to": 103, "port": 0},
+    {"from": 103, "to": 123, "port": 0},
+    {"from": 127, "to": 100, "port": 0}
   ]
 }

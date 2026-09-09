@@ -49,7 +49,7 @@ bool cache_file(const std::filesystem::path& path) {
     ext = ext.substr(0, ext.find('-'));
     const auto name = path.filename().string();
     return name == ".last_used" || name.rfind(".last_used-", 0) == 0 || ext == ".mez" || ext == ".pcm" ||
-        ext == ".thumbs" || ext == ".analysis" || ext == ".track" ||
+        ext == ".thumbs" || ext == ".analysis" || ext == ".track" || ext == ".lrgba" ||
         (ext == ".mp4" && path.stem().extension() == ".intra");
 }
 

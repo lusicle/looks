@@ -30,11 +30,11 @@ TEST(look_fresh_document_has_a_sequence_and_no_look) {
 TEST(look_fixture_ids_are_unique_across_kinds) {
     Document d = doc_with_look();
     CHECK_EQ(d.looks.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers.size(), size_t{1});
-    CHECK(doc::layer_is_media(d.looks[0].layers[0]));
+    CHECK_EQ(d.looks[0].sources.size(), size_t{1});
+    CHECK(doc::source_is_media(d.looks[0].sources[0]));
     // Ids are unique across kinds: one counter for everything.
     CHECK(d.looks[0].id != d.sequences[0].id);
-    CHECK(d.looks[0].id != d.looks[0].layers[0].id);
+    CHECK(d.looks[0].id != d.looks[0].sources[0].id);
 }
 
 TEST(look_add_remove_undo) {
@@ -62,9 +62,9 @@ TEST(source_delete_preserves_shared_effects_groups_and_undo) {
     Document d = doc_with_look();
     auto& look = d.looks[0];
     const auto look_id = look.id;
-    auto& layer = look.layers[0];
+    auto& layer = look.sources[0];
     const auto source_id = layer.id;
-    layer.source = doc::LayerSourceKind::Solid;
+    layer.source = doc::SourceKind::Solid;
     layer.visible = false;
     auto first = make_effect(d, EffectType::Blur);
     auto second = make_effect(d, EffectType::Blur);
@@ -72,29 +72,29 @@ TEST(source_delete_preserves_shared_effects_groups_and_undo) {
     group.id = d.next_effect_id++;
     group.name = "retained";
     first.group_id = second.group_id = group.id;
-    layer.stack = {first, second};
-    layer.groups = {group};
-    layer.stack[0].node_x = 123;
-    auto other = doc::make_layer(d, doc::LayerSourceKind::Solid);
-    look.layers.push_back(other);
+    look.effects = {first, second};
+    look.groups = {group};
+    look.effects[0].node_x = 123;
+    auto other = doc::make_source(d, doc::SourceKind::Solid);
+    look.sources.push_back(other);
     look.links = {{source_id, first.id, 0}, {other.id, first.id, 0},
                   {first.id, second.id, 0}, {second.id, 0, 0}};
     look.lanes.push_back({{first.id, 0}, {{0, 0.5f}}});
     const auto before = json::write(doc::doc_to_json(d), false);
     doc::UndoStack undo;
-    undo.execute(d, doc::remove_layer_command(look_id, 0));
-    CHECK(!doc::find_layer(look, source_id));
+    undo.execute(d, doc::remove_source_command(look_id, source_id));
+    CHECK(!doc::find_source(look, source_id));
     CHECK(doc::find_effect(look, first.id));
     CHECK(doc::find_effect(look, second.id));
     CHECK(doc::find_group(look, group.id));
-    CHECK_EQ(look.layers[0].stack[0].node_x, 123.0f);
-    CHECK(look.layers[0].visible);
+    CHECK_EQ(look.effects[0].node_x, 123.0f);
+    CHECK(look.sources[0].visible);
     CHECK_EQ(look.links.size(), size_t{3});
     CHECK_EQ(look.links[0].from, other.id);
     CHECK_EQ(look.lanes.size(), size_t{1});
     const auto saved = doc::doc_to_json(d);
     auto loaded = doc::doc_from_json(saved);
-    CHECK(!doc::find_layer(loaded.look(look_id), source_id));
+    CHECK(!doc::find_source(loaded.look(look_id), source_id));
     CHECK(doc::find_effect(loaded.look(look_id), first.id));
     CHECK(doc::find_group(loaded.look(look_id), group.id));
     undo.undo(d);
@@ -107,25 +107,27 @@ TEST(source_delete_preserves_shared_effects_groups_and_undo) {
 TEST(last_source_delete_keeps_effect_chain_without_auto_wiring) {
     Document d = doc_with_look();
     auto& look = d.looks[0];
-    const auto source_id = look.layers[0].id;
+    const auto source_id = look.sources[0].id;
     const auto first = make_effect(d, EffectType::Blur);
     const auto second = make_effect(d, EffectType::Blur);
-    look.layers[0].stack = {first, second};
+    look.effects = {first, second};
+    look.links = {{source_id, first.id, 0}, {first.id, second.id, 0}, {second.id, 0, 0}};
+    const auto links = look.links;
     doc::UndoStack undo;
-    undo.execute(d, doc::remove_layer_command(look.id, 0));
-    CHECK(!doc::find_layer(look, source_id));
+    undo.execute(d, doc::remove_source_command(look.id, source_id));
+    CHECK(!doc::find_source(look, source_id));
     CHECK_EQ(look.links.size(), size_t{2});
     CHECK_EQ(look.links[0].from, first.id);
     CHECK_EQ(look.links[0].to, second.id);
     CHECK_EQ(look.links[1].to, uint64_t{0});
     undo.undo(d);
+    CHECK_EQ(look.links.size(), links.size());
+    CHECK(doc::find_source(look, source_id));
+    look.effects.clear();
+    look.links = {{source_id, 0, 0}};
+    undo.execute(d, doc::remove_source_command(look.id, source_id));
+    CHECK(look.sources.empty());
     CHECK(look.links.empty());
-    CHECK(doc::find_layer(look, source_id));
-    look.layers[0].stack.clear();
-    undo.execute(d, doc::remove_layer_command(look.id, 0));
-    CHECK(look.layers.empty());
-    CHECK_EQ(look.links.size(), size_t{1});
-    CHECK(doc::link_is_tombstone(look.links[0]));
 }
 
 TEST(look_audio_split_toggle_undo) {
@@ -141,37 +143,39 @@ TEST(look_audio_split_toggle_undo) {
     CHECK(d.looks[0].audio_split);
 
     // Combining DROPS the audio wire; undo brings it back with the mode.
-    doc::ensure_links(d.looks[0]);
-    d.looks[0].links.push_back({d.looks[0].layers[0].id, 0, 1});
+    d.looks[0].links.push_back({d.looks[0].sources[0].id, 0, 1});
+    auto second = doc::make_source(d, doc::SourceKind::Solid);
+    d.looks[0].sources.push_back(second);
+    d.looks[0].links.insert(d.looks[0].links.begin(), {second.id, 0, 1});
+    const auto original_links = d.looks[0].links;
     const size_t wired = d.looks[0].links.size();
     undo.execute(d, doc::set_look_audio_split_command(id, false));
     CHECK(!d.looks[0].audio_split);
-    CHECK_EQ(d.looks[0].links.size(), wired - 1);
+    CHECK_EQ(d.looks[0].links.size(), wired - 2);
     for (const doc::NodeLink& l : d.looks[0].links)
         CHECK(!(l.to == 0 && l.to_port == 1));
     undo.undo(d);
     CHECK(d.looks[0].audio_split);
     CHECK_EQ(d.looks[0].links.size(), wired);
+    CHECK(d.looks[0].links == original_links);
 }
 
 TEST(look_disconnect_last_wire_stays_deleted) {
-    // An empty link table means synthesized wiring, so the delete seals it.
     Document d = doc_with_look();
-    d.looks[0].layers[0].asset = d.next_effect_id++;
+    d.looks[0].sources[0].asset = d.next_effect_id++;
     doc::UndoStack undo;
-    const uint64_t lid = d.looks[0].layers[0].id;
+    const uint64_t lid = d.looks[0].sources[0].id;
     undo.execute(d, doc::disconnect_command(d.looks[0].id, {lid, 0, 0}));
-    CHECK(!d.looks[0].links.empty());
+    CHECK(d.looks[0].links.empty());
     for (const doc::NodeLink& l : d.looks[0].links)
         CHECK(!(l.to == 0 && l.to_port == 0));
     undo.execute(d, doc::connect_command(d.looks[0].id, {lid, 0, 0}));
-    for (const doc::NodeLink& l : d.looks[0].links)
-        CHECK(!doc::link_is_tombstone(l));
+    CHECK_EQ(d.looks[0].links.size(), size_t{1});
     undo.undo(d);
     for (const doc::NodeLink& l : d.looks[0].links)
         CHECK(!(l.to == 0 && l.to_port == 0));
     undo.undo(d);
-    CHECK(d.looks[0].links.empty());
+    CHECK_EQ(d.looks[0].links.size(), size_t{1});
 }
 
 TEST(sequence_add_remove_undo) {
@@ -352,25 +356,22 @@ TEST(look_commands_stay_on_their_own_look) {
     Document d = doc_with_look();
     doc::UndoStack undo;
     doc::Look second = doc::make_look(d, "second");
-    doc::Layer l;
+    doc::Source l;
     l.id = d.next_effect_id++;
-    second.layers.push_back(std::move(l));
+    second.sources.push_back(std::move(l));
     const uint64_t second_id = second.id;
     undo.execute(d, doc::add_look_command(std::move(second)));
 
-    undo.execute(d, doc::add_effect_command(
-                        d.looks[0].id, 0,
-                        make_effect(d, EffectType::Vignette), 0));
-    undo.execute(d, doc::add_effect_command(
-                        second_id, 0, make_effect(d, EffectType::Grain), 0));
-    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{1});
-    CHECK_EQ(d.look(second_id).layers[0].stack.size(), size_t{1});
+    undo.execute(d, doc::add_effect_command(d.looks[0].id, make_effect(d, EffectType::Vignette), 0));
+    undo.execute(d, doc::add_effect_command(second_id, make_effect(d, EffectType::Grain), 0));
+    CHECK_EQ(d.looks[0].effects.size(), size_t{1});
+    CHECK_EQ(d.look(second_id).effects.size(), size_t{1});
 
     undo.undo(d);
-    CHECK_EQ(d.look(second_id).layers[0].stack.size(), size_t{0});
-    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{1});
+    CHECK_EQ(d.look(second_id).effects.size(), size_t{0});
+    CHECK_EQ(d.looks[0].effects.size(), size_t{1});
     undo.undo(d);
-    CHECK_EQ(d.looks[0].layers[0].stack.size(), size_t{0});
+    CHECK_EQ(d.looks[0].effects.size(), size_t{0});
 }
 
 TEST(look_placement_maps_local_to_source) {
@@ -416,17 +417,17 @@ TEST(look_still_duration_grows_and_regions_preserve_content) {
     still.frame_count = 300;
     still.still = true;
     d.assets.push_back(still);
-    d.looks[0].layers[0].asset = still.id;
+    d.looks[0].sources[0].asset = still.id;
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{300});
     doc::Asset video;
     video.id = d.next_effect_id++;
     video.frame_count = 480;
     video.fps = 24;
     d.assets.push_back(video);
-    doc::Layer layer = doc::make_layer(d, doc::LayerSourceKind::Media);
+    doc::Source layer = doc::make_source(d, doc::SourceKind::Media);
     layer.asset = video.id;
     doc::UndoStack undo;
-    undo.execute(d, doc::add_layer_command(target, layer, d.looks[0].layers.size()));
+    undo.execute(d, doc::add_source_command(target, layer, d.looks[0].sources.size()));
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{600});
     undo.execute(d, doc::set_look_region_command(target, 30, 450, 60, 120), true);
     undo.execute(d, doc::set_look_region_command(target, 45, 420, 60, 150), true);
@@ -459,20 +460,20 @@ TEST(look_duration_is_lockstep_content) {
     a.id = d.next_effect_id++;
     a.frame_count = 90;
     d.assets.push_back(a);
-    d.looks[0].layers[0].asset = a.id;
+    d.looks[0].sources[0].asset = a.id;
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{90});
     // Slip shortens what the media can play.
-    d.looks[0].layers[0].slip = 30;
+    d.looks[0].sources[0].slip = 30;
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{60});
     // A second, longer media extends the lockstep length.
-    doc::Layer l;
+    doc::Source l;
     l.id = d.next_effect_id++;
     doc::Asset b;
     b.id = d.next_effect_id++;
     b.frame_count = 200;
     d.assets.push_back(b);
     l.asset = b.id;
-    d.looks[0].layers.push_back(std::move(l));
+    d.looks[0].sources.push_back(std::move(l));
     CHECK_EQ(doc::look_duration(d, d.looks[0]), uint32_t{200});
     // An explicit duration wins over the derived one.
     d.looks[0].duration = 42;
@@ -497,7 +498,7 @@ struct SeqRig {
         a.frame_count = frames;
         d.assets.push_back(a);
         asset = a.id;
-        d.looks[0].layers[0].asset = asset;
+        d.looks[0].sources[0].asset = asset;
         look = d.looks[0].id;
         doc::Placement block;
         block.id = d.next_effect_id++;
@@ -611,41 +612,27 @@ TEST(sequence_remove_placement_takes_the_link_group) {
     CHECK_EQ(rig.d.root().audio[0].placements.size(), size_t{1});
 }
 
-TEST(look_nest_wraps_graph_selection_in_a_lockstep_ref) {
-    Document d = doc_with_look();
-    doc::UndoStack undo;
-    doc::Look& base = d.looks[0];
-    base.layers[0].asset = d.next_effect_id++;
-    doc::Layer solid;
-    solid.id = d.next_effect_id++;
-    solid.source = doc::LayerSourceKind::Solid;
-    base.layers.push_back(std::move(solid));
-    const uint64_t solid_id = base.layers.back().id;
-    const uint64_t media_id = base.layers[0].id;
-
-    auto cmd = doc::nest_layers_command(d, base.id, {solid_id}, "wrap");
-    CHECK(cmd != nullptr);
-    undo.execute(d, std::move(cmd));
-    CHECK_EQ(d.looks.size(), size_t{2});
-    CHECK_EQ(d.looks[0].layers.size(), size_t{2});
-    const doc::Layer& ref = d.looks[0].layers[1];
-    CHECK(ref.source == doc::LayerSourceKind::LookRef);
-    const doc::Look* nested = d.find_look(ref.target);
-    CHECK(nested != nullptr);
-    CHECK_EQ(nested->layers.size(), size_t{1});
-    CHECK(nested->layers[0].source == doc::LayerSourceKind::Solid);
-    CHECK_EQ(d.looks[0].layers[0].id, media_id);
-
-    undo.undo(d);
-    CHECK_EQ(d.looks.size(), size_t{1});
-    CHECK_EQ(d.looks[0].layers.size(), size_t{2});
-    CHECK_EQ(d.looks[0].layers[1].id, solid_id);
-}
-
 TEST(look_make_unique_forks_the_template) {
     SeqRig rig;
-    rig.d.looks[0].layers[0].stack.push_back(
+    rig.d.looks[0].effects.push_back(
         make_effect(rig.d, EffectType::Vignette));
+    auto& original = rig.d.looks[0];
+    doc::ValueNode value;
+    value.id = original.sources[0].id;
+    value.audio_src = original.sources[0].id;
+    rig.d.next_route_id = value.id + 1;
+    original.value_nodes.push_back(value);
+    doc::ValueNode dependent;
+    dependent.id = rig.d.next_route_id++;
+    dependent.in_a = value.id;
+    original.value_nodes.push_back(dependent);
+    doc::ModRoute route;
+    route.id = rig.d.next_route_id++;
+    route.node = value.id;
+    route.target = {original.effects[0].id, 0};
+    original.mod_routes.push_back(route);
+    original.links = {{original.sources[0].id, original.effects[0].id, 0},
+        {original.effects[0].id, 0, 0}};
     doc::Placement dup;
     dup.id = rig.d.next_effect_id++;
     dup.target = rig.look;
@@ -664,9 +651,15 @@ TEST(look_make_unique_forks_the_template) {
     CHECK_EQ(rig.d.root().tracks[0].placements[0].target, rig.look);
     const doc::Look* forked = rig.d.find_look(fork);
     CHECK(forked != nullptr);
-    CHECK_EQ(forked->layers[0].stack.size(), size_t{1});
-    CHECK(forked->layers[0].stack[0].id !=
-          rig.d.looks[0].layers[0].stack[0].id);
+    CHECK_EQ(forked->effects.size(), size_t{1});
+    CHECK(forked->effects[0].id !=
+          rig.d.looks[0].effects[0].id);
+    CHECK_EQ(forked->value_nodes[1].in_a, forked->value_nodes[0].id);
+    CHECK_EQ(forked->value_nodes[0].audio_src, forked->sources[0].id);
+    CHECK_EQ(forked->mod_routes[0].node, forked->value_nodes[0].id);
+    CHECK_EQ(forked->mod_routes[0].target.effect_id, forked->effects[0].id);
+    CHECK_EQ(forked->links[0].from, forked->sources[0].id);
+    CHECK_EQ(forked->links[0].to, forked->effects[0].id);
 
     rig.undo.undo(rig.d);
     CHECK_EQ(rig.d.looks.size(), size_t{1});
@@ -715,7 +708,7 @@ TEST(look_version_gate_refuses_older_projects) {
     std::string error;
     auto loaded = doc::load_document(path, &error);
     CHECK(!loaded.has_value());
-    CHECK(error.find("value graph") != std::string::npos);
+    CHECK(error.find("unsupported project format") != std::string::npos);
 }
 
 TEST(fresh_sequences_carry_a_default_audio_track) {

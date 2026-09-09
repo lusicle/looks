@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "death log",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 0
       }
     ],
-    "face_in": 109,
+    "inputs": [129],
     "face_out": 113
   },
   "effects": [
@@ -129,5 +129,12 @@
       "node_x": 1410,
       "node_y": 40
     }
+  ],
+  "links": [
+    {"from": 109, "to": 110, "port": 0},
+    {"from": 110, "to": 111, "port": 0},
+    {"from": 111, "to": 112, "port": 0},
+    {"from": 112, "to": 113, "port": 0},
+    {"from": 129, "to": 109, "port": 0}
   ]
 }

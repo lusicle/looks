@@ -16,8 +16,8 @@ namespace {
 
 doc::Document make_doc() {
     doc::Document d = doc_with_look();
-    d.looks[0].layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::Vignette));
-    d.looks[0].layers[0].stack.push_back(doc::make_effect(d, doc::EffectType::RgbSplit));
+    d.looks[0].effects.push_back(doc::make_effect(d, doc::EffectType::Vignette));
+    d.looks[0].effects.push_back(doc::make_effect(d, doc::EffectType::RgbSplit));
     return d;
 }
 
@@ -46,45 +46,45 @@ TEST(mod_param_table_paths) {
     auto table = mod::build_param_table(d, d.looks[0]);
     // 10 = morph + 5 vignette + 4 rgb. Slip, waveform, gradient shape and
     // gradient blend are selectors or field ids, so they have no slot.
-    CHECK_EQ(table.size(), size_t{10 + doc::kLayerParamCount - 4});
+    CHECK_EQ(table.size(), size_t{10 + doc::kSourceParamCount - 4});
     CHECK_EQ(table[0].path, "global.morph");
     CHECK_EQ(table[0].key.effect_id, uint64_t{0});
-    CHECK_EQ(table[1].path, "layer0.fx0.wet");
-    CHECK_EQ(table[3].path, "layer0.fx0.amount");
-    CHECK_EQ(table[6].path, "layer0.fx1.wet");
-    CHECK_EQ(table[8].path, "layer0.fx1.shift_x");
-    CHECK_EQ(table[8].key.effect_id, d.looks[0].layers[0].stack[1].id);
+    CHECK_EQ(table[1].path, "fx" + std::to_string(d.looks[0].effects[0].id) + ".wet");
+    CHECK_EQ(table[3].path, "fx" + std::to_string(d.looks[0].effects[0].id) + ".amount");
+    CHECK_EQ(table[6].path, "fx" + std::to_string(d.looks[0].effects[1].id) + ".wet");
+    CHECK_EQ(table[8].path, "fx" + std::to_string(d.looks[0].effects[1].id) + ".shift_x");
+    CHECK_EQ(table[8].key.effect_id, d.looks[0].effects[1].id);
     CHECK_EQ(table[8].min_value, -64.0f);
     CHECK_EQ(table[8].max_value, 64.0f);
-    CHECK_EQ(table[10].path, "layer0.opacity");
+    CHECK_EQ(table[10].path, "source" + std::to_string(d.looks[0].sources[0].id) + ".opacity");
     CHECK_EQ(table[10].key.effect_id,
-             d.looks[0].layers[0].id | doc::kLayerParamBit);
+             d.looks[0].sources[0].id | doc::kSourceParamBit);
     CHECK_EQ(table[10].key.param_index, 0);
-    CHECK_EQ(table[24].path, "layer0.xf_rotate");
+    CHECK_EQ(table[24].path, "source" + std::to_string(d.looks[0].sources[0].id) + ".xf_rotate");
     CHECK_EQ(table[24].min_value, -180.0f);
 }
 
 TEST(mod_resolve_snaps_discrete_params) {
     doc::Document d = doc_with_look();
-    d.looks[0].layers[0].stack.push_back(
+    d.looks[0].effects.push_back(
         doc::make_effect(d, doc::EffectType::Dither));
     doc::KeyframeLane lane;
-    lane.target = {d.looks[0].layers[0].stack[0].id, 0};   // levels, integer count
+    lane.target = {d.looks[0].effects[0].id, 0};   // levels, integer count
     lane.keys.push_back({0.0, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     lane.keys.push_back({10.0, 7.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     d.looks[0].lanes.push_back(lane);
     // Param 2 (dither amount) is continuous.
     doc::KeyframeLane amt;
-    amt.target = {d.looks[0].layers[0].stack[0].id, 2};
+    amt.target = {d.looks[0].effects[0].id, 2};
     amt.keys.push_back({0.0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     amt.keys.push_back({10.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     d.looks[0].lanes.push_back(amt);
 
     const doc::Document r = mod::resolve(d, 3, 30.0, nullptr);
-    const float levels = r.looks[0].layers[0].stack[0].params[0];
+    const float levels = r.looks[0].effects[0].params[0];
     CHECK_EQ(levels, std::round(levels));
     CHECK(levels >= 2.0f && levels <= 7.0f);
-    const float amount = r.looks[0].layers[0].stack[0].params[2];
+    const float amount = r.looks[0].effects[0].params[2];
     CHECK(amount > 0.05f && amount < 0.95f);
     CHECK(amount != std::round(amount));
 }
@@ -92,14 +92,14 @@ TEST(mod_resolve_snaps_discrete_params) {
 TEST(mod_resolve_layer_params) {
     doc::Document d = doc_with_look();
     doc::KeyframeLane lane;
-    lane.target = {d.looks[0].layers[0].id | doc::kLayerParamBit, 8};   // gen_angle
+    lane.target = {d.looks[0].sources[0].id | doc::kSourceParamBit, 8};   // gen_angle
     lane.keys.push_back({0.0, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     lane.keys.push_back({10.0, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, false});
     d.looks[0].lanes.push_back(lane);
     const doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
     const doc::Document r10 = mod::resolve(d, 10, 30.0, nullptr);
-    CHECK(near(r0.looks[0].layers[0].gen_angle, -1.0f));
-    CHECK(near(r10.looks[0].layers[0].gen_angle, 1.0f));
+    CHECK(near(r0.looks[0].sources[0].gen_angle, -1.0f));
+    CHECK(near(r10.looks[0].sources[0].gen_angle, 1.0f));
 }
 
 TEST(mod_lfo_shapes_deterministic) {
@@ -176,12 +176,12 @@ TEST(mod_video_sampling_sources) {
     // Without a view the source reads 0, so wet lands on the range floor.
     doc::Document d = make_doc();
     add_valued_route(d, s,
-                     {d.looks[0].layers[0].stack[0].id, doc::kWetParam});
+                     {d.looks[0].effects[0].id, doc::kWetParam});
     const doc::Document lit =
         mod::resolve(d, 0, 30.0, nullptr, -1.0, -1.0, &view);
-    CHECK(near(lit.looks[0].layers[0].stack[0].wet, mean));
+    CHECK(near(lit.looks[0].effects[0].wet, mean));
     const doc::Document dark = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK_EQ(dark.looks[0].layers[0].stack[0].wet, 0.0f);
+    CHECK_EQ(dark.looks[0].effects[0].wet, 0.0f);
 }
 
 TEST(mod_lane_eval) {
@@ -210,7 +210,7 @@ TEST(mod_lane_eval) {
 
 TEST(mod_resolve_lane_and_route) {
     doc::Document d = make_doc();
-    const uint64_t vignette_id = d.looks[0].layers[0].stack[0].id;
+    const uint64_t vignette_id = d.looks[0].effects[0].id;
 
     doc::KeyframeLane lane;
     lane.target = {vignette_id, 0};   // amount
@@ -220,10 +220,10 @@ TEST(mod_resolve_lane_and_route) {
 
     doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
     doc::Document r5 = mod::resolve(d, 5, 30.0, nullptr);
-    CHECK(near(r0.looks[0].layers[0].stack[0].params[0], 0.0f));
-    CHECK(near(r5.looks[0].layers[0].stack[0].params[0], 0.5f));
+    CHECK(near(r0.looks[0].effects[0].params[0], 0.0f));
+    CHECK(near(r5.looks[0].effects[0].params[0], 0.5f));
     // Source doc untouched.
-    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.6f));
+    CHECK(near(d.looks[0].effects[0].params[0], 0.6f));
 
     // A wire replaces wet: at 1 Hz frame 15 is t = 0.5 s and reads 0.
     doc::ModSource lfo;
@@ -234,8 +234,8 @@ TEST(mod_resolve_lane_and_route) {
 
     doc::Document ra = mod::resolve(d, 0, 30.0, nullptr);
     doc::Document rb = mod::resolve(d, 15, 30.0, nullptr);
-    CHECK(near(ra.looks[0].layers[0].stack[0].wet, 1.0f));
-    CHECK(near(rb.looks[0].layers[0].stack[0].wet, 0.0f));
+    CHECK(near(ra.looks[0].effects[0].wet, 1.0f));
+    CHECK(near(rb.looks[0].effects[0].wet, 0.0f));
 
     // A value past the range clamps at the param edge.
     doc::ValueNode big;
@@ -247,15 +247,25 @@ TEST(mod_resolve_lane_and_route) {
     d.looks[0].value_nodes.push_back(big);
     d.looks[0].mod_routes[0].node = big.id;
     doc::Document rc = mod::resolve(d, 15, 30.0, nullptr);
-    CHECK(near(rc.looks[0].layers[0].stack[0].wet, 1.0f));
+    CHECK(near(rc.looks[0].effects[0].wet, 1.0f));
+}
+
+TEST(mod_hold_changes_on_each_key_frame) {
+    doc::KeyframeLane lane;
+    lane.keys = {{0, 0.1f}, {4, 0.4f}, {8, 0.8f}};
+    for (auto& key : lane.keys) key.hold = true;
+    CHECK(near(mod::eval_lane(lane, 3.999), 0.1f));
+    CHECK(near(mod::eval_lane(lane, 4), 0.4f));
+    CHECK(near(mod::eval_lane(lane, 7.999), 0.4f));
+    CHECK(near(mod::eval_lane(lane, 8), 0.8f));
 }
 
 TEST(mod_resolve_group_wet_and_opacity) {
     doc::Document d = make_doc();
     doc::Group g;
     g.id = d.next_effect_id++;
-    d.looks[0].layers[0].stack[0].group_id = g.id;
-    d.looks[0].layers[0].groups.push_back(g);
+    d.looks[0].effects[0].group_id = g.id;
+    d.looks[0].groups.push_back(g);
     const doc::ParamKey wet_key{g.id | doc::kGroupParamBit,
                                 doc::kWetParam};
 
@@ -265,7 +275,7 @@ TEST(mod_resolve_group_wet_and_opacity) {
     lane.keys.push_back({10.0, 1.0f});
     d.looks[0].lanes.push_back(lane);
     doc::Document r5 = mod::resolve(d, 5, 30.0, nullptr);
-    CHECK(near(r5.looks[0].layers[0].groups[0].wet, 0.5f));
+    CHECK(near(r5.looks[0].groups[0].wet, 0.5f));
 
     // A wire REPLACES: square LFO at 1 Hz, frame 15 reads 0.
     doc::ModSource lfo;
@@ -275,14 +285,14 @@ TEST(mod_resolve_group_wet_and_opacity) {
     add_valued_route(d, lfo, wet_key);
     doc::Document ra = mod::resolve(d, 0, 30.0, nullptr);
     doc::Document rb = mod::resolve(d, 15, 30.0, nullptr);
-    CHECK(near(ra.looks[0].layers[0].groups[0].wet, 1.0f));
-    CHECK(near(rb.looks[0].layers[0].groups[0].wet, 0.0f));
+    CHECK(near(ra.looks[0].groups[0].wet, 1.0f));
+    CHECK(near(rb.looks[0].groups[0].wet, 0.0f));
     doc::KeyframeLane olane;
     olane.target = {g.id | doc::kGroupParamBit, doc::kOpacityParam};
     olane.keys.push_back({0.0, 0.25f});
     d.looks[0].lanes.push_back(olane);
     doc::Document ro = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK(near(ro.looks[0].layers[0].groups[0].opacity, 0.25f));
+    CHECK(near(ro.looks[0].groups[0].opacity, 0.25f));
 }
 
 TEST(mod_wired_analysis_node_reads_its_connection) {
@@ -290,11 +300,11 @@ TEST(mod_wired_analysis_node_reads_its_connection) {
     // An unwired node reads 0, never the global curves.
     doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
-    look.layers[0].asset = d.next_effect_id++;
+    look.sources[0].asset = d.next_effect_id++;
     doc::ValueNode n;
     n.id = d.next_effect_id++;
     n.source.type = doc::ModSourceType::AudioLow;
-    n.audio_src = look.layers[0].id;
+    n.audio_src = look.sources[0].id;
     look.value_nodes.push_back(n);
 
     auto curves = std::make_shared<mod::AnalysisCurves>();
@@ -326,9 +336,9 @@ TEST(mod_resolve_analysis_sources) {
     doc::ModSource low;
     low.type = doc::ModSourceType::AudioLow;
     // rgb shift_x, range -64..64: the wire maps low onto the full span.
-    add_valued_route(d, low, {d.looks[0].layers[0].stack[1].id, 0});
+    add_valued_route(d, low, {d.looks[0].effects[1].id, 0});
     doc::ValueNode& vn = d.looks[0].value_nodes.back();
-    vn.audio_src = d.looks[0].layers[0].id;
+    vn.audio_src = d.looks[0].sources[0].id;
 
     auto curves = std::make_shared<mod::AnalysisCurves>();
     curves->low = {0.0f, 1.0f, 0.5f};
@@ -341,15 +351,15 @@ TEST(mod_resolve_analysis_sources) {
         mod::resolve(d, 1, 30.0, nullptr, -1.0, -1.0, nullptr, &map);
     doc::Document r9 =
         mod::resolve(d, 9, 30.0, nullptr, -1.0, -1.0, nullptr, &map);
-    CHECK(near(r0.looks[0].layers[0].stack[1].params[0], -64.0f));
-    CHECK(near(r1.looks[0].layers[0].stack[1].params[0], 64.0f));
-    CHECK(near(r9.looks[0].layers[0].stack[1].params[0], 0.0f));
+    CHECK(near(r0.looks[0].effects[1].params[0], -64.0f));
+    CHECK(near(r1.looks[0].effects[1].params[0], 64.0f));
+    CHECK(near(r9.looks[0].effects[1].params[0], 0.0f));
 
     d.looks[0].value_nodes.back().audio_src = 0;
     mod::AnalysisCurves global;
     global.low = {1.0f, 1.0f, 1.0f};
     doc::Document ru = mod::resolve(d, 1, 30.0, &global);
-    CHECK(near(ru.looks[0].layers[0].stack[1].params[0], -64.0f));
+    CHECK(near(ru.looks[0].effects[1].params[0], -64.0f));
 }
 
 TEST(mod_route_commands_undo) {
@@ -364,7 +374,7 @@ TEST(mod_route_commands_undo) {
     doc::ModRoute route;
     route.id = d.next_route_id++;
     route.node = node.id;
-    route.target = {d.looks[0].layers[0].stack[0].id, doc::kWetParam};
+    route.target = {d.looks[0].effects[0].id, doc::kWetParam};
     undo.execute(d, doc::add_route_command(d.looks[0].id,route));
     CHECK_EQ(d.looks[0].mod_routes.size(), size_t{1});
 
@@ -463,8 +473,8 @@ TEST(mod_value_math_and_normalise) {
 
 TEST(mod_value_chain_and_fanout) {
     doc::Document d = make_doc();
-    const uint64_t vignette_id = d.looks[0].layers[0].stack[0].id;
-    const uint64_t rgb_id = d.looks[0].layers[0].stack[1].id;
+    const uint64_t vignette_id = d.looks[0].effects[0].id;
+    const uint64_t rgb_id = d.looks[0].effects[1].id;
 
     doc::ValueNode lfo;
     lfo.id = d.next_route_id++;
@@ -491,11 +501,11 @@ TEST(mod_value_chain_and_fanout) {
 
     // At 30 fps frame 15 is t = 0.5 s, where the square LFO reads 0.
     doc::Document r0 = mod::resolve(d, 0, 30.0, nullptr);
-    CHECK(near(r0.looks[0].layers[0].stack[0].wet, 0.5f));
-    CHECK(near(r0.looks[0].layers[0].stack[1].wet, 0.5f));
+    CHECK(near(r0.looks[0].effects[0].wet, 0.5f));
+    CHECK(near(r0.looks[0].effects[1].wet, 0.5f));
     doc::Document r15 = mod::resolve(d, 15, 30.0, nullptr);
-    CHECK(near(r15.looks[0].layers[0].stack[0].wet, 0.0f));
-    CHECK(near(r15.looks[0].layers[0].stack[1].wet, 0.0f));
+    CHECK(near(r15.looks[0].effects[0].wet, 0.0f));
+    CHECK(near(r15.looks[0].effects[1].wet, 0.0f));
 }
 
 TEST(mod_value_cycle_guard) {
@@ -524,7 +534,7 @@ TEST(mod_remove_value_node_cascades) {
     doc::Document d = make_doc();
     doc::UndoStack undo;
     doc::Look& look = d.looks[0];
-    const uint64_t vignette_id = look.layers[0].stack[0].id;
+    const uint64_t vignette_id = look.effects[0].id;
 
     doc::ValueNode lfo;
     lfo.id = d.next_route_id++;
@@ -560,7 +570,7 @@ TEST(mod_remove_value_node_cascades) {
 TEST(mod_lane_command_and_snapshots) {
     doc::Document d = make_doc();
     doc::UndoStack undo;
-    const doc::ParamKey key{d.looks[0].layers[0].stack[0].id, 0};
+    const doc::ParamKey key{d.looks[0].effects[0].id, 0};
 
     undo.execute(d, doc::set_lane_command(d.looks[0].id,key, {{0.0, 0.1f}, {5.0, 0.9f}}));
     CHECK_EQ(d.looks[0].lanes.size(), size_t{1});
@@ -574,12 +584,12 @@ TEST(mod_lane_command_and_snapshots) {
 
     undo.execute(d, doc::store_snapshot_command(d.looks[0].id,0));
     CHECK(d.looks[0].snapshots[0].valid);
-    undo.execute(d, doc::set_param_command(d.looks[0].id,0, 0, 0, 0.11f));
-    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.11f));
+    undo.execute(d, doc::set_param_command(d.looks[0].id, d.looks[0].effects[0].id, 0, 0.11f));
+    CHECK(near(d.looks[0].effects[0].params[0], 0.11f));
     undo.execute(d, doc::apply_snapshot_command(d.looks[0].id,0));
-    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.6f));
+    CHECK(near(d.looks[0].effects[0].params[0], 0.6f));
     undo.undo(d);
-    CHECK(near(d.looks[0].layers[0].stack[0].params[0], 0.11f));
+    CHECK(near(d.looks[0].effects[0].params[0], 0.11f));
 }
 
 TEST(mod_fft_sine_bin) {
@@ -715,13 +725,13 @@ TEST(mod_envelope_source) {
     // The cut trigger stays video-derived and reads the global curves.
     doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
-    look.layers[0].asset = d.next_effect_id++;
+    look.sources[0].asset = d.next_effect_id++;
     doc::ValueNode n;
     n.id = d.next_effect_id++;
     n.source.type = doc::ModSourceType::Envelope;
     n.source.attack = 0.02f;
     n.source.decay = 0.3f;
-    n.audio_src = look.layers[0].id;
+    n.audio_src = look.sources[0].id;
     look.value_nodes.push_back(n);
 
     auto curves = std::make_shared<mod::AnalysisCurves>();
@@ -752,7 +762,7 @@ TEST(mod_envelope_source) {
     env.analysis = &global;
     look.value_nodes[0].audio_src = 0;
     CHECK_EQ(at(10), 0.0f);
-    look.value_nodes[0].audio_src = look.layers[0].id;
+    look.value_nodes[0].audio_src = look.sources[0].id;
 
     // eval_source has no wire, so the onset trigger reads 0.
     doc::ModSource envs = n.source;
@@ -771,13 +781,13 @@ TEST(mod_lfo_beat_synced) {
     // The phase anchors on the media position: local plus slip plus offset.
     doc::Document d = doc_with_look();
     doc::Look& look = d.looks[0];
-    look.layers[0].asset = d.next_effect_id++;
+    look.sources[0].asset = d.next_effect_id++;
     doc::ValueNode n;
     n.id = d.next_effect_id++;
     n.source.type = doc::ModSourceType::LfoBeat;
     n.source.shape = doc::LfoShape::Square;
     n.source.rate_hz = 1.0f;          // beats per cycle
-    n.audio_src = look.layers[0].id;
+    n.audio_src = look.sources[0].id;
     look.value_nodes.push_back(n);
 
     auto curves = std::make_shared<mod::AnalysisCurves>();

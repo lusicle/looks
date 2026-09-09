@@ -7,52 +7,124 @@
 
 namespace looks::doc {
 
-namespace {
-
-std::vector<EffectInstance>& stack_of(Look& look, size_t layer_index) {
-    assert(layer_index < look.layers.size());
-    return look.layers[layer_index].stack;
+std::unique_ptr<Command> set_generated_frame_command(uint64_t look, uint64_t effect,
+                                                    std::string path, std::string signature) {
+    class SetGenerated final : public LookCommand {
+    public:
+        SetGenerated(uint64_t look, uint64_t effect, std::string path, std::string signature)
+            : LookCommand(look), effect_(effect), path_(std::move(path)), signature_(std::move(signature)) {}
+        std::string name() const override { return "generate Mode"; }
+        void apply(Document& doc) override {
+            if (auto* fx = find_effect(entity_of(doc), effect_)) {
+                old_path_ = fx->generated_path;
+                old_signature_ = fx->generated_signature;
+                fx->generated_path = path_;
+                fx->generated_signature = signature_;
+            }
+        }
+        void revert(Document& doc) override {
+            if (auto* fx = find_effect(entity_of(doc), effect_)) {
+                fx->generated_path = old_path_;
+                fx->generated_signature = old_signature_;
+            }
+        }
+    private:
+        uint64_t effect_;
+        std::string path_, signature_, old_path_, old_signature_;
+    };
+    return std::make_unique<SetGenerated>(look, effect, std::move(path), std::move(signature));
 }
 
-float& param_ref(Look& look, size_t layer_index, size_t effect_index,
-                 int param_index) {
-    auto& stack = stack_of(look, layer_index);
-    assert(effect_index < stack.size());
-    EffectInstance& fx = stack[effect_index];
-    if (param_index == kWetParam) return fx.wet;
-    if (param_index == kOpacityParam) return fx.opacity;
-    assert(param_index >= 0 &&
-           static_cast<size_t>(param_index) < fx.params.size());
-    return fx.params[static_cast<size_t>(param_index)];
+void NodeReferenceState::detach(Look& look, uint64_t node) {
+    lanes = look.lanes;
+    routes = look.mod_routes;
+    for (size_t i = 0; i < 3; ++i) snapshots[i] = look.snapshots[i];
+    std::vector<uint64_t> targets;
+    if (const auto* source = find_source(look, node)) {
+        targets.push_back(node | kSourceParamBit);
+        for (const auto& stop : source->stops) targets.push_back(stop.id | kStopParamBit);
+    } else if (find_group(look, node)) targets.push_back(node | kGroupParamBit);
+    else targets.push_back(node);
+    auto matches = [&](uint64_t id) {
+        return std::find(targets.begin(), targets.end(), id) != targets.end();
+    };
+    look.lanes.erase(std::remove_if(look.lanes.begin(), look.lanes.end(),
+        [&](const KeyframeLane& lane) { return matches(lane.target.effect_id); }), look.lanes.end());
+    look.mod_routes.erase(std::remove_if(look.mod_routes.begin(), look.mod_routes.end(),
+        [&](const ModRoute& route) { return matches(route.target.effect_id); }), look.mod_routes.end());
+    for (auto& snapshot : look.snapshots)
+        snapshot.entries.erase(std::remove_if(snapshot.entries.begin(), snapshot.entries.end(),
+            [&](const SnapshotEntry& entry) { return matches(entry.effect_id); }), snapshot.entries.end());
+    media_users.clear();
+    for (auto& value : look.value_nodes)
+        if (value.audio_src == node) {
+            media_users.push_back(value.id);
+            value.audio_src = 0;
+        }
+}
+
+void NodeReferenceState::restore(Look& look, uint64_t node) const {
+    look.lanes = lanes;
+    look.mod_routes = routes;
+    for (size_t i = 0; i < 3; ++i) look.snapshots[i] = snapshots[i];
+    for (const auto id : media_users)
+        if (auto* value = find_value_node(look, id)) value->audio_src = node;
+}
+
+namespace {
+
+bool chain_pair(const Look& look, uint64_t first, uint64_t second) {
+    const auto* a = find_effect(look, first);
+    const auto* b = find_effect(look, second);
+    if (!a || !b || a->group_id != b->group_id) return false;
+    if (const auto* group = find_group(look, a->group_id))
+        if (group->face_out == first) return false;
+    size_t outputs = 0, inputs = 0;
+    bool connected = false;
+    for (const auto& link : look.links) {
+        if (link.from == first) ++outputs;
+        if (link.to == second && link.to_port == 0) ++inputs;
+        if (link.from == first && link.to == second && link.to_port == 0) connected = true;
+    }
+    return connected && outputs == 1 && inputs == 1;
+}
+
+float* param_ref(Look& look, uint64_t effect_id, int param_index) {
+    EffectInstance* target = find_effect(look, effect_id);
+    if (!target) return nullptr;
+    EffectInstance& fx = *target;
+    if (param_index == kWetParam) return &fx.wet;
+    if (param_index == kOpacityParam) return &fx.opacity;
+    if (param_index < 0 || static_cast<size_t>(param_index) >= fx.params.size()) return nullptr;
+    return &fx.params[static_cast<size_t>(param_index)];
 }
 
 class SetParamCommand final : public LookCommand {
 public:
-    SetParamCommand(uint64_t look, size_t layer_index, size_t effect_index,
+    SetParamCommand(uint64_t look, uint64_t effect_id,
                     int param_index, float new_value)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), param_index_(param_index),
+        : LookCommand(look), effect_id_(effect_id), param_index_(param_index),
           new_value_(new_value) {}
 
     std::string name() const override { return "Edit Parameter"; }
 
     void apply(Document& doc) override {
-        float& p = param_ref(entity_of(doc), layer_index_, effect_index_,
-                             param_index_);
-        old_value_ = p;
-        p = new_value_;
+        float* p = param_ref(entity_of(doc), effect_id_, param_index_);
+        applied_ = p != nullptr;
+        if (!applied_) return;
+        old_value_ = *p;
+        *p = new_value_;
     }
 
     void revert(Document& doc) override {
-        param_ref(entity_of(doc), layer_index_, effect_index_, param_index_) =
-            old_value_;
+        if (applied_)
+            if (auto* p = param_ref(entity_of(doc), effect_id_, param_index_)) *p = old_value_;
     }
 
     bool merge(const Command& next) override {
         const auto* other = dynamic_cast<const SetParamCommand*>(&next);
-        if (!other || !same_entity(*other) ||
-            other->layer_index_ != layer_index_ ||
-            other->effect_index_ != effect_index_ ||
+        if (!other || !applied_ || !other->applied_ || !same_entity(*other) ||
+            other->effect_id_ != effect_id_ ||
             other->param_index_ != param_index_)
             return false;
         new_value_ = other->new_value_;   // keep old_value_ for the undo
@@ -60,32 +132,36 @@ public:
     }
 
 private:
-    size_t layer_index_;
-    size_t effect_index_;
+    uint64_t effect_id_;
     int param_index_;
     float new_value_;
     float old_value_ = 0.0f;
+    bool applied_ = false;
 };
 
 // Keyed params arrive as lane writes, unkeyed params as base writes.
 class SetParamGestureCommand final : public LookCommand {
 public:
-    SetParamGestureCommand(uint64_t look, size_t layer_index,
-                           size_t effect_index,
+    SetParamGestureCommand(uint64_t look, uint64_t effect_id,
                            std::vector<ParamWrite> base_writes,
                            std::vector<KeyframeLane> lane_writes)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), base_writes_(std::move(base_writes)),
+        : LookCommand(look), effect_id_(effect_id), base_writes_(std::move(base_writes)),
           lane_writes_(std::move(lane_writes)) {}
 
     std::string name() const override { return "Edit Parameter"; }
 
     void apply(Document& doc) override {
         Look& look = entity_of(doc);
+        applied_ = false;
+        if (!find_effect(look, effect_id_)) return;
+        for (const auto& write : base_writes_)
+            if (!param_ref(look, effect_id_, write.param_index)) return;
+        for (const auto& lane : lane_writes_)
+            if (lane.target.effect_id != effect_id_ || !param_ref(look, effect_id_, lane.target.param_index)) return;
+        applied_ = true;
         old_base_.clear();
         for (const ParamWrite& w : base_writes_) {
-            float& p = param_ref(look, layer_index_, effect_index_,
-                                 w.param_index);
+            float& p = *param_ref(look, effect_id_, w.param_index);
             old_base_.push_back(p);
             p = w.value;
         }
@@ -108,6 +184,7 @@ public:
     }
 
     void revert(Document& doc) override {
+        if (!applied_) return;
         Look& look = entity_of(doc);
         for (size_t i = lane_writes_.size(); i-- > 0;) {
             for (size_t li = 0; li < look.lanes.size(); ++li) {
@@ -121,14 +198,12 @@ public:
             }
         }
         for (size_t i = base_writes_.size(); i-- > 0;)
-            param_ref(look, layer_index_, effect_index_,
-                      base_writes_[i].param_index) = old_base_[i];
+            if (auto* p = param_ref(look, effect_id_, base_writes_[i].param_index)) *p = old_base_[i];
     }
 
     bool merge(const Command& next) override {
         const auto* o = dynamic_cast<const SetParamGestureCommand*>(&next);
-        if (!o || !same_entity(*o) || o->layer_index_ != layer_index_ ||
-            o->effect_index_ != effect_index_ ||
+        if (!o || !applied_ || !o->applied_ || !same_entity(*o) || o->effect_id_ != effect_id_ ||
             o->base_writes_.size() != base_writes_.size() ||
             o->lane_writes_.size() != lane_writes_.size())
             return false;
@@ -146,11 +221,11 @@ public:
     }
 
 private:
-    size_t layer_index_;
-    size_t effect_index_;
+    uint64_t effect_id_;
     std::vector<ParamWrite> base_writes_;
     std::vector<KeyframeLane> lane_writes_;
     std::vector<float> old_base_;
+    bool applied_ = false;
     // Pairs of {the lane was there, its keys before}, one per lane write.
     std::vector<std::pair<bool, std::vector<Keyframe>>> old_lanes_;
 };
@@ -158,115 +233,150 @@ private:
 template <class T, T EffectInstance::*Field>
 class SetEffectFieldCommand final : public LookCommand {
 public:
-    SetEffectFieldCommand(uint64_t look, size_t layer_index,
-                          size_t effect_index, T value, const char* name)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index), value_(std::move(value)),
+    SetEffectFieldCommand(uint64_t look, uint64_t effect_id, T value, const char* name)
+        : LookCommand(look), effect_id_(effect_id), value_(std::move(value)),
           name_(name) {}
 
     std::string name() const override { return name_; }
 
     void apply(Document& doc) override {
-        auto& stack = stack_of(entity_of(doc), layer_index_);
-        assert(effect_index_ < stack.size());
-        old_ = stack[effect_index_].*Field;
-        stack[effect_index_].*Field = value_;
+        applied_ = false;
+        if (auto* fx = find_effect(entity_of(doc), effect_id_)) {
+            applied_ = true;
+            old_ = fx->*Field;
+            fx->*Field = value_;
+        }
     }
 
     void revert(Document& doc) override {
-        stack_of(entity_of(doc), layer_index_)[effect_index_].*Field = old_;
+        if (applied_)
+            if (auto* fx = find_effect(entity_of(doc), effect_id_)) fx->*Field = old_;
     }
 
 private:
-    size_t layer_index_;
-    size_t effect_index_;
+    uint64_t effect_id_;
     T value_;
     const char* name_;
     T old_{};
+    bool applied_ = false;
 };
 
 class AddEffectCommand final : public LookCommand {
 public:
-    AddEffectCommand(uint64_t look, size_t layer_index, EffectInstance instance,
+    AddEffectCommand(uint64_t look, EffectInstance instance,
                      size_t insert_index)
-        : LookCommand(look), layer_index_(layer_index),
-          instance_(std::move(instance)), insert_index_(insert_index) {}
+        : LookCommand(look), instance_(std::move(instance)), insert_index_(insert_index) {}
 
     std::string name() const override {
         return std::string("Add ") + effect_info(instance_.type).label;
     }
 
     void apply(Document& doc) override {
-        auto& stack = stack_of(entity_of(doc), layer_index_);
-        assert(insert_index_ <= stack.size());
-        stack.insert(stack.begin() + insert_index_, instance_);
+        auto& stack = entity_of(doc).effects;
+        stack.insert(stack.begin() + std::min(insert_index_, stack.size()), instance_);
     }
 
     void revert(Document& doc) override {
-        auto& stack = stack_of(entity_of(doc), layer_index_);
-        stack.erase(stack.begin() + insert_index_);
+        auto& stack = entity_of(doc).effects;
+        stack.erase(std::remove_if(stack.begin(), stack.end(),
+            [&](const EffectInstance& fx) { return fx.id == instance_.id; }), stack.end());
     }
 
 private:
-    size_t layer_index_;
     EffectInstance instance_;
     size_t insert_index_;
 };
 
 class RemoveEffectCommand final : public LookCommand {
 public:
-    RemoveEffectCommand(uint64_t look, size_t layer_index, size_t effect_index)
-        : LookCommand(look), layer_index_(layer_index),
-          effect_index_(effect_index) {}
+    RemoveEffectCommand(uint64_t look, uint64_t effect_id)
+        : LookCommand(look), effect_id_(effect_id) {}
 
     std::string name() const override { return "Remove Effect"; }
 
     void apply(Document& doc) override {
-        auto& stack = stack_of(entity_of(doc), layer_index_);
-        assert(effect_index_ < stack.size());
+        Look& look = entity_of(doc);
+        auto& stack = look.effects;
+        const EffectInstance* fx = find_effect(look, effect_id_);
+        applied_ = fx != nullptr;
+        if (!applied_) return;
+        effect_index_ = static_cast<size_t>(fx - stack.data());
         removed_ = stack[effect_index_];
+        links_ = look.links;
+        groups_ = look.groups;
+        references_.detach(look, effect_id_);
+        look.links.erase(std::remove_if(look.links.begin(), look.links.end(),
+            [&](const NodeLink& link) { return link.from == effect_id_ || link.to == effect_id_; }),
+            look.links.end());
+        for (Group& group : look.groups) {
+            group.exposed.erase(std::remove_if(group.exposed.begin(), group.exposed.end(),
+                [&](const ParamKey& key) { return key.effect_id == effect_id_; }), group.exposed.end());
+            if (group.face_out == effect_id_) group.face_out = 0;
+        }
         stack.erase(stack.begin() + effect_index_);
     }
 
     void revert(Document& doc) override {
-        auto& stack = stack_of(entity_of(doc), layer_index_);
+        if (!applied_) return;
+        Look& look = entity_of(doc);
+        auto& stack = look.effects;
         stack.insert(stack.begin() + effect_index_, removed_);
+        look.links = links_;
+        look.groups = groups_;
+        references_.restore(look, effect_id_);
     }
 
 private:
-    size_t layer_index_;
-    size_t effect_index_;
+    uint64_t effect_id_;
+    size_t effect_index_ = 0;
+    bool applied_ = false;
     EffectInstance removed_;
+    std::vector<NodeLink> links_;
+    std::vector<Group> groups_;
+    NodeReferenceState references_;
 };
 
 class MoveEffectCommand final : public LookCommand {
 public:
-    MoveEffectCommand(uint64_t look, size_t layer_index, size_t from_index,
-                      size_t to_index)
-        : LookCommand(look), layer_index_(layer_index), from_(from_index),
-          to_(to_index) {}
+    MoveEffectCommand(uint64_t look, uint64_t effect_id, uint64_t other_id)
+        : LookCommand(look), from_(effect_id), to_(other_id) {}
 
     std::string name() const override { return "Move Effect"; }
 
     void apply(Document& doc) override {
-        shift(entity_of(doc), layer_index_, from_, to_);
+        Look& look = entity_of(doc);
+        old_links_ = look.links;
+        old_groups_ = look.groups;
+        uint64_t first = from_, second = to_;
+        if (!chain_pair(look, first, second)) std::swap(first, second);
+        if (!chain_pair(look, first, second)) return;
+        for (NodeLink& link : look.links) {
+            if (link.from == first && link.to == second && link.to_port == 0) {
+                link.from = second;
+                link.to = first;
+            } else {
+                if (link.to == first && link.to_port == 0) link.to = second;
+                if (link.from == second) link.from = first;
+            }
+        }
+        for (const auto& link : look.links)
+            if (link_would_cycle(look, link.from, link.to)) {
+                look.links = old_links_;
+                return;
+            }
+        for (auto& group : look.groups)
+            if (group.face_out == second) group.face_out = first;
     }
     void revert(Document& doc) override {
-        shift(entity_of(doc), layer_index_, to_, from_);
+        entity_of(doc).links = old_links_;
+        entity_of(doc).groups = old_groups_;
     }
 
 private:
-    static void shift(Look& look, size_t layer, size_t from, size_t to) {
-        auto& stack = stack_of(look, layer);
-        assert(from < stack.size() && to < stack.size());
-        EffectInstance fx = std::move(stack[from]);
-        stack.erase(stack.begin() + from);
-        stack.insert(stack.begin() + to, std::move(fx));
-    }
-
-    size_t layer_index_;
-    size_t from_;
-    size_t to_;
+    uint64_t from_;
+    uint64_t to_;
+    std::vector<NodeLink> old_links_;
+    std::vector<Group> old_groups_;
 };
 
 // A missing target is a silent no-op: the node can be gone in the history.
@@ -315,8 +425,8 @@ private:
                 if (EffectInstance* fx = find_effect(look, id_))
                     return {&fx->node_x, &fx->node_y};
                 return {};
-            case NodeRef::Layer:
-                if (Layer* l = find_layer(look, id_))
+            case NodeRef::Source:
+                if (Source* l = find_source(look, id_))
                     return {&l->node_x, &l->node_y};
                 return {};
             case NodeRef::Route:
@@ -330,18 +440,15 @@ private:
                     return {&f->x, &f->y};
                 return {};
             case NodeRef::Group:
-                for (Layer& l : look.layers)
-                    for (Group& g : l.groups)
+                for (Group& g : look.groups)
                         if (g.id == id_) return {&g.node_x, &g.node_y};
                 return {};
             case NodeRef::GroupIn:
-                for (Layer& l : look.layers)
-                    for (Group& g : l.groups)
+                for (Group& g : look.groups)
                         if (g.id == id_) return {&g.in_x, &g.in_y};
                 return {};
             case NodeRef::GroupOut:
-                for (Layer& l : look.layers)
-                    for (Group& g : l.groups)
+                for (Group& g : look.groups)
                         if (g.id == id_) return {&g.out_x, &g.out_y};
                 return {};
         }
@@ -354,26 +461,6 @@ private:
     float old_x_ = 0.0f, old_y_ = 0.0f;
 };
 
-// On a look with no layers this is a no-op: the first source auto-wires.
-class MaterializeLinksCommand final : public LookCommand {
-public:
-    explicit MaterializeLinksCommand(uint64_t look) : LookCommand(look) {}
-    std::string name() const override { return "Materialize Links"; }
-
-    void apply(Document& doc) override {
-        Look& look = entity_of(doc);
-        materialized_ = look.links.empty();
-        ensure_links(look);
-    }
-
-    void revert(Document& doc) override {
-        if (materialized_) entity_of(doc).links.clear();
-    }
-
-private:
-    bool materialized_ = false;
-};
-
 // Link order is stacking order: the first link of a port is the bottom.
 // Keep positions exact. Only a new wire appends to the end.
 class ConnectCommand final : public LookCommand {
@@ -384,68 +471,18 @@ public:
 
     void apply(Document& doc) override {
         Look& look = entity_of(doc);
-        materialized_ = look.links.empty();
-        ensure_links(look);
-        pruned_ = prune_tombstone(look);   // a real wire replaces the seal
-        had_replaced_ = false;
-        appended_ = false;
-        auto replace_first = [&](auto&& match) {
-            for (size_t i = 0; i < look.links.size(); ++i)
-                if (match(look.links[i])) {
-                    replaced_ = look.links[i];
-                    replaced_at_ = i;
-                    had_replaced_ = true;
-                    look.links[i] = link_;
-                    return;
-                }
-        };
-        if (link_.to == 0) {
-            // The Output keeps one contribution per owner layer, per port.
-            // A chain that re-terminates replaces its old end in place.
-            auto owner_of = [&](uint64_t id) -> uint64_t {
-                if (find_layer(look, id)) return id;
-                const Layer* owner = nullptr;
-                if (find_effect(std::as_const(look), id, &owner))
-                    return owner->id;
-                return 0;
-            };
-            const uint64_t own = owner_of(link_.from);
-            replace_first([&](const NodeLink& l) {
-                return own && l.to == 0 && l.to_port == link_.to_port &&
-                       owner_of(l.from) == own;
-            });
-        } else {
-            // An exact duplicate replaces itself: a port never double-feeds.
-            replace_first([&](const NodeLink& l) {
-                return l.from == link_.from && l.to == link_.to &&
-                       l.to_port == link_.to_port;
-            });
-        }
-        if (!had_replaced_) {
-            look.links.push_back(link_);
-            appended_ = true;
-        }
+        appended_ = std::none_of(look.links.begin(), look.links.end(),
+            [&](const NodeLink& link) { return link.same_endpoints(link_); });
+        if (appended_) look.links.push_back(link_);
     }
 
     void revert(Document& doc) override {
-        Look& look = entity_of(doc);
-        if (appended_) {
-            erase_last_link(look, link_);
-        } else if (had_replaced_ && replaced_at_ < look.links.size()) {
-            look.links[replaced_at_] = replaced_;
-        }
-        if (pruned_) seal_links(look);
-        if (materialized_) look.links.clear();
+        if (appended_) erase_last_link(entity_of(doc), link_);
     }
 
 private:
     NodeLink link_;
-    NodeLink replaced_{};
-    size_t replaced_at_ = 0;
-    bool had_replaced_ = false;
     bool appended_ = false;
-    bool materialized_ = false;
-    bool pruned_ = false;
 };
 
 class DisconnectCommand final : public LookCommand {
@@ -456,44 +493,34 @@ public:
 
     void apply(Document& doc) override {
         Look& look = entity_of(doc);
-        materialized_ = look.links.empty();
-        ensure_links(look);
         removed_ = false;
         for (size_t i = 0; i < look.links.size(); ++i)
             if (look.links[i].from == link_.from &&
                 look.links[i].to == link_.to &&
                 look.links[i].to_port == link_.to_port) {
                 removed_at_ = i;
+                link_ = look.links[i];
                 look.links.erase(look.links.begin() +
                                  static_cast<ptrdiff_t>(i));
                 removed_ = true;
                 break;
             }
-        sealed_ = false;
-        if (removed_ && look.links.empty()) {
-            seal_links(look);
-            sealed_ = true;
-        }
     }
 
     void revert(Document& doc) override {
         Look& look = entity_of(doc);
-        if (sealed_) prune_tombstone(look);
         if (removed_)
             look.links.insert(
                 look.links.begin() +
                     static_cast<ptrdiff_t>(
                         std::min(removed_at_, look.links.size())),
                 link_);
-        if (materialized_) look.links.clear();
     }
 
 private:
     NodeLink link_;
     size_t removed_at_ = 0;
     bool removed_ = false;
-    bool materialized_ = false;
-    bool sealed_ = false;
 };
 
 // If old_link is absent this appends. If new_link is there this only
@@ -506,10 +533,11 @@ public:
 
     void apply(Document& doc) override {
         Look& look = entity_of(doc);
-        materialized_ = look.links.empty();
-        ensure_links(look);
-        pruned_ = prune_tombstone(look);
         mode_ = kAppended;
+        if (old_.from == new_.from && old_.to == new_.to && old_.to_port == new_.to_port) {
+            mode_ = kNoop;
+            return;
+        }
         size_t old_at = look.links.size();
         bool have_old = false;
         bool have_new = false;
@@ -519,6 +547,7 @@ public:
                 l.to_port == old_.to_port) {
                 old_at = i;
                 have_old = true;
+                old_ = l;
             }
             if (l.from == new_.from && l.to == new_.to &&
                 l.to_port == new_.to_port)
@@ -531,6 +560,7 @@ public:
             mode_ = kRemovedOnly;
         } else if (have_old) {
             at_ = old_at;
+            new_.blend = old_.blend;
             look.links[old_at] = new_;
             mode_ = kReplaced;
         } else if (!have_new) {
@@ -560,8 +590,6 @@ public:
             case kNoop:
                 break;
         }
-        if (pruned_) seal_links(look);
-        if (materialized_) look.links.clear();
     }
 
 private:
@@ -570,11 +598,35 @@ private:
     NodeLink new_;
     size_t at_ = 0;
     Mode mode_ = kNoop;
-    bool materialized_ = false;
-    bool pruned_ = false;
 };
 
-// The swap is self-inverse, thus apply and revert do the same operation.
+class SetLinkBlendCommand final : public LookCommand {
+public:
+    SetLinkBlendCommand(uint64_t look, NodeLink link, BlendMode blend)
+        : LookCommand(look), link_(link), blend_(blend) {}
+    std::string name() const override { return "Edit Connection Blend"; }
+    void apply(Document& doc) override {
+        applied_ = false;
+        if (static_cast<uint32_t>(blend_) > static_cast<uint32_t>(BlendMode::Difference)) return;
+        for (auto& link : entity_of(doc).links)
+            if (link.same_endpoints(link_)) {
+                old_ = link.blend;
+                link.blend = blend_;
+                applied_ = true;
+                break;
+            }
+    }
+    void revert(Document& doc) override {
+        if (!applied_) return;
+        for (auto& link : entity_of(doc).links)
+            if (link.same_endpoints(link_)) { link.blend = old_; break; }
+    }
+private:
+    NodeLink link_;
+    BlendMode blend_, old_ = BlendMode::Normal;
+    bool applied_ = false;
+};
+
 class MovePortLinkCommand final : public LookCommand {
 public:
     MovePortLinkCommand(uint64_t look, uint64_t to, uint32_t to_port,
@@ -589,7 +641,6 @@ public:
 private:
     void swap_links(Document& doc) {
         Look& look = entity_of(doc);
-        ensure_links(look);
         std::vector<size_t> pos;
         for (size_t i = 0; i < look.links.size(); ++i)
             if (look.links[i].to == to_ && look.links[i].to_port == port_)
@@ -733,12 +784,11 @@ std::unique_ptr<Command> set_frame_title_command(uint64_t look,
 }
 
 std::unique_ptr<Command> set_effect_text_command(uint64_t look,
-                                                 size_t layer_index,
-                                                 size_t effect_index,
+                                                 uint64_t effect_id,
                                                  std::string text) {
     return std::make_unique<
         SetEffectFieldCommand<std::string, &EffectInstance::text>>(
-        look, layer_index, effect_index, std::move(text), "Edit Text");
+        look, effect_id, std::move(text), "Edit Text");
 }
 
 std::unique_ptr<Command> set_frame_color_command(uint64_t look,
@@ -757,8 +807,7 @@ std::unique_ptr<Command> remove_frame_command(uint64_t look,
 bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
     if (from == to) return true;
     if (to == 0) return false;   // the Output node has no outgoing links
-    std::vector<NodeLink> synth;
-    const std::vector<NodeLink>& links = effective_links(look, synth);
+    const std::vector<NodeLink>& links = (look).links;
     std::vector<uint64_t> stack{to};
     std::vector<uint64_t> seen;
     while (!stack.empty()) {
@@ -782,8 +831,15 @@ bool link_would_cycle(const Look& look, uint64_t from, uint64_t to) {
     return false;
 }
 
-std::unique_ptr<Command> materialize_links_command(uint64_t look) {
-    return std::make_unique<MaterializeLinksCommand>(look);
+uint64_t effect_chain_neighbor(const Look& look, uint64_t effect_id, int direction) {
+    for (const auto& link : look.links) {
+        if (link.to_port != 0) continue;
+        if (direction < 0 && link.to == effect_id && chain_pair(look, link.from, effect_id))
+            return link.from;
+        if (direction > 0 && link.from == effect_id && chain_pair(look, effect_id, link.to))
+            return link.to;
+    }
+    return 0;
 }
 
 std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link) {
@@ -792,6 +848,10 @@ std::unique_ptr<Command> connect_command(uint64_t look, NodeLink link) {
 
 std::unique_ptr<Command> disconnect_command(uint64_t look, NodeLink link) {
     return std::make_unique<DisconnectCommand>(look, link);
+}
+
+std::unique_ptr<Command> set_link_blend_command(uint64_t look, NodeLink link, BlendMode blend) {
+    return std::make_unique<SetLinkBlendCommand>(look, link, blend);
 }
 
 std::unique_ptr<Command> reconnect_command(uint64_t look, NodeLink old_link,
@@ -811,65 +871,55 @@ std::unique_ptr<Command> set_node_pos_command(uint64_t look, NodeRef kind,
     return std::make_unique<SetNodePosCommand>(look, kind, id, x, y);
 }
 
-std::unique_ptr<Command> set_param_command(uint64_t look, size_t layer_index,
-                                           size_t effect_index,
+std::unique_ptr<Command> set_param_command(uint64_t look, uint64_t effect_id,
                                            int param_index, float new_value) {
-    return std::make_unique<SetParamCommand>(look, layer_index, effect_index,
+    return std::make_unique<SetParamCommand>(look, effect_id,
                                              param_index, new_value);
 }
 
 std::unique_ptr<Command> set_param_gesture_command(
-    uint64_t look, size_t layer_index, size_t effect_index,
+    uint64_t look, uint64_t effect_id,
     std::vector<ParamWrite> base_writes,
     std::vector<KeyframeLane> lane_writes) {
     return std::make_unique<SetParamGestureCommand>(
-        look, layer_index, effect_index, std::move(base_writes),
+        look, effect_id, std::move(base_writes),
         std::move(lane_writes));
 }
 
-std::unique_ptr<Command> set_bypass_command(uint64_t look, size_t layer_index,
-                                            size_t effect_index, bool bypass) {
+std::unique_ptr<Command> set_bypass_command(uint64_t look, uint64_t effect_id, bool bypass) {
     return std::make_unique<SetEffectFieldCommand<bool, &EffectInstance::bypass>>(
-        look, layer_index, effect_index, bypass,
+        look, effect_id, bypass,
         bypass ? "Bypass Effect" : "Enable Effect");
 }
 
 std::unique_ptr<Command> set_effect_blend_command(uint64_t look,
-                                                  size_t layer_index,
-                                                  size_t effect_index,
+                                                  uint64_t effect_id,
                                                   BlendMode blend) {
     return std::make_unique<
         SetEffectFieldCommand<BlendMode, &EffectInstance::blend>>(
-        look, layer_index, effect_index, blend, "Effect Blend");
+        look, effect_id, blend, "Effect Blend");
 }
 
-std::unique_ptr<Command> set_solo_command(uint64_t look, size_t layer_index,
-                                          size_t effect_index, bool solo) {
+std::unique_ptr<Command> set_solo_command(uint64_t look, uint64_t effect_id, bool solo) {
     return std::make_unique<SetEffectFieldCommand<bool, &EffectInstance::solo>>(
-        look, layer_index, effect_index, solo,
+        look, effect_id, solo,
         solo ? "Solo Effect" : "Unsolo Effect");
 }
 
-std::unique_ptr<Command> add_effect_command(uint64_t look, size_t layer_index,
-                                            EffectInstance instance,
+std::unique_ptr<Command> add_effect_command(uint64_t look, EffectInstance instance,
                                             size_t insert_index) {
-    return std::make_unique<AddEffectCommand>(look, layer_index,
-                                              std::move(instance),
+    return std::make_unique<AddEffectCommand>(look, std::move(instance),
                                               insert_index);
 }
 
 std::unique_ptr<Command> remove_effect_command(uint64_t look,
-                                               size_t layer_index,
-                                               size_t effect_index) {
-    return std::make_unique<RemoveEffectCommand>(look, layer_index,
-                                                 effect_index);
+                                               uint64_t effect_id) {
+    return std::make_unique<RemoveEffectCommand>(look, effect_id);
 }
 
-std::unique_ptr<Command> move_effect_command(uint64_t look, size_t layer_index,
-                                             size_t from_index,
-                                             size_t to_index) {
-    return std::make_unique<MoveEffectCommand>(look, layer_index, from_index,
-                                               to_index);
+std::unique_ptr<Command> move_effect_command(uint64_t look, uint64_t effect_id,
+                                             uint64_t other_id) {
+    return std::make_unique<MoveEffectCommand>(look, effect_id, other_id);
 }
 
 }  // namespace looks::doc

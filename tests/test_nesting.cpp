@@ -20,11 +20,12 @@ uint64_t add_inner_look(Document& d, EffectType fx_type) {
     looks::doc::Look inner;
     inner.id = d.next_effect_id++;
     inner.name = "inner";
-    looks::doc::Layer gen;
+    looks::doc::Source gen;
     gen.id = d.next_effect_id++;
-    gen.source = looks::doc::LayerSourceKind::Gradient;
-    gen.stack.push_back(make_effect(d, fx_type));
-    inner.layers.push_back(std::move(gen));
+    gen.source = looks::doc::SourceKind::Gradient;
+    inner.effects.push_back(make_effect(d, fx_type));
+    connect_test_chain(inner, gen.id, {inner.effects[0].id});
+    inner.sources.push_back(std::move(gen));
     d.looks.push_back(std::move(inner));
     return d.looks.back().id;
 }
@@ -129,12 +130,13 @@ TEST(nesting_lockstep_ref_inside_a_look) {
     // A look ref runs on the same clock, with no affine hop.
     Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
-    looks::doc::Layer ref;
+    looks::doc::Source ref;
     ref.id = d.next_effect_id++;
-    ref.source = looks::doc::LayerSourceKind::LookRef;
+    ref.source = looks::doc::SourceKind::LookRef;
     ref.target = inner;
-    d.looks[0].layers.push_back(std::move(ref));
-    const uint64_t ref_id = d.looks[0].layers.back().id;
+    d.looks[0].sources.push_back(std::move(ref));
+    const uint64_t ref_id = d.looks[0].sources.back().id;
+    d.looks[0].links.push_back({ref_id, 0, 0});
 
     const RenderGraph g = compile_graph(d, d.looks[0].id, 33);
     CHECK(g.valid);
@@ -164,12 +166,13 @@ TEST(nesting_sequence_inside_a_look_carries_its_lanes) {
 
     looks::doc::Look grade;
     grade.id = d.next_effect_id++;
-    looks::doc::Layer sref;
+    looks::doc::Source sref;
     sref.id = d.next_effect_id++;
-    sref.source = looks::doc::LayerSourceKind::SequenceRef;
+    sref.source = looks::doc::SourceKind::SequenceRef;
     sref.target = cut_id;
-    sref.stack.push_back(make_effect(d, EffectType::Grain));
-    grade.layers.push_back(std::move(sref));
+    grade.effects.push_back(make_effect(d, EffectType::Grain));
+    connect_test_chain(grade, sref.id, {grade.effects[0].id});
+    grade.sources.push_back(std::move(sref));
     const uint64_t grade_id = grade.id;
     d.looks.push_back(std::move(grade));
 
@@ -188,11 +191,11 @@ TEST(nesting_stops_at_the_depth_bound) {
     // Commands cannot build a self-cycle, but a hand-edited file can.
     Document d = doc_with_look();
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
-    looks::doc::Layer self_ref;
+    looks::doc::Source self_ref;
     self_ref.id = d.next_effect_id++;
-    self_ref.source = looks::doc::LayerSourceKind::LookRef;
+    self_ref.source = looks::doc::SourceKind::LookRef;
     self_ref.target = inner;
-    d.look(inner).layers.push_back(std::move(self_ref));
+    d.look(inner).sources.push_back(std::move(self_ref));
     place_block(d, inner, 0, 100);
     const RenderGraph g = compile_graph(d, d.root_sequence, 5);
     CHECK(g.valid);
@@ -229,11 +232,11 @@ TEST(nesting_reaches_spans_both_entity_kinds) {
     cut.tracks.push_back(std::move(lane));
     const uint64_t cut_id = cut.id;
     d.sequences.push_back(std::move(cut));
-    looks::doc::Layer sref;
+    looks::doc::Source sref;
     sref.id = d.next_effect_id++;
-    sref.source = looks::doc::LayerSourceKind::SequenceRef;
+    sref.source = looks::doc::SourceKind::SequenceRef;
     sref.target = cut_id;
-    d.looks[0].layers.push_back(std::move(sref));
+    d.looks[0].sources.push_back(std::move(sref));
     CHECK(looks::doc::nest_reaches(d, d.looks[0].id, cut_id));
     CHECK(looks::doc::nest_reaches(d, d.looks[0].id, inner));
     CHECK(!looks::doc::nest_reaches(d, inner, d.looks[0].id));
@@ -245,11 +248,11 @@ TEST(nesting_two_levels_compose_their_maps) {
     const uint64_t inner = add_inner_look(d, EffectType::Vignette);
     looks::doc::Look mid;
     mid.id = d.next_effect_id++;
-    looks::doc::Layer ref;
+    looks::doc::Source ref;
     ref.id = d.next_effect_id++;
-    ref.source = looks::doc::LayerSourceKind::LookRef;
+    ref.source = looks::doc::SourceKind::LookRef;
     ref.target = inner;
-    mid.layers.push_back(std::move(ref));
+    mid.sources.push_back(std::move(ref));
     const uint64_t mid_id = mid.id;
     d.looks.push_back(std::move(mid));
     place_block(d, mid_id, 10, 100, 2.0f);

@@ -1,5 +1,5 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "acid proof",
   "tags": [
     "digital"
@@ -27,7 +27,7 @@
         "param": 0
       }
     ],
-    "face_in": 164,
+    "inputs": [175],
     "face_out": 156
   },
   "effects": [
@@ -140,5 +140,14 @@
       "seed": 0,
       "group": 174
     }
+  ],
+  "links": [
+    {"from": 164, "to": 152, "port": 0},
+    {"from": 152, "to": 153, "port": 0},
+    {"from": 153, "to": 170, "port": 0},
+    {"from": 170, "to": 171, "port": 0},
+    {"from": 171, "to": 155, "port": 0},
+    {"from": 155, "to": 156, "port": 0},
+    {"from": 175, "to": 164, "port": 0}
   ]
 }

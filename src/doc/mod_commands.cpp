@@ -666,22 +666,20 @@ private:
 Snapshot capture_snapshot(const Look& look) {
     Snapshot snapshot;
     snapshot.valid = true;
-    for (const Layer& layer : look.layers) {
-        for (const EffectInstance& fx : layer.stack) {
-            SnapshotEntry entry;
-            entry.effect_id = fx.id;
-            entry.params = fx.params;
-            entry.wet = fx.wet;
-            entry.opacity = fx.opacity;
-            snapshot.entries.push_back(std::move(entry));
-        }
-        for (const Group& g : layer.groups) {
-            SnapshotEntry entry;
-            entry.effect_id = g.id | kGroupParamBit;
-            entry.wet = g.wet;
-            entry.opacity = g.opacity;
-            snapshot.entries.push_back(std::move(entry));
-        }
+    for (const EffectInstance& fx : look.effects) {
+        SnapshotEntry entry;
+        entry.effect_id = fx.id;
+        entry.params = fx.params;
+        entry.wet = fx.wet;
+        entry.opacity = fx.opacity;
+        snapshot.entries.push_back(std::move(entry));
+    }
+    for (const Group& g : look.groups) {
+        SnapshotEntry entry;
+        entry.effect_id = g.id | kGroupParamBit;
+        entry.wet = g.wet;
+        entry.opacity = g.opacity;
+        snapshot.entries.push_back(std::move(entry));
     }
     return snapshot;
 }
@@ -737,8 +735,7 @@ private:
                 }
                 continue;
             }
-            for (Layer& layer : look.layers) {
-                for (EffectInstance& fx : layer.stack) {
+                for (EffectInstance& fx : look.effects) {
                     if (fx.id != entry.effect_id) continue;
                     fx.wet = entry.wet;
                     fx.opacity = entry.opacity;
@@ -747,7 +744,6 @@ private:
                     for (size_t p = 0; p < n; ++p)
                         fx.params[p] = entry.params[p];
                 }
-            }
         }
     }
 

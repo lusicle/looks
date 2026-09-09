@@ -1,5 +1,9 @@
 #include "doc/serialize.h"
 
+#include <unordered_set>
+
+#include "doc/stack_commands.h"
+
 #include <algorithm>
 
 #include "doc/effects.h"
@@ -18,9 +22,9 @@ const char* const kBlendNames[] = {"normal", "add", "multiply", "screen",
                                    "difference"};
 const char* const kSourceKindNames[] = {"media", "solid", "gradient",
                                         "noise", "test",  "oscillator",
-                                        "shape", "look",  "sequence", "slideshow", "none"};
+                                        "shape", "look",  "sequence", "slideshow"};
 static_assert(sizeof(kSourceKindNames) / sizeof(kSourceKindNames[0]) ==
-                  static_cast<size_t>(LayerSourceKind::Count),
+                  static_cast<size_t>(SourceKind::Count),
               "source kind names track the enum");
 const char* const kModSourceNames[] = {
     "lfo",         "drift",       "audio_low",    "audio_mid",
@@ -87,11 +91,13 @@ void set_xy(Value& v, const char* kx, const char* ky, float x, float y) {
 
 Value param_key_to_json(const ParamKey& k) {
     Value v = Value::make_object();
-    // Bits 62 and 61 are past the exact JSON integer range: store bare ids.
-    if (k.effect_id & kLayerParamBit)
-        v.set("layer", static_cast<int64_t>(k.effect_id & ~kLayerParamBit));
+    // Tagged IDs exceed the exact JSON integer range; store each bare ID.
+    if (k.effect_id & kSourceParamBit)
+        v.set("source", static_cast<int64_t>(k.effect_id & ~kSourceParamBit));
     else if (k.effect_id & kGroupParamBit)
         v.set("group", static_cast<int64_t>(k.effect_id & ~kGroupParamBit));
+    else if (k.effect_id & kStopParamBit)
+        v.set("stop", static_cast<int64_t>(k.effect_id & ~kStopParamBit));
     else
         v.set("effect", static_cast<int64_t>(k.effect_id));
     v.set("param", k.param_index);
@@ -100,12 +106,15 @@ Value param_key_to_json(const ParamKey& k) {
 
 ParamKey param_key_from_json(const Value& v) {
     ParamKey k;
-    const int64_t layer_id = v.get("layer").as_int(-1);
+    const int64_t source_id = v.get("source").as_int(-1);
     const int64_t group_id = v.get("group").as_int(-1);
-    if (layer_id >= 0)
-        k.effect_id = static_cast<uint64_t>(layer_id) | kLayerParamBit;
+    const int64_t stop_id = v.get("stop").as_int(-1);
+    if (source_id >= 0)
+        k.effect_id = static_cast<uint64_t>(source_id) | kSourceParamBit;
     else if (group_id >= 0)
         k.effect_id = static_cast<uint64_t>(group_id) | kGroupParamBit;
+    else if (stop_id >= 0)
+        k.effect_id = static_cast<uint64_t>(stop_id) | kStopParamBit;
     else
         k.effect_id = static_cast<uint64_t>(v.get("effect").as_int(0));
     k.param_index = static_cast<int>(v.get("param").as_int(0));
@@ -356,7 +365,7 @@ Placement placement_from_json(const Value& pl) {
     return p;
 }
 
-Value layer_to_json(const Layer& l) {
+Value source_to_json(const Source& l) {
     Value v = Value::make_object();
     v.set("id", static_cast<int64_t>(l.id));
     v.set("name", l.name);
@@ -366,7 +375,7 @@ Value layer_to_json(const Layer& l) {
     if (l.slip) v.set("slip", static_cast<int64_t>(l.slip));
     if (l.timeline_lock) v.set("timeline_lock", true);
     if (l.target) v.set("target", static_cast<int64_t>(l.target));
-    if (l.source == LayerSourceKind::Slideshow) {
+    if (l.source == SourceKind::Slideshow) {
         v.set("slide_bin", static_cast<int64_t>(l.slide_bin));
         v.set("slide_seconds", static_cast<double>(l.slide_seconds));
         v.set("slide_speed", static_cast<double>(l.slide_speed));
@@ -421,12 +430,11 @@ Value layer_to_json(const Layer& l) {
         v.set("gradient_y", static_cast<double>(l.gradient_y));
     }
 
-    v.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(l.blend)));
     v.set("opacity", static_cast<double>(l.opacity));
     v.set("visible", l.visible);
     // Write the transform only if it is not the default: files stay stable.
     // A moved anchor stays written even if the transform is identity.
-    if (layer_has_transform(l) || l.xf_anchor_x != 0.5f ||
+    if (source_has_transform(l) || l.xf_anchor_x != 0.5f ||
         l.xf_anchor_y != 0.5f) {
         Value xf = Value::make_object();
         xf.set("crop_l", static_cast<double>(l.crop_l));
@@ -444,21 +452,15 @@ Value layer_to_json(const Layer& l) {
         v.set("transform", std::move(xf));
     }
     set_xy(v, "node_x", "node_y", l.node_x, l.node_y);
-    Value stack = Value::make_array();
-    for (const EffectInstance& fx : l.stack) stack.push(effect_to_json(fx));
-    v.set("stack", std::move(stack));
-    Value groups = Value::make_array();
-    for (const Group& g : l.groups) groups.push(group_to_json(g));
-    v.set("groups", std::move(groups));
     return v;
 }
 
-Layer layer_from_json(const Value& v) {
-    Layer l;
+Source source_from_json(const Value& v) {
+    Source l;
     l.id = static_cast<uint64_t>(v.get("id").as_int(0));
     l.name = v.get("name").as_string();
     const std::string src_name = v.get("source").as_string();
-    l.source = static_cast<LayerSourceKind>(
+    l.source = static_cast<SourceKind>(
         enum_index(kSourceKindNames, src_name));
     l.asset = static_cast<uint64_t>(v.get("asset").as_int(0));
     l.slip = static_cast<uint32_t>(v.get("slip").as_int(0));
@@ -523,8 +525,6 @@ Layer layer_from_json(const Value& v) {
         l.gradient_x = num(v, "gradient_x", 0.5f);
         l.gradient_y = num(v, "gradient_y", 0.5f);
     }
-    l.blend = static_cast<BlendMode>(
-        enum_index(kBlendNames, v.get("blend").as_string()));
     l.opacity = num(v, "opacity", 1.0f);
     l.visible = v.get("visible").as_bool(true);
     if (const Value& xf = v.get("transform"); xf.is_object()) {
@@ -541,10 +541,6 @@ Layer layer_from_json(const Value& v) {
     }
     l.node_x = num(v, "node_x", 0.0f);
     l.node_y = num(v, "node_y", 0.0f);
-    for (const Value& fv : v.get("stack").array())
-        if (auto fx = effect_from_json(fv)) l.stack.push_back(std::move(*fx));
-    for (const Value& gv : v.get("groups").array())
-        l.groups.push_back(group_from_json(gv));
     return l;
 }
 
@@ -589,7 +585,6 @@ Asset asset_from_json(const Value& v) {
 }
 
 // An exact duplicate wire drops. The first one wins, thus order stays.
-// The audio-in of the Output stays single-feed: the last one wins.
 void dedupe_links(std::vector<NodeLink>& links) {
     for (size_t i = 0; i < links.size(); ++i)
         for (size_t j = links.size(); j-- > i + 1;)
@@ -597,10 +592,6 @@ void dedupe_links(std::vector<NodeLink>& links) {
                 links[j].to == links[i].to &&
                 links[j].to_port == links[i].to_port)
                 links.erase(links.begin() + static_cast<ptrdiff_t>(j));
-    size_t audio_seen = 0;
-    for (size_t i = links.size(); i-- > 0;)
-        if (links[i].to == 0 && links[i].to_port == 1 && ++audio_seen > 1)
-            links.erase(links.begin() + static_cast<ptrdiff_t>(i));
 }
 
 Value look_to_json(const Look& look) {
@@ -629,9 +620,15 @@ Value look_to_json(const Look& look) {
     if (look.bin) v.set("bin", static_cast<int64_t>(look.bin));
     if (look.audio_split) v.set("audio_split", true);
 
-    Value layers = Value::make_array();
-    for (const Layer& l : look.layers) layers.push(layer_to_json(l));
-    v.set("layers", std::move(layers));
+    Value sources = Value::make_array();
+    for (const Source& s : look.sources) sources.push(source_to_json(s));
+    v.set("sources", std::move(sources));
+    Value effects = Value::make_array();
+    for (const EffectInstance& fx : look.effects) effects.push(effect_to_json(fx));
+    v.set("effects", std::move(effects));
+    Value groups = Value::make_array();
+    for (const Group& g : look.groups) groups.push(group_to_json(g));
+    v.set("groups", std::move(groups));
 
     Value vnodes = Value::make_array();
     for (const ValueNode& n : look.value_nodes)
@@ -661,11 +658,7 @@ Value look_to_json(const Look& look) {
     if (!look.links.empty()) {
         Value links = Value::make_array();
         for (const NodeLink& l : look.links) {
-            Value lv = Value::make_object();
-            lv.set("from", static_cast<int64_t>(l.from));
-            lv.set("to", static_cast<int64_t>(l.to));
-            lv.set("port", static_cast<int64_t>(l.to_port));
-            links.push(std::move(lv));
+            links.push(link_to_json(l));
         }
         v.set("links", std::move(links));
     }
@@ -709,10 +702,14 @@ Look look_from_json(const Value& v) {
     look.bin = static_cast<uint64_t>(v.get("bin").as_int(0));
     look.audio_split = v.get("audio_split").as_bool(false);
 
-    for (const Value& lv : v.get("layers").array()) {
-        if (look.layers.size() >= kMaxLayers) break;
-        look.layers.push_back(layer_from_json(lv));
+    for (const Value& lv : v.get("sources").array()) {
+        if (look.sources.size() >= kMaxSources) break;
+        look.sources.push_back(source_from_json(lv));
     }
+    for (const Value& fv : v.get("effects").array())
+        if (auto fx = effect_from_json(fv)) look.effects.push_back(std::move(*fx));
+    for (const Value& gv : v.get("groups").array())
+        look.groups.push_back(group_from_json(gv));
     for (const Value& nv : v.get("value_nodes").array())
         look.value_nodes.push_back(value_node_from_json(nv));
     for (const Value& rv : v.get("mod_routes").array())
@@ -728,12 +725,8 @@ Look look_from_json(const Value& v) {
 
     look.out_node_x = num(v, "out_node_x", 0.0f);
     look.out_node_y = num(v, "out_node_y", 0.0f);
-    // An absent link table means implicit wiring. The loader keeps it empty.
     for (const Value& lv : v.get("links").array())
-        look.links.push_back(
-            {static_cast<uint64_t>(lv.get("from").as_int(0)),
-             static_cast<uint64_t>(lv.get("to").as_int(0)),
-             static_cast<uint32_t>(lv.get("port").as_int(0))});
+        look.links.push_back(link_from_json(lv));
     dedupe_links(look.links);
     for (const Value& fv : v.get("frames").array()) {
         CanvasFrame f;
@@ -751,14 +744,14 @@ Look look_from_json(const Value& v) {
 
 uint64_t max_node_id(const Look& look) {
     uint64_t max_id = look.id;
-    for (const Layer& l : look.layers) {
+    for (const Source& l : look.sources) {
         max_id = std::max(max_id, l.id);
-        for (const EffectInstance& fx : l.stack)
-            max_id = std::max(max_id, fx.id);
-        for (const Group& g : l.groups) {
-            max_id = std::max(max_id, g.id);
-            for (uint64_t s : g.inputs) max_id = std::max(max_id, s);
-        }
+        for (const GradientStop& stop : l.stops) max_id = std::max(max_id, stop.id);
+    }
+    for (const EffectInstance& fx : look.effects) max_id = std::max(max_id, fx.id);
+    for (const Group& g : look.groups) {
+        max_id = std::max(max_id, g.id);
+        for (uint64_t s : g.inputs) max_id = std::max(max_id, s);
     }
     for (const CanvasFrame& f : look.frames) max_id = std::max(max_id, f.id);
     return max_id;
@@ -841,7 +834,7 @@ template <class Track, class Extra>
 void tracks_from_json(const Value& arr, std::vector<Track>& out,
                       Extra extra) {
     for (const Value& tv : arr.array()) {
-        if (out.size() >= kMaxLayers) break;
+        if (out.size() >= kMaxSources) break;
         Track t;
         t.id = static_cast<uint64_t>(tv.get("id").as_int(0));
         t.name = tv.get("name").as_string();
@@ -909,6 +902,10 @@ json::Value effect_to_json(const EffectInstance& fx) {
     v.set("seed", static_cast<int64_t>(fx.seed));
     v.set("group", static_cast<int64_t>(fx.group_id));
     if (!fx.text.empty()) v.set("text", fx.text);
+    if (fx.type == EffectType::Mode && !fx.generated_path.empty()) {
+        v.set("generated_path", fx.generated_path);
+        v.set("generated_signature", fx.generated_signature);
+    }
     set_xy(v, "node_x", "node_y", fx.node_x, fx.node_y);
     return v;
 }
@@ -935,6 +932,10 @@ std::optional<EffectInstance> effect_from_json(const json::Value& v) {
     fx.seed = static_cast<uint64_t>(v.get("seed").as_int(0));
     fx.group_id = static_cast<uint64_t>(v.get("group").as_int(0));
     fx.text = v.get("text").as_string();
+    if (*type == EffectType::Mode) {
+        fx.generated_path = v.get("generated_path").as_string();
+        fx.generated_signature = v.get("generated_signature").as_string();
+    }
     fx.node_x = num(v, "node_x", 0.0f);
     fx.node_y = num(v, "node_y", 0.0f);
     return fx;
@@ -967,7 +968,7 @@ json::Value group_to_json(const Group& g) {
     return v;
 }
 
-Group group_from_json(const json::Value& v, uint64_t* face_in) {
+Group group_from_json(const json::Value& v) {
     Group g;
     g.id = static_cast<uint64_t>(v.get("id").as_int(0));
     g.name = v.get("name").as_string();
@@ -983,7 +984,6 @@ Group group_from_json(const json::Value& v, uint64_t* face_in) {
     g.opacity = num(v, "opacity", 1.0f);
     for (const Value& sv : v.get("inputs").array())
         g.inputs.push_back(static_cast<uint64_t>(sv.as_int(0)));
-    if (face_in) *face_in = static_cast<uint64_t>(v.get("face_in").as_int(0));
     g.face_out = static_cast<uint64_t>(v.get("face_out").as_int(0));
     g.in_x = num(v, "in_x", 0.0f);
     g.in_y = num(v, "in_y", 0.0f);
@@ -1118,20 +1118,8 @@ Document doc_from_json(const json::Value& v) {
         std::max(static_cast<uint64_t>(v.get("next_route_id").as_int(1)),
                  max_route_id + 1);
 
-    // A document keeps one look with a layer, and one sequence with a lane.
-    if (doc.looks.empty()) {
-        Look look;
-        look.name = "look 1";
-        doc.looks.push_back(std::move(look));
-    }
     for (Look& look : doc.looks) {
         if (!look.id) look.id = doc.next_effect_id++;
-        if (look.layers.empty()) {
-            Layer base;
-            base.id = doc.next_effect_id++;
-            base.name = "layer 1";
-            look.layers.push_back(std::move(base));
-        }
     }
     if (doc.sequences.empty()) {
         Sequence seq;
@@ -1156,7 +1144,7 @@ Document doc_from_json(const json::Value& v) {
     for (Asset& a : doc.assets)
         if (!a.id) a.id = doc.next_effect_id++;
     for (Look& look : doc.looks)
-        for (Layer& l : look.layers)
+        for (Source& l : look.sources)
             if (!l.id) l.id = doc.next_effect_id++;
     for (Sequence& seq : doc.sequences)
         for_each_lane(seq, [&](auto& t) {
@@ -1165,6 +1153,55 @@ Document doc_from_json(const json::Value& v) {
                 if (!p.id) p.id = doc.next_effect_id++;
         });
     return doc;
+}
+
+bool valid_look_graph(const Look& look) {
+    std::unordered_set<uint64_t> ids;
+    auto add_id = [&](uint64_t id) { return id && id < (1ull << 53) && ids.insert(id).second; };
+    for (const auto& source : look.sources) {
+        if (!add_id(source.id)) return false;
+        for (const auto& stop : source.stops) if (!add_id(stop.id)) return false;
+    }
+    for (const auto& effect : look.effects) if (!add_id(effect.id)) return false;
+    for (const auto& group : look.groups) {
+        if (!add_id(group.id)) return false;
+        for (const auto slot : group.inputs) if (!add_id(slot)) return false;
+        if (group.face_out && !group_face_member(look, group)) return false;
+        for (const auto& key : group.exposed) {
+            const auto* effect = find_effect(look, key.effect_id);
+            if (!effect || effect->group_id != group.id || key.param_index < 0 ||
+                static_cast<size_t>(key.param_index) >= effect->params.size()) return false;
+        }
+    }
+    for (const auto& frame : look.frames) if (!add_id(frame.id)) return false;
+    for (const auto& effect : look.effects)
+        if (effect.group_id && !find_group(look, effect.group_id)) return false;
+    for (const auto& link : look.links)
+        if (link.blend >= BlendMode::Count || !link_endpoints_valid(look, link) ||
+            link_would_cycle(look, link.from, link.to)) return false;
+    return true;
+}
+
+json::Value link_to_json(const NodeLink& link) {
+    auto value = json::Value::make_object();
+    value.set("from", static_cast<int64_t>(link.from));
+    value.set("to", static_cast<int64_t>(link.to));
+    value.set("port", static_cast<int64_t>(link.to_port));
+    value.set("blend", enum_name(kBlendNames, static_cast<uint32_t>(link.blend)));
+    return value;
+}
+
+NodeLink link_from_json(const json::Value& value) {
+    NodeLink link{static_cast<uint64_t>(value.get("from").as_int(0)),
+        static_cast<uint64_t>(value.get("to").as_int(0)),
+        static_cast<uint32_t>(value.get("port").as_int(0))};
+    const auto& name = value.get("blend");
+    if (!name.is_null()) {
+        link.blend = BlendMode::Count;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(BlendMode::Count); ++i)
+            if (name.is_string() && name.as_string() == kBlendNames[i]) link.blend = static_cast<BlendMode>(i);
+    }
+    return link;
 }
 
 bool save_document(const std::filesystem::path& path, const Document& doc) {
@@ -1191,11 +1228,17 @@ std::optional<Document> load_document(const std::filesystem::path& path,
         if (error) *error = "not a looks project file";
         return std::nullopt;
     }
-    if (parsed.value->get("looks_project").as_int(0) < kProjectVersion) {
-        if (error) *error = "project predates the value graph format";
+    if (parsed.value->get("looks_project").as_int(0) != kProjectVersion) {
+        if (error) *error = "unsupported project format";
         return std::nullopt;
     }
-    return doc_from_json(*parsed.value);
+    auto document = doc_from_json(*parsed.value);
+    for (const auto& look : document.looks)
+        if (!valid_look_graph(look)) {
+            if (error) *error = "invalid look graph";
+            return std::nullopt;
+        }
+    return document;
 }
 
 }  // namespace looks::doc

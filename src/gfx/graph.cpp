@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "doc/instances.h"
+#include "doc/serialize.h"
 #include "util/hash.h"
 
 namespace looks::gfx {
@@ -35,6 +36,11 @@ struct Compiler {
 
     int add(GraphNode node, int instance, uint64_t key = 0) {
         node.instance = instance;
+        if (!node.inputs.empty()) {
+            const auto& input = graph.nodes[node.inputs.front()];
+            node.media_asset = input.media_asset;
+            node.media_frame = input.media_frame;
+        }
         doc::content_size(doc, graph.instances[instance].look,
                          &node.canvas_w, &node.canvas_h);
         if (node.kind == GraphNode::Kind::LayerBlend ||
@@ -62,13 +68,13 @@ struct Compiler {
     }
 
     // Multi-pass expansion order must match the engine's pass_index dispatch.
-    int emit_effect(const doc::EffectInstance& fx, int layer_index,
+    int emit_effect(const doc::EffectInstance& fx, int source_index,
                     int stack_index, int upstream, int instance, uint64_t key,
                     int extra_input) {
         auto make = [&](int pass, std::vector<int> inputs) {
             GraphNode n;
             n.kind = GraphNode::Kind::Effect;
-            n.layer_index = layer_index;
+            n.source_index = source_index;
             n.effect_index = stack_index;
             n.pass_index = pass;
             n.inputs = std::move(inputs);
@@ -202,7 +208,7 @@ int Compiler::emit_sequence(uint64_t seq_id, int inst, bool is_root) {
         } else {
             GraphNode blend;
             blend.kind = GraphNode::Kind::LayerBlend;
-            blend.layer_index = -1;
+            blend.source_index = -1;
             blend.p_opacity = popa;
             if (moved) {
                 blend.p_shift_x = place->pos_x;
@@ -226,48 +232,25 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     const uint64_t path = graph.instances[static_cast<size_t>(inst)].path;
     auto subject_key = [&](uint64_t id) { return hash_combine(path, id); };
 
-    // An empty link table compiles through a synthesized stack-order chain.
-    std::vector<doc::NodeLink> links_synth;
     const std::vector<doc::NodeLink>& links =
-        doc::effective_links(look, links_synth);
+        look.links;
     auto link_into = [&](uint64_t to, uint32_t port) -> uint64_t {
         for (const doc::NodeLink& l : links)
             if (l.to == to && l.to_port == port) return l.from;
         return 0;
     };
 
-    // Solo mutes only within the owner layer.
-    struct EffectOwner {
-        size_t layer;
-        const doc::EffectInstance* effect;
-    };
-    std::unordered_map<uint64_t, EffectOwner> owner;
-    std::vector<char> layer_solo(look.layers.size(), 0);
-    for (size_t li = 0; li < look.layers.size(); ++li)
-        for (const doc::EffectInstance& fx : look.layers[li].stack) {
-            owner[fx.id] = {li, &fx};
-            if (fx.solo && !fx.bypass) layer_solo[li] = 1;
-        }
-    auto group_bypassed_in = [&](size_t li, uint64_t gid) {
-        if (gid == 0) return false;
-        for (const doc::Group& g : look.layers[li].groups)
-            if (g.id == gid) return g.bypass;
-        return false;
-    };
+    std::unordered_map<uint64_t, size_t> effects;
+    for (size_t i = 0; i < look.effects.size(); ++i)
+        effects.emplace(look.effects[i].id, i);
+    const bool has_solo = doc::look_has_solo(look);
     auto effect_active = [&](uint64_t id) {
-        if (strip_effects) return false;
-        const auto ito = owner.find(id);
-        if (ito == owner.end()) return false;
-        const size_t li = ito->second.layer;
-        const doc::EffectInstance& fx = *ito->second.effect;
-        // Audio effects are image-identity; the image graph routes past them.
-        // Offset never dispatches; pass A2 turns adjacent ones into shims.
-        if (doc::is_audio_effect(fx.type) ||
-            fx.type == doc::EffectType::Offset)
-            return false;
-        return look.layers[li].visible && !fx.bypass &&
-               !(layer_solo[li] && !fx.solo) &&
-               !group_bypassed_in(li, fx.group_id);
+        const auto it = effects.find(id);
+        if (strip_effects || it == effects.end()) return false;
+        const auto& fx = look.effects[it->second];
+        return !doc::is_audio_effect(fx.type) &&
+               fx.type != doc::EffectType::Offset &&
+               doc::effect_enabled(look, fx, has_solo);
     };
 
     // A later call replaces an earlier one, so a wrapped card taps its wrap.
@@ -286,11 +269,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     std::unordered_map<uint64_t, int> heads;   // layer id to node index
     std::unordered_set<uint64_t> head_ungated;   // matte wired, not yet gated
     const LookInstance self = graph.instances[static_cast<size_t>(inst)];
-    for (size_t li = 0; li < look.layers.size(); ++li) {
-        const doc::Layer& layer = look.layers[li];
-        if (!layer.visible || layer.source == doc::LayerSourceKind::None) continue;
+    for (size_t li = 0; li < look.sources.size(); ++li) {
+        const doc::Source& layer = look.sources[li];
+        if (!layer.visible) continue;
         int cur = -1;
-        if (layer.source == doc::LayerSourceKind::Slideshow) {
+        if (layer.source == doc::SourceKind::Slideshow) {
             const auto assets = doc::slideshow_assets(doc, layer);
             const auto sample = doc::slideshow_sample(self.local_time * std::max(0.01f, layer.slide_speed),
                 doc::slideshow_period(layer, eff), assets.size(), layer.slide_fade * eff, layer.slide_end);
@@ -298,7 +281,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             auto slide_source = [&](size_t index) {
                 GraphNode src;
                 src.kind = GraphNode::Kind::Source;
-                src.layer_index = static_cast<int>(li);
+                src.source_index = static_cast<int>(li);
                 return add(std::move(src), inst,
                     doc::media_stream_key(path, layer.id, assets[index]->id, false, 0));
             };
@@ -311,7 +294,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 mix.p_opacity = sample.mix;
                 cur = add(std::move(mix), inst, subject_key(layer.id));
             }
-        } else if (doc::layer_is_media(layer)) {
+        } else if (doc::source_is_media(layer)) {
             // An unbound media node is dormant, like an unwired port.
             // A timeline-locked node reads and windows on the root clock.
             if (!layer.asset) continue;
@@ -337,12 +320,15 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             }
             GraphNode src;
             src.kind = GraphNode::Kind::Source;
-            src.layer_index = static_cast<int>(li);
+            src.source_index = static_cast<int>(li);
+            src.media_asset = layer.asset;
+            src.media_frame = t * doc::media_conform_rate(doc, *a,
+                layer.timeline_lock ? root_fps : eff) + layer.slip;
             cur = add(std::move(src), inst,
                       doc::media_stream_key(path, layer.id, layer.asset,
                                             layer.timeline_lock, 0));
             if (graph.source < 0) graph.source = cur;
-        } else if (doc::layer_is_nested(layer)) {
+        } else if (doc::source_is_nested(layer)) {
             // A nested entity plays 1:1 with this clock; its duration cuts it.
             if (!layer.target) continue;
             const doc::Look* tl = doc.find_look(layer.target);
@@ -380,13 +366,13 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             // Generators have no media and no end: always on.
             GraphNode gen;
             gen.kind = GraphNode::Kind::Generator;
-            gen.layer_index = static_cast<int>(li);
+            gen.source_index = static_cast<int>(li);
             cur = add(std::move(gen), inst, subject_key(layer.id));
         }
-        if (doc::layer_has_transform(layer) || layer.opacity != 1.0f) {
+        if (doc::source_has_transform(layer) || layer.opacity != 1.0f) {
             GraphNode xf;
             xf.kind = GraphNode::Kind::LayerTransform;
-            xf.layer_index = static_cast<int>(li);
+            xf.source_index = static_cast<int>(li);
             xf.inputs.push_back(cur);
             cur = add(std::move(xf), inst, subject_key(layer.id));
         }
@@ -401,31 +387,27 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     // and re-keys its stream; wired anywhere else it passes through.
     std::unordered_map<uint64_t, uint64_t> offset_terminal;
     if (!strip_effects) {
-        for (size_t li = 0; li < look.layers.size(); ++li) {
-            if (!look.layers[li].visible) continue;
-            for (const doc::EffectInstance& fx : look.layers[li].stack) {
-                if (fx.type != doc::EffectType::Offset || fx.bypass)
-                    continue;
-                if (layer_solo[li] && !fx.solo) continue;
-                if (group_bypassed_in(li, fx.group_id)) continue;
+        for (const doc::EffectInstance& fx : look.effects) {
+                if (fx.type != doc::EffectType::Offset ||
+                    !doc::effect_enabled(look, fx, has_solo)) continue;
                 if (!doc::offset_targets_video(fx)) continue;
                 const int64_t off = doc::offset_frames(fx);
                 if (!off) continue;
                 // Adjacency looks through group input slots.
                 const uint64_t src = doc::offset_source(look, links, fx.id);
-                const doc::Layer* sl = nullptr;
+                const doc::Source* sl = nullptr;
                 size_t sli = 0;
-                for (size_t k = 0; k < look.layers.size(); ++k)
-                    if (look.layers[k].id == src) {
-                        sl = &look.layers[k];
+                for (size_t k = 0; k < look.sources.size(); ++k)
+                    if (look.sources[k].id == src) {
+                        sl = &look.sources[k];
                         sli = k;
                     }
                 if (!sl || !sl->visible ||
-                    !(doc::layer_is_media(*sl) || doc::layer_is_nested(*sl)))
+                    !(doc::source_is_media(*sl) || doc::source_is_nested(*sl)))
                     continue;
                 offset_terminal[fx.id] = sl->id;
                 int shifted = -1;
-                if (doc::layer_is_media(*sl)) {
+                if (doc::source_is_media(*sl)) {
                     if (!sl->asset) continue;   // dormant, like the base
                     const doc::Asset* a = doc.find_asset(sl->asset);
                     // Dangling or audio-only: image-dormant, like the base.
@@ -448,7 +430,10 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     }
                     GraphNode srcn;
                     srcn.kind = GraphNode::Kind::Source;
-                    srcn.layer_index = static_cast<int>(sli);
+                    srcn.source_index = static_cast<int>(sli);
+                    srcn.media_asset = sl->asset;
+                    srcn.media_frame = t * doc::media_conform_rate(doc, *a,
+                        sl->timeline_lock ? root_fps : eff) + sl->slip + off;
                     shifted = add(std::move(srcn), inst,
                                   doc::media_stream_key(
                                       path, sl->id, sl->asset,
@@ -488,39 +473,31 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                     if (shifted < 0) continue;
                     shifted = fit_child(shifted, inst);
                 }
-                if (doc::layer_has_transform(*sl) || sl->opacity != 1.0f) {
+                if (doc::source_has_transform(*sl) || sl->opacity != 1.0f) {
                     GraphNode xf;
                     xf.kind = GraphNode::Kind::LayerTransform;
-                    xf.layer_index = static_cast<int>(sli);
+                    xf.source_index = static_cast<int>(sli);
                     xf.inputs.push_back(shifted);
                     shifted = add(std::move(xf), inst, subject_key(sl->id));
                 }
                 fx_out[fx.id] = shifted;
             }
-        }
     }
 
     // Stacking order is the link order: the first link composites at bottom.
     using Port = std::pair<uint64_t, uint32_t>;
-    std::map<Port, std::vector<uint64_t>> port_links;
+    std::map<Port, std::vector<const doc::NodeLink*>> port_links;
     for (const doc::NodeLink& l : links)
-        port_links[{l.to, l.to_port}].push_back(l.from);
-    static const std::vector<uint64_t> kNoLinks;
+        port_links[{l.to, l.to_port}].push_back(&l);
+    static const std::vector<const doc::NodeLink*> kNoLinks;
     auto links_into_port =
-        [&](uint64_t to, uint32_t port) -> const std::vector<uint64_t>& {
+        [&](uint64_t to, uint32_t port) -> const std::vector<const doc::NodeLink*>& {
         const auto it = port_links.find({to, port});
         return it == port_links.end() ? kNoLinks : it->second;
-    };
-    auto owner_layer_index = [&](uint64_t id) -> size_t {
-        if (auto it = owner.find(id); it != owner.end()) return it->second.layer;
-        for (size_t k = 0; k < look.layers.size(); ++k)
-            if (look.layers[k].id == id) return k;
-        return SIZE_MAX;
     };
     // Group input slots resolve like inactive effects: their own fan-in.
     std::unordered_map<uint64_t, char> slot_ids;
     struct FaceWrap {
-        size_t layer_index;
         size_t group_index;
         const doc::Group* group;
         bool mixes;
@@ -537,10 +514,9 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             if ((r.target.effect_id & doc::kGroupParamBit) && r.node)
                 driven_groups.insert(r.target.effect_id &
                                      ~doc::kGroupParamBit);
-        for (size_t li = 0; li < look.layers.size(); ++li)
-            for (size_t gi = 0; gi < look.layers[li].groups.size();
+        for (size_t gi = 0; gi < look.groups.size();
                  ++gi) {
-                const doc::Group& g = look.layers[li].groups[gi];
+                const doc::Group& g = look.groups[gi];
                 for (uint64_t s : g.inputs) slot_ids[s] = 1;
                 if (g.bypass || strip_effects) continue;
                 const bool mixes = g.wet != 1.0f || g.opacity != 1.0f ||
@@ -548,8 +524,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
                 const bool matted = !links_into_port(g.id, 1).empty();
                 if (!mixes && !matted) continue;
                 const uint64_t face =
-                    doc::group_face_member(look.layers[li], g);
-                if (face) face_wraps[face] = {li, gi, &g, mixes};
+                    doc::group_face_member(look, g);
+                if (face) face_wraps[face] = {gi, &g, mixes};
             }
     }
     std::vector<uint64_t> subjects;
@@ -558,16 +534,14 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (subject_indices.emplace(id, static_cast<int>(subjects.size())).second)
             subjects.push_back(id);
     };
-    for (const auto& layer : look.layers) {
-        add_subject(layer.id);
-        for (const auto& fx : layer.stack) add_subject(fx.id);
-        for (const auto& group : layer.groups)
-            for (uint64_t slot : group.inputs) add_subject(slot);
-    }
+    for (const auto& source : look.sources) add_subject(source.id);
+    for (const auto& fx : look.effects) add_subject(fx.id);
+    for (const auto& group : look.groups)
+        for (uint64_t slot : group.inputs) add_subject(slot);
     std::vector<GraphNode> dependencies(subjects.size());
     auto depend_on_port = [&](size_t index, uint64_t to, uint32_t port) {
-        for (uint64_t from : links_into_port(to, port))
-            if (auto it = subject_indices.find(from); it != subject_indices.end())
+        for (const auto* link : links_into_port(to, port))
+            if (auto it = subject_indices.find(link->from); it != subject_indices.end())
                 dependencies[index].inputs.push_back(it->second);
     };
     for (size_t i = 0; i < subjects.size(); ++i) {
@@ -575,11 +549,11 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (head_ungated.count(id)) depend_on_port(i, id, 1);
         if (auto it = offset_terminal.find(id); it != offset_terminal.end())
             depend_on_port(i, it->second, 1);
-        if ((owner.count(id) && !offset_terminal.count(id)) || slot_ids.count(id))
+        if (( effects.count(id) && !offset_terminal.count(id)) || slot_ids.count(id))
             depend_on_port(i, id, 0);
         if (effect_active(id)) {
             depend_on_port(i, id, 1);
-            if (doc::effect_aux_port(owner.at(id).effect->type)) depend_on_port(i, id, 2);
+            if (doc::effect_aux_port(look.effects[effects.at(id)].type)) depend_on_port(i, id, 2);
         }
         if (auto it = face_wraps.find(id); it != face_wraps.end()) {
             const auto& group = *it->second.group;
@@ -603,25 +577,18 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         const Port memo_key{to, port};
         if (auto it = merge_memo.find(memo_key); it != merge_memo.end())
             return it->second;
-        // The layer matte already gated the head, so the stack carried it
-        // down. Alpha-over reveals what is below wherever the gate closed.
         int below = -1;
-        for (uint64_t from : links_into_port(to, port)) {
-            const int cur = resolve_node(from);
+        for (const auto* link : links_into_port(to, port)) {
+            const int cur = resolve_node(link->from);
             if (cur < 0) continue;
             if (below < 0) {
                 below = cur;
             } else {
-                const size_t li = owner_layer_index(from);
                 GraphNode blend;
                 blend.kind = GraphNode::Kind::LayerBlend;
-                blend.layer_index =
-                    li == SIZE_MAX ? -1 : static_cast<int>(li);
+                blend.blend = link->blend;
                 blend.inputs = {below, cur};
-                below = add(std::move(blend), inst,
-                            li == SIZE_MAX
-                                ? 0
-                                : subject_key(look.layers[li].id));
+                below = add(std::move(blend), inst);
             }
         }
         merge_memo[memo_key] = below;
@@ -629,9 +596,9 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
     };
 
     // matte_node is a port-1 image; the luma extract makes it the gate.
-    auto emit_one = [&](size_t li, size_t stack_index, int in_node,
+    auto emit_one = [&](size_t stack_index, int in_node,
                         int aux_node = -1, int matte_node = -1) {
-        const doc::EffectInstance& fx = look.layers[li].stack[stack_index];
+        const doc::EffectInstance& fx = look.effects[stack_index];
         const uint64_t key = subject_key(fx.id);
         int gate = -1;
         if (matte_node >= 0) {
@@ -650,14 +617,13 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
              fx.params.size() > 1 && fx.params[1] >= 1.5f);
         if (extra < 0 && wants_map && gate >= 0) extra = gate;
         const int fx_node =
-            emit_effect(fx, static_cast<int>(li),
+            emit_effect(fx, -1,
                         static_cast<int>(stack_index), in_node, inst, key,
                         extra);
         int out = fx_node;
         if (fx.blend != doc::BlendMode::Normal) {
             GraphNode blend;
             blend.kind = GraphNode::Kind::LayerBlend;
-            blend.layer_index = static_cast<int>(li);
             blend.effect_index = static_cast<int>(stack_index);
             blend.inputs = {in_node, out};
             out = add(std::move(blend), inst, key);
@@ -670,7 +636,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             out = add(std::move(apply), inst);
         }
         fx_out[fx.id] = out;
-        set_tap(fx.id, out);
         return out;
     };
 
@@ -694,7 +659,6 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         if (fw.mixes) {
             GraphNode mix;
             mix.kind = GraphNode::Kind::GroupMix;
-            mix.layer_index = static_cast<int>(fw.layer_index);
             mix.effect_index = static_cast<int>(fw.group_index);
             mix.inputs = {dry, raw};
             out = add(std::move(mix), inst, subject_key(fw.group->id));
@@ -716,8 +680,7 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         fx_out[face_id] = out;
         set_tap(face_id, out);
     };
-    // A layer matte gates the HEAD, so the whole stack sees the crop. The
-    // composite then alpha-overs, which reveals below where the gate closed.
+    // Source mattes apply before downstream effects.
     auto gate_source = [&](uint64_t layer_id, int head) {
         int m = merge_port(layer_id, 1);
         if (m < 0 && !links_into_port(layer_id, 1).empty()) m = zero();
@@ -742,21 +705,22 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
             set_tap(id, fx_out.at(id));
         }
         if (slot_ids.count(id)) fx_out[id] = merge_port(id, 0);
-        if (auto it = owner.find(id); it != owner.end() && !offset_terminal.count(id)) {
+        if (auto it = effects.find(id); it != effects.end() && !offset_terminal.count(id)) {
             const int in_node = merge_port(id, 0);
+            if (is_root && id == graph.input_target)
+                graph.target_input = in_node >= 0 ? in_node : zero();
             fx_out[id] = in_node;
             if (effect_active(id) && in_node >= 0) {
                 int aux_node = -1;
-                if (doc::effect_aux_port(it->second.effect->type)) {
+                if (doc::effect_aux_port(look.effects[it->second].type)) {
                     aux_node = merge_port(id, 2);
                     if (aux_node < 0 && !links_into_port(id, 2).empty()) aux_node = zero();
                 }
                 int matte_node = merge_port(id, 1);
                 if (matte_node < 0 && !links_into_port(id, 1).empty()) matte_node = zero();
-                const size_t li = it->second.layer;
-                const size_t si = static_cast<size_t>(it->second.effect - look.layers[li].stack.data());
-                emit_one(li, si, in_node, aux_node, matte_node);
+                emit_one(it->second, in_node, aux_node, matte_node);
             }
+            set_tap(id, fx_out.at(id));
         }
         wrap_group_face(id);
     }
@@ -780,21 +744,8 @@ int Compiler::emit_look(uint64_t look_id, int inst, bool is_root) {
         }
         if (idx >= 0) graph.preview = idx;
     }
-    // The layer tap resolves the last link that leaves the layer chain.
-    // It shows the layer pre-blend and pre-matte; a node tap outranks it.
-    if (is_root && graph.preview < 0 && preview_layer != 0) {
-        size_t want = SIZE_MAX;
-        for (size_t k = 0; k < look.layers.size(); ++k)
-            if (look.layers[k].id == preview_layer) want = k;
-        int idx = -1;
-        if (want != SIZE_MAX)
-            for (const doc::NodeLink& l : links) {
-                if (owner_layer_index(l.from) != want) continue;
-                if (l.to != 0 && owner_layer_index(l.to) == want) continue;
-                if (int r = resolve_node(l.from); r >= 0) idx = r;
-            }
-        if (idx >= 0) graph.preview = idx;
-    }
+    if (is_root && graph.preview < 0 && preview_layer != 0)
+        graph.preview = resolve_node(preview_layer);
     return below;
 }
 
@@ -853,13 +804,13 @@ std::vector<SpatialImage> spatial_images(const doc::Document& doc,
             map.m = {node.sample_rect[2], 0, node.sample_rect[0],
                      0, node.sample_rect[3], node.sample_rect[1]};
         } else if (node.kind == GraphNode::Kind::LayerTransform ||
-                   (node.kind == GraphNode::Kind::LayerBlend && node.layer_index < 0 &&
+                   (node.kind == GraphNode::Kind::LayerBlend && node.source_index < 0 &&
                     graph.nodes[node.inputs[0]].kind == GraphNode::Kind::Generator &&
-                    graph.nodes[node.inputs[0]].layer_index < 0)) {
+                    graph.nodes[node.inputs[0]].source_index < 0)) {
             const bool layer_xf = node.kind == GraphNode::Kind::LayerTransform;
             const auto& layer = layer_xf
-                ? doc.look(graph.instances[node.instance].look).layers[node.layer_index]
-                : doc::Layer{};
+                ? doc.look(graph.instances[node.instance].look).sources[node.source_index]
+                : doc::Source{};
             upstream = node.inputs[layer_xf ? 0 : 1];
             const float scale = std::max(0.0001f, layer_xf ? layer.xf_scale : node.p_scale);
             const float angle = layer_xf ? layer.xf_rotate * doc::kDeg2Rad : node.p_rotate;
@@ -919,7 +870,7 @@ std::vector<std::array<double, 2>> render_demands(const doc::Document& doc,
         const auto& path = spatial[index];
         if (node.kind == GraphNode::Kind::Effect) {
             const auto& fx = doc.look(graph.instances[node.instance].look)
-                .layers[node.layer_index].stack[node.effect_index];
+                .effects[node.effect_index];
             if (doc::is_codec_box(fx.type) || fx.type == doc::EffectType::ErrorDiffusion)
                 for (auto& d : demand[index]) if (d > 0) d = std::max(2.0, std::ceil(d / 2) * 2);
         }
@@ -937,7 +888,7 @@ std::vector<std::array<double, 2>> render_demands(const doc::Document& doc,
         } else {
             for (size_t i = 0; i < node.inputs.size(); ++i) {
                 const double scale = node.kind == GraphNode::Kind::LayerBlend &&
-                    node.layer_index < 0 && i == 1 ? std::max(1.0f, node.p_scale) : 1.0;
+                    node.source_index < 0 && i == 1 ? std::max(1.0f, node.p_scale) : 1.0;
                 require(node.inputs[i], d[0] * scale, d[1] * scale);
             }
         }
@@ -948,8 +899,9 @@ std::vector<std::array<double, 2>> render_demands(const doc::Document& doc,
 RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
                           uint32_t frame, uint64_t preview_node,
                           uint64_t preview_layer,
-                          uint64_t measure_placement, bool with_before) {
+                          uint64_t measure_placement, bool with_before, uint64_t input_target) {
     RenderGraph graph;
+    graph.input_target = input_target;
 
     // Instance 0 is the compiled entity; its path is its own id.
     LookInstance root;
@@ -976,7 +928,179 @@ RenderGraph compile_graph(const doc::Document& doc, uint64_t root_id,
     }
 
     graph.valid = c.valid && topo_sort(graph.nodes, graph.order);
+    if (input_target) {
+        graph.output = graph.target_input;
+        graph.preview = graph.before = graph.measure = -1;
+        graph.thumb_taps.clear();
+        graph.valid = graph.valid && graph.output >= 0;
+        std::vector<bool> needed(graph.nodes.size());
+        if (graph.output >= 0) needed[graph.output] = true;
+        for (auto it = graph.order.rbegin(); it != graph.order.rend(); ++it)
+            if (needed[*it])
+                for (int input : graph.nodes[*it].inputs)
+                    if (input >= 0) needed[input] = true;
+        std::erase_if(graph.order, [&](int index) { return !needed[index]; });
+        graph.source = -1;
+        for (int index : graph.order)
+            if (graph.nodes[index].kind == GraphNode::Kind::Source) { graph.source = index; break; }
+    }
     return graph;
+}
+
+uint32_t mode_input_length(const doc::Document& doc, uint64_t look_id, uint64_t effect_id) {
+    const auto* look = doc.find_look(look_id);
+    if (!look) return 1;
+    std::vector<uint64_t> pending;
+    for (const auto& link : look->links)
+        if (link.to == effect_id && link.to_port == 0) pending.push_back(link.from);
+    std::unordered_set<uint64_t> visited;
+    uint32_t length = 0;
+    bool finite = false;
+    const double fps = doc::effective_fps(doc, *look);
+    const bool solo = doc::look_has_solo(*look);
+    while (!pending.empty()) {
+        const uint64_t id = pending.back();
+        pending.pop_back();
+        if (!visited.insert(id).second) continue;
+        bool shifted = false;
+        if (const auto* fx = doc::find_effect(*look, id);
+            fx && fx->type == doc::EffectType::Offset && doc::offset_targets_video(*fx) &&
+            doc::effect_enabled(*look, *fx, solo) && doc::offset_frames(*fx)) {
+            const auto* source = doc::find_source(*look, doc::offset_source(*look, look->links, id));
+            if (source && source->visible && (doc::source_is_media(*source) || doc::source_is_nested(*source))) {
+                double count = 0, rate = 1;
+                int64_t shift = doc::offset_frames(*fx);
+                if (doc::source_is_media(*source)) {
+                    if (const auto* asset = doc.find_asset(source->asset)) {
+                        count = asset->frame_count;
+                        rate = doc::media_conform_rate(doc, *asset, fps);
+                    }
+                    shift += source->slip;
+                } else {
+                    rate = doc::entity_fps(doc, source->target) / fps;
+                    count = doc::layer_source_length(doc, *source, doc::entity_fps(doc, source->target));
+                }
+                if (count > 0) {
+                    double first, last;
+                    doc::shifted_window(count, shift, rate, &first, &last);
+                    length = std::max(length, uint32_t(std::clamp(std::ceil(last), 0.0, 4294967295.0)));
+                    finite = true;
+                    shifted = true;
+                }
+            }
+        }
+        for (const auto& source : look->sources)
+            if (source.id == id && source.visible) {
+                const auto frames = doc::layer_source_length(doc, source, fps);
+                length = std::max(length, frames);
+                finite |= frames > 0;
+            }
+        for (const auto& link : look->links)
+            if (link.to == id && (!shifted || link.to_port != 0)) pending.push_back(link.from);
+        for (const auto& group : look->groups)
+            if (group.face_out == id) {
+                for (uint64_t input : group.inputs) pending.push_back(input);
+                for (const auto& link : look->links)
+                    if (link.to == group.id) pending.push_back(link.from);
+            }
+    }
+    return finite ? length : doc::look_duration(doc, *look);
+}
+
+std::vector<uint32_t> mode_sample_frames(uint32_t length, uint32_t samples) {
+    length = std::max(1u, length);
+    samples = std::clamp(samples, 1u, length);
+    std::vector<uint32_t> frames(samples);
+    for (uint32_t i = 0; i < samples; ++i)
+        frames[i] = samples == 1 ? 0 : uint32_t(uint64_t(i) * (length - 1) / (samples - 1));
+    return frames;
+}
+
+std::string mode_signature(const doc::Document& doc, uint64_t look_id, uint64_t effect_id) {
+    if (!doc.find_look(look_id)) return {};
+    doc::Document input = doc;
+    auto& look = input.look(look_id);
+    const auto* mode = doc::find_effect(look, effect_id);
+    if (!mode || mode->type != doc::EffectType::Mode) return {};
+    std::unordered_set<uint64_t> nodes{effect_id};
+    std::vector<uint64_t> pending{effect_id};
+    while (!pending.empty()) {
+        const uint64_t id = pending.back();
+        pending.pop_back();
+        auto add = [&](uint64_t next) { if (nodes.insert(next).second) pending.push_back(next); };
+        for (const auto& link : look.links)
+            if (link.to == id && (id != effect_id || link.to_port == 0)) add(link.from);
+        for (const auto& group : look.groups)
+            if (group.face_out == id && id != effect_id) {
+                add(group.id);
+                for (uint64_t slot : group.inputs) add(slot);
+                for (const auto& link : look.links) if (link.to == group.id) add(link.from);
+            }
+    }
+    const bool solo = doc::look_has_solo(look);
+    for (auto& fx : look.effects) {
+        fx.bypass = !doc::effect_enabled(look, fx, solo);
+        fx.solo = false;
+        if (fx.id == effect_id) {
+            fx.generated_path.clear();
+            fx.generated_signature.clear();
+            fx.wet = fx.opacity = 1;
+            fx.blend = doc::BlendMode::Normal;
+            fx.bypass = false;
+        }
+    }
+    std::erase_if(look.sources, [&](const auto& s) { return !nodes.count(s.id); });
+    std::erase_if(look.effects, [&](const auto& fx) { return !nodes.count(fx.id); });
+    std::erase_if(look.links, [&](const auto& link) {
+        return !nodes.count(link.to) || !nodes.count(link.from) ||
+            (link.to == effect_id && link.to_port != 0);
+    });
+    std::erase_if(look.groups, [&](const auto& group) {
+        return std::none_of(look.effects.begin(), look.effects.end(),
+            [&](const auto& fx) { return fx.group_id == group.id; });
+    });
+    std::erase_if(look.lanes, [&](const auto& lane) {
+        return lane.target.effect_id == effect_id && lane.target.param_index < 0;
+    });
+    std::erase_if(look.mod_routes, [&](const auto& route) {
+        return route.target.effect_id == effect_id && route.target.param_index < 0;
+    });
+    std::unordered_set<uint64_t> entities{look_id};
+    pending = {look_id};
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        auto add = [&](uint64_t target) {
+            if (target && entities.insert(target).second) pending.push_back(target);
+        };
+        if (const auto* l = input.find_look(id))
+            for (const auto& source : l->sources) add(source.target);
+        if (const auto* sequence = input.find_sequence(id))
+            for (const auto& track : sequence->tracks)
+                for (const auto& place : track.placements) add(place.target);
+    }
+    std::erase_if(input.looks, [&](const auto& l) { return !entities.count(l.id); });
+    std::erase_if(input.sequences, [&](const auto& s) { return !entities.count(s.id); });
+    input.root_sequence = 0;
+    auto value = doc::doc_to_json(input);
+    auto clean = [&](auto&& self, json::Value& v) -> void {
+        if (v.is_array()) for (auto& item : v.array()) self(self, item);
+        if (!v.is_object()) return;
+        std::erase_if(v.object(), [](const auto& item) {
+            const auto& k = item.first;
+            return k == "name" || k == "node_x" || k == "node_y" || (k == "frames" && item.second.is_array()) ||
+                k == "trim_in" || k == "trim_out" || k == "loop_in" || k == "loop_out" ||
+                k == "cache_mb" || k == "use_proxy" || k == "next_effect_id" ||
+                k == "next_route_id" || k == "folded";
+        });
+        for (auto& item : v.object()) self(self, item.second);
+    };
+    clean(clean, value);
+    const std::string text = json::write(value, false);
+    char signature[32];
+    std::snprintf(signature, sizeof(signature), "%016llx",
+        static_cast<unsigned long long>(fnv1a(text.data(), text.size())));
+    return signature;
 }
 
 }  // namespace looks::gfx

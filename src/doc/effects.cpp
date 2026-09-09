@@ -116,6 +116,11 @@ constexpr ParamDesc kBitrateStarveParams[] = {
     {"gop", "gop", 1.0f, 120.0f, 30.0f, "%.0f", nullptr, true},
 };
 
+constexpr ParamDesc kModeParams[] = {
+    {"tolerance", "tolerance", 0.0f, 0.25f, 0.03f, "%.3f"},
+    {"samples", "samples", 2.0f, 128.0f, 64.0f, "%.0f", nullptr, true},
+};
+
 constexpr ParamDesc kEchoParams[] = {
     {"decay", "decay", 0.0f, 0.98f, 0.85f, "%.2f"},
     {"mode", "mode", 0.0f, 1.0f, 0.0f, "%.0f", "lighten|crossfade"},
@@ -1289,6 +1294,7 @@ constexpr EffectInfo kEffectInfos[] = {
     {"rolling_shutter", "Rolling Shutter", kRollingShutterParams, 5,
      FxCategory::Warp},
     {"normalise", "Normalise", kNormaliseParams, 3, FxCategory::Color},
+    {"mode", "Mode", kModeParams, 2, FxCategory::Time},
 };
 static_assert(sizeof(kEffectInfos) / sizeof(kEffectInfos[0]) ==
               static_cast<size_t>(EffectType::Count));
@@ -1411,22 +1417,20 @@ bool instance_uses_history(const EffectInstance& fx) {
 }  // namespace
 
 bool look_uses_history(const Look& look) {
-    for (const Layer& layer : look.layers)
-        for (const EffectInstance& fx : layer.stack) {
-            if (fx.bypass) continue;
-            if (instance_uses_history(fx)) return true;
-            if (fx.type != EffectType::CrtSim || fx.params.size() <= 11) continue;
-            auto changes_decay = [&](const ParamKey& key) {
-                return key.effect_id == fx.id &&
-                    (key.param_index == 11 ||
-                     (key.param_index == 4 && fx.params[11] > 0.0f));
-            };
-            for (const auto& lane : look.lanes)
-                if (!lane.muted && !lane.keys.empty() && changes_decay(lane.target))
-                    return true;
-            for (const auto& route : look.mod_routes)
-                if (changes_decay(route.target)) return true;
-        }
+    const bool has_solo = look_has_solo(look);
+    for (const EffectInstance& fx : look.effects) {
+        if (!effect_enabled(look, fx, has_solo)) continue;
+        if (instance_uses_history(fx)) return true;
+        if (fx.type != EffectType::CrtSim || fx.params.size() <= 11) continue;
+        auto changes_decay = [&](const ParamKey& key) {
+            return key.effect_id == fx.id &&
+                (key.param_index == 11 || (key.param_index == 4 && fx.params[11] > 0.0f));
+        };
+        for (const auto& lane : look.lanes)
+            if (!lane.muted && !lane.keys.empty() && changes_decay(lane.target)) return true;
+        for (const auto& route : look.mod_routes)
+            if (changes_decay(route.target)) return true;
+    }
     return false;
 }
 

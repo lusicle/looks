@@ -97,63 +97,65 @@ Look clone_look_for_unique(Document& doc, const Look& src) {
         return it == map.end() ? old : it->second;
     };
 
-    for (Layer& l : out.layers) {
+    for (Source& l : out.sources) {
         l.id = remint(l.id);
-        for (EffectInstance& fx : l.stack) fx.id = remint(fx.id);
-        for (Group& g : l.groups) {
-            g.id = remint(g.id);
-            for (uint64_t& s : g.inputs) s = remint(s);
-        }
+        for (GradientStop& stop : l.stops) stop.id = remint(stop.id);
+    }
+    for (EffectInstance& fx : out.effects) fx.id = remint(fx.id);
+    for (Group& g : out.groups) {
+        g.id = remint(g.id);
+        for (uint64_t& s : g.inputs) s = remint(s);
     }
     for (CanvasFrame& f : out.frames) f.id = remint(f.id);
 
     // An id the look does not own passes through unchanged.
     auto mapped_key = [&](ParamKey k) {
-        if (k.effect_id & kLayerParamBit)
-            k.effect_id = mapped(k.effect_id & ~kLayerParamBit) |
-                          kLayerParamBit;
+        if (k.effect_id & kSourceParamBit)
+            k.effect_id = mapped(k.effect_id & ~kSourceParamBit) |
+                          kSourceParamBit;
         else if (k.effect_id & kGroupParamBit)
             k.effect_id = mapped(k.effect_id & ~kGroupParamBit) |
                           kGroupParamBit;
+        else if (k.effect_id & kStopParamBit)
+            k.effect_id = mapped(k.effect_id & ~kStopParamBit) | kStopParamBit;
         else if (k.effect_id)
             k.effect_id = mapped(k.effect_id);
         return k;
     };
-    for (Layer& l : out.layers) {
-        for (EffectInstance& fx : l.stack)
-            fx.group_id = mapped(fx.group_id);
-        for (Group& g : l.groups) {
-            g.face_out = mapped(g.face_out);
-            for (ParamKey& k : g.exposed) k = mapped_key(k);
-        }
+    for (EffectInstance& fx : out.effects) fx.group_id = mapped(fx.group_id);
+    for (Group& g : out.groups) {
+        g.face_out = mapped(g.face_out);
+        for (ParamKey& k : g.exposed) k = mapped_key(k);
     }
     for (NodeLink& l : out.links) {
         l.from = mapped(l.from);
         if (l.to) l.to = mapped(l.to);
     }
-    // Value node ids come from next_route_id but share the same map.
+    std::unordered_map<uint64_t, uint64_t> value_map;
     for (ValueNode& n : out.value_nodes) {
         const uint64_t id = doc.next_route_id++;
-        map.emplace(n.id, id);
+        value_map.emplace(n.id, id);
         n.id = id;
     }
+    auto mapped_value = [&](uint64_t id) {
+        const auto it = value_map.find(id);
+        return it == value_map.end() ? id : it->second;
+    };
     for (ValueNode& n : out.value_nodes) {
-        n.in_a = mapped(n.in_a);
-        n.in_b = mapped(n.in_b);
+        n.in_a = mapped_value(n.in_a);
+        n.in_b = mapped_value(n.in_b);
+        n.audio_src = mapped(n.audio_src);
     }
     for (ModRoute& r : out.mod_routes) {
         r.id = doc.next_route_id++;
-        r.node = mapped(r.node);
+        r.node = mapped_value(r.node);
         r.target = mapped_key(r.target);
     }
     for (KeyframeLane& lane : out.lanes)
         lane.target = mapped_key(lane.target);
     for (Snapshot& s : out.snapshots)
         for (SnapshotEntry& e : s.entries)
-            e.effect_id =
-                e.effect_id & kGroupParamBit
-                    ? mapped(e.effect_id & ~kGroupParamBit) | kGroupParamBit
-                    : mapped(e.effect_id);
+            e.effect_id = mapped_key({e.effect_id, 0}).effect_id;
     return out;
 }
 
@@ -367,36 +369,21 @@ public:
         Look& look = entity_of(doc);
         old_split_ = look.audio_split;
         look.audio_split = split_;
-        had_wire_ = false;
-        sealed_ = false;
-        if (!split_)
-            for (auto it = look.links.begin(); it != look.links.end();
-                 ++it)
-                if (it->to == 0 && it->to_port == 1) {
-                    wire_ = *it;
-                    had_wire_ = true;
-                    look.links.erase(it);
-                    if (look.links.empty()) {
-                        seal_links(look);
-                        sealed_ = true;
-                    }
-                    break;
-                }
+        old_links_ = look.links;
+        if (!split_) look.links.erase(std::remove_if(look.links.begin(), look.links.end(),
+            [](const NodeLink& link) { return link.to == 0 && link.to_port == 1; }), look.links.end());
     }
 
     void revert(Document& doc) override {
         Look& look = entity_of(doc);
         look.audio_split = old_split_;
-        if (sealed_) prune_tombstone(look);
-        if (had_wire_) look.links.push_back(wire_);
+        look.links = old_links_;
     }
 
 private:
     bool split_;
     bool old_split_ = false;
-    NodeLink wire_{};
-    bool had_wire_ = false;
-    bool sealed_ = false;
+    std::vector<NodeLink> old_links_;
 };
 
 class SetAssetCommand final : public Command {
@@ -430,115 +417,6 @@ private:
     bool had_ = false;
 };
 
-
-// Links name effects too: the boundary test needs the whole subtree.
-std::vector<uint64_t> owned_ids(const Look& look,
-                                const std::vector<uint64_t>& layer_ids) {
-    std::vector<uint64_t> ids;
-    for (const uint64_t sel : layer_ids) {
-        for (const Layer& l : look.layers) {
-            if (l.id != sel) continue;
-            ids.push_back(l.id);
-            for (const EffectInstance& fx : l.stack) ids.push_back(fx.id);
-            for (const Group& g : l.groups) ids.push_back(g.id);
-        }
-    }
-    return ids;
-}
-
-class NestLayersCommand final : public LookCommand {
-public:
-    NestLayersCommand(uint64_t look, Look nested, Layer ref,
-                      std::vector<uint64_t> layers,
-                      std::vector<uint64_t> owned, size_t insert_index)
-        : LookCommand(look), nested_(std::move(nested)),
-          ref_(std::move(ref)), layers_(std::move(layers)),
-          owned_(std::move(owned)), insert_index_(insert_index) {}
-    std::string name() const override { return "Nest"; }
-
-    void apply(Document& doc) override {
-        Look& parent = entity_of(doc);
-        removed_layers_.clear();
-        removed_links_.clear();
-        // An empty link table means the wiring comes from stack order.
-        // Freeze it first, or the layers that stay behind go unwired.
-        materialized_ = parent.links.empty();
-        if (materialized_) parent.links = synthesize_links(parent);
-        for (size_t i = parent.layers.size(); i-- > 0;) {
-            if (!is_layer(parent.layers[i].id)) continue;
-            removed_layers_.push_back({i, parent.layers[i]});
-            parent.layers.erase(parent.layers.begin() +
-                                static_cast<ptrdiff_t>(i));
-        }
-        // Every link that touches the selection goes. Undo rebuilds them.
-        for (size_t i = parent.links.size(); i-- > 0;) {
-            const NodeLink& l = parent.links[i];
-            if (!selected(l.from) && !selected(l.to)) continue;
-            removed_links_.push_back({i, l});
-            parent.links.erase(parent.links.begin() +
-                               static_cast<ptrdiff_t>(i));
-        }
-        parent.layers.insert(
-            parent.layers.begin() +
-                static_cast<ptrdiff_t>(
-                    std::min(insert_index_, parent.layers.size())),
-            ref_);
-        parent.links.push_back({ref_.id, 0, 0});
-        doc.looks.push_back(nested_);
-    }
-
-    void revert(Document& doc) override {
-        Look& parent = entity_of(doc);
-        erase_by_id(doc.looks, nested_.id);
-        for (size_t i = parent.links.size(); i-- > 0;)
-            if (parent.links[i].from == ref_.id && parent.links[i].to == 0) {
-                parent.links.erase(parent.links.begin() +
-                                   static_cast<ptrdiff_t>(i));
-                break;
-            }
-        erase_by_id(parent.layers, ref_.id);
-        // Restore back-to-front: apply walked the vectors backwards.
-        for (size_t i = removed_layers_.size(); i-- > 0;) {
-            const auto& [index, layer] = removed_layers_[i];
-            parent.layers.insert(
-                parent.layers.begin() +
-                    static_cast<ptrdiff_t>(std::min(index,
-                                                    parent.layers.size())),
-                layer);
-        }
-        for (size_t i = removed_links_.size(); i-- > 0;) {
-            const auto& [index, link] = removed_links_[i];
-            parent.links.insert(
-                parent.links.begin() +
-                    static_cast<ptrdiff_t>(std::min(index,
-                                                    parent.links.size())),
-                link);
-        }
-        // Go back to synthesized wiring if that is what it was.
-        if (materialized_) parent.links.clear();
-    }
-
-private:
-    bool is_layer(uint64_t id) const {
-        for (const uint64_t m : layers_)
-            if (m == id) return true;
-        return false;
-    }
-    bool selected(uint64_t id) const {
-        for (const uint64_t m : owned_)
-            if (m == id) return true;
-        return false;
-    }
-
-    Look nested_;
-    Layer ref_;
-    std::vector<uint64_t> layers_;   // the chosen layers
-    std::vector<uint64_t> owned_;    // plus their effects and groups
-    size_t insert_index_;
-    bool materialized_ = false;   // this command froze the wiring
-    std::vector<std::pair<size_t, Layer>> removed_layers_;
-    std::vector<std::pair<size_t, NodeLink>> removed_links_;
-};
 
 class MakeUniqueCommand final : public SequenceCommand {
 public:
@@ -596,62 +474,6 @@ std::unique_ptr<Command> make_unique_command(Document& doc, uint64_t seq_id,
             seq_id, placement_id, Look{}, std::move(clone), false);
     }
     return nullptr;
-}
-
-std::unique_ptr<Command> nest_layers_command(
-    Document& doc, uint64_t look_id, const std::vector<uint64_t>& layer_ids,
-    std::string name) {
-    if (layer_ids.empty()) return nullptr;
-    const Look* parent = doc.find_look(look_id);
-    if (!parent) return nullptr;
-
-    auto picked = [&](uint64_t id) {
-        for (const uint64_t l : layer_ids)
-            if (l == id) return true;
-        return false;
-    };
-    // Keep compositing order when you resolve the selection.
-    std::vector<const Layer*> members;
-    size_t insert_index = 0;
-    bool have_index = false;
-    for (size_t i = 0; i < parent->layers.size(); ++i) {
-        if (!picked(parent->layers[i].id)) continue;
-        if (!have_index) {
-            insert_index = i;
-            have_index = true;
-        }
-        members.push_back(&parent->layers[i]);
-    }
-    if (members.empty()) return nullptr;
-
-    Look nested = make_look(doc, std::move(name));
-    for (const Layer* l : members) nested.layers.push_back(*l);
-    // A link travels if both ends are inside, or if it feeds the Output.
-    // Read the effective table: synthesized wiring must travel too.
-    std::vector<NodeLink> synth;
-    const std::vector<NodeLink>& table = effective_links(*parent, synth);
-    const std::vector<uint64_t> owned = owned_ids(*parent, layer_ids);
-    auto inside = [&](uint64_t id) {
-        for (const uint64_t o : owned)
-            if (o == id) return true;
-        return false;
-    };
-    for (const NodeLink& l : table) {
-        if (!inside(l.from)) continue;
-        if (inside(l.to) || l.to == 0) nested.links.push_back(l);
-    }
-
-    Layer ref;
-    ref.id = doc.next_effect_id++;
-    ref.name = nested.name;
-    ref.source = LayerSourceKind::LookRef;
-    ref.target = nested.id;
-    ref.node_x = members.front()->node_x;
-    ref.node_y = members.front()->node_y;
-
-    return std::make_unique<NestLayersCommand>(look_id, std::move(nested),
-                                               std::move(ref), layer_ids,
-                                               owned, insert_index);
 }
 
 Look make_look(Document& doc, std::string name) {

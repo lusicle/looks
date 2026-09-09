@@ -1,10 +1,12 @@
 {
-  "looks_preset": 1,
+  "looks_preset": 2,
   "name": "unknown pleasures",
   "tags": [
     "graphic"
   ],
   "group": {
+    "face_out": 2,
+    "inputs": [101],
     "id": 100,
     "name": "unknown pleasures",
     "folded": true,
@@ -56,5 +58,9 @@
       "seed": 0,
       "group": 100
     }
+  ],
+  "links": [
+    {"from": 1, "to": 2, "port": 0},
+    {"from": 101, "to": 1, "port": 0}
   ]
 }

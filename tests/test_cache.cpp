@@ -7,9 +7,23 @@
 #include <chrono>
 #include <fstream>
 #include "util/image.h"
+#include "util/linear_image.h"
 #include "codec/mez.h"
 
 using namespace looks;
+
+TEST(mode_saved_frame_obeys_cache_protection) {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("looks_mode_cache_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto directory = root / "abcdef0123456789-mode-1";
+    std::filesystem::create_directories(directory);
+    CHECK(write_linear_image(directory / "frame.lrgba", {1, 1, {0, 0, 0, 0}}));
+    auto scan = media::scan_disk_cache(root);
+    CHECK_EQ(scan.entries.size(), size_t{1});
+    CHECK(scan.entries[0].removable);
+    CHECK(media::cache_cleanup_plan(scan, {0, 0}, {directory / "frame.lrgba"}, true).empty());
+    CHECK_EQ(media::cache_cleanup_plan(scan, {0, 0}, {}, true).size(), size_t{1});
+}
 
 TEST(disk_cache_defaults_and_cleanup_protection) {
     namespace fs = std::filesystem;
@@ -239,28 +253,28 @@ TEST(cache_replace_same_frame_updates_bytes) {
 TEST(history_scan_gates_cache) {
     doc::Document doc = doc_with_look();
     CHECK(!doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.push_back(
         doc::make_effect(doc, doc::EffectType::Vignette));
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.push_back(
         doc::make_effect(doc, doc::EffectType::Quantize));
     CHECK(!doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.push_back(
         doc::make_effect(doc, doc::EffectType::Feedback));
     CHECK(doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack.back().bypass = true;
+    doc.looks[0].effects.back().bypass = true;
     CHECK(!doc::document_uses_history(doc));
 }
 
 TEST(history_scan_quantize_rd_stipple) {
     // params[2] is the dither mode; only mode 9 (RD stipple) has state.
     doc::Document doc = doc_with_look();
-    doc.looks[0].layers[0].stack.push_back(
+    doc.looks[0].effects.push_back(
         doc::make_effect(doc, doc::EffectType::Quantize));
     CHECK(!doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack[0].params[2] = 8.0f;
+    doc.looks[0].effects[0].params[2] = 8.0f;
     CHECK(!doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack[0].params[2] = 9.0f;
+    doc.looks[0].effects[0].params[2] = 9.0f;
     CHECK(doc::document_uses_history(doc));
-    doc.looks[0].layers[0].stack[0].params[2] = 13.0f;
+    doc.looks[0].effects[0].params[2] = 13.0f;
     CHECK(!doc::document_uses_history(doc));
 }

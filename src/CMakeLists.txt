@@ -8,6 +8,7 @@ add_library(looks_util STATIC
     util/inflate.cpp
     util/numerics.cpp
     util/image.cpp)
+target_sources(looks_util PRIVATE util/linear_image.cpp)
 target_include_directories(looks_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # Pixel/byte loops (image decode, inflate, the doc-hash JSON writer) are
 # hot on the import and autosave paths - same Debug-/O2 tradeoff as
@@ -173,8 +174,12 @@ target_link_libraries(looks_ui PUBLIC looks_ui_core looks_gfx looks_util)
 
 # ---- app
 add_executable(looks WIN32
+    app/mode_renderer.cpp
     app/flow_canvas.cpp
     app/main.cpp)
+if(MSVC)
+    target_compile_options(looks PRIVATE /bigobj)
+endif()
 target_link_libraries(looks PRIVATE
     looks_platform looks_gfx looks_ui looks_doc looks_media looks_mod
     looks_script looks_util)

@@ -9,10 +9,10 @@
 namespace looks::doc {
 
 // param_index >= 0 indexes params; negatives are built-ins (stack_commands.h).
-// A layer key sets this bit and carries the layer id.
-inline constexpr uint64_t kLayerParamBit = 1ull << 62;
+// A source key sets this bit and carries the source id.
+inline constexpr uint64_t kSourceParamBit = 1ull << 62;
 // Slots 15, 16, 20 and 21 are field ids only, never modulatable.
-inline constexpr int kLayerParamCount = 27;
+inline constexpr int kSourceParamCount = 27;
 // A group key sets this bit and carries the group id; wet/opacity only.
 inline constexpr uint64_t kGroupParamBit = 1ull << 61;
 // A gradient stop key sets this bit and carries the stop id.
@@ -102,7 +102,7 @@ struct ValueNode {
     ValueOp op = ValueOp::Add;
     uint64_t in_a = 0, in_b = 0;    // upstream value-node ids; 0 = constant
     float const_a = 0.0f, const_b = 1.0f;
-    // A layer or effect id in the same look. 0 = unwired = the node reads 0.
+    // A source or effect id in the same look. 0 = unwired = the node reads 0.
     uint64_t audio_src = 0;
     // Window [in_min, in_max], capped -1..1, scaled by m = const_b.
     float in_min = 0.0f, in_max = 1.0f;
